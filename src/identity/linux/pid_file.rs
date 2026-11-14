@@ -11,17 +11,19 @@ use std::io;
 use std::sync::Arc;
 
 use super::kernel::Kernel;
-use super::proc_view::{read_own, OwnUnreadable, ProcDir, ReadFailure};
+use super::proc_read::{read_own, OwnUnreadable, ProcDir, ReadFailure};
 use super::prove::Refusal;
 
 /// What reading one pid's file yielded.
 #[derive(Debug)]
 pub(crate) enum ReadOutcome {
     Read(Vec<u8>),
-    /// The pid exited: `ESRCH`, of the open or of the read. The error is why.
+    /// The pid exited: `ESRCH`, of the open or of a file's `read(2)`; or, of a link's `readlinkat`,
+    /// `ENOENT` (`ns_get_name`: the task has no namespace left). The error is why.
     Exited(io::Error),
     /// The pid is not shown to us: it is gone (`ENOENT`), or `hidepid` hides it (`EACCES`, or `EPERM`
-    /// while the checked directory still answers). The error is why. A caller that holds the pid
+    /// while the checked directory still answers); of a link's `readlinkat`, `EACCES` (`proc_ns_readlink`:
+    /// ptrace of the task is denied, or the task is gone). The error is why. A caller that holds the pid
     /// unreaped, so that it cannot be gone, reads this as `/proc` hiding it.
     Hidden(io::Error),
     /// The `openat2` was refused.
@@ -71,10 +73,7 @@ impl Unreadable {
     /// failure alone, or both failures as the members of a list that a context ("two reads failed")
     /// holds, which names neither the pid nor the file again.
     pub(crate) fn into_io(self) -> io::Error {
-        match self.into_cause() {
-            crate::error::Error::Io(e) => e,
-            both => crate::error::io_context_over("two reads failed", both),
-        }
+        self.into_cause().into_io_over("two reads failed")
     }
 }
 
@@ -88,8 +87,8 @@ enum Kind {
     /// `EPERM`, and the `self/stat` re-check failed without refusing: whether the pid is hidden is
     /// unknown. The re-check's error is the source, and the pid's own `EPERM` is the peer.
     RecheckFailed,
-    /// `EMFILE`, `ENOMEM`, `EIO`, ... of the `openat2`, or any failure of `read(2)` (a link's
-    /// `readlinkat`) but `ESRCH`: nothing is known about the pid.
+    /// `EMFILE`, `ENOMEM`, `EIO`, ... of the `openat2`, or a failure of the read step (`read(2)`, or a
+    /// link's `readlinkat`) that is no exit or hiding of the pid: nothing is known about it.
     Other,
 }
 
@@ -126,45 +125,74 @@ pub(crate) fn read(
     pid: u32,
     file: &'static str,
 ) -> Result<ReadOutcome, Unreadable> {
-    classify(kernel, dir, pid, file, kernel.read(dir, &format!("{pid}/{file}")))
+    classify(
+        kernel,
+        dir,
+        pid,
+        file,
+        Entry::File,
+        kernel.read(dir, &format!("{pid}/{file}")),
+    )
 }
 
 /// [`read`] of the symlink `<pid>/<file>` (`ns/pid`): its target is the [`ReadOutcome::Read`] bytes.
-/// The `readlinkat` is the read step, as `read(2)` is of a file.
+/// The `readlinkat` is the read step, as `read(2)` is of a file, with its own errnos.
 pub(crate) fn read_link(
     kernel: &dyn Kernel,
     dir: &ProcDir,
     pid: u32,
     file: &'static str,
 ) -> Result<ReadOutcome, Unreadable> {
-    classify(kernel, dir, pid, file, kernel.read_link(dir, &format!("{pid}/{file}")))
+    classify(
+        kernel,
+        dir,
+        pid,
+        file,
+        Entry::Link,
+        kernel.read_link(dir, &format!("{pid}/{file}")),
+    )
 }
 
-/// What the read `read` of `<pid>/<file>` yielded: the one rule of a pid's file, for a file and a link.
+/// What kind of entry of a pid's directory is read, which decides what its read step's errno means.
+#[derive(Clone, Copy)]
+enum Entry {
+    File,
+    Link,
+}
+
+/// The one rule of a pid's `file`, a file or a link as `entry` says, applied to `read`, the result of
+/// reading it through `kernel` and `dir`: what the read yielded.
 fn classify(
     kernel: &dyn Kernel,
     dir: &ProcDir,
     pid: u32,
     file: &'static str,
+    entry: Entry,
     read: Result<Vec<u8>, ReadFailure>,
 ) -> Result<ReadOutcome, Unreadable> {
     let source = match read {
         Ok(bytes) => return Ok(ReadOutcome::Read(bytes)),
         Err(ReadFailure::Open(source)) => source,
-        // The file opened, so no `openat2` errno is in play. A task that exited after the open is the
-        // one racing exit `read(2)` reports; every other failure says nothing about the pid.
-        Err(ReadFailure::Read(source)) if source.raw_os_error() == Some(libc::ESRCH) => {
-            return Ok(ReadOutcome::Exited(source));
-        }
-        Err(ReadFailure::Read(source)) => {
-            return Err(Unreadable {
-                pid,
-                file,
-                kind: Kind::Other,
-                cause: source,
-                peer: None,
-            });
-        }
+        // The entry opened, so no `openat2` errno is in play; only the read step's own say anything
+        // about the pid.
+        Err(ReadFailure::Read(source)) => match (entry, source.raw_os_error()) {
+            // A task that exited after the open is the one racing exit a file's `read(2)` reports.
+            (Entry::File, Some(libc::ESRCH)) => return Ok(ReadOutcome::Exited(source)),
+            // `proc_ns_readlink` (fs/proc/namespaces.c): `EACCES` when ptrace of the task is denied or
+            // the task is gone before it is looked up; `ns_get_name` (fs/nsfs.c): `ENOENT` when the
+            // task, once found, no longer has the namespace, which is exiting.
+            (Entry::Link, Some(libc::EACCES)) => return Ok(ReadOutcome::Hidden(source)),
+            (Entry::Link, Some(libc::ENOENT)) => return Ok(ReadOutcome::Exited(source)),
+            _ => {
+                return Err(Unreadable {
+                    pid,
+                    file,
+                    kind: Kind::Other,
+                    cause: source,
+                    peer: None,
+                });
+            }
+        },
     };
     let (kind, cause, peer) = match source.raw_os_error() {
         Some(libc::ESRCH) => return Ok(ReadOutcome::Exited(source)),

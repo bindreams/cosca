@@ -10,7 +10,7 @@ use rustix::fs::{fstat, fstatfs};
 use rustix::io::Errno;
 use rustix::process::{pidfd_open, test_kill_process, Pid, PidfdFlags};
 
-use super::proc_view::{ProcDir, ReadFailure, ViewUnreadable};
+use super::proc_read::{ProcDir, ProcOpenFailure, ReadFailure};
 
 /// `PIDFD_THREAD`: open a pidfd for a thread that is not a thread-group leader. rustix has no
 /// name for it.
@@ -30,13 +30,13 @@ pub(crate) trait Kernel: Sync {
     fn pidfs_ino(&self, fd: BorrowedFd<'_>) -> Result<Option<u64>, Errno>;
 
     /// `ProcDir::open`: `openat2` of `/proc`, proven procfs's root.
-    fn open_proc(&self) -> Result<ProcDir, ViewUnreadable>;
+    fn open_proc(&self) -> Result<ProcDir, ProcOpenFailure>;
 
     /// The file at `path` under `dir`: `<pid>/stat`, `<pid>/cgroup`, `self/stat`, `self/status`
     /// or `thread-self/fdinfo/<fd>`. A failure says whether the `openat2` or `read(2)` failed.
     fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure>;
 
-    /// The target of the symlink at `path` under `dir`: `thread-self/ns/pid` or `<pid>/ns/pid`. A
+    /// The target of the symlink at `path` under `dir`: `self/ns/pid` or `<pid>/ns/pid`. A
     /// failure says whether the `openat2` or the `readlinkat` failed.
     fn read_link(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure>;
 
@@ -64,7 +64,7 @@ impl Kernel for HostKernel {
         Ok(Some(fstat(fd)?.st_ino as u64))
     }
 
-    fn open_proc(&self) -> Result<ProcDir, ViewUnreadable> {
+    fn open_proc(&self) -> Result<ProcDir, ProcOpenFailure> {
         ProcDir::open()
     }
 

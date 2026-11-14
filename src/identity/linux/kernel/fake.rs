@@ -11,7 +11,7 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags};
 
 use super::Kernel;
-use crate::identity::{ProcDir, ReadFailure, ViewUnreadable};
+use crate::identity::{ProcDir, ProcOpenFailure, ReadFailure};
 
 pub(crate) struct FakeKernel<'a> {
     /// What answers a call the tables have nothing for. `None`: such a call panics.
@@ -313,9 +313,9 @@ impl Kernel for FakeKernel<'_> {
         }
     }
 
-    fn open_proc(&self) -> Result<ProcDir, ViewUnreadable> {
+    fn open_proc(&self) -> Result<ProcDir, ProcOpenFailure> {
         match self.open_proc {
-            Some(errno) => Err(ViewUnreadable::from_open_errno(errno)),
+            Some(errno) => Err(ProcOpenFailure::opening(errno)),
             None => self.real("open_proc").open_proc(),
         }
     }

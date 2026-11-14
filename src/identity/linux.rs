@@ -9,6 +9,8 @@
 pub(crate) mod kernel;
 #[path = "linux/pid_file.rs"]
 pub(crate) mod pid_file;
+#[path = "linux/proc_read.rs"]
+pub(crate) mod proc_read;
 #[path = "linux/proc_view.rs"]
 pub(crate) mod proc_view;
 #[path = "linux/prove.rs"]
@@ -37,7 +39,7 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags};
 
 use self::kernel::Kernel;
-use self::proc_view::ProcDir;
+use self::proc_read::ProcDir;
 use self::prove::Proof;
 use super::probe::{classify_unreadable, SignalProbe};
 use super::stat_parse::{parse_ppid, parse_starttime_jiffies};

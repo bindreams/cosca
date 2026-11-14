@@ -8,7 +8,9 @@ use super::ProbeEnd;
 use super::{dying_in, front_placement, proc_names, Subtree};
 use crate::containment::cgroup::fault::{self, ProbeStep};
 use crate::containment::cgroup::test_support::{alone, kill_record};
-use crate::identity::{FakeKernel, HostKernel, Kernel, ProcDir, ReadFailure, ViewUnreadable, UNREADABLE_STATUS_REASON};
+use crate::identity::{
+    FakeKernel, HostKernel, Kernel, ProcDir, ProcOpenFailure, ReadFailure, UNREADABLE_STATUS_REASON,
+};
 use crate::log_capture::warns_since;
 use crate::test_groups::{cgroup, Group};
 
@@ -624,7 +626,7 @@ fn any_other_failure_to_read_the_leaf_id_is_an_io_error() {
 /// Mutant: the error keeps the view's kind and drops the error.
 #[skuld::test]
 fn a_task_read_through_an_unusable_view_has_the_views_error_as_its_cause() {
-    let why = crate::identity::ViewUnreadable::from_open_errno(rustix::io::Errno::MFILE);
+    let why: crate::identity::ViewUnreadable = ProcOpenFailure::opening(rustix::io::Errno::MFILE).into();
     let kind = std::io::Error::from_raw_os_error(libc::EMFILE).kind();
 
     let err = super::view_unreadable(7, why);
@@ -641,7 +643,6 @@ fn refused_view_kernel() -> FakeKernel<'static> {
     FakeKernel::over(&HostKernel)
         .on_read("self/status", Ok(b"Name:\tcosca\n"))
         .on_read("self/ns/pid", Ok(b"pid:[4026531836]"))
-        .on_read("thread-self/ns/pid", Ok(b"pid:[4026531836]"))
         .on_read("1/ns/pid", Err(libc::EPERM))
         .on_read("self/stat", Err(libc::ENOSYS))
 }
@@ -669,6 +670,29 @@ fn a_refused_views_errors_carry_the_refusals_chain() {
         panic!("a refused view reads no cgroup");
     };
     said_all(crate::error::said(&super::refusal(unreadable)));
+}
+
+/// A refused view stays a refusal wherever the view is read: a task's cgroup read is `Unsupported` and
+/// names the requirement, as its cgroup read's refusal is, and the probe's answer is the refusal itself.
+/// Mutant: "a refused view is only an unreadable one" (an `Other` error; a `View` string).
+#[skuld::test]
+fn a_refused_view_is_a_refusal_where_it_is_read() {
+    let kernel = refused_view_kernel();
+
+    let err = proc_names(&kernel, "/leaf", 7, || None, false).expect_err("a refused view reads no cgroup");
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{err:?}");
+    assert!(
+        crate::error::said(&err).contains("cosca requires openat2"),
+        "{}",
+        crate::error::said(&err)
+    );
+
+    match super::untraceable_cgroup_readable(&kernel) {
+        Err(super::Unreadable::Refused(refusal)) => {
+            assert!(refusal.requirement().contains("requires openat2"), "{refusal:?}");
+        }
+        other => panic!("a refused view reads no cgroup, and is the refusal: {other:?}"),
+    }
 }
 
 /// A forked probe, killed and reaped when dropped, so a probe a failing assertion would leave
@@ -1069,7 +1093,7 @@ impl Kernel for ChildExitsAfterCgroupRead {
         HostKernel.pidfs_ino(fd)
     }
 
-    fn open_proc(&self) -> Result<ProcDir, ViewUnreadable> {
+    fn open_proc(&self) -> Result<ProcDir, ProcOpenFailure> {
         HostKernel.open_proc()
     }
 

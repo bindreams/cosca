@@ -18,20 +18,19 @@
 //! - **Without one** ([`proc_view_with`]): the `NSpid` line of `self/status`, which has one entry per
 //!   pid namespace from the procfs's down to the reader's. One entry means the same namespace.
 //!   Where `NSpid` is absent but pid namespaces exist (gVisor), the procfs's pid 1 namespace
-//!   link must name this thread's own pid namespace ([`cross_check_with_init_ns`]).
+//!   link must name this process's own pid namespace ([`cross_check_with_init_ns`]).
 //!
 //! [`ProcDir`] is proven procfs's root and reads only with `openat2` (Linux 5.6), so a mount
-//! placed over `/proc`, or over a file below it, after the check is refused, not read.
+//! placed over `/proc`, or over a file below it, after the check is refused, not read. It and
+//! the failure of a read of it live in [`proc_read`](super::proc_read), below this module.
 
-use std::io::{self, Read};
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
-
-use rustix::fs::{openat2, Mode, OFlags, ResolveFlags, CWD, PROC_SUPER_MAGIC};
-use rustix::io::Errno;
+use std::io;
+use std::os::fd::{AsRawFd, BorrowedFd};
 
 use super::kernel::Kernel;
 use super::pid_file::{self, ReadOutcome, Unreadable};
-use super::prove::{FailedCall, Refusal};
+use super::proc_read::{read_own, utf8, OwnUnreadable, ProcDir, ProcOpenFailure, ReadFailure};
+use super::prove::Refusal;
 use crate::error::Error;
 
 /// What this process's `/proc` says about its own pid namespace.
@@ -65,56 +64,6 @@ impl ProcView {
     }
 }
 
-/// A failed [`ProcDir::read`], [`ProcDir::read_link`] or [`ProcDir::pids`] (and so a
-/// [`Kernel`] call that answers one), by the call that failed: only an `openat2`'s errno can be a
-/// refusal ([`FailedCall::openat2`]), and only a file, link or directory that opened can fail
-/// reading it (`read(2)`, `readlinkat`, or the directory's setup and `getdents64`).
-#[derive(Debug)]
-pub(crate) enum ReadFailure {
-    Open(io::Error),
-    Read(io::Error),
-}
-
-impl ReadFailure {
-    /// The OS error, whichever call failed.
-    pub(crate) fn into_io(self) -> io::Error {
-        match self {
-            ReadFailure::Open(e) | ReadFailure::Read(e) => e,
-        }
-    }
-
-    /// The [`Refusal`] this failure is, if any: an `openat2` errno in
-    /// [`FailedCall::requirement`]'s table. A failure after the `openat2` (a `read(2)`, a
-    /// `readlinkat`, a listing) is none, whatever its errno. The one rule of every read and listing
-    /// of `/proc`.
-    pub(crate) fn refusal(&self) -> Option<Refusal> {
-        match self {
-            ReadFailure::Open(e) => FailedCall::openat2(Errno::from_io_error(e)?).refusal(),
-            ReadFailure::Read(_) => None,
-        }
-    }
-}
-
-/// Why one of this process's own files could not be read: `self/status`, `self/stat`,
-/// `thread-self/fdinfo/<fd>`, `self/ns/pid`, `thread-self/ns/pid`. `hidepid` hides other users' pid
-/// directories and cannot hide these, so an `EPERM` of one is nothing to re-check. The one rule: a
-/// [`ReadFailure::refusal`] is a [`Refusal`], and every other failure, any `read(2)` errno
-/// included, is the file's own.
-#[derive(Debug)]
-pub(crate) enum OwnUnreadable {
-    Refused(Refusal),
-    Failed(io::Error),
-}
-
-impl OwnUnreadable {
-    pub(crate) fn of(failure: ReadFailure) -> Self {
-        match failure.refusal() {
-            Some(refusal) => OwnUnreadable::Refused(refusal),
-            None => OwnUnreadable::Failed(failure.into_io()),
-        }
-    }
-}
-
 /// Why a file read to establish a [`ProcView`] failed: an own file's failure ([`OwnUnreadable`]), or
 /// pid 1's `ns/pid`, a foreign pid's file, with the verdict the pid-file rule ([`pid_file::read_link`])
 /// gave it. `hidepid` can hide pid 1 from a reader, so its failure is told by that rule, not the
@@ -122,13 +71,9 @@ impl OwnUnreadable {
 #[derive(Debug)]
 pub(crate) enum ViewReadFailure {
     Own(OwnUnreadable),
-    /// Pid 1's `ns/pid` is not there: `ESRCH`.
-    Pid1Exited(io::Error),
-    /// Pid 1 is not shown to this process: gone, or `hidepid` hides it.
-    Pid1Hidden(io::Error),
-    Pid1Refused(Refusal),
-    /// Any other failure, which says nothing about pid 1.
-    Pid1Unreadable(Unreadable),
+    /// The rule's verdict on pid 1's link, kept as it is: any but [`ReadOutcome::Read`], which is no
+    /// failure.
+    Pid1(Result<ReadOutcome, Unreadable>),
 }
 
 impl From<OwnUnreadable> for ViewReadFailure {
@@ -142,7 +87,10 @@ impl From<OwnUnreadable> for ViewReadFailure {
 pub(crate) struct ViewUnreadable {
     pub(crate) reason: String,
     /// The failure behind `reason`, when there was one: for a refusal, its whole chain
-    /// ([`Refusal::cause_io`]), whose `openat2` errno is `refusal`'s.
+    /// ([`Refusal::cause_io`]), whose `openat2` errno is `refusal`'s. Held beside `refusal` rather than
+    /// derived from it, because [`Error::source`](std::error::Error::source) lends a reference and
+    /// the chain is built, not stored. Only [`of_failure`](Self::of_failure) sets `refusal`, and
+    /// sets both together, so they cannot disagree.
     pub(crate) source: Option<io::Error>,
     /// The refused `openat2`, when that is why the view could not be established: of `/proc`
     /// itself or of a file read to check it.
@@ -164,30 +112,29 @@ impl ViewUnreadable {
         use crate::error::io_context;
 
         let (source, refusal) = match failure.into() {
-            ViewReadFailure::Own(OwnUnreadable::Refused(refusal)) | ViewReadFailure::Pid1Refused(refusal) => {
+            ViewReadFailure::Own(OwnUnreadable::Refused(refusal))
+            | ViewReadFailure::Pid1(Ok(ReadOutcome::Refused(refusal))) => {
                 (Some(refusal.cause_io()), Some(Box::new(refusal)))
             }
             ViewReadFailure::Own(OwnUnreadable::Failed(e)) => (Some(e), None),
-            ViewReadFailure::Pid1Exited(e) => (Some(io_context("pid 1 exited", e)), None),
-            ViewReadFailure::Pid1Hidden(e) => (
+            ViewReadFailure::Pid1(Ok(ReadOutcome::Exited(e))) => (Some(io_context("pid 1 exited", e)), None),
+            ViewReadFailure::Pid1(Ok(ReadOutcome::Hidden(e))) => (
                 Some(io_context(
                     "pid 1 is hidden from this process (gone, or hidepid hides it)",
                     e,
                 )),
                 None,
             ),
-            ViewReadFailure::Pid1Unreadable(unreadable) => (Some(unreadable.into_io()), None),
+            ViewReadFailure::Pid1(Ok(ReadOutcome::Read(_))) => {
+                debug_assert!(false, "a link that was read is no failure");
+                (None, None)
+            }
+            ViewReadFailure::Pid1(Err(unreadable)) => (Some(unreadable.into_io()), None),
         };
         ViewUnreadable {
             refusal,
             ..ViewUnreadable::new(reason, source)
         }
-    }
-
-    /// The view that `openat2` of `/proc` failing with `errno` leaves.
-    pub(crate) fn from_open_errno(errno: rustix::io::Errno) -> Self {
-        let failure = ReadFailure::Open(errno.into());
-        ViewUnreadable::of_failure("/proc could not be opened", OwnUnreadable::of(failure))
     }
 
     /// [`Error::Unsupported`] naming the `openat2` requirement, when that is why the view
@@ -200,6 +147,21 @@ impl ViewUnreadable {
     /// error type is not [`Error`].
     pub(crate) fn refusal(&self) -> Option<Refusal> {
         self.refusal.as_deref().cloned()
+    }
+}
+
+impl From<ProcOpenFailure> for ViewUnreadable {
+    fn from(failure: ProcOpenFailure) -> Self {
+        match failure {
+            ProcOpenFailure::Open(own) => ViewUnreadable::of_failure("/proc could not be opened", own),
+            ProcOpenFailure::Check(e) => ViewUnreadable::new("/proc could not be checked", Some(e)),
+            ProcOpenFailure::NotProcfs { f_type } => {
+                ViewUnreadable::new(format!("/proc is not procfs (filesystem type {f_type:#x})"), None)
+            }
+            ProcOpenFailure::NotRoot { ino } => {
+                ViewUnreadable::new(format!("/proc is not the root of procfs (inode {ino})"), None)
+            }
+        }
     }
 }
 
@@ -216,128 +178,12 @@ impl std::error::Error for ViewUnreadable {
     }
 }
 
-/// A `/proc` directory fd proven to be procfs's root, and the only way to read `/proc`: every
-/// read is an `openat2` beneath it that cannot cross a mount, so nothing mounted over `/proc`
-/// or below it after the check is ever read. Needs `openat2` (Linux 5.6, and not filtered by
-/// seccomp): [`open`](Self::open) fails, flagged so [`ViewUnreadable::unsupported`] names it.
-#[derive(Debug)]
-pub(crate) struct ProcDir(OwnedFd);
-
-impl ProcDir {
-    /// Open `/proc` and prove it is procfs's root: `PROC_SUPER_MAGIC`, and inode 1.
-    pub(crate) fn open() -> Result<ProcDir, ViewUnreadable> {
-        let fd = open_proc_root().map_err(ViewUnreadable::from_open_errno)?;
-        let fs =
-            rustix::fs::fstatfs(&fd).map_err(|e| ViewUnreadable::new("/proc could not be checked", Some(e.into())))?;
-        if fs.f_type != PROC_SUPER_MAGIC {
-            return Err(ViewUnreadable::new(
-                format!("/proc is not procfs (filesystem type {:#x})", fs.f_type),
-                None,
-            ));
-        }
-        let ino = rustix::fs::fstat(&fd)
-            .map_err(|e| ViewUnreadable::new("/proc could not be checked", Some(e.into())))?
-            .st_ino;
-        if ino != PROC_ROOT_INO {
-            return Err(ViewUnreadable::new(
-                format!("/proc is not the root of procfs (inode {ino})"),
-                None,
-            ));
-        }
-        Ok(ProcDir(fd))
-    }
-
-    /// Open `path` under this `/proc`, refusing to leave it, cross a mount, or follow a magic link.
-    fn open_beneath(&self, path: &str, oflags: OFlags) -> io::Result<OwnedFd> {
-        openat2(
-            &self.0,
-            path,
-            oflags | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS,
-        )
-        .map_err(io::Error::from)
-    }
-
-    /// This process's `self/fd` directory under this `/proc`, opened as
-    /// [`open_beneath`](Self::open_beneath) opens. Async-signal-safe (one `openat2`, no allocation);
-    /// in a forked child `self` is the child.
-    pub(crate) fn open_own_fd_dir(&self) -> rustix::io::Result<OwnedFd> {
-        openat2(
-            &self.0,
-            c"self/fd",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS,
-        )
-    }
-
-    /// Read the file at `path` under this `/proc`.
-    pub(crate) fn read(&self, path: &str) -> Result<Vec<u8>, ReadFailure> {
-        let file = self.open_beneath(path, OFlags::RDONLY).map_err(ReadFailure::Open)?;
-        let mut bytes = Vec::new();
-        std::fs::File::from(file)
-            .read_to_end(&mut bytes)
-            .map_err(ReadFailure::Read)?;
-        Ok(bytes)
-    }
-
-    /// The target of the symlink at `path` under this `/proc`, without following it. A failure says
-    /// whether the `openat2` or the `readlinkat` failed.
-    pub(super) fn read_link(&self, path: &str) -> Result<Vec<u8>, ReadFailure> {
-        let link = self
-            .open_beneath(path, OFlags::PATH | OFlags::NOFOLLOW)
-            .map_err(ReadFailure::Open)?;
-        let target = rustix::fs::readlinkat(&link, "", Vec::new()).map_err(|e| ReadFailure::Read(e.into()))?;
-        Ok(target.into_bytes())
-    }
-
-    /// The pids listed under this `/proc`: its decimal-named entries. The `openat2` of `.` is
-    /// [`ReadFailure::Open`]; the directory's setup and listing are [`ReadFailure::Read`].
-    pub(super) fn pids(&self) -> Result<Vec<u32>, ReadFailure> {
-        let fd = self
-            .open_beneath(".", OFlags::RDONLY | OFlags::DIRECTORY)
-            .map_err(ReadFailure::Open)?;
-        let dir = rustix::fs::Dir::new(fd).map_err(|e| ReadFailure::Read(e.into()))?;
-        collect_pids(dir.map(|entry| Ok(entry?.file_name().to_bytes().to_vec()))).map_err(ReadFailure::Read)
-    }
-}
-
-/// The inode of procfs's root directory (`PROC_ROOT_INO`).
-const PROC_ROOT_INO: u64 = 1;
-
-/// The `openat2` of `/proc` itself.
-fn open_proc_root() -> Result<OwnedFd, rustix::io::Errno> {
-    openat2(
-        CWD,
-        "/proc",
-        OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::NO_MAGICLINKS,
-    )
-}
-
-/// `bytes` as UTF-8 text.
-pub(crate) fn utf8(bytes: Vec<u8>) -> io::Result<String> {
-    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-/// This process's own file `path` under `dir`, read through `kernel`: the one read of such a file.
-pub(crate) fn read_own(kernel: &dyn Kernel, dir: &ProcDir, path: &str) -> Result<Vec<u8>, OwnUnreadable> {
-    kernel.read(dir, path).map_err(OwnUnreadable::of)
-}
-
-/// [`read_own`] of this process's own symlink `path` (`self/ns/pid`): its target.
-pub(crate) fn read_own_link(kernel: &dyn Kernel, dir: &ProcDir, path: &str) -> Result<Vec<u8>, OwnUnreadable> {
-    kernel.read_link(dir, path).map_err(OwnUnreadable::of)
-}
-
 /// This process's [`ProcView`], from `self/status`'s `NSpid` read through one `/proc` dirfd that
 /// `kernel` opens.
 pub(crate) fn proc_view_with(kernel: &dyn Kernel) -> ProcView {
     let dir = match kernel.open_proc() {
         Ok(dir) => dir,
-        Err(why) => return ProcView::Unassessable(why),
+        Err(why) => return ProcView::Unassessable(why.into()),
     };
     let status = match read_own(kernel, &dir, "self/status") {
         Ok(bytes) => match utf8(bytes) {
@@ -346,12 +192,12 @@ pub(crate) fn proc_view_with(kernel: &dyn Kernel) -> ProcView {
         },
         Err(own) => return ProcView::Unassessable(ViewUnreadable::of_failure(UNREADABLE_STATUS_REASON, own)),
     };
-    let verdict = match classify_status(&status, || ns_pid_exists(kernel, &dir)) {
-        Verdict::NoNspid => cross_check_with_init_ns(kernel, &dir),
+    let verdict = match classify_status(&status, || own_ns_link(kernel, &dir)) {
+        Verdict::NoNspid(own) => cross_check_with_init_ns(kernel, &dir, own),
         decided => decided,
     };
     match verdict {
-        Verdict::Same | Verdict::NoNspid => ProcView::Same(dir),
+        Verdict::Same | Verdict::NoNspid(_) => ProcView::Same(dir),
         Verdict::Diverged => ProcView::Diverged,
         Verdict::Unassessable(why) => ProcView::Unassessable(why),
     }
@@ -363,23 +209,24 @@ pub(crate) fn proc_view_with(kernel: &dyn Kernel) -> ProcView {
 enum Verdict {
     Same,
     /// `NSpid` is absent although pid namespaces exist; only [`cross_check_with_init_ns`] can
-    /// decide. Never leaves [`proc_view_with`].
-    NoNspid,
+    /// decide, by this process's pid namespace link, which is what was read to find they exist. Never
+    /// leaves [`proc_view_with`].
+    NoNspid(Vec<u8>),
     Diverged,
     Unassessable(ViewUnreadable),
 }
 
-/// Classify `self/status`. `ns_pid_exists` answers whether `self/ns/pid` exists, and is asked
-/// only when `NSpid` is absent.
+/// Classify `self/status`. `own_ns_link` reads this process's `self/ns/pid`, and is asked only when
+/// `NSpid` is absent.
 ///
 /// `NSpid` exists only under `CONFIG_PID_NS`, and gVisor omits it. Absent, the kernel either
 /// has no pid namespaces at all (then `self/ns/pid` does not exist and the view is trivially
-/// `Same`), or does and this status file cannot say (gVisor): [`Verdict::NoNspid`].
-fn classify_status(status: &str, ns_pid_exists: impl FnOnce() -> Result<bool, OwnUnreadable>) -> Verdict {
+/// `Same`), or does and this status file cannot say (gVisor): [`Verdict::NoNspid`], with the link.
+fn classify_status(status: &str, own_ns_link: impl FnOnce() -> Result<Option<Vec<u8>>, OwnUnreadable>) -> Verdict {
     let Some(line) = status.lines().find_map(|l| l.strip_prefix("NSpid:")) else {
-        return match ns_pid_exists() {
-            Ok(false) => Verdict::Same,
-            Ok(true) => Verdict::NoNspid,
+        return match own_ns_link() {
+            Ok(None) => Verdict::Same,
+            Ok(Some(own)) => Verdict::NoNspid(own),
             Err(own) => Verdict::Unassessable(ViewUnreadable::of_failure(
                 "self/status has no NSpid line and self/ns/pid could not be checked",
                 own,
@@ -393,10 +240,10 @@ fn classify_status(status: &str, ns_pid_exists: impl FnOnce() -> Result<bool, Ow
     }
 }
 
-/// Decide [`Verdict::NoNspid`] by pid namespace identity. `thread-self/ns/pid` names this
-/// thread's pid namespace (a namespace link names its task's namespace, whichever procfs shows
-/// it), and `1/ns/pid` names the procfs's own, since its pid 1 is that namespace's init. Equal
-/// links: `Same`.
+/// Decide [`Verdict::NoNspid`] by pid namespace identity. `own`, the target of `self/ns/pid`, names
+/// this process's pid namespace (a namespace link names its task's namespace, whichever procfs shows
+/// it; every thread of a process is in one), and `1/ns/pid` names the procfs's own, since its pid 1 is
+/// that namespace's init. Equal links: `Same`.
 ///
 /// Numbers cannot decide it: an outer procfs can number this thread exactly as `gettid()` does.
 /// Nor can our own pidfd's fdinfo `Pid:`: Linux prints it in the procfs's namespace, where it
@@ -404,14 +251,13 @@ fn classify_status(status: &str, ns_pid_exists: impl FnOnce() -> Result<bool, Ow
 ///
 /// No Linux kernel reaches this arm (it prints `NSpid` whenever it has pid namespaces). "pid 1 is
 /// the init" holds on gVisor, whose allocator wraps to 2 and refuses a namespace whose init has
-/// exited. Reading this thread's own link needs no ptrace right, even non-dumpable. Linux lets
-/// only a reader with ptrace-read access to that pid 1 read its link (else `EACCES`:
-/// `Unassessable`); gVisor does not check. gVisor printed a fake, per-link `pid:[…]` until
-/// 2023-06 (commit 94bf4b6), but the arm needs `openat2` ([`ProcDir`]), which it gained in 2026-08.
-fn cross_check_with_init_ns(kernel: &dyn Kernel, dir: &ProcDir) -> Verdict {
-    classify_ns_links(read_own_link(kernel, dir, "thread-self/ns/pid"), || {
-        init_ns_link(kernel, dir)
-    })
+/// exited. Reading this process's own link needs no ptrace right, even non-dumpable. Linux lets
+/// only a reader with ptrace-read access to that pid 1 read its link (else `EACCES`: pid 1 is
+/// hidden from it, so `Unassessable`); gVisor does not check. gVisor printed a fake, per-link
+/// `pid:[…]` until 2023-06 (commit 94bf4b6), but the arm needs `openat2` ([`ProcDir`]), which it
+/// gained in 2026-08.
+fn cross_check_with_init_ns(kernel: &dyn Kernel, dir: &ProcDir, own: Vec<u8>) -> Verdict {
+    classify_ns_links(own, || init_ns_link(kernel, dir))
 }
 
 /// The target of the procfs's `1/ns/pid`. Pid 1 is a foreign pid to most readers, so this is a pid's
@@ -421,20 +267,14 @@ fn cross_check_with_init_ns(kernel: &dyn Kernel, dir: &ProcDir) -> Verdict {
 fn init_ns_link(kernel: &dyn Kernel, dir: &ProcDir) -> Result<Vec<u8>, ViewReadFailure> {
     match pid_file::read_link(kernel, dir, 1, "ns/pid") {
         Ok(ReadOutcome::Read(target)) => Ok(target),
-        Ok(ReadOutcome::Refused(refusal)) => Err(ViewReadFailure::Pid1Refused(refusal)),
-        Ok(ReadOutcome::Exited(e)) => Err(ViewReadFailure::Pid1Exited(e)),
-        Ok(ReadOutcome::Hidden(e)) => Err(ViewReadFailure::Pid1Hidden(e)),
-        Err(unreadable) => Err(ViewReadFailure::Pid1Unreadable(unreadable)),
+        failed => Err(ViewReadFailure::Pid1(failed)),
     }
 }
 
-/// Classify this thread's pid namespace link `own` against the procfs's pid 1's, which `init`
-/// reads only once `own` has been read.
-fn classify_ns_links(
-    own: Result<Vec<u8>, OwnUnreadable>,
-    init: impl FnOnce() -> Result<Vec<u8>, ViewReadFailure>,
-) -> Verdict {
-    let links = pid_ns_link(own.map_err(ViewReadFailure::Own), "thread-self/ns/pid")
+/// Classify this process's pid namespace link `own` against the procfs's pid 1's, which `init`
+/// reads only once `own` is known to name a pid namespace.
+fn classify_ns_links(own: Vec<u8>, init: impl FnOnce() -> Result<Vec<u8>, ViewReadFailure>) -> Verdict {
+    let links = pid_ns_link(Ok(own), "self/ns/pid")
         .and_then(|own| Ok((own, pid_ns_link(init(), "1/ns/pid (this /proc's pid 1)")?)));
     match links {
         Ok((own, init)) if own == init => Verdict::Same,
@@ -461,12 +301,15 @@ fn pid_ns_link(link: Result<Vec<u8>, ViewReadFailure>, path: &str) -> Result<Vec
     }
 }
 
-/// Whether `self/ns/pid` exists: a kernel with no pid namespaces has no such link (`ENOENT`).
-fn ns_pid_exists(kernel: &dyn Kernel, dir: &ProcDir) -> Result<bool, OwnUnreadable> {
-    match read_own_link(kernel, dir, "self/ns/pid") {
-        Ok(_) => Ok(true),
-        Err(OwnUnreadable::Failed(e)) if e.raw_os_error() == Some(libc::ENOENT) => Ok(false),
-        Err(own) => Err(own),
+/// The target of this process's `self/ns/pid`, or `None` when there is no such link: a kernel with no
+/// pid namespaces. Only the `openat2` that finds nothing says so (`ENOENT`); an `ENOENT` after the open
+/// is a link whose task has no namespace, which says nothing about the kernel, and any other failure is
+/// the link's own, as every own file's is.
+fn own_ns_link(kernel: &dyn Kernel, dir: &ProcDir) -> Result<Option<Vec<u8>>, OwnUnreadable> {
+    match kernel.read_link(dir, "self/ns/pid") {
+        Ok(target) => Ok(Some(target)),
+        Err(ReadFailure::Open(e)) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(failure) => Err(OwnUnreadable::of(failure)),
     }
 }
 
@@ -506,35 +349,6 @@ fn parse_fdinfo_pid(fdinfo: &str) -> Option<PidfdTarget> {
             REAPED => Some(PidfdTarget::Reaped),
             _ => u32::try_from(p).ok().map(PidfdTarget::Pid),
         })
-}
-
-/// The pids among directory entry `names`: the all-digit ones. `self`, `thread-self`, `net`, ...
-/// are not pids. An all-digit name that is no `u32` is a corrupt listing, so an error: a live
-/// process dropped from the list would read as one that is not there.
-fn collect_pids(names: impl IntoIterator<Item = io::Result<Vec<u8>>>) -> io::Result<Vec<u32>> {
-    /// The kernel's `PID_MAX_LIMIT` on 64-bit.
-    const PID_MAX_LIMIT: u32 = 1 << 22;
-    let mut pids = Vec::new();
-    for name in names {
-        let name = name?;
-        if name.is_empty() || !name.iter().all(u8::is_ascii_digit) {
-            continue;
-        }
-        // All ASCII digits, so UTF-8; the only way to fail is overflow.
-        let text = String::from_utf8_lossy(&name);
-        let pid = text.parse::<u32>().map_err(|e| {
-            crate::error::io_context(
-                format!("the /proc entry {text:?} is all digits but not a pid"),
-                io::Error::new(io::ErrorKind::InvalidData, e),
-            )
-        })?;
-        debug_assert!(
-            pid <= PID_MAX_LIMIT,
-            "/proc lists pid {pid} beyond the kernel's PID_MAX_LIMIT"
-        );
-        pids.push(pid);
-    }
-    Ok(pids)
 }
 
 #[cfg(test)]

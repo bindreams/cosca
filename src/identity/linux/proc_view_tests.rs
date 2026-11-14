@@ -7,17 +7,19 @@ use crate::test_child::namespaces as ns;
 use crate::test_groups::{namespaces, Group};
 
 use super::{
-    classify_ns_links, classify_status, collect_pids, cross_check_with_init_ns, parse_fdinfo_pid, pidfd_pid_in,
-    proc_view_with, read_own, OwnUnreadable, PidfdTarget, ProcDir, ProcView, ReadFailure, Verdict, ViewUnreadable,
-    UNREADABLE_STATUS_REASON,
+    classify_ns_links, classify_status, cross_check_with_init_ns, parse_fdinfo_pid, pidfd_pid_in, proc_view_with,
+    PidfdTarget, ProcView, Verdict, ViewUnreadable, UNREADABLE_STATUS_REASON,
 };
-use crate::identity::{FakeKernel, HostKernel, Kernel};
+use crate::identity::{FakeKernel, HostKernel, Kernel, OwnUnreadable, ProcDir, ReadFailure};
 
-fn ns_pid(exists: Result<bool, OwnUnreadable>) -> impl FnOnce() -> Result<bool, OwnUnreadable> {
-    move || exists
+/// What `self/ns/pid` yields: its target, `None` for a kernel with no pid namespaces.
+type OwnLink = Result<Option<Vec<u8>>, OwnUnreadable>;
+
+fn ns_pid(link: OwnLink) -> impl FnOnce() -> OwnLink {
+    move || link
 }
 
-fn unreachable_ns_pid() -> Result<bool, OwnUnreadable> {
+fn unreachable_ns_pid() -> OwnLink {
     panic!("self/ns/pid must be consulted only when NSpid is absent")
 }
 
@@ -70,16 +72,19 @@ fn an_empty_nspid_line_is_unassessable() {
 /// that made every live foreign wait fail on such kernels).
 #[skuld::test]
 fn no_nspid_and_no_ns_pid_is_same() {
-    let verdict = classify_status("Name:\tcosca\nState:\tR\n", ns_pid(Ok(false)));
+    let verdict = classify_status("Name:\tcosca\nState:\tR\n", ns_pid(Ok(None)));
     assert!(matches!(verdict, Verdict::Same), "got {verdict:?}");
 }
 
 /// gVisor: no `NSpid` but pid namespaces exist, so the status file alone cannot decide; the
-/// stat cross-check does. Mutant: "an absent NSpid is always Same".
+/// namespace cross-check does, with the link that was read. Mutant: "an absent NSpid is always Same".
 #[skuld::test]
 fn no_nspid_but_ns_pid_exists_needs_the_cross_check() {
-    let verdict = classify_status("Name:\tcosca\n", ns_pid(Ok(true)));
-    assert!(matches!(verdict, Verdict::NoNspid), "got {verdict:?}");
+    let verdict = classify_status("Name:\tcosca\n", ns_pid(Ok(Some(b"pid:[1]".to_vec()))));
+    assert!(
+        matches!(&verdict, Verdict::NoNspid(own) if own == b"pid:[1]"),
+        "got {verdict:?}"
+    );
 }
 
 #[skuld::test]
@@ -151,62 +156,8 @@ fn proc_view_with_is_unassessable_for_a_status_that_is_not_utf8() {
     }
 }
 
-/// What a failed read of an own file is, by the call that failed and its errno: the `openat2`'s
-/// errno in the refusal table is a refusal, with no `self/stat` re-check (the kernel hides no own file
-/// from its reader, so a `FakeKernel` with no `self/stat` row panics on one); every other failure is
-/// the file's own, `ENOENT` and `ESRCH` included (an own file is neither hidden nor exited) and any
-/// `read(2)` errno whatever it is.
-///
-/// Mutant: a `read(2)` errno is read as the `openat2`'s; `EPERM` asks a re-check; an own file's
-/// `ENOENT` or `ESRCH` is a skip; a failure's errno is not its own.
-#[skuld::test]
-fn a_failed_read_of_an_own_file_is_what_its_call_and_errno_say() {
-    #[derive(Clone, Copy)]
-    enum Call {
-        Open,
-        Read,
-    }
-    use Call::{Open, Read};
-
-    let dir = HostKernel.open_proc().expect("/proc opens");
-    let rows = [
-        (Open, libc::ENOSYS, true),
-        (Open, libc::EPERM, true),
-        (Open, libc::ENODEV, true),
-        (Open, libc::EACCES, false),
-        (Open, libc::EIO, false),
-        (Open, libc::ENOENT, false),
-        (Open, libc::ESRCH, false),
-        (Open, libc::EXDEV, false),
-        (Read, libc::ENOSYS, false),
-        (Read, libc::EPERM, false),
-        (Read, libc::ENODEV, false),
-        (Read, libc::EIO, false),
-        (Read, libc::ESRCH, false),
-    ];
-    for (call, errno, refused) in rows {
-        let kernel = match call {
-            Open => FakeKernel::new().on_read("self/status", Err(errno)),
-            Read => FakeKernel::new().on_read_failing_after_open("self/status", errno),
-        };
-        let name = format!("{} {errno}", if matches!(call, Open) { "openat2" } else { "read(2)" });
-        match read_own(&kernel, &dir, "self/status") {
-            Err(OwnUnreadable::Refused(refusal)) => {
-                assert!(refused, "{name}: is no refusal");
-                assert_eq!(crate::error::first_os_code(&refusal.cause()), Some(errno), "{name}");
-                assert!(refusal.requirement().contains("requires openat2"), "{name}");
-            }
-            Err(OwnUnreadable::Failed(e)) => {
-                assert!(!refused, "{name}: is a refusal");
-                assert_eq!(e.raw_os_error(), Some(errno), "{name}");
-            }
-            Ok(_) => panic!("{name}: the read has no row to succeed by"),
-        }
-    }
-}
-
 /// Each own file that establishes the view hands its refusal to the view, as a refused `/proc` open
-/// does: `self/status`, `self/ns/pid`, `thread-self/ns/pid`. A `read(2)` failure of `self/status` is
+/// does: `self/status`, `self/ns/pid`. A `read(2)` failure of `self/status` is
 /// no refusal, though its errno is in the table. Mutant: "a read that establishes the view and is
 /// refused is only an unreadable view"; "`read(2)`'s errno is the `openat2`'s".
 #[skuld::test]
@@ -227,12 +178,6 @@ fn a_refused_own_file_is_a_refused_openat2_of_the_view() {
     };
     assert_eq!(refusal_of(&why), Some(Some(libc::ENOSYS)), "self/ns/pid");
 
-    let Verdict::Unassessable(why) = classify_ns_links(Err(denied(libc::ENODEV)), || panic!("own link failed first"))
-    else {
-        panic!("expected Unassessable");
-    };
-    assert_eq!(refusal_of(&why), Some(Some(libc::ENODEV)), "thread-self/ns/pid");
-
     let kernel = FakeKernel::over(&HostKernel).on_read_failing_after_open("self/status", libc::EPERM);
     let ProcView::Unassessable(why) = proc_view_with(&kernel) else {
         panic!("a status that cannot be read is Unassessable");
@@ -245,12 +190,11 @@ fn a_refused_own_file_is_a_refused_openat2_of_the_view() {
     );
 }
 
-/// The verdict of the namespace-link cross-check over `kernel`, with this thread's own link readable
-/// and `kernel`'s rows answering for pid 1. Every call with no row panics.
+/// The verdict of the namespace-link cross-check over `kernel`, with this process's own link read and
+/// `kernel`'s rows answering for pid 1. Every call with no row panics.
 fn init_link_verdict(kernel: FakeKernel<'_>) -> Verdict {
     let dir = HostKernel.open_proc().expect("/proc opens");
-    let kernel = kernel.on_read("thread-self/ns/pid", Ok(b"pid:[4026531836]"));
-    cross_check_with_init_ns(&kernel, &dir)
+    cross_check_with_init_ns(&kernel, &dir, b"pid:[4026531836]".to_vec())
 }
 
 /// Pid 1 is a foreign pid to most readers, so its `1/ns/pid` follows the pid-file rule, not the
@@ -332,13 +276,15 @@ fn pid_1s_namespace_link_that_the_open_does_not_show_says_why() {
         (libc::ENOENT, "hidden"),
         (libc::EACCES, "hidden"),
         (libc::ESRCH, "exited"),
-        (libc::EMFILE, "could not be read"),
+        (libc::EMFILE, "1/ns/pid could not be read"),
     ];
     for (errno, says) in rows {
         let Verdict::Unassessable(why) = init_link_verdict(FakeKernel::new().on_read("1/ns/pid", Err(errno))) else {
             panic!("{errno}: expected Unassessable");
         };
-        let said = crate::error::said(&why);
+        // The words are the layer below the view's reason, which already says "could not be read".
+        let source = why.source.as_ref().expect("pid 1's verdict is the view's source");
+        let said = crate::error::said(source);
         assert!(why.refusal().is_none(), "{errno}: {why:?}");
         assert!(said.contains(says), "{errno}: {said}");
         assert_eq!(crate::error::first_os_code(&why), Some(errno), "{errno}: {said}");
@@ -346,14 +292,15 @@ fn pid_1s_namespace_link_that_the_open_does_not_show_says_why() {
 }
 
 /// `self/ns/pid`'s existence is asked of the kernel like every other read: an `openat2` the kernel
-/// refuses leaves the view refused, `ENOENT` is a kernel with no pid namespaces (`Same`), and a
-/// `readlinkat` failure is no refusal. Mutant: "the existence check opens `/proc` by itself".
+/// refuses leaves the view refused, an `openat2` that finds no link is a kernel with no pid namespaces
+/// (`Same`), and a failure of the `readlinkat` is no refusal and no such kernel, whatever its errno:
+/// an `ENOENT` after the open is a link whose task has no namespace, which says nothing of the
+/// kernel. Mutant: "the existence check opens `/proc` by itself"; "any `ENOENT` is no pid namespaces".
 #[skuld::test]
 fn self_ns_pid_is_asked_of_the_kernel() {
     let no_nspid = || {
         FakeKernel::over(&HostKernel)
             .on_read("self/status", Ok(b"Name:\tcosca\n"))
-            .on_read("thread-self/ns/pid", Ok(b"pid:[4026531836]"))
             .on_read("1/ns/pid", Ok(b"pid:[4026531836]"))
     };
 
@@ -370,84 +317,37 @@ fn self_ns_pid_is_asked_of_the_kernel() {
         "no self/ns/pid is a kernel with no pid namespaces"
     );
 
-    let kernel = no_nspid().on_read_failing_after_open("self/ns/pid", libc::EPERM);
-    let ProcView::Unassessable(why) = proc_view_with(&kernel) else {
-        panic!("a failed existence check is Unassessable");
-    };
-    assert!(why.refusal().is_none(), "a readlinkat errno is no refusal: {why:?}");
+    for errno in [libc::EPERM, libc::ENOENT] {
+        let kernel = no_nspid().on_read_failing_after_open("self/ns/pid", errno);
+        let ProcView::Unassessable(why) = proc_view_with(&kernel) else {
+            panic!("{errno}: a failed existence check is Unassessable, never a view of no pid namespaces");
+        };
+        assert!(
+            why.refusal().is_none(),
+            "{errno}: a readlinkat errno is no refusal: {why:?}"
+        );
+        assert_eq!(crate::error::first_os_code(&why), Some(errno), "{errno}: {why:?}");
+    }
 }
 
-// Checked /proc dirfd =====
-
+/// With no `NSpid`, the link that showed `self/ns/pid` exists is this process's pid namespace, which
+/// the cross-check compares with pid 1's: it is not read a second time as `thread-self/ns/pid`. The
+/// rows name a namespace this process is not in, so a read of any other own link would differ.
+/// Mutant: "the cross-check reads the own link again".
 #[skuld::test]
-fn the_proc_dir_reads_a_file_beneath_it() {
-    let status = ProcDir::open()
-        .expect("/proc opens")
-        .read("thread-self/status")
-        .expect("read");
-    let status = String::from_utf8(status).expect("UTF-8");
-    assert!(status.contains("Name:"), "{status}");
-}
-
-/// A path that leaves the directory it is opened under is refused, by the `openat2`. Mutant: "plain
-/// `openat` without `RESOLVE_BENEATH`" — `..` reaches `/`.
-#[skuld::test]
-fn the_proc_dir_refuses_a_path_that_climbs_out_of_it() {
-    let dir = ProcDir::open().expect("/proc opens");
-    let Err(ReadFailure::Open(err)) = dir.read("../etc/passwd") else {
-        panic!("must not leave /proc");
+fn the_link_that_shows_self_ns_pid_exists_is_the_own_link_of_the_cross_check() {
+    let own = b"pid:[4026539999]";
+    let no_nspid = |init: &'static [u8]| {
+        FakeKernel::over(&HostKernel)
+            .on_read("self/status", Ok(b"Name:\tcosca\n"))
+            .on_read("self/ns/pid", Ok(own))
+            .on_read("1/ns/pid", Ok(init))
     };
-    assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
-}
-
-/// An absolute path names another tree entirely. Mutant: "no `RESOLVE_BENEATH`" — the path
-/// resolves from the root, and `NO_XDEV` alone allows it (the root filesystem is one mount).
-#[skuld::test]
-fn the_proc_dir_refuses_an_absolute_path() {
-    let dir = ProcDir::open().expect("/proc opens");
-    let Err(ReadFailure::Open(err)) = dir.read("/etc/passwd") else {
-        panic!("must not leave /proc");
-    };
-    assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
-}
-
-/// A magic link (`self/exe`, `self/fd/N`) jumps out of the tree, so it is refused. Mutant:
-/// "no `RESOLVE_NO_MAGICLINKS`".
-#[skuld::test]
-fn the_proc_dir_refuses_a_magic_link() {
-    let dir = ProcDir::open().expect("/proc opens");
-    let Err(ReadFailure::Open(err)) = dir.read("self/exe") else {
-        panic!("a magic link must not be followed");
-    };
-    assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
-}
-
-/// A file that opens and then fails `read(2)` is a failure of the read, not of the `openat2`: a
-/// directory opens, and reading it is `EISDIR`. Mutant: "every failure is the `openat2`'s".
-#[skuld::test]
-fn the_proc_dir_says_a_failed_read_is_the_reads() {
-    let dir = ProcDir::open().expect("/proc opens");
-    let Err(ReadFailure::Read(err)) = dir.read("self/task") else {
-        panic!("a directory opens and cannot be read");
-    };
-    assert_eq!(err.raw_os_error(), Some(libc::EISDIR), "{err}");
-}
-
-/// A link read says which call failed, as a file read does: a path the `openat2` refuses is `Open`
-/// (`EXDEV`), and a path that opens but is no link fails `readlinkat` (`ENOENT`, which is what the
-/// kernel answers a `readlinkat` of an empty path on a file that is no link). Mutant: "every failure
-/// of `read_link` is the `openat2`'s".
-#[skuld::test]
-fn the_proc_dir_says_a_failed_link_read_is_the_reads() {
-    let dir = ProcDir::open().expect("/proc opens");
-    let Err(ReadFailure::Open(err)) = dir.read_link("../etc/passwd") else {
-        panic!("must not leave /proc");
-    };
-    assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
-    let Err(ReadFailure::Read(err)) = dir.read_link("self/status") else {
-        panic!("a file opens and is no link");
-    };
-    assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "{err}");
+    assert!(matches!(proc_view_with(&no_nspid(own)), ProcView::Same(_)));
+    assert!(matches!(
+        proc_view_with(&no_nspid(b"pid:[4026539998]")),
+        ProcView::Diverged
+    ));
 }
 
 // Namespace-link cross-check (no NSpid) =====
@@ -458,22 +358,26 @@ fn link<E>(target: &str) -> Result<Vec<u8>, E> {
     Ok(target.as_bytes().to_vec())
 }
 
+fn own(target: &str) -> Vec<u8> {
+    target.as_bytes().to_vec()
+}
+
 #[skuld::test]
-fn a_procfs_whose_pid_1_shares_this_threads_namespace_is_same() {
-    let verdict = classify_ns_links(link("pid:[4026531836]"), || link("pid:[4026531836]"));
+fn a_procfs_whose_pid_1_shares_this_processs_namespace_is_same() {
+    let verdict = classify_ns_links(own("pid:[4026531836]"), || link("pid:[4026531836]"));
     assert!(matches!(verdict, Verdict::Same), "got {verdict:?}");
 }
 
 /// Mutant: "any two readable links are Same".
 #[skuld::test]
 fn a_procfs_whose_pid_1_is_in_another_namespace_is_diverged() {
-    let verdict = classify_ns_links(link("pid:[4026532831]"), || link("pid:[4026532830]"));
+    let verdict = classify_ns_links(own("pid:[4026532831]"), || link("pid:[4026532830]"));
     assert!(matches!(verdict, Verdict::Diverged), "got {verdict:?}");
 }
 
 #[skuld::test]
 fn an_unreadable_pid_1_link_is_unassessable_with_the_cause() {
-    let Verdict::Unassessable(why) = classify_ns_links(link("pid:[4026531836]"), || Err(denied(libc::EACCES).into()))
+    let Verdict::Unassessable(why) = classify_ns_links(own("pid:[4026531836]"), || Err(denied(libc::EACCES).into()))
     else {
         panic!("expected Unassessable");
     };
@@ -481,36 +385,17 @@ fn an_unreadable_pid_1_link_is_unassessable_with_the_cause() {
     assert_eq!(why.source.and_then(|e| e.raw_os_error()), Some(libc::EACCES));
 }
 
-/// An unreadable own link is reported as such, and the pid 1 link is then not read.
-#[skuld::test]
-fn an_unreadable_own_link_is_unassessable_without_reading_pid_1() {
-    let Verdict::Unassessable(why) = classify_ns_links(Err(denied(libc::ENOENT)), || {
-        panic!("pid 1's link must not be read once the own link failed")
-    }) else {
-        panic!("expected Unassessable");
-    };
-    assert!(why.reason.contains("thread-self/ns/pid"), "{why}");
-}
-
 /// Two equal non-namespace targets (say, both empty) prove nothing. Mutant: "compare the raw
 /// targets".
 #[skuld::test]
 fn a_link_that_names_no_pid_namespace_is_unassessable() {
-    for (own, init) in [("", ""), ("net:[1]", "net:[1]"), ("pid:[1]", "pid:[1")] {
-        let verdict = classify_ns_links(link(own), || link(init));
+    for (own_link, init) in [("", ""), ("net:[1]", "net:[1]"), ("pid:[1]", "pid:[1")] {
+        let verdict = classify_ns_links(own(own_link), || link(init));
         assert!(
             matches!(verdict, Verdict::Unassessable(_)),
-            "{own:?} {init:?}: got {verdict:?}"
+            "{own_link:?} {init:?}: got {verdict:?}"
         );
     }
-}
-
-/// The real links through the real `/proc` read as pid namespace links.
-#[skuld::test]
-fn this_threads_own_namespace_link_reads_through_the_proc_dir() {
-    let dir = ProcDir::open().expect("/proc opens");
-    let own = dir.read_link("thread-self/ns/pid").expect("read own link");
-    assert!(own.starts_with(b"pid:["), "{:?}", String::from_utf8_lossy(&own));
 }
 
 // pidfd fdinfo =====
@@ -727,69 +612,16 @@ fn fixture_own_procfs_unprivileged() {
     match proc_view_with(&FakeKernel::over(&HostKernel).on_read("self/status", Ok(NO_NSPID.as_bytes()))) {
         ProcView::Unassessable(why) => {
             assert!(why.reason.contains("1/ns/pid"), "{why}");
-            // The `readlinkat` of a foreign pid's link is the pid file's `read(2)` step: an `Unreadable`
-            // names it, and the errno is below.
+            // The `readlinkat`'s `EACCES` is ptrace denied: pid 1 is hidden from this reader, and the
+            // errno is below that.
+            assert!(
+                crate::error::said(why.source.as_ref().expect("a source")).contains("hidden"),
+                "{why}"
+            );
             assert_eq!(crate::error::first_os_code(&why), Some(libc::EACCES), "{why}");
         }
         other => panic!("an unreadable pid 1 namespace link must be Unassessable, got {other:?}"),
     }
-}
-
-// Listing =====
-
-/// The real `/proc` holds `self`, `thread-self`, `net`, `sys`, ...; listing it must skip them, not
-/// fail on them. Mutant: "every entry is a pid" — the first non-numeric name aborts the listing.
-#[skuld::test]
-fn pids_lists_the_numeric_entries_including_this_process() {
-    let pids = ProcDir::open().expect("/proc opens").pids().expect("list");
-    assert!(pids.contains(&std::process::id()), "{pids:?}");
-}
-
-fn names(list: &[&[u8]]) -> Vec<io::Result<Vec<u8>>> {
-    list.iter().map(|n| Ok(n.to_vec())).collect()
-}
-
-/// Non-pid names are excluded, not errors. Mutant: "keep every name that parses" / "abort on the
-/// first name that is not a pid".
-#[skuld::test]
-fn collect_pids_excludes_names_that_are_not_pids() {
-    let listed: &[&[u8]] = &[
-        b"1",
-        b"self",
-        b"thread-self",
-        b"net",
-        b"sys",
-        b"",
-        b"+5",
-        b"-5",
-        b"1a",
-        b" 7",
-        b"\xff\xfe",
-        b"4194304",
-    ];
-    assert_eq!(collect_pids(names(listed)).expect("list"), vec![1, 4_194_304]);
-}
-
-/// An all-digit name that is no `u32` is a corrupt listing, never a member dropped in silence.
-/// Mutant: "`.parse().ok()` drops it".
-#[skuld::test]
-fn collect_pids_is_an_error_for_an_all_digit_name_that_overflows() {
-    for name in [&b"4294967296"[..], b"99999999999999999999"] {
-        let err = collect_pids(names(&[b"1", name])).expect_err("a corrupt listing is an error");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
-        assert!(err.to_string().contains(std::str::from_utf8(name).unwrap()), "{err}");
-        let cause = crate::error::chain(&err).last().expect("a chain").to_string();
-        assert_eq!(cause, "number too large to fit in target type", "{err}");
-        assert_eq!(crate::error::chain(&err).count(), 2, "{err}");
-    }
-}
-
-/// A listing failure part-way is the listing's failure, not a shorter list.
-#[skuld::test]
-fn collect_pids_propagates_a_listing_error() {
-    let items = vec![Ok(b"1".to_vec()), Err(io::Error::from_raw_os_error(libc::EIO))];
-    let err = collect_pids(items).expect_err("listing error");
-    assert_eq!(err.raw_os_error(), Some(libc::EIO));
 }
 
 /// The OS error behind an unusable view is its `source()`; a view with none has no source.

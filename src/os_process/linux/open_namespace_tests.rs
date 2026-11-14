@@ -12,7 +12,7 @@ use rustix::process::Pid;
 use super::open_tests::LiveNonLeaderTid;
 use crate::error::Error;
 use crate::identity::{
-    proc_view_with, FakeKernel, HostKernel, Kernel, ProcDir, ProcView, ReadFailure, ViewUnreadable,
+    proc_view_with, FakeKernel, HostKernel, Kernel, ProcDir, ProcOpenFailure, ProcView, ReadFailure,
     UNREADABLE_STATUS_REASON,
 };
 use crate::test_child::fixture_path;
@@ -191,7 +191,7 @@ impl Kernel for PauseKernel<'_> {
         self.inner.pidfs_ino(fd)
     }
 
-    fn open_proc(&self) -> Result<ProcDir, ViewUnreadable> {
+    fn open_proc(&self) -> Result<ProcDir, ProcOpenFailure> {
         self.inner.open_proc()
     }
 
@@ -365,7 +365,7 @@ fn fixture_tmpfs_at_proc() {
     ns::mount_tmpfs(std::path::Path::new("/proc"));
     let opened = ProcDir::open();
     assert!(
-        matches!(&opened, Err(why) if why.reason.contains("not procfs")),
+        matches!(&opened, Err(ProcOpenFailure::NotProcfs { .. })),
         "got {opened:?}"
     );
     match proc_view_with(&HostKernel) {
@@ -394,7 +394,7 @@ fn fixture_subtree_at_proc() {
     ns::bind_over(std::path::Path::new("/proc/sys"), std::path::Path::new("/proc"));
     let opened = ProcDir::open();
     assert!(
-        matches!(&opened, Err(why) if why.reason.contains("not the root of procfs")),
+        matches!(&opened, Err(ProcOpenFailure::NotRoot { .. })),
         "got {opened:?}"
     );
 }

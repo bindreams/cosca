@@ -780,6 +780,7 @@ pub(crate) fn record_member_term(sys: crate::containment::unix::Sys<'_>, pid: u3
     let entry = match sys {
         Sys::Pidfd(pidfd, _) => {
             let pid = ProcDir::open()
+                .map_err(crate::identity::ViewUnreadable::from)
                 .and_then(|dir| pidfd_pid_in(&HostKernel, &dir, pidfd))
                 .map_err(|why| {
                     log::debug!(

@@ -1,7 +1,7 @@
 //! `pid_file::read` decides a failed read from the call that failed and its errno alone: a scan
 //! covers all of `/proc`, and a `kill(pid, 0)` probe of a foreign uid's process fails under `hidepid`.
 
-use super::{read, ReadOutcome};
+use super::{read, read_link, ReadOutcome};
 use crate::identity::{FakeKernel, HostKernel, Kernel};
 
 /// The call a row's errno answers for.
@@ -159,6 +159,46 @@ fn a_failed_read_is_what_its_call_and_errno_say() {
                 assert_eq!(crate::error::first_os_code(&unreadable), Some(recheck), "{name}");
                 let peer = unreadable.take_peer().and_then(|e| e.raw_os_error());
                 assert_eq!(peer, Some(libc::EPERM), "{name}: the pid's EPERM is the peer");
+            }
+            (got, want) => panic!("{name}: expected {want:?}, got {got:?}"),
+        }
+    }
+}
+
+/// What a failed read of the link `4242/ns/pid` is, by call and errno. The `openat2` is classed as a
+/// file's is. The `readlinkat` answers `EACCES` when the reader may not ptrace the task or the task is
+/// gone (`proc_ns_readlink`: `res = -EACCES`), so `Hidden`, and `ENOENT` when the task no longer has
+/// the namespace (`ns_get_name`: `res = -ENOENT`), so `Exited`; it never answers `ESRCH`, which is
+/// no exit of a link, and every other errno says nothing about the pid.
+///
+/// Mutant: a link's `readlinkat` is classed as a file's `read(2)`: its `EACCES` or `ENOENT` is
+/// "could not be read", and its `ESRCH` an exit.
+#[skuld::test]
+fn a_failed_link_read_is_what_its_call_and_errno_say() {
+    use Call::{Open, Read};
+
+    let rows = [
+        (Open, libc::ESRCH, Want::Exited),
+        (Open, libc::ENOENT, Want::Hidden),
+        (Read, libc::EACCES, Want::Hidden),
+        (Read, libc::ENOENT, Want::Exited),
+        (Read, libc::ESRCH, Want::Unreadable("could not be read")),
+        (Read, libc::EPERM, Want::Unreadable("could not be read")),
+        (Read, libc::EIO, Want::Unreadable("could not be read")),
+    ];
+    let dir = HostKernel.open_proc().expect("/proc opens");
+    for (call, errno, want) in rows {
+        let kernel = match call {
+            Open => FakeKernel::new().on_read("4242/ns/pid", Err(errno)),
+            Read => FakeKernel::new().on_read_failing_after_open("4242/ns/pid", errno),
+        };
+        let name = format!("{call:?} {errno}");
+        match (read_link(&kernel, &dir, 4242, "ns/pid"), want) {
+            (Ok(ReadOutcome::Exited(why)), Want::Exited) | (Ok(ReadOutcome::Hidden(why)), Want::Hidden) => {
+                assert_eq!(why.raw_os_error(), Some(errno), "{name}: the pid's own error is why");
+            }
+            (Err(unreadable), Want::Unreadable(words)) => {
+                assert!(unreadable.to_string().contains(words), "{name}: {unreadable}");
             }
             (got, want) => panic!("{name}: expected {want:?}, got {got:?}"),
         }

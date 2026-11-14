@@ -104,7 +104,7 @@ fn a_refused_pidfd_open_is_unknown_and_unsupported() {
 /// errno as its source. Mutant: "the view keeps its own errno set", or "the source is dropped".
 #[skuld::test]
 fn a_refused_openat2_is_unsupported_carrying_the_errno() {
-    use crate::identity::{FailedCall, UnknownCause, ViewUnreadable};
+    use crate::identity::{FailedCall, ProcOpenFailure, UnknownCause, ViewUnreadable};
 
     for (errno, name) in OPENAT2_REFUSALS {
         let errno = Errno::from_raw_os_error(errno);
@@ -112,7 +112,7 @@ fn a_refused_openat2_is_unsupported_carrying_the_errno() {
         let want = format!("cosca requires openat2 (Linux \u{2265} 5.6), refused here: openat2 answered {name}");
         assert_eq!(call.requirement().as_deref(), Some(want.as_str()), "{errno}");
 
-        let view = ViewUnreadable::from_open_errno(errno);
+        let view = ViewUnreadable::from(ProcOpenFailure::opening(errno));
         assert_eq!(
             view.refusal().as_ref().map(|refusal| refusal.requirement()),
             Some(want.as_str()),
@@ -141,11 +141,11 @@ fn a_refused_openat2_is_unsupported_carrying_the_errno() {
 /// `pidfd_open` is a refusal. Mutant: "one errno set decides both calls".
 #[skuld::test]
 fn an_openat2_that_answers_eacces_is_unassessable_carrying_eacces() {
-    use crate::identity::{FailedCall, UnknownCause, ViewUnreadable};
+    use crate::identity::{FailedCall, ProcOpenFailure, UnknownCause, ViewUnreadable};
 
     assert!(FailedCall::openat2(Errno::ACCESS).requirement().is_none());
     assert!(FailedCall::pidfd_open(Errno::ACCESS).requirement().is_some());
-    let view = ViewUnreadable::from_open_errno(Errno::ACCESS);
+    let view = ViewUnreadable::from(ProcOpenFailure::opening(Errno::ACCESS));
     assert!(view.unsupported("op").is_none());
     let err = UnknownCause::of_view(Some(view))
         .into_error("pid 4242")
