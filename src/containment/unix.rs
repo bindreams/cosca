@@ -114,11 +114,11 @@ impl Contains for Group {
     }
 
     /// A signal to a group is subject to the kernel's permission check, as the child's own kill is.
-    fn would_reach(&self, _pid: u32, _pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> io::Result<bool> {
+    fn would_reach(&self, _pid: u32, _pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> Result<bool, Error> {
         Ok(false)
     }
 
-    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> io::Result<bool> {
+    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> Result<bool, Error> {
         Ok(false)
     }
 
@@ -755,7 +755,11 @@ fn verify(
     root: Option<&dyn Root>,
     killed: &mut Vec<crate::identity::ProcessId>,
 ) -> Result<(), Error> {
-    answer_of(group::state(pgid, signal, root, killed), pgid, signal)
+    answer_of(
+        group::state(&crate::identity::HostKernel, pgid, signal, root, killed),
+        pgid,
+        signal,
+    )
 }
 
 /// The contract answer for `state`, what `signal` left of the group `pgid`. Each member that refused
@@ -805,17 +809,15 @@ fn answer_of(state: group::GroupState, pgid: i32, signal: Signal) -> Result<(), 
                 source: Failures::collect(members).map(Failures::into_cause),
             })
         }
-        // A listing that can never work here (no `openat2`) is the platform's `Unsupported`, as
-        // from a wait or a spawn, not an unassessable group.
-        group::GroupState::Unlistable { source, .. } if source.kind() == io::ErrorKind::Unsupported => {
-            Err(Error::Unsupported {
-                op: format!("listing process group {pgid}"),
-                platform: std::env::consts::OS,
-                detail: "the group could not be listed".to_owned(),
-                source: Some(Error::io_cause(source)),
-            })
-        }
-        group::GroupState::Unlistable { detail, source } => Err(Error::Unassessable {
+        // A refused listing is the platform's `Unsupported`, like a wait's or spawn's, not an unassessable group.
+        group::GroupState::Unlistable {
+            source: group::ListingFailure::Unsupported(refused),
+            ..
+        } => Err(refused),
+        group::GroupState::Unlistable {
+            detail,
+            source: group::ListingFailure::Failed(source),
+        } => Err(Error::Unassessable {
             detail,
             source: Some(Error::io_cause(source)),
         }),

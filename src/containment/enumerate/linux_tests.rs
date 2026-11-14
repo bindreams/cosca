@@ -220,28 +220,23 @@ fn assert_warned_once_about_openat2(records: &Records, row: &str) {
 }
 
 /// An `openat2` refused before any pid is read is the same `Unsupported`: the `/proc` listing, and the
-/// read of `self/status` that establishes the view. Each is warned about once. Any other listing
-/// failure stays `Unassessable`. Mutant: "an `openat2` refused before any pid is read is
-/// `Unassessable`".
+/// read of `self/status` that establishes the view, one row each (the errno table is
+/// `ReadFailure::refusal`'s). Each is warned about once. Any other listing failure stays `Unassessable`.
+/// Mutant: "an `openat2` refused before any pid is read is `Unassessable`".
 #[skuld::test]
 fn a_refused_openat2_in_the_listing_or_the_view_read_is_unsupported() {
-    for errno in [libc::ENOSYS, libc::EPERM, libc::ENODEV] {
-        let listing = FakeKernel::over(&HostKernel).same_view().on_pids(Err(errno));
-        let status = FakeKernel::over(&HostKernel).on_read("self/status", Err(errno));
-        for (what, kernel) in [("listing", listing), ("self/status", status)] {
-            let (got, records) = snapshot_with(&kernel);
-            match got {
-                Err(error @ crate::error::Error::Unsupported { .. }) => {
-                    assert_eq!(
-                        crate::error::first_os_code(&error),
-                        Some(errno),
-                        "{what} {errno}: {error:?}"
-                    );
-                }
-                other => panic!("{what} {errno}: expected Unsupported, got {other:?}"),
+    let errno = libc::ENOSYS;
+    let listing = FakeKernel::over(&HostKernel).same_view().on_pids(Err(errno));
+    let status = FakeKernel::over(&HostKernel).on_read("self/status", Err(errno));
+    for (what, kernel) in [("listing", listing), ("self/status", status)] {
+        let (got, records) = snapshot_with(&kernel);
+        match got {
+            Err(error @ crate::error::Error::Unsupported { .. }) => {
+                assert_eq!(crate::error::first_os_code(&error), Some(errno), "{what}: {error:?}");
             }
-            assert_warned_once_about_openat2(&records, &format!("{what} {errno}"));
+            other => panic!("{what}: expected Unsupported, got {other:?}"),
         }
+        assert_warned_once_about_openat2(&records, what);
     }
 }
 

@@ -9,21 +9,46 @@ use std::time::Duration;
 use super::teardown::{child_with_an_unreadable_exit, due_now, exit, fake, fire_on_block, id, slow_warns, PID};
 use crate::child::owned::teardown::{FrontLook, LookOutcome, Reach};
 use crate::child::owned::OwnedChild;
-use crate::error::ChildFate;
+use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 
 /// A [`Reach`] with a stated answer, and the pids of the children it was asked about.
 pub(super) struct FakeReach {
-    answer: Result<bool, io::ErrorKind>,
+    answer: Result<bool, Failing>,
     asked: RefCell<Vec<Option<u32>>>,
+}
+
+/// How a [`FakeReach`] fails: an I/O error of a kind, or a refusal.
+#[derive(Clone, Copy)]
+enum Failing {
+    Kind(io::ErrorKind),
+    Refused,
+}
+
+/// The refusal a [`FakeReach::refusing`] answers with.
+fn refusal() -> Error {
+    Error::Unsupported {
+        op: "reading where the front is".to_owned(),
+        platform: "linux",
+        detail: "cosca requires openat2 (Linux \u{2265} 5.6), refused here".to_owned(),
+        source: Some(Error::io_cause(io::Error::from(io::ErrorKind::Other))),
+    }
 }
 
 impl FakeReach {
     pub(super) fn answering(answer: Result<bool, io::ErrorKind>) -> Self {
         Self {
-            answer,
+            answer: answer.map_err(Failing::Kind),
+            asked: RefCell::default(),
+        }
+    }
+
+    /// A reach that answers [`refusal`].
+    fn refusing() -> Self {
+        Self {
+            answer: Err(Failing::Refused),
             asked: RefCell::default(),
         }
     }
@@ -34,15 +59,18 @@ impl FakeReach {
 }
 
 impl Reach for FakeReach {
-    fn reached(&self, child: &OwnedChild) -> io::Result<bool> {
+    fn reached(&self, child: &OwnedChild) -> Result<bool, Error> {
         self.asked.borrow_mut().push(child.pid());
-        self.answer.map_err(io::Error::from)
+        self.answer.map_err(|failing| match failing {
+            Failing::Kind(kind) => Error::Io(io::Error::from(kind)),
+            Failing::Refused => refusal(),
+        })
     }
 }
 
 /// What the look at a front is given to tell whether a kill sent elsewhere reached it: a reach, or
 /// none; or the failure of reading the subtree that kill went through.
-type Reaches<'a> = Result<Option<&'a dyn Reach>, io::Error>;
+type Reaches<'a> = Result<Option<&'a dyn Reach>, Error>;
 
 /// `look_at_front(id, reach, warn_after)` over `fake`, and everything it logged on this thread.
 fn look_logged(
@@ -219,10 +247,10 @@ impl std::error::Error for Original {}
 #[skuld::test]
 fn a_front_whose_subtree_cannot_be_read_is_left_for_the_subtree_with_its_own_error() {
     let fake = fake().reaps([ReapAnswer::Running]);
-    let unreadable = io::Error::new(io::ErrorKind::PermissionDenied, Original);
+    let unreadable = Error::Io(io::Error::new(io::ErrorKind::PermissionDenied, Original));
     let (torn, _) = look_logged(&fake, Some(id()), Err(unreadable), None);
     assert_outcome(&torn, ChildFate::Running { id: Some(id()) }, Went::SubtreeUnreadable);
-    let LookOutcome::SubtreeUnreadable(e) = &torn.look else {
+    let LookOutcome::SubtreeUnreadable(Error::Io(e)) = &torn.look else {
         panic!("{torn:?}");
     };
     assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
@@ -236,7 +264,12 @@ fn a_front_whose_subtree_cannot_be_read_is_left_for_the_subtree_with_its_own_err
 #[skuld::test]
 fn a_front_that_has_exited_is_reaped_though_its_subtree_cannot_be_read() {
     let fake = fake().reaps([ReapAnswer::Reaped(exit())]);
-    let (torn, _) = look_logged(&fake, Some(id()), Err(io::Error::from(io::ErrorKind::Other)), None);
+    let (torn, _) = look_logged(
+        &fake,
+        Some(id()),
+        Err(Error::Io(io::Error::from(io::ErrorKind::Other))),
+        None,
+    );
     assert_outcome(&torn, ChildFate::Reaped, Went::Ended);
 }
 
@@ -276,7 +309,7 @@ mod worded {
     }
 
     fn cause() -> String {
-        io::Error::from(io::ErrorKind::Other).to_string()
+        crate::error::said(&Error::Io(io::Error::from(io::ErrorKind::Other)))
     }
 
     /// The clause is a warn that says `wanted`, for the caller's one warn.
@@ -322,7 +355,7 @@ mod worded {
     /// `SubtreeUnreadable`.
     #[skuld::test]
     fn a_front_is_worded_uncollected_exactly_when_it_is_still_ours() {
-        let unreadable = || Err(io::Error::from(io::ErrorKind::Other));
+        let unreadable = || Err(Error::Io(io::Error::from(io::ErrorKind::Other)));
         for disposition in BOTH {
             let running = || fake().reaps([ReapAnswer::Running]);
             assert_uncollected(disposition, Ok(None), &running(), true);
@@ -427,12 +460,40 @@ mod worded {
         );
     }
 
+    /// A refusal that hides where a front is reads in its own words, and the failure it leaves is
+    /// still the `Unsupported` it was, with its cause.
+    ///
+    /// Mutants: the refusal is worded as an I/O failure; the failure is rebuilt as `Error::Io`.
+    #[skuld::test]
+    fn a_front_whose_place_a_refusal_hides_is_worded_in_its_own_words_and_fails_as_unsupported() {
+        for disposition in BOTH {
+            let fake = fake().reaps([ReapAnswer::Running]);
+            let _fire = fire_on_block(&fake);
+            let (worded, _) = worded_by_the_drop(disposition, &fake, Ok(Some(&FakeReach::refusing())));
+            let said = crate::error::said(&refusal());
+            let warn = warn_of(&worded).expect("a warn");
+            assert!(
+                warn.contains(&format!("where it is cannot be read ({said})")),
+                "{disposition:?}: {warn}"
+            );
+            let failures = worded.remains().failures.expect("the look's failure");
+            let listed: Vec<_> = failures.iter().collect();
+            let [kept] = listed[..] else {
+                panic!("{disposition:?}: {listed:?}");
+            };
+            let Error::Unsupported { source, .. } = &**kept else {
+                panic!("{disposition:?}: {kept:?}");
+            };
+            assert!(source.is_some(), "{disposition:?}: the refusal's cause is kept");
+        }
+    }
+
     /// Mutant: `Leave` words the front as handed back.
     #[skuld::test]
     fn a_front_whose_subtree_cannot_be_read_is_worded_as_left_for_a_caller_that_leaves_it() {
         assert_left(
             Disposition::Leave,
-            Err(io::Error::from(io::ErrorKind::Other)),
+            Err(Error::Io(io::Error::from(io::ErrorKind::Other))),
             &fake().reaps([ReapAnswer::Running]),
             &format!("elevation front pid 4242 is left unreaped: its leaf's subtree cannot be read ({}), so it is not known whether the cgroup kill ended it", cause()),
         );
@@ -443,7 +504,7 @@ mod worded {
     fn a_front_whose_subtree_cannot_be_read_is_worded_as_handed_back_for_a_caller_that_hands_it_back() {
         assert_left(
             Disposition::HandBack,
-            Err(io::Error::from(io::ErrorKind::Other)),
+            Err(Error::Io(io::Error::from(io::ErrorKind::Other))),
             &fake().reaps([ReapAnswer::Running]),
             &format!("elevation front pid 4242 is running and unreaped: its leaf's subtree cannot be read ({}), so it is not known whether the cgroup kill ended it; handed back to the caller in the error", cause()),
         );
@@ -604,6 +665,20 @@ fn a_front_reaped_by_someone_else_is_gone() {
     let torn = look(&fake, Some(&reach));
     assert_outcome(&torn, ChildFate::Gone, Went::Ended);
     assert_eq!(reach.asked(), []);
+}
+
+/// A place a refusal hides is held as the `Unsupported` it was, not rebuilt as an I/O failure.
+///
+/// Mutant: the look wraps the reach's error as `Error::Io`.
+#[skuld::test]
+fn a_front_whose_place_a_refusal_hides_keeps_the_refusal() {
+    let fake = fake().reaps([ReapAnswer::Running]);
+    let torn = look(&fake, Some(&FakeReach::refusing()));
+    assert_outcome(&torn, ChildFate::Running { id: Some(id()) }, Went::PlaceUnreadable);
+    let LookOutcome::PlaceUnreadable(Error::Unsupported { op, .. }) = &torn.look else {
+        panic!("{torn:?}");
+    };
+    assert_eq!(op, "reading where the front is");
 }
 
 /// A front whose zombie launchd holds is gone and collected, and the policy logs nothing above

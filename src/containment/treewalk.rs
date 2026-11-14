@@ -183,12 +183,12 @@ impl Contains for Walker {
     /// A signal to a walked member is subject to the kernel's permission check, as the child's own
     /// kill is.
     #[cfg(unix)]
-    fn would_reach(&self, _pid: u32, _pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> std::io::Result<bool> {
+    fn would_reach(&self, _pid: u32, _pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> Result<bool, crate::error::Error> {
         Ok(false)
     }
 
     #[cfg(unix)]
-    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
+    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> Result<bool, crate::error::Error> {
         Ok(false)
     }
 

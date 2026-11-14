@@ -130,14 +130,14 @@ pub(crate) trait Contains: fmt::Debug {
     /// `false` for every other mechanism. `pid` must be this process's unreaped child, so its number
     /// is not reused.
     #[cfg(unix)]
-    fn would_reach(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> std::io::Result<bool>;
+    fn would_reach(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> Result<bool, crate::error::Error>;
 
     /// Whether a kill through it has landed and reached `child` (see
     /// [`Reach`](crate::child::owned::teardown::Reach)): only then does the child's exit follow, so
     /// only then may it be waited for. `false` for every mechanism whose kill is subject to the kernel's
     /// permission check; an error where the child cannot be placed.
     #[cfg(unix)]
-    fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool>;
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> Result<bool, crate::error::Error>;
 
     /// The end of the resource it owns, which the caller's wait over the [`Release`] completes: a cgroup
     /// leaf is killed through, drained and removed, and its release owns the leaf (`None`); a marker's
@@ -347,7 +347,7 @@ impl Contains for Mechanism {
     }
 
     #[cfg(unix)]
-    fn would_reach(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> std::io::Result<bool> {
+    fn would_reach(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> Result<bool, crate::error::Error> {
         match self {
             #[cfg(target_os = "linux")]
             Mechanism::Cgroup(m) => m.would_reach(pid, pidfd),
@@ -361,7 +361,7 @@ impl Contains for Mechanism {
     }
 
     #[cfg(unix)]
-    fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> Result<bool, crate::error::Error> {
         match self {
             #[cfg(target_os = "linux")]
             Mechanism::Cgroup(m) => m.reached(child),
@@ -419,7 +419,7 @@ impl Contains for Mechanism {
 /// read. Linux only; elsewhere there is no leaf to read.
 #[cfg(unix)]
 pub(crate) struct FrontReach(
-    #[cfg(target_os = "linux")] pub(crate) std::io::Result<Option<crate::containment::cgroup::Subtree>>,
+    #[cfg(target_os = "linux")] pub(crate) Result<Option<crate::containment::cgroup::Subtree>, crate::error::Error>,
 );
 
 /// The end of a mechanism's resource, which [`wait`](Self::wait) completes by dropping it: a cgroup

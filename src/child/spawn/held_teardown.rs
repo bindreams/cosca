@@ -241,7 +241,7 @@ pub(crate) fn tear_down_expecting(
 pub(crate) fn look_at_failed_spawn_front(
     child: &OwnedChild,
     id: Option<ProcessId>,
-    reach: Result<Option<&dyn Reach>, std::io::Error>,
+    reach: Result<Option<&dyn Reach>, crate::error::Error>,
     disposition: Disposition,
     warn_after: Option<Duration>,
 ) -> (FrontFate, TeardownOutcome) {

@@ -1,5 +1,7 @@
 // Unit tests for process-group membership listing and the identity it carries.
 
+#[cfg(target_os = "linux")]
+use super::ListingFailure;
 use super::{members, state, GroupState, Member};
 #[cfg(target_os = "linux")]
 use crate::identity::{FakeKernel, UNREADABLE_STATUS_REASON};
@@ -9,6 +11,24 @@ use nix::sys::signal::Signal;
 
 fn is_alive(m: &Member) -> bool {
     matches!(m.id.is_alive(), Liveness::Alive)
+}
+
+/// The error of a listing that failed and is no refusal; `why` says what the row expected.
+#[cfg(target_os = "linux")]
+pub(super) fn failed(listed: Result<Vec<Member>, ListingFailure>, why: &str) -> std::io::Error {
+    match listed {
+        Err(ListingFailure::Failed(error)) => error,
+        other => panic!("{why}: expected a failure that is no refusal, got {other:?}"),
+    }
+}
+
+/// The public error of a listing that was refused; `why` says what the row expected.
+#[cfg(target_os = "linux")]
+fn refused(listed: Result<Vec<Member>, ListingFailure>, why: &str) -> crate::error::Error {
+    match listed {
+        Err(ListingFailure::Unsupported(error)) => error,
+        other => panic!("{why}: expected a refusal, got {other:?}"),
+    }
 }
 
 /// Block until `pid` has exited, leaving it UNREAPED so it is a zombie the
@@ -128,6 +148,7 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
     assert!(
         matches!(
             state(
+                &HostKernel,
                 pgid,
                 Signal::SIGKILL,
                 Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
@@ -163,7 +184,7 @@ fn a_group_kill_names_no_root_among_the_members_it_reached() {
         crate::test_support::stated_root::StatedRoot::with_state(child.id(), || crate::signal::RootState::Unreaped);
 
     let mut killed = Vec::new();
-    let verdict = state(pgid, Signal::SIGKILL, Some(&root), &mut killed);
+    let verdict = state(&HostKernel, pgid, Signal::SIGKILL, Some(&root), &mut killed);
 
     assert!(matches!(verdict, GroupState::Cleared), "got {verdict:?}");
     assert_eq!(
@@ -189,6 +210,7 @@ fn state_of_an_all_zombie_group_is_cleared() {
     assert!(
         matches!(
             state(
+                &HostKernel,
                 pid as i32,
                 Signal::SIGKILL,
                 Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
@@ -364,6 +386,7 @@ fn term_group_probe_reports_pid_1_as_a_refuser_unless_reachable(#[fixture(stray_
     let reachable = unsafe { libc::kill(1, 0) } == 0;
     match (
         state(
+            &HostKernel,
             pgid,
             Signal::SIGTERM,
             Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
@@ -665,7 +688,7 @@ fn a_resends_answer_is_the_members_reached() {
 #[skuld::test]
 fn members_is_an_error_when_the_proc_view_is_diverged() {
     let kernel = FakeKernel::over(&HostKernel).diverged_view();
-    let err = members(&kernel, i32::MAX).expect_err("a diverged view lists nothing");
+    let err = failed(members(&kernel, i32::MAX), "a diverged view lists nothing");
     assert!(err.to_string().contains("outer pid namespace"), "{err}");
 }
 
@@ -673,7 +696,7 @@ fn members_is_an_error_when_the_proc_view_is_diverged() {
 #[skuld::test]
 fn members_is_an_error_naming_the_cause_when_the_proc_view_is_unassessable() {
     let kernel = FakeKernel::over(&HostKernel).unreadable_view();
-    let err = members(&kernel, i32::MAX).expect_err("an unassessable view lists nothing");
+    let err = failed(members(&kernel, i32::MAX), "an unassessable view lists nothing");
     assert!(err.to_string().contains(UNREADABLE_STATUS_REASON), "{err}");
     // The view's read error is the source, with its code, and not repeated in the text.
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
@@ -695,7 +718,7 @@ const PID: u32 = 4242;
 #[skuld::test]
 fn members_excludes_a_pid_whose_stat_read_says_it_is_gone_or_hidden() {
     let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::ENOENT);
-    let listed = members(&kernel, i32::MAX).unwrap_or_else(|e| panic!("an exclusion: {e}"));
+    let listed = members(&kernel, i32::MAX).unwrap_or_else(|e| panic!("an exclusion: {e:?}"));
     assert!(listed.is_empty(), "{listed:?}");
 }
 
@@ -707,7 +730,7 @@ fn members_excludes_a_pid_whose_stat_read_says_it_is_gone_or_hidden() {
 fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
     for errno in [libc::EXDEV, libc::EMFILE] {
         let kernel = FakeKernel::listing_unreadable_pid(&HostKernel, PID, errno);
-        let err = members(&kernel, i32::MAX).expect_err("an unexplained read failure lists nothing");
+        let err = failed(members(&kernel, i32::MAX), "an unexplained read failure lists nothing");
         // The listing's own words do not fold in the layer's (`to_string` is this layer alone).
         let own = err.to_string();
         assert!(!own.contains("/stat"), "{errno}: {own}");
@@ -733,8 +756,10 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
 fn members_keeps_the_pids_eperm_when_the_checked_directory_fails_without_refusing() {
     let kernel =
         FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(libc::EMFILE));
-    let err =
-        members(&kernel, i32::MAX).expect_err("a pid whose stat is refused and whose re-check fails lists nothing");
+    let err = failed(
+        members(&kernel, i32::MAX),
+        "a pid whose stat is refused and whose re-check fails lists nothing",
+    );
     let text = crate::error::said(&err);
     assert!(text.contains("re-check of self/stat failed"), "{text}");
     let members = crate::error::several_in(&err).unwrap_or_else(|| panic!("a list of both failures: {text}"));
@@ -743,7 +768,7 @@ fn members_keeps_the_pids_eperm_when_the_checked_directory_fails_without_refusin
 }
 
 /// An `openat2` refused after the view opened (a seccomp filter installed mid-scan) is the same host
-/// condition as a refused view-open: `ErrorKind::Unsupported` naming `openat2`, with the refusing
+/// condition as a refused view-open: a [`ListingFailure::Unsupported`] naming `openat2`, with the refusing
 /// errno as the source and the pid's own failure, which names the pid, as a second cause when the
 /// refusal is the directory's. The refusal shows as the pid's `stat` answering `ENOSYS`/`ENODEV`, or
 /// as `EPERM` beside a checked directory that refuses `self/stat` too. It is warned about once, as
@@ -764,13 +789,8 @@ fn members_is_unsupported_when_the_scan_meets_a_refused_openat2() {
             kernel = kernel.on_read("self/stat", Err(recheck));
         }
         let mark = crate::log_capture::mark();
-        let err = members(&kernel, i32::MAX).expect_err("a refused openat2 lists nothing");
+        let err = refused(members(&kernel, i32::MAX), "a refused openat2 lists nothing");
         let text = crate::error::said(&err);
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::Unsupported,
-            "{stat}/{recheck:?}: {text}"
-        );
         assert!(text.contains("requires openat2"), "{stat}/{recheck:?}: {text}");
         assert_eq!(
             crate::error::first_os_code(&err),
@@ -798,7 +818,7 @@ fn members_is_unsupported_when_the_scan_meets_a_refused_openat2() {
 }
 
 /// The member's own identity read goes through the `stat` of the pid again, and a refusal there is the
-/// same `Unsupported` as a refusal in the scan, with the pid's own failure beside it when the refusal
+/// same refusal as one in the scan, with the pid's own failure beside it when the refusal
 /// is the directory's. Mutant: "a refused read of the member's own `stat` excludes the member".
 #[cfg(target_os = "linux")]
 #[skuld::test]
@@ -821,13 +841,8 @@ fn members_is_unsupported_when_the_members_own_stat_read_is_refused() {
             kernel = kernel.on_read("self/stat", Err(recheck));
         }
         let mark = crate::log_capture::mark();
-        let err = members(&kernel, 1234).expect_err("a refused own read lists nothing");
+        let err = refused(members(&kernel, 1234), "a refused own read lists nothing");
         let text = crate::error::Report(&err).to_string();
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::Unsupported,
-            "{stat}/{recheck:?}: {text}"
-        );
         assert!(text.contains("requires openat2"), "{stat}/{recheck:?}: {text}");
         assert_eq!(
             crate::error::first_os_code(&err),
@@ -876,9 +891,8 @@ fn members_fails_when_the_members_own_stat_read_is_unreadable() {
         if let Some(recheck) = recheck {
             kernel = kernel.on_read("self/stat", Err(recheck));
         }
-        let err = members(&kernel, 1234).expect_err("an unreadable own read lists nothing");
+        let err = failed(members(&kernel, 1234), "an unreadable own read lists nothing");
         let text = crate::error::Report(&err).to_string();
-        assert_eq!(err.kind(), std::io::ErrorKind::Other, "{stat}/{recheck:?}: {text}");
         assert!(text.contains(&format!("pid {PID}")), "{stat}/{recheck:?}: {text}");
         assert_eq!(
             crate::error::first_os_code(&err),
@@ -910,41 +924,38 @@ fn members_excludes_a_pid_whose_own_stat_read_is_an_absence() {
         }
         assert!(
             members(&kernel, 1234)
-                .unwrap_or_else(|e| panic!("{stat}: an exclusion, not an error: {e}"))
+                .unwrap_or_else(|e| panic!("{stat}: an exclusion, not an error: {e:?}"))
                 .is_empty(),
             "{stat}"
         );
     }
 }
 
-/// An `openat2` refused where the listing begins is the same `Unsupported`: the `/proc` listing
-/// (`ENOSYS`, `EPERM`, `ENODEV` of the open), and the read of `self/status` that establishes the view.
+/// An `openat2` refused where the listing begins is the same refusal: the `/proc` listing and the read
+/// of `self/status` that establishes the view, one row each (the errno table is `ReadFailure::refusal`'s).
 /// Each is warned about once. Any other listing failure stays an error with its own errno. Mutant:
-/// "an `openat2` refused before any pid is read is `Other`".
+/// "an `openat2` refused before any pid is read is a failure".
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn members_is_unsupported_when_the_listing_or_the_view_read_is_refused() {
     crate::log_capture::install();
-    for errno in [libc::ENOSYS, libc::EPERM, libc::ENODEV] {
-        let listing = FakeKernel::over(&HostKernel).same_view().on_pids(Err(errno));
-        let status = FakeKernel::over(&HostKernel).on_read("self/status", Err(errno));
-        for (what, kernel) in [("listing", listing), ("self/status", status)] {
-            let mark = crate::log_capture::mark();
-            let err = members(&kernel, i32::MAX).expect_err("a refused openat2 lists nothing");
-            let text = crate::error::Report(&err).to_string();
-            assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{what} {errno}: {text}");
-            assert!(text.contains("requires openat2"), "{what} {errno}: {text}");
-            assert_eq!(crate::error::first_os_code(&err), Some(errno), "{what} {errno}: {text}");
-            assert_eq!(
-                crate::log_capture::warns_since(mark, "").len(),
-                1,
-                "{what} {errno}: warned once"
-            );
-        }
+    let errno = libc::ENOSYS;
+    let listing = FakeKernel::over(&HostKernel).same_view().on_pids(Err(errno));
+    let status = FakeKernel::over(&HostKernel).on_read("self/status", Err(errno));
+    for (what, kernel) in [("listing", listing), ("self/status", status)] {
+        let mark = crate::log_capture::mark();
+        let err = refused(members(&kernel, i32::MAX), "a refused openat2 lists nothing");
+        let text = crate::error::Report(&err).to_string();
+        assert!(text.contains("requires openat2"), "{what}: {text}");
+        assert_eq!(crate::error::first_os_code(&err), Some(errno), "{what}: {text}");
+        assert_eq!(
+            crate::log_capture::warns_since(mark, "").len(),
+            1,
+            "{what}: warned once"
+        );
     }
     let kernel = FakeKernel::over(&HostKernel).same_view().on_pids(Err(libc::EIO));
-    let err = members(&kernel, i32::MAX).expect_err("an unlistable /proc lists nothing");
-    assert_ne!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
+    let err = failed(members(&kernel, i32::MAX), "an unlistable /proc lists nothing");
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
 }
 
@@ -958,9 +969,8 @@ fn members_is_not_unsupported_when_the_listing_fails_after_the_open() {
         let kernel = FakeKernel::over(&HostKernel)
             .same_view()
             .on_pids_failing_after_open(errno);
-        let err = members(&kernel, i32::MAX).expect_err("an unlistable /proc lists nothing");
+        let err = failed(members(&kernel, i32::MAX), "an unlistable /proc lists nothing");
         let text = crate::error::Report(&err).to_string();
-        // Not `err.kind()`: an `ENOSYS` of its own is `Unsupported` by std's mapping.
         assert!(!text.contains("requires openat2"), "{errno}: {text}");
         assert_eq!(crate::error::first_os_code(&err), Some(errno), "{errno}: {text}");
     }
@@ -1035,9 +1045,9 @@ fn members_lists_a_pid_whose_scan_and_identity_read_agree() {
     );
 }
 
-/// A member whose pidfd cannot be opened fails the listing: a refused `pidfd_open` stays
-/// `Unsupported` (the caller reports it so), a transient one is `Other`. Mutant: "the listing error
-/// is always `Other`", "the member is excluded".
+/// A member whose pidfd cannot be opened fails the listing: a refused `pidfd_open` stays a refusal
+/// (the caller reports it `Unsupported`), a transient one is a failure. Mutant: "the listing error
+/// is always a failure", "the member is excluded".
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn members_fails_for_a_member_whose_pidfd_cannot_be_opened_and_keeps_a_refusal_unsupported() {
@@ -1045,18 +1055,27 @@ fn members_fails_for_a_member_whose_pidfd_cannot_be_opened_and_keeps_a_refusal_u
 
     use crate::identity::stat_parse::stat_fixture;
 
-    for (errno, kind) in [
-        (Errno::PERM, std::io::ErrorKind::Unsupported),
-        (Errno::MFILE, std::io::ErrorKind::Other),
-    ] {
+    for (errno, is_refusal) in [(Errno::PERM, true), (Errno::MFILE, false)] {
         let kernel = FakeKernel::over(&HostKernel)
             .same_view()
             .on_pids(Ok(&[PID]))
             .on_read(&format!("{PID}/stat"), Ok(&stat_fixture("S", 777)))
             .on_pidfd_open(PID, Err(errno));
         // `stat_fixture` puts the process in group 1234.
-        let err = members(&kernel, 1234).expect_err("an unopenable member lists nothing");
-        assert_eq!(err.kind(), kind, "{errno}: {err}");
-        assert!(err.to_string().contains(&format!("pid {PID}")), "{errno}: {err}");
+        let listed = members(&kernel, 1234);
+        if is_refusal {
+            let err = refused(listed, "an unopenable member lists nothing");
+            assert!(
+                crate::error::said(&err).contains("requires pidfd_open"),
+                "{errno}: {err:?}"
+            );
+            let crate::error::Error::Unsupported { op, .. } = &err else {
+                panic!("{errno}: {err:?}");
+            };
+            assert_eq!(op, &format!("listing process group 1234 at pid {PID}"), "{errno}");
+        } else {
+            let err = failed(listed, "an unopenable member lists nothing");
+            assert!(err.to_string().contains(&format!("pid {PID}")), "{errno}: {err}");
+        }
     }
 }

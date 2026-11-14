@@ -65,7 +65,7 @@ fn subtree_of(fd: OwnedFd, swept: crate::containment::cgroup::Swept) -> Subtree 
 
 /// Whether `leaf` holds this process, read as a task whose pidfd's cgroup id is `id`, with `/proc`
 /// hidden: only the id, the sweep's record and the walk may place it.
-fn holds_hidden(leaf: &Subtree, id: u64) -> std::io::Result<bool> {
+fn holds_hidden(leaf: &Subtree, id: u64) -> Result<bool, crate::error::Error> {
     let _id = fault::force_pidfd_cgroup_id(id);
     let _hidden = fault::hide_proc();
     let pidfd = own_pidfd();
@@ -314,7 +314,8 @@ fn a_task_the_walk_cannot_place_is_placed_through_proc() {
             std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
         }
         let err = holds_hidden(&leaf, HIGH + 1).expect_err("placed through the hidden /proc");
-        assert!(err.to_string().contains("maybe one under it"), "{stat:?} {sub}: {err}");
+        let said = crate::error::said(&err);
+        assert!(said.contains("maybe one under it"), "{stat:?} {sub}: {said}");
         // What `/proc` answered is the cause, with its code.
         assert_eq!(
             crate::error::first_os_code(&err),
@@ -464,7 +465,7 @@ fn an_unreadable_pidfd_id_places_a_seen_task_through_proc_without_the_leafs_id()
         .holds_seen(std::process::id(), Some(pidfd.as_fd()), Some(HIGH))
         .expect_err("the hidden /proc places nothing");
     assert_eq!(
-        e.raw_os_error(),
+        crate::error::first_os_code(&e),
         Some(libc::ENOENT),
         "/proc's error, not the id's EIO: {e}"
     );
@@ -492,7 +493,11 @@ fn an_exited_task_has_no_pidfd_id_and_is_not_placed_through_proc_without_the_lea
     let e = leaf
         .holds_seen(std::process::id(), Some(pidfd.as_fd()), Some(HIGH))
         .expect_err("the task's exit is the answer");
-    assert_eq!(e.raw_os_error(), Some(libc::ESRCH), "the id's ESRCH, not /proc's: {e}");
+    assert_eq!(
+        crate::error::first_os_code(&e),
+        Some(libc::ESRCH),
+        "the id's ESRCH, not /proc's: {e}"
+    );
 }
 
 /// The id a placement names is the one that placed the task: here the leaf's own.
@@ -629,7 +634,9 @@ fn a_task_read_through_an_unusable_view_has_the_views_error_as_its_cause() {
     let why: crate::identity::ViewUnreadable = ProcOpenFailure::opening(rustix::io::Errno::MFILE).into();
     let kind = std::io::Error::from_raw_os_error(libc::EMFILE).kind();
 
-    let err = super::view_unreadable(7, why);
+    let crate::error::Error::Io(err) = super::view_unreadable(7, why) else {
+        panic!("a view that is no refusal is an I/O error");
+    };
 
     assert_eq!(err.kind(), kind);
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EMFILE), "{err:?}");
@@ -672,15 +679,15 @@ fn a_refused_views_errors_carry_the_refusals_chain() {
     said_all(crate::error::said(&super::refusal(unreadable)));
 }
 
-/// A refused view stays a refusal wherever the view is read: a task's cgroup read is `Unsupported` and
-/// names the requirement, as its cgroup read's refusal is, and the probe's answer is the refusal itself.
-/// Mutant: "a refused view is only an unreadable one" (an `Other` error; a `View` string).
+/// A refused view stays a refusal wherever the view is read: a task's cgroup read is an
+/// `Error::Unsupported` and names the requirement, as its cgroup read's refusal is, and the probe's answer
+/// is the refusal itself. Mutant: "a refused view is only an unreadable one".
 #[skuld::test]
 fn a_refused_view_is_a_refusal_where_it_is_read() {
     let kernel = refused_view_kernel();
 
     let err = proc_names(&kernel, "/leaf", 7, || None, false).expect_err("a refused view reads no cgroup");
-    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{err:?}");
+    assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{err:?}");
     assert!(
         crate::error::said(&err).contains("cosca requires openat2"),
         "{}",
@@ -1567,8 +1574,9 @@ fn proc_names_keeps_the_pids_eperm_beside_a_failed_recheck() {
 }
 
 /// `proc_names` over an unreadable cgroup says the pid and its file once, in the `Unreadable`'s words:
-/// no context of its own above them and no layer of a cosca `Error` between. Mutant: "the cause is
-/// wrapped in a context that names the pid again, or as an `Error::Io` layer".
+/// no context of its own above them and no second layer of a cosca `Error` (the one is `proc_names`'s
+/// own error). Mutant: "the cause is wrapped in a context that names the pid again, or as a second
+/// `Error::Io` layer".
 #[skuld::test]
 fn proc_names_says_an_unreadable_cgroup_once() {
     let pid = std::process::id();
@@ -1576,10 +1584,11 @@ fn proc_names_says_an_unreadable_cgroup_once() {
         .same_view()
         .on_read(&format!("{pid}/cgroup"), Err(libc::EIO));
     let err = proc_names(&kernel, "/leaf", pid, || None, false).expect_err("an unreadable cgroup");
+    assert!(matches!(err, crate::error::Error::Io(_)), "{err:?}");
     let eio = std::io::Error::from_raw_os_error(libc::EIO);
     assert_eq!(
         crate::error::said(&err),
-        format!("{pid}/cgroup could not be read: {eio}")
+        format!("an I/O operation failed: {pid}/cgroup could not be read: {eio}")
     );
 }
 
@@ -1597,8 +1606,8 @@ fn a_probe_whose_cgroup_read_fails_says_the_file_once() {
     assert!(said.contains("probing whether /proc shows"), "{said}");
 }
 
-/// A task's `<pid>/cgroup` read that is refused is an error that says what cosca requires, of kind
-/// `Unsupported`, with the refusing errno as its code, so the placement's callers carry it.
+/// A task's `<pid>/cgroup` read that is refused is an `Error::Unsupported` that says what cosca requires,
+/// with the refusing errno as its code, so the placement's callers carry it.
 /// Mutant: "the read's error is returned as it is".
 #[skuld::test]
 fn a_refused_cgroup_read_of_a_task_says_what_cosca_requires() {
@@ -1606,11 +1615,27 @@ fn a_refused_cgroup_read_of_a_task_says_what_cosca_requires() {
     for errno in [libc::ENOSYS, libc::ENODEV] {
         let _refused = fault::hide_proc_as(errno);
         let err = leaf.holds(std::process::id(), None).expect_err("a refused read");
-        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{errno}: {err}");
+        assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{errno}: {err}");
         assert_eq!(crate::error::first_os_code(&err), Some(errno), "{err:?}");
         let said = crate::error::Report(&err).to_string();
         assert!(said.contains("requires openat2"), "{errno}: {said}");
     }
+}
+
+/// A refusal met in the `/proc` read, after the task's pidfd placed it in a cgroup the walk cannot tell
+/// from one under the leaf, is still the refusal: the context that read's other errors get does not bury it.
+/// Mutant: "every error of that read is wrapped in the context".
+#[skuld::test]
+fn a_refused_cgroup_read_after_the_pidfd_placed_the_task_elsewhere_is_still_a_refusal() {
+    let (leaf, _dir) = stand_in_subtree(None);
+    let _id = fault::force_pidfd_cgroup_id(HIGH + 1);
+    let _refused = fault::hide_proc_as(libc::ENOSYS);
+    let pidfd = own_pidfd();
+    let err = leaf
+        .holds(std::process::id(), Some(pidfd.as_fd()))
+        .expect_err("a refused read");
+    assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{err:?}");
+    assert!(crate::error::said(&err).contains("requires openat2"), "{err:?}");
 }
 
 /// A `<pid>/cgroup` read that is no refusal is not one in the error: a task that is not there for us
@@ -1622,7 +1647,10 @@ fn a_cgroup_read_of_a_task_that_is_no_refusal_is_no_refusal_in_the_error() {
     for errno in [libc::EIO, libc::ENOENT, libc::EPERM] {
         let _failing = fault::hide_proc_as(errno);
         let err = leaf.holds(std::process::id(), None).expect_err("a failed read");
-        assert_ne!(err.kind(), std::io::ErrorKind::Unsupported, "{errno}: {err:?}");
+        assert!(
+            !matches!(err, crate::error::Error::Unsupported { .. }),
+            "{errno}: {err:?}"
+        );
         assert_eq!(crate::error::first_os_code(&err), Some(errno), "{err:?}");
         assert!(
             !crate::error::Report(&err).to_string().contains("requires"),
