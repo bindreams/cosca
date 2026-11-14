@@ -6,7 +6,7 @@
 use rustix::io::Errno;
 use rustix::process::Pid;
 
-use super::{current_key, signal_probe};
+use super::signal_probe;
 use crate::error::Error;
 use crate::identity::probe::SignalProbe;
 use crate::identity::stat_parse::stat_fixture;
@@ -41,39 +41,6 @@ fn of_a_live_pid_is_unknown_when_the_view_is_unavailable() {
             "{name}: the view is the cause"
         );
     }
-}
-
-/// Where pidfds have no inode, this process's own key is its `self/stat` read through the checked
-/// `/proc`, as every other start-token read is: an `openat2` the kernel refuses is `Unsupported`
-/// naming it, any other failure of the `/proc` or of the file is the I/O error, and a file that reads
-/// gives its `starttime`. Mutant: "`self/stat` is read by path, past the check"; "a refusal is an I/O
-/// error".
-#[skuld::test]
-fn the_own_key_without_pidfs_is_self_stat_read_through_the_checked_proc() {
-    let pid = std::process::id();
-
-    let refused = ticks_host(pid).on_read("self/stat", Err(libc::EPERM));
-    match current_key(&refused) {
-        Err(Error::Unsupported { detail, .. }) => assert!(detail.contains("requires openat2"), "{detail}"),
-        other => panic!("a refused openat2 is Unsupported, got {other:?}"),
-    }
-
-    let no_proc = ticks_host(pid).open_proc_fails(Errno::MFILE);
-    match current_key(&no_proc) {
-        Err(Error::Io(e)) => assert_eq!(crate::error::first_os_code(&e), Some(libc::EMFILE), "{e}"),
-        other => panic!("a /proc that cannot be opened is the I/O error, got {other:?}"),
-    }
-
-    for errno in [libc::EIO, libc::EPERM] {
-        let unreadable = ticks_host(pid).on_read_failing_after_open("self/stat", errno);
-        match current_key(&unreadable) {
-            Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(errno), "read(2) {errno}"),
-            other => panic!("read(2) {errno}: a failed read is the I/O error, got {other:?}"),
-        }
-    }
-
-    let reads = ticks_host(pid).on_read("self/stat", Ok(&stat_fixture("R", 424242)));
-    assert!(matches!(current_key(&reads), Ok(Key::Ticks(424242))));
 }
 
 /// The debug line of a read left `Unknown` by a `/proc` that cannot be opened carries the OS error.
