@@ -750,6 +750,8 @@ pub(crate) mod fault {
         CreationTime,
         /// The assignment of a Strongest root's job.
         Assign,
+        /// The read of a root's loader state, in the proof that it never ran.
+        LoaderRead,
         JobKill,
         /// The membership check of a process by pid (`member_identity`), keyed by the pid.
         Membership,
@@ -813,7 +815,7 @@ pub(crate) mod fault {
     thread_local! {
         static INJECTED: Cell<Option<(u32, Option<u32>)>> = const { Cell::new(None) };
         static INJECTED_VISIT: Cell<Option<Option<super::Visit>>> = const { Cell::new(None) };
-        static FORCED: Cell<Option<(Step, u32, Option<u32>)>> = const { Cell::new(None) };
+        static FORCED: RefCell<Vec<(Step, u32, Option<u32>)>> = const { RefCell::new(Vec::new()) };
         static EQUAL_CREATION_TIMES: Cell<bool> = const { Cell::new(false) };
     }
     /// Make `resume_initial_threads` on THIS thread walk one extra snapshot entry for thread
@@ -839,8 +841,9 @@ pub(crate) mod fault {
     pub(crate) fn take_injected_visit() -> Option<Option<super::Visit>> {
         INJECTED_VISIT.with(|f| f.take())
     }
-    /// Make the NEXT `step` call on THIS thread fail with Win32 error `code`. Reset on drop of the
-    /// guard. Neither an owner of 0 nor a failed `ResumeThread` can be produced on a live system.
+    /// Make the NEXT `step` call on THIS thread fail with Win32 error `code`. Different steps can
+    /// be forced at once. Reset on drop of the guard. Neither an owner of 0 nor a failed
+    /// `ResumeThread` can be produced on a live system.
     pub(crate) fn force_next(step: Step, code: u32) -> Forced {
         arm(step, code, None)
     }
@@ -851,24 +854,25 @@ pub(crate) mod fault {
     }
     fn arm(step: Step, code: u32, tid: Option<u32>) -> Forced {
         FORCED.with(|f| {
-            debug_assert!(f.get().is_none(), "a failure is already forced");
-            f.set(Some((step, code, tid)));
+            let mut f = f.borrow_mut();
+            debug_assert!(f.iter().all(|(armed, ..)| *armed != step), "{step:?} is already forced");
+            f.push((step, code, tid));
         });
         Forced(())
     }
     /// Whether a forced failure is still armed: the call it was armed for never happened.
     pub(crate) fn forced_is_armed() -> bool {
-        FORCED.with(|f| f.get().is_some())
+        FORCED.with(|f| !f.borrow().is_empty())
     }
     /// Consume a forced failure for `step` (on thread `tid`, where the call has one), if one is
     /// armed for it.
     pub(crate) fn take_forced(step: Step, tid: Option<u32>) -> Option<u32> {
-        FORCED.with(|f| match f.get() {
-            Some((armed, code, only)) if armed == step && (only.is_none() || only == tid) => {
-                f.set(None);
-                Some(code)
-            }
-            _ => None,
+        FORCED.with(|f| {
+            let mut f = f.borrow_mut();
+            let at = f
+                .iter()
+                .position(|&(armed, _, only)| armed == step && (only.is_none() || only == tid))?;
+            Some(f.remove(at).1)
         })
     }
     /// Make every creation time read on THIS thread answer the same value, as a coarse clock would,
@@ -899,7 +903,7 @@ pub(crate) mod fault {
     pub(crate) struct Forced(());
     impl Drop for Forced {
         fn drop(&mut self) {
-            FORCED.with(|f| f.set(None));
+            FORCED.with(|f| f.borrow_mut().clear());
         }
     }
 }
@@ -1779,6 +1783,7 @@ impl Walk {
 }
 
 /// A thread handle, closed on drop.
+#[derive(Debug)]
 struct ThreadHandle(HANDLE);
 
 impl Drop for ThreadHandle {
@@ -2180,52 +2185,6 @@ pub(crate) fn resume_initial_threads(
     walk_verdict(process_pid, walk)
 }
 
-/// Whether the Job Object `mode` asks for is the only mechanism it accepts: a failure to create it or
-/// assign the child to it fails the spawn, where every other mode degrades to a process-tree walk.
-/// Windows has no session, so `Session` is `Strongest` here.
-pub(crate) fn is_strict(mode: crate::ContainMode) -> bool {
-    matches!(mode, crate::ContainMode::Strongest | crate::ContainMode::Session)
-}
-
-/// Whether the initial thread of the process at `proc_handle` is still suspended, as its creator
-/// left it: the program has not run. It finds the thread as the [`SuspendCount::ExactlyOne`]
-/// release does, and reads its suspend count by suspending and resuming it once, since the OS has
-/// no read of it. A count of 0 (something resumed the thread) is `false`; the read itself leaves a
-/// running thread stopped for the length of two calls. A count that is not 0 is `true`, though a
-/// thread something resumed and suspended again has one too, as the release's check cannot tell.
-///
-/// `Err` when the thread cannot be found or read: the count is unknown.
-pub(crate) fn initial_thread_still_suspended(proc_handle: std::os::windows::io::RawHandle) -> io::Result<bool> {
-    let process_pid = process_pid_of(HANDLE(proc_handle.cast()))?;
-    let mut walk = Walk {
-        expected: SuspendCount::ExactlyOne,
-        ..Walk::default()
-    };
-    let entries = thread_entries()?;
-    let Some(initial) = initial_thread_among(&entries, process_pid, &mut walk) else {
-        return Err(walk
-            .last_err
-            .take()
-            .unwrap_or_else(|| none_resumed_error(process_pid, walk.last_skip.as_deref())));
-    };
-    let call = |call: &str, e: windows::core::Error| {
-        io_context(
-            format!("{call} failed for thread {initial} of pid {process_pid}"),
-            win32_io_error(e),
-        )
-    };
-    let thread = open_for_resume(initial).map_err(|e| call("OpenThread(suspend/resume)", e))?;
-    let owner = owner_of(&thread).map_err(|e| call("GetProcessIdOfThread", e))?;
-    if owner != process_pid {
-        return Err(io::Error::other(format!(
-            "thread {initial} belongs to pid {owner}, not to pid {process_pid}"
-        )));
-    }
-    let previous = suspend_thread(&thread).map_err(|e| call("SuspendThread", e))?;
-    resume_thread(&thread).map_err(|e| call("ResumeThread", e))?;
-    Ok(previous != 0)
-}
-
 /// Assign the process at `proc_handle` to a `KILL_ON_JOB_CLOSE` job and resume its
 /// initial threads. `strict`: the request accepts no weaker mechanism than the job.
 ///
@@ -2238,9 +2197,11 @@ pub(crate) fn initial_thread_still_suspended(proc_handle: std::os::windows::io::
 /// resumed, the failure is logged at `warn`, and the caller falls back to the universal
 /// `Containment::TreeWalk` mechanism (identity teardown).
 /// Returns `Err` when job assignment fails and the request is `strict`: the child is left
-/// suspended, for the caller to terminate, and the failure says the program never ran when the
-/// root's initial thread is still suspended ([`initial_thread_still_suspended`]); a root that was
-/// resumed, or whose thread cannot be read, fails as one that may have started.
+/// suspended, for the caller to terminate. The failure says the program never ran when
+/// [`prove_not_started`](not_started::prove_not_started) proves it from the process, and then holds the root's initial thread
+/// suspended ([`ProvenRoot`]) so nothing resumes it before the caller's termination. A root that may
+/// have run, or whose state cannot be read, fails as one that may have started, with a `warn` naming
+/// why.
 /// Returns `Err` when resume fails — a frozen child is unacceptable; the
 /// child+job are killed and the failure propagates to fail the spawn. The resume failure is its
 /// cause; a failure of the job's kill after it is its cleanup (a teardown failure of the failed
@@ -2251,23 +2212,19 @@ pub(crate) fn attach_job(
 ) -> Result<Option<JobHandle>, crate::containment::dispatch::AttachFailure> {
     let job_result = match assign_held(proc_handle) {
         Err(e) if strict => {
-            // The program did not run only if its initial thread is still as the spawn left it; a
-            // root something resumed (a debugger, an EDR agent) may have run, and is torn down as
-            // one that may have started. A thread that cannot be read proves nothing.
-            let not_started = match initial_thread_still_suspended(proc_handle) {
-                Ok(suspended) => suspended,
-                Err(read) => {
+            let proven = match not_started::prove_not_started(proc_handle) {
+                Ok(proven) => Some(Box::new(proven)),
+                Err(why) => {
                     log::warn!(
-                        "the child's initial thread could not be read, so it is not known not to have run: {report}",
-                        report = crate::error::Report(&read)
+                        "the child may have run, so its failed Job assignment is not a not-started failure: {why}"
                     );
-                    false
+                    None
                 }
             };
             let detail = "the child could not be put in its Job Object";
             return Err(crate::containment::dispatch::AttachFailure {
                 cause: crate::error::Error::Containment {
-                    detail: if not_started {
+                    detail: if proven.is_some() {
                         format!("{detail}, so the program did not run")
                     } else {
                         detail.to_owned()
@@ -2275,7 +2232,8 @@ pub(crate) fn attach_job(
                     source: Some(crate::error::Error::io_cause(e)),
                 },
                 cleanup: None,
-                not_started,
+                not_started: proven.is_some(),
+                proven,
             });
         }
         other => other,
@@ -2306,6 +2264,7 @@ pub(crate) fn attach_job(
             },
             cleanup: crate::error::Failures::collect(cleanup),
             not_started: false,
+            proven: None,
         });
     }
 
@@ -2377,6 +2336,10 @@ pub(crate) fn job_kills_on_close(job: &JobHandle) -> bool {
     let flags = job_limit_flags(job).unwrap_or_else(|e| panic!("querying the job's limits failed: {e}"));
     flags.0 & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0 != 0
 }
+
+#[path = "windows/not_started.rs"]
+mod not_started;
+pub(crate) use not_started::ProvenRoot;
 
 #[cfg(test)]
 #[path = "windows_tests.rs"]

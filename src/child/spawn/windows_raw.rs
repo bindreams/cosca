@@ -241,8 +241,6 @@ pub(crate) fn spawn_raw(
     let attachment = match attach_or_fault(id, raw_handle, prepared) {
         Ok(v) => v,
         Err(failure) => {
-            // A suspended root that never ran is ended as one that did not start; any other child
-            // is killed and handed back if it cannot be: the std spawn's teardown.
             return Err(tear_down_after_failed_windows_attach(
                 owned, id_read, failure, policy, &mut why,
             ));

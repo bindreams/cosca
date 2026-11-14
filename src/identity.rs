@@ -669,6 +669,8 @@ impl ProcessId {
 }
 
 #[cfg(windows)]
+pub(crate) use backend::query as windows_query_process;
+#[cfg(windows)]
 pub(crate) use backend::{
     exit_look as windows_exit_look, granted_access as windows_granted_access,
     open_dropping_refused as windows_open_dropping_refused, terminate_held as windows_terminate_held, Look, Opened,

@@ -66,8 +66,7 @@ impl Command {
     /// [`Error::Containment`] under every one of those modes: a frozen root without a Job Object is
     /// not worth having, so there is no [`TreeWalk`] fallback (which `spawn` makes under
     /// `BestEffort`). Unlike `spawn`'s, which answers not started under `Strongest` and `Session`,
-    /// it is wrapped in [`Error::MayHaveStarted`], with the child's fate. A frozen spawn that fails
-    /// after the process exists reports [`Error::MayHaveStarted`].
+    /// it is wrapped in [`Error::MayHaveStarted`], with the child's fate.
     /// `spawn_suspended` with [`elevate`](Self::elevate) is [`Error::Unsupported`] on every platform,
     /// even for an already-elevated caller.
     ///

@@ -213,12 +213,15 @@ pub enum ContainMode {
     /// - **macOS:** the inherited-fd marker, always offered. A failure to install it fails the
     ///   spawn. An explicit [`Session`](ContainMode::Session) or [`TreeWalk`](ContainMode::TreeWalk)
     ///   installs the marker too, and degrades when it fails.
-    /// - **Windows:** a Job Object, always offered (Jobs nest, and the floor is Rust's own: its
-    ///   tier-1 Windows targets need Windows 10). A failure to create the Job or assign the child
+    /// - **Windows:** a Job Object, always offered. A failure to create the Job or assign the child
     ///   to it fails the spawn: the child, created suspended, is terminated and reaped before it
-    ///   runs, and the error names the Job Object, with the OS error as its source.
+    ///   runs, and the error names the Job Object, with the OS error as its source. The spawn
+    ///   answers not started only when it has proved that from the process: its initial thread is
+    ///   still suspended, it has no other thread, and the loader has not initialised it. Otherwise
+    ///   it answers [`Error::MayHaveStarted`].
     ///
     /// [`Error::Containment`]: crate::error::Error::Containment
+    /// [`Error::MayHaveStarted`]: crate::error::Error::MayHaveStarted
     Strongest,
     /// The strongest kernel container that sets up, else the next one down, rather than an error.
     /// A cgroup v2 leaf on Linux, a Job Object on Windows and the inherited-fd marker on macOS,
@@ -265,11 +268,14 @@ pub enum ContainMode {
 
 impl ContainMode {
     /// Whether the mechanism this mode picks is the only one it accepts: a failure to set it up
-    /// fails the spawn, where every other mode degrades to the mechanism below it. Windows has its
-    /// own, in the Windows module.
-    #[cfg(unix)]
+    /// fails the spawn, where every other mode degrades to the mechanism below it. `Session` has no
+    /// session on Windows, and is a Job Object there as `Strongest` is.
     pub(crate) fn is_strict(self) -> bool {
-        matches!(self, ContainMode::Strongest)
+        match self {
+            ContainMode::Strongest => true,
+            ContainMode::Session => cfg!(windows),
+            ContainMode::BestEffort | ContainMode::TreeWalk => false,
+        }
     }
 }
 

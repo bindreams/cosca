@@ -892,13 +892,9 @@ fn spawn_reported(
         Ok(v) => v,
         Err(failure) => {
             log::debug!("attach failed: {report}", report = crate::error::Report(&failure.cause));
-            // Off macOS: kill + reap so a failed attach never leaks the child (a dropped handle
-            // neither kills nor reaps). Only Linux's and Windows' attach say the program never ran,
-            // and that child, front or not (a front never ran its `sudo`), is killed and reaped.
-            // On Linux a front is the exception to the kill otherwise, and a failed attach has
-            // dropped the containment already: a cgroup leaf's drop kills it, so a front in it is
-            // dying, and is waited for (`tear_down_held`). On Windows any other child is killed
-            // and handed back if it cannot be.
+            // Off macOS: kill + reap, since a dropped handle neither kills nor reaps. A Linux front
+            // is the exception: a failed attach has dropped the containment, a cgroup leaf's drop
+            // kills it, and the front is waited for (`tear_down_held`).
             #[cfg(target_os = "linux")]
             return Err(held_teardown::tear_down_after_failed_attach(
                 owned,

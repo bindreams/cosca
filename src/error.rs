@@ -403,11 +403,11 @@ pub enum Error {
     /// where `fate` does not say it all).
     ///
     /// Every error a spawn returns answers whether the program could have started, meaning the
-    /// child reached `exec` (on Windows: `CreateProcess` or `ShellExecuteEx` succeeded; a `Strongest`
-    /// or `Session` root that is created suspended and ended, never resumed, because it could not be
-    /// put in its Job Object did not start, as its still-suspended initial thread shows). This
-    /// variant says it may have. Any other variant from a spawn says
-    /// it did not, and cosca has proved it. Where cosca cannot prove it, the answer is this variant:
+    /// child reached `exec` (on Windows: `CreateProcess` or `ShellExecuteEx` succeeded; a suspended
+    /// root ended before its first resume did not start). This variant says it may have. Any other
+    /// variant from a spawn says it did not, and cosca has proved it (on Windows, for such a root: its
+    /// initial thread is still suspended, it has no other thread, and the loader has not initialised
+    /// it). Where cosca cannot prove it, the answer is this variant:
     ///
     /// - every failure after `exec`, such as an identity read that finds the child gone, a
     ///   containment attach (one that needs the child's identity fails with the error of the read

@@ -2942,10 +2942,13 @@ mod frozen_attach {
 
     /// `Strongest` (and `Session`, which Windows treats as `Strongest`) is a Job Object or an error:
     /// a failed assignment fails the attach as one that proves the program never ran, with the OS
-    /// error as the source, and the child is not resumed.
+    /// error as the source. The child is not resumed, and the failure holds the proof's suspend (count
+    /// 2, the creator's and the proof's) until it is dropped, which resumes nothing: the caller ends the
+    /// process while it is still frozen.
     ///
-    /// Mutants: the attach resumes the child before it fails; it falls back to `TreeWalk`; the
-    /// failure is not marked not started; the OS error is dropped or goes into the text.
+    /// Mutants: the attach resumes the child before it fails, or when the failure is dropped; it falls
+    /// back to `TreeWalk`; the failure is not marked not started; the OS error is dropped or goes into
+    /// the text.
     #[skuld::test]
     fn attach_fails_a_strict_root_whose_job_assignment_fails_without_resuming_it() {
         for mode in [ContainMode::Strongest, ContainMode::Session] {
@@ -2972,9 +2975,42 @@ mod frozen_attach {
             );
             let os_text = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32).to_string();
             assert!(!detail.contains(&os_text), "{mode:?}: {detail}");
-            assert_eq!(thread.suspend_count(), 1, "{mode:?}: the child must not be resumed");
+            assert_eq!(
+                thread.suspend_count(),
+                2,
+                "{mode:?}: the child must not be resumed, and the failure holds the proof's suspend"
+            );
+            drop(failure);
+            assert_eq!(
+                thread.suspend_count(),
+                2,
+                "{mode:?}: dropping the failure resumes nothing"
+            );
             dispose(child);
         }
+    }
+
+    /// A strict root that something resumed before the failed assignment fails the attach as one that
+    /// may have started: not marked not started, nothing held, and the read's suspend undone.
+    ///
+    /// Mutant: the attach answers not started from the root's state before the read.
+    #[skuld::test]
+    fn attach_fails_a_strict_root_that_was_resumed_as_one_that_may_have_started() {
+        let child = spawn_suspended_blocker();
+        let thread = InitialThread::of(child.id());
+        assert_eq!(thread.release_one(), 1);
+        let _forced = force_next(Step::Assign, ERROR_ACCESS_DENIED);
+
+        let failure = attach_failure_of(&child, prepared(Some(ContainMode::Strongest), true, false));
+
+        assert!(!failure.not_started, "{failure:?}");
+        assert!(failure.proven.is_none(), "{failure:?}");
+        let Error::Containment { detail, .. } = &failure.cause else {
+            panic!("got {:?}", failure.cause);
+        };
+        assert!(!detail.contains("did not run"), "{detail}");
+        assert_eq!(thread.suspend_count(), 0, "the read's suspend was undone");
+        dispose(child);
     }
 
     /// `BestEffort` is the ordinary attach: it resumes, a failed assignment degrades to `TreeWalk`,

@@ -144,6 +144,9 @@ pub(crate) fn tear_down_after_failed_attach(
         cause,
         cleanup,
         not_started,
+        // Held across the teardown: the root stays suspended until it is ended.
+        #[cfg(windows)]
+            proven: _proven,
     } = failure;
     let (detail, torn) = if not_started {
         (None, tear_down_unexecuted(child, id, unexecuted, policy, why))
