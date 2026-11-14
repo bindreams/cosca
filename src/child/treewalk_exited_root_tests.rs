@@ -151,6 +151,33 @@ fn graceful_shutdown_tree_kills_the_members_its_sigterm_walk_found_after_the_roo
     drop(stdin);
 }
 
+/// A root that ignores the `SIGTERM` outlives the grace, and the `SIGTERM` ends its child, which
+/// reparents the member below it out of the sweep's walk from the root: the member the call's own walk
+/// reached is killed by identity, and the root by the sweep.
+///
+/// Mutant: the sweep kills only what the walk from the live root finds.
+#[skuld::test]
+fn graceful_shutdown_tree_kills_a_member_reparented_while_the_root_outlives_the_grace() {
+    let (child, stdin, members) = tree_of(crate::test_child::ROOT_OUTLIVING_THE_GRACE_ARGV);
+
+    let status = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .expect("every member the walk reached is killed");
+
+    std::os::unix::process::ExitStatusExt::signal(&status)
+        .filter(|signal| *signal == libc::SIGKILL)
+        .unwrap_or_else(|| panic!("the sweep killed the live root: {status:?}"));
+    for member in &members {
+        assert_eq!(
+            member.is_alive(),
+            Liveness::Dead,
+            "{member:?} is killed or ended by the SIGTERM"
+        );
+    }
+    assert_eq!(drop_warns(child), Vec::<String>::new());
+    drop(stdin);
+}
+
 /// A tree every member of which ends on the `SIGTERM` is the common case: the call answers the root's
 /// status, and the drop does not warn.
 ///

@@ -41,10 +41,17 @@ pub(crate) fn parse_pgrp(stat: &[u8]) -> Option<u32> {
     tail(stat)?.split_whitespace().nth(2)?.parse::<u32>().ok()
 }
 
+/// Field 20 (`num_threads`, index 17 of the tail) — the live threads of the process.
+pub(crate) fn parse_num_threads(stat: &[u8]) -> Option<u64> {
+    tail(stat)?.split_whitespace().nth(17)?.parse::<u64>().ok()
+}
+
 /// Decide whether a process is *running* from its raw `/proc/<pid>/stat` bytes: the
 /// starttime token must match `start` (reject a reused PID) AND the state must not be zombie
-/// ('Z') or dead ('X'/'x'). An unparseable record is `Unknown` — we read the file, so the
-/// process is there; we just could not read its state. Pure, so it is host-testable.
+/// ('Z') or dead ('X'/'x'). A zombie that still has other live threads is running: its leader
+/// thread exited (`pthread_exit`) and the process has not. An unparseable record is `Unknown` — we
+/// read the file, so the process is there; we just could not read its state. Pure, so it is
+/// host-testable.
 pub(super) fn running_from_stat(stat: &[u8], ticks: u64) -> super::Liveness {
     use super::Liveness;
     match parse_starttime_jiffies(stat) {
@@ -53,6 +60,8 @@ pub(super) fn running_from_stat(stat: &[u8], ticks: u64) -> super::Liveness {
         None => return Liveness::Unknown, // unparseable — not evidence of death
     }
     match parse_state(stat) {
+        // The thread count precedes `starttime` in the record, so it is there once the token matched.
+        Some(b'Z') if parse_num_threads(stat).is_some_and(|threads| threads > 1) => Liveness::Alive,
         Some(b'Z' | b'X' | b'x') => Liveness::Dead,
         Some(_) => Liveness::Alive,
         None => Liveness::Unknown,

@@ -1657,6 +1657,17 @@ pub(crate) const TERM_SURVIVOR_TREE_ARGV: &[&str] = &[
     "trap '' TERM; exec 3<&0; { cat <&3 3<&- && echo eof; } & trap - TERM; echo r; exec cat",
 ];
 
+/// A root that ignores `SIGTERM` and outlives any grace (a `cat` once its child ends), a child `sh` that
+/// a `SIGTERM` ends, and below it a `cat` (an `sh` until its `exec`) that ignores `SIGTERM` and reads
+/// the stdin pipe too. The child's end reparents that `cat` out of every later walk from the root. It
+/// prints `r` before its `exec`, so both descendants exist when it is read.
+#[cfg(unix)]
+pub(crate) const ROOT_OUTLIVING_THE_GRACE_ARGV: &[&str] = &[
+    "sh",
+    "-c",
+    "trap '' TERM; exec 3<&0; ( trap - TERM; ( trap '' TERM; echo r; exec cat <&3 3<&- ) & wait ) & wait; exec cat",
+];
+
 /// A spawned, contained `SIGTERM`-ignoring [`TERM_IGNORING_BLOCKER_ARGV`] child and the write end of
 /// its stdin, returned once its readiness byte proves the trap is installed. A test whose only end
 /// for it is a sweep or escalation holds the stdin and releases it after the kill.

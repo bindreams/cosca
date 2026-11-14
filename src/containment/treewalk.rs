@@ -590,17 +590,32 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
 /// Whether `root` has exited, whether or not it is reaped, where the kernel reparents a process's
 /// children at its exit (Unix): a walk from its pid finds none of them, so an empty walk says nothing
 /// about the tree. Windows never reparents, so a walk from an exited root still finds its children and
-/// the root's exit is no reason to refuse it. A root whose state cannot be read is not taken to have
-/// exited.
-fn root_exited(kernel: &dyn Kernel, root: ProcessId) -> bool {
+/// the root's exit is no reason to refuse it.
+///
+/// # Errors
+///
+/// [`Error::Unassessable`] when the root's state cannot be read: an empty walk from it says nothing of
+/// the tree either way, as for a root whose anchor cannot be proved.
+fn root_exited(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Error> {
     #[cfg(unix)]
     {
-        matches!(root.is_alive_with(kernel), crate::identity::Liveness::Dead)
+        match root.is_alive_with(kernel) {
+            crate::identity::Liveness::Dead => Ok(true),
+            crate::identity::Liveness::Alive => Ok(false),
+            crate::identity::Liveness::Unknown => Err(Error::Unassessable {
+                detail: format!(
+                    "pid {pid}: whether the root has exited could not be read, so a walk that finds no member says \
+                     nothing of the tree",
+                    pid = root.pid()
+                ),
+                source: None,
+            }),
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = (kernel, root);
-        false
+        Ok(false)
     }
 }
 
@@ -648,7 +663,7 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
         .and_then(|parents| walk_from(kernel, root, &parents, Recursive::Yes))
     {
         Ok(Some(walk)) => walk,
-        Ok(None) => return TreeKill::of(TreeKillOutcome::NoRoot(root.pid())).through(kernel),
+        Ok(None) => return TreeKill::of(TreeKillOutcome::NoRoot(root.pid(), None)).through(kernel),
         Err(error) => return TreeKill::of(TreeKillOutcome::Unwalked(error)).through(kernel),
     };
     #[cfg(test)]
@@ -675,8 +690,13 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
             left.push(forced_error(root.pid().wrapping_add(1)));
         }
     }
-    if descendants.is_empty() && left.is_empty() && root_left.is_none() && root_exited(kernel, root) {
-        return TreeKill::of(TreeKillOutcome::NoRoot(root.pid())).through(kernel);
+    if descendants.is_empty() && left.is_empty() && root_left.is_none() {
+        match root_exited(kernel, root) {
+            Ok(true) => return TreeKill::of(TreeKillOutcome::NoRoot(root.pid(), None)).through(kernel),
+            Ok(false) => {}
+            // Nothing is killed, the root included: a retry can read it.
+            Err(unreadable) => return TreeKill::of(TreeKillOutcome::Unwalked(unreadable)).through(kernel),
+        }
     }
     let mut resolved = Vec::new();
     let mut killed = Vec::new();
@@ -739,8 +759,28 @@ pub(crate) enum Left {
     /// `Arc`).
     Unread { pid: RawPid, source: Arc<Error> },
     /// A `SIGTERM` walk reached it while the root ran, and nothing has refused it: a later kill, which
-    /// cannot walk to it once the root has exited, kills it by identity.
-    Termed(ProcessId),
+    /// cannot walk to it once the root has exited, kills it by identity. `walk` names the call whose
+    /// walk listed the tree whole and reached it, if one did ([`WalkToken`]); a member of a walk that
+    /// could not read every candidate, or of a separate `terminate_tree`, has none.
+    Termed { id: ProcessId, walk: Option<WalkToken> },
+}
+
+/// A call that walked a tree with `SIGTERM` and will sweep it: the tag of the members its complete
+/// walk reached ([`Left::Termed`]), which that call's own sweep asks the settlement about. One value
+/// per call, equal only to its own clones.
+#[derive(Debug, Clone)]
+pub(crate) struct WalkToken(Arc<()>);
+
+impl WalkToken {
+    pub(crate) fn new() -> WalkToken {
+        WalkToken(Arc::new(()))
+    }
+}
+
+impl PartialEq for WalkToken {
+    fn eq(&self, other: &WalkToken) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 impl Left {
@@ -771,7 +811,7 @@ impl Left {
 
     pub(crate) fn pid(&self) -> RawPid {
         match self {
-            Left::Resolved(id) | Left::Termed(id) => id.pid(),
+            Left::Resolved(id) | Left::Termed { id, .. } => id.pid(),
             Left::Unread { pid, .. } => *pid,
         }
     }
@@ -810,7 +850,7 @@ pub(crate) fn with_earlier(
         match left {
             // A member a `SIGTERM` walk reached that this kill refuses becomes a refused one: the
             // next kill finds it `Resolved`.
-            Left::Resolved(id) | Left::Termed(id) => {
+            Left::Resolved(id) | Left::Termed { id, .. } => {
                 #[cfg(any(unix, windows))]
                 {
                     let outcome = kill_one(kernel, id);
@@ -1071,7 +1111,9 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -
         };
         #[cfg(test)]
         fault::note_walk(root.pid());
-        if walk.members.is_empty() && walk.unassessed.is_empty() && root_exited(kernel, root) {
+        // An exited root sends nothing, whether or not the walk could read every candidate: a signal to
+        // its zombie reaches no one, and `Ok` would say it reached the tree.
+        if walk.members.is_empty() && root_exited(kernel, root)? {
             return Ok(Terminated::RootExited(exited_root_error(root.pid())));
         }
         // Best effort by contract: a candidate that could not be read is warned of and not signalled.

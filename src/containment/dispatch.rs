@@ -380,8 +380,8 @@ enum TreeState {
     /// told apart by the entry ([`Left`](crate::containment::treewalk::Left)): `Resolved` and `Unread`
     /// are leftovers of a kill that did not kill them, `Termed` members of a `SIGTERM` walk, which
     /// nothing has refused. A kill that finds only `Termed` members gone leaves the tree unvouched all
-    /// the same, unless the call is the one whose own walk listed them
-    /// ([`settle_listing`](TreeKilled::settle_listing)).
+    /// the same, unless the call is the one whose own complete walk reached them
+    /// ([`settle`](TreeKilled::settle)).
     Left(Vec<crate::containment::treewalk::Left>),
     /// A kill ran, and no member it left is held now (each is gone, or the handle never held an
     /// identity for it), but no walk since has vouched for the tree: a member seen running may have
@@ -443,23 +443,46 @@ impl TreeKilled {
 
     /// Holds `members`, which a `SIGTERM` walk found and reached, as members a later kill answers first
     /// ([`Left`](TreeState::Left), as `Termed` entries, not as leftovers of a refused kill): the root's
-    /// exit reparents them out of every later walk, so only their identities reach them. One already
-    /// held, in either kind, is held once.
-    pub(crate) fn hold(&self, members: Vec<crate::identity::ProcessId>) {
-        if members.is_empty() {
-            return;
-        }
+    /// exit reparents them out of every later walk, so only their identities reach them. `complete`:
+    /// the walk read every candidate, so `members` list the tree whole as it saw it. `call` is the call
+    /// that walked, if it will sweep: the returned token is the one its sweep may vouch with, `Some`
+    /// only for a complete walk, and tags the members it reached. A member held already (the same
+    /// process, by pid and start identity, in either kind) is held once, and is tagged by the call
+    /// that reached it now. A tree already killed or left unvouched keeps its state and kind: a walk
+    /// cannot vouch for what an earlier kill did not.
+    pub(crate) fn hold(
+        &self,
+        members: Vec<crate::identity::ProcessId>,
+        complete: bool,
+        call: Option<&crate::containment::treewalk::WalkToken>,
+    ) -> Option<crate::containment::treewalk::WalkToken> {
+        use crate::containment::treewalk::Left;
+
+        let walk = call.filter(|_| complete).cloned();
         let mut state = self.lock();
         let mut held = match &*state {
             TreeState::Left(held) => held.clone(),
-            TreeState::Never | TreeState::Killed | TreeState::Unvouched(_) => Vec::new(),
+            TreeState::Never => Vec::new(),
+            TreeState::Killed | TreeState::Unvouched(_) => return walk,
         };
         for id in members {
-            if !held.iter().any(|left| left.pid() == id.pid()) {
-                held.push(crate::containment::treewalk::Left::Termed(id));
+            match held.iter_mut().find(|member| match member {
+                Left::Resolved(held_id) | Left::Termed { id: held_id, .. } => *held_id == id,
+                Left::Unread { .. } => false,
+            }) {
+                Some(Left::Termed { walk: tagged, .. }) => {
+                    if walk.is_some() {
+                        tagged.clone_from(&walk);
+                    }
+                }
+                Some(_) => {}
+                None => held.push(Left::Termed { id, walk: walk.clone() }),
             }
         }
-        *state = TreeState::Left(held);
+        if !held.is_empty() {
+            *state = TreeState::Left(held);
+        }
+        walk
     }
 }
 
@@ -657,12 +680,15 @@ pub(crate) enum TreeKillOutcome {
     /// error says why. Every other failure is a kill that was attempted, a `TreeWalk`'s
     /// [`Error::MemberNotKilled`] included.
     Unwalked(Error),
-    /// A `TreeWalk` walk found its root, the pid it carries, exited: gone, holding its pid no longer, or
-    /// exited and not yet reaped. Its children were reparented at its exit, so there is no tree to walk
-    /// from, and this kill killed nothing. It is [`Error::Unassessable`]: [`no_root_error`](Self::no_root_error)
-    /// over a tree never settled, [`no_root_after_kills_error`](Self::no_root_after_kills_error) over
-    /// an unvouched one, worded by what the settlement knows of it ([`UnvouchedKind`]).
-    NoRoot(u32),
+    /// A `TreeWalk` walk found its root, the pid it carries, gone, or holding its pid no longer, or (Unix)
+    /// exited and not yet reaped: its children were reparented at its exit, so there is no tree to
+    /// walk from, and this kill killed nothing. It is [`Error::Unassessable`]:
+    /// [`no_root_error`](Self::no_root_error) over a tree never settled,
+    /// [`no_root_after_kills_error`](Self::no_root_after_kills_error) over an unvouched one, worded by
+    /// what the settlement knows of it ([`UnvouchedKind`]). The token, if there is one, is the call
+    /// whose own complete `SIGTERM` walk listed the tree ([`in_call`](Self::in_call)): its sweep may
+    /// stand on that listing.
+    NoRoot(u32, Option<crate::containment::treewalk::WalkToken>),
     /// The root's number is untrusted, so the kill skipped what names the tree by it. The tree is
     /// not killed. The caller that has the root's handle acts on [`Skip::root_alone`].
     #[cfg_attr(
@@ -680,16 +706,28 @@ impl From<Result<(), Unkilled>> for TreeKillOutcome {
 }
 
 impl TreeKillOutcome {
+    /// This outcome for the sweep of the call `call`, whose own complete `SIGTERM` walk listed the tree
+    /// ([`NoRoot`](Self::NoRoot) is the only outcome that stands on it).
+    pub(crate) fn in_call(self, call: Option<&crate::containment::treewalk::WalkToken>) -> TreeKillOutcome {
+        match self {
+            TreeKillOutcome::NoRoot(pid, _) => TreeKillOutcome::NoRoot(pid, call.cloned()),
+            other => other,
+        }
+    }
+
     /// What [`NoRoot`](Self::NoRoot) of the root `pid` is as an error: nothing was killed, because no
     /// walk ran.
     pub(crate) fn no_root_error(pid: u32) -> Error {
-        Error::Unassessable {
-            detail: format!(
-                "the root (pid {pid}) has exited, so its descendants were reparented and a walk from its pid finds \
-                 none: no walk ran and nothing was killed"
-            ),
-            source: None,
-        }
+        #[cfg(unix)]
+        let detail = format!(
+            "the root (pid {pid}) has exited, so its descendants were reparented and a walk from its pid finds \
+             none: no walk ran and nothing was killed"
+        );
+        // Windows never reparents: the pid names no process of this tree any more.
+        #[cfg(not(unix))]
+        let detail =
+            format!("the root's pid ({pid}) names no process of this tree: no walk ran and nothing was killed");
+        Error::Unassessable { detail, source: None }
     }
 
     /// What a [`NoRoot`](Self::NoRoot) is as an error over a tree an earlier kill left unvouched
@@ -708,7 +746,7 @@ impl TreeKillOutcome {
             TreeKillOutcome::Ran(result) | TreeKillOutcome::Answered(result) => result,
             TreeKillOutcome::Skipped(skip) => skip.holders.unwrap_or(Ok(())).map_err(Unkilled::from),
             TreeKillOutcome::Unwalked(error) => Err(Unkilled::from(error)),
-            TreeKillOutcome::NoRoot(pid) => Err(Unkilled::from(Self::no_root_error(pid))),
+            TreeKillOutcome::NoRoot(pid, _) => Err(Unkilled::from(Self::no_root_error(pid))),
         }
     }
 
@@ -739,7 +777,7 @@ impl TreeKillOutcome {
                 format!("the kill was skipped, and would {action}")
             }
             TreeKillOutcome::Unwalked(error) => word(error),
-            TreeKillOutcome::NoRoot(pid) => word(&Self::no_root_error(*pid)),
+            TreeKillOutcome::NoRoot(pid, _) => word(&Self::no_root_error(*pid)),
             TreeKillOutcome::Ran(Ok(())) | TreeKillOutcome::Answered(Ok(())) => {
                 unreachable!("a completed kill has nothing left")
             }
@@ -754,7 +792,7 @@ impl TreeKillOutcome {
             TreeKillOutcome::Ran(_)
             | TreeKillOutcome::Answered(_)
             | TreeKillOutcome::Unwalked(_)
-            | TreeKillOutcome::NoRoot(_) => None,
+            | TreeKillOutcome::NoRoot(..) => None,
         }
     }
 
@@ -918,9 +956,8 @@ impl SweepFailure {
         backstop: Result<(), Error>,
         root: u32,
         root_ended: bool,
-        listed: Option<&[crate::identity::ProcessId]>,
     ) -> Settled<Result<(), SweepFailure>> {
-        tree.settle_for_kill_tree_listing(walk, root_ended, listed).map(|walk| {
+        tree.settle_for_kill_tree(walk, root_ended).map(|walk| {
             let error = match (walk, backstop) {
                 (Ok(()), Ok(())) => return Ok(()),
                 (Err(walk), Ok(())) => walk,
@@ -978,29 +1015,20 @@ impl TreeKilled {
     ///
     /// `kill_tree` reads `root_ended` from its backstop, which it runs for any walk; a drop or a
     /// failed spawn's cleanup reads it from the fate of the root kill it made after the walk.
+    ///
+    /// A gone root whose outcome names a call ([`TreeKillOutcome::in_call`]) is that call's sweep, and
+    /// it may stand on the call's own `SIGTERM` walk, which was a kill's walk before the root exited:
+    /// when every held member is one that walk reached ([`Left::Termed`](crate::containment::treewalk::Left)
+    /// tagged with that call), and each is gone or killed by identity and waited for, the tree is
+    /// vouched for, `Killed`, and the answer `Ok`; a walk that found nothing is an empty listing. The
+    /// limit is `kill_tree`'s: a process forked after the listing is not seen. A tree that holds
+    /// anything else (a refused kill's leftovers, members of a separate `terminate_tree` or of an
+    /// incomplete walk, an unvouched state) is not vouched: the answer is the held members' own.
     pub(crate) fn settle(
         &self,
         mechanism: Option<&Mechanism>,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
-    ) -> Settled {
-        self.settle_listing(mechanism, outcome, root_ended, None)
-    }
-
-    /// [`settle`](Self::settle) for a call whose own `SIGTERM` walk listed the members `listed`, while
-    /// the root ran (`graceful_shutdown_tree`; `None` for any other call, and for a graceful call
-    /// whose walk could not list the tree whole or never ran). That listing is the call's own, as a
-    /// kill's walk is: when the root's exit leaves nothing to walk, the members of it that are gone, or
-    /// killed by identity and waited for, leave the tree vouched for, `Killed`, and the call is `Ok`.
-    /// What a member forked after the listing is the limit `kill_tree` states. A tree that held anything
-    /// but the call's own listing (a refused kill's leftovers, members of a separate `terminate_tree`, an
-    /// unvouched state) is not vouched: that call's answer is the held members' own.
-    pub(crate) fn settle_listing(
-        &self,
-        mechanism: Option<&Mechanism>,
-        outcome: impl Into<TreeKillOutcome>,
-        root_ended: bool,
-        listed: Option<&[crate::identity::ProcessId]>,
     ) -> Settled {
         let outcome = outcome.into();
         let mut state = self.lock();
@@ -1010,23 +1038,24 @@ impl TreeKilled {
             TreeState::Left(held) => held.clone(),
             TreeState::Never | TreeState::Killed | TreeState::Unvouched(_) => Vec::new(),
         };
-        let listing_holds = listed.is_some_and(|listed| match &*state {
-            TreeState::Never | TreeState::Killed => true,
-            TreeState::Left(held) => held
-                .iter()
-                .all(|member| matches!(member, crate::containment::treewalk::Left::Termed(id) if listed.contains(id))),
-            TreeState::Unvouched(_) => false,
-        });
-        let gone_root_pid = match &outcome {
-            TreeKillOutcome::NoRoot(pid) => Some(*pid),
-            _ => None,
+        let (gone_root_pid, call) = match &outcome {
+            TreeKillOutcome::NoRoot(pid, call) => (Some(*pid), call.as_ref()),
+            _ => (None, None),
         };
         let gone_root = gone_root_pid.is_some();
-        // The call's own listing stands for the walk the gone root cannot make.
-        let listing_stands = gone_root && listing_holds;
+        // The call's own walk stands for the walk the gone root cannot make.
+        let listing_stands = call.is_some_and(|call| {
+            match &*state {
+            TreeState::Never | TreeState::Killed => true,
+            TreeState::Left(held) => held.iter().all(|member| {
+                matches!(member, crate::containment::treewalk::Left::Termed { walk: Some(walk), .. } if walk == call)
+            }),
+            TreeState::Unvouched(_) => false,
+        }
+        });
         let ran = matches!(outcome, TreeKillOutcome::Ran(_) | TreeKillOutcome::Answered(_));
         // What a walk not made or a gone root leaves is its error, not a member seen running.
-        let looked_for_no_member = matches!(outcome, TreeKillOutcome::NoRoot(_) | TreeKillOutcome::Unwalked(_));
+        let looked_for_no_member = matches!(outcome, TreeKillOutcome::NoRoot(..) | TreeKillOutcome::Unwalked(_));
         // A walk already covered the tree unless it was never settled: a gone root adds no error of its own.
         let covered = gone_root && (listing_stands || !matches!(*state, TreeState::Never));
         let result = if covered { Ok(()) } else { outcome.into_result() };
@@ -1087,19 +1116,7 @@ impl TreeKilled {
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Settled<Result<(), Error>> {
-        self.settle_for_kill_tree_listing(mechanism, outcome, root_ended, None)
-    }
-
-    /// [`settle_for_kill_tree`](Self::settle_for_kill_tree) for a call with a listing of its own
-    /// ([`settle_listing`](Self::settle_listing)).
-    pub(crate) fn settle_for_kill_tree_listing(
-        &self,
-        mechanism: Option<&Mechanism>,
-        outcome: impl Into<TreeKillOutcome>,
-        root_ended: bool,
-        listed: Option<&[crate::identity::ProcessId]>,
-    ) -> Settled<Result<(), Error>> {
-        self.settle_listing(mechanism, outcome, root_ended, listed)
+        self.settle(mechanism, outcome, root_ended)
             .map(|answer| answer.map(drop))
     }
 
@@ -1137,7 +1154,7 @@ impl TreeKilled {
             TreeKillOutcome::Unwalked(_) => "; the root is killed regardless, so its descendants may be orphaned",
             TreeKillOutcome::Ran(_)
             | TreeKillOutcome::Answered(_)
-            | TreeKillOutcome::NoRoot(_)
+            | TreeKillOutcome::NoRoot(..)
             | TreeKillOutcome::Skipped(_) => "",
         };
         let (left, failure) = match self.settle(mechanism, outcome, root_ended).answer {

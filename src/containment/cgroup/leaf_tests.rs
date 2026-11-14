@@ -1424,8 +1424,8 @@ fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
     let tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(leaf));
     assert!(
         matches!(
-            tree.terminate(0, None),
-            crate::containment::TerminateOutcome::Sent { result: Ok(()), .. }
+            tree.terminate(0, None, None),
+            (crate::containment::TerminateOutcome::Sent { result: Ok(()), .. }, _)
         ),
         "terminate and hard_kill must agree about an already-gone leaf"
     );

@@ -41,13 +41,13 @@ fn take_forced_sweep() -> Option<crate::containment::dispatch::SweepFailure> {
 /// `graceful_shutdown_tree`, which the caller then follows with the grace and the sweep.
 pub(crate) enum SignalTreeCooperativelyOutcome {
     /// The cooperative signal went out, and `result` is what the check after it found; the sweep says
-    /// `earlier` was sent before it. `listed` are the members the call's own `SIGTERM` walk found while
-    /// the root ran and listed whole; `None` where there is no such listing: the walk could not read
-    /// every candidate, or never ran because the root had exited before the call.
+    /// `earlier` was sent before it. `walk` is the token of this call's own complete `SIGTERM` walk,
+    /// which its sweep may stand on; `None` where there is no such walk: it could not read every
+    /// candidate, or never ran because the root had exited before the call.
     Sent {
         result: Result<(), Error>,
         earlier: Option<&'static str>,
-        listed: Option<Vec<crate::identity::ProcessId>>,
+        walk: Option<crate::containment::treewalk::WalkToken>,
     },
     /// The call ends now, with this error: nothing was sent, or what the root's number names was
     /// skipped and nothing else is left to signal.
@@ -283,11 +283,13 @@ impl Child {
     /// still running by their identities and waits for them, and the call returns the root's real
     /// status when every one is gone or killed. A root with no descendants is an empty listing. The
     /// limit is [`kill_tree`](Child::kill_tree)'s: a process forked after the listing, here the
-    /// `SIGTERM` walk, is not seen. A walk that could not read every candidate lists nothing, and the
-    /// call is [`Error::Unassessable`](crate::error::Error::Unassessable) as for a root that had
-    /// already exited before the call, which sends nothing and answers what `kill_tree` answers,
-    /// killing the members a [`terminate_tree`](Child::terminate_tree) reached and held. A root that
-    /// outlives the grace is walked and killed as usual.
+    /// `SIGTERM` walk, is not seen. A walk that could not read every candidate still has its members
+    /// killed by identity, but lists the tree whole for nobody, so the call is
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable), as it is for a root that had already
+    /// exited before the call, which sends nothing and answers what `kill_tree` answers, killing the
+    /// members a [`terminate_tree`](Child::terminate_tree) reached and held. A root that outlives the
+    /// grace is walked and killed as usual, and the members that were reparented meanwhile are killed
+    /// by identity too.
     ///
     /// **macOS, a root the handle cannot vouch for** is signalled as for
     /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A
@@ -311,20 +313,16 @@ impl Child {
         if let Some(forced) = fault::forced_in_place_of_the_signal(root) {
             return forced;
         }
-        match self.tree.terminate(self.pid(), root) {
-            TerminateOutcome::Sent {
-                result,
-                earlier,
-                termed,
-                complete,
-            } => SignalTreeCooperativelyOutcome::Sent {
-                result,
-                earlier,
-                listed: complete.then_some(termed),
-            },
+        // This call's walk is tagged with its own token, which its sweep asks the settlement about.
+        let call = crate::containment::treewalk::WalkToken::new();
+        let (outcome, walk) = self.tree.terminate(self.pid(), root, Some(&call));
+        match outcome {
+            TerminateOutcome::Sent { result, earlier, .. } => {
+                SignalTreeCooperativelyOutcome::Sent { result, earlier, walk }
+            }
             TerminateOutcome::NotSent(not_sent) => SignalTreeCooperativelyOutcome::End(not_sent),
             // The root exited before the call: nothing is left to signal, and the sweep answers what
-            // `kill_tree` does, killing the members the handle holds. There is no listing of its own.
+            // `kill_tree` does, killing the members the handle holds. There is no walk of its own.
             TerminateOutcome::RootExited(exited) => {
                 log::debug!(
                     "graceful_shutdown_tree({}): sent no SIGTERM: {report}",
@@ -334,7 +332,7 @@ impl Child {
                 SignalTreeCooperativelyOutcome::Sent {
                     result: Ok(()),
                     earlier: None,
-                    listed: None,
+                    walk: None,
                 }
             }
             #[cfg(unix)]
@@ -351,7 +349,7 @@ impl Child {
                     Ok(()) => SignalTreeCooperativelyOutcome::Sent {
                         result: Ok(()),
                         earlier: None,
-                        listed: None,
+                        walk: None,
                     },
                 }
             }
@@ -371,7 +369,7 @@ impl Child {
                 SignalTreeCooperativelyOutcome::Sent {
                     result: skip.holders.take().unwrap_or(Ok(())),
                     earlier: None,
-                    listed: None,
+                    walk: None,
                 }
             }
             #[cfg(unix)]
@@ -597,7 +595,7 @@ pub(crate) mod fault {
             super::SignalTreeCooperativelyOutcome::Sent {
                 result: Err(error),
                 earlier: Some("the SIGTERM"),
-                listed: None,
+                walk: None,
             }
         })
     }

@@ -1,4 +1,6 @@
-use super::{parse_pgrp, parse_ppid, parse_starttime_jiffies, parse_state, running_from_stat, stat_fixture};
+use super::{
+    parse_num_threads, parse_pgrp, parse_ppid, parse_starttime_jiffies, parse_state, running_from_stat, stat_fixture,
+};
 use crate::identity::Liveness;
 
 fn tok(v: u64) -> u64 {
@@ -107,6 +109,29 @@ fn running_from_stat_sleeping_state_matching_token() {
 fn running_from_stat_zombie_is_dead() {
     let stat = stat_fixture("Z", 8675309);
     assert_eq!(running_from_stat(&stat, tok(8675309)), Liveness::Dead);
+}
+
+/// A zombie `stat` whose process still has `threads` live threads: the fixture's `num_threads` (field
+/// 20, the `1` after `priority nice`) changed.
+fn zombie_with_threads(threads: u64) -> Vec<u8> {
+    let stat = String::from_utf8(stat_fixture("Z", 8675309)).expect("a utf-8 fixture");
+    stat.replacen(" 20 0 1 0 ", &format!(" 20 0 {threads} 0 "), 1)
+        .into_bytes()
+}
+
+/// A process whose leader thread exited while another still runs shows `Z` and the live threads: it
+/// has not exited. Mutant: any `Z` is dead.
+#[skuld::test]
+fn running_from_stat_zombie_leader_with_a_live_thread_is_alive() {
+    let stat = zombie_with_threads(2);
+    assert_eq!(parse_num_threads(&stat), Some(2));
+    assert_eq!(running_from_stat(&stat, tok(8675309)), Liveness::Alive);
+}
+
+#[skuld::test]
+fn running_from_stat_zombie_with_one_thread_is_dead() {
+    assert_eq!(parse_num_threads(&zombie_with_threads(1)), Some(1));
+    assert_eq!(running_from_stat(&zombie_with_threads(1), tok(8675309)), Liveness::Dead);
 }
 
 #[skuld::test]

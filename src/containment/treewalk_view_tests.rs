@@ -222,6 +222,53 @@ fn every_walk_from_a_root_that_lost_its_pid_signals_nothing_and_a_kill_is_unasse
     }
 }
 
+/// A root whose state cannot be read, whose walk finds no member, is `Unassessable` with nothing
+/// signalled: neither an exit nor a running root can be told, and a walk that found nothing says
+/// nothing of the tree either way. The root's `stat` is read by the snapshot, by the anchor, and then by
+/// the check that the walk's root has not exited, which finds a record it cannot parse. Mutant: an
+/// unreadable state is "not exited".
+#[skuld::test]
+fn every_id_walk_from_a_root_whose_state_cannot_be_read_is_unassessable_and_signals_nothing() {
+    for (name, walk) in id_walks() {
+        let (child, id) = live_member();
+        let id = ticks_id(id.pid());
+        let pid = id.pid();
+        let kernel = FakeKernel::over(&HostKernel)
+            .live_without_pidfs(pid, pidfd_of(pid))
+            .on_read_after(&format!("{pid}/stat"), 2, Ok(&b"not a stat record"[..]));
+        let result = walk(&kernel, id);
+        assert!(
+            matches!(&result, Err(Error::Unassessable { detail, .. }) if detail.contains("has exited could not be read")),
+            "{name}: {result:?}"
+        );
+        release(child);
+    }
+}
+
+/// `pid`'s `stat` as the kernel gives it now, except for the state: a zombie's.
+fn stat_as_a_zombie(pid: u32) -> Vec<u8> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("the live pid's stat");
+    let (head, tail) = stat.rsplit_once(')').expect("stat names its command in parentheses");
+    let mut fields: Vec<String> = tail.split_whitespace().map(str::to_owned).collect();
+    // `tail` starts at field 3, the state.
+    fields[0] = "Z".to_owned();
+    format!("{head}) {}\n", fields.join(" ")).into_bytes()
+}
+
+/// A root that has exited sends nothing, whether or not the walk could read every candidate: a signal
+/// to its zombie reaches no one, and `Ok` would say it reached the tree. Mutant: an exited root with an
+/// unread candidate is walked and signalled.
+#[skuld::test]
+fn terminate_over_an_exited_root_with_an_unreadable_candidate_sends_nothing() {
+    let (child, root, _, kernel) = root_with_an_unreadable_descendant();
+    let kernel = kernel.on_read(&format!("{}/stat", root.pid()), Ok(&stat_as_a_zombie(root.pid())));
+
+    let walked = super::terminate(&kernel, root, &super::ByIdentity::new(&kernel, root)).expect("the table reads");
+
+    assert!(matches!(walked, super::Terminated::RootExited(_)), "nothing is sent");
+    release(child);
+}
+
 /// A root whose pid cannot be queried is an error naming the pid and the view, with nothing
 /// signalled. Mutants: "an unqueryable root is treated as gone"; "the anchor is skipped". The
 /// `/proc` path: only a `starttime` id is proved through the view; a `pidfs` id is proved by its

@@ -156,7 +156,11 @@ struct SurvivorTree {
 }
 
 fn survivor_tree() -> SurvivorTree {
-    let argv = crate::test_child::TERM_SURVIVOR_TREE_ARGV;
+    tree_of(crate::test_child::TERM_SURVIVOR_TREE_ARGV)
+}
+
+/// [`survivor_tree`] over `argv`, which prints `r\n` once its descendants exist.
+fn tree_of(argv: &[&str]) -> SurvivorTree {
     let mut child = crate::test_spawn::spawn(
         std::process::Command::new(argv[0])
             .args(&argv[1..])
@@ -203,6 +207,36 @@ fn foreign_graceful_shutdown_tree_kills_a_member_that_ignores_the_sigterm_after_
     }
     let status = tree.child.wait().expect("reap the root");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
+}
+
+// A root that ignores the `SIGTERM` outlives the grace, and the `SIGTERM` ends its child, which
+// reparents the member below it out of the sweep's walk from the root. The member the call's own walk
+// reached is killed by identity all the same, as a `Child`'s tree does through its settlement, and the
+// call is `Ok`.
+//
+// Mutant: the sweep kills only what the walk from the live root finds.
+#[skuld::test]
+fn foreign_graceful_shutdown_tree_kills_a_member_reparented_while_the_root_outlives_the_grace() {
+    let mut tree = tree_of(crate::test_child::ROOT_OUTLIVING_THE_GRACE_ARGV);
+    assert_eq!(tree.members.len(), 2, "the child and the member below it");
+
+    tree.process
+        .graceful_shutdown_tree(Duration::ZERO)
+        .expect("the member its walk reached is killed by identity");
+
+    for member in &tree.members {
+        assert_eq!(
+            member.is_alive(),
+            crate::identity::Liveness::Dead,
+            "{member:?} is killed or ended by the SIGTERM"
+        );
+    }
+    let status = tree.child.wait().expect("reap the root");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the sweep killed the live root: {status:?}"
+    );
 }
 
 // A walk from an exited root finds nothing, so `kill_tree` says it could not see the tree.

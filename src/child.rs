@@ -9,6 +9,7 @@ use crate::command::Command;
 use crate::containment::dispatch::{SweepFailure, Swept, TeardownCaller};
 #[cfg(unix)]
 use crate::containment::dispatch::{TreeKillOutcome, TreeSignal};
+use crate::containment::treewalk::WalkToken;
 use crate::containment::{Containment, TerminateOutcome};
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -697,16 +698,15 @@ impl Child {
     /// what it reports. The [`Swept`] has the answer, which says whether the root is dead all the same
     /// on a failure ([`SweepFailure`]), and the wait for what the kill reached: a caller that waits
     /// [`wait`](Swept::wait)s, and one that sends alone takes the [`answer`](Swept::answer).
-    /// `listed`: the members the call's own `SIGTERM` walk found while the root ran and listed whole
-    /// (`graceful_shutdown_tree`), which stand for the walk a root that has exited cannot make
-    /// ([`TreeKilled::settle_listing`](crate::containment::dispatch::TreeKilled::settle_listing)).
+    /// `call`: the call whose own complete `SIGTERM` walk the sweep may stand on when the root has
+    /// exited (`graceful_shutdown_tree`, [`TreeKilled::settle`](crate::containment::dispatch::TreeKilled::settle)).
     pub(crate) fn kill_tree_after(
         &self,
         op: &'static str,
         earlier: Option<&str>,
-        listed: Option<&[ProcessId]>,
+        call: Option<&WalkToken>,
     ) -> Swept<'_> {
-        self.sweep(op, earlier, listed, KillTree::Waiting)
+        self.sweep(op, earlier, call, KillTree::Waiting)
     }
 
     /// [`kill_tree_after`](Self::kill_tree_after) for a caller that sends and does not wait: the tree
@@ -717,13 +717,7 @@ impl Child {
 
     /// The sweep behind both: the kill, its settlement and the root's backstop. Only the
     /// [`Waiting`](KillTree::Waiting) one reads the members its kill will reach.
-    fn sweep(
-        &self,
-        op: &'static str,
-        earlier: Option<&str>,
-        listed: Option<&[ProcessId]>,
-        kind: KillTree,
-    ) -> Swept<'_> {
+    fn sweep(&self, op: &'static str, earlier: Option<&str>, call: Option<&WalkToken>, kind: KillTree) -> Swept<'_> {
         #[cfg(not(unix))]
         let _ = earlier;
         if let Err(e) = self.require_contained() {
@@ -823,7 +817,7 @@ impl Child {
                     .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user())),
             )
         };
-        let settled = SweepFailure::of(&self.tree, group_result, backstop, self.pid(), root_ended, listed);
+        let settled = SweepFailure::of(&self.tree, group_result.in_call(call), backstop, self.pid(), root_ended);
         wait.reaching(settled.killed_again);
         // A root launchd holds is not ours to wait on: nothing of ours killed it.
         Swept::new(
@@ -920,7 +914,8 @@ impl Child {
         // off until the signal is sent.
         let held = self.proc.hold(self.pid());
         let root: Option<&dyn crate::containment::Root> = Some(&held);
-        let outcome = self.tree.terminate(self.pid(), root);
+        // A separate `terminate_tree` is no call that sweeps: it holds its members for the next kill.
+        let (outcome, _) = self.tree.terminate(self.pid(), root, None);
         #[cfg(unix)]
         {
             let call = self.skip_call("terminate_tree", TreeSignal::Term, None);

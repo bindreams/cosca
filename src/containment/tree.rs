@@ -7,6 +7,7 @@ use crate::containment::drain_edge::DrainEdge;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{Contains, Mechanism};
+use crate::containment::treewalk::WalkToken;
 use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
 use crate::error::Error;
 
@@ -200,30 +201,49 @@ impl Tree {
 
     /// Send the graceful termination signal to the tree (signal-only), as [`kill`](Self::kill) decides
     /// it from `root`: the outcome says what went out, or what was skipped and what the caller does
-    /// about it.
-    pub(crate) fn terminate(&self, pid: u32, root: Option<&dyn Root>) -> TerminateOutcome {
+    /// about it. The members a walk reached are held for the next kill, which cannot walk to them once
+    /// the root has exited ([`hold_walked`](Self::hold_walked)); `call`, the call that will sweep, and
+    /// the token its sweep may vouch with come back as there.
+    pub(crate) fn terminate(
+        &self,
+        pid: u32,
+        root: Option<&dyn Root>,
+        call: Option<&WalkToken>,
+    ) -> (TerminateOutcome, Option<WalkToken>) {
         match &self.holder {
             Holder::None | Holder::Delegated => {
                 debug_assert!(false, "Tree::terminate on a tree that is not contained");
-                TerminateOutcome::NotSent(Error::Unsupported {
+                let not_sent = TerminateOutcome::NotSent(Error::Unsupported {
                     op: "terminate on a non-actionable mechanism".into(),
                     platform: std::env::consts::OS,
                     detail: "internal invariant: a non-actionable mechanism reached terminate".into(),
                     source: None,
-                })
+                });
+                (not_sent, None)
             }
             Holder::Contained(mechanism) => {
                 debug_assert!(!self.released, "a send on a released tree");
-                let outcome = mechanism.send_terminate(pid, root);
-                // The members a walk reached are held for the next kill, which cannot walk to them once
-                // the root has exited. The outcome keeps them: the call that walked them may vouch for
-                // them ([`TreeKilled::settle_listing`]).
-                if let TerminateOutcome::Sent { termed, .. } = &outcome {
-                    self.killed.hold(termed.clone());
-                }
-                outcome
+                let mut outcome = mechanism.send_terminate(pid, root);
+                let walk = match &mut outcome {
+                    TerminateOutcome::Sent { termed, complete, .. } => {
+                        self.hold_walked(std::mem::take(termed), *complete, call)
+                    }
+                    _ => None,
+                };
+                (outcome, walk)
             }
         }
+    }
+
+    /// Holds the members a `SIGTERM` walk reached ([`TreeKilled::hold`]), and returns the token `call`'s
+    /// sweep may vouch with: the one place that a walk's completeness decides it.
+    pub(crate) fn hold_walked(
+        &self,
+        members: Vec<crate::identity::ProcessId>,
+        complete: bool,
+        call: Option<&WalkToken>,
+    ) -> Option<WalkToken> {
+        self.killed.hold(members, complete, call)
     }
 
     /// Whether a kill sent through the mechanism would reach `pid` whatever its credentials (see
@@ -353,25 +373,12 @@ impl Tree {
     }
 
     /// [`settle`](Self::settle) for a `kill_tree` call: the error holds every member left.
-    #[cfg(unix)]
     pub(crate) fn settle_for_kill_tree(
         &self,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Settled<Result<(), Error>> {
         self.killed.settle_for_kill_tree(self.named_by(), outcome, root_ended)
-    }
-
-    /// [`settle_for_kill_tree`](Self::settle_for_kill_tree) for a call whose own `SIGTERM` walk listed
-    /// the members `listed` ([`TreeKilled::settle_listing`]).
-    pub(crate) fn settle_for_kill_tree_listing(
-        &self,
-        outcome: impl Into<TreeKillOutcome>,
-        root_ended: bool,
-        listed: Option<&[crate::identity::ProcessId]>,
-    ) -> Settled<Result<(), Error>> {
-        self.killed
-            .settle_for_kill_tree_listing(self.named_by(), outcome, root_ended, listed)
     }
 
     /// [`Contains::root_left`] of this tree's mechanism. A tree that holds none is not reached:
