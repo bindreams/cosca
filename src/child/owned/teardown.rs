@@ -114,7 +114,7 @@ pub(crate) struct Kill<'a> {
 pub(crate) trait Reach {
     /// `Ok(true)`: the kill landed and reached `child`, so its exit follows. `Err`: where `child` is
     /// could not be read, so whether the kill reached it is not known.
-    fn reached(&self, child: &OwnedChild) -> io::Result<bool>;
+    fn reached(&self, child: &OwnedChild) -> Result<bool, Error>;
 }
 
 /// How the look at an elevation front went ([`OwnedChild::look_at_front`]). The policy words none
@@ -133,10 +133,10 @@ pub(crate) enum LookOutcome {
     LeftRunning,
     /// It is running and where it is could not be read, so whether a kill reached it is not known:
     /// it is left unreaped, or handed back by a caller that does ([`Disposition::HandBack`]).
-    PlaceUnreadable(io::Error),
+    PlaceUnreadable(Error),
     /// It is running and the subtree the kill went through could not be read, so whether it reached
     /// the front is not known: it is left unreaped, or handed back as above.
-    SubtreeUnreadable(io::Error),
+    SubtreeUnreadable(Error),
 }
 
 /// How a look at an elevation front went ([`OwnedChild::look_at_front`]): the front's fate, and the
@@ -562,19 +562,30 @@ impl OwnedChild {
                 }
                 BeginOutcome::Wait(wait)
             }
-            Err(refused) => match tree.map(|tree| tree.reached(self)) {
-                // The tree's kill reached it, and is asynchronous: one look would race it. Its exit
-                // follows, so the reap is the wait that kill bounds.
-                Some(Ok(true)) => BeginOutcome::Wait(self.begin_reap_after_tree_kill(
-                    id,
-                    self.teardown_subject(),
-                    disposition,
-                    warn_after,
-                )),
-                // No tree kill, one that missed the child, or one whose reach cannot be read: nothing
-                // is shown to be ending it.
-                _ => BeginOutcome::Done(self.look_after_refused_kill(id, refused, disposition)),
-            },
+            Err(refused) => {
+                let reached = tree.map(|tree| tree.reached(self));
+                // Only logged: the look words the kill's refusal, and an unreadable reach changes no outcome.
+                if let Some(Err(unread)) = &reached {
+                    log::debug!(
+                        "{}: whether the tree kill reached it cannot be read ({}); looking as after a refused kill",
+                        child_named(self.pid()),
+                        crate::error::Report(unread)
+                    );
+                }
+                match reached {
+                    // The tree's kill reached it, and is asynchronous: one look would race it. Its exit
+                    // follows, so the reap is the wait that kill bounds.
+                    Some(Ok(true)) => BeginOutcome::Wait(self.begin_reap_after_tree_kill(
+                        id,
+                        self.teardown_subject(),
+                        disposition,
+                        warn_after,
+                    )),
+                    // No tree kill, one that missed the child, or one whose reach cannot be read: nothing
+                    // is shown to be ending it.
+                    _ => BeginOutcome::Done(self.look_after_refused_kill(id, refused, disposition)),
+                }
+            }
         }
     }
 
@@ -645,7 +656,7 @@ impl OwnedChild {
     pub(crate) fn look_at_front(
         &self,
         id: Option<ProcessId>,
-        reach: Result<Option<&dyn Reach>, io::Error>,
+        reach: Result<Option<&dyn Reach>, Error>,
         warn_after: Option<Duration>,
     ) -> FrontLook {
         match self.begin_look_at_front(id, reach, warn_after) {
@@ -664,7 +675,7 @@ impl OwnedChild {
     pub(crate) fn begin_look_at_front(
         &self,
         id: Option<ProcessId>,
-        reach: Result<Option<&dyn Reach>, io::Error>,
+        reach: Result<Option<&dyn Reach>, Error>,
         warn_after: Option<Duration>,
     ) -> BeginOutcome<FrontLook, FrontWait> {
         let looked = Settlement::new(self.wait(Some(crate::wait::now())), false);

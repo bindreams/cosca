@@ -972,11 +972,11 @@ impl Contains for Marker {
 
     /// A signal to a marker's holders is subject to the kernel's permission check, as the child's own
     /// kill is.
-    fn would_reach(&self, _pid: u32, _pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+    fn would_reach(&self, _pid: u32, _pidfd: Option<BorrowedFd<'_>>) -> Result<bool, crate::error::Error> {
         Ok(false)
     }
 
-    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> io::Result<bool> {
+    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> Result<bool, crate::error::Error> {
         Ok(false)
     }
 

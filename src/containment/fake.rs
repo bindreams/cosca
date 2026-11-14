@@ -149,12 +149,12 @@ impl Contains for FakeContains {
     }
 
     #[cfg(unix)]
-    fn would_reach(&self, _pid: u32, _pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> std::io::Result<bool> {
+    fn would_reach(&self, _pid: u32, _pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> Result<bool, crate::error::Error> {
         Ok(self.reaches)
     }
 
     #[cfg(unix)]
-    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
+    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> Result<bool, crate::error::Error> {
         Ok(self.reaches)
     }
 

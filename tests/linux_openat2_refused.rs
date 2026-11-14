@@ -263,32 +263,9 @@ fn a_seccomp_refused_openat2_makes_kill_tree_and_terminate_tree_of_a_session_uns
             ]
         });
         for (call, result) in results {
-            let err = result.expect_err("a refused listing must fail");
-            let cosca::error::Error::Unsupported {
-                op, platform, detail, ..
-            } = &err
-            else {
-                panic!("{call} under {name}: expected Unsupported, got {err:?}");
-            };
-            assert_eq!(*platform, "linux", "{call} under {name}");
-            assert_eq!(op, &format!("listing process group {pgid}"), "{call} under {name}");
-            assert_eq!(detail, "the group could not be listed", "{call} under {name}");
-            assert_eq!(
-                cosca::error::Report::new(&err).to_string(),
-                format!(
-                    "listing process group {pgid} is not supported on linux: the group could not be listed: \
-                     an I/O operation failed: containment::unix::group::members: {}, so pgid {pgid} cannot be \
-                     listed: an I/O operation failed: {}",
-                    refused_detail(name),
-                    std::io::Error::from_raw_os_error(errno)
-                ),
-                "{call} under {name}"
-            );
-            assert_eq!(
-                os_code(&err),
-                Some(errno),
-                "{call} under {name}: the errno is the source"
-            );
+            // The shape the snapshot's refusal has: the requirement is the detail, the errno the source.
+            let op = assert_unsupported_naming(result, (errno, name), call);
+            assert_eq!(op, format!("listing process group {pgid}"), "{call} under {name}");
         }
         common::kill_tree_release_reap(&child, control);
     }

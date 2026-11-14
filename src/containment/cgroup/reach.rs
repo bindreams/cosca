@@ -17,6 +17,7 @@ use std::sync::Arc;
 use super::parse::{is_at_or_under, parse_v2_relative_path};
 use super::KillRecord;
 use crate::child::owned::teardown::Reach;
+use crate::error::Error;
 use crate::os_process::child::PeekOutcome;
 use crate::os_process::linux::fork::{fork_with_pidfd, Fork, Path};
 use crate::wait::exit_only::linux::peek;
@@ -73,40 +74,38 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> 
 /// (see [`names_leaf`]): `other_id` says the task's pidfd gave a cgroup id other than the leaf's,
 /// and `recorded` answers for the leaf's own path with ` (deleted)` after it.
 ///
-/// Reads `pid`'s cgroup through `kernel`. A refusal is an `Unsupported` error, carried as the
-/// `io::Error` this returns; a pid that is not there for us fails with the read's own error; any
-/// other failure is the [`Unreadable`](crate::identity::pid_file::Unreadable), which names the pid and
-/// its file (with the pid's `EPERM` beside a failed re-check).
+/// Reads `pid`'s cgroup through `kernel`. A refusal is an
+/// [`Error::Unsupported`](crate::error::Error::Unsupported); a pid that is not there for us fails with the
+/// read's own error; any other failure is an [`Error::Io`](crate::error::Error::Io) of the
+/// [`Unreadable`](crate::identity::pid_file::Unreadable), which names the pid and its file.
 pub(crate) fn proc_names(
     kernel: &dyn crate::identity::Kernel,
     leaf_path: &str,
     pid: u32,
     recorded: impl FnOnce() -> Option<bool>,
     other_id: bool,
-) -> io::Result<bool> {
+) -> Result<bool, Error> {
     use crate::identity::pid_file::ReadOutcome;
 
     let proc_dir = match crate::identity::proc_view_with(kernel) {
         crate::identity::ProcView::Same(dir) => dir,
         crate::identity::ProcView::Diverged => {
-            return Err(io::Error::other(format!(
+            return Err(Error::Io(io::Error::other(format!(
                 "{}, so pid {pid}'s cgroup cannot be read",
                 crate::identity::DIVERGED_REASON
-            )));
+            ))));
         }
         crate::identity::ProcView::Unassessable(why) => return Err(view_unreadable(pid, why)),
     };
     let text = match read_cgroup(kernel, &proc_dir, pid) {
         Ok(ReadOutcome::Read(bytes)) => crate::identity::utf8(bytes)?,
-        Ok(ReadOutcome::Exited(e) | ReadOutcome::Hidden(e)) => return Err(e),
-        Ok(ReadOutcome::Refused(refusal)) => {
-            return Err(refusal.unsupported_io(format!("reading pid {pid}'s cgroup")));
-        }
-        Err(unreadable) => return Err(unreadable.into_io()),
+        Ok(ReadOutcome::Exited(e) | ReadOutcome::Hidden(e)) => return Err(Error::Io(e)),
+        Ok(ReadOutcome::Refused(refusal)) => return Err(refusal.unsupported(format!("reading pid {pid}'s cgroup"))),
+        Err(unreadable) => return Err(Error::Io(unreadable.into_io())),
     };
     let path = parse_v2_relative_path(&text)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cgroup v2 `0::` line"))?;
-    names_leaf(path, leaf_path, other_id, recorded)
+    names_leaf(path, leaf_path, other_id, recorded).map_err(Error::Io)
 }
 
 /// `pid`'s cgroup file through [`pid_file::read`](crate::identity::pid_file::read). A test build
@@ -125,17 +124,18 @@ fn read_cgroup(
 }
 
 /// The error of reading `pid`'s cgroup through a `/proc` view that could not be established, `why`:
-/// `Unsupported` naming the requirement when the view was refused, as a refused cgroup read is;
-/// otherwise of the view's error's kind, with that error as its source.
-fn view_unreadable(pid: u32, why: crate::identity::ViewUnreadable) -> io::Error {
+/// an [`Error::Unsupported`](crate::error::Error::Unsupported) naming the requirement when the view was
+/// refused, as a refused cgroup read is; otherwise an [`Error::Io`](crate::error::Error::Io) of the view's
+/// error's kind, with that error as its source.
+fn view_unreadable(pid: u32, why: crate::identity::ViewUnreadable) -> Error {
     if let Some(refusal) = why.refusal() {
-        return refusal.unsupported_io(format!("reading pid {pid}'s cgroup"));
+        return refusal.unsupported(format!("reading pid {pid}'s cgroup"));
     }
     let context = format!(
         "the /proc view could not be established, so pid {pid}'s cgroup cannot be read: {}",
         why.reason
     );
-    crate::error::io_context_or_other(context, why.source)
+    Error::Io(crate::error::io_context_or_other(context, why.source))
 }
 
 /// What `/proc/<pid>/cgroup` prints after the path of a removed cgroup.
@@ -235,7 +235,7 @@ impl Subtree {
     /// outside if the walk finds it nowhere (see [`walk_places`](Self::walk_places)). Otherwise,
     /// before 6.13 or when the walk cannot tell, by `/proc/<pid>/cgroup`'s path. A subtree with no
     /// unified-hierarchy path (a test leaf) holds nothing that read would place.
-    pub(crate) fn holds(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+    pub(crate) fn holds(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> Result<bool, Error> {
         self.holds_seen(pid, pidfd, None).map(|(inside, _)| inside)
     }
 
@@ -245,13 +245,14 @@ impl Subtree {
     /// still in that cgroup is where it was, so no walk of the leaf's descendants is made for it, and
     /// the leaf's own id is not needed. Where the leaf's id is unknown, the pidfd route answers only
     /// from `seen` or a known id, and `/proc` places any other task; an `ESRCH` from the pidfd is the
-    /// task's exit and is returned.
+    /// task's exit and is returned. A refusal of the `/proc` read is returned as it is
+    /// ([`Error::Unsupported`]): the read of a cgroup that is not the leaf's adds no context to it.
     pub(crate) fn holds_seen(
         &self,
         pid: u32,
         pidfd: Option<BorrowedFd<'_>>,
         seen: Option<u64>,
-    ) -> io::Result<(bool, Option<u64>)> {
+    ) -> Result<(bool, Option<u64>), Error> {
         let mut elsewhere = false;
         let id = match pidfd {
             Some(pidfd) if self.leaf_id.is_some() || seen.is_some() || !self.swept.is_empty() => {
@@ -267,7 +268,7 @@ impl Subtree {
                         );
                         None
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(Error::Io(e)),
                 }
             }
             _ => None,
@@ -294,18 +295,15 @@ impl Subtree {
             elsewhere,
         )
         .map(|inside| (inside, None))
-        .map_err(|e| {
-            if elsewhere {
-                crate::error::io_context(
-                    format!(
-                        "pid {pid} is in another cgroup than its leaf, maybe one under it, and that cgroup's path \
-                             cannot be read"
-                    ),
-                    e,
-                )
-            } else {
-                e
-            }
+        .map_err(|e| match e {
+            Error::Io(e) if elsewhere => Error::Io(crate::error::io_context(
+                format!(
+                    "pid {pid} is in another cgroup than its leaf, maybe one under it, and that cgroup's path \
+                         cannot be read"
+                ),
+                e,
+            )),
+            other => other,
         })
     }
 
@@ -370,7 +368,7 @@ impl Subtree {
     /// only then does the task's exit follow, so only then may it be waited for. `seen` is as in
     /// [`holds_seen`](Self::holds_seen): the pidfd route answers from it when the leaf's id is
     /// unknown. This is the one check that a kill reached a task.
-    pub(crate) fn reached_by(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>, seen: Option<u64>) -> io::Result<bool> {
+    pub(crate) fn reached_by(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>, seen: Option<u64>) -> Result<bool, Error> {
         if !self.killed.landed() {
             return Ok(false);
         }
@@ -381,10 +379,12 @@ impl Subtree {
 impl Reach for Subtree {
     /// [`Subtree::reached_by`], asked with the child's pid and pidfd. A child with no pid cannot be placed: it
     /// has no number to ask `/proc` with, so whether the kill reached it is not known.
-    fn reached(&self, child: &crate::child::owned::OwnedChild) -> io::Result<bool> {
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> Result<bool, Error> {
         match child.pid() {
             Some(pid) => self.reached_by(pid, child.pidfd(), None),
-            None => Err(io::Error::other("the child's pid is not known, so it cannot be placed")),
+            None => Err(Error::Io(io::Error::other(
+                "the child's pid is not known, so it cannot be placed",
+            ))),
         }
     }
 }

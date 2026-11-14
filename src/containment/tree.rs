@@ -243,7 +243,11 @@ impl Tree {
     /// Whether a kill sent through the mechanism would reach `pid` whatever its credentials (see
     /// [`Contains::would_reach`]): `false` for a tree that is none or delegated.
     #[cfg(unix)]
-    pub(crate) fn would_reach(&self, pid: u32, pidfd: Option<std::os::fd::BorrowedFd<'_>>) -> std::io::Result<bool> {
+    pub(crate) fn would_reach(
+        &self,
+        pid: u32,
+        pidfd: Option<std::os::fd::BorrowedFd<'_>>,
+    ) -> Result<bool, crate::error::Error> {
         match &self.holder {
             Holder::None | Holder::Delegated => {
                 debug_assert!(!self.released, "a send on a released tree");
@@ -405,7 +409,7 @@ impl Tree {
 /// tree that is none or delegated.
 #[cfg(unix)]
 impl crate::child::owned::teardown::Reach for Tree {
-    fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> Result<bool, crate::error::Error> {
         match &self.holder {
             Holder::None | Holder::Delegated => Ok(false),
             _ if self.released => Ok(false),

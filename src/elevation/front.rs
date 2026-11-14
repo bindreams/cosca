@@ -90,7 +90,7 @@ pub(crate) fn kill_gate(
     front: Option<Front>,
     pid: u32,
     running: impl Fn() -> io::Result<bool>,
-    in_cgroup: impl FnOnce() -> io::Result<bool>,
+    in_cgroup: impl FnOnce() -> Result<bool, Error>,
 ) -> Gate {
     #[cfg(test)]
     seams::note_kill_gate();
@@ -101,7 +101,7 @@ pub(crate) fn kill_gate(
     match running() {
         Ok(false) => return Gate::Exited,
         Ok(true) => {}
-        Err(e) => unread.push(("whether it had exited could not be read", e)),
+        Err(e) => unread.push(("whether it had exited could not be read", Error::Io(e))),
     }
     #[cfg(test)]
     seams::run_between_gate_reads();
@@ -120,7 +120,7 @@ pub(crate) fn kill_gate(
 }
 
 /// Failed reads of a gate.
-type Unread = Vec<(&'static str, io::Error)>;
+type Unread = Vec<(&'static str, Error)>;
 
 /// A refusal's reason: its words and, if any, its cause.
 struct Reason {
@@ -141,7 +141,7 @@ impl Reason {
 /// one failure, or a [`Error::Several`] of them in the order they failed.
 fn unread_reason(unread: Unread) -> Option<Reason> {
     let words = unread.iter().map(|(what, _)| *what).collect::<Vec<_>>().join("; ");
-    let cause = Failures::collect(unread.into_iter().map(|(_, e)| Error::io_cause(e)))?.into_cause();
+    let cause = Failures::collect(unread.into_iter().map(|(_, e)| std::sync::Arc::new(e)))?.into_cause();
     Some(Reason {
         words,
         cause: Some(cause),
@@ -166,7 +166,7 @@ pub(crate) fn cgroup_kill_reached(
     front: Front,
     pid: u32,
     exited: impl Fn() -> io::Result<bool>,
-    under_leaf: impl FnOnce() -> io::Result<bool>,
+    under_leaf: impl FnOnce() -> Result<bool, Error>,
 ) -> Result<(), Error> {
     let exited = || {
         #[cfg(test)]
@@ -179,7 +179,7 @@ pub(crate) fn cgroup_kill_reached(
     match exited() {
         Ok(true) => return Ok(()),
         Ok(false) => {}
-        Err(e) => unread.push(("whether it had exited could not be read", e)),
+        Err(e) => unread.push(("whether it had exited could not be read", Error::Io(e))),
     }
     #[cfg(test)]
     seams::run_between_reach_reads();
@@ -239,7 +239,7 @@ pub(crate) fn terminate_gate(front: Option<Front>, pid: u32, running: impl FnOnc
             front,
             pid,
             Signal::Term,
-            unread_reason(vec![("whether it had exited could not be read", e)]),
+            unread_reason(vec![("whether it had exited could not be read", Error::Io(e))]),
         )),
     }
 }

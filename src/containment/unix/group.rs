@@ -34,6 +34,26 @@ pub(crate) struct Member {
     pub(crate) system: bool,
 }
 
+/// Why a process group could not be listed.
+#[derive(Debug)]
+pub(crate) enum ListingFailure {
+    /// The listing can never work here: a [`Refusal`](crate::identity::Refusal) of `openat2`, or of the
+    /// `pidfd_open` of a member, as the [`Error::Unsupported`] built where it was met
+    /// ([`refused_error`]). The caller answers with it, not with an unassessable group.
+    #[cfg_attr(target_os = "macos", allow(dead_code, reason = "only Linux's listing is refused"))]
+    Unsupported(Error),
+    /// The listing failed this time, or nothing can be said of the group; the failure says why.
+    Failed(std::io::Error),
+}
+
+/// The `Error::Unsupported` of a listing of process group `pgid` that `refusal` ended, met at `pid` when
+/// it was a member's.
+#[cfg(target_os = "linux")]
+fn refused_error(refusal: &crate::identity::Refusal, pgid: i32, pid: Option<RawPid>) -> Error {
+    let at = pid.map_or(String::new(), |pid| format!(" at pid {pid}"));
+    refusal.unsupported(format!("listing process group {pgid}{at}"))
+}
+
 /// Every process the kernel currently lists in process group `pgid`. An empty result means
 /// the group holds nothing — not an error.
 ///
@@ -41,8 +61,10 @@ pub(crate) struct Member {
 /// unprivileged (verified, this file's Background) and reports each member's start time in
 /// the same record as its pid. libproc's `proc_listpgrppids` is deliberately NOT used: it
 /// returns a COUNT where its siblings return bytes, and it carries no start time.
+///
+/// Every `sysctl` failure is [`ListingFailure::Failed`], whatever its errno: macOS has no refusal table.
 #[cfg(target_os = "macos")]
-pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::io::Result<Vec<Member>> {
+pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> Result<Vec<Member>, ListingFailure> {
     use crate::identity::kinfo::kinfo_proc;
 
     const RECORD: usize = std::mem::size_of::<kinfo_proc>();
@@ -75,7 +97,7 @@ pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::
             if e.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            return Err(e);
+            return Err(ListingFailure::Failed(e));
         }
         // No `len == 0` early return here: measured directly (Background), the sizing query
         // is always padded by xnu's `KERN_PROCSLOP` and so is never literally 0, even for a
@@ -110,7 +132,7 @@ pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::
             if e.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            return Err(e);
+            return Err(ListingFailure::Failed(e));
         }
         // A partial trailing record means the kernel's `kinfo_proc` no longer matches this
         // crate's 648-byte definition — the same ENOMEM-is-the-only-runtime-detector situation
@@ -119,10 +141,10 @@ pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::
         // stride, which would silently produce garbage `p_pid` values that `converge` would
         // then send a real signal to.
         if !got.is_multiple_of(RECORD) {
-            return Err(std::io::Error::other(format!(
+            return Err(ListingFailure::Failed(std::io::Error::other(format!(
                 "sysctl(KERN_PROC_PGRP, {pgid}) returned {got} bytes, not a whole multiple of \
                  the {RECORD}-byte kinfo_proc record — kernel ABI drift, refusing to reinterpret"
-            )));
+            ))));
         }
         // SAFETY: sysctl initialised exactly `got / RECORD` whole records (checked above).
         unsafe { buf.set_len(got / RECORD) };
@@ -150,13 +172,14 @@ pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::
 /// membership.
 ///
 /// A `/proc` from another pid namespace is an error naming the view, not an empty group. A
-/// [`Refusal`](crate::identity::Refusal), wherever in the listing it is met, is `ErrorKind::Unsupported`.
+/// [`Refusal`](crate::identity::Refusal), wherever in the listing it is met, is [`ListingFailure::Unsupported`],
+/// warned about once here.
 /// A `stat` read fails the listing unless the pid exited (`ENOENT`/`ESRCH`) or `hidepid` hides it
 /// (`EACCES`, or `EPERM` while the checked directory still answers). A member whose own identity
 /// read fails for a cause (a pidfd that cannot be opened, an unreadable `stat`) fails the listing
-/// too, as `Other` unless it is a refusal: leaving it out could clear a live group.
+/// too, as [`ListingFailure::Failed`] unless it is a refusal: leaving it out could clear a live group.
 #[cfg(target_os = "linux")]
-pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::io::Result<Vec<Member>> {
+pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> Result<Vec<Member>, ListingFailure> {
     use crate::identity::stat_parse::parse_pgrp;
     use crate::identity::Resolved;
 
@@ -168,14 +191,14 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
                 let message = format!(
                     "containment::unix::group::members: {why}, so its process listing says nothing about pgid {pgid}"
                 );
-                listing_error(std::io::ErrorKind::Other, message, why.source.map(Into::into))
+                failed_listing(message, why.source.map(Into::into))
             }
         })?;
     let mut out = Vec::new();
     // A listing error makes the whole scan unreliable; propagate it.
     let pids = kernel.pids(&proc_dir).map_err(|failure| match failure.refusal() {
         Some(refusal) => refused_listing(pgid, None, &refusal),
-        None => failure.into_io(),
+        None => ListingFailure::Failed(failure.into_io()),
     })?;
     for pid in pids {
         let stat = match crate::identity::pid_file::read(kernel, &proc_dir, pid, "stat") {
@@ -199,11 +222,7 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
             // and the failure that came with its read is its peer: both are causes of the listing.
             Err(e) => {
                 let message = format!("containment::unix::group::members: process group {pgid} cannot be listed");
-                return Err(listing_error(
-                    std::io::ErrorKind::Other,
-                    message,
-                    Some(Box::new(e.into_cause())),
-                ));
+                return Err(failed_listing(message, Some(Box::new(e.into_cause()))));
             }
         };
         let Some(g) = parse_pgrp(&stat) else {
@@ -241,11 +260,11 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
                         );
                         return Err(match why {
                             crate::error::Error::Unassessable { source, .. } => {
-                                listing_error(std::io::ErrorKind::Other, message, source.map(Into::into))
+                                failed_listing(message, source.map(Into::into))
                             }
                             other => {
                                 debug_assert!(false, "a cause that is no refusal is Unassessable: {other:?}");
-                                listing_error(std::io::ErrorKind::Other, message, None)
+                                failed_listing(message, None)
                             }
                         });
                     }
@@ -268,34 +287,24 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
     Ok(out)
 }
 
-/// The listing failure of a refusal (see [`Refusal`](crate::identity::Refusal)) met at `pid`, or
-/// before any pid was read: `ErrorKind::Unsupported` saying the requirement, with the refusal's causes
-/// as its source. Its caller (`unix.rs`'s `signal_group`) does not log it, so it is warned about here,
-/// once.
+/// Wraps a refusal as [`ListingFailure::Unsupported`], warning once here: `signal_group` does not log it.
 #[cfg(target_os = "linux")]
-fn refused_listing(pgid: i32, pid: Option<RawPid>, refusal: &crate::identity::Refusal) -> std::io::Error {
-    let at = pid.map_or(String::new(), |pid| format!("pid {pid}: "));
-    crate::identity::warn_refused(
+fn refused_listing(pgid: i32, pid: Option<RawPid>, refusal: &crate::identity::Refusal) -> ListingFailure {
+    ListingFailure::Unsupported(crate::identity::warn_refused(
         "containment::unix::group::members",
-        listing_error(
-            std::io::ErrorKind::Unsupported,
-            format!(
-                "containment::unix::group::members: {at}{requirement}, so pgid {pgid} cannot be listed",
-                requirement = refusal.requirement()
-            ),
-            Some(Box::new(refusal.cause())),
-        ),
-    )
+        refused_error(refusal, pgid, pid),
+    ))
 }
 
-/// A listing failure of `kind` that says `message` and keeps `cause`, the failed call's errno, as
-/// its [`source`](std::error::Error::source).
 #[cfg(target_os = "linux")]
-fn listing_error(
-    kind: std::io::ErrorKind,
-    message: String,
-    cause: Option<Box<dyn std::error::Error + Send + Sync>>,
-) -> std::io::Error {
+fn failed_listing(message: String, cause: Option<Box<dyn std::error::Error + Send + Sync>>) -> ListingFailure {
+    ListingFailure::Failed(listing_error(message, cause))
+}
+
+/// A listing error that says `message` and keeps `cause`, the failed call's errno, as its
+/// [`source`](std::error::Error::source).
+#[cfg(target_os = "linux")]
+fn listing_error(message: String, cause: Option<Box<dyn std::error::Error + Send + Sync>>) -> std::io::Error {
     #[derive(Debug)]
     struct Listing {
         message: String,
@@ -311,19 +320,7 @@ fn listing_error(
             self.cause.as_deref().map(|cause| cause as _)
         }
     }
-    std::io::Error::new(kind, Listing { message, cause })
-}
-
-/// Other Unix: the crate supports Linux, macOS and Windows (see
-/// `containment::enumerate`), so there is no listing here. Reported as
-/// unlistable rather than silently empty — an empty group would read as
-/// "teardown succeeded".
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, _pgid: i32) -> std::io::Result<Vec<Member>> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "process-group membership is implemented only for Linux and macOS",
-    ))
+    std::io::Error::other(Listing { message, cause })
 }
 
 /// What a process group looked like after one signal-and-classify pass.
@@ -352,7 +349,7 @@ pub(crate) enum GroupState {
     Unassessed { members: Vec<(RawPid, Error)> },
     /// The group's membership could not be listed: nothing can be said about whether the group is
     /// down.
-    Unlistable { detail: String, source: std::io::Error },
+    Unlistable { detail: String, source: ListingFailure },
 }
 
 /// Whether a live-confirmed member was actually reached by the signal/probe. A THIRD
@@ -682,7 +679,7 @@ pub(crate) fn converge(
     signal: Signal,
     root: Option<&dyn Root>,
     killed: &mut Vec<crate::identity::ProcessId>,
-) -> std::io::Result<GroupState> {
+) -> Result<GroupState, ListingFailure> {
     #[cfg(test)]
     let listing_pgid = fault::listed(pgid);
     #[cfg(not(test))]
@@ -772,6 +769,7 @@ fn decide(refused: Vec<(RawPid, Error)>, unassessable: Vec<(RawPid, Error)>) -> 
 /// safety net for a dangerous syscall — the REAL guard, which runs before `killpg` is ever
 /// called, is in `unix.rs`'s `signal_group` (this module's only production caller).
 pub(crate) fn state(
+    kernel: &dyn crate::identity::Kernel,
     pgid: i32,
     signal: Signal,
     root: Option<&dyn Root>,
@@ -782,7 +780,7 @@ pub(crate) fn state(
         "group::state called with a non-positive pgid ({pgid}); the real guard belongs in the \
          caller, before any signal is sent — see unix.rs::signal_group"
     );
-    match converge(&crate::identity::HostKernel, pgid, signal, root, killed) {
+    match converge(kernel, pgid, signal, root, killed) {
         Ok(gs) => gs,
         Err(e) => GroupState::Unlistable {
             detail: format!("process group {pgid} could not be listed after {signal}"),
