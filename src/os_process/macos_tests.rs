@@ -826,12 +826,25 @@ fn esrch_at_registration_reads_as_exited_and_rechecks() {
     let id = ProcessId::of(child.id()).found().expect("identity");
     wait_until_zombie(id.pid());
     let forced = force_proc_registration_once(Registration::ExitWatch);
-    // The zombie is not yet visible to the look's peek.
-    let os = adopt_std_over(|pid, _| FakeKernel::over(&HostKernel).on_peek(pid, Ok(None)), child, id)
-        .unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    // The zombie is not yet visible to the look's peek. The test keeps a handle to the kernel the
+    // child owns, to ask whether that row was taken.
+    let kernel = std::sync::Arc::new(FakeKernel::over(&HostKernel).on_peek(id.pid(), Ok(None)));
+    let os = adopt_std_over(
+        {
+            let kernel = std::sync::Arc::clone(&kernel);
+            move |_, _| kernel
+        },
+        child,
+        id,
+    )
+    .unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     drop(forced);
     assert!(matches!(os.exited().unwrap(), Exit::Exited));
     assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Recheck));
+    assert!(
+        kernel.all_rows_taken(),
+        "the first try_reap's peek must have taken the row"
+    );
     assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
 }
 

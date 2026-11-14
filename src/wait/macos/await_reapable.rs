@@ -249,6 +249,11 @@ pub(crate) fn await_reapable_on(
             if drain_for_reap(kq, &mut events, pid, &mut tracer)? {
                 return Ok(Waited::Gone);
             }
+            // The final peek is the only one at or after the deadline: it answers what this
+            // round's peek would.
+            if expired(deadline) {
+                return final_peek(kernel, pid, unique);
+            }
             let (peeked, holder) = peek(kernel, pid, unique)?;
             if let Some(verdict) = settle(peeked) {
                 return Ok(verdict);

@@ -60,36 +60,33 @@ impl Blocker {
         }
     }
 
-    /// [`Blocker::spawn`] with a `MacosChild` that asks `kernel(pid, unique)`, which owns it. The
-    /// kernel is built once the child exists, as its rows are about the child's pid and unique id.
-    /// A row the test leaves unused answers the teardown's reads.
+    /// [`Blocker::spawn`] with a `MacosChild` that asks the kernel `kernel(pid, unique)` makes. The
+    /// kernel is built once the child exists, as its rows are about the child's pid and unique id,
+    /// and is shared: the child owns one handle and the test gets the other, to ask a `FakeKernel`
+    /// whether every row was taken. A row the test leaves unused answers the teardown's reads.
     #[cfg(target_os = "macos")]
     pub(super) fn spawn_over<K: crate::identity::Kernel + Send + 'static>(
         kernel: impl FnOnce(u32, u64) -> K,
-    ) -> Blocker {
+    ) -> (Blocker, Arc<K>) {
         let (child, stdin) = spawn_std_blocker();
         let id = identity_of(&child);
-        let owned = OwnedChild::adopt_over(kernel, child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-        Blocker {
+        let mut shared = None;
+        let owned = OwnedChild::adopt_over(
+            |pid, unique| {
+                let kernel = Arc::new(kernel(pid, unique));
+                shared = Some(Arc::clone(&kernel));
+                kernel
+            },
+            child,
+            id,
+        )
+        .unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+        let blocker = Blocker {
             owned: Arc::new(owned),
             pid: id.pid(),
             stdin: Some(stdin),
-        }
-    }
-
-    /// [`Blocker::spawn_over`] with a `FakeKernel` the test keeps a handle to, so that it can ask
-    /// whether every row was taken.
-    #[cfg(target_os = "macos")]
-    pub(super) fn spawn_over_rows(
-        rows: impl FnOnce(u32) -> crate::identity::FakeKernel<'static>,
-    ) -> (Blocker, Arc<crate::identity::FakeKernel<'static>>) {
-        let mut kernel = None;
-        let blocker = Self::spawn_over(|pid, _| {
-            let shared = Arc::new(rows(pid));
-            kernel = Some(Arc::clone(&shared));
-            shared
-        });
-        (blocker, kernel.expect("spawn_over builds the kernel"))
+        };
+        (blocker, shared.expect("adopt_over builds the kernel"))
     }
 
     /// End the child: close its stdin, so it reads EOF and exits.

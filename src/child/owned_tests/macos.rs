@@ -40,7 +40,7 @@ fn is_foreign(outcome: &Result<ChildWaitOutcome, crate::error::Error>) -> bool {
 /// Mutant: a `debug_assert!` on the by-pid target.
 #[skuld::test]
 fn a_reap_that_finds_none_after_reapable_takes_the_echild_path() {
-    let (mut b, kernel) = Blocker::spawn_over_rows(|pid| FakeKernel::over(&HostKernel).on_consume(pid, Ok(None)));
+    let (mut b, kernel) = Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_consume(pid, Ok(None)));
     b.end_child_and_confirm_exit();
     let outcome = b.owned.wait(None);
     assert!(is_foreign(&outcome), "{outcome:?}");
@@ -61,7 +61,7 @@ fn a_reap_that_finds_none_after_reapable_takes_the_echild_path() {
 #[skuld::test]
 fn a_second_peek_runs_after_every_first_reap() {
     let (mut b, kernel) =
-        Blocker::spawn_over_rows(|pid| FakeKernel::over(&HostKernel).on_consume(pid, Ok(Some(exit_record(0)))));
+        Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_consume(pid, Ok(Some(exit_record(0)))));
     b.end_child_and_confirm_exit();
     let status = wait_status(&b.owned);
     assert!(status.success(), "{status:?}");
@@ -180,7 +180,8 @@ fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
 #[skuld::test]
 fn try_wait_on_a_pid_with_another_unique_id_is_echild_and_consumes_nothing() {
     // The peek's id check is the first unique-id read.
-    let mut b = Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
+    let (mut b, _) =
+        Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
     b.end_child_and_confirm_exit();
     let outcome = try_wait(&b.owned);
     assert!(is_foreign(&outcome), "another process holds the pid: {outcome:?}");
@@ -194,7 +195,8 @@ fn try_wait_on_a_pid_with_another_unique_id_is_echild_and_consumes_nothing() {
 #[skuld::test]
 fn a_wait_on_a_pid_with_another_unique_id_never_reaches_the_reap() {
     // The peek's id check is the first unique-id read.
-    let mut b = Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
+    let (mut b, _) =
+        Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
     b.end_child_and_confirm_exit();
     let outcome = b.owned.wait(None);
     assert!(is_foreign(&outcome), "another process holds the pid: {outcome:?}");
@@ -209,7 +211,8 @@ fn a_wait_on_a_pid_with_another_unique_id_never_reaches_the_reap() {
 #[skuld::test]
 fn kill_sends_nothing_to_a_pid_with_another_unique_id() {
     // The kill's version read is the first unique-id read.
-    let mut b = Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
+    let (mut b, _) =
+        Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
     let log = crate::send_log::Capture::start();
     b.owned
         .signal(Sig::Kill)
@@ -501,7 +504,7 @@ fn a_wait_on_a_child_whose_tracer_is_exiting_at_launchd_peeks_again_on_a_backoff
 #[skuld::test]
 fn a_running_peek_of_a_pid_with_another_unique_id_is_foreign() {
     // Each `try_wait` makes one unique-id read, the peek's id check, so the rows answer them in order.
-    let mut b = Blocker::spawn_over(|pid, unique| {
+    let (mut b, _) = Blocker::spawn_over(|pid, unique| {
         FakeKernel::over(&HostKernel)
             .on_unique_info(pid, found(unique ^ 1))
             .on_unique_info(pid, UniqRead::Refused(libc::EPERM))
@@ -588,7 +591,7 @@ fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
 #[skuld::test]
 fn a_reap_that_finds_no_exit_record_after_the_peek_saw_one_looks_again() {
     // The look's peek sees the exit; the reap's own peek then finds none.
-    let (mut b, kernel) = Blocker::spawn_over_rows(|pid| {
+    let (mut b, kernel) = Blocker::spawn_over(|pid, _| {
         FakeKernel::over(&HostKernel)
             .on_peek(pid, Ok(Some(exit_record(0))))
             .on_peek(pid, Ok(None))
@@ -674,7 +677,7 @@ fn setuid_child_kill_is_permission_denied(#[fixture(setuid)] _group: &Group) {
 #[skuld::test]
 fn a_refused_id_read_at_the_exit_check_consumes_nothing() {
     // Each call's peek makes one unique-id read, its id check, so the rows answer them in order.
-    let mut b = Blocker::spawn_over(|pid, _| {
+    let (mut b, _) = Blocker::spawn_over(|pid, _| {
         FakeKernel::over(&HostKernel)
             .on_unique_info(pid, UniqRead::Refused(libc::EPERM))
             .on_unique_info(pid, UniqRead::Refused(libc::EACCES))
@@ -738,7 +741,7 @@ fn try_wait_during_a_wait_errors_when_a_running_childs_unique_id_is_unreadable()
     // holder is parked in its blocking hook, making no read: the holder's looks before it blocks
     // find the child's id, whatever their number, and every read the `try_wait` makes is refused.
     let refused = Arc::new(AtomicBool::new(false));
-    let mut b = Blocker::spawn_over({
+    let (mut b, _) = Blocker::spawn_over({
         let refused = Arc::clone(&refused);
         move |pid, unique| {
             FakeKernel::over(&HostKernel).on_every_unique_info(pid, move || {
@@ -787,7 +790,7 @@ fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
     // Each look's peek finds no record, as when XNU is still finishing the exit: the `try_wait`'s,
     // which drains `NOTE_EXIT` from the reap kqueue, and the first of the `wait`'s, which finds
     // that queue empty. The `wait`'s second peek is the real one.
-    let (mut b, kernel) = Blocker::spawn_over_rows(|pid| {
+    let (mut b, kernel) = Blocker::spawn_over(|pid, _| {
         FakeKernel::over(&HostKernel)
             .on_peek(pid, Ok(None))
             .on_peek(pid, Ok(None))
@@ -810,7 +813,7 @@ fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
 /// answers `Dead` without the confirming read, leaving the row for the `try_wait`.
 #[skuld::test]
 fn a_refused_confirmation_is_dead_when_the_peek_shows_the_exit_record() {
-    let mut b =
+    let (mut b, _) =
         Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_unique_info(pid, UniqRead::Refused(libc::EPERM)));
     b.end_child_and_confirm_exit();
     assert!(
@@ -830,7 +833,7 @@ fn a_refused_confirmation_is_dead_when_the_peek_shows_the_exit_record() {
 #[skuld::test]
 fn a_refused_confirmation_is_the_refusal_when_the_peek_reads_the_child_running() {
     let forced_watch = test_hooks::force_proc_registration_once(test_hooks::Registration::ExitWatch);
-    let b =
+    let (b, _) =
         Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_unique_info(pid, UniqRead::Refused(libc::EPERM)));
     drop(forced_watch);
     let err = b.owned.liveness().expect_err("a running peek does not answer");

@@ -62,11 +62,8 @@ fn await_reapable_at_a_past_deadline_takes_its_final_peek() {
     let (child, stdin) = spawn_blocker();
     drop(stdin);
     confirm_exit(&child);
-    // The first peek finds no record; only the final peek reads the zombie.
-    let kernel = FakeKernel::over(&HostKernel).on_peek(child.id(), Ok(None));
-    let waited = await_reapable(&kernel, child.id(), None, Some(std::time::Instant::now())).expect("wait");
+    let waited = await_reapable(&HostKernel, child.id(), None, Some(std::time::Instant::now())).expect("wait");
     assert_eq!(waited, Waited::Reapable);
-    assert!(kernel.all_rows_taken(), "the first peek must have happened");
     let mut child = child;
     child.wait().expect("reap");
 }
@@ -104,7 +101,8 @@ fn spurious_wake() {
 /// `DeadlinePassed` after exactly one.
 ///
 /// Mutant: an unbounded `kevent` under a deadline (its `debug_assert!` fires); a round after the
-/// deadline (no expiry check before the block: its peek at or after the deadline makes two); a
+/// deadline (no expiry check before the block: the round-start assertion fires; none before the
+/// round's peek: a peek at or after the deadline besides the final one makes two); a
 /// timeout above the time remaining, or computed once per wait; no final peek (none at or after
 /// the deadline); a second final peek; the clock not held (the stall at round 0 ends the wait
 /// there).
