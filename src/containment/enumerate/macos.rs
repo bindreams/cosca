@@ -52,12 +52,12 @@ const DENIED_SAMPLE_CAP: usize = 5;
 /// legitimate one; the transient fork-in-progress window is resolved inside `ppid_of`). Silent
 /// per-call either way: a dropped edge drops the pid's whole subtree in
 /// `treewalk::descendants_with`, and [`snapshot`] is what surfaces the aggregate.
-fn ppid_of(pid: libc::c_int) -> Resolved<RawPid> {
+fn ppid_of(kernel: &dyn Kernel, pid: libc::c_int) -> Resolved<RawPid> {
     #[cfg(test)]
     if fault::is_denied(pid) {
         return Resolved::Unknown;
     }
-    crate::identity::macos_ppid_of(pid as RawPid)
+    crate::identity::macos_ppid_of(kernel, pid as RawPid)
 }
 
 /// Buffer capacity, in PIDS, for a sizing answer of `needed` pids.
@@ -352,7 +352,7 @@ type Joined = (Vec<(RawPid, RawPid)>, usize, Vec<libc::c_int>);
 /// An allocation failure is an `Err`, not an abort: [`process_parents`] reports it as
 /// `Unassessable` rather than as an empty process tree. `pids.len()` over-estimates the edge
 /// count, since some entries are filtered or fail the join.
-fn join_edges(pids: &[libc::c_int]) -> std::io::Result<Joined> {
+fn join_edges(kernel: &dyn Kernel, pids: &[libc::c_int]) -> std::io::Result<Joined> {
     #[cfg(test)]
     if fault::join_alloc_fails() {
         return Err(std::io::Error::other(
@@ -372,7 +372,7 @@ fn join_edges(pids: &[libc::c_int]) -> std::io::Result<Joined> {
         if pid <= 0 {
             continue; // pid 0 is the kernel process, not a real ppid edge
         }
-        match ppid_of(pid) {
+        match ppid_of(kernel, pid) {
             Resolved::Found(ppid) => edges.push((pid as RawPid, ppid)),
             Resolved::Gone => {}
             Resolved::Unknown => {
@@ -387,7 +387,7 @@ fn join_edges(pids: &[libc::c_int]) -> std::io::Result<Joined> {
 /// [`Error::Unassessable`] naming the `proc_listallpids` failure when no pid list can be taken,
 /// or the count and a sample of the pids denied a ppid read: each leaves its subtree out of the
 /// edges, and a walk over them would skip it. [`snapshot`] applies its own policy to the same denial.
-pub(crate) fn process_parents(_kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
+pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
     let raw = try_all_pids().map_err(|e| {
         let error = Error::Unassessable {
             detail: "the process snapshot could not be taken: proc_listallpids failed".to_owned(),
@@ -396,7 +396,7 @@ pub(crate) fn process_parents(_kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPi
         log::warn!("enumerate::process_parents: {}", crate::error::Report(&error));
         error
     })?;
-    let (edges, denied, sample) = join_edges(&raw).map_err(|e| {
+    let (edges, denied, sample) = join_edges(kernel, &raw).map_err(|e| {
         let error = Error::Unassessable {
             detail: "the process snapshot could not be taken".to_owned(),
             source: Some(Error::io_cause(e)),
@@ -439,7 +439,7 @@ fn log_denied(denied: usize, total: usize, sample: &[libc::c_int]) {
 /// it as one.
 pub(crate) fn snapshot() -> (Vec<RawPid>, Vec<(RawPid, RawPid)>, usize) {
     let raw = all_pids();
-    let (edges, denied, sample) = match join_edges(&raw) {
+    let (edges, denied, sample) = match join_edges(&crate::identity::HostKernel, &raw) {
         Ok(joined) => joined,
         Err(e) => {
             // Blind, like a failed `proc_listallpids`: the fd-marker sweep reads an empty pid

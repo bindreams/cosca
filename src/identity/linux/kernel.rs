@@ -93,6 +93,17 @@ impl Kernel for HostKernel {
     }
 }
 
+forward_kernel! {
+    fn pidfd_open(&self, target: Pid, flags: PidfdFlags) -> Result<OwnedFd, Errno>;
+    fn pidfs_ino(&self, fd: BorrowedFd<'_>) -> Result<Option<u64>, Errno>;
+    fn open_proc(&self) -> Result<ProcDir, ProcOpenFailure>;
+    fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure>;
+    fn read_link(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure>;
+    fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure>;
+    fn tids(&self, dir: &ProcDir, pid: u32) -> Result<Vec<u32>, ReadFailure>;
+    fn signal_probe(&self, target: Pid) -> Result<(), Errno>;
+}
+
 #[cfg(test)]
 #[path = "kernel/fake.rs"]
 pub(crate) mod fake;

@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
 use super::{OnTracer, TracerWatch};
+use crate::identity::Kernel;
 use crate::os_process::child::{Foreign, PeekOutcome};
 #[cfg(test)]
 use crate::os_process::macos::kqueue::test_hooks;
@@ -74,9 +75,8 @@ fn blank() -> KEvent {
 
 /// Register `EVFILT_SIGNAL` for `SIGCHLD` and `EVFILT_PROC` for `pid`. `Ok(true)` when the
 /// `EVFILT_PROC` receipt says `ESRCH` (the child is already past `P_REF_DEAD`).
-fn register(kq: &Kqueue, pid: u32) -> io::Result<bool> {
-    kq.subscribe(Subscription::Signal(libc::SIGCHLD))
-        .map_err(crate::error::Error::into_io)?;
+fn register(kernel: &dyn Kernel, kq: &Kqueue, pid: u32) -> io::Result<bool> {
+    kernel.subscribe(kq, Subscription::Signal(libc::SIGCHLD))?;
     #[cfg(test)]
     if test_hooks::take_forced_registration(test_hooks::Registration::Reap) {
         return Ok(true);
@@ -86,17 +86,17 @@ fn register(kq: &Kqueue, pid: u32) -> io::Result<bool> {
         signals: true,
         reap: true,
     };
-    match kq.subscribe(child) {
+    match kernel.subscribe(kq, child) {
         Ok(()) => Ok(false),
         Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => Ok(true),
-        Err(e) => Err(e.into_io()),
+        Err(e) => Err(e),
     }
 }
 
 /// One non-consuming look, by number and checked against `unique` when there is one, and the tracer
 /// that holds a running child, if one does.
-fn peek(pid: u32, unique: Option<u64>) -> io::Result<(PeekOutcome, Option<u32>)> {
-    exit_only::peek_traced(&Target::pid(pid, unique))
+fn peek(kernel: &dyn Kernel, pid: u32, unique: Option<u64>) -> io::Result<(PeekOutcome, Option<u32>)> {
+    exit_only::peek_traced(&Target::pid(kernel, pid, unique))
 }
 
 /// The peek's verdict as a wait verdict, or `None` when the child is still running.
@@ -216,12 +216,13 @@ fn kevent_round(kq: &Kqueue, events: &mut [KEvent; BATCH], block: Block) -> io::
 
 /// Wait until `pid`'s exit is reapable, on `kq`; see the module docs.
 pub(crate) fn await_reapable_on(
+    kernel: &dyn Kernel,
     kq: &Kqueue,
     pid: u32,
     unique: Option<u64>,
     deadline: Option<Instant>,
 ) -> io::Result<Waited> {
-    let mut backoff = register(kq, pid)?;
+    let mut backoff = register(kernel, kq, pid)?;
     let mut interval = BACKOFF_START;
     let mut events = [blank(); BATCH];
     let mut tracer = TracerWatch::default();
@@ -251,12 +252,12 @@ pub(crate) fn await_reapable_on(
             if drain_for_reap(kq, &mut events, pid, &mut tracer)? {
                 return Ok(Waited::Gone);
             }
-            let (peeked, holder) = peek(pid, unique)?;
+            let (peeked, holder) = peek(kernel, pid, unique)?;
             if let Some(verdict) = settle(peeked) {
                 return Ok(verdict);
             }
             let Some(holder) = holder else { break };
-            match tracer.held_by(kq, holder)? {
+            match tracer.held_by(kernel, kq, holder)? {
                 OnTracer::Block => break,
                 OnTracer::Recheck(after) if after.is_zero() && !expired(deadline) => {}
                 OnTracer::Recheck(after) => {
@@ -266,7 +267,7 @@ pub(crate) fn await_reapable_on(
             }
         }
         if expired(deadline) {
-            return final_peek(pid, unique);
+            return final_peek(kernel, pid, unique);
         }
         // Block: on the kqueue alone until `NOTE_EXIT`, then per backoff interval.
         #[cfg(test)]
@@ -297,7 +298,7 @@ pub(crate) fn await_reapable_on(
             if drain_for_reap(kq, &mut events, pid, &mut tracer)? {
                 return Ok(Waited::Gone);
             }
-            return final_peek(pid, unique);
+            return final_peek(kernel, pid, unique);
         }
     }
 }
@@ -307,18 +308,18 @@ fn expired(deadline: Option<Instant>) -> bool {
 }
 
 /// The one non-blocking look at expiry.
-fn final_peek(pid: u32, unique: Option<u64>) -> io::Result<Waited> {
+fn final_peek(kernel: &dyn Kernel, pid: u32, unique: Option<u64>) -> io::Result<Waited> {
     #[cfg(test)]
     exit_only::seams::step(exit_only::seams::HolderStep::FinalPeek);
-    Ok(settle(peek(pid, unique)?.0).unwrap_or(Waited::DeadlinePassed))
+    Ok(settle(peek(kernel, pid, unique)?.0).unwrap_or(Waited::DeadlinePassed))
 }
 
 // For a waiter that drives the kqueue itself (the sync and the tokio child's reap) =====
 
 /// Register on `kq` what [`await_reapable_on`] waits on. `Ok(true)` when the `EVFILT_PROC` receipt
 /// says `ESRCH`, so no `NOTE_EXIT` or `NOTE_REAP` will come.
-pub(crate) fn register_exit_events(kq: &Kqueue, pid: u32) -> io::Result<bool> {
-    register(kq, pid)
+pub(crate) fn register_exit_events(kernel: &dyn Kernel, kq: &Kqueue, pid: u32) -> io::Result<bool> {
+    register(kernel, kq, pid)
 }
 
 /// Read every event pending on `kq` without blocking: whether one was the child `pid`'s
@@ -350,9 +351,14 @@ pub(crate) fn drain_exit_events(kq: &Kqueue, pid: u32, tracer: &mut TracerWatch)
 }
 
 /// [`await_reapable_on`] on a kqueue of its own.
-pub(crate) fn await_reapable(pid: u32, unique: Option<u64>, deadline: Option<Instant>) -> io::Result<Waited> {
+pub(crate) fn await_reapable(
+    kernel: &dyn Kernel,
+    pid: u32,
+    unique: Option<u64>,
+    deadline: Option<Instant>,
+) -> io::Result<Waited> {
     let kq = Kqueue::new().map_err(crate::error::Error::into_io)?;
-    await_reapable_on(&kq, pid, unique, deadline)
+    await_reapable_on(kernel, &kq, pid, unique, deadline)
 }
 
 #[cfg(test)]

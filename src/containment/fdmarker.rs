@@ -343,7 +343,7 @@ pub(crate) fn holds_marker_query(pid: RawPid, handle: u64) -> MarkerQuery {
 /// `errno == EPERM`, NOT a negative value.** `proc_pidinfo(1, PROC_PIDLISTFDS, …)` (pid 1,
 /// root-owned, from an unprivileged caller) returns `0`/`EPERM` for both the sizing and fill
 /// forms; across the live table, every EPERM-denied pid returned exactly `0`, none returned
-/// negative. This matches `identity::macos::bsd_info`'s established handling of the sibling
+/// negative. This matches `identity::macos::pidinfo`'s established handling of the sibling
 /// `PROC_PIDTBSDINFO` call: gate on `n <= 0`, then classify by errno. So the failure gate here
 /// is `<= 0`, not `< 0` — and because `0` is ALSO the legitimate "successful, empty answer"
 /// return (e.g. a zombie with no open fds), `errno` must be cleared immediately before each

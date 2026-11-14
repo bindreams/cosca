@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use super::fixtures::{spawn_std_blocker, status, try_wait, wait_status, Blocker};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::error::Error;
-use crate::identity::{ppid_fault, uniq_fault, ReadPurpose, UniqRead, LAUNCHD};
+use crate::identity::{ppid_fault, uniq_fault, HostKernel, ReadPurpose, UniqRead, LAUNCHD};
 use crate::os_process::child::{Foreign, OsChild, PeekOutcome, TryReapOutcome};
-use crate::os_process::macos::child::MacChild;
+use crate::os_process::macos::child::MacosChild;
 use crate::os_process::macos::kqueue::test_hooks;
 use crate::os_process::{Exit, OsProcess};
 use crate::signal::{Sent, Sig};
@@ -252,9 +252,9 @@ fn kill_on_an_own_unreaped_zombie_is_delivered() {
 
 // A pid that is not our child, yet still names it (a tracer holds it) =====
 
-/// A [`MacChild`] the test keeps a handle on, so a round hook can read its reap kqueue.
+/// A [`MacosChild`] the test keeps a handle on, so a round hook can read its reap kqueue.
 #[derive(Debug)]
-pub(super) struct SharedMac(Arc<MacChild>);
+pub(super) struct SharedMac(Arc<MacosChild<HostKernel>>);
 
 impl OsProcess for SharedMac {
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
@@ -280,10 +280,10 @@ impl OsChild for SharedMac {
     }
 }
 
-/// The child `pid`, whose unique id is `unique`, watched through a fresh [`MacChild`]: an
+/// The child `pid`, whose unique id is `unique`, watched through a fresh [`MacosChild`]: an
 /// `OwnedChild` over it, which reaps the child, and the handle the round hooks read.
-pub(super) fn watch(pid: u32, unique: u64) -> (OwnedChild, Arc<MacChild>) {
-    let mac = Arc::new(MacChild::new(pid, unique).expect("watch the child"));
+pub(super) fn watch(pid: u32, unique: u64) -> (OwnedChild, Arc<MacosChild<HostKernel>>) {
+    let mac = Arc::new(MacosChild::new(HostKernel, pid, unique).expect("watch the child"));
     (OwnedChild::new(Box::new(SharedMac(Arc::clone(&mac)))), mac)
 }
 
@@ -333,8 +333,8 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
 /// `SIGCHLD` to this process, which the wait also watches, so a wait that missed its event fails its
 /// test's assertion instead of hanging.
 pub(super) fn on_rounds(
-    mac: &Arc<MacChild>,
-    mut hook: impl FnMut(u32, &MacChild) -> bool + 'static,
+    mac: &Arc<MacosChild<HostKernel>>,
+    mut hook: impl FnMut(u32, &MacosChild<HostKernel>) -> bool + 'static,
 ) -> crate::wait::block_probe::Rounds {
     let mac = Arc::clone(mac);
     crate::wait::block_probe::on_every_round(move |round| {
@@ -532,7 +532,7 @@ fn the_kqueue_wait_keeps_waiting_for_a_child_that_answers_echild_yet_resolves() 
     // The first look, and the final one at expiry.
     let _forced = (held_by_a_tracer(), held_by_a_tracer());
     // An expired deadline: no blocking.
-    let waited = await_reapable(pid, Some(unique), Some(Instant::now())).expect("wait");
+    let waited = await_reapable(&HostKernel, pid, Some(unique), Some(Instant::now())).expect("wait");
     assert_eq!(waited, Waited::DeadlinePassed);
 }
 
@@ -543,7 +543,7 @@ fn the_kqueue_wait_keeps_waiting_for_a_child_that_answers_echild_yet_resolves() 
 fn the_kqueue_wait_reports_gone_for_a_pid_with_another_unique_id() {
     use crate::wait::macos::{await_reapable, Waited};
     let (pid, unique) = echild_yet_resolvable();
-    let waited = await_reapable(pid, Some(unique ^ 1), Some(Instant::now())).expect("wait");
+    let waited = await_reapable(&HostKernel, pid, Some(unique ^ 1), Some(Instant::now())).expect("wait");
     assert_eq!(waited, Waited::Gone);
 }
 

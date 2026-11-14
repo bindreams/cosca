@@ -1,5 +1,6 @@
 //! macOS: an [`OsChild`] over the child's pid and unique id. There is no handle, so every act checks
 //! the pid's unique id first, and a child is an unreaped zombie at worst, which pins the number.
+//! The child owns the [`Kernel`] it asks.
 //!
 //! Three kinds of kqueue, deliberately, so that a kqueue that is read has one reader. The exit kqueue
 //! ([`ExitWatch`]) is never read, so a look at it is a zero-timeout `poll` that takes nothing from
@@ -12,7 +13,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use super::{ExitWatch, Kqueue};
 use crate::error::Error;
-use crate::identity::{has_exited, held_by, Held, ReadPurpose};
+use crate::identity::{has_exited, held_by, Held, Kernel, ReadPurpose};
 use crate::os_process::child::{Foreign, OsChild, PeekOutcome, TryReapOutcome};
 use crate::os_process::drive::{Step, Waitable};
 use crate::os_process::{Exit, ExitWait, OsProcess, WaitFor};
@@ -21,8 +22,9 @@ use crate::wait::exit_only::{self, Reap, Target};
 use crate::wait::macos::{drain_exit_events, register_exit_events, OnTracer, TracerWatch};
 
 /// A child of this process, named by its pid and `p_uniqueid`.
-#[derive(Debug)]
-pub(crate) struct MacChild {
+pub(crate) struct MacosChild<K> {
+    /// What every read of the child asks.
+    kernel: K,
     pid: u32,
     /// The child's unique id: never reused, so it tells the child from a process that took its pid.
     unique: u64,
@@ -36,16 +38,29 @@ pub(crate) struct MacChild {
     tracer: Mutex<TracerWatch>,
 }
 
-impl MacChild {
-    /// Take over the child `pid`, whose unique id the spawn read as `unique`. A pid already past
-    /// registration (`ESRCH`) is not a failure: the child has exited, and `exited` says so. Any other
-    /// refusal is, and the caller tears the child down.
-    pub(crate) fn new(pid: u32, unique: u64) -> Result<MacChild, Error> {
-        let exit = ExitWatch::proc_exit(pid)?;
+impl<K> std::fmt::Debug for MacosChild<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacosChild")
+            .field("pid", &self.pid)
+            .field("unique", &self.unique)
+            .field("exit", &self.exit)
+            .field("reap", &self.reap)
+            .field("tracer", &self.tracer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K: Kernel + Send> MacosChild<K> {
+    /// Take over the child `pid`, whose unique id the spawn read as `unique`, asking `kernel`, which
+    /// the child then owns. A pid already past registration (`ESRCH`) is not a failure: the child
+    /// has exited, and `exited` says so. Any other refusal is, and the caller tears the child down.
+    pub(crate) fn new(kernel: K, pid: u32, unique: u64) -> Result<MacosChild<K>, Error> {
+        let exit = ExitWatch::proc_exit(&kernel, pid)?;
         let reap = Kqueue::new()?;
         // An ESRCH here is not read as an exit: only the exit watch reports one.
-        register_exit_events(&reap, pid).map_err(Error::Io)?;
-        Ok(MacChild {
+        register_exit_events(&kernel, &reap, pid).map_err(Error::Io)?;
+        Ok(MacosChild {
+            kernel,
             pid,
             unique,
             exit,
@@ -54,8 +69,8 @@ impl MacChild {
         })
     }
 
-    fn target(&self) -> Target<'static> {
-        Target::pid(self.pid, Some(self.unique))
+    fn target(&self) -> Target<'_> {
+        Target::pid(&self.kernel, self.pid, Some(self.unique))
     }
 
     /// The tracer watch, for the one `try_reap` caller. A second concurrent caller breaks the
@@ -73,22 +88,22 @@ impl MacChild {
 }
 
 #[cfg(test)]
-impl MacChild {
+impl<K> MacosChild<K> {
     /// Whether the reap kqueue has an event pending, read without taking it.
     pub(crate) fn event_pending(&self) -> bool {
         crate::os_process::macos::kqueue::test_hooks::event_pending(&self.reap)
     }
 }
 
-impl OsProcess for MacChild {
+impl<K: Kernel + Send> OsProcess for MacosChild<K> {
     /// By audit token, which the kernel checks against the pid's `p_idversion`: a bare errno on a
     /// refused send; `Gone` once the unique id says the pid names another process; `Delivered` for
     /// this child's own unreaped zombie.
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
-        via_audit_token(self.pid, Some(self.unique), sig).map_err(Error::Io)
+        via_audit_token(&self.kernel, self.pid, Some(self.unique), sig).map_err(Error::Io)
     }
 
-    /// `Exited` once the child is a zombie or gone, as [`MacProcess`](super::MacProcess) answers it
+    /// `Exited` once the child is a zombie or gone, as [`MacosProcess`](super::MacosProcess) answers it
     /// ([`ExitWatch::look`]), and also when the watch cannot say: XNU withholds `NOTE_EXIT` from a
     /// parent that does not hold the child (`p_oppid` set), so a
     /// child whose parent is another process, a tracer or launchd, may be a zombie with its watch
@@ -103,7 +118,7 @@ impl OsProcess for MacChild {
     /// The reap ([`try_reap`](OsChild::try_reap)) does not come through here: it reads the watch raw
     /// and peeks `waitid` itself, so this adds nothing to it.
     fn exited(&self) -> Result<Exit<'_>, Error> {
-        match self.exit.look(self.pid, self.unique)? {
+        match self.exit.look(&self.kernel, self.pid, self.unique)? {
             Exit::Running(wait_for) => self.exited_past_the_watch(wait_for),
             look => Ok(look),
         }
@@ -117,13 +132,13 @@ impl OsProcess for MacChild {
     }
 }
 
-/// One wait for a [`MacChild`]'s exit, on a kqueue of its own: armed for `NOTE_EXIT`, `NOTE_SIGNAL`
+/// One wait for a [`MacosChild`]'s exit, on a kqueue of its own: armed for `NOTE_EXIT`, `NOTE_SIGNAL`
 /// and `NOTE_REAP` of the child and for `SIGCHLD`, as the reap waiter's is. Every look drains it
 /// first, so what woke the wait is taken, and what comes after the drain stays queued for the wait
 /// the look returns: no wake is lost, and none is taken from another waiter. The shared exit watch
 /// is still only polled.
-struct ChildExit<'a> {
-    child: &'a MacChild,
+struct ChildExit<'a, K> {
+    child: &'a MacosChild<K>,
     kq: Kqueue,
     /// The registration found the pid past registration (`ESRCH`): no event will come.
     unarmed: bool,
@@ -133,10 +148,10 @@ struct ChildExit<'a> {
     exit_seen: bool,
 }
 
-impl<'a> ChildExit<'a> {
-    fn arm(child: &'a MacChild) -> Result<Self, Error> {
+impl<'a, K: Kernel + Send> ChildExit<'a, K> {
+    fn arm(child: &'a MacosChild<K>) -> Result<Self, Error> {
         let kq = Kqueue::new()?;
-        let unarmed = register_exit_events(&kq, child.pid).map_err(Error::Io)?;
+        let unarmed = register_exit_events(&child.kernel, &kq, child.pid).map_err(Error::Io)?;
         Ok(Self {
             child,
             kq,
@@ -146,7 +161,7 @@ impl<'a> ChildExit<'a> {
     }
 }
 
-impl Waitable for ChildExit<'_> {
+impl<K: Kernel + Send> Waitable for ChildExit<'_, K> {
     type Output = ();
 
     fn look(&mut self) -> Result<Step<'_, ()>, Error> {
@@ -163,7 +178,7 @@ impl Waitable for ChildExit<'_> {
     }
 }
 
-impl MacChild {
+impl<K: Kernel + Send> MacosChild<K> {
     /// [`exited`](OsProcess::exited) for a watch that has not fired: `Running` on `wait_for` only
     /// while this process is the child's parent.
     fn exited_past_the_watch<'a>(&self, wait_for: WaitFor<'a>) -> Result<Exit<'a>, Error> {
@@ -174,9 +189,11 @@ impl MacChild {
                 "its exit watch has not fired, and whether it has exited could not be read",
             )
         };
-        let exited = match held_by(self.pid, self.unique, ReadPurpose::Running) {
+        let exited = match held_by(&self.kernel, self.pid, self.unique, ReadPurpose::Running) {
             Held::Parent(parent) if parent == std::process::id() => return Ok(Exit::Running(wait_for)),
-            Held::Parent(_) => has_exited(self.pid, self.unique, ReadPurpose::Running).map_err(refused)?,
+            Held::Parent(_) => {
+                has_exited(&self.kernel, self.pid, self.unique, ReadPurpose::Running).map_err(refused)?
+            }
             // Another process now, or reaped: exited.
             Held::Other | Held::Gone => true,
             Held::Refused(errno) => return Err(refused(errno)),
@@ -189,7 +206,7 @@ impl MacChild {
     }
 }
 
-impl OsChild for MacChild {
+impl<K: Kernel + Send> OsChild for MacosChild<K> {
     fn pid(&self) -> Option<u32> {
         Some(self.pid)
     }
@@ -222,7 +239,10 @@ impl OsChild for MacChild {
             PeekOutcome::Running => {
                 if let Some(holder) = holder {
                     return Ok(
-                        match tracer.held_by(&self.reap, holder).map_err(|e| Error::Io(e.into()))? {
+                        match tracer
+                            .held_by(&self.kernel, &self.reap, holder)
+                            .map_err(|e| Error::Io(e.into()))?
+                        {
                             OnTracer::Block => TryReapOutcome::Running(WaitFor::Readable(self.reap.as_fd())),
                             // The loop's backoff governs; the watch's own interval is not used.
                             OnTracer::Recheck(_) => TryReapOutcome::Recheck,

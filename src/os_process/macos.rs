@@ -4,6 +4,9 @@
 //! macOS has no pidfd. A signal goes through `proc_signal_with_audittoken` instead, with a token
 //! that names the pid and the process's `p_idversion`: the kernel checks the version and signals
 //! while it holds a reference, so a process that took a reused pid is never signalled.
+//!
+//! A [`MacosProcess`] owns the [`Kernel`] it asks, and [`open_with`](super::open_with) moves the
+//! kernel it checked through into it.
 
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -14,7 +17,7 @@ use mach2::message::audit_token_t;
 
 use super::{Exit, OsProcess, WaitFor, EXIT_CONSEQUENCE, OPEN_CONSEQUENCE};
 use crate::error::{io_context, Error};
-use crate::identity::{has_exited, uniq_info, Existence, ProcessId, ReadPurpose, UniqInfo, UniqRead};
+use crate::identity::{has_exited, uniq_info, Existence, Kernel, ProcessId, ReadPurpose, UniqInfo, UniqRead};
 use crate::signal::{Sent, Sig};
 use kqueue::{Kqueue, Subscription};
 
@@ -35,22 +38,35 @@ extern "C" {
 /// at `exec`, and `signal` follows it, so it is atomic. The watch, one kqueue descriptor, is armed
 /// by the first look ([`exited`](OsProcess::exited)): an open costs no descriptor, and a send never
 /// fails for want of one.
-#[derive(Debug)]
-pub(crate) struct MacProcess {
+pub(crate) struct MacosProcess<K> {
+    /// What every read of the process asks.
+    kernel: K,
     id: ProcessId,
     unique: u64,
     idversion: AtomicI32,
     watch: OnceLock<ExitWatch>,
 }
 
-impl MacProcess {
-    /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
-    pub(crate) fn open(id: ProcessId) -> Result<Option<Self>, Error> {
+impl<K> std::fmt::Debug for MacosProcess<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacosProcess")
+            .field("id", &self.id)
+            .field("unique", &self.unique)
+            .field("idversion", &self.idversion)
+            .field("watch", &self.watch)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K: Kernel + Send> MacosProcess<K> {
+    /// Open the process `id` names, checking it through `kernel`, which the process then owns.
+    /// `Ok(None)`: it is gone, or its pid now names another process.
+    pub(crate) fn open(kernel: K, id: ProcessId) -> Result<Option<Self>, Error> {
         let pid = id.pid();
-        let Some(read) = read_for_open(pid, OPEN_CONSEQUENCE)? else {
+        let Some(read) = read_for_open(&kernel, pid, OPEN_CONSEQUENCE)? else {
             return Ok(None);
         };
-        match id.exists() {
+        match id.exists_with(&kernel).0 {
             Existence::Present => {}
             Existence::Gone => return Ok(None),
             Existence::Unknown => {
@@ -61,6 +77,7 @@ impl MacProcess {
             }
         }
         Ok(Some(Self {
+            kernel,
             id,
             unique: read.unique_id,
             idversion: AtomicI32::new(read.id_version),
@@ -72,8 +89,8 @@ impl MacProcess {
     /// arming proves it was this process, any other answer reads as exited.
     fn arm(&self) -> Result<ExitWatch, Error> {
         let pid = self.id.pid();
-        let watch = ExitWatch::proc_exit(pid)?;
-        Ok(match read_for_open(pid, EXIT_CONSEQUENCE)? {
+        let watch = ExitWatch::proc_exit(&self.kernel, pid)?;
+        Ok(match read_for_open(&self.kernel, pid, EXIT_CONSEQUENCE)? {
             Some(now) if now.unique_id == self.unique => watch,
             Some(_) | None => watch.exited_now(),
         })
@@ -83,8 +100,8 @@ impl MacProcess {
 /// `pid`'s unique id for an open. `Ok(None)`: it is gone. A refused read is `Unassessable`, with the
 /// errno as its source; the caller names what its refusal leaves undone (`consequence`), since what
 /// was already sent differs by caller. It logs nothing.
-pub(crate) fn read_for_open(pid: u32, consequence: &str) -> Result<Option<UniqInfo>, Error> {
-    match uniq_info(pid, ReadPurpose::Open) {
+pub(crate) fn read_for_open(kernel: &dyn Kernel, pid: u32, consequence: &str) -> Result<Option<UniqInfo>, Error> {
+    match uniq_info(kernel, pid, ReadPurpose::Open) {
         UniqRead::Found(info) => Ok(Some(info)),
         UniqRead::Gone => Ok(None),
         UniqRead::Refused(errno) => Err(Error::Unassessable {
@@ -140,8 +157,8 @@ pub(crate) enum SignalByTokenOutcome {
 
 /// The `p_idversion` of the process `unique` names, if `pid` still names it. `Ok(None)`: the pid is
 /// gone or names another process. A refusal is an error that keeps its errno.
-pub(crate) fn read_version(pid: u32, unique: u64, sig: Sig) -> io::Result<Option<i32>> {
-    match uniq_info(pid, ReadPurpose::Kill) {
+pub(crate) fn read_version(kernel: &dyn Kernel, pid: u32, unique: u64, sig: Sig) -> io::Result<Option<i32>> {
+    match uniq_info(kernel, pid, ReadPurpose::Kill) {
         UniqRead::Found(now) if now.unique_id == unique => Ok(Some(now.id_version)),
         UniqRead::Found(_) | UniqRead::Gone => Ok(None),
         UniqRead::Refused(errno) => Err(io_context(
@@ -160,6 +177,7 @@ pub(crate) fn read_version(pid: u32, unique: u64, sig: Sig) -> io::Result<Option
 /// `pid` must be a single-process signal target. No cap on the loop: each pass past the first needs
 /// a fresh `exec` of the process.
 pub(crate) fn signal_by_token(
+    kernel: &dyn Kernel,
     pid: u32,
     unique: u64,
     idversion: &mut i32,
@@ -173,7 +191,7 @@ pub(crate) fn signal_by_token(
             Err(errno) => return Err(io::Error::from_raw_os_error(errno)),
         }
         // `ESRCH` is a zombie, an `exec`, or a process that is gone: read what the pid names.
-        match read_version(pid, unique, sig)? {
+        match read_version(kernel, pid, unique, sig)? {
             Some(now) if now == *idversion => {
                 log::debug!("{sig:?} to pid {pid}: it has exited and is not reaped yet");
                 return Ok(SignalByTokenOutcome::ExitedUnreaped);
@@ -188,7 +206,7 @@ pub(crate) fn signal_by_token(
     }
 }
 
-impl OsProcess for MacProcess {
+impl<K: Kernel + Send> OsProcess for MacosProcess<K> {
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         let pid = self.id.pid();
         // `kernel_task` is pid 0 and macOS resolves it, so an identity can name it. It is no
@@ -200,7 +218,7 @@ impl OsProcess for MacProcess {
             });
         }
         let mut idversion = self.idversion.load(Ordering::Relaxed);
-        let outcome = signal_by_token(pid, self.unique, &mut idversion, sig);
+        let outcome = signal_by_token(&self.kernel, pid, self.unique, &mut idversion, sig);
         self.idversion.store(idversion, Ordering::Relaxed);
         match outcome.map_err(Error::Io)? {
             SignalByTokenOutcome::Delivered => Ok(Sent::Delivered),
@@ -219,7 +237,7 @@ impl OsProcess for MacProcess {
                 self.watch.get_or_init(|| armed)
             }
         };
-        watch.look(self.id.pid(), self.unique)
+        watch.look(&self.kernel, self.id.pid(), self.unique)
     }
 }
 
@@ -265,7 +283,7 @@ impl ExitWatch {
     }
 
     /// Arm `NOTE_EXIT` for `pid`. A pid that is already gone is a watch that reads as exited.
-    pub(crate) fn proc_exit(pid: u32) -> Result<Self, Error> {
+    pub(crate) fn proc_exit(kernel: &dyn Kernel, pid: u32) -> Result<Self, Error> {
         let kq = Kqueue::new()?;
         let exit = Subscription::Process {
             pid,
@@ -281,14 +299,14 @@ impl ExitWatch {
         #[cfg(not(test))]
         let forced = false;
         let subscribed = if forced {
-            Err(Error::Io(io::Error::from_raw_os_error(libc::ESRCH)))
+            Err(io::Error::from_raw_os_error(libc::ESRCH))
         } else {
-            kq.subscribe(exit)
+            kernel.subscribe(&kq, exit)
         };
         match subscribed {
             Ok(()) => Ok(Self::new(kq)),
             Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => Ok(Self::new(kq).exited_now()),
-            Err(e) => Err(e),
+            Err(e) => Err(Error::Io(e)),
         }
     }
 
@@ -301,7 +319,7 @@ impl ExitWatch {
     }
 
     /// One look at the process `unique` names at `pid`, which this watch is armed for: the answer
-    /// both [`MacProcess`] and [`MacChild`](child::MacChild) give for [`OsProcess::exited`].
+    /// both [`MacosProcess`] and [`MacosChild`](child::MacosChild) give for [`OsProcess::exited`].
     ///
     /// The watch fires early: `NOTE_EXIT` precedes `p_stat = SZOMB`, and a pid past `P_REF_DEAD`
     /// refuses registration before either. A fired watch is `Exited` only once the process is a
@@ -310,14 +328,14 @@ impl ExitWatch {
     /// `Recheck`, which the driver's uncapped backoff re-reads. A refused read is `Unassessable`
     /// with the errno as its source, never `Exited`; an unfired watch reads nothing, and neither
     /// does a look after the exit was confirmed.
-    pub(crate) fn look(&self, pid: u32, unique: u64) -> Result<Exit<'_>, Error> {
+    pub(crate) fn look(&self, kernel: &dyn Kernel, pid: u32, unique: u64) -> Result<Exit<'_>, Error> {
         if self.confirmed.load(Ordering::Relaxed) {
             return Ok(Exit::Exited);
         }
         if !self.exited()? {
             return Ok(Exit::Running(WaitFor::Readable(self.as_fd())));
         }
-        match has_exited(pid, unique, ReadPurpose::Exit) {
+        match has_exited(kernel, pid, unique, ReadPurpose::Exit) {
             Ok(true) => {
                 self.confirm();
                 Ok(Exit::Exited)
