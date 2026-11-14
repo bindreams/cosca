@@ -368,16 +368,19 @@ fn a_root_whose_proof_finds_another_process_walks_nothing() {
                 &super::ByIdentity::new(&root_changed_hands(), root())
             )
             .outcome(),
-            crate::containment::dispatch::TreeKillOutcome::NoRoot
+            crate::containment::dispatch::TreeKillOutcome::NoRoot(..)
         ),
         "a gone root has no tree to walk"
     );
-    super::terminate(
+    let termed = super::terminate(
         &root_changed_hands(),
         root(),
         &super::ByIdentity::new(&root_changed_hands(), root()),
-    )
-    .expect("a gone root is Ok");
+    );
+    assert!(
+        matches!(termed, Ok(super::Terminated::RootExited(_))),
+        "a gone root sends nothing"
+    );
     for recursive in [Recursive::No, Recursive::Yes] {
         let children = root().children_with(&root_changed_hands(), recursive);
         assert_eq!(children.expect("a gone root is Ok"), vec![], "{recursive:?}");
@@ -407,7 +410,8 @@ fn a_root_whose_proof_cannot_be_made_is_unassessable_and_signals_nothing() {
             &root_proof_fails(),
             root(),
             &super::ByIdentity::new(&root_proof_fails(), root()),
-        ),
+        )
+        .map(drop),
         root().children_with(&root_proof_fails(), Recursive::No).map(|_| ()),
         root().children_with(&root_proof_fails(), Recursive::Yes).map(|_| ()),
     ];

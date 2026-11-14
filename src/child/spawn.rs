@@ -1125,7 +1125,9 @@ pub(crate) struct Unreported {
 /// 2. the root, so it can add no member after its kill lands (a `setsid`, an `exec`, a fork);
 /// 3. once the root is an unreaped zombie, whose pid still names its group, the tree again, for what
 ///    it added before it died: a child held between its report and a `setsid` escapes the first
-///    `killpg`;
+///    `killpg`. A `TreeWalk` tree skips this step: the root's kill reparented its children, so a walk
+///    from the zombie finds none and answers
+///    [`NoRoot`](crate::containment::dispatch::TreeKillOutcome::NoRoot), which judges nothing;
 /// 4. the root's reap.
 ///
 /// The root's wait is unbounded. With `warn_after`, it logs one `warn` naming `pid` once the wait
@@ -1146,7 +1148,10 @@ pub(crate) fn kill_and_reap_unreported(
     fault::run_at(fault::SpawnPoint::BeforeLateRootKill, pid);
     let mut found = Findings::default();
     let (fate, kill) = kill_and_reap_noting(pid, unique, tree.id, warn_after, &mut found, |zombie| {
-        tree.kill(Sweep::RootKilled { zombie })
+        // A walk from the zombie root finds nothing: the kill reparented its children (see step 3).
+        if !(zombie && tree.is_walk()) {
+            tree.kill(Sweep::RootKilled { zombie });
+        }
     });
     let Findings {
         mut notes,
@@ -1297,6 +1302,11 @@ impl LateTree {
             None => tree.notes.push(why.fold(format!("its tree was not killed: {unshown}"))),
         }
         tree
+    }
+
+    /// Whether the tree is a `TreeWalk`'s, found by a walk from its root.
+    fn is_walk(&self) -> bool {
+        matches!(&self.tree, Some(tree) if tree.containment() == crate::containment::Containment::TreeWalk)
     }
 
     /// Runs `sweep`.

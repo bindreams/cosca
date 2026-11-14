@@ -1084,3 +1084,7 @@ pub(crate) fn windows_identity_from_handle_result(
 #[cfg(test)]
 #[path = "identity_tests.rs"]
 mod identity_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "identity/leader_exit_tests.rs"]
+mod leader_exit_tests;

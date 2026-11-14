@@ -285,15 +285,16 @@ fn a_fired_watch_on_a_child_is_exited_only_once_it_is_a_zombie() {
     child.wait().unwrap();
 }
 
-/// A look at a watch that has not fired reads no state of the process: a process's reads nothing, and a
-/// child's, whose parent is this process, reads only that parent, never whether it is a zombie. The
-/// confirming read is forced refused: a look that makes it before it asks the watch is an error for
-/// a process that runs.
+/// A look at a watch that has not fired reads no state of the process: a process's first look arms
+/// the watch, which proves the process by one unique-id read for an open, and later looks read
+/// nothing; a child's, whose parent is this process, reads only that parent, never whether it is a
+/// zombie. The confirming read is forced refused: a look that makes it before it asks the watch is
+/// an error for a process that runs.
 ///
 /// Mutant: `ExitWatch::look` reads the process's state before it asks the watch; `MacChild::exited`
 /// reads whether the child is a zombie while this process is its parent.
 #[skuld::test]
-fn a_look_at_an_unfired_watch_reads_nothing() {
+fn the_first_look_at_an_unfired_watch_arms_it_by_one_open_read_and_reads_no_state() {
     use crate::identity::uniq_fault::force_uniq_read_once;
     use crate::os_process::macos::child::MacChild;
 
@@ -309,14 +310,27 @@ fn a_look_at_an_unfired_watch_reads_nothing() {
         matches!(p.exited(), Ok(Exit::Running(_))),
         "an unfired watch on a running process is Running"
     );
-    assert_eq!(reads.purposes(), vec![], "a process's unfired watch reads nothing");
+    assert_eq!(
+        reads.purposes(),
+        vec![ReadPurpose::Open],
+        "the first look arms the watch: it proves the process by its unique id and reads no state"
+    );
+    assert!(
+        matches!(p.exited(), Ok(Exit::Running(_))),
+        "a second look at the unfired watch is Running"
+    );
+    assert_eq!(
+        reads.purposes(),
+        vec![ReadPurpose::Open],
+        "a look at an armed, unfired watch reads nothing"
+    );
     assert!(
         matches!(mac.exited(), Ok(Exit::Running(_))),
         "an unfired watch on a running child is Running"
     );
     assert_eq!(
         reads.purposes(),
-        vec![ReadPurpose::Running, ReadPurpose::Running],
+        vec![ReadPurpose::Open, ReadPurpose::Running, ReadPurpose::Running],
         "a child's unfired watch reads its parent (two unique-id reads) and nothing else"
     );
     child.kill().unwrap();

@@ -6,6 +6,10 @@
 use std::time::Duration;
 
 use super::Process;
+use crate::containment::dispatch::Keeping;
+use crate::containment::mechanism::Mechanism;
+use crate::containment::treewalk::{Terminated, WalkToken, Walker};
+use crate::containment::Tree;
 use crate::error::Error;
 
 impl Process {
@@ -48,15 +52,17 @@ impl Process {
     /// # Errors
     ///
     /// [`Error::Unassessable`] when the process table cannot be read, or the root exists but cannot
-    /// be queried: nothing is killed, the root included. Also when the root is gone, or no longer
-    /// holds its pid: no walk ran, and nothing was killed.
+    /// be queried: nothing is killed, the root included. Also when the root has exited, reaped or not
+    /// (its children were reparented at its exit, so a walk from its pid says nothing of the tree), or
+    /// no longer holds its pid, and the walk finds no member: no walk ran, and nothing was killed.
     ///
     /// [`Error::MembersLeft`] when the walk killed what it could and left members running, each a
     /// [`Error::MemberNotKilled`] naming it and why: its identity could not be read, or its kill was
     /// refused.
     ///
     /// **`Ok` means every member the walk killed has exited**, and so has the root: the call waits
-    /// for each, with no deadline. A member forked after the walk's snapshot is not seen. On Linux
+    /// for each, with no deadline. A member forked after the walk's snapshot is not seen, and a parent
+    /// that exits during the call, the root included, hides its children from the walk. On Linux
     /// below 6.9 a member that was killed and reaped, and whose pid was taken again within its own
     /// start tick, is waited for in its successor's place. A member whose exit cannot be observed is
     /// an [`Error::Unassessable`] naming it, returned once the others have been waited for. [`send_kill_tree`](Process::send_kill_tree) only sends.
@@ -73,7 +79,18 @@ impl Process {
     /// [`kill_tree`](Self::kill_tree) for the call `op`, which a warn about its failed wait names,
     /// reading through `kernel`.
     pub(crate) fn kill_tree_with(&self, op: &str, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
-        let (answer, wait) = self.sweep(kernel);
+        self.kill_tree_settling(op, kernel, None)
+    }
+
+    /// [`kill_tree_with`](Self::kill_tree_with) for a graceful call, which keeps the members its
+    /// `SIGTERM` walk reached in a settlement of its own (see [`sweep`](Self::sweep)).
+    pub(crate) fn kill_tree_settling(
+        &self,
+        op: &str,
+        kernel: &dyn crate::identity::Kernel,
+        call: Option<&Settling>,
+    ) -> Result<(), Error> {
+        let (answer, wait) = self.sweep(kernel, call);
         let waited = wait.wait();
         crate::containment::tree_kill::answer_after_wait(op, answer, waited, |error| error)
     }
@@ -85,26 +102,50 @@ impl Process {
         op: &str,
         kernel: &dyn crate::identity::Kernel,
     ) -> Result<(), Error> {
-        let (answer, wait) = self.sweep(kernel);
+        self.kill_tree_settling_async(op, kernel, None).await
+    }
+
+    /// [`kill_tree_settling`](Self::kill_tree_settling), awaited, with no runtime thread blocked.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn kill_tree_settling_async(
+        &self,
+        op: &str,
+        kernel: &dyn crate::identity::Kernel,
+        call: Option<&Settling>,
+    ) -> Result<(), Error> {
+        let (answer, wait) = self.sweep(kernel, call);
         let waited = wait.wait_async().await;
         crate::containment::tree_kill::answer_after_wait(op, answer, waited, |error| error)
     }
 
     /// [`send_kill_tree`](Self::send_kill_tree), reading through `kernel`.
     pub(crate) fn send_kill_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
-        self.sweep(kernel).0
+        self.sweep(kernel, None).0
     }
 
     /// The walk's kills, the answer they come to, and the wait for what they reached: the members, and
     /// the root through this handle once its kill landed.
+    ///
+    /// A root whose exit is visible, reaped or not, whose walk finds no member answers
+    /// [`Error::Unassessable`]. `call`: a graceful call's settlement, which settles the walk as a
+    /// `Child`'s tree does ([`TreeKilled::settle`](crate::containment::dispatch::TreeKilled::settle)).
     fn sweep<'a>(
         &'a self,
         kernel: &'a dyn crate::identity::Kernel,
+        call: Option<&Settling>,
     ) -> (Result<(), Error>, crate::containment::KillWait<'a>) {
-        let (outcome, wait) = crate::containment::treewalk::hard_kill(kernel, self.id, self).split();
-        // No handle backstop: the root is left as any member is, and the error holds every member.
-        let answer = outcome.into_result().or_else(|left| left.unsettled(false));
+        let (outcome, mut wait) = crate::containment::treewalk::hard_kill(kernel, self.id, self).split();
         let landed = wait.root_killed();
+        // No handle backstop: the root is left as any member is, and the error holds every member.
+        let answer = match call {
+            Some(Settling { tree, walk }) => {
+                // A foreign handle has no retry of its own to keep anything for.
+                let settled = tree.settle_for_kill_tree(outcome.in_call(walk.as_ref()), landed, Keeping::Nothing);
+                wait.reaching(settled.killed_again);
+                settled.answer
+            }
+            None => outcome.into_result().or_else(|left| left.unsettled(false)),
+        };
         (answer, wait.with_root(&*self.os, self.id.pid(), landed))
     }
 
@@ -117,13 +158,21 @@ impl Process {
     /// # Errors
     ///
     /// [`Error::Unassessable`] when the process table cannot be read, or the root exists but cannot
-    /// be queried: nothing is signalled.
+    /// be queried: nothing is signalled. Also when the root has exited, reaped or not, and its walk
+    /// finds no member: its children were reparented at its exit, so a walk from its pid says nothing
+    /// of the tree, and nothing is signalled.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.terminate_tree_with(&crate::identity::HostKernel)
     }
 
     /// [`terminate_tree`](Self::terminate_tree), reading through `kernel`.
     pub(crate) fn terminate_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
+        self.terminate_walk(kernel).and_then(Terminated::into_result)
+    }
+
+    /// The `SIGTERM` walk of [`terminate_tree`](Self::terminate_tree), with what it found: the members it
+    /// listed, which a graceful shutdown stands on ([`sweep`](Self::sweep)).
+    pub(crate) fn terminate_walk(&self, kernel: &dyn crate::identity::Kernel) -> Result<Terminated, Error> {
         #[cfg(unix)]
         {
             crate::containment::treewalk::terminate(kernel, self.id, self)
@@ -144,8 +193,35 @@ impl Process {
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (kernel, self.id);
-            Ok(())
+            Ok(Terminated::Walked(crate::containment::treewalk::Listing {
+                members: Vec::new(),
+                complete: true,
+            }))
         }
+    }
+
+    /// The `SIGTERM` walk of a graceful shutdown and the call-local settlement ([`Settling`]) its sweep
+    /// answers to.
+    ///
+    /// # Errors
+    ///
+    /// As [`terminate_tree`](Process::terminate_tree) for a walk that could not be made: nothing is
+    /// signalled. Windows: `Unsupported`.
+    pub(crate) fn begin_graceful(&self) -> Result<Settling, Error> {
+        let walked = self.terminate_walk(&crate::identity::HostKernel)?;
+        let tree = Tree::contained(Mechanism::Walk(Walker::new(self.id)));
+        let walk = match walked {
+            Terminated::Walked(listing) => tree.hold_walked(listing, Some(&WalkToken::new())),
+            Terminated::RootExited(exited) => {
+                log::debug!(
+                    "graceful_shutdown_tree({}): sent no SIGTERM: {report}",
+                    self.id.pid(),
+                    report = crate::error::Report(&exited)
+                );
+                None
+            }
+        };
+        Ok(Settling { tree, walk })
     }
 
     /// Cooperative-then-forced shutdown of the foreign process's tree: `SIGTERM`-walk, wait up
@@ -159,16 +235,33 @@ impl Process {
     /// it as a peer, as for [`graceful_shutdown`](Process::graceful_shutdown). The sweep's errors
     /// are those of [`kill_tree`](Process::kill_tree); one that left members running carries the watch
     /// failure in its `others`.
+    ///
+    /// As for a `Child` on a `TreeWalk` tree ([`Child::graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree)): the members the call's
+    /// own `SIGTERM` walk found are killed by identity if the root exits within the grace, and the call
+    /// is `Ok` when every one is gone. A root that had exited before the call is
+    /// [`Error::Unassessable`]. A foreign handle keeps nothing for a retry: the members the call's own
+    /// `SIGTERM` walk found are killed by identity on every sweep, walked or not. When the sweep's walk
+    /// cannot be made (the process table cannot be read), they are killed and waited for, the root's
+    /// reparented ones included, and the call is the walk's error. Children one of them forked after
+    /// that walk are not seen (the limit of [`kill_tree`](Process::kill_tree)). The root is not
+    /// killed, and a retry walks from it.
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
-        self.terminate_tree()?; // SIGTERM-walk (Windows: Unsupported, early return)
+        let settling = self.begin_graceful()?;
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
 
         let call = format!("graceful_shutdown_tree({})", self.id.pid());
         crate::graceful::after_tree_grace(&call, self.wait_timeout(grace), || {
-            self.kill_tree_with("graceful_shutdown_tree", &crate::identity::HostKernel)
+            self.kill_tree_settling("graceful_shutdown_tree", &crate::identity::HostKernel, Some(&settling))
         })
     }
+}
+
+/// A graceful shutdown's settlement ([`Process::begin_graceful`]): the tree its `SIGTERM` walk held its
+/// members in, and the token of that walk, if it read every candidate.
+pub(crate) struct Settling {
+    tree: Tree,
+    walk: Option<WalkToken>,
 }
 
 #[cfg(test)]

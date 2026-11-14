@@ -9,6 +9,7 @@ use crate::containment::drain_edge::DrainEdge;
 #[cfg(feature = "tokio")]
 use crate::containment::mechanism::AwaitableRelease;
 use crate::containment::mechanism::{Contains, Release};
+use crate::containment::treewalk::Listing;
 use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
 use crate::identity::HostKernel;
 
@@ -81,8 +82,8 @@ impl Contains for CgroupLeaf {
         TreeKillOutcome::Ran(self.hard_kill().map_err(Unkilled::from))
     }
 
-    fn send_terminate(&self, _pid: u32, _root: Option<&dyn Root>) -> TerminateOutcome {
-        TerminateOutcome::of(self.terminate(), Some("the SIGTERM"))
+    fn send_terminate(&self, _pid: u32, _root: Option<&dyn Root>) -> (TerminateOutcome, Option<Listing>) {
+        (TerminateOutcome::of(self.terminate(), Some("the SIGTERM")), None)
     }
 
     fn drain_edge(&self) -> Option<DrainEdge<'_>> {

@@ -11,7 +11,7 @@ use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{nothing_held, Contains, KillLeftOutcome};
 #[cfg(unix)]
 use crate::containment::tree_kill::refused_unobserved;
-use crate::containment::treewalk::Left;
+use crate::containment::treewalk::{Left, Listing};
 use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
 use crate::identity::ProcessId;
 
@@ -33,6 +33,8 @@ pub(crate) struct FakeContains {
     /// The pids its kill states it reached but whose exit cannot be observed, which fail the wait.
     #[cfg(unix)]
     unobserved: Vec<u32>,
+    /// Whether its kill states that its walk was not made.
+    unwalked: bool,
     sends: Sends,
 }
 
@@ -48,6 +50,7 @@ impl FakeContains {
             killed_again: Vec::new(),
             #[cfg(unix)]
             unobserved: Vec::new(),
+            unwalked: false,
             sends: sends.clone(),
         };
         (fake, sends)
@@ -75,6 +78,13 @@ impl FakeContains {
         self
     }
 
+    /// A mechanism whose kill states that its walk was not made ([`TreeKillOutcome::Unwalked`]).
+    #[cfg_attr(windows, allow(dead_code, reason = "only a Unix row states an unwalked walk"))]
+    pub(crate) fn unwalked(mut self) -> FakeContains {
+        self.unwalked = true;
+        self
+    }
+
     fn record(&self, send: &'static str) {
         self.sends
             .lock()
@@ -87,6 +97,13 @@ impl Contains for FakeContains {
     /// A kill that leaves nothing running, and states the members it reached.
     fn kill(&self, _root: Option<&dyn Root>) -> TreeKill<'_> {
         self.record("kill");
+        if self.unwalked {
+            let error = crate::error::Error::Unassessable {
+                detail: "the process table could not be read".into(),
+                source: None,
+            };
+            return TreeKill::of(TreeKillOutcome::Unwalked(error));
+        }
         let kill = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching(self.killed.iter().copied());
         #[cfg(unix)]
         let kill = self
@@ -103,12 +120,13 @@ impl Contains for FakeContains {
         }
     }
 
-    fn send_terminate(&self, _pid: u32, _root: Option<&dyn Root>) -> TerminateOutcome {
+    fn send_terminate(&self, _pid: u32, _root: Option<&dyn Root>) -> (TerminateOutcome, Option<Listing>) {
         self.record("terminate");
-        TerminateOutcome::Sent {
+        let sent = TerminateOutcome::Sent {
             result: Ok(()),
             earlier: Some("the SIGTERM"),
-        }
+        };
+        (sent, None)
     }
 
     /// It has no drain edge.
