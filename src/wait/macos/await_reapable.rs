@@ -73,20 +73,20 @@ fn blank() -> KEvent {
     KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)
 }
 
+/// What [`register`] subscribes for `pid`: its exit, its signals and its reap.
+pub(crate) fn reap_registration(pid: u32) -> Subscription {
+    Subscription::Process {
+        pid,
+        signals: true,
+        reap: true,
+    }
+}
+
 /// Register `EVFILT_SIGNAL` for `SIGCHLD` and `EVFILT_PROC` for `pid`. `Ok(true)` when the
 /// `EVFILT_PROC` receipt says `ESRCH` (the child is already past `P_REF_DEAD`).
 fn register(kernel: &dyn Kernel, kq: &Kqueue, pid: u32) -> io::Result<bool> {
     kernel.subscribe(kq, Subscription::Signal(libc::SIGCHLD))?;
-    #[cfg(test)]
-    if test_hooks::take_forced_registration(test_hooks::Registration::Reap) {
-        return Ok(true);
-    }
-    let child = Subscription::Process {
-        pid,
-        signals: true,
-        reap: true,
-    };
-    match kernel.subscribe(kq, child) {
+    match kernel.subscribe(kq, reap_registration(pid)) {
         Ok(()) => Ok(false),
         Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => Ok(true),
         Err(e) => Err(e),
