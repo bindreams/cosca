@@ -1,6 +1,7 @@
 //! Tests for the macOS wait (`await_reapable`): its own `kevent` loop, the self-registration, the
-//! backoff and the deadline. Every test that blocks on a real kqueue is covered by the suite's
-//! `slow-timeout` in `.config/nextest.toml`.
+//! backoff and the deadline. A test that blocks on a real kqueue ends its wait from a
+//! [`block_probe`](crate::wait::block_probe) hook, at the block, through the event the wait
+//! watches.
 //!
 //! The cases that change the process-wide `SIGCHLD` disposition each run in a fresh re-exec of
 //! this test binary (`run_case`), so they cannot affect the other tests.
@@ -9,7 +10,8 @@ use std::process::{Child, ChildStdin};
 use std::time::Duration;
 
 use crate::identity::{FakeKernel, HostKernel};
-use crate::os_process::macos::kqueue::{test_hooks, Kqueue};
+use crate::os_process::macos::kqueue::{test_hooks, Kqueue, Subscription};
+use crate::wait::block_probe::{self, on_blocking, on_each_block};
 use crate::wait::macos::{await_reapable, await_reapable_on, reap_registration, Waited};
 
 fn spawn_blocker() -> (Child, ChildStdin) {
@@ -74,12 +76,21 @@ fn stall(d: Duration) {
     crate::wait::test_clock::advance_by_elapsed_if_frozen(d);
 }
 
-/// Hold the frozen clock until the wait's round `round`: the calls before it take no clock time,
-/// however long the runner stalls them. From `round` on, measured time drives the clock again and
-/// runs the deadline out.
-fn hold_the_clock_until_round(round: u32) -> test_hooks::ForcedOnce {
-    let held = crate::wait::test_clock::ZeroElapsedGuard::install();
-    test_hooks::on_kevent_round(round, move || drop(held))
+/// Runs `hook` with the index of each blocking round of the wait (0 for the first), and holds the
+/// frozen clock until the end of round `round`'s hook: the calls before it take no clock time,
+/// however long the runner stalls them. From the end of that hook on, measured time drives the clock
+/// again and runs the deadline out. A `kevent` the OS interrupts is a round of its own.
+fn hold_the_clock_until_round(round: u32, mut hook: impl FnMut(u32) + 'static) -> block_probe::Armed {
+    let mut held = Some(crate::wait::test_clock::ZeroElapsedGuard::install());
+    on_each_block(move |block| {
+        // Another waiter's `Condvar` block has no number and is no round of this wait.
+        let Some(n) = block.n else { return };
+        let index = n - 1;
+        hook(index);
+        if index == round {
+            drop(held.take());
+        }
+    })
 }
 
 /// A short-lived child that starts and exits inside the wait: its `SIGCHLD` wakes the kqueue with
@@ -110,11 +121,10 @@ fn spurious_wake() {
 fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
     let (mut child, stdin) = spawn_blocker();
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
-    let _held = hold_the_clock_until_round(1);
     let limit = Duration::from_millis(30);
     let deadline = at + limit;
     let remainings = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let _rounds = test_hooks::on_every_kevent_round({
+    let _rounds = hold_the_clock_until_round(1, {
         let remainings = std::rc::Rc::clone(&remainings);
         move |round| {
             let left = deadline.saturating_duration_since(crate::wait::now());
@@ -137,6 +147,7 @@ fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
             Ok(None)
         }
     });
+    block_probe::take();
     let waited = await_reapable(&kernel, child.id(), None, Some(deadline)).expect("wait");
     assert_eq!(waited, Waited::DeadlinePassed);
     assert_eq!(
@@ -144,10 +155,9 @@ fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
         1,
         "exactly one peek at or after the deadline: the final peek"
     );
-    let timeouts = test_hooks::await_requested_timeouts();
+    let timeouts = block_probe::take();
     let blocking: Vec<Duration> = timeouts
         .iter()
-        .filter(|t| **t != Some(Duration::ZERO))
         .map(|t| t.expect("a deadline wait arms a bounded kevent"))
         .collect();
     let remainings = remainings.borrow();
@@ -166,30 +176,37 @@ fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
 
 /// A `kevent` interrupted by a signal is retried with the time remaining now, not the time
 /// remaining when the interrupted call started. The interrupted call is made to spend 10 ms of
-/// the frozen clock, which is held until round 0 so a runner stall before it changes nothing.
+/// the frozen clock, which is held until round 0 so a runner stall before it changes nothing: the
+/// retry is armed with exactly what the interrupted call was armed with, less what it spent.
 ///
-/// Mutant: the timeout computed once, before the retry loop; the clock not held (the stall leaves
-/// less than `spent` for round 0).
+/// Mutant: the timeout computed once, before the retry loop (the retry is armed with `first`); the
+/// clock not held (the 25 ms stall also comes off the retry's time, which is armed with nothing,
+/// or with less than `first - spent`).
 #[skuld::test]
 fn an_interrupted_kevent_is_retried_with_the_time_remaining_now() {
     let (mut child, stdin) = spawn_blocker();
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
-    let _held = hold_the_clock_until_round(0);
     let spent = Duration::from_millis(10);
     let _eintr = test_hooks::force_eintr_once(spent);
-    let _stall = test_hooks::on_every_kevent_round(|round| {
+    let _stall = hold_the_clock_until_round(0, |round| {
         if round == 0 {
             stall(Duration::from_millis(25));
         }
     });
+    block_probe::take();
     let waited = await_reapable(&HostKernel, child.id(), None, Some(at + Duration::from_millis(30))).expect("wait");
     assert_eq!(waited, Waited::DeadlinePassed);
-    let timeouts = test_hooks::await_requested_timeouts();
-    // The drain, the interrupted call, its retry, then the drain after expiry.
-    let first = timeouts[1].expect("bounded");
-    let retry = timeouts[2].expect("bounded");
+    let timeouts = block_probe::take();
+    // The interrupted call, then its retry: a retry armed with nothing left is recorded too.
     assert!(
-        retry + spent <= first,
+        timeouts.len() >= 2,
+        "the interrupted call must be retried: {timeouts:?}"
+    );
+    let first = timeouts[0].expect("bounded");
+    let retry = timeouts[1].expect("bounded");
+    assert_eq!(
+        retry + spent,
+        first,
         "the retry was armed with {retry:?} after {spent:?} of {first:?} was spent"
     );
     drop(stdin);
@@ -205,12 +222,13 @@ fn an_interrupted_kevent_is_retried_with_the_time_remaining_now() {
 fn await_reapable_with_a_deadline_beyond_the_kevent_limit_returns_the_exit() {
     let (mut child, stdin) = spawn_blocker();
     let mut stdin = Some(stdin);
-    let _end = test_hooks::on_kevent_round(0, move || drop(stdin.take()));
+    let _end = on_blocking(move || drop(stdin.take()));
     let deadline = crate::wait::deadline_from(Duration::from_secs(u64::from(u32::MAX)))
         .expect("a deadline this far is still finite");
+    block_probe::take();
     let waited = await_reapable(&HostKernel, child.id(), None, Some(deadline)).expect("a far deadline is not an error");
     assert_eq!(waited, Waited::Reapable);
-    for armed in test_hooks::await_requested_timeouts() {
+    for armed in block_probe::take() {
         let armed = armed.expect("a deadline wait arms a bounded kevent");
         assert!(armed <= Duration::from_secs(i32::MAX as u64), "armed {armed:?}");
     }
@@ -225,18 +243,11 @@ fn await_reapable_with_a_deadline_beyond_the_kevent_limit_returns_the_exit() {
 #[skuld::test]
 fn dropped_hook_guards_remove_their_hooks() {
     let fired = std::rc::Rc::new(std::cell::Cell::new(0u32));
-    let count = |fired: &std::rc::Rc<std::cell::Cell<u32>>| {
-        let fired = std::rc::Rc::clone(fired);
-        move || fired.set(fired.get() + 1)
-    };
-    drop(test_hooks::on_esrch_repeek(count(&fired)));
-    drop(test_hooks::on_kevent_round(0, count(&fired)));
-    drop(test_hooks::on_every_kevent_round({
+    drop(test_hooks::on_esrch_repeek({
         let fired = std::rc::Rc::clone(&fired);
-        move |_| fired.set(fired.get() + 1)
+        move || fired.set(fired.get() + 1)
     }));
     test_hooks::fire_esrch_repeek();
-    test_hooks::fire_kevent_round(0);
     assert_eq!(fired.get(), 0, "a hook outlived its guard");
 }
 
@@ -262,7 +273,7 @@ fn no_evfilt_proc_event_arrives_after_the_round_that_delivered_note_exit() {
     let (mut child, stdin) = spawn_blocker();
     let mut stdin = Some(stdin);
     // The child exits only after `EVFILT_PROC` is registered and the wait is about to block.
-    let _end = test_hooks::on_kevent_round(0, move || drop(stdin.take()));
+    let _end = on_blocking(move || drop(stdin.take()));
     // At least one more round after the one that delivers `NOTE_EXIT`: the first peek, before the
     // round that blocks, and the one after it, which the exit is not yet visible to, find no record.
     let kernel = FakeKernel::over(&HostKernel)
@@ -383,7 +394,13 @@ fn a_macos_esrch_wait_follows_the_kernel_not_the_disposition() {
 /// failed spawn's normal path) still waits for a real `NOTE_EXIT`: under `SIG_IGN` with a live
 /// sibling XNU sends no `SIGCHLD`, and nothing else would wake the kqueue.
 ///
-/// Mutant: no self-registration: the wait blocks on a `NOTE_EXIT` that never comes.
+/// The block's hook ends the child, waits until the kernel has reaped it itself (`NOTE_EXIT` is
+/// posted before that reap, `kern_exit.c:2562` against `:2577-2601`), and looks at the wait's kqueue:
+/// the `NOTE_EXIT` must be on it. A look that finds nothing is ended by a byte on a pipe the test
+/// registered on the same kqueue, so the assertion on the look fails instead of the wait blocking.
+///
+/// Mutant: no self-registration: the look finds nothing, as the wait would have blocked on a
+/// `NOTE_EXIT` that never comes.
 #[skuld::test]
 fn await_reapable_on_waits_out_a_caller_registration_that_got_esrch() {
     const MARKER: &str = "COSCA_TESTCFG_AWAIT_CALLER_ESRCH";
@@ -400,11 +417,42 @@ fn await_reapable_on_waits_out_a_caller_registration_that_got_esrch() {
     let pid = child.id();
     // The caller's own registration, on the kqueue it hands in, "got ESRCH": it registered nothing.
     let kq = Kqueue::new().expect("kqueue");
+    // The backstop: a byte on this pipe wakes the wait if the look finds nothing.
+    let (backstop, mut backstop_writer) = std::io::pipe().expect("pipe");
+    kq.subscribe(Subscription::Readable {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&backstop),
+        low_water: 1,
+    })
+    .expect("watch the backstop pipe");
+    let looked = std::rc::Rc::new(std::cell::Cell::new(None));
     let mut stdin = Some(stdin);
     // The child exits only from inside the first blocking round, once the wait is about to sleep.
-    let _end = test_hooks::on_kevent_round(0, move || drop(stdin.take()));
+    let _end = on_each_block({
+        let looked = std::rc::Rc::clone(&looked);
+        move |block| {
+            if block.n != Some(1) {
+                return;
+            }
+            drop(stdin.take());
+            // A re-check of the real condition, with no end of its own: the child is the one ending.
+            let mut pause = Duration::from_millis(1);
+            while crate::test_child::is_unreaped_child(pid) {
+                std::thread::sleep(pause);
+                pause = pause.saturating_mul(2);
+            }
+            looked.set(block.ready());
+            if looked.get() != Some(true) {
+                std::io::Write::write_all(&mut backstop_writer, &[1]).expect("write the backstop byte");
+            }
+        }
+    });
     // The first peek finds the child running (it is): the wait must then block, not spin.
     let waited = await_reapable_on(&HostKernel, &kq, pid, None, None).expect("wait");
+    assert_eq!(
+        looked.get(),
+        Some(true),
+        "the wait's own registration must have put the child's exit on its kqueue"
+    );
     assert_eq!(waited, Waited::Gone, "XNU reaped the child itself under SIG_IGN");
     std::mem::forget(child);
 }

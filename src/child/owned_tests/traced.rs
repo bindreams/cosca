@@ -54,20 +54,56 @@ fn held() -> (crate::Child, crate::PipeWriter) {
 
 /// Runs `wait(tracee)` on a thread and returns once that thread is about to block on its first
 /// `poll` of a kqueue, whose knote is registered: no event can be lost after that.
+///
+/// `at_block` runs on the waiter's thread at that block, after the test thread was told: a test
+/// that looks at the block parks it there until its wake is staged (see
+/// [`look_after_staging`]).
 fn blocked_in<'s, G, R: Send + 's>(
     scope: &'s std::thread::Scope<'s, '_>,
     tracee: &'s crate::Child,
     arm: impl FnOnce() -> G + Send + 's,
     wait: impl FnOnce(&'s crate::Child) -> R + Send + 's,
+    at_block: impl FnOnce(&crate::wait::block_probe::Block<'_>) + Send + 'static,
 ) -> std::thread::ScopedJoinHandle<'s, R> {
     let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
     let waiter = scope.spawn(move || {
         let _armed = arm();
-        let _blocked = crate::wait::block_probe::on_blocking(move || _ = blocked_tx.send(()));
+        let mut at_block = Some(at_block);
+        let _blocked = crate::wait::block_probe::on_each_block(move |block| {
+            if block.n == Some(1) {
+                _ = blocked_tx.send(());
+                if let Some(at_block) = at_block.take() {
+                    at_block(block);
+                }
+            }
+        });
         wait(tracee)
     });
     blocked_rx.recv().expect("the waiter must reach its blocking poll");
     waiter
+}
+
+/// The `at_block` of a [`blocked_in`] that looks at its block: waits until the test thread has
+/// staged its wake (`staged.send(())`), then looks at the wait's kqueue (`ready()`) and answers on
+/// the receiver. A test thread that panicked before it staged dropped the sender: the waiter
+/// panics, ending its wait, instead of blocking the scope's join for ever.
+///
+/// A look that finds nothing is ended by the test's hand-back, whose `NOTE_EXIT` XNU re-fires on the
+/// watch's kqueue (`kern_exit.c:2856-2912`), and the assertion on the look fails.
+fn look_after_staging() -> (
+    impl FnOnce(&crate::wait::block_probe::Block<'_>) + Send + 'static,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<Option<bool>>,
+) {
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel::<()>();
+    let (looked_tx, looked_rx) = std::sync::mpsc::channel();
+    let look = move |block: &crate::wait::block_probe::Block<'_>| {
+        staged_rx
+            .recv()
+            .expect("the test thread panicked before it staged its wake");
+        _ = looked_tx.send(block.ready());
+    };
+    (look, staged_tx, looked_rx)
 }
 
 /// [`blocked_in`] for `tracee.wait()`, which blocks on the reap kqueue.
@@ -76,7 +112,7 @@ fn wait_blocked<'s, G>(
     tracee: &'s crate::Child,
     arm: impl FnOnce() -> G + Send + 's,
 ) -> std::thread::ScopedJoinHandle<'s, Result<std::process::ExitStatus, crate::error::Error>> {
-    blocked_in(scope, tracee, arm, |tracee| tracee.wait())
+    blocked_in(scope, tracee, arm, |tracee| tracee.wait(), |_| {})
 }
 
 /// An `OwnedChild` wait blocked while a tracer holds the child stays blocked through the child's
@@ -149,8 +185,13 @@ fn a_zombie_a_tracer_holds_is_running_until_the_hand_back(#[fixture(tracer_group
 /// tracer still holding it. While the tracee runs, the held look is a `Recheck`, so it reads as
 /// running at an expired deadline.
 ///
+/// The unbounded watch runs on a thread of its own and must not block: a block is the mutant's. The
+/// test thread then ends it with the hand-back, whose `NOTE_EXIT` XNU re-fires on the exit watch's
+/// kqueue (`kern_exit.c:2856-2912`); the knote stays pending whether the watch's poll has begun or
+/// not, so no ordering is needed. The assertion that the watch made no block fails after that.
+///
 /// Mutant: `exited_by` waits on the exit watch alone, which fires only at the hand-back: the
-/// unbounded watch below never returns.
+/// unbounded watch blocks.
 #[skuld::test]
 fn a_zombie_a_tracer_holds_has_exited_for_the_grace_watch_before_the_hand_back(
     #[fixture(tracer_group)] _group: &Group,
@@ -164,10 +205,34 @@ fn a_zombie_a_tracer_holds_has_exited_for_the_grace_watch_before_the_hand_back(
     );
     drop(stdin);
     assert_eq!(helper.recv(), Report::Exited);
+    let (blocked, exited) = std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watcher = s.spawn({
+            let (tracee, tx) = (&tracee, tx.clone());
+            move || {
+                let _blocked = crate::wait::block_probe::on_blocking({
+                    let tx = tx.clone();
+                    move || _ = tx.send(true)
+                });
+                let exited = tracee.proc.exited_by(None);
+                _ = tx.send(false);
+                exited
+            }
+        });
+        let blocked = rx.recv().expect("the watcher reports a block or its end");
+        if blocked {
+            helper.signal();
+        }
+        (blocked, watcher.join().expect("watcher"))
+    });
+    if blocked {
+        assert_eq!(helper.recv(), Report::Reaped);
+    }
     assert!(
-        tracee.proc.exited_by(None).expect("a held zombie"),
-        "the held zombie has exited"
+        !blocked,
+        "the watch must end on the held zombie, not block until the hand-back"
     );
+    assert!(exited.expect("a held zombie"), "the held zombie has exited");
     assert_eq!(
         tracee.try_wait().expect("try_wait"),
         None,
@@ -213,21 +278,35 @@ fn a_zombie_launchd_holds_has_exited_for_the_grace_watch_at_once(#[fixture(trace
 /// child, and the watch ends once the tracer holds the child's zombie. XNU sends that `NOTE_EXIT` to
 /// the tracer alone.
 ///
+/// The watch's block is looked at once the attach is staged (`blocked_in` with `look_after_staging`). The ordering edge
+/// is the helper's `attached`: it follows `PT_ATTACH`, which sends the `SIGSTOP`, and XNU posts
+/// `NOTE_SIGNAL` before any disposition check (`kern_sig.c:2126`).
+///
 /// Mutant: the exit wait registers no `NOTE_SIGNAL`, or blocks on the shared exit kqueue, whose
-/// `NOTE_EXIT` is withheld: the watch never returns.
+/// `NOTE_EXIT` is withheld: the look finds nothing.
 #[skuld::test]
 fn a_tracer_that_attaches_during_the_grace_watch_wakes_it(#[fixture(tracer_group)] _group: &Group) {
     let (tracee, stdin) = held();
     std::thread::scope(|s| {
-        let watcher = blocked_in(s, &tracee, || (), |tracee| tracee.proc.exited_by(None));
+        let (look, staged, looked) = look_after_staging();
+        let watcher = blocked_in(s, &tracee, || (), |tracee| tracee.proc.exited_by(None), look);
         let mut helper = tracer::start(Mode::Hold).attach_shared(&tracee);
         assert_eq!(helper.recv(), Report::Attached);
+        staged.send(()).expect("the waiter is at its block");
+        let look = looked.recv().expect("the waiter looks at its block");
         drop(stdin);
         assert_eq!(helper.recv(), Report::Exited);
-        assert!(
-            watcher.join().expect("watcher").expect("the watch"),
-            "the held zombie has exited"
+        if look != Some(true) {
+            helper.signal();
+            assert_eq!(helper.recv(), Report::Reaped);
+        }
+        let exited = watcher.join().expect("watcher").expect("the watch");
+        assert_eq!(
+            look,
+            Some(true),
+            "the attach's SIGSTOP must leave the watch an event to wake on"
         );
+        assert!(exited, "the held zombie has exited");
         helper.signal();
         assert_eq!(helper.recv(), Report::Reaped);
     });
@@ -239,23 +318,38 @@ fn a_tracer_that_attaches_during_the_grace_watch_wakes_it(#[fixture(tracer_group
 /// that follows still wakes the watch, which ends once the tracer holds the zombie. The watch's
 /// kqueue is its own, and `is_alive` reads only the shared exit watch.
 ///
+/// The watch's block is looked at once the attach is staged and `is_alive` has run after it
+/// (`blocked_in` with `look_after_staging`), so a wake `is_alive` took is a look that finds nothing. The ordering edge
+/// is the helper's `attached`: it follows `PT_ATTACH`, which sends the `SIGSTOP`, and XNU posts
+/// `NOTE_SIGNAL` before any disposition check (`kern_sig.c:2126`).
+///
 /// Mutant: the watch blocks on a kqueue that `is_alive` reads, which takes the attach's event.
 #[skuld::test]
 fn is_alive_during_the_grace_watch_does_not_swallow_its_wake(#[fixture(tracer_group)] _group: &Group) {
     let (tracee, stdin) = held();
     std::thread::scope(|s| {
-        let watcher = blocked_in(s, &tracee, || (), |tracee| tracee.proc.exited_by(None));
+        let (look, staged, looked) = look_after_staging();
+        let watcher = blocked_in(s, &tracee, || (), |tracee| tracee.proc.exited_by(None), look);
         assert_eq!(tracee.is_alive(), crate::identity::Liveness::Alive);
         let mut helper = tracer::start(Mode::Hold).attach_shared(&tracee);
         assert_eq!(helper.recv(), Report::Attached);
         // Whatever it answers for a held child, it must not take the watch's wake.
         let _liveness = tracee.is_alive();
+        staged.send(()).expect("the waiter is at its block");
+        let look = looked.recv().expect("the waiter looks at its block");
         drop(stdin);
         assert_eq!(helper.recv(), Report::Exited);
-        assert!(
-            watcher.join().expect("watcher").expect("the watch"),
-            "the held zombie has exited"
+        if look != Some(true) {
+            helper.signal();
+            assert_eq!(helper.recv(), Report::Reaped);
+        }
+        let exited = watcher.join().expect("watcher").expect("the watch");
+        assert_eq!(
+            look,
+            Some(true),
+            "is_alive must not take the attach's SIGSTOP from the watch"
         );
+        assert!(exited, "the held zombie has exited");
         helper.signal();
         assert_eq!(helper.recv(), Report::Reaped);
     });
@@ -280,8 +374,12 @@ fn tracee_with_unique() -> (crate::Child, crate::PipeWriter, u64) {
 /// watches the tracer; the child's exit and the tracer's hand-back end it with the child's status.
 /// The attach's `SIGSTOP` is the only wake of the wait's first block.
 ///
-/// Mutant: the wait registers no `NOTE_SIGNAL` on the child: it never ends (the suite's `slow-timeout`
-/// fails it).
+/// Each staged wake is looked at, at its block (`on_rounds`). Round 0's ordering edge is the helper's
+/// `attached`: it follows `PT_ATTACH`, which sends the `SIGSTOP`, and XNU posts `NOTE_SIGNAL` before any
+/// disposition check (`kern_sig.c:2126`). Round 1's is the helper's `reaped`: it follows the helper's
+/// `wait4`, which hands the zombie back and re-fires `NOTE_EXIT` to this process (`kern_exit.c:2856-2912`).
+///
+/// Mutant: the wait registers no `NOTE_SIGNAL` on the child: round 0's look finds nothing.
 #[skuld::test]
 fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group: &Group) {
     use std::cell::RefCell;
@@ -293,7 +391,7 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
     let pending = RefCell::new(Some(tracer::start(Mode::Auto)));
     let helper = Rc::new(RefCell::new(None));
     let stdin = RefCell::new(Some(stdin));
-    let _rounds = super::macos::on_rounds({
+    let (_rounds, looks) = super::macos::on_rounds({
         let helper = Rc::clone(&helper);
         move |round| match round {
             0 => {
@@ -304,15 +402,21 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
             }
             1 => {
                 drop(stdin.borrow_mut().take());
+                let mut helper = helper.borrow_mut();
+                let helper = helper.as_mut().expect("the helper attached in round 0");
+                assert_eq!(helper.recv(), Report::Reaped);
                 true
             }
-            _ => true,
+            _ => false,
         }
     });
     let outcome = owned.wait(None);
-    let mut helper = helper.borrow_mut().take().expect("the helper attached");
-    assert_eq!(helper.recv(), Report::Reaped);
-    drop(helper);
+    assert_eq!(
+        looks.get(),
+        [(0, Some(true)), (1, Some(true))],
+        "the attach's SIGSTOP, then the hand-back's NOTE_EXIT, must each leave the wait an event to wake on"
+    );
+    drop(helper.borrow_mut().take());
     let status = super::fixtures::status(outcome);
     assert!(status.success(), "{status:?}");
 }
@@ -323,11 +427,18 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
 /// tracer's hand-back end the wait with the child's status. The `SIGCONT` is the only wake of the
 /// wait's first block.
 ///
-/// Mutant: the walk stops at the child's tracer: the wait never ends (the suite's `slow-timeout`
-/// fails it).
+/// Each staged wake is looked at, at its block (`on_rounds`). Round 0's ordering edge is the
+/// `kill(2)`: XNU's `psignal_internal` posts `NOTE_SIGNAL` to the target's knotes before it returns,
+/// ahead of any disposition check (`kern_sig.c:2126`); the signal goes to the outer helper, so no
+/// other event is on the wait's kqueue. Round 1's is the inner helper's `reaped`: it follows the inner
+/// helper's `wait4`, which hands the zombie back and re-fires `NOTE_EXIT` to this process
+/// (`kern_exit.c:2856-2912`).
+///
+/// Mutant: the walk stops at the child's tracer: round 0's look finds nothing.
 #[skuld::test]
 fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixture(tracer_group)] _group: &Group) {
     use std::cell::RefCell;
+    use std::rc::Rc;
 
     let (tracee, stdin, unique) = tracee_with_unique();
     let pid = tracee.pid();
@@ -337,24 +448,35 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
     assert_eq!(outer.recv(), Report::Attached);
     let outer_pid = outer.helper_pid();
     let stdin = RefCell::new(Some(stdin));
+    let inner = Rc::new(RefCell::new(inner));
     let owned = super::macos::watch(pid, unique);
-    let _rounds = super::macos::on_rounds(move |round| match round {
-        0 => {
-            test_hooks::send_signal(outer_pid, libc::SIGCONT);
-            true
+    let (rounds, looks) = super::macos::on_rounds({
+        let inner = Rc::clone(&inner);
+        move |round| match round {
+            0 => {
+                test_hooks::send_signal(outer_pid, libc::SIGCONT);
+                true
+            }
+            1 => {
+                drop(stdin.borrow_mut().take());
+                assert_eq!(inner.borrow_mut().recv(), Report::Reaped);
+                true
+            }
+            _ => false,
         }
-        1 => {
-            drop(stdin.borrow_mut().take());
-            true
-        }
-        _ => true,
     });
     let outcome = owned.wait(None);
-    assert_eq!(inner.recv(), Report::Reaped);
+    assert_eq!(
+        looks.get(),
+        [(0, Some(true)), (1, Some(true))],
+        "the SIGCONT to the tracer's tracer, then the hand-back's NOTE_EXIT, must each leave the wait an event to wake on"
+    );
     // The inner helper's exit goes to the outer one, its tracer and parent, which hands it back
     // when it reaps it; until then this process's reap of it fails with `ECHILD`.
-    inner.close_signal_pipe();
+    inner.borrow_mut().close_signal_pipe();
     assert_eq!(outer.recv(), Report::Reaped);
+    // The hook holds a handle on the inner helper too.
+    drop(rounds);
     drop(inner);
     drop(outer);
     let status = super::fixtures::status(outcome);

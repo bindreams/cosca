@@ -521,9 +521,8 @@ fn note_lowat_suppresses_a_wakeup_for_bytes_under_the_clamp() {
         .expect("the child wrote to fd 3 before this returns");
 
     let kq = super::arm(marker.as_fd(), false).expect("arm");
-    let mut fds = [rustix::event::PollFd::new(&kq, rustix::event::PollFlags::IN)];
     assert!(
-        !crate::wait::any_ready_now(&mut fds).expect("poll the kqueue"),
+        !crate::os_process::poll::look_readable(kq.as_fd()).expect("poll the kqueue"),
         "NOTE_LOWAT must suppress a wakeup for bytes under the clamp, but the kqueue reports ready"
     );
     drop(stdin);
@@ -683,27 +682,16 @@ fn fill_pipe_to_capacity(r: BorrowedFd<'_>, w: BorrowedFd<'_>) -> i32 {
     fionread(r)
 }
 
-/// Whether `kq_fd` — assumed to be a kqueue's own fd, itself pollable — is ALREADY readable,
-/// checked with a non-blocking `poll` of a brand-new, separate probe kqueue subscribed to it.
-/// Non-consuming: this touches only the probe kqueue's own queue, never `kq_fd`'s pending events
-/// or registrations.
-#[cfg(feature = "tokio")]
-fn kqueue_fd_is_already_readable(kq_fd: std::os::fd::RawFd) -> bool {
-    use crate::os_process::macos::kqueue::{Kqueue, Subscription};
-
-    let probe_kq = Kqueue::new().expect("probe kqueue");
-    probe_kq
-        .subscribe(Subscription::Readable {
-            fd: kq_fd,
-            low_water: 1,
-        })
-        .expect("register the probe knote");
-    !probe_kq
-        .poll()
-        .expect("non-blocking poll of the probe kqueue")
-        .is_empty()
-}
-
+/// The async wait of a marker pipe held at its low-water clamp never drains it: it sees the
+/// readable edge, declines, and leaves every buffered byte.
+///
+/// The wait is the tokio reactor's registration, not a block call, so no block hook ends it; the
+/// test relies on a precondition on tokio: an `AsyncFd` registered for READABLE wakes the task when
+/// its fd is readable. Mutants fail by assertion: an arm that registers the knote disabled
+/// (`EV_DISABLE`: the readiness probe); a wait that drains (`queued_after` differs, or the poll
+/// that sees the wait resolve panics); a wait that answers `Spurious` for `Declined` (the poll
+/// that took the edge off the kqueue, with no decline sent, asserts); a wrong decline decision in
+/// `drain_kqueue` (`drain_kqueue_reports_declined_for_a_full_pipe_and_leaves_its_bytes`).
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn async_wait_never_drains_past_the_low_water_clamp() {
@@ -758,22 +746,36 @@ async fn async_wait_never_drains_past_the_low_water_clamp() {
     let armed_kq_fd = armed_rx.recv().expect("watch armed");
 
     // The pipe was full before `arm`, so a correctly armed knote is already ready. A zero-timeout
-    // `kevent` on a separate probe kqueue checks that without touching `fut`'s queue. This
-    // catches an `EV_DISABLE` arm in-process; the suite slow-timeout covers what it cannot.
+    // `poll` of the armed kqueue's own fd checks that without taking an event. This catches an
+    // `EV_DISABLE` arm in-process.
+    // SAFETY: `fut` owns the kqueue `armed_kq_fd` names and is alive until the end of this test.
+    let armed_kq = unsafe { BorrowedFd::borrow_raw(armed_kq_fd) };
     assert!(
-        kqueue_fd_is_already_readable(armed_kq_fd),
+        crate::os_process::poll::look_readable(armed_kq).expect("poll the armed kqueue"),
         "a knote armed without EV_DISABLE on a full pipe must be immediately readable, but the \
          probe kqueue reported it as not-readable"
     );
 
-    ::tokio::select! {
-        biased;
-        res = &mut fut => panic!(
-            "a pipe proven at its low-water clamp resolved the wait anyway — \
-             it must never be drained: {res:?}"
-        ),
-        _ = declined_rx.recv() => {} // provably saw the real readiness edge and declined to drain on it
-    }
+    // The future first, then the decline it sends from the same poll: a poll that took the readiness
+    // edge off the kqueue (it reads not-ready now) and neither resolved nor declined has answered it
+    // as `Spurious`, and nothing would wake the wait again.
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(res) = std::future::Future::poll(fut.as_mut(), cx) {
+            panic!(
+                "a pipe proven at its low-water clamp resolved the wait anyway — \
+                 it must never be drained: {res:?}"
+            );
+        }
+        if declined_rx.poll_recv(cx).is_ready() {
+            return std::task::Poll::Ready(());
+        }
+        assert!(
+            crate::os_process::poll::look_readable(armed_kq).expect("poll the armed kqueue"),
+            "the wait took the readiness edge off the armed kqueue and neither declined nor resolved"
+        );
+        std::task::Poll::Pending
+    })
+    .await;
     // Distinguishes a mutant that drained some bytes before declining from correct behavior.
     let queued_after = fionread(fd);
     assert_eq!(

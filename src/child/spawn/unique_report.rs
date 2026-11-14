@@ -231,8 +231,7 @@ fn std_pipe_exposed() -> bool {
     free >= 2
 }
 
-/// How long the wait runs before it says what it is waiting on. A test sets its own
-/// (`seams::say_waiting_after_then_record`).
+/// How long the wait runs before it says what it is waiting on. A test sets its own.
 const SAY_WAITING_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Blocks until the report of child `pid` is in `read_end`, or the child is gone, then answers what
@@ -295,8 +294,6 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
     let kq = Kqueue::new().map_err(Error::into_io)?;
-    #[cfg(test)]
-    seams::wait_begins();
     let pipe = Subscription::Readable {
         fd: read_end.as_raw_fd(),
         low_water: 1,
@@ -319,7 +316,7 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
     // A batch: events past it stay pending for the next call.
     let mut events = [blank; 8];
     let started = std::time::Instant::now();
-    // In a test, only one that opted in (`seams::say_waiting_after_then_record`): a loaded runner
+    // In a test, only one that opted in: a loaded runner
     // could pass a second, and no verdict may depend on elapsed time.
     #[cfg(not(test))]
     let say_after = Some(SAY_WAITING_AFTER);
@@ -342,8 +339,6 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
                 OnTracer::Recheck(after) => Some(after),
             },
         };
-        #[cfg(test)]
-        seams::blocking(kq.native());
         let warn_in = say_after
             .filter(|_| !warned)
             .map(|after| after.saturating_sub(started.elapsed()));
@@ -351,13 +346,12 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
             (Some(recheck), Some(warn_in)) => Some(recheck.min(warn_in)),
             (recheck, warn_in) => recheck.or(warn_in),
         };
+        let timeout = timeout.map(crate::os_process::macos::kqueue::kevent_timeout);
+        // Records every call, a warning due at once (zero) included, as `about_to_block` does for
+        // every `kevent` that may block: a hook can end a wait that would otherwise spin on it.
         #[cfg(test)]
-        seams::record_timeout(timeout);
-        let n = match kq.native().kevent(
-            &[],
-            &mut events,
-            timeout.map(crate::os_process::macos::kqueue::kevent_timeout),
-        ) {
+        kq.about_to_block(timeout);
+        let n = match kq.native().kevent(&[], &mut events, timeout) {
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(e.into()),
@@ -679,10 +673,6 @@ pub(crate) mod seams {
         }
     }
 
-    /// What [`on_each_block`] runs: the block's number in its wait (1 for the first) and the
-    /// wait's kqueue.
-    type BlockHook = Box<dyn FnMut(u32, &nix::sys::event::Kqueue)>;
-
     /// What [`on_first_read`] runs: the child's pid.
     type FirstReadHook = Box<dyn FnOnce(u32)>;
 
@@ -694,10 +684,6 @@ pub(crate) mod seams {
         static GATE: std::cell::RefCell<Option<Gate>> = const { std::cell::RefCell::new(None) };
         static AFTER_GATE: std::cell::RefCell<Option<Gate>> = const { std::cell::RefCell::new(None) };
         static ON_FIRST_READ: std::cell::RefCell<Option<FirstReadHook>> = const { std::cell::RefCell::new(None) };
-        static ON_FIRST_BLOCK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-        static ON_EACH_BLOCK: std::cell::RefCell<Option<BlockHook>> = const { std::cell::RefCell::new(None) };
-        static BLOCKS_IN_WAIT: Cell<u32> = const { Cell::new(0) };
-        static BLOCKS: Cell<u32> = const { Cell::new(0) };
         static WAKE: Cell<Option<Wake>> = const { Cell::new(None) };
     }
 
@@ -958,57 +944,6 @@ pub(crate) mod seams {
         }
     }
 
-    /// Runs `hook` once, the first time a wait for a report on this thread is about to block.
-    pub(crate) fn on_first_block(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
-        crate::oneshot_hook::arm(&ON_FIRST_BLOCK, hook)
-    }
-
-    /// How many times a wait for a report on this thread has been about to block.
-    pub(crate) fn block_count() -> u32 {
-        BLOCKS.with(Cell::get)
-    }
-
-    /// Runs `hook` each time a wait for a report on this thread is about to block, with the
-    /// block's number in that wait (1 for the first) and the wait's kqueue, until the guard drops.
-    pub(crate) fn on_each_block(hook: impl FnMut(u32, &nix::sys::event::Kqueue) + 'static) -> EachBlock {
-        ON_EACH_BLOCK.with(|h| {
-            let previous = h.borrow_mut().replace(Box::new(hook));
-            debug_assert!(previous.is_none(), "a block hook is already armed");
-        });
-        EachBlock(())
-    }
-
-    #[must_use = "the hook is cleared as soon as the guard is dropped"]
-    pub(crate) struct EachBlock(());
-
-    impl Drop for EachBlock {
-        fn drop(&mut self) {
-            ON_EACH_BLOCK.with(|h| h.borrow_mut().take());
-        }
-    }
-
-    /// A wait for a report has begun on this thread.
-    pub(super) fn wait_begins() {
-        BLOCKS_IN_WAIT.with(|b| b.set(0));
-    }
-
-    pub(super) fn blocking(kq: &nix::sys::event::Kqueue) {
-        BLOCKS.with(|b| b.set(b.get() + 1));
-        let n = BLOCKS_IN_WAIT.with(|b| {
-            b.set(b.get() + 1);
-            b.get()
-        });
-        crate::oneshot_hook::fire(&ON_FIRST_BLOCK);
-        // Taken out for the call, so the hook may use the other seams.
-        let hook = ON_EACH_BLOCK.with(|h| h.borrow_mut().take());
-        if let Some(mut hook) = hook {
-            hook(n, kq);
-            ON_EACH_BLOCK.with(|h| {
-                h.borrow_mut().get_or_insert(hook);
-            });
-        }
-    }
-
     /// What ended the last wait for a report on this thread.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Wake {
@@ -1037,7 +972,6 @@ pub(crate) mod seams {
     thread_local! {
         static REPORT_FIRST: Cell<bool> = const { Cell::new(false) };
         static SAY_AFTER: Cell<Option<std::time::Duration>> = const { Cell::new(None) };
-        static TIMEOUTS: std::cell::RefCell<Vec<Option<std::time::Duration>>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
     /// While the guard lives, the parent's first read of a spawn's report on this thread waits until
@@ -1065,39 +999,25 @@ pub(crate) mod seams {
         crate::wait::poll_ready(&mut fds).expect("poll the report pipe");
     }
 
-    /// While the guard lives, a wait for a report on this thread warns after `after`, and records the
-    /// timeout of each of its `kevent` calls. Without the guard a wait in a test never warns.
-    pub(crate) fn say_waiting_after_then_record(after: std::time::Duration) -> SayAfter {
+    /// While the guard lives, a wait for a report on this thread warns after `after`. Without the
+    /// guard a wait in a test never warns.
+    pub(crate) fn warn_after(after: std::time::Duration) -> SayAfter {
         SAY_AFTER.with(|s| s.set(Some(after)));
-        TIMEOUTS.with(|t| t.borrow_mut().clear());
         SayAfter(())
     }
 
     #[must_use = "the wait stops warning as soon as the guard is dropped"]
     pub(crate) struct SayAfter(());
 
-    impl SayAfter {
-        /// The timeout of each `kevent` call of the waits so far, in order.
-        pub(crate) fn timeouts(&self) -> Vec<Option<std::time::Duration>> {
-            TIMEOUTS.with(|t| t.borrow().clone())
-        }
-    }
-
     impl Drop for SayAfter {
         fn drop(&mut self) {
             SAY_AFTER.with(|s| s.set(None));
-            TIMEOUTS.with(|t| t.borrow_mut().clear());
         }
     }
 
+    /// The threshold [`warn_after`] set on this thread, if any.
     pub(super) fn say_waiting_after() -> Option<std::time::Duration> {
         SAY_AFTER.with(Cell::get)
-    }
-
-    pub(super) fn record_timeout(timeout: Option<std::time::Duration>) {
-        if SAY_AFTER.with(Cell::get).is_some() {
-            TIMEOUTS.with(|t| t.borrow_mut().push(timeout));
-        }
     }
 }
 

@@ -318,6 +318,8 @@ impl Kqueue {
             // nix's `kevent` takes `Option<timespec>`; `None` blocks with no end.
             let timeout = crate::wait::remaining(deadline).map(kevent_timeout);
             #[cfg(test)]
+            self.about_to_block(timeout);
+            #[cfg(test)]
             let call_start = Instant::now();
             let read = self.0.kevent(&[], &mut slot, timeout);
             // Bounds what would otherwise be an unbounded spin under a mock clock a test forgot
@@ -361,6 +363,16 @@ impl Kqueue {
     /// `unique_report`, the test tracer).
     pub(crate) fn native(&self) -> &NixKqueue {
         &self.0
+    }
+
+    /// Test-only: the block-hook call every `kevent` that may block makes just before it, with its
+    /// timeout (`None`: unbounded), zero included. A fixed-zero `poll` cannot block and makes none.
+    #[cfg(test)]
+    pub(crate) fn about_to_block(&self, timeout: Option<libc::timespec>) {
+        crate::wait::block_probe::blocking(
+            as_duration(timeout),
+            crate::wait::block_probe::WaitObject::Fd(self.as_fd()),
+        );
     }
 }
 

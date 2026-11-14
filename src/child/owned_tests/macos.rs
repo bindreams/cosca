@@ -78,30 +78,58 @@ fn run_case(path: &str, case: &str) {
     crate::test_child::run_fixture_case(path, MARKER, CASE_ENV, case);
 }
 
+/// Fails, by assertion, a wait that blocks after the kernel reaped `pid` with no event left on the
+/// wait's kqueue: nothing is left to wake it, so it would sleep until its deadline. The kernel posts a
+/// process's `NOTE_EXIT` before it reaps it, so an event is pending at every block that begins after the
+/// reap unless the wait already took it; a block there is a wait that took the event and did not act on
+/// it. The reap is read before the look, so an event posted before the reap is seen. A block armed for
+/// nothing (a deadline already passed) is no block. The hook panics on the waiting thread, which ends
+/// the wait: a recorded block ended by a `SIGCHLD` would only send the same wait round again.
+fn no_block_after_the_kernel_reaps(pid: u32) -> crate::wait::block_probe::Armed {
+    crate::wait::block_probe::on_each_block(move |block| {
+        if !block.is_round() || block.armed == Some(Duration::ZERO) {
+            return;
+        }
+        if !crate::test_child::is_unreaped_child(pid) {
+            assert_ne!(
+                block.ready(),
+                Some(false),
+                "the wait blocked with nothing left to wake it, after the kernel reaped pid {pid}"
+            );
+        }
+    })
+}
+
 /// A root child adopted into an `OwnedChild`, under `SIGCHLD` set to `SIG_IGN` with a live
 /// sibling blocked on its stdin, so the kernel reaps the root itself and a blocking `waitid`
 /// would sleep until the sibling is gone. The root's stdin closes from inside the holder's first
-/// blocking `poll` of the reap kqueue, so the waiter is known to be asleep first.
+/// blocking `poll` of the reap kqueue, so the waiter is known to be asleep first. The second guard
+/// is [`no_block_after_the_kernel_reaps`] for the root.
 fn ignoring_sigchld_with_a_sibling() -> (
     OwnedChild,
     std::process::Child,
     std::process::ChildStdin,
-    crate::wait::block_probe::Armed,
+    (crate::wait::block_probe::Armed, crate::wait::block_probe::Armed),
 ) {
     crate::test_child::set_signal_ignored(libc::SIGCHLD, true);
     let (sibling, sibling_stdin) = spawn_std_blocker();
     let (root, root_stdin) = spawn_std_blocker();
+    let root_pid = root.id();
     let id = super::fixtures::identity_of(&root);
     let owned = OwnedChild::adopt(root, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     let mut root_stdin = Some(root_stdin);
     let end = crate::wait::block_probe::on_blocking(move || drop(root_stdin.take()));
-    (owned, sibling, sibling_stdin, end)
+    let reaped = no_block_after_the_kernel_reaps(root_pid);
+    (owned, sibling, sibling_stdin, (end, reaped))
 }
 
-/// A `wait` on a child the kernel reaped returns `ECHILD` while a sibling lives.
+/// A `wait` on a child the kernel reaped returns `ECHILD` while a sibling lives. (A blocking
+/// `waitid` there would sleep until the child list empties: `HostKernel`'s `waitid_record` asserts
+/// `WNOHANG` for that.)
 ///
-/// Mutant: a blocking `waitid` instead of the kqueue form, which sleeps until the child list
-/// empties.
+/// Mutant: the wait reads the kernel's own reap (no zombie, `ECHILD` from the by-pid `waitid`) as
+/// anything but `Foreign`: it answers a status or an error. Or it ignores `NOTE_REAP` and blocks
+/// again: [`no_block_after_the_kernel_reaps`] fails the assertion at that block.
 #[skuld::test]
 fn a_wait_on_a_child_the_kernel_reaped_returns_while_a_sibling_lives() {
     if !crate::test_child::is_marked_fixture_reexec(MARKER) {
@@ -115,9 +143,11 @@ fn a_wait_on_a_child_the_kernel_reaped_returns_while_a_sibling_lives() {
     assert!(is_foreign(&outcome), "the kernel reaped the root: {outcome:?}");
 }
 
-/// A `wait_deadline` far past the bound returns `ECHILD`, not `Ok(None)`.
+/// A `wait_deadline` far past the bound returns `ECHILD`, not `DeadlinePassed`.
 ///
-/// Mutant: the same.
+/// Mutant: the deadline path of `wait` reads the kernel's reap as a child still running, and answers
+/// `DeadlinePassed`: it blocks again, and [`no_block_after_the_kernel_reaps`] fails the assertion at
+/// that block instead of waiting out the hour.
 #[skuld::test]
 fn a_wait_timeout_far_past_the_bound_returns_echild() {
     if !crate::test_child::is_marked_fixture_reexec(MARKER) {
@@ -134,7 +164,9 @@ fn a_wait_timeout_far_past_the_bound_returns_echild() {
 /// A sync drop of a child the kernel reaped returns: its wait after a successful kill answers
 /// `ECHILD` instead of sleeping.
 ///
-/// Mutant: the same.
+/// Mutant: the drop's kill sends nothing before its wait: `cat` ends of its own accord and the shell
+/// prints `eof`. Or the drop's wait ignores `NOTE_REAP` and blocks again after the kernel's reap:
+/// [`no_block_after_the_kernel_reaps`] fails the assertion at that block.
 #[skuld::test]
 fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
     if !crate::test_child::is_marked_fixture_reexec(MARKER) {
@@ -159,6 +191,7 @@ fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
     cmd.stdout(crate::Stdio::pipe()).expect("stdout");
     let mut child = cmd.spawn().expect("spawn");
     let mut stdout = child.stdout().expect("piped stdout");
+    let _no_late_block = no_block_after_the_kernel_reaps(child.pid());
     drop(child);
     teardown.assert_released();
     let mut printed = Vec::new();
@@ -301,24 +334,48 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
     tracer.wait().expect("reap the stand-in tracer");
 }
 
-/// The rounds of a wait: `hook` runs before each blocking round with the round's index. A round
-/// whose hook answers `false` gets a `SIGCHLD` to this process, which the wait also watches: the
-/// wake that ends a round the test stages no wake for. A wake the hook stages itself is not checked
-/// here: a wait that misses it blocks until nextest's `slow-timeout`.
-pub(super) fn on_rounds(mut hook: impl FnMut(u32) -> bool + 'static) -> crate::wait::block_probe::Armed {
-    use crate::wait::block_probe::WaitObject;
+/// What [`on_rounds`] saw: for each round whose hook staged a wake, the round's index and whether the
+/// wait's kqueue held an event at the block (`ready()`). Empty until a round stages one, so a wait that
+/// never blocks leaves it empty too.
+#[derive(Clone, Default)]
+pub(super) struct Looks(std::rc::Rc<std::cell::RefCell<Vec<Look>>>);
 
-    let mut round = 0;
-    crate::wait::block_probe::on_each_block(move |block| {
-        // A round is a block on a descriptor: another waiter's `Condvar` block is none.
-        if matches!(block.on, WaitObject::Condvar) {
-            return;
-        }
-        round += 1;
-        if !hook(round - 1) {
+/// A round's index and what its look found.
+type Look = (u32, Option<bool>);
+
+impl Looks {
+    pub(super) fn get(&self) -> Vec<Look> {
+        self.0.borrow().clone()
+    }
+}
+
+/// The rounds of a wait: `hook` runs at each blocking round with the round's index (0 for the first)
+/// and answers whether it staged a wake for it. The hook must have an ordering edge from staging to the
+/// look: an event the kernel has posted by the time the hook returns.
+///
+/// A round that staged a wake is looked at: `ready()` says whether the wait's kqueue holds an event
+/// ([`Looks`]). A round that staged none, or whose look found nothing, gets a `SIGCHLD` to this
+/// process, which the wait always watches: it ends the round, so a wake the wait missed fails the
+/// test's assertion on [`Looks`] instead of blocking it for ever.
+pub(super) fn on_rounds(mut hook: impl FnMut(u32) -> bool + 'static) -> (crate::wait::block_probe::Armed, Looks) {
+    let looks = Looks::default();
+    let armed = crate::wait::block_probe::on_each_block({
+        let looks = looks.clone();
+        move |block| {
+            // A round is a numbered block: another waiter's `Condvar` block has no number.
+            let Some(n) = block.n else { return };
+            let round = n - 1;
+            if hook(round) {
+                let look = block.ready();
+                looks.0.borrow_mut().push((round, look));
+                if look == Some(true) {
+                    return;
+                }
+            }
             test_hooks::send_signal(std::process::id(), libc::SIGCHLD);
         }
-    })
+    });
+    (armed, looks)
 }
 
 /// A tracer that attaches after the wait's check: XNU reparents the child to it and sends the child
@@ -327,10 +384,16 @@ pub(super) fn on_rounds(mut hook: impl FnMut(u32) -> bool + 'static) -> crate::w
 /// holding the child, ends the wait: `Orphaned`. This process's own pid stands in for the child, and
 /// a blocker for the tracer; the parent read is forced: this process until the attach, then the
 /// stand-in, then launchd once that has exited. A `SIGCONT` to this process stands in for the
-/// attach's `SIGSTOP`. Nothing but that signal wakes the wait.
+/// attach's `SIGSTOP`. Nothing but that signal wakes the wait's first block.
 ///
-/// Mutant: the wait registers no `NOTE_SIGNAL` on the child: it never ends (the suite's `slow-timeout`
-/// fails it).
+/// Each staged wake is looked at, at its block (`on_rounds`). Round 0's ordering edge is the `kill(2)`:
+/// XNU's `psignal_internal` posts `NOTE_SIGNAL` to the target's knotes before it returns, ahead of any
+/// disposition check (`kern_sig.c:2126`). Round 1's is `wait_until_zombie` on the stand-in: a process's
+/// `NOTE_EXIT` is posted before it is a zombie (`kern_exit.c:2562` against `:2631`, as in
+/// `await_reapable_tests`); its `SIGCHLD` lands on the wait's kqueue too, so round 1's look says that
+/// the wait has an event to wake on, not which.
+///
+/// Mutant: the wait registers no `NOTE_SIGNAL` on the child: round 0's look finds nothing.
 #[skuld::test]
 fn a_wait_on_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
     use std::cell::{Cell, RefCell};
@@ -346,7 +409,7 @@ fn a_wait_on_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
     });
     let owned = watch(pid, unique);
     let tracer_stdin = RefCell::new(Some(tracer_stdin));
-    let _rounds = on_rounds(move |round| match round {
+    let (_rounds, looks) = on_rounds(move |round| match round {
         0 => {
             holder.set(tracer_pid);
             test_hooks::send_signal(pid, libc::SIGCONT);
@@ -360,8 +423,13 @@ fn a_wait_on_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
         }
         _ => false,
     });
-    let outcome = owned.wait(None).expect("wait");
-    assert_eq!(outcome, ChildWaitOutcome::Foreign(Foreign::Orphaned));
+    let outcome = owned.wait(None);
+    assert_eq!(
+        looks.get(),
+        [(0, Some(true)), (1, Some(true))],
+        "the attach's SIGCONT, then the tracer's exit, must each leave the wait an event to wake on"
+    );
+    assert_eq!(outcome.expect("wait"), ChildWaitOutcome::Foreign(Foreign::Orphaned));
     tracer.wait().expect("reap the stand-in tracer");
 }
 
@@ -378,8 +446,12 @@ fn started_by_us_traced_by(tracer: u32) -> (libc::pid_t, libc::pid_t) {
 /// that one's tracer, by its forced parents. A `SIGCHLD` to the second stands in for the first one's
 /// exit, and the child's parent read then answers launchd. Nothing but that `SIGCHLD` wakes the wait.
 ///
-/// Mutant: the walk stops at the child's tracer: the wait never ends (the suite's `slow-timeout`
-/// fails it).
+/// The staged wake is looked at, at its block (`on_rounds`). The ordering edge is the `kill(2)`: XNU's
+/// `psignal_internal` posts `NOTE_SIGNAL` to the target's knotes before it returns, ahead of any
+/// disposition check (`kern_sig.c:2126`). The signal goes to the second blocker, not to this process,
+/// so no other event is on the wait's kqueue: a look that finds one is the registration.
+///
+/// Mutant: the walk stops at the child's tracer: round 0's look finds nothing.
 #[skuld::test]
 fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
     use std::cell::Cell;
@@ -396,7 +468,7 @@ fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
     });
     let _traced = crate::identity::kinfo::fault::force_parents(tracer_pid, move || started_by_us_traced_by(outer_pid));
     let owned = watch(pid, unique);
-    let _rounds = on_rounds(move |round| {
+    let (_rounds, looks) = on_rounds(move |round| {
         if round != 0 {
             return false;
         }
@@ -404,8 +476,13 @@ fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
         test_hooks::send_signal(outer_pid, libc::SIGCHLD);
         true
     });
-    let outcome = owned.wait(None).expect("wait");
-    assert_eq!(outcome, ChildWaitOutcome::Foreign(Foreign::Orphaned));
+    let outcome = owned.wait(None);
+    assert_eq!(
+        looks.get(),
+        [(0, Some(true))],
+        "the SIGCHLD to the tracer's tracer must leave the wait an event to wake on"
+    );
+    assert_eq!(outcome.expect("wait"), ChildWaitOutcome::Foreign(Foreign::Orphaned));
     for (mut child, stdin) in [(tracer, tracer_stdin), (outer, outer_stdin)] {
         drop(stdin);
         child.wait().expect("reap a stand-in tracer");
@@ -745,10 +822,19 @@ fn try_wait_during_a_wait_errors_when_a_running_childs_unique_id_is_unreadable()
 /// event gone from the reap kqueue, and a `wait` whose first look still finds no record returns:
 /// "exit seen" is read from the exit kqueue, which nothing drains, so that look is a `Recheck`.
 ///
+/// The wait's first look is a `Recheck`, which pauses on a backoff (a sleep, not a block), so a correct
+/// wait never blocks. A block is the mutant's; the hook there ends it through a `SIGCHLD` to this
+/// process, which the wait always watches. That knote stays pending whether the poll has begun or
+/// not, so no ordering is needed, and the wait's second look reads the zombie. The assertion that
+/// no block was made then fails.
+///
 /// Mutant: "exit seen" taken from the drain's own result, or read from the reap kqueue: the wait
-/// blocks on a queue that holds nothing, for ever.
+/// blocks on a queue that holds nothing.
 #[skuld::test]
 fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     // Each look's peek finds no record, as when XNU is still finishing the exit: the `try_wait`'s,
     // which drains `NOTE_EXIT` from the reap kqueue, and the first of the `wait`'s, which finds
     // that queue empty. The `wait`'s second peek is the real one.
@@ -759,7 +845,19 @@ fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
     });
     b.end_child_and_confirm_exit();
     assert_eq!(try_wait(&b.owned).expect("try_wait"), ChildWaitOutcome::DeadlinePassed);
+    let blocked = Rc::new(Cell::new(false));
+    let _end = crate::wait::block_probe::on_each_block({
+        let blocked = Rc::clone(&blocked);
+        move |_| {
+            blocked.set(true);
+            test_hooks::send_signal(std::process::id(), libc::SIGCHLD);
+        }
+    });
     let status = wait_status(&b.owned);
+    assert!(
+        !blocked.get(),
+        "the wait must pause and look again, not block on an empty queue"
+    );
     assert!(status.success(), "{status:?}");
     assert!(kernel.all_rows_taken(), "the try_wait and the wait must each peek");
 }

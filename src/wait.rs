@@ -567,7 +567,7 @@ pub(crate) mod block_probe {
     /// arm or drop a hook, or block.
     struct Armament {
         id: u64,
-        /// The blocks this hook has seen.
+        /// The blocks of a wait this hook has seen: a `Condvar` block is not one.
         blocks: u32,
         hook: Option<Hook>,
     }
@@ -583,7 +583,7 @@ pub(crate) mod block_probe {
     /// What one wait is about to block on.
     #[allow(
         dead_code,
-        reason = "`Fd` is read by `Block::ready`, which only tests call; `Listener` is built on Linux only"
+        reason = "`Fd` is read only by `Block::ready`, which only macOS tests call; `Listener` is built on Linux only"
     )]
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum WaitObject<'a> {
@@ -603,20 +603,25 @@ pub(crate) mod block_probe {
     }
 
     /// One block, as the hook of [`on_each_block`] sees it.
-    #[allow(dead_code, reason = "`n` is read only by tests")]
     #[derive(Debug)]
     pub(crate) struct Block<'a> {
-        /// 1 for the first block this hook sees after it was armed.
-        pub(crate) n: u32,
+        /// `Some(1)` for the first block of a wait this hook sees; `None` at a `Condvar` block.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code, reason = "only macOS tests read it"))]
+        pub(crate) n: Option<u32>,
         /// What the call is armed for; `None` is unbounded.
         pub(crate) armed: Option<Duration>,
         pub(crate) on: WaitObject<'a>,
     }
 
     impl Block<'_> {
+        /// Whether this is a round of the wait itself, not another waiter's `Condvar` block.
+        pub(crate) fn is_round(&self) -> bool {
+            self.n.is_some()
+        }
+
         /// Whether the awaited event is already there (a zero-timeout `poll`); `None` when the block
         /// lends no descriptor.
-        #[allow(dead_code, reason = "called only by tests")]
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code, reason = "only macOS tests call it"))]
         pub(crate) fn ready(&self) -> Option<bool> {
             match &self.on {
                 #[cfg(unix)]
@@ -646,8 +651,11 @@ pub(crate) mod block_probe {
                 let mut hooks = hooks.borrow_mut();
                 let armament = hooks.iter_mut().find(|a| a.id == id)?;
                 let hook = armament.hook.take()?;
-                armament.blocks += 1;
-                Some((armament.blocks, hook))
+                let n = (!matches!(on, WaitObject::Condvar)).then(|| {
+                    armament.blocks += 1;
+                    armament.blocks
+                });
+                Some((n, hook))
             });
             let Some((n, hook)) = taken else { continue };
             let mut running = Running { id, hook: Some(hook) };
@@ -714,11 +722,11 @@ pub(crate) mod block_probe {
         }
     }
 
-    /// Run `hook` on this thread at every [`blocking`] call until the guard drops, numbering them
-    /// from 1 at this call. Any number of hooks may be armed at once: each runs at every block, in
-    /// the order they were armed, and counts the blocks it sees from its own arming. One armed by
-    /// a running hook is kept, and first sees the next block. A block made while a hook runs is
-    /// not one that hook sees.
+    /// Run `hook` on this thread at every [`blocking`] call until the guard drops, numbering the
+    /// blocks of a wait ([`Block::n`]) from 1 at this call. Any number of hooks may be armed at
+    /// once: each runs at every block, in the order they were armed, and counts the blocks it sees
+    /// from its own arming. One armed by a running hook is kept, and first sees the next block. A
+    /// block made while a hook runs is not one that hook sees.
     ///
     /// A hook run at a `Condvar` block holds the child's lock: it must not take it.
     pub(crate) fn on_each_block(hook: impl FnMut(&Block<'_>) + 'static) -> Armed {
@@ -738,7 +746,7 @@ pub(crate) mod block_probe {
     pub(crate) fn on_blocking(hook: impl FnOnce() + 'static) -> Armed {
         let mut hook = Some(hook);
         on_each_block(move |block| {
-            if !matches!(block.on, WaitObject::Condvar) {
+            if block.is_round() {
                 if let Some(hook) = hook.take() {
                     hook();
                 }
@@ -765,7 +773,7 @@ pub(crate) mod block_probe {
     pub(crate) fn on_condvar_block_with(hook: impl FnOnce(Option<Duration>) + 'static) -> Armed {
         let mut hook = Some(hook);
         on_each_block(move |block| {
-            if matches!(block.on, WaitObject::Condvar) {
+            if !block.is_round() {
                 if let Some(hook) = hook.take() {
                     hook(block.armed);
                 }

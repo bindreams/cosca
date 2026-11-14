@@ -5,26 +5,11 @@ use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 type OnceHook = Box<dyn FnOnce()>;
-type RoundHookOnce = (u32, OnceHook);
-type EveryRoundHook = Box<dyn FnMut(u32)>;
 
 thread_local! {
-    static AWAIT_TIMEOUTS: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
     static AWAIT_EVENTS: RefCell<Vec<(i16, u32)>> = const { RefCell::new(Vec::new()) };
     static ON_ESRCH_REPEEK: RefCell<Option<OnceHook>> = const { RefCell::new(None) };
-    static ON_KEVENT_ROUND: RefCell<Option<RoundHookOnce>> = const { RefCell::new(None) };
-    static ON_EVERY_KEVENT_ROUND: RefCell<Option<EveryRoundHook>> = const { RefCell::new(None) };
     static FORCED_EINTR: Cell<Option<Duration>> = const { Cell::new(None) };
-}
-
-/// Record the timeout one `await_reapable` `kevent` call was armed with.
-pub(crate) fn record_await_kevent(requested: Option<Duration>) {
-    AWAIT_TIMEOUTS.with(|v| v.borrow_mut().push(requested));
-}
-
-/// The timeout each `await_reapable` `kevent` call on this thread was armed with, in order.
-pub(crate) fn await_requested_timeouts() -> Vec<Option<Duration>> {
-    AWAIT_TIMEOUTS.with(|v| v.borrow().clone())
 }
 
 /// Record one event the `await_reapable` loop got back: its `filter` and `fflags`.
@@ -53,20 +38,6 @@ pub(crate) fn fire_esrch_repeek() {
     }
 }
 
-/// Run `hook` on the waiting thread just before round `round`'s blocking `kevent` in the
-/// `await_reapable` loop. The guard drops an unfired hook.
-pub(crate) fn on_kevent_round(round: u32, hook: impl FnOnce() + 'static) -> ForcedOnce {
-    ON_KEVENT_ROUND.with(|h| *h.borrow_mut() = Some((round, Box::new(hook))));
-    ForcedOnce(|| ON_KEVENT_ROUND.with(|h| *h.borrow_mut() = None))
-}
-
-/// Run `hook` with the round index on the waiting thread just before every blocking `kevent`
-/// round of the `await_reapable` loop. The guard drops it.
-pub(crate) fn on_every_kevent_round(hook: impl FnMut(u32) + 'static) -> ForcedOnce {
-    ON_EVERY_KEVENT_ROUND.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-    ForcedOnce(|| ON_EVERY_KEVENT_ROUND.with(|h| *h.borrow_mut() = None))
-}
-
 /// The next blocking `kevent` call on this thread (not a zero-timeout drain) fails with `EINTR`
 /// instead of running, after the frozen clock has advanced by `elapsed`: the time a real
 /// interrupted call would have spent.
@@ -77,35 +48,6 @@ pub(crate) fn force_eintr_once(elapsed: Duration) -> ForcedOnce {
 
 pub(crate) fn take_forced_eintr() -> Option<Duration> {
     FORCED_EINTR.with(Cell::take)
-}
-
-pub(crate) fn fire_kevent_round(round: u32) {
-    // Out of its slot for the call, so the hook may itself install or drop hooks.
-    if let Some(mut every) = ON_EVERY_KEVENT_ROUND.with(|h| h.borrow_mut().take()) {
-        every(round);
-        ON_EVERY_KEVENT_ROUND.with(|h| {
-            let mut slot = h.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(every);
-            }
-        });
-    }
-    let hook = ON_KEVENT_ROUND.with(|h| {
-        let mut slot = h.borrow_mut();
-        match slot.as_ref() {
-            Some((r, _)) if *r == round => slot.take().map(|(_, hook)| hook),
-            _ => None,
-        }
-    });
-    if let Some(hook) = hook {
-        hook();
-    }
-}
-
-/// Whether `kq` has an event pending, by a `poll` of its descriptor, which takes nothing from it.
-pub(crate) fn event_pending(kq: &impl std::os::fd::AsFd) -> bool {
-    let mut fds = [rustix::event::PollFd::new(kq, rustix::event::PollFlags::IN)];
-    crate::wait::any_ready_now(&mut fds).expect("poll the wait's kqueue")
 }
 
 /// Sends `signal` to `pid`, asserting it was delivered.

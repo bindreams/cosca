@@ -269,7 +269,7 @@ fn a_spurious_wake_re_arms_a_deadline_waiter_with_less_time() {
             // stays in the first hook's captures: it disarms with the first.
             let mut second = None;
             let _first = crate::wait::block_probe::on_each_block(move |block| {
-                if matches!(block.on, crate::wait::block_probe::WaitObject::Condvar) && second.is_none() {
+                if !block.is_round() && second.is_none() {
                     _ = blocked_tx.send(());
                     let again_tx = again_tx.clone();
                     second = Some(crate::wait::block_probe::on_condvar_block(move || {
