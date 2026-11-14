@@ -197,7 +197,9 @@ fn verify_pidfd_target(
     id: ProcessId,
     pidfd: rustix::fd::OwnedFd,
 ) -> Result<Option<rustix::fd::OwnedFd>, Error> {
-    let proc_dir = kernel.open_proc().map_err(|why| view_unreadable(id, why, None))?;
+    let proc_dir = kernel
+        .open_proc()
+        .map_err(|why| view_unreadable(id, why.into(), None))?;
     match crate::identity::pidfd_pid_in(kernel, &proc_dir, pidfd.as_fd()) {
         Ok(PidfdTarget::Pid(pid)) if pid == id.pid() => {}
         // Reaped after `pidfd_open`: gone, and nothing to signal.

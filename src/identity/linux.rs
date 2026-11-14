@@ -9,10 +9,14 @@
 pub(crate) mod kernel;
 #[path = "linux/pid_file.rs"]
 pub(crate) mod pid_file;
+#[path = "linux/proc_read.rs"]
+pub(crate) mod proc_read;
 #[path = "linux/proc_view.rs"]
 pub(crate) mod proc_view;
 #[path = "linux/prove.rs"]
 pub(crate) mod prove;
+#[path = "linux/refusal.rs"]
+pub(crate) mod refusal;
 
 #[cfg(test)]
 #[path = "linux/bracket_tests.rs"]
@@ -37,8 +41,9 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags};
 
 use self::kernel::Kernel;
-use self::proc_view::ProcDir;
+use self::proc_read::ProcDir;
 use self::prove::Proof;
+use self::refusal::FailedCall;
 use super::probe::{classify_unreadable, SignalProbe};
 use super::stat_parse::{parse_ppid, parse_starttime_jiffies};
 use super::{Existence, Liveness, OrderedRead, ParentRead, RawPid, Resolved, TokenKind, UnknownCause};
@@ -230,7 +235,7 @@ fn look(kernel: &dyn Kernel, pid: RawPid) -> Look {
             Ok(None) => Look::Ticks,
             Err(failed) => Look::Unknown(UnknownCause::of_call(failed)),
         },
-        Err(e) => Look::Unknown(UnknownCause::of_call(prove::FailedCall::pidfd_open(e))),
+        Err(e) => Look::Unknown(UnknownCause::of_call(FailedCall::pidfd_open(e))),
     }
 }
 
@@ -239,7 +244,7 @@ fn look_at(kernel: &dyn Kernel, fd: std::os::fd::BorrowedFd<'_>) -> Look {
     match kernel.pidfs_ino(fd) {
         Ok(Some(ino)) => Look::Pidfs(ino),
         Ok(None) => Look::Ticks,
-        Err(e) => Look::Unknown(UnknownCause::of_call(prove::FailedCall::pidfs_ino(e))),
+        Err(e) => Look::Unknown(UnknownCause::of_call(FailedCall::pidfs_ino(e))),
     }
 }
 
@@ -481,6 +486,10 @@ fn liveness_of(stat: Resolved<Vec<u8>>, ticks: u64) -> Liveness {
 /// `openat2` nor a `/proc` view; the by-pid re-reads (`exists()`/`is_alive()`) then answer
 /// `Unknown`, never `Gone`/`Dead` for the running caller.
 ///
+/// It reads this process's own start token by path, not through the checked `/proc`, so that
+/// [`ProcessId::current`](super::ProcessId::current) stays infallible where `openat2` is refused; a
+/// mount over this process's own `/proc/self/stat` is out of scope.
+///
 /// `hidepid` never hides a task from itself, so a failure here is not a foreign-pid outcome:
 /// [`ProcessId::current`](super::ProcessId::current) panics on it. That includes a kernel or filter
 /// that refuses `pidfd_open` to the process itself, which is the error [`Process::open`] gives (an
@@ -512,7 +521,7 @@ pub(crate) fn view_error(subject: &str, why: proc_view::ViewUnreadable) -> Error
 /// The error for a by-pid identity read of `subject` that a failed pidfd call made `Unknown`:
 /// [`Error::Unsupported`] when the call was refused, else [`Error::Unassessable`] naming the call
 /// and carrying the errno.
-pub(crate) fn call_error(subject: &str, call: prove::FailedCall) -> Error {
+pub(crate) fn call_error(subject: &str, call: FailedCall) -> Error {
     call.unsupported(format!("identifying {subject}"))
         .unwrap_or_else(|| Error::Unassessable {
             detail: format!("{subject} identity could not be read: {}", call.name()),
@@ -631,15 +640,15 @@ pub(super) fn session_scope_at(
 }
 
 /// The inode of this process's own pidfd: `Some` on pidfs, `None` where pidfds have none.
-fn own_pidfs_ino(kernel: &dyn Kernel) -> Result<Option<u64>, prove::FailedCall> {
+fn own_pidfs_ino(kernel: &dyn Kernel) -> Result<Option<u64>, FailedCall> {
     let pidfd = kernel
         .pidfd_open(rustix::process::getpid(), PidfdFlags::empty())
-        .map_err(prove::FailedCall::pidfd_open)?;
-    kernel.pidfs_ino(pidfd.as_fd()).map_err(prove::FailedCall::pidfs_ino)
+        .map_err(FailedCall::pidfd_open)?;
+    kernel.pidfs_ino(pidfd.as_fd()).map_err(FailedCall::pidfs_ino)
 }
 
 /// The kind of [`Key`] this host's processes have, as a record names it.
-fn own_token_kind(kernel: &dyn Kernel) -> Result<TokenKind, prove::FailedCall> {
+fn own_token_kind(kernel: &dyn Kernel) -> Result<TokenKind, FailedCall> {
     Ok(match own_pidfs_ino(kernel)? {
         Some(_) => TokenKind::Pidfs,
         None => TokenKind::Ticks,

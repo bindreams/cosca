@@ -125,8 +125,12 @@ fn read_cgroup(
 }
 
 /// The error of reading `pid`'s cgroup through a `/proc` view that could not be established, `why`:
-/// of the view's error's kind, with that error as its source.
+/// `Unsupported` naming the requirement when the view was refused, as a refused cgroup read is;
+/// otherwise of the view's error's kind, with that error as its source.
 fn view_unreadable(pid: u32, why: crate::identity::ViewUnreadable) -> io::Error {
+    if let Some(refusal) = why.refusal() {
+        return refusal.unsupported_io(format!("reading pid {pid}'s cgroup"));
+    }
     let context = format!(
         "the /proc view could not be established, so pid {pid}'s cgroup cannot be read: {}",
         why.reason
@@ -494,9 +498,10 @@ fn unplaceable_by(why: String, cause: Option<Arc<crate::error::Error>>) -> crate
 enum Unreadable {
     /// `/proc` hid it.
     Hidden(io::Error),
-    /// A read or an open of the probe was refused ([`Refusal`](crate::identity::Refusal)): the
-    /// probe's child could not open its `/proc/self/fd`, or the read of its cgroup was refused
-    /// (`EPERM` with `self/stat` refused too).
+    /// A read or an open of the probe, or of this process's `/proc` view, was refused
+    /// ([`Refusal`](crate::identity::Refusal)): the probe's child could not open its `/proc/self/fd`,
+    /// the read of its cgroup was refused (`EPERM` with `self/stat` refused too), or a file that
+    /// establishes the view was.
     Refused(crate::identity::Refusal),
     /// This process's `/proc` view is not its own pid namespace's, or could not be told: what it
     /// says, and the error behind it, if there is one.
@@ -959,10 +964,13 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
             ))
         }
         crate::identity::ProcView::Unassessable(why) => {
+            if let Some(refusal) = why.refusal() {
+                return Err(Unreadable::Refused(refusal));
+            }
             return Err(Unreadable::View(
                 format!("this process's /proc view could not be established ({})", why.reason),
                 why.source,
-            ))
+            ));
         }
     };
     #[cfg(test)]
@@ -1021,14 +1029,17 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
         ProbeRead::Answer(answer) => answer,
         ProbeRead::Gone(_) => Err(Unreadable::Probe(io::Error::other(describe_end(&read, end)))),
         ProbeRead::SetupFailed(errno) => {
-            let call = crate::identity::FailedCall::openat2(rustix::io::Errno::from_raw_os_error(errno));
-            Err(match call.refusal() {
-                Some(refusal) => Unreadable::Refused(refusal),
-                None => Unreadable::Probe(crate::error::io_context(
-                    describe_end(&read, end),
-                    io::Error::from_raw_os_error(errno),
-                )),
-            })
+            use crate::identity::OwnUnreadable;
+
+            // The child's `openat2` of its own `/proc/self/fd`.
+            Err(
+                match OwnUnreadable::opening(rustix::io::Errno::from_raw_os_error(errno)) {
+                    OwnUnreadable::Refused(refusal) => Unreadable::Refused(refusal),
+                    OwnUnreadable::Failed(e) => {
+                        Unreadable::Probe(crate::error::io_context(describe_end(&read, end), e))
+                    }
+                },
+            )
         }
     }
 }

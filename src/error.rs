@@ -1182,6 +1182,16 @@ impl Error {
         }
     }
 
+    /// This error as an `io::Error` that keeps every member of it: an [`Error::Io`] as it is, any other
+    /// variant (a list above all) as the layer [`io_context_over`] makes of it, saying `context`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn into_io_over(self, context: &str) -> std::io::Error {
+        match self {
+            Error::Io(e) => e,
+            other => io_context_over(context, other),
+        }
+    }
+
     /// The `io::Error`s down this error's `source()` chain, outermost first. Under [`io_context`]
     /// and [`with_note`](Error::with_note) the first of them is a code-less wrapper and the OS error
     /// comes below it.
