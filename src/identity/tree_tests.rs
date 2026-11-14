@@ -92,18 +92,33 @@ fn an_anchor_that_is_access_denied_is_unassessable_blaming_access() {
     let id = crate::identity::ticks_id(id.pid());
     let (kernel, _guard) = crate::identity::unreadable(id.pid());
     let expected = format!("pid {} exists but could not be queried", id.pid());
-    // The macOS snapshot reads every pid's parent through the kernel, so it meets the refusal first.
-    #[cfg(target_os = "macos")]
-    let in_the_snapshot = "pids denied a ppid read".to_owned();
-    #[cfg(not(target_os = "macos"))]
-    let in_the_snapshot = expected.clone();
-    for (result, expected) in [
-        (id.parent_with(&kernel).map(|_| ()), &expected),
-        (id.children_with(&kernel, Recursive::No).map(|_| ()), &in_the_snapshot),
-        (id.children_with(&kernel, Recursive::Yes).map(|_| ()), &in_the_snapshot),
+    // The kernel of a children walk. The macOS snapshot reads every pid's parent, the anchor's
+    // too, before the walk reads the anchor: the first record read of the anchor answers, and every
+    // later one is refused, so the refusal is the anchor's and not the snapshot's.
+    let for_a_walk = || {
+        #[cfg(target_os = "macos")]
+        let kernel = {
+            use crate::identity::{FakeKernel, Kernel as _, ReadErr};
+            let pid = id.pid();
+            let Ok(record) = HostKernel.bsd_info(pid) else {
+                panic!("the live member has a record");
+            };
+            FakeKernel::over(&HostKernel)
+                .on_bsd_info(pid, Ok(record))
+                .on_every_bsd_info_failing(pid, ReadErr::Refused(libc::EPERM))
+                .on_every_kinfo_refused(pid, libc::EPERM)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let kernel = crate::identity::unreadable(id.pid()).0;
+        kernel
+    };
+    for result in [
+        id.parent_with(&kernel).map(|_| ()),
+        id.children_with(&for_a_walk(), Recursive::No).map(|_| ()),
+        id.children_with(&for_a_walk(), Recursive::Yes).map(|_| ()),
     ] {
         match result {
-            Err(Error::Unassessable { detail, .. }) => assert!(detail.contains(expected), "{detail}"),
+            Err(Error::Unassessable { detail, .. }) => assert!(detail.contains(&expected), "{detail}"),
             other => panic!("expected Unassessable, got {other:?}"),
         }
     }

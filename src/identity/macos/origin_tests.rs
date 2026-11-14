@@ -1,7 +1,7 @@
 //! `origin`: whether a pid was forked by this process, before its unique id is known.
 
 use super::{origin, Origin};
-use crate::identity::{FakeKernel, HostKernel, Kernel, Resolved};
+use crate::identity::{FakeKernel, HostKernel};
 
 /// A child of this process, untraced, is ours by its parent.
 ///
@@ -42,10 +42,13 @@ fn the_parent_of_this_process_is_not_ours() {
 fn a_stale_parent_at_attach_does_not_make_an_older_process_ours() {
     // SAFETY: `getppid` has no preconditions.
     let parent = unsafe { libc::getppid() } as u32;
-    let (Resolved::Found(mut record), _) = HostKernel.kinfo(parent) else {
-        panic!("this process's parent has a kinfo_proc");
-    };
-    record.kp_proc.p_oppid = std::process::id() as libc::pid_t;
+    // The record keeps this process's pid as the parent at the attach, and states launchd as the
+    // parent now.
+    let record = super::kinfo::kinfo_proc::of_host_held_by(
+        parent,
+        std::process::id() as libc::pid_t,
+        crate::identity::LAUNCHD as libc::pid_t,
+    );
     let kernel = FakeKernel::over(&HostKernel).on_kinfo(parent, record);
     assert_eq!(origin(&kernel, parent), Origin::NotOurs);
 }

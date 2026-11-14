@@ -2,12 +2,14 @@ use std::os::unix::process::ExitStatusExt;
 use std::time::Duration;
 
 use super::{ExitWatch, MacosProcess};
+use crate::child::spawn::identity_macos_tests::other_unique_id;
 use crate::error::Error;
 use crate::identity::{uniq_info, HostKernel, Kernel, ProcessId, ReadPurpose, UniqInfo, UniqRead};
 use crate::os_process::drive::exited_held;
 use crate::os_process::{kill, open, terminate, Exit, OsProcess};
 use crate::signal::{Sent, Sig};
 use crate::test_child::wait_until_zombie;
+use crate::wait::exit_only::macos_tests::unique_of;
 
 // ExitWatch =====
 
@@ -307,7 +309,7 @@ fn a_child_with_a_fired_watch<K: Kernel + Send>(
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let stdin = child.stdin.take().expect("piped stdin");
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let unique = own_unique_info(id).unique_id;
+    let unique = unique_of(id.pid());
     let fired = force_proc_registration_once(Registration::ExitWatch);
     let mac = MacosChild::new(kernel(id), id.pid(), unique).expect("watch the child");
     drop(fired);
@@ -490,18 +492,11 @@ fn a_watch_armed_while_another_process_holds_the_pid_reads_exited() {
     use crate::os_process::open_with;
 
     let (mut child, id) = blocker();
-    let real = own_unique_info(id);
-    let other = || {
-        UniqRead::Found(UniqInfo {
-            unique_id: real.unique_id ^ 1,
-            ..real
-        })
-    };
     // The open's read, then the arming's and the confirming one, which name another process.
     let kernel = FakeKernel::over(&HostKernel)
-        .on_unique_info(id.pid(), UniqRead::Found(real))
-        .on_unique_info(id.pid(), other())
-        .on_unique_info(id.pid(), other());
+        .on_unique_info(id.pid(), UniqRead::Found(own_unique_info(id)))
+        .on_unique_info(id.pid(), other_unique_id(id.pid()))
+        .on_unique_info(id.pid(), other_unique_id(id.pid()));
     let p = open_with(kernel, id).unwrap().expect("a live process opens");
     assert!(
         matches!(p.exited(), Ok(Exit::Exited)),
@@ -678,10 +673,7 @@ fn a_child_that_was_reaped_is_exited_with_its_watch_unfired_and_remembered() {
         let read = own_unique_info(id);
         let answer = match reaped {
             "gone" => UniqRead::Gone,
-            _ => UniqRead::Found(UniqInfo {
-                unique_id: read.unique_id ^ 1,
-                ..read
-            }),
+            _ => other_unique_id(id.pid()),
         };
         let kernel = FakeKernel::over(&HostKernel)
             .on_unique_info(id.pid(), answer)
@@ -697,34 +689,47 @@ fn a_child_that_was_reaped_is_exited_with_its_watch_unfired_and_remembered() {
     }
 }
 
-/// Once a look has confirmed the exit, later looks make no read. The watch is armed on a live process
-/// that then exits, so it fires from `NOTE_EXIT`; the kernel states the reads of the open, the arming
-/// and the confirming look (two unique-id reads around the zombie state, which is the host's), then a
-/// refusal, which a look that read again would meet.
+/// Once a look has confirmed the exit, later looks make no read. The process runs throughout and its
+/// watch has fired (the registration refusal stands in for the edge), so the host never says it is a
+/// zombie: only the kernel's rows can, and the kernel states the reads of the open and the arming,
+/// a first confirming look (id, state, id) that finds it running, and a second that finds a zombie.
+/// A third and fourth look that read again would meet the host's running process.
 ///
-/// Mutant: `ExitWatch::look` does not remember the confirmation, so the second look reads again.
+/// Mutant: `ExitWatch::look` answers `Exited` without its confirming reads, so the first look is not
+/// `Recheck`; or it does not remember the confirmation, so the third look is `Recheck`.
 #[skuld::test]
 fn a_confirmed_exit_is_remembered_and_later_looks_read_nothing() {
-    use crate::identity::FakeKernel;
+    use crate::identity::{short_info, FakeKernel, LAUNCHD};
+    use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_once, Registration};
+    use crate::os_process::open_with;
 
     let (mut child, id) = blocker();
     let own = UniqRead::Found(own_unique_info(id));
     let kernel = FakeKernel::over(&HostKernel)
+        // The open's read, and the arming's.
         .on_unique_info(id.pid(), own)
         .on_unique_info(id.pid(), own)
+        // The first confirming look: the process runs.
         .on_unique_info(id.pid(), own)
+        .on_short_bsd(id.pid(), Ok(short_info(LAUNCHD, libc::SRUN)))
         .on_unique_info(id.pid(), own)
-        .on_unique_info(id.pid(), UniqRead::Refused(libc::EPERM));
-    let p = MacosProcess::open(kernel, id).unwrap().expect("a live process opens");
+        // The second: a zombie.
+        .on_unique_info(id.pid(), own)
+        .on_short_bsd(id.pid(), Ok(short_info(LAUNCHD, libc::SZOMB)))
+        .on_unique_info(id.pid(), own);
+    let p = open_with(kernel, id).unwrap().expect("a live process opens");
+    let _fired = force_proc_registration_once(Registration::ExitWatch);
     assert!(
-        matches!(p.exited(), Ok(Exit::Running(_))),
-        "the watch is armed on a live process"
+        matches!(p.exited(), Ok(Exit::Recheck)),
+        "the watch fired and the first confirming read finds it running"
     );
-    assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
-    wait_until_zombie(id.pid());
-    assert!(matches!(p.exited(), Ok(Exit::Exited)), "the zombie confirms");
+    assert!(
+        matches!(p.exited(), Ok(Exit::Exited)),
+        "the second confirming read finds a zombie"
+    );
     assert!(matches!(p.exited(), Ok(Exit::Exited)));
     assert!(matches!(p.exited(), Ok(Exit::Exited)));
+    child.kill().unwrap();
     child.wait().unwrap();
 }
 

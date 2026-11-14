@@ -7,9 +7,10 @@ use std::time::Duration;
 use super::{watched, OnTracer, TracerWatch, WalkError};
 use crate::child::spawn::identity_macos_tests::{other_unique_id, std_blocker_with_unique};
 use crate::identity::kinfo::kinfo_proc;
-use crate::identity::{FakeKernel, HostKernel, Kernel, UniqInfo, UniqRead};
+use crate::identity::{FakeKernel, HostKernel, Kernel, UniqRead};
 use crate::os_process::macos::kqueue::test_hooks::{event_pending, send_signal};
 use crate::os_process::macos::kqueue::{Event, Kqueue};
+use crate::wait::exit_only::macos_tests::found;
 
 /// A live blocker on a held stdin, and its unique id. Dropping it ends and reaps the blocker.
 struct Live {
@@ -49,13 +50,6 @@ impl Drop for Live {
         drop(self.stdin.take());
         self.child.wait().expect("reap the blocker");
     }
-}
-
-fn found(unique_id: u64) -> UniqRead {
-    UniqRead::Found(UniqInfo {
-        unique_id,
-        id_version: 0,
-    })
 }
 
 /// A kernel whose first `count` unique-id reads of `pid` say it is gone, and the host's after.

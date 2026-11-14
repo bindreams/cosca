@@ -41,7 +41,10 @@ impl kinfo_proc {
     }
 }
 
-/// Read only by the tracer helper's tests (`test_support::tracer`), for their preconditions.
+/// Test-only: `e_jobc` is read by the tracer helper's tests (`test_support::tracer_tests`) for
+/// their preconditions; `of_host_held_by` builds the records that `origin_tests`, `os_process`'s
+/// and the tracer watch's tests state as a tracer's hold, and `set_e_ppid` serves it and
+/// `fault::force_parents`.
 #[cfg(test)]
 impl kinfo_proc {
     /// Byte offset of `eproc.e_jobc` within `kp_eproc`: after `e_ppid` and `e_pgid`

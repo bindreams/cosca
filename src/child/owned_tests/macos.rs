@@ -732,26 +732,45 @@ fn a_try_wait_during_a_holders_wait_does_not_strand_the_holder() {
 /// Mutant: the peek is the plain one, which calls an unreadable id on a running child `Running`.
 #[skuld::test]
 fn try_wait_during_a_wait_errors_when_a_running_childs_unique_id_is_unreadable() {
-    // The holder's one look before it blocks reads the id once, and finds it the child's; the next
-    // read is the `try_wait`'s peek.
-    let mut b = Blocker::spawn_over(|pid, unique| {
-        FakeKernel::over(&HostKernel)
-            .on_unique_info(pid, found(unique))
-            .on_unique_info(pid, UniqRead::Refused(libc::EPERM))
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // The kernel answers every unique-id read by `refused`, which the test raises only while the
+    // holder is parked in its blocking hook, making no read: the holder's looks before it blocks
+    // find the child's id, whatever their number, and every read the `try_wait` makes is refused.
+    let refused = Arc::new(AtomicBool::new(false));
+    let mut b = Blocker::spawn_over({
+        let refused = Arc::clone(&refused);
+        move |pid, unique| {
+            FakeKernel::over(&HostKernel).on_every_unique_info(pid, move || {
+                if refused.load(Ordering::SeqCst) {
+                    UniqRead::Refused(libc::EPERM)
+                } else {
+                    found(unique)
+                }
+            })
+        }
     });
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn({
-        let owned = std::sync::Arc::clone(&b.owned);
+        let owned = Arc::clone(&b.owned);
         move || {
-            let _blocking = crate::wait::block_probe::on_blocking(move || _ = reached_tx.send(()));
+            let _blocking = crate::wait::block_probe::on_blocking(move || {
+                _ = reached_tx.send(());
+                staged_rx.recv().expect("the test stages the refusal");
+            });
             owned.wait(None)
         }
     });
     reached_rx.recv().expect("the holder must reach its wait");
+    refused.store(true, Ordering::SeqCst);
     let err = try_wait(&b.owned)
         .expect_err("a running child that cannot be shown to be ours")
         .into_io();
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    // The holder's poll is next: its looks after the exit read the child's id again.
+    refused.store(false, Ordering::SeqCst);
+    staged_tx.send(()).expect("the holder is waiting for the stage");
     b.end_child();
     let status = status(holder.join().expect("holder"));
     assert!(status.success(), "{status:?}");
@@ -783,9 +802,11 @@ fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
 /// before the watch was confirmed by a read.
 ///
 /// The confirming read is the first unique-id read, so the row refuses it; the peek's id check
-/// after it is the host's.
+/// after it is the host's. The one row is spent by the confirming read: the `try_wait` after it
+/// reaches the exit record, where a row left for its id check would refuse it.
 ///
-/// Mutant: `OwnedChild::liveness` propagates the refusal of `exited` without asking the peek.
+/// Mutant: `OwnedChild::liveness` propagates the refusal of `exited` without asking the peek; or
+/// answers `Dead` without the confirming read, leaving the row for the `try_wait`.
 #[skuld::test]
 fn a_refused_confirmation_is_dead_when_the_peek_shows_the_exit_record() {
     let mut b =
@@ -795,6 +816,8 @@ fn a_refused_confirmation_is_dead_when_the_peek_shows_the_exit_record() {
         matches!(b.owned.liveness(), Ok(crate::identity::Liveness::Dead)),
         "the exit record is visible whatever the confirming read says"
     );
+    let reaped = status(try_wait(&b.owned));
+    assert!(reaped.success(), "{reaped:?}");
 }
 
 /// A child whose exit watch has fired while it runs and whose confirming read is refused is the

@@ -1054,11 +1054,13 @@ impl ProcessId {
 pub(crate) use backend::kinfo;
 
 /// A kernel, and a guard to hold while it is used, under which every by-pid identity read of `pid`
-/// answers `Unknown`: an access refusal (`hidepid` on Linux, a sandboxed or cross-user read on
-/// macOS) for a live pid. The kernel states the answer and the guard holds nothing.
+/// answers `Unknown`: an access refusal (`hidepid` on Linux, a sandbox on macOS) for a live pid.
+/// The kernel states the answer and the guard holds nothing.
 ///
 /// Linux: a `stat` row for `pid` answering `EACCES`, which fails for every read through the kernel,
-/// a table scan's too. macOS: rows refusing every `proc_pidinfo` and `sysctl` read of the record.
+/// a table scan's too. macOS: rows refusing every `proc_pidinfo` and `sysctl` read of the record,
+/// so `ppid_of`, `is_running`, `exit_begun` and a process snapshot fail for `pid` too, not only
+/// the identity read.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn unreadable(pid: RawPid) -> (impl Kernel, impl Sized) {
     (ticks_host(pid).on_read(&format!("{pid}/stat"), Err(libc::EACCES)), ())
@@ -1084,7 +1086,8 @@ pub(crate) fn ticks_id(pid: RawPid) -> ProcessId {
         .expect("a live pid has a starttime")
 }
 
-/// [`unreadable`] on macOS: the record read `EPERM`s on both paths, as a cross-user read does.
+/// [`unreadable`] on macOS: the record read `EPERM`s on both paths, as a sandbox refuses it (a
+/// cross-user read is refused by `proc_pidinfo` only).
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn unreadable(pid: RawPid) -> (impl Kernel, impl Sized) {
     let kernel = FakeKernel::over(&HostKernel)

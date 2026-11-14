@@ -125,6 +125,17 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
+    /// Every unique-id read of `pid` that no row answers answers what `answer` says at that read, so
+    /// a test that reads from two threads states what each sees, not an order of reads.
+    pub(crate) fn on_every_unique_info(
+        mut self,
+        pid: RawPid,
+        answer: impl Fn() -> UniqRead + Send + Sync + 'static,
+    ) -> Self {
+        self.unique_infos.push_every(pid, answer);
+        self
+    }
+
     /// Every BSD-info read of `pid` that no row answers fails with `error`.
     pub(crate) fn on_every_bsd_info_failing(mut self, pid: RawPid, error: ReadErr) -> Self {
         self.bsd_infos.push_every(pid, move || Err(error));

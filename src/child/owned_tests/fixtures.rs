@@ -68,15 +68,11 @@ impl Blocker {
         kernel: impl FnOnce(u32, u64) -> K,
     ) -> Blocker {
         let (child, stdin) = spawn_std_blocker();
-        let pid = identity_of(&child).pid();
-        let unique = crate::wait::exit_only::macos_tests::unique_of(pid);
-        let os = crate::os_process::macos::child::MacosChild::new(kernel(pid, unique), pid, unique)
-            .expect("watch the child");
-        // std's `Child` holds nothing else the tests use: dropping it neither kills nor reaps.
-        drop(child);
+        let id = identity_of(&child);
+        let owned = OwnedChild::adopt_over(kernel, child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
         Blocker {
-            owned: Arc::new(OwnedChild::new(Box::new(os))),
-            pid,
+            owned: Arc::new(owned),
+            pid: id.pid(),
             stdin: Some(stdin),
         }
     }

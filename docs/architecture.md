@@ -136,7 +136,10 @@ In order:
      `tracer_watch::seams::force_links` and `identity::seams::by_pid_reads`. Of the last kind,
      `a_failed_start_read_in_the_second_reap_neither_panics_nor_leaves_n` needs `uniq_fault`: how
      many unique-id reads precede the second peek depends on how many looks the wait makes before
-     the killed tracee's exit shows. `exit_only::{peek, peek_verified, peek_traced}` still
+     the killed tracee's exit shows. `host_kinfo`'s `contract_violation` arm (a `sysctl` failure
+     that is not `ESRCH`, `EPERM` or `EACCES`) is untested by design: no row reaches
+     `HostKernel`'s own read, and a production seam for it is not worth the arm
+     (coordinator, 2026-11-14). `exit_only::{peek, peek_verified, peek_traced}` still
      consult the `exit_only::seams` hook; five macOS tests need it, and `MacosChild::event_pending`
      (a `cfg(test)` accessor) goes with it. `LinuxProcess` no longer does. The slices that convert
      them also remove `block_probe::on_round` and `on_every_round`, the `cfg(test)` round hooks of
