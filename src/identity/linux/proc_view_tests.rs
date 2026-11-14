@@ -645,11 +645,9 @@ fn fixture_own_procfs_unprivileged() {
     match proc_view_with(&FakeKernel::over(&HostKernel).on_read("self/status", Ok(NO_NSPID.as_bytes()))) {
         ProcView::Unassessable(why) => {
             assert!(why.reason.contains("1/ns/pid"), "{why}");
-            assert_eq!(
-                why.source.as_ref().and_then(io::Error::raw_os_error),
-                Some(libc::EACCES),
-                "{why}"
-            );
+            // The `readlinkat` of a foreign pid's link is the pid file's `read(2)` step: an `Unreadable`
+            // names it, and the errno is below.
+            assert_eq!(crate::error::first_os_code(&why), Some(libc::EACCES), "{why}");
         }
         other => panic!("an unreadable pid 1 namespace link must be Unassessable, got {other:?}"),
     }
