@@ -214,7 +214,13 @@ impl Tree {
             }
             Holder::Contained(mechanism) => {
                 debug_assert!(!self.released, "a send on a released tree");
-                mechanism.send_terminate(pid, root)
+                let mut outcome = mechanism.send_terminate(pid, root);
+                // The members a walk reached are held for the next kill, which cannot walk to them once
+                // the root has exited.
+                if let TerminateOutcome::Sent { termed, .. } = &mut outcome {
+                    self.killed.hold(std::mem::take(termed));
+                }
+                outcome
             }
         }
     }

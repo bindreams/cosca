@@ -126,7 +126,8 @@ impl Process {
     pub(crate) fn terminate_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
         #[cfg(unix)]
         {
-            crate::containment::treewalk::terminate(kernel, self.id, self)
+            // A foreign process holds no settlement, so the members the walk reached are not kept.
+            crate::containment::treewalk::terminate(kernel, self.id, self).map(drop)
         }
         #[cfg(windows)]
         {

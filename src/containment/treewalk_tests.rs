@@ -1097,7 +1097,7 @@ fn a_walk_is_skipped_by_the_roots_state_only_on_macos() {
             "kill, {name}: {killed:?}"
         );
         if !skipped {
-            assert!(matches!(killed, TreeKillOutcome::NoRoot), "kill, {name}: {killed:?}");
+            assert!(matches!(killed, TreeKillOutcome::NoRoot(_)), "kill, {name}: {killed:?}");
         }
         let termed = super::terminate_tree(&crate::identity::HostKernel, self::root(), Some(&root));
         assert_eq!(

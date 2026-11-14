@@ -8,6 +8,9 @@ use crate::test_groups::setuid;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 
+/// The pid a gone root's outcome names.
+const ROOT_PID: u32 = 4242;
+
 /// A tree walk's mechanism, which answers the members an earlier kill left (the root it walks from
 /// is never walked here).
 fn walker() -> crate::containment::mechanism::Mechanism {
@@ -425,7 +428,8 @@ fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
                 termed,
                 TerminateOutcome::Sent {
                     result: Ok(()),
-                    earlier: Some("the SIGTERM")
+                    earlier: Some("the SIGTERM"),
+                    ..
                 }
             ),
             "{name}: {termed:?}"
@@ -746,7 +750,7 @@ fn settle_answers_a_walk_that_was_not_made_with_an_error_and_marks_nothing() {
     use super::{TreeKillOutcome, TreeKilled};
     use crate::error::Error;
     for outcome in [
-        TreeKillOutcome::NoRoot,
+        TreeKillOutcome::NoRoot(ROOT_PID),
         TreeKillOutcome::Unwalked(Error::Unassessable {
             detail: "the snapshot could not be taken".into(),
             source: None,
@@ -778,7 +782,7 @@ fn settle_answers_a_gone_root_as_killed_once_the_handle_killed_the_tree() {
         .expect("the tree is killed");
 
     let later = killed
-        .settle(Some(&walker()), TreeKillOutcome::NoRoot, false)
+        .settle(Some(&walker()), TreeKillOutcome::NoRoot(ROOT_PID), false)
         .answer
         .expect("the tree was killed already");
 
@@ -910,7 +914,7 @@ fn table_outcomes() -> [(&'static str, super::TreeKillOutcome); 5] {
                 resolved: Vec::new(),
             })),
         ),
-        ("NoRoot", TreeKillOutcome::NoRoot),
+        ("NoRoot", TreeKillOutcome::NoRoot(ROOT_PID)),
         (
             "Unwalked",
             TreeKillOutcome::Unwalked(crate::error::Error::Unassessable {
@@ -1095,7 +1099,7 @@ fn unvouched_tree() -> (super::TreeKilled, Box<dyn FnOnce()>) {
     let id = blocker.id().expect(crate::test_child::IDENTITY_READ);
     let killed = tree_left_with(id.pid(), vec![id]);
     killed
-        .settle(Some(&walker()), TreeKillOutcome::NoRoot, true)
+        .settle(Some(&walker()), TreeKillOutcome::NoRoot(ROOT_PID), true)
         .answer
         .expect_err("a gone root walked nothing");
     assert_eq!(
@@ -1316,7 +1320,7 @@ fn a_held_member_is_answered_first_whatever_the_next_kill_found() {
     };
     let skipped = || skipped_kill("walk the process table", None);
     let outcomes: [(&str, &dyn Fn() -> TreeKillOutcome); 3] = [
-        ("NoRoot", &|| TreeKillOutcome::NoRoot),
+        ("NoRoot", &|| TreeKillOutcome::NoRoot(ROOT_PID)),
         ("Unwalked", &unwalked),
         ("Skipped", &skipped),
     ];
@@ -1371,7 +1375,7 @@ fn a_gone_root_over_a_marked_tree_still_answers_a_held_member() {
         .expect_err("a later kill left a member");
 
     let again = killed
-        .settle(Some(&walker()), TreeKillOutcome::NoRoot, true)
+        .settle(Some(&walker()), TreeKillOutcome::NoRoot(ROOT_PID), true)
         .answer
         .expect_err("the member is not shown killed");
     assert_eq!(pid_left(first_left(&again)), 7, "{again}");
@@ -1383,7 +1387,7 @@ fn a_gone_root_over_a_marked_tree_still_answers_a_held_member() {
         .expect("a complete kill");
     assert!(matches!(
         nothing_held
-            .settle(Some(&walker()), TreeKillOutcome::NoRoot, true)
+            .settle(Some(&walker()), TreeKillOutcome::NoRoot(ROOT_PID), true)
             .answer,
         Ok(SettleOutcome::Killed)
     ));
@@ -1496,7 +1500,7 @@ fn gone_root_answers_over_gone_members_each_time(exits_on_its_own: bool) {
     let texts: Vec<String> = (0..2)
         .map(|_| {
             let left = killed
-                .settle(Some(&walker()), TreeKillOutcome::NoRoot, true)
+                .settle(Some(&walker()), TreeKillOutcome::NoRoot(ROOT_PID), true)
                 .answer
                 .expect_err("a gone root walked nothing");
             assert_eq!(left.left_members().len(), 1, "{left}");
@@ -1518,6 +1522,37 @@ fn gone_root_answers_over_gone_members_each_time(exits_on_its_own: bool) {
         assert!(!text.contains("nothing was killed"), "{text}");
         assert!(!text.contains("killed again"), "{text}");
     }
+}
+
+/// A member a cooperative walk reached is held like one a refused kill left: a gone root's settlement
+/// kills it by its identity, and one held twice is held once. Nothing held for an empty list.
+///
+/// Mutants: the held member is not killed; the second hold adds it again; an empty hold marks the tree
+/// left.
+#[skuld::test]
+fn members_a_cooperative_walk_reached_are_killed_by_identity_when_the_root_is_gone() {
+    use super::{TreeKillOutcome, TreeKilled};
+    let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
+    let killed = TreeKilled::default();
+    let id = blocker.id().expect(crate::test_child::IDENTITY_READ);
+
+    killed.hold(Vec::new());
+    assert_eq!(standing(&killed), Standing::Never);
+    killed.hold(vec![id]);
+    killed.hold(vec![id]);
+    assert_eq!(standing(&killed), Standing::Left(vec![id.pid()]));
+
+    let settled = killed.settle(Some(&walker()), TreeKillOutcome::NoRoot(ROOT_PID), true);
+    settled.answer.expect_err("a gone root walked nothing");
+    assert_eq!(settled.killed_again, vec![id], "the held member was killed again");
+    assert_eq!(
+        standing(&killed),
+        Standing::Unvouched(super::UnvouchedKind::HeldMembersGone)
+    );
+    // Released after the kill: a settlement that sent nothing lets the member exit on EOF, which
+    // fails the assertion instead of leaving a wait unbounded.
+    drop(stdin);
+    crate::test_child::assert_killed("the held member", blocker.wait().expect("reap the member"));
 }
 
 /// Mutant: the answer is `no_root_error`, or says the members were killed again, or changes with the
@@ -1758,7 +1793,7 @@ fn a_walk_that_saw_the_root_running_unvouches_the_tree_whatever_ended_it_afterwa
             let mut texts = Vec::new();
             for _ in 0..2 {
                 let gone = killed
-                    .settle(Some(&walker()), TreeKillOutcome::NoRoot, true)
+                    .settle(Some(&walker()), TreeKillOutcome::NoRoot(ROOT_PID), true)
                     .answer
                     .expect_err("a gone root walked nothing");
                 let text = first_left(&gone).to_string();

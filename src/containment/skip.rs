@@ -114,9 +114,14 @@ impl Why {
 pub(crate) enum TerminateOutcome {
     /// The signal went out, as usual or to what names the tree by identity, and `result` is what the
     /// check after it found. `earlier` names what a later sweep's error says was sent before it.
+    /// `termed` are the members a tree walk found and signalled, by identity: the root's exit
+    /// reparents them out of every later walk, so the tree's settlement holds them for its next kill
+    /// ([`TreeKilled::hold`](crate::containment::dispatch::TreeKilled::hold)). Every other mechanism
+    /// names its tree without a walk, and has none.
     Sent {
         result: Result<(), Error>,
         earlier: Option<&'static str>,
+        termed: Vec<crate::identity::ProcessId>,
     },
     /// Nothing was sent: the call ends with this error.
     NotSent(Error),
@@ -141,7 +146,11 @@ impl TerminateOutcome {
     /// ([`Sent`](Self::Sent)).
     pub(crate) fn of(sent: Result<Result<(), Error>, Error>, earlier: Option<&'static str>) -> TerminateOutcome {
         match sent {
-            Ok(result) => TerminateOutcome::Sent { result, earlier },
+            Ok(result) => TerminateOutcome::Sent {
+                result,
+                earlier,
+                termed: Vec::new(),
+            },
             Err(not_sent) => TerminateOutcome::NotSent(not_sent),
         }
     }

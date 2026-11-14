@@ -92,7 +92,7 @@ fn id_walks() -> [(&'static str, Walk); 2] {
                 .map_err(Unkilled::into_error)
         }),
         ("terminate", |k, id| {
-            super::terminate(k, id, &super::ByIdentity::new(k, id))
+            super::terminate(k, id, &super::ByIdentity::new(k, id)).map(drop)
         }),
     ]
 }

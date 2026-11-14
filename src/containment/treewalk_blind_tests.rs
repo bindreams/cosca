@@ -29,7 +29,7 @@ fn walks() -> [(&'static str, Walk); 4] {
         }),
         ("terminate", |p| {
             let hk = &crate::identity::HostKernel;
-            super::terminate(hk, p.id(), &super::ByIdentity::new(hk, p.id()))
+            super::terminate(hk, p.id(), &super::ByIdentity::new(hk, p.id())).map(drop)
         }),
         ("kill_tree", |p| p.kill_tree()),
         ("terminate_tree", |p| p.terminate_tree()),

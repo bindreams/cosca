@@ -274,6 +274,14 @@ impl Child {
     /// on and returns the status. A macOS marker's holders still get the `SIGTERM`, the grace and the
     /// kill. The `SIGTERM` and the sweep each decide on a look of their own at the root.
     ///
+    /// **A `TreeWalk` whose root exits within the grace.** The kernel reparents the root's children
+    /// at its exit, so the sweep cannot walk to them from its pid. The `SIGTERM` walk, made while the
+    /// root ran, remembered the members it reached, and the sweep kills those still running by their
+    /// identities, waits for them, and reaps the root. The call then returns
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) even so: what those members forked
+    /// since the walk was never looked for, so the tree cannot be vouched for. A root that outlives the
+    /// grace is walked and killed as usual, and the call is `Ok` when that leaves nothing.
+    ///
     /// **macOS, a root the handle cannot vouch for** is signalled as for
     /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A
     /// mechanism with no channel by identity ends the call up front, with nothing sent and no grace
@@ -297,7 +305,7 @@ impl Child {
             return forced;
         }
         match self.tree.terminate(self.pid(), root) {
-            TerminateOutcome::Sent { result, earlier } => SignalTreeCooperativelyOutcome::Sent { result, earlier },
+            TerminateOutcome::Sent { result, earlier, .. } => SignalTreeCooperativelyOutcome::Sent { result, earlier },
             TerminateOutcome::NotSent(not_sent) => SignalTreeCooperativelyOutcome::End(not_sent),
             #[cfg(unix)]
             TerminateOutcome::End(skip) => {

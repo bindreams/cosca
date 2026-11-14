@@ -99,6 +99,10 @@ mod openat2_refused_drop_tests;
 #[path = "child/drop_reaped_tests.rs"]
 mod drop_reaped_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "child/treewalk_exited_root_tests.rs"]
+mod treewalk_exited_root_tests;
+
 #[cfg(all(test, unix))]
 #[path = "child/root_state_tests.rs"]
 mod root_state_tests;
@@ -553,15 +557,20 @@ impl Child {
     /// On the `TreeWalk` mechanism, an [`Error::Unassessable`] (or `Unsupported`) means the
     /// process table could not be read or trusted, so the descendants could not be found: NOTHING
     /// was killed, the root included, and a retry can work. (`Drop` cannot retry, so it still
-    /// kills the root and logs that descendants may be orphaned.) A root that is gone (this handle
-    /// reaped it) or no longer holds its pid is `Unassessable` too: no walk ran and nothing was
-    /// killed, and a retry cannot work, since the root will not come back.
+    /// kills the root and logs that descendants may be orphaned.) A root that has exited is
+    /// `Unassessable` too, whether this handle reaped it, it is exited and not yet reaped, or it no
+    /// longer holds its pid: its children were reparented at its exit, so a walk from its pid finds
+    /// none, and `Ok` there would say nothing of the tree. Nothing was killed (the root, an unreaped
+    /// zombie, apart), and a retry cannot work, since the root will not come back. A root exited
+    /// and not yet reaped whose walk finds a member is walked as usual.
     ///
     /// On the `TreeWalk` mechanism (on macOS, only where the ppid walk runs instead of the fd
     /// marker), a walk that killed what it could and left members running is an
     /// [`Error::MembersLeft`] of every member, each an [`Error::MemberNotKilled`] naming it and why:
     /// its identity could not be read, or its kill was refused. The handle keeps the members the walk
-    /// left: a later `kill_tree`, or the
+    /// left, and those a [`terminate_tree`](Child::terminate_tree) or
+    /// [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) `SIGTERM` walk reached while the root
+    /// ran: a later `kill_tree`, or the
     /// drop, kills those whose identity was read again, and reports the others again. That holds
     /// whatever the later walk finds, a root that is gone included. Once those members are gone, a
     /// gone root is `Unassessable` on every later call, saying the members an earlier kill left are

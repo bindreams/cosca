@@ -435,6 +435,26 @@ impl TreeKilled {
     pub(crate) fn is_set(&self) -> bool {
         matches!(*self.lock(), TreeState::Killed)
     }
+
+    /// Holds `members`, which a cooperative signal's walk found and reached, as members a later kill
+    /// answers first ([`Left`](TreeState::Left)): the root's exit reparents them out of every later walk,
+    /// so only their identities reach them. One already held is held once.
+    pub(crate) fn hold(&self, members: Vec<crate::identity::ProcessId>) {
+        if members.is_empty() {
+            return;
+        }
+        let mut state = self.lock();
+        let mut held = match &*state {
+            TreeState::Left(held) => held.clone(),
+            TreeState::Never | TreeState::Killed | TreeState::Unvouched(_) => Vec::new(),
+        };
+        for id in members {
+            if !held.iter().any(|left| left.pid() == id.pid()) {
+                held.push(crate::containment::treewalk::Left::Resolved(id));
+            }
+        }
+        *state = TreeState::Left(held);
+    }
 }
 
 /// Which signal a tree path sends.
@@ -562,7 +582,8 @@ impl UnvouchedKind {
     fn found(self) -> &'static str {
         match self {
             UnvouchedKind::HeldMembersGone => {
-                "the members an earlier kill left are gone now, but no later walk has checked what they forked"
+                "the members an earlier kill left, or a SIGTERM walk reached, are gone now, but no later walk has \
+                 checked what they forked"
             }
             UnvouchedKind::RootSeenRunning => {
                 "the walk found the root running, and what the root forked meanwhile was never looked for"
@@ -594,8 +615,8 @@ impl UnvouchedKind {
     fn gone_root_text(self) -> &'static str {
         match self {
             UnvouchedKind::HeldMembersGone => {
-                "the members an earlier kill left are gone; the tree could not be walked from its gone root, so \
-                 what they forked is unknown"
+                "the members an earlier kill left, or a SIGTERM walk reached, are gone; the tree could not be walked \
+                 from its exited root, so what they forked is unknown"
             }
             UnvouchedKind::RootSeenRunning => {
                 "the root an earlier walk found running is gone; the tree could not be walked from it, so what it \
@@ -630,11 +651,12 @@ pub(crate) enum TreeKillOutcome {
     /// error says why. Every other failure is a kill that was attempted, a `TreeWalk`'s
     /// [`Error::MemberNotKilled`] included.
     Unwalked(Error),
-    /// A `TreeWalk` walk found its root gone, or holding its pid no longer: there is no tree to walk
-    /// from, so this kill killed nothing. It is [`Error::Unassessable`]: [`no_root_error`](Self::no_root_error)
+    /// A `TreeWalk` walk found its root, the pid it carries, exited: gone, holding its pid no longer, or
+    /// exited and not yet reaped. Its children were reparented at its exit, so there is no tree to walk
+    /// from, and this kill killed nothing. It is [`Error::Unassessable`]: [`no_root_error`](Self::no_root_error)
     /// over a tree never settled, [`no_root_after_kills_error`](Self::no_root_after_kills_error) over
     /// an unvouched one, worded by what the settlement knows of it ([`UnvouchedKind`]).
-    NoRoot,
+    NoRoot(u32),
     /// The root's number is untrusted, so the kill skipped what names the tree by it. The tree is
     /// not killed. The caller that has the root's handle acts on [`Skip::root_alone`].
     #[cfg_attr(
@@ -652,10 +674,14 @@ impl From<Result<(), Unkilled>> for TreeKillOutcome {
 }
 
 impl TreeKillOutcome {
-    /// What [`NoRoot`](Self::NoRoot) is as an error: nothing was killed, because no walk ran.
-    pub(crate) fn no_root_error() -> Error {
+    /// What [`NoRoot`](Self::NoRoot) of the root `pid` is as an error: nothing was killed, because no
+    /// walk ran.
+    pub(crate) fn no_root_error(pid: u32) -> Error {
         Error::Unassessable {
-            detail: "the root is gone or no longer holds its pid, so no walk ran and nothing was killed".to_owned(),
+            detail: format!(
+                "the root (pid {pid}) has exited, so its descendants were reparented and a walk from its pid finds \
+                 none: no walk ran and nothing was killed"
+            ),
             source: None,
         }
     }
@@ -676,7 +702,7 @@ impl TreeKillOutcome {
             TreeKillOutcome::Ran(result) | TreeKillOutcome::Answered(result) => result,
             TreeKillOutcome::Skipped(skip) => skip.holders.unwrap_or(Ok(())).map_err(Unkilled::from),
             TreeKillOutcome::Unwalked(error) => Err(Unkilled::from(error)),
-            TreeKillOutcome::NoRoot => Err(Unkilled::from(Self::no_root_error())),
+            TreeKillOutcome::NoRoot(pid) => Err(Unkilled::from(Self::no_root_error(pid))),
         }
     }
 
@@ -707,7 +733,7 @@ impl TreeKillOutcome {
                 format!("the kill was skipped, and would {action}")
             }
             TreeKillOutcome::Unwalked(error) => word(error),
-            TreeKillOutcome::NoRoot => word(&Self::no_root_error()),
+            TreeKillOutcome::NoRoot(pid) => word(&Self::no_root_error(*pid)),
             TreeKillOutcome::Ran(Ok(())) | TreeKillOutcome::Answered(Ok(())) => {
                 unreachable!("a completed kill has nothing left")
             }
@@ -722,7 +748,7 @@ impl TreeKillOutcome {
             TreeKillOutcome::Ran(_)
             | TreeKillOutcome::Answered(_)
             | TreeKillOutcome::Unwalked(_)
-            | TreeKillOutcome::NoRoot => None,
+            | TreeKillOutcome::NoRoot(_) => None,
         }
     }
 
@@ -959,10 +985,14 @@ impl TreeKilled {
             TreeState::Left(held) => held.clone(),
             TreeState::Never | TreeState::Killed | TreeState::Unvouched(_) => Vec::new(),
         };
-        let gone_root = matches!(outcome, TreeKillOutcome::NoRoot);
+        let gone_root_pid = match &outcome {
+            TreeKillOutcome::NoRoot(pid) => Some(*pid),
+            _ => None,
+        };
+        let gone_root = gone_root_pid.is_some();
         let ran = matches!(outcome, TreeKillOutcome::Ran(_) | TreeKillOutcome::Answered(_));
         // What a walk not made or a gone root leaves is its error, not a member seen running.
-        let looked_for_no_member = matches!(outcome, TreeKillOutcome::NoRoot | TreeKillOutcome::Unwalked(_));
+        let looked_for_no_member = matches!(outcome, TreeKillOutcome::NoRoot(_) | TreeKillOutcome::Unwalked(_));
         // A walk already covered the tree unless it was never settled: a gone root adds no error of its own.
         let covered = gone_root && !matches!(*state, TreeState::Never);
         let result = if covered { Ok(()) } else { outcome.into_result() };
@@ -989,7 +1019,7 @@ impl TreeKilled {
                         "a gone root over held or unvouched members leaves the tree unvouched"
                     );
                     // Release: the gone-root answer of a tree no kill left unvouched.
-                    TreeKillOutcome::no_root_error()
+                    TreeKillOutcome::no_root_error(gone_root_pid.expect("a gone root has its pid"))
                 }
             };
             result = Err(Unkilled::from(error));
@@ -1058,7 +1088,7 @@ impl TreeKilled {
             TreeKillOutcome::Unwalked(_) => "; the root is killed regardless, so its descendants may be orphaned",
             TreeKillOutcome::Ran(_)
             | TreeKillOutcome::Answered(_)
-            | TreeKillOutcome::NoRoot
+            | TreeKillOutcome::NoRoot(_)
             | TreeKillOutcome::Skipped(_) => "",
         };
         let (left, failure) = match self.settle(mechanism, outcome, root_ended).answer {

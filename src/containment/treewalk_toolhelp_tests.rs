@@ -72,7 +72,7 @@ fn a_walk_from_a_root_that_lost_its_pid_terminates_nothing() {
                 &super::ByIdentity::new(&crate::identity::HostKernel, stale)
             )
             .outcome(),
-            crate::containment::dispatch::TreeKillOutcome::NoRoot
+            crate::containment::dispatch::TreeKillOutcome::NoRoot(_)
         ),
         "a root that lost its pid is nothing to do"
     );
