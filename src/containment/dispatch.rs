@@ -471,6 +471,11 @@ impl TreeKilled {
         self.lock().vouching == Vouching::Killed
     }
 
+    /// Whether the tree holds members: what a refused kill left, or a `SIGTERM` walk reached.
+    pub(crate) fn holds_members(&self) -> bool {
+        !self.lock().held.is_empty()
+    }
+
     /// Holds `members`, which a `SIGTERM` walk found and reached, as members a later kill answers first
     /// ([`held`](TreeState::held), as `Termed` entries, not as leftovers of a refused kill): the root's
     /// exit reparents them out of every later walk, so only their identities reach them. `complete`:
@@ -1163,9 +1168,11 @@ impl TreeKilled {
     /// reports each of them once, in it.
     ///
     /// `keeping`: with [`Keeping::ForWalkFromRunningRoot`] a walk not made
-    /// ([`Unwalked`](TreeKillOutcome::Unwalked)) is answered with its own error and settles nothing:
-    /// the state and the members it holds stay for the retry, which walks from the running root. Every
-    /// other outcome is settled whatever `keeping` says.
+    /// ([`Unwalked`](TreeKillOutcome::Unwalked)) settles nothing: the state and the members it holds
+    /// stay for the retry, which walks from the running root. The answer is its own error beside every
+    /// held member an earlier kill refused and that may still run
+    /// ([`refused_still`](crate::containment::treewalk::refused_still)), as a settlement would report
+    /// it. Every other outcome is settled whatever `keeping` says.
     pub(crate) fn settle_for_kill_tree(
         &self,
         mechanism: Option<&Mechanism>,
@@ -1174,7 +1181,19 @@ impl TreeKilled {
         keeping: Keeping,
     ) -> Settled<Result<(), Error>> {
         match (outcome.into(), keeping) {
-            (TreeKillOutcome::Unwalked(error), Keeping::ForWalkFromRunningRoot) => Settled::of(Err(error)),
+            (TreeKillOutcome::Unwalked(error), Keeping::ForWalkFromRunningRoot) => {
+                let mut members =
+                    crate::containment::treewalk::refused_still(&crate::identity::HostKernel, &self.lock().held);
+                members.push(error);
+                Settled::of(
+                    Unkilled {
+                        members,
+                        root: None,
+                        resolved: Vec::new(),
+                    }
+                    .unsettled(false),
+                )
+            }
             (outcome, _) => self
                 .settle(mechanism, outcome, root_ended)
                 .map(|answer| answer.map(drop)),
@@ -1191,21 +1210,25 @@ impl TreeKilled {
         root_ended: bool,
     ) -> Option<TreeLeft> {
         let outcome = outcome.into();
-        let after = match &outcome {
-            // A drop cannot retry a walk that was not made.
-            TreeKillOutcome::Unwalked(_) => {
-                "; the members this handle held were killed by identity, those named above excepted, and the root is \
-                 killed regardless, so its other descendants may be orphaned"
-            }
-            TreeKillOutcome::Ran(_)
-            | TreeKillOutcome::Answered(_)
-            | TreeKillOutcome::NoRoot(..)
-            | TreeKillOutcome::Skipped(_) => "",
-        };
-        let (left, failure) = match self.settle(mechanism, outcome, root_ended).answer {
+        // A drop cannot retry a walk that was not made.
+        let unwalked = matches!(outcome, TreeKillOutcome::Unwalked(_));
+        let settled = self.settle(mechanism, outcome, root_ended);
+        let (left, failure) = match settled.answer {
             Err(left) => (crate::error::Report(&left).to_string(), Some(left)),
             Ok(SettleOutcome::Unvouched { kind }) => (kind.drop_text(), None),
             Ok(SettleOutcome::Killed | SettleOutcome::Skipped) => return None,
+        };
+        let after = match (unwalked, &settled.killed_again[..]) {
+            (false, _) => String::new(),
+            (true, []) => "; the root is killed regardless, so its other descendants may be orphaned".to_owned(),
+            (true, killed) => {
+                let pids: Vec<String> = killed.iter().map(|id| id.pid().to_string()).collect();
+                format!(
+                    "; the members this handle held were killed by identity (pid {}), and the root is killed \
+                     regardless, so its other descendants may be orphaned",
+                    pids.join(", ")
+                )
+            }
         };
         Some(TreeLeft {
             text: format!("contained-tree teardown did not fully succeed: {left}{after}"),

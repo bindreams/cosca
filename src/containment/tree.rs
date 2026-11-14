@@ -229,6 +229,11 @@ impl Tree {
         }
     }
 
+    /// Whether the tree holds members ([`TreeKilled::holds_members`]).
+    pub(crate) fn holds_members(&self) -> bool {
+        self.killed.holds_members()
+    }
+
     /// Holds the members a `SIGTERM` walk reached ([`TreeKilled::hold`]) and returns `call`'s token if
     /// the listing is `complete`.
     pub(crate) fn hold_walked(&self, listing: Listing, call: Option<&WalkToken>) -> Option<WalkToken> {

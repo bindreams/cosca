@@ -550,8 +550,9 @@ impl Child {
     ///   backstop's failure and the walk's, the backstop first. A backstop that fails after a walk that
     ///   left nothing is a `MembersLeft` of the root alone. A walk that could not be made runs no
     ///   backstop, so the root has no `MemberNotKilled` peer: it is its [`Error::Unassessable`] (or
-    ///   `Unsupported`) alone, or, over a root the handle sees exited, a `MembersLeft` of the held
-    ///   members that survived their kill by identity, with the walk's error beside them.
+    ///   `Unsupported`) alone, or a `MembersLeft` of the held members an earlier kill refused that may
+    ///   still run (over a running root nothing is killed to find out), and, over a root the handle
+    ///   sees exited, of those that survived their kill by identity, with the walk's error beside them.
     /// - Any other mechanism keeps its own error and its variant, with the root's `MemberNotKilled` as
     ///   its peer, below it after its own cause. A kill that left nothing is an [`Error::Containment`]
     ///   over the root's `MemberNotKilled`.
@@ -561,7 +562,8 @@ impl Child {
     /// was killed, the root included, and a retry can work. The members the handle holds are the
     /// exception once the handle sees the root exited: no walk reaches anything then, so they are
     /// killed by identity in that call. While it sees the root running, or cannot say, they are kept
-    /// for the retry's walk from the root, which reaches them and what they forked since. (`Drop`
+    /// for the retry: its walk from the root reaches the ones still under it, and what they forked
+    /// since, and its settlement kills by identity the ones reparented meanwhile. (`Drop`
     /// cannot retry, so it kills the held members and the root, and warns that its other
     /// descendants may be orphaned.)
     /// A root whose exit is visible (reaped, a zombie, or no longer holding its pid) is
@@ -580,7 +582,8 @@ impl Child {
     /// drop, kills those whose identity was read again, and reports the others again. That holds
     /// whatever the later walk finds, a root that is gone included. A walk that cannot be made kills
     /// nothing of its own (the root stays for a retry's walk of what is still under it), and over a
-    /// root the handle sees running it keeps the members held (above). Once those
+    /// root the handle sees running it keeps the members held and still answers the ones an earlier
+    /// kill refused (above). Once those
     /// members are gone, a gone root is `Unassessable` on every later call, saying the members an earlier kill left are
     /// gone and the tree could not be walked: the tree cannot be vouched for again. A walk that left
     /// only the root is `Ok` once the handle backstop killed it, but the walk saw the root running
@@ -855,8 +858,12 @@ impl Child {
 
     /// What a walk that was not made leaves, by this handle's own look at the root (one look, no wait,
     /// no reap): the held members are kept while the root runs, and while the look cannot say, for a
-    /// walk from it; once it has exited no walk reaches anything, so they are killed in the call.
+    /// walk from it; once it has exited no walk reaches anything, so they are killed in the call. A tree
+    /// that holds none is settled the same either way, so the root is not looked at.
     fn keeping_over_unwalked(&self) -> Keeping {
+        if !self.tree.holds_members() {
+            return Keeping::ForWalkFromRunningRoot;
+        }
         match self
             .proc
             .exited_by(crate::wait::deadline_from(std::time::Duration::ZERO))

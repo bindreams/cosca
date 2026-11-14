@@ -1415,32 +1415,32 @@ fn a_gone_root_over_a_marked_tree_still_answers_a_held_member() {
     ));
 }
 
-/// A `Child`'s `kill_tree` whose walk was not made answers the walk's own `Unassessable`, does not kill
-/// the root through its handle (its own retry walks from it), and settles the tree all the same: the
-/// held member the root's exit reparented, which no walk reaches, is killed by identity and waited for.
-/// The fake mechanism kills nothing and states that it killed the member again, so the row reads the
-/// wait the sweep made of it; the kill itself is the settlement's
-/// (`a_settlement_of_a_walk_not_made_kills_the_held_members`).
-///
-/// The "exited" root is shown to the handle on Linux; on macOS the sweep reads a peek, and the fake
-/// answers `Running` there, so only the running root is covered.
+/// A `Child`'s `kill_tree` whose walk was not made answers the walk's own `Unassessable` and does not
+/// kill the root through its handle (its own retry walks from it). What it does with the held member
+/// follows the handle's own look at the root: a root it sees running, or cannot say has exited, keeps
+/// the member for the retry's walk (the call waits for nothing); a root it sees exited has no walk that
+/// reaches the member, so the call kills it by identity and waits for it. The fake mechanism kills
+/// nothing and states that it killed the member again, so the row reads the wait the sweep made of it;
+/// the kill itself is the settlement's (`a_settlement_of_a_walk_not_made_kills_the_held_members`). The
+/// fake's looks answer on every platform, the exited one included: the rule reads `exited_by`, not a
+/// peek.
 ///
 /// Mutants: the sweep runs the root's backstop over an unwalked walk; it answers that walk with another
-/// error; it leaves the held member unsettled, so nothing is waited for.
+/// error; it kills the held member whatever the look says, or never kills it; a look that fails is
+/// taken as an exit.
 #[cfg(unix)]
 #[skuld::test]
-fn a_child_kill_tree_over_an_unwalked_walk_settles_the_held_member_and_leaves_the_root_alone() {
+fn a_child_kill_tree_over_an_unwalked_walk_keeps_the_held_member_unless_its_root_looks_exited() {
     use crate::containment::fake::FakeContains;
     use crate::containment::treewalk::Listing;
     use crate::containment::Containment;
     use crate::error::Error;
     use crate::os_process::fake::Answer;
     use crate::test_child::over_fake::{child_with, live_member, root_looking};
-    // What the sweep waits for: nothing over a running root (the members are kept for a walk from it),
-    // the held member over an exited one (no walk reaches it).
+    // What the sweep waits for: the held member only over an exited root.
     let looks = [
         ("running", Answer::Running, false),
-        #[cfg(not(target_os = "macos"))]
+        ("unknown", Answer::Err(std::io::ErrorKind::PermissionDenied), false),
         ("exited", Answer::Exited, true),
     ];
     for (root_looks, looks, killed_in_call) in looks {
@@ -1478,6 +1478,34 @@ fn a_child_kill_tree_over_an_unwalked_walk_settles_the_held_member_and_leaves_th
         drop((swept, stdin));
         member.wait().expect("reap the member");
     }
+}
+
+/// A `Child` whose tree holds no member has nothing to keep or kill over a walk not made, so its
+/// `kill_tree` answers the walk's error without a look at the root. The fake root has no look scripted,
+/// and a look past them panics.
+///
+/// Mutant: the sweep looks at the root whatever the tree holds.
+#[cfg(unix)]
+#[skuld::test]
+fn a_child_kill_tree_over_an_unwalked_walk_looks_at_no_root_when_the_tree_holds_nothing() {
+    use crate::containment::fake::FakeContains;
+    use crate::containment::Containment;
+    use crate::error::Error;
+    use crate::test_child::over_fake::{child_with, root_looking};
+    let (fake, _) = FakeContains::new(Containment::TreeWalk, false);
+    let root = root_looking([]);
+    let child = child_with(&root, fake.unwalked());
+
+    let swept = child.kill_tree_after("kill_tree", None, None);
+
+    let failure = swept.answer.as_ref().expect_err("the walk was not made");
+    assert!(
+        matches!(failure.error, Error::Unassessable { .. }),
+        "{:?}",
+        failure.error
+    );
+    assert_eq!(root.looks(), 0, "no look at the root");
+    assert!(root.signal_calls().is_empty(), "the root is not killed");
 }
 
 /// A member whose identity was read and whose kill was refused is killed by identity again by the
@@ -1650,6 +1678,104 @@ fn a_settlement_of_a_walk_not_made_kills_the_held_members() {
         crate::test_child::assert_killed("the termed member", termed.wait().expect("reap the member"));
         crate::test_child::assert_killed("the refused member", refused.wait().expect("reap the member"));
     }
+}
+
+/// The drop's warn over a walk not made claims a kill by identity only when the handle held members,
+/// and names the ones the settlement killed; the root is killed regardless, and the warn says so either
+/// way.
+///
+/// Mutants: the warn claims kills over a tree that held nothing; it names no pid.
+#[skuld::test]
+fn a_drop_over_a_walk_not_made_claims_only_the_kills_the_settlement_made() {
+    use super::TreeKilled;
+    let none_held = TreeKilled::default()
+        .settle_for_drop(Some(&walker()), unwalked(), true)
+        .expect("a walk not made is warned of")
+        .text;
+    assert!(none_held.contains("the snapshot failed"), "{none_held}");
+    assert!(none_held.contains("may be orphaned"), "{none_held}");
+    assert!(!none_held.contains("killed by identity"), "{none_held}");
+
+    let (held, held_stdin) = crate::test_child::held_uncontained_blocker(false);
+    let held_id = held.id().expect(crate::test_child::IDENTITY_READ);
+    let killed = TreeKilled::default();
+    killed.hold(vec![held_id], true, None);
+    let warn = killed
+        .settle_for_drop(Some(&walker()), unwalked(), true)
+        .expect("a walk not made is warned of")
+        .text;
+    assert!(
+        warn.contains(&format!("killed by identity (pid {})", held_id.pid())),
+        "{warn}"
+    );
+    assert!(warn.contains("may be orphaned"), "{warn}");
+    drop(held_stdin);
+    crate::test_child::assert_killed("the held member", held.wait().expect("reap the member"));
+}
+
+/// A settlement of a walk not made that a `Child` keeps for a walk from its running root kills
+/// nothing, and still answers every member an earlier kill could not kill beside the walk's own
+/// `Unassessable`: the one whose identity was read and that still runs, and the one never read. A
+/// refused member that is gone is not named, and a member only a `SIGTERM` walk reached was refused by
+/// nothing. The state is left as it was.
+///
+/// Mutants: the answer is the walk's error alone; a refused member that is gone is named; a `Termed`
+/// one is named; a member is killed.
+#[skuld::test]
+fn a_kept_settlement_of_a_walk_not_made_names_the_members_an_earlier_kill_refused() {
+    use super::{Keeping, TreeKillOutcome, TreeKilled, Unkilled};
+    use crate::error::Error;
+    let alive_member = || {
+        let (member, stdin) = crate::test_child::held_uncontained_blocker(false);
+        let id = member.id().expect(crate::test_child::IDENTITY_READ);
+        (member, stdin, id)
+    };
+    let (refused, refused_stdin, refused_id) = alive_member();
+    let (termed, termed_stdin, termed_id) = alive_member();
+    let (gone, gone_stdin, gone_id) = alive_member();
+    let never_read = u32::MAX - 1;
+    let killed = TreeKilled::default();
+    killed
+        .settle(
+            Some(&walker()),
+            TreeKillOutcome::Ran(Err(Unkilled {
+                members: vec![
+                    member_left(refused_id.pid()),
+                    member_left(never_read),
+                    member_left(gone_id.pid()),
+                ],
+                root: None,
+                resolved: vec![refused_id, gone_id],
+            })),
+            false,
+        )
+        .answer
+        .expect_err("the members were left");
+    killed.hold(vec![termed_id], true, None);
+    drop(gone_stdin);
+    gone.wait().expect("the member exits on its own and is reaped");
+    let held = standing(&killed);
+
+    let settled = killed.settle_for_kill_tree(Some(&walker()), unwalked(), false, Keeping::ForWalkFromRunningRoot);
+
+    let error = settled.answer.expect_err("a walk not made");
+    assert_eq!(
+        members_of(&error).iter().map(|(pid, _)| *pid).collect::<Vec<_>>(),
+        [refused_id.pid(), never_read],
+        "{error}"
+    );
+    assert!(
+        matches!(unwalked_of(&error), Some(Error::Unassessable { detail, .. }) if detail == "the snapshot failed"),
+        "{error:?}"
+    );
+    assert_eq!(settled.killed_again, vec![], "nothing is killed");
+    for id in [refused_id, termed_id] {
+        assert_eq!(id.is_alive(), crate::identity::Liveness::Alive, "{id:?} is not killed");
+    }
+    assert_eq!(standing(&killed), held, "the state is kept for the retry");
+    drop((refused_stdin, termed_stdin));
+    refused.wait().expect("reap the member");
+    termed.wait().expect("reap the member");
 }
 
 /// A call whose own complete `SIGTERM` walk reached the held members stands on it when the root has

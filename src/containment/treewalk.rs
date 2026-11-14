@@ -873,6 +873,33 @@ pub(crate) fn with_earlier(
     (Err(walked), killed)
 }
 
+/// What a call that kills nothing still owes of `held`: each member an earlier kill refused and that
+/// may still run, as that kill's [`Error::MemberNotKilled`] (a member never read as it was reported; a
+/// member whose identity was read, and that is not gone, with a source that says this call did not try
+/// again). A member a `SIGTERM` walk reached was refused by nothing, so it is not owed.
+pub(crate) fn refused_still(kernel: &dyn Kernel, held: &[Left]) -> Vec<Error> {
+    held.iter()
+        .filter_map(|left| match left {
+            Left::Resolved(id) => (id.is_alive_with(kernel) != crate::identity::Liveness::Dead).then(|| {
+                not_killed(
+                    id.pid(),
+                    Error::Unassessable {
+                        detail: "an earlier kill could not kill it, and this call, which could not walk the tree, \
+                                 did not try again"
+                            .into(),
+                        source: None,
+                    },
+                )
+            }),
+            Left::Unread { pid, source } => Some(Error::MemberNotKilled {
+                pid: *pid,
+                source: Arc::clone(source),
+            }),
+            Left::Termed { .. } => None,
+        })
+        .collect()
+}
+
 /// The error for the member `pid` a walk left behind, `source` why.
 fn not_killed(pid: RawPid, source: Error) -> Error {
     Error::MemberNotKilled {
