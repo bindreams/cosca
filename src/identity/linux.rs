@@ -3,8 +3,11 @@
 //! gives a proven key. Reading the pidfd the caller holds gives a key that the caller's later peek
 //! through that pidfd checks. `is_running` polls the pidfd, or reads the process state before 6.9;
 //! `created_at` reads the `starttime` (bracketed for a pidfs id) and uses `/proc/stat` `btime` and
-//! `_SC_CLK_TCK`.
+//! `_SC_CLK_TCK`. [`exit`] reads whether a process's exit has begun, from the `PF_EXITING` flag of
+//! every thread's `stat`.
 
+#[path = "linux/exit.rs"]
+pub(crate) mod exit;
 #[path = "linux/kernel.rs"]
 pub(crate) mod kernel;
 #[path = "linux/pid_file.rs"]

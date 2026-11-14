@@ -7,6 +7,7 @@
 //! is not there for us" skip; every other one fails the scan, as `Unsupported` when it is a
 //! [`Refusal`].
 
+use std::borrow::Cow;
 use std::io;
 use std::sync::Arc;
 
@@ -15,10 +16,11 @@ use super::proc_read::{read_own, OwnUnreadable, ProcDir, ReadFailure};
 use super::refusal::Refusal;
 use crate::error::io_context;
 
-/// What reading one pid's file yielded.
+/// What reading one pid's file yielded: its bytes, or for a listing of the pid's threads
+/// ([`read_tasks`]) the thread ids.
 #[derive(Debug)]
-pub(crate) enum ReadOutcome {
-    Read(Vec<u8>),
+pub(crate) enum ReadOutcome<T = Vec<u8>> {
+    Read(T),
     /// The pid exited: `ESRCH`, of the open, of a file's `read(2)` or of a link's `readlinkat`; or, of
     /// a link's `readlinkat`, `ENOENT` (the task has no namespace left). The error is why.
     Exited(io::Error),
@@ -39,8 +41,8 @@ pub(crate) enum ReadOutcome {
 #[derive(Debug)]
 pub(crate) struct Unreadable {
     pid: u32,
-    /// The file of the pid that was read: `stat`, `cgroup`, or the link `ns/pid`.
-    file: &'static str,
+    /// The file of the pid that was read: `stat`, `cgroup`, the link `ns/pid`, or a thread's, `task/<tid>/stat`.
+    file: Cow<'static, str>,
     kind: Kind,
     cause: io::Error,
     /// The other read that failed with it, when there is one ([`Kind::RecheckFailed`]): the pid's
@@ -130,10 +132,34 @@ pub(crate) fn read(
         kernel,
         dir,
         pid,
-        file,
+        file.into(),
         Entry::File,
         kernel.read(dir, &format!("{pid}/{file}")),
     )
+}
+
+/// [`read`] of the `stat` of the thread `tid` of `pid`: `<pid>/task/<tid>/stat`. A thread that exited
+/// is [`ReadOutcome::Hidden`] (`ENOENT`) or [`ReadOutcome::Exited`] (`ESRCH`), as a pid does.
+pub(crate) fn read_task_stat(
+    kernel: &dyn Kernel,
+    dir: &ProcDir,
+    pid: u32,
+    tid: u32,
+) -> Result<ReadOutcome, Unreadable> {
+    classify(
+        kernel,
+        dir,
+        pid,
+        format!("task/{tid}/stat").into(),
+        Entry::File,
+        kernel.read(dir, &format!("{pid}/task/{tid}/stat")),
+    )
+}
+
+/// [`read`] of the directory `<pid>/task`: the ids of the threads listed, [`ReadOutcome::Read`] of them.
+/// Each call lists afresh.
+pub(crate) fn read_tasks(kernel: &dyn Kernel, dir: &ProcDir, pid: u32) -> Result<ReadOutcome<Vec<u32>>, Unreadable> {
+    classify(kernel, dir, pid, "task".into(), Entry::File, kernel.tids(dir, pid))
 }
 
 /// [`read`] of the symlink `<pid>/<file>` (`ns/pid`): its target is the [`ReadOutcome::Read`] bytes.
@@ -148,7 +174,7 @@ pub(crate) fn read_link(
         kernel,
         dir,
         pid,
-        file,
+        file.into(),
         Entry::Link,
         kernel.read_link(dir, &format!("{pid}/{file}")),
     )
@@ -163,16 +189,16 @@ enum Entry {
 
 /// The one rule of a pid's `file`, a file or a link as `entry` says, applied to `read`, the result of
 /// reading it through `kernel` and `dir`: what the read yielded.
-fn classify(
+fn classify<T>(
     kernel: &dyn Kernel,
     dir: &ProcDir,
     pid: u32,
-    file: &'static str,
+    file: Cow<'static, str>,
     entry: Entry,
-    read: Result<Vec<u8>, ReadFailure>,
-) -> Result<ReadOutcome, Unreadable> {
+    read: Result<T, ReadFailure>,
+) -> Result<ReadOutcome<T>, Unreadable> {
     let source = match read {
-        Ok(bytes) => return Ok(ReadOutcome::Read(bytes)),
+        Ok(read) => return Ok(ReadOutcome::Read(read)),
         Err(ReadFailure::Open(source)) => source,
         // The entry opened, so no `openat2` errno is in play; only the read step's own say anything
         // about the pid.

@@ -1121,6 +1121,10 @@ impl Kernel for ChildExitsAfterCgroupRead {
         HostKernel.pids(dir)
     }
 
+    fn tids(&self, dir: &ProcDir, pid: u32) -> Result<Vec<u32>, ReadFailure> {
+        HostKernel.tids(dir, pid)
+    }
+
     fn signal_probe(&self, target: rustix::process::Pid) -> Result<(), rustix::io::Errno> {
         HostKernel.signal_probe(target)
     }

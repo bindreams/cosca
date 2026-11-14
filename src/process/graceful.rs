@@ -126,8 +126,9 @@ impl Process {
     /// The walk's kills, the answer they come to, and the wait for what they reached: the members, and
     /// the root through this handle once its kill landed.
     ///
-    /// A root whose exit is visible, reaped or not, whose walk finds no member answers
-    /// [`Error::Unassessable`]. `call`: a graceful call's settlement, which settles the walk as a
+    /// A root whose exit has begun, reaped or not, whose walk finds no member answers
+    /// [`Error::Unassessable`], and so does one whose walk finds members: they are killed, and the
+    /// exit may have moved other children out of its reach. `call`: a graceful call's settlement, which settles the walk as a
     /// `Child`'s tree does ([`TreeKilled::settle`](crate::containment::dispatch::TreeKilled::settle)).
     fn sweep<'a>(
         &'a self,

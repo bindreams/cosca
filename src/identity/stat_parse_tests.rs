@@ -1,5 +1,6 @@
 use super::{
-    parse_num_threads, parse_pgrp, parse_ppid, parse_starttime_jiffies, parse_state, running_from_stat, stat_fixture,
+    exiting_from_stat, parse_flags, parse_num_threads, parse_pgrp, parse_ppid, parse_starttime_jiffies, parse_state,
+    running_from_stat, stat_fixture, PF_EXITING,
 };
 use crate::identity::Liveness;
 
@@ -63,6 +64,49 @@ fn parse_pgrp_survives_a_hostile_comm() {
 fn parse_pgrp_rejects_a_truncated_record() {
     assert_eq!(parse_pgrp(b"1234 (sh) S 1"), None);
     assert_eq!(parse_pgrp(b"no parens here"), None);
+}
+
+/// Field 9 is the task's flags (index 6 of the tail). The values are the ones measured on Linux
+/// 6.12.113: a single-thread root before its exit `0x400140`, held inside it `0x40014c` (`PF_EXITING`
+/// and, with it, `0x8`).
+#[skuld::test]
+fn parse_flags_reads_field_nine() {
+    let before = b"1234 (sh) S 1 4321 4321 0 -1 4194624 100 0 0 0 1 2 3 4 20 0 1 0 987 0 0";
+    let held = b"1234 (sh) S 1 4321 4321 0 -1 4194636 100 0 0 0 1 2 3 4 20 0 1 0 987 0 0";
+    assert_eq!(parse_flags(before), Some(0x40_0140));
+    assert_eq!(parse_flags(held), Some(0x40_014c));
+}
+
+#[skuld::test]
+fn parse_flags_survives_a_hostile_comm() {
+    let stat = b"1234 (evil ) S 9 9 9 4) S 1 4321 4321 0 -1 4194636 100 0 0 0 1 2 3 4 20 0 1 0 987 0 0";
+    assert_eq!(parse_flags(stat), Some(0x40_014c));
+}
+
+#[skuld::test]
+fn parse_flags_rejects_a_record_without_a_flags_field() {
+    assert_eq!(parse_flags(b"1234 (sh) S 1 4321 4321 0 -1"), None);
+    assert_eq!(parse_flags(b"1234 (sh) S 1 4321 4321 0 -1 many"), None);
+    assert_eq!(parse_flags(b"no parens here"), None);
+}
+
+/// The exit sets `0x4` beside other bits, so the test is the bit, not equality: it holds for the
+/// value measured while held, for a zombie's (`0x40814c`), and not for a record before the exit.
+/// Mutant: `flags == PF_EXITING`.
+#[skuld::test]
+fn exiting_from_stat_tests_the_exit_bit() {
+    let with =
+        |flags: u32| format!("1234 (sh) S 1 4321 4321 0 -1 {flags} 100 0 0 0 1 2 3 4 20 0 1 0 987 0 0").into_bytes();
+    assert_eq!(PF_EXITING, 0x4);
+    assert_eq!(exiting_from_stat(&with(0x40_0140)), Some(false));
+    assert_eq!(exiting_from_stat(&with(0x40_014c)), Some(true));
+    assert_eq!(exiting_from_stat(&with(0x40_814c)), Some(true));
+    assert_eq!(
+        exiting_from_stat(&with(0x8)),
+        Some(false),
+        "0x8 alone is not the exit flag"
+    );
+    assert_eq!(exiting_from_stat(b"1234 (sh) S 1"), None);
 }
 
 #[skuld::test]

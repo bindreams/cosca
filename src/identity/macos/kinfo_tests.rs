@@ -334,3 +334,22 @@ fn p_flag_system_bit_matches_a_second_sysctl_query_and_libproc_disagrees_for_non
         "this test process must not be PROC_FLAG_SYSTEM-flagged via proc_pidinfo"
     );
 }
+
+// The exit-begun read is `P_WEXIT` or a zombie's state, and no other flag: this process shows neither.
+// Mutants: the zombie state is not read; any flag counts; `P_WEXIT` is masked with `P_SYSTEM`.
+#[skuld::test]
+fn exit_begun_is_p_wexit_or_a_zombie_and_no_other_flag() {
+    let running = libc::SRUN as libc::c_char;
+    let zombie = libc::SZOMB as libc::c_char;
+    assert!(!exit_begun(running, 0));
+    assert!(!exit_begun(running, P_SYSTEM));
+    assert!(exit_begun(running, P_WEXIT));
+    assert!(exit_begun(running, P_WEXIT | P_SYSTEM));
+    assert!(exit_begun(zombie, 0));
+
+    let me = kinfo(std::process::id()).found().expect("this process resolves");
+    assert!(
+        !exit_begun(me.kp_proc.p_stat, me.kp_proc.p_flag),
+        "this process is running"
+    );
+}

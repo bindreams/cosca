@@ -44,6 +44,10 @@ pub(crate) trait Kernel: Sync {
     /// or its listing failed.
     fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure>;
 
+    /// The thread ids of `pid`, the numeric entries of `<pid>/task` under `dir`: each call lists the
+    /// directory afresh. A failure says whether the `openat2` of the directory or its listing failed.
+    fn tids(&self, dir: &ProcDir, pid: u32) -> Result<Vec<u32>, ReadFailure>;
+
     /// `kill(target, 0)`. The caller decides what is a kill target (`probe::signal_target`); the
     /// kernel is asked only about one.
     fn signal_probe(&self, target: Pid) -> Result<(), Errno>;
@@ -78,6 +82,10 @@ impl Kernel for HostKernel {
 
     fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure> {
         dir.pids()
+    }
+
+    fn tids(&self, dir: &ProcDir, pid: u32) -> Result<Vec<u32>, ReadFailure> {
+        dir.tids(pid)
     }
 
     fn signal_probe(&self, target: Pid) -> Result<(), Errno> {

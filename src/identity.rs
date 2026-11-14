@@ -646,6 +646,32 @@ impl ProcessId {
         }
     }
 
+    /// Whether this process's exit has begun, as the kernel's own exit flag shows: `Found(true)` for a
+    /// process exiting, a zombie, or one whose threads all exit; `Found(false)` while a thread runs.
+    /// [`Resolved::Gone`] when the pid holds another process, or none, when the read is done (an exit
+    /// past its beginning, or a reuse); [`Resolved::Unknown`] when the OS refuses the query.
+    ///
+    /// The flag shows before the kernel reparents the process's children, so a walk of the tree from
+    /// this pid that is followed by a `Found(false)` read met no child the exit moved. Linux: every
+    /// thread of the group shows `PF_EXITING` (the leader alone does not tell: `pthread_exit` sets it
+    /// while the process runs), read through the checked `/proc`. macOS: `P_WEXIT` in `kinfo_proc`'s
+    /// `p_flag`. Measured on Linux 6.12.113 and on macOS 15.7.9, 15.8.2 and 26.7.2; the project's macOS
+    /// floor, 14.4, is not measurable on CI, and where its order differs the read does not see the
+    /// exit, which is the window a walk always had, never a false answer. Unlike
+    /// [`is_alive`](Self::is_alive), it answers `true` before the process is a zombie.
+    #[cfg(unix)]
+    pub(crate) fn exit_begun_with(&self, kernel: &dyn Kernel) -> (Resolved<bool>, UnknownCause) {
+        #[cfg(target_os = "linux")]
+        {
+            backend::exit::exit_begun(kernel, self.pid, self.key)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = kernel;
+            (backend::exit_begun(self.pid, self.key), UnknownCause::default())
+        }
+    }
+
     /// Best-effort wall-clock creation time. Lazy and allowed to drift (NTP);
     /// NEVER used for identity. `None` if the process is gone or unavailable. On Linux 6.9+ the
     /// time is read from `/proc` when asked, so a reaped process has none.
@@ -1084,6 +1110,10 @@ pub(crate) fn windows_identity_from_handle_result(
 #[cfg(test)]
 #[path = "identity_tests.rs"]
 mod identity_tests;
+
+#[cfg(all(test, unix))]
+#[path = "identity/exit_begun_tests.rs"]
+mod exit_begun_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "identity/leader_exit_tests.rs"]

@@ -147,9 +147,16 @@ pub(crate) const P_SYSTEM: libc::c_int = 0x00000200;
 
 /// `kinfo_proc`'s `p_flag` bit for a process that has begun to exit: `#define P_WEXIT
 /// 0x00002000` in the SDK's `usr/include/sys/proc.h`. XNU sets it from `P_LEXIT`, which is never
-/// cleared.
-#[cfg(test)]
+/// cleared. It shows before the process's children are reparented (CI probe, 2026-11-14: macOS 15.7.9,
+/// 15.8.2 and 26.7.2, on arm64 and x86_64), so a read that finds it clear met a process none of whose
+/// children its exit had moved.
 pub(crate) const P_WEXIT: libc::c_int = 0x0000_2000;
+
+/// Whether a process that `kinfo_proc` shows with `p_stat` and `p_flag` has begun to exit: `P_WEXIT`
+/// is set, or it is already a zombie (XNU sets `P_LEXIT` first, but the state is the stronger fact).
+pub(crate) fn exit_begun(p_stat: libc::c_char, p_flag: libc::c_int) -> bool {
+    p_stat as u32 == libc::SZOMB || p_flag & P_WEXIT != 0
+}
 
 /// Read one `kinfo_proc` for `pid`. `None` means "not resolvable" — the EXPECTED miss is
 /// a nonexistent pid (sysctl SUCCESS with `size == 0`); a real sysctl failure or a

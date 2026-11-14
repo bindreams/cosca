@@ -764,6 +764,18 @@ pub(super) fn is_running(pid: RawPid, start: Key) -> Liveness {
     }
 }
 
+/// [`ProcessId::exit_begun_with`](super::ProcessId::exit_begun_with) on macOS: `P_WEXIT` in the process's
+/// `kinfo_proc` (a zombie included), token-guarded as [`is_running`] is. A pid that holds another
+/// process, or none, is `Gone`.
+pub(super) fn exit_begun(pid: RawPid, start: Key) -> Resolved<bool> {
+    match kinfo::kinfo(pid) {
+        Resolved::Found(info) if token_of_kinfo(&info) != start => Resolved::Gone,
+        Resolved::Found(info) => Resolved::Found(kinfo::exit_begun(info.kp_proc.p_stat, info.kp_proc.p_flag)),
+        Resolved::Gone => Resolved::Gone,
+        Resolved::Unknown => Resolved::Unknown,
+    }
+}
+
 pub(super) fn created_at(start: Key) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::from_micros(start.raw()))
 }

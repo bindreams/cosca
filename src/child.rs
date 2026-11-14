@@ -566,11 +566,15 @@ impl Child {
     /// since, and its settlement kills by identity the ones reparented meanwhile. (`Drop`
     /// cannot retry, so it kills the held members and the root, and warns that its other
     /// descendants may be orphaned.)
-    /// A root whose exit is visible (reaped, a zombie, or no longer holding its pid) is
-    /// `Unassessable` too: its children were
-    /// reparented at its exit, so a walk from its pid finds none and `Ok` would say nothing of the
-    /// tree. Nothing is killed (a zombie root apart) and a retry cannot work. A zombie root whose walk
-    /// finds a member is walked as usual.
+    /// A root whose exit has begun, as the kernel's exit flag shows (Linux: every thread of it exits;
+    /// macOS: `P_WEXIT`), and so a root that is a zombie, reaped, or no longer holding its pid, is
+    /// `Unassessable` too: its children are reparented at its exit, so a walk from its pid finds none
+    /// or only some, and `Ok` would say nothing of the tree. A walk that finds no member kills nothing
+    /// (a zombie root apart) and a retry cannot work. One that finds members kills them, and is
+    /// `Unassessable` all the same: the exit may have moved other children out of its reach. The flag
+    /// is read after the walk and before the root is killed. macOS 14 cannot be measured and may not
+    /// show the exit: the root's children are then missed as those of any parent that exits during the
+    /// walk are.
     ///
     /// On the `TreeWalk` mechanism (on macOS, only where the ppid walk runs instead of the fd
     /// marker), a walk that killed what it could and left members running is an
