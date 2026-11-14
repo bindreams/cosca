@@ -52,13 +52,13 @@ impl OwnedChild {
     fn block<'a>(&'a self, lock: Guard<'a>, remaining: Option<Duration>) -> Guard<'a> {
         let Some(remaining) = remaining else {
             #[cfg(test)]
-            crate::wait::block_probe::record_condvar_block(None);
+            crate::wait::block_probe::blocking(None, crate::wait::block_probe::WaitObject::Condvar);
             return self.cv_wait(lock);
         };
         let armed = crate::wait::clamp_block(remaining);
         debug_assert!(armed <= remaining, "a block was armed longer than the time remaining");
         #[cfg(test)]
-        crate::wait::block_probe::record_condvar_block(Some(armed));
+        crate::wait::block_probe::blocking(Some(armed), crate::wait::block_probe::WaitObject::Condvar);
         #[cfg(test)]
         let started = Instant::now();
         let lock = self.cv_wait_timeout(lock, armed);

@@ -49,7 +49,7 @@ const MAX_POLL_BLOCK: Duration = Duration::from_millis(i32::MAX as u64);
 pub(crate) fn poll_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> std::io::Result<bool> {
     let Some(deadline) = deadline else {
         #[cfg(test)]
-        crate::wait::block_probe::record_blocking(None);
+        crate::wait::block_probe::blocking(None, crate::wait::block_probe::WaitObject::Fd(fd));
         let mut fds = [PollFd::new(&fd, PollFlags::IN)];
         crate::wait::poll_ready(&mut fds)?;
         return readable(fds[0].revents()).map(|()| true);
@@ -57,7 +57,7 @@ pub(crate) fn poll_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> st
     let seen = crate::wait::rearm_until(Some(deadline), |remaining| {
         let remaining = remaining.map(|d| d.min(MAX_POLL_BLOCK));
         #[cfg(test)]
-        crate::wait::block_probe::record_blocking(remaining);
+        crate::wait::block_probe::blocking(remaining, crate::wait::block_probe::WaitObject::Fd(fd));
         let ts = remaining.map(|d| Timespec {
             tv_sec: d.as_secs() as i64,
             tv_nsec: d.subsec_nanos() as _,

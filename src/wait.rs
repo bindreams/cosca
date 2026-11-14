@@ -557,148 +557,213 @@ fn win32_wait_clamp() -> u32 {
 
 /// Test-only, thread-local record of the timeout each block or recheck pause was armed with on this
 /// thread (`None` = unbounded): a `poll` round, a Win32 wait, a [`crate::os_process::drive`] pause,
-/// or an `OwnedChild`'s `Condvar` block.
+/// a cgroup drain's listener, or an `OwnedChild`'s `Condvar` block.
 /// A test proves a deadline wait armed nothing longer than the time remaining, and blocked at all,
 /// from the log.
+///
+/// A block calls [`blocking`] just before it blocks, naming what it blocks on; [`on_each_block`]
+/// hands a test that, so the test can look at what the wait is about to wait for.
 #[cfg(test)]
 pub(crate) mod block_probe {
-    #[cfg(target_os = "macos")]
-    use std::cell::Cell;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::marker::PhantomData;
     use std::time::Duration;
 
-    /// A hook that runs before each blocking round, with the round's index.
-    #[cfg(target_os = "macos")]
-    type RoundHook = Box<dyn FnMut(u32)>;
+    #[cfg(unix)]
+    use std::os::fd::BorrowedFd;
 
-    /// A one-shot hook slot ([`on_blocking`]'s, [`on_pause`]'s or [`on_condvar_block`]'s).
-    type Slot = RefCell<Option<Box<dyn FnOnce(Option<Duration>)>>>;
+    /// The hook [`on_each_block`] arms.
+    type Hook = Box<dyn FnMut(&Block<'_>)>;
+
+    /// One hook [`on_each_block`] armed. `hook` is out of the slot while it runs, so it may itself
+    /// arm or drop a hook, or block.
+    struct Armament {
+        id: u64,
+        /// The blocks this hook has seen.
+        blocks: u32,
+        hook: Option<Hook>,
+    }
 
     thread_local! {
         static ARMED: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
-        static ON_BLOCKING: Slot = const { RefCell::new(None) };
-        static ON_PAUSE: Slot = const { RefCell::new(None) };
-        static ON_CONDVAR_BLOCK: Slot = const { RefCell::new(None) };
-        #[cfg(target_os = "macos")]
-        static ROUND: Cell<u32> = const { Cell::new(0) };
-        #[cfg(target_os = "macos")]
-        static ON_ROUND: RefCell<Option<RoundHook>> = const { RefCell::new(None) };
-        /// Which arming owns `ON_ROUND`: every arm and every disarm moves it on.
-        #[cfg(target_os = "macos")]
-        static ROUND_OWNER: Cell<u64> = const { Cell::new(0) };
+        /// The hooks armed on this thread, in the order they were armed.
+        static ON_BLOCK: RefCell<Vec<Armament>> = const { RefCell::new(Vec::new()) };
+        static NEXT_ID: Cell<u64> = const { Cell::new(0) };
+        static ON_PAUSE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+    }
+
+    /// What one wait is about to block on.
+    #[allow(
+        dead_code,
+        reason = "`Fd` is read by `Block::ready`, which only tests call; `Listener` is built on Linux only"
+    )]
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum WaitObject<'a> {
+        /// A descriptor `poll` is about to wait on: a pidfd, a kqueue, a pipe.
+        #[cfg(unix)]
+        Fd(BorrowedFd<'a>),
+        /// A `WaitForSingleObject` or `WaitForMultipleObjects` call: the block names its kind only.
+        #[cfg(windows)]
+        Handles,
+        /// Keeps `'a` used on Windows, where there is no `Fd`. Never built.
+        #[cfg(windows)]
+        Unbuilt(std::convert::Infallible, std::marker::PhantomData<&'a ()>),
+        /// The cgroup pump's broadcast: nothing to look at.
+        Listener,
+        /// Another waiter's reap: nothing to look at.
+        Condvar,
+    }
+
+    /// One block, as the hook of [`on_each_block`] sees it.
+    #[allow(dead_code, reason = "`n` is read only by tests")]
+    #[derive(Debug)]
+    pub(crate) struct Block<'a> {
+        /// 1 for the first block this hook sees after it was armed.
+        pub(crate) n: u32,
+        /// What the call is armed for; `None` is unbounded.
+        pub(crate) armed: Option<Duration>,
+        pub(crate) on: WaitObject<'a>,
+    }
+
+    impl Block<'_> {
+        /// Whether the awaited event is already there (a zero-timeout `poll`); `None` when the block
+        /// lends no descriptor.
+        #[allow(dead_code, reason = "called only by tests")]
+        pub(crate) fn ready(&self) -> Option<bool> {
+            match &self.on {
+                #[cfg(unix)]
+                WaitObject::Fd(fd) => Some(
+                    crate::os_process::poll::look_readable(*fd)
+                        .expect("a zero-timeout look at the awaited descriptor: a broken one is no event"),
+                ),
+                _ => None,
+            }
+        }
     }
 
     fn record(armed: Option<Duration>) {
         ARMED.with(|a| a.borrow_mut().push(armed));
     }
 
-    /// [`record`], for a thread about to make a blocking OS call on a descriptor or handle (`poll`,
-    /// `WaitForSingleObject`), and run the hook [`on_blocking`] armed.
-    pub(crate) fn record_blocking(armed: Option<Duration>) {
+    /// The one call a block site makes, just before the blocking call: records what the block is
+    /// armed for (`None`: no timeout) and runs the hooks [`on_each_block`] armed. Every lock the
+    /// wait took is released, except a `Condvar` block's: it holds the child's lock.
+    pub(crate) fn blocking(armed: Option<Duration>, on: WaitObject<'_>) {
         record(armed);
-        fire(&ON_BLOCKING, armed);
-        #[cfg(target_os = "macos")]
-        fire_round();
+        // The hooks armed now, in arming order: one armed by a hook first sees the next block, and
+        // one a hook disarmed does not run.
+        let ids: Vec<u64> = ON_BLOCK.with(|hooks| hooks.borrow().iter().map(|a| a.id).collect());
+        for id in ids {
+            let taken = ON_BLOCK.with(|hooks| {
+                let mut hooks = hooks.borrow_mut();
+                let armament = hooks.iter_mut().find(|a| a.id == id)?;
+                let hook = armament.hook.take()?;
+                armament.blocks += 1;
+                Some((armament.blocks, hook))
+            });
+            let Some((n, hook)) = taken else { continue };
+            let mut running = Running { id, hook: Some(hook) };
+            if let Some(hook) = running.hook.as_mut() {
+                hook(&Block { n, armed, on });
+            }
+        }
     }
 
-    /// Record a recheck pause of `d` and run the armed [`on_pause`] hook. Unlike a block, it fires
-    /// no round.
+    /// A hook while it runs, out of its slot. Dropping it, also when the hook panicked, puts it
+    /// back, so a hook that panicked once still runs at the next block.
+    struct Running {
+        id: u64,
+        hook: Option<Hook>,
+    }
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let hook = self.hook.take();
+            // Unless its guard dropped while it ran: then it drops here, outside the borrow, since
+            // it may hold another guard.
+            let unplaced = ON_BLOCK.with(|hooks| match hooks.borrow_mut().iter_mut().find(|a| a.id == self.id) {
+                Some(armament) => {
+                    armament.hook = hook;
+                    None
+                }
+                None => hook,
+            });
+            drop(unplaced);
+        }
+    }
+
+    /// Record a recheck pause of `d` and run the armed [`on_pause`] hook. Unlike a block, it is no
+    /// [`Block`]: a backoff sleep waits on no object.
     pub(crate) fn record_pause(d: Duration) {
         record(Some(d));
-        fire(&ON_PAUSE, Some(d));
+        crate::oneshot_hook::fire(&ON_PAUSE);
     }
 
-    /// Record a `Condvar` block `armed` for (`None`: no timeout) and run the [`on_condvar_block`]
-    /// hook. Fires no macOS round.
-    pub(crate) fn record_condvar_block(armed: Option<Duration>) {
-        record(armed);
-        fire(&ON_CONDVAR_BLOCK, armed);
-    }
-
-    /// Run the hook armed in `slot` with `armed`, taken out first, so the hook may arm the slot
-    /// again.
-    fn fire(slot: &'static std::thread::LocalKey<Slot>, armed: Option<Duration>) {
-        if let Some(hook) = slot.with(|h| h.borrow_mut().take()) {
-            hook(armed);
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn fire_round() {
-        let round = ROUND.with(|r| r.replace(r.get() + 1));
-        // Out of its slot for the call, so the hook may itself arm or drop rounds; it goes back
-        // only if neither happened.
-        if let Some(mut hook) = ON_ROUND.with(|h| h.borrow_mut().take()) {
-            let owner = ROUND_OWNER.with(Cell::get);
-            hook(round);
-            if ROUND_OWNER.with(Cell::get) == owner {
-                ON_ROUND.with(|h| *h.borrow_mut() = Some(hook));
-            }
-        }
-    }
-
-    /// Disarms an [`on_every_round`] hook on drop.
-    #[cfg(target_os = "macos")]
+    /// Disarms the hook of [`on_each_block`], [`on_blocking`], [`on_condvar_block`] or [`on_pause`] on
+    /// drop, and only that one. Not `Send`: the hooks are this thread's.
     #[must_use = "dropping this immediately disarms the hook; bind it for the probe's duration"]
-    pub(crate) struct Rounds(u64);
+    pub(crate) struct Armed(Disarm, PhantomData<*const ()>);
 
-    #[cfg(target_os = "macos")]
-    impl Drop for Rounds {
-        /// Disarms only the arming this guard came from: a guard that a later arm replaced does
-        /// nothing.
-        fn drop(&mut self) {
-            if ROUND_OWNER.with(Cell::get) == self.0 {
-                ON_ROUND.with(|h| *h.borrow_mut() = None);
-                ROUND_OWNER.with(|o| o.set(self.0 + 1));
-            }
-        }
+    enum Disarm {
+        Pause {
+            _hook: crate::oneshot_hook::Armed,
+        },
+        /// The [`Armament`] with this id.
+        Block(u64),
     }
-
-    /// Run `hook` with the round's index on this thread just before every blocking `poll`, counted
-    /// from 0 at this call: the wait's own look has just returned what to block on, and every lock
-    /// is released.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn on_every_round(hook: impl FnMut(u32) + 'static) -> Rounds {
-        ROUND.with(|r| r.set(0));
-        let owner = ROUND_OWNER.with(|o| o.replace(o.get() + 1)) + 1;
-        ON_ROUND.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-        Rounds(owner)
-    }
-
-    /// Run `hook` on this thread just before blocking round `round` (see [`on_every_round`]).
-    #[cfg(target_os = "macos")]
-    pub(crate) fn on_round(round: u32, hook: impl FnOnce() + 'static) -> Rounds {
-        let mut hook = Some(hook);
-        on_every_round(move |at| {
-            if at == round {
-                hook.take().expect("a round comes once")();
-            }
-        })
-    }
-
-    /// Disarms an unfired [`on_blocking`], [`on_pause`] or [`on_condvar_block`] hook on drop.
-    #[must_use = "dropping this immediately disarms the hook; bind it for the probe's duration"]
-    pub(crate) struct Armed(&'static std::thread::LocalKey<Slot>);
 
     impl Drop for Armed {
         fn drop(&mut self) {
-            self.0.with(|h| *h.borrow_mut() = None);
+            if let Disarm::Block(id) = self.0 {
+                // The armament drops after the borrow ends: its hook may hold another guard.
+                let removed = ON_BLOCK.with(|hooks| {
+                    let mut hooks = hooks.borrow_mut();
+                    let at = hooks.iter().position(|a| a.id == id)?;
+                    Some(hooks.remove(at))
+                });
+                drop(removed);
+            }
         }
     }
 
-    /// Run `hook` on this thread just before its next blocking `poll` or `WaitForSingleObject`: the
-    /// thread has released every lock it took for the wait it is about to make.
+    /// Run `hook` on this thread at every [`blocking`] call until the guard drops, numbering them
+    /// from 1 at this call. Any number of hooks may be armed at once: each runs at every block, in
+    /// the order they were armed, and counts the blocks it sees from its own arming. One armed by
+    /// a running hook is kept, and first sees the next block. A block made while a hook runs is
+    /// not one that hook sees.
+    ///
+    /// A hook run at a `Condvar` block holds the child's lock: it must not take it.
+    pub(crate) fn on_each_block(hook: impl FnMut(&Block<'_>) + 'static) -> Armed {
+        let id = NEXT_ID.with(|next| next.replace(next.get() + 1));
+        ON_BLOCK.with(|hooks| {
+            hooks.borrow_mut().push(Armament {
+                id,
+                blocks: 0,
+                hook: Some(Box::new(hook)),
+            })
+        });
+        Armed(Disarm::Block(id), PhantomData)
+    }
+
+    /// Run `hook` once, at this thread's next block that is not a `Condvar`'s: the thread has
+    /// released every lock it took for the wait it is about to make.
     pub(crate) fn on_blocking(hook: impl FnOnce() + 'static) -> Armed {
-        ON_BLOCKING.with(|h| *h.borrow_mut() = Some(Box::new(move |_| hook())));
-        Armed(&ON_BLOCKING)
+        let mut hook = Some(hook);
+        on_each_block(move |block| {
+            if !matches!(block.on, WaitObject::Condvar) {
+                if let Some(hook) = hook.take() {
+                    hook();
+                }
+            }
+        })
     }
 
     /// Run `hook` on this thread just before its next recheck pause sleeps. A hook that takes the
     /// `Waitable`'s lock proves the `Step::Recheck` contract (the lock is released before the
     /// pause); the hook firing alone does not.
     pub(crate) fn on_pause(hook: impl FnOnce() + 'static) -> Armed {
-        ON_PAUSE.with(|h| *h.borrow_mut() = Some(Box::new(move |_| hook())));
-        Armed(&ON_PAUSE)
+        let _hook = crate::oneshot_hook::arm(&ON_PAUSE, hook);
+        Armed(Disarm::Pause { _hook }, PhantomData)
     }
 
     /// Run `hook`, under the `OwnedChild`'s lock, just before this thread's next block on that
@@ -710,8 +775,14 @@ pub(crate) mod block_probe {
 
     /// [`on_condvar_block`], with the armed timeout (`None`: no timeout).
     pub(crate) fn on_condvar_block_with(hook: impl FnOnce(Option<Duration>) + 'static) -> Armed {
-        ON_CONDVAR_BLOCK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-        Armed(&ON_CONDVAR_BLOCK)
+        let mut hook = Some(hook);
+        on_each_block(move |block| {
+            if matches!(block.on, WaitObject::Condvar) {
+                if let Some(hook) = hook.take() {
+                    hook(block.armed);
+                }
+            }
+        })
     }
 
     /// Every timeout armed on this thread since the last call, in order.
