@@ -262,7 +262,7 @@ pub(crate) fn assert_holders_only(err: &Error, op: &str, state: Untrusted) {
     match err {
         Error::Unassessable { detail, source } => {
             assert!(
-                detail.contains(state.why()) && detail.contains(&format!("{op} signalled only the marker holders")),
+                detail.contains(state.why()) && detail.contains(&format!("{op} signalled the marker holders")),
                 "{state:?}: {detail}"
             );
             state.cause().assert(source);
