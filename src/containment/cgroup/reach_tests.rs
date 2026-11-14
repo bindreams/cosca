@@ -1052,6 +1052,10 @@ impl Kernel for ChildExitsAfterCgroupRead {
         read
     }
 
+    fn read_link(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure> {
+        HostKernel.read_link(dir, path)
+    }
+
     fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure> {
         HostKernel.pids(dir)
     }
@@ -1384,9 +1388,6 @@ fn a_probe_child_whose_fd_directory_open_fails_is_reported_with_its_errno_and_it
     );
 }
 
-/// The errnos by which `openat2` is refused (see `identity::Refusal`).
-const REFUSALS: [i32; 3] = [libc::ENOSYS, libc::EPERM, libc::ENODEV];
-
 /// `err` is the spawn's refusal for an `openat2` that answered `errno`: `Unsupported` naming the
 /// requirement, not `hidepid`, with `errno` as its source.
 fn assert_refused_openat2(err: &crate::error::Error, errno: i32) {
@@ -1405,11 +1406,9 @@ fn assert_refused_openat2(err: &crate::error::Error, errno: i32) {
 #[skuld::test]
 fn a_probe_childs_refused_openat2_refuses_the_spawn_naming_it() {
     let _missing = fault::miss_pidfd_info();
-    for errno in REFUSALS {
-        let _no_dir = fault::fail_probe_fd_dir(errno);
-        let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe's child cannot set up");
-        assert_refused_openat2(&err, errno);
-    }
+    let _no_dir = fault::fail_probe_fd_dir(libc::EPERM);
+    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe's child cannot set up");
+    assert_refused_openat2(&err, libc::EPERM);
 }
 
 /// A refused read of the probe child's `<pid>/cgroup` refuses the spawn as `Unsupported` naming

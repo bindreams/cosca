@@ -36,6 +36,10 @@ pub(crate) trait Kernel: Sync {
     /// or `thread-self/fdinfo/<fd>`. A failure says whether the `openat2` or `read(2)` failed.
     fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure>;
 
+    /// The target of the symlink at `path` under `dir`: `thread-self/ns/pid` or `<pid>/ns/pid`. A
+    /// failure says whether the `openat2` or the `readlinkat` failed.
+    fn read_link(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure>;
+
     /// The numeric entries of `dir` (`ProcDir::pids`). A failure says whether the `openat2` of `dir`
     /// or its listing failed.
     fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure>;
@@ -66,6 +70,10 @@ impl Kernel for HostKernel {
 
     fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure> {
         dir.read(path)
+    }
+
+    fn read_link(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure> {
+        dir.read_link(path)
     }
 
     fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure> {

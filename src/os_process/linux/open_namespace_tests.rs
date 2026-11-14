@@ -205,6 +205,10 @@ impl Kernel for PauseKernel<'_> {
         self.inner.read(dir, path)
     }
 
+    fn read_link(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure> {
+        self.inner.read_link(dir, path)
+    }
+
     fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure> {
         self.inner.pids(dir)
     }

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use rustix::io::Errno;
 
 use super::kernel::Kernel;
-use super::proc_view::{ProcDir, ReadFailure};
+use super::proc_view::{read_own, OwnUnreadable, ProcDir, ReadFailure};
 use super::prove::{FailedCall, Refusal};
 
 /// What reading one pid's file yielded.
@@ -127,7 +127,27 @@ pub(crate) fn read(
     pid: u32,
     file: &'static str,
 ) -> Result<ReadOutcome, Unreadable> {
-    match kernel.read(dir, &format!("{pid}/{file}")) {
+    outcome(kernel, dir, pid, file, kernel.read(dir, &format!("{pid}/{file}")))
+}
+
+/// [`read`] of the symlink `<pid>/<file>` (`ns/pid`): its target is the [`ReadOutcome::Read`] bytes.
+pub(crate) fn read_link(
+    kernel: &dyn Kernel,
+    dir: &ProcDir,
+    pid: u32,
+    file: &'static str,
+) -> Result<ReadOutcome, Unreadable> {
+    outcome(kernel, dir, pid, file, kernel.read_link(dir, &format!("{pid}/{file}")))
+}
+
+fn outcome(
+    kernel: &dyn Kernel,
+    dir: &ProcDir,
+    pid: u32,
+    file: &'static str,
+    read: Result<Vec<u8>, ReadFailure>,
+) -> Result<ReadOutcome, Unreadable> {
+    match read {
         Ok(bytes) => Ok(ReadOutcome::Read(bytes)),
         Err(failure) => failed_read(kernel, dir, pid, file, failure),
     }
@@ -161,21 +181,19 @@ fn failed_read(
         Some(libc::ESRCH) => return Ok(ReadOutcome::Exited(source)),
         Some(libc::ENOENT | libc::EACCES) => return Ok(ReadOutcome::Hidden(source)),
         // `hidepid`'s answer only if the checked directory still reads.
-        Some(libc::EPERM) => match kernel.read(dir, "self/stat") {
+        Some(libc::EPERM) => match read_own(kernel, dir, "self/stat") {
             Ok(_) => return Ok(ReadOutcome::Hidden(source)),
-            Err(recheck) => match open_refusal(&recheck) {
-                Some(refusal) => {
-                    let pid_failure = Unreadable {
-                        pid,
-                        file,
-                        kind: Kind::BesideRefusal,
-                        cause: source,
-                        peer: None,
-                    };
-                    return Ok(ReadOutcome::Refused(refusal.beside(Arc::new(pid_failure.into_cause()))));
-                }
-                None => (Kind::RecheckFailed, recheck.into_io(), Some(source)),
-            },
+            Err(OwnUnreadable::Refused(refusal)) => {
+                let pid_failure = Unreadable {
+                    pid,
+                    file,
+                    kind: Kind::BesideRefusal,
+                    cause: source,
+                    peer: None,
+                };
+                return Ok(ReadOutcome::Refused(refusal.beside(Arc::new(pid_failure.into_cause()))));
+            }
+            Err(OwnUnreadable::Failed(recheck)) => (Kind::RecheckFailed, recheck, Some(source)),
         },
         Some(libc::EXDEV | libc::ELOOP) => (Kind::BeyondMount, source, None),
         _ => {

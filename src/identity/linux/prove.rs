@@ -121,7 +121,7 @@ impl FailedCall {
 /// `/proc` listing and each pid's `stat`. That `stat` answering `EPERM` is `hidepid`'s answer, and a
 /// refusal only if the checked directory refuses `self/stat` too: the re-check's errno is then the
 /// refusal, and the pid's failure is kept beside it. Every other errno is the call's own failure.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Refusal {
     call: FailedCall,
     requirement: String,
@@ -141,10 +141,15 @@ impl Refusal {
         &self.requirement
     }
 
+    /// The refusing errno as an error.
+    pub(crate) fn os_error(&self) -> std::io::Error {
+        std::io::Error::from(self.call.errno())
+    }
+
     /// The failures behind the refusal: the refusing errno, then the other failure, as an
     /// [`Error::Several`] when there is one.
     pub(crate) fn cause(&self) -> Error {
-        let own = std::io::Error::from(self.call.errno());
+        let own = self.os_error();
         match &self.beside {
             None => Error::Io(own),
             Some(beside) => Error::Several(Failures::new(Error::io_cause(own), [Arc::clone(beside)])),

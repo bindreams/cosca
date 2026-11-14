@@ -724,11 +724,9 @@ pub(crate) use backend::proc_view::UNREADABLE_STATUS_REASON;
 
 #[cfg(target_os = "linux")]
 pub(crate) use backend::proc_view::{
-    pidfd_pid_in, proc_view_with, utf8, PidfdTarget, ProcDir, ProcView, ViewUnreadable, DIVERGED_REASON,
+    pidfd_pid_in, proc_view_with, utf8, OwnUnreadable, PidfdTarget, ProcDir, ProcView, ReadFailure, ViewUnreadable,
+    DIVERGED_REASON,
 };
-
-#[cfg(all(target_os = "linux", test))]
-pub(crate) use backend::proc_view::ReadFailure;
 
 /// Why a by-pid read answered `Unknown`, when the read itself knows: on Linux, the unusable
 /// `/proc` view it went through or the failed pidfd call. Carried out of the failing read, so the

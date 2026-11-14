@@ -7,17 +7,23 @@ use crate::test_child::namespaces as ns;
 use crate::test_groups::{namespaces, Group};
 
 use super::{
-    classify_ns_links, classify_status, collect_pids, parse_fdinfo_pid, pidfd_pid_in, proc_view_with, PidfdTarget,
-    ProcDir, ProcView, ReadFailure, Verdict, ViewUnreadable, UNREADABLE_STATUS_REASON,
+    classify_ns_links, classify_status, collect_pids, cross_check_with_init_ns, parse_fdinfo_pid, pidfd_pid_in,
+    proc_view_with, read_own, OwnUnreadable, PidfdTarget, ProcDir, ProcView, ReadFailure, Verdict, ViewUnreadable,
+    UNREADABLE_STATUS_REASON,
 };
-use crate::identity::{FakeKernel, HostKernel};
+use crate::identity::{FakeKernel, HostKernel, Kernel};
 
-fn ns_pid(exists: io::Result<bool>) -> impl FnOnce() -> io::Result<bool> {
+fn ns_pid(exists: Result<bool, OwnUnreadable>) -> impl FnOnce() -> Result<bool, OwnUnreadable> {
     move || exists
 }
 
-fn unreachable_ns_pid() -> io::Result<bool> {
+fn unreachable_ns_pid() -> Result<bool, OwnUnreadable> {
     panic!("self/ns/pid must be consulted only when NSpid is absent")
+}
+
+/// An own file's failure at its `openat2`, as the kernel states it.
+fn denied(errno: i32) -> OwnUnreadable {
+    OwnUnreadable::of(ReadFailure::Open(io::Error::from_raw_os_error(errno)))
 }
 
 /// The ordinary view of this test binary, derived independently of `NSpid`: `/proc` is this
@@ -78,10 +84,7 @@ fn no_nspid_but_ns_pid_exists_needs_the_cross_check() {
 
 #[skuld::test]
 fn no_nspid_and_an_unreadable_ns_pid_is_unassessable_with_the_cause() {
-    let Verdict::Unassessable(why) = classify_status(
-        "Name:\tcosca\n",
-        ns_pid(Err(io::Error::from_raw_os_error(libc::EACCES))),
-    ) else {
+    let Verdict::Unassessable(why) = classify_status("Name:\tcosca\n", ns_pid(Err(denied(libc::EACCES)))) else {
         panic!("expected Unassessable");
     };
     assert!(why.source.is_some(), "the OS error must be carried: {why}");
@@ -148,47 +151,166 @@ fn proc_view_with_is_unassessable_for_a_status_that_is_not_utf8() {
     }
 }
 
-/// Every read made to establish the view is an `openat2`, and a refusal of one is the view's
-/// `openat2` refusal, as a refused `/proc` open is: `self/status`, `self/ns/pid`,
-/// `thread-self/ns/pid` and the procfs's `1/ns/pid`. Any other errno is no refusal. Mutant: "a read
-/// that establishes the view and is refused is only an unreadable view".
+/// What a failed read of an own file is, by the call that failed and its errno: the `openat2`'s
+/// errno in the refusal table is a refusal, with no `self/stat` re-check (the kernel hides no own file
+/// from its reader, so a `FakeKernel` with no `self/stat` row panics on one); every other failure is
+/// the file's own, `ENOENT` and `ESRCH` included (an own file is neither hidden nor exited) and any
+/// `read(2)` errno whatever it is.
+///
+/// Mutant: a `read(2)` errno is read as the `openat2`'s; `EPERM` asks a re-check; an own file's
+/// `ENOENT` or `ESRCH` is a skip; a failure's errno is not its own.
 #[skuld::test]
-fn a_refused_read_that_establishes_the_view_is_a_refused_openat2() {
+fn a_failed_read_of_an_own_file_is_what_its_call_and_errno_say() {
+    #[derive(Clone, Copy)]
+    enum Call {
+        Open,
+        Read,
+    }
+    use Call::{Open, Read};
+
+    let dir = HostKernel.open_proc().expect("/proc opens");
+    let rows = [
+        (Open, libc::ENOSYS, true),
+        (Open, libc::EPERM, true),
+        (Open, libc::ENODEV, true),
+        (Open, libc::EACCES, false),
+        (Open, libc::EIO, false),
+        (Open, libc::ENOENT, false),
+        (Open, libc::ESRCH, false),
+        (Open, libc::EXDEV, false),
+        (Read, libc::ENOSYS, false),
+        (Read, libc::EPERM, false),
+        (Read, libc::ENODEV, false),
+        (Read, libc::EIO, false),
+        (Read, libc::ESRCH, false),
+    ];
+    for (call, errno, refused) in rows {
+        let kernel = match call {
+            Open => FakeKernel::new().on_read("self/status", Err(errno)),
+            Read => FakeKernel::new().on_read_failing_after_open("self/status", errno),
+        };
+        let name = format!("{} {errno}", if matches!(call, Open) { "openat2" } else { "read(2)" });
+        match read_own(&kernel, &dir, "self/status") {
+            Err(OwnUnreadable::Refused(refusal)) => {
+                assert!(refused, "{name}: is no refusal");
+                assert_eq!(crate::error::first_os_code(&refusal.cause()), Some(errno), "{name}");
+                assert!(refusal.requirement().contains("requires openat2"), "{name}");
+            }
+            Err(OwnUnreadable::Failed(e)) => {
+                assert!(!refused, "{name}: is a refusal");
+                assert_eq!(e.raw_os_error(), Some(errno), "{name}");
+            }
+            Ok(_) => panic!("{name}: the read has no row to succeed by"),
+        }
+    }
+}
+
+/// Each own file that establishes the view hands its refusal to the view, as a refused `/proc` open
+/// does: `self/status`, `self/ns/pid`, `thread-self/ns/pid`. A `read(2)` failure of `self/status` is
+/// no refusal, though its errno is in the table. Mutant: "a read that establishes the view and is
+/// refused is only an unreadable view"; "`read(2)`'s errno is the `openat2`'s".
+#[skuld::test]
+fn a_refused_own_file_is_a_refused_openat2_of_the_view() {
     let refusal_of = |why: &ViewUnreadable| {
         why.refusal()
             .map(|refusal| crate::error::first_os_code(&refusal.cause()))
     };
-    for (errno, refused) in [
-        (libc::ENOSYS, true),
-        (libc::EPERM, true),
-        (libc::ENODEV, true),
-        (libc::EACCES, false),
-        (libc::EIO, false),
-    ] {
-        let denied = || io::Error::from_raw_os_error(errno);
-        let expected = refused.then_some(Some(errno));
 
-        let kernel = FakeKernel::over(&HostKernel).on_read("self/status", Err(errno));
-        let ProcView::Unassessable(why) = proc_view_with(&kernel) else {
-            panic!("{errno}: a status that cannot be read is Unassessable");
-        };
-        assert_eq!(refusal_of(&why), expected, "{errno}: self/status");
+    let kernel = FakeKernel::over(&HostKernel).on_read("self/status", Err(libc::EPERM));
+    let ProcView::Unassessable(why) = proc_view_with(&kernel) else {
+        panic!("a status that cannot be read is Unassessable");
+    };
+    assert_eq!(refusal_of(&why), Some(Some(libc::EPERM)), "self/status");
 
-        let Verdict::Unassessable(why) = classify_status("Name:\tcosca\n", ns_pid(Err(denied()))) else {
-            panic!("{errno}: expected Unassessable");
-        };
-        assert_eq!(refusal_of(&why), expected, "{errno}: self/ns/pid");
+    let Verdict::Unassessable(why) = classify_status("Name:\tcosca\n", ns_pid(Err(denied(libc::ENOSYS)))) else {
+        panic!("expected Unassessable");
+    };
+    assert_eq!(refusal_of(&why), Some(Some(libc::ENOSYS)), "self/ns/pid");
 
-        let Verdict::Unassessable(why) = classify_ns_links(Err(denied()), || panic!("own link failed first")) else {
-            panic!("{errno}: expected Unassessable");
-        };
-        assert_eq!(refusal_of(&why), expected, "{errno}: thread-self/ns/pid");
+    let Verdict::Unassessable(why) = classify_ns_links(Err(denied(libc::ENODEV)), || panic!("own link failed first"))
+    else {
+        panic!("expected Unassessable");
+    };
+    assert_eq!(refusal_of(&why), Some(Some(libc::ENODEV)), "thread-self/ns/pid");
 
-        let Verdict::Unassessable(why) = classify_ns_links(link("pid:[4026531836]"), || Err(denied())) else {
-            panic!("{errno}: expected Unassessable");
-        };
-        assert_eq!(refusal_of(&why), expected, "{errno}: 1/ns/pid");
-    }
+    let kernel = FakeKernel::over(&HostKernel).on_read_failing_after_open("self/status", libc::EPERM);
+    let ProcView::Unassessable(why) = proc_view_with(&kernel) else {
+        panic!("a status that cannot be read is Unassessable");
+    };
+    assert!(why.refusal().is_none(), "self/status read(2): {why:?}");
+    assert_eq!(
+        why.source.and_then(|e| e.raw_os_error()),
+        Some(libc::EPERM),
+        "the failure's own errno is the source"
+    );
+}
+
+/// The verdict of the namespace-link cross-check over `kernel`, with this thread's own link readable
+/// and `kernel`'s rows answering for pid 1. Every call with no row panics.
+fn init_link_verdict(kernel: FakeKernel<'_>) -> Verdict {
+    let dir = HostKernel.open_proc().expect("/proc opens");
+    let kernel = kernel.on_read("thread-self/ns/pid", Ok(b"pid:[4026531836]"));
+    cross_check_with_init_ns(&kernel, &dir)
+}
+
+/// Pid 1 is a foreign pid to most readers, so its `1/ns/pid` follows the pid-file rule, not the
+/// own-file one: `EPERM` is `hidepid`'s answer when the checked directory still reads `self/stat`
+/// (the view is unestablished, and no refusal), unknown when the re-check fails without refusing, and
+/// a refusal only when the re-check is refused; an `openat2` errno in the table is a refusal as it
+/// stands. Mutant: "`1/ns/pid`'s `EPERM` is a refusal with no re-check" (the own-file rule).
+#[skuld::test]
+fn pid_1s_namespace_link_follows_the_pid_file_rule() {
+    let cause_of = |verdict: Verdict| match verdict {
+        Verdict::Unassessable(why) => why,
+        other => panic!("expected Unassessable, got {other:?}"),
+    };
+
+    let hidden = cause_of(init_link_verdict(
+        FakeKernel::new()
+            .on_read("1/ns/pid", Err(libc::EPERM))
+            .on_read("self/stat", Ok(b"")),
+    ));
+    assert!(
+        hidden.refusal().is_none(),
+        "EPERM with a re-check that answers: {hidden:?}"
+    );
+    assert_eq!(crate::error::first_os_code(&hidden), Some(libc::EPERM));
+    assert!(hidden.reason.contains("1/ns/pid"), "{hidden}");
+
+    let unknown = cause_of(init_link_verdict(
+        FakeKernel::new()
+            .on_read("1/ns/pid", Err(libc::EPERM))
+            .on_read("self/stat", Err(libc::EMFILE)),
+    ));
+    assert!(unknown.refusal().is_none(), "EPERM with a failed re-check: {unknown:?}");
+    assert_eq!(crate::error::first_os_code(&unknown), Some(libc::EMFILE));
+    assert!(
+        crate::error::said(&unknown).contains("re-check of self/stat failed"),
+        "{}",
+        crate::error::said(&unknown)
+    );
+
+    let refused = cause_of(init_link_verdict(
+        FakeKernel::new()
+            .on_read("1/ns/pid", Err(libc::EPERM))
+            .on_read("self/stat", Err(libc::ENOSYS)),
+    ));
+    let refusal = refused.refusal().expect("a refused re-check is a refusal");
+    assert_eq!(crate::error::first_os_code(&refusal.cause()), Some(libc::ENOSYS));
+
+    let refused = cause_of(init_link_verdict(
+        FakeKernel::new().on_read("1/ns/pid", Err(libc::ENODEV)),
+    ));
+    let refusal = refused.refusal().expect("an openat2 errno in the table is a refusal");
+    assert_eq!(crate::error::first_os_code(&refusal.cause()), Some(libc::ENODEV));
+
+    let failed = cause_of(init_link_verdict(
+        FakeKernel::new().on_read_failing_after_open("1/ns/pid", libc::ENOSYS),
+    ));
+    assert!(
+        failed.refusal().is_none(),
+        "a readlinkat errno is no refusal: {failed:?}"
+    );
 }
 
 // Checked /proc dirfd =====
@@ -251,7 +373,7 @@ fn the_proc_dir_says_a_failed_read_is_the_reads() {
 
 const NO_NSPID: &str = "Name:\tcosca\nState:\tR (running)\n";
 
-fn link(target: &str) -> io::Result<Vec<u8>> {
+fn link(target: &str) -> Result<Vec<u8>, OwnUnreadable> {
     Ok(target.as_bytes().to_vec())
 }
 
@@ -270,9 +392,7 @@ fn a_procfs_whose_pid_1_is_in_another_namespace_is_diverged() {
 
 #[skuld::test]
 fn an_unreadable_pid_1_link_is_unassessable_with_the_cause() {
-    let Verdict::Unassessable(why) = classify_ns_links(link("pid:[4026531836]"), || {
-        Err(io::Error::from_raw_os_error(libc::EACCES))
-    }) else {
+    let Verdict::Unassessable(why) = classify_ns_links(link("pid:[4026531836]"), || Err(denied(libc::EACCES))) else {
         panic!("expected Unassessable");
     };
     assert!(why.reason.contains("1/ns/pid"), "{why}");
@@ -282,7 +402,7 @@ fn an_unreadable_pid_1_link_is_unassessable_with_the_cause() {
 /// An unreadable own link is reported as such, and the pid 1 link is then not read.
 #[skuld::test]
 fn an_unreadable_own_link_is_unassessable_without_reading_pid_1() {
-    let Verdict::Unassessable(why) = classify_ns_links(Err(io::Error::from_raw_os_error(libc::ENOENT)), || {
+    let Verdict::Unassessable(why) = classify_ns_links(Err(denied(libc::ENOENT)), || {
         panic!("pid 1's link must not be read once the own link failed")
     }) else {
         panic!("expected Unassessable");
@@ -358,8 +478,8 @@ fn pidfd_pid_in_reads_thread_self_fdinfo_and_names_a_missing_pid_line() {
 }
 
 /// The fdinfo read is an `openat2` through the view, so a refusal of it is the view's `openat2`
-/// refusal, with the errno as its source; any other errno is no refusal. Mutant: "a failed fdinfo
-/// read is only an unreadable view".
+/// refusal, with the errno as its source; a `read(2)` failure of it is no refusal. Mutant: "a failed
+/// fdinfo read is only an unreadable view"; "`read(2)`'s errno is the `openat2`'s".
 #[skuld::test]
 fn a_refused_fdinfo_read_is_a_refused_openat2() {
     use std::os::fd::AsRawFd as _;
@@ -367,20 +487,18 @@ fn a_refused_fdinfo_read_is_a_refused_openat2() {
     let (mut child, pidfd) = spawn_exited_child_with_pidfd();
     let dir = ProcDir::open().expect("/proc opens");
     let path = format!("thread-self/fdinfo/{}", pidfd.as_raw_fd());
-    for (errno, refused) in [
-        (libc::ENOSYS, true),
-        (libc::EPERM, true),
-        (libc::ENODEV, true),
-        (libc::EACCES, false),
-        (libc::EIO, false),
-    ] {
-        let kernel = FakeKernel::over(&HostKernel).on_read(&path, Err(errno));
-        let why = pidfd_pid_in(&kernel, &dir, pidfd.as_fd()).expect_err("an unreadable fdinfo");
-        let got = why
-            .refusal()
-            .map(|refusal| crate::error::first_os_code(&refusal.cause()));
-        assert_eq!(got, refused.then_some(Some(errno)), "{errno}");
-    }
+
+    let kernel = FakeKernel::over(&HostKernel).on_read(&path, Err(libc::EPERM));
+    let why = pidfd_pid_in(&kernel, &dir, pidfd.as_fd()).expect_err("an unreadable fdinfo");
+    let got = why
+        .refusal()
+        .map(|refusal| crate::error::first_os_code(&refusal.cause()));
+    assert_eq!(got, Some(Some(libc::EPERM)));
+
+    let kernel = FakeKernel::over(&HostKernel).on_read_failing_after_open(&path, libc::EPERM);
+    let why = pidfd_pid_in(&kernel, &dir, pidfd.as_fd()).expect_err("an unreadable fdinfo");
+    assert!(why.refusal().is_none(), "{why:?}");
+    assert_eq!(why.source.and_then(|e| e.raw_os_error()), Some(libc::EPERM));
     child.wait().expect("reap the child");
 }
 

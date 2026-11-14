@@ -1021,13 +1021,13 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
         ProbeRead::Answer(answer) => answer,
         ProbeRead::Gone(_) => Err(Unreadable::Probe(io::Error::other(describe_end(&read, end)))),
         ProbeRead::SetupFailed(errno) => {
-            let call = crate::identity::FailedCall::openat2(rustix::io::Errno::from_raw_os_error(errno));
-            Err(match call.refusal() {
-                Some(refusal) => Unreadable::Refused(refusal),
-                None => Unreadable::Probe(crate::error::io_context(
-                    describe_end(&read, end),
-                    io::Error::from_raw_os_error(errno),
-                )),
+            use crate::identity::{OwnUnreadable, ReadFailure};
+
+            // The child's `openat2` of its own `/proc/self/fd`.
+            let failure = ReadFailure::Open(io::Error::from_raw_os_error(errno));
+            Err(match OwnUnreadable::of(failure) {
+                OwnUnreadable::Refused(refusal) => Unreadable::Refused(refusal),
+                OwnUnreadable::Failed(e) => Unreadable::Probe(crate::error::io_context(describe_end(&read, end), e)),
             })
         }
     }
