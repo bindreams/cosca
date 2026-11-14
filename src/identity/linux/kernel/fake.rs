@@ -22,6 +22,8 @@ pub(crate) struct FakeKernel<'a> {
     read_counts: Mutex<Vec<(String, usize)>>,
     /// The listing of any `/proc`: the pids, or the call that failed and its raw errno.
     pids: Option<Result<Vec<u32>, (ReadCall, i32)>>,
+    /// A pid, the number of earlier listings of its threads before the row answers, and the answer.
+    tids: Vec<TidsRow>,
     signal_probes: Vec<(Pid, Result<(), Errno>)>,
     /// A pid, the flags the row answers (`None`: any), and the answer.
     pidfd_opens: Vec<(Pid, Option<PidfdFlags>, PidfdRow)>,
@@ -51,6 +53,10 @@ impl ReadCall {
 /// A read row: the path, the number of earlier reads of it before the row answers, and the answer.
 /// `Err` is the call that failed and its raw errno.
 type ReadRow = (String, usize, Result<Vec<u8>, (ReadCall, i32)>);
+
+/// A thread listing row: the pid, the number of earlier listings of its threads before the row answers,
+/// and the answer (`Err` as for a read row).
+type TidsRow = (u32, usize, Result<Vec<u32>, (ReadCall, i32)>);
 
 /// A `pidfs_ino` row: the pid, the path whose earlier read it waits for, and the answer.
 type PidfsRow = (Pid, Option<String>, Result<Option<u64>, Errno>);
@@ -82,6 +88,7 @@ impl<'a> FakeKernel<'a> {
             reads: Vec::new(),
             read_counts: Mutex::new(Vec::new()),
             pids: None,
+            tids: Vec::new(),
             signal_probes: Vec::new(),
             pidfd_opens: Vec::new(),
             pidfs_inos: Vec::new(),
@@ -141,6 +148,31 @@ impl<'a> FakeKernel<'a> {
     /// fails with the raw `errno`.
     pub(crate) fn on_pids_failing_after_open(mut self, errno: i32) -> Self {
         self.pids = Some(Err((ReadCall::Read, errno)));
+        self
+    }
+
+    /// Listing the threads of `pid` answers `answer`: the thread ids, or the raw errno of the
+    /// `openat2` of its `task` directory.
+    pub(crate) fn on_tids(self, pid: u32, answer: Result<&[u32], i32>) -> Self {
+        self.on_tids_after(pid, 0, answer)
+    }
+
+    /// From the listing of `pid`'s threads that follows `earlier_lists` listings of them, answers
+    /// `answer`, as [`on_tids`](Self::on_tids) does. Of the rows whose count has been reached, the one
+    /// with the highest count wins.
+    pub(crate) fn on_tids_after(mut self, pid: u32, earlier_lists: usize, answer: Result<&[u32], i32>) -> Self {
+        self.tids.push((
+            pid,
+            earlier_lists,
+            answer.map(<[u32]>::to_vec).map_err(|errno| (ReadCall::Open, errno)),
+        ));
+        self
+    }
+
+    /// Listing the threads of `pid` opens its `task` directory, and the listing itself fails with the
+    /// raw `errno`.
+    pub(crate) fn on_tids_failing_after_open(mut self, pid: u32, errno: i32) -> Self {
+        self.tids.push((pid, 0, Err((ReadCall::Read, errno))));
         self
     }
 
@@ -335,6 +367,20 @@ impl Kernel for FakeKernel<'_> {
             Some(Ok(pids)) => Ok(pids.clone()),
             Some(Err((call, errno))) => Err(call.failure(*errno)),
             None => self.real("pids").pids(dir),
+        }
+    }
+
+    fn tids(&self, dir: &ProcDir, pid: u32) -> Result<Vec<u32>, ReadFailure> {
+        let earlier = self.count_read(&format!("{pid}/task"));
+        let row = self
+            .tids
+            .iter()
+            .filter(|(p, from, _)| *p == pid && *from <= earlier)
+            .max_by_key(|(_, from, _)| *from);
+        match row {
+            Some((_, _, Ok(tids))) => Ok(tids.clone()),
+            Some((_, _, Err((call, errno)))) => Err(call.failure(*errno)),
+            None => self.real(&format!("tids of {pid}")).tids(dir, pid),
         }
     }
 

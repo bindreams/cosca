@@ -43,7 +43,7 @@ fn assert_not_killed(result: Result<(), Error>, pid: u32, causes: &[&str]) {
     }
 }
 
-fn assert_unassessable_naming(result: Result<(), Error>, causes: &[&str]) {
+pub(super) fn assert_unassessable_naming(result: Result<(), Error>, causes: &[&str]) {
     match result {
         Err(Error::Unassessable { detail, .. }) => {
             for cause in causes {
@@ -80,10 +80,10 @@ impl View {
 
 const VIEWS: [View; 2] = [View::Diverged, View::Unreadable];
 
-type Walk = fn(&dyn Kernel, ProcessId) -> Result<(), Error>;
+pub(super) type Walk = fn(&dyn Kernel, ProcessId) -> Result<(), Error>;
 
 /// The walks that take an identity.
-fn id_walks() -> [(&'static str, Walk); 2] {
+pub(super) fn id_walks() -> [(&'static str, Walk); 2] {
     [
         ("hard_kill", |k, id| {
             super::hard_kill(k, id, &super::ByIdentity::new(k, id))
@@ -98,7 +98,7 @@ fn id_walks() -> [(&'static str, Walk); 2] {
 }
 
 /// Every walk, `Process`'s included, over an open handle on the live `id`.
-fn walks() -> [(&'static str, Walk); 4] {
+pub(super) fn walks() -> [(&'static str, Walk); 4] {
     let [hard_kill, terminate] = id_walks();
     [
         hard_kill,
@@ -222,11 +222,11 @@ fn every_walk_from_a_root_that_lost_its_pid_signals_nothing_and_a_kill_is_unasse
     }
 }
 
-/// A root whose state cannot be read, whose walk finds no member, is `Unassessable` with nothing
-/// signalled: neither an exit nor a running root can be told, and a walk that found nothing says
-/// nothing of the tree either way. The root's `stat` is read by the snapshot, by the anchor, and then by
-/// the check that the walk's root has not exited, which finds a record it cannot parse. Mutant: an
-/// unreadable state is "not exited".
+/// A root whose exit cannot be read, whose walk finds no member, is `Unassessable` with nothing
+/// signalled: neither an exit under way nor a running root can be told, and a walk that found nothing
+/// says nothing of the tree either way. The root's `stat` is read by the snapshot, by the anchor, and
+/// then by the check that the walk's root has not begun to exit, whose proof of the id finds a record
+/// it cannot parse. Mutant: an unreadable exit is "not begun".
 #[skuld::test]
 fn every_id_walk_from_a_root_whose_state_cannot_be_read_is_unassessable_and_signals_nothing() {
     for (name, walk) in id_walks() {
@@ -238,30 +238,20 @@ fn every_id_walk_from_a_root_whose_state_cannot_be_read_is_unassessable_and_sign
             .on_read_after(&format!("{pid}/stat"), 2, Ok(&b"not a stat record"[..]));
         let result = walk(&kernel, id);
         assert!(
-            matches!(&result, Err(Error::Unassessable { detail, .. }) if detail.contains("has exited could not be read")),
+            matches!(&result, Err(Error::Unassessable { detail, .. }) if detail.contains("exit has begun could not be read")),
             "{name}: {result:?}"
         );
         release(child);
     }
 }
 
-/// `pid`'s `stat` as the kernel gives it now, except for the state: a zombie's.
-fn stat_as_a_zombie(pid: u32) -> Vec<u8> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("the live pid's stat");
-    let (head, tail) = stat.rsplit_once(')').expect("stat names its command in parentheses");
-    let mut fields: Vec<String> = tail.split_whitespace().map(str::to_owned).collect();
-    // `tail` starts at field 3, the state.
-    fields[0] = "Z".to_owned();
-    format!("{head}) {}\n", fields.join(" ")).into_bytes()
-}
-
-/// A root that has exited sends nothing, whether or not the walk could read every candidate: a signal
-/// to its zombie reaches no one, and `Ok` would say it reached the tree. Mutant: an exited root with an
-/// unread candidate is walked and signalled.
+/// A root whose exit has begun sends nothing, whether or not the walk could read every candidate: a
+/// signal to its zombie reaches no one, and `Ok` would say it reached the tree. Mutant: a root that has
+/// begun to exit, with an unread candidate, is walked and signalled.
 #[skuld::test]
 fn terminate_over_an_exited_root_with_an_unreadable_candidate_sends_nothing() {
     let (child, root, _, kernel) = root_with_an_unreadable_descendant();
-    let kernel = kernel.on_read(&format!("{}/stat", root.pid()), Ok(&stat_as_a_zombie(root.pid())));
+    let kernel = super::treewalk_exiting_tests::with_exiting_root(kernel, root);
 
     let walked = super::terminate(&kernel, root, &super::ByIdentity::new(&kernel, root)).expect("the table reads");
 
@@ -477,8 +467,9 @@ fn kill_by_identity_spares_a_pidfs_pid_the_kernel_cannot_open_or_shows_as_anothe
     release(child);
 }
 
-/// The root's `stat` is read four times: by the snapshot, by the anchor, by the check that an empty
-/// walk's root has not exited, and by the kill's re-verify, which finds another start time. Nothing is
+/// The root's `stat` is read four times: by the snapshot, by the anchor, by the proof of the id that
+/// ends the check that the walk's root has not begun to exit, and by the kill's re-verify, which finds
+/// another start time. Nothing is
 /// signalled. The root's own pidfd passes the
 /// proof's fdinfo check, so the `stat` is what the row is about. Mutants: "the walk's kill
 /// re-verifies through `HostKernel`"; "the kill ignores a start time that differs".
@@ -506,7 +497,7 @@ fn every_walk_re_verifies_its_kill_through_its_kernel() {
 /// A live root `sh` that has announced its pid, its identity, and the identity of the `sh` it
 /// forked. That descendant prints `released` and exits at the EOF of its stdin, which the test
 /// holds the write end of; the root waits for it.
-fn live_member_with_descendant() -> (std::process::Child, ProcessId, ProcessId) {
+pub(super) fn live_member_with_descendant() -> (std::process::Child, ProcessId, ProcessId) {
     let mut cmd = std::process::Command::new("/bin/sh");
     cmd.arg("-c")
         .arg("exec 3<&0; sh -c 'read _ignored; echo released' <&3 3<&- & echo $$; wait")

@@ -147,9 +147,16 @@ pub(crate) const P_SYSTEM: libc::c_int = 0x00000200;
 
 /// `kinfo_proc`'s `p_flag` bit for a process that has begun to exit: `#define P_WEXIT
 /// 0x00002000` in the SDK's `usr/include/sys/proc.h`. XNU sets it from `P_LEXIT`, which is never
-/// cleared.
-#[cfg(test)]
+/// cleared. It shows before the process's children are reparented (measured on macOS 15.7.9, 15.8.2 and
+/// 26.7.2; 14, the floor, is not measurable on CI), so a read that finds it clear met a process none of
+/// whose children its exit had moved.
 pub(crate) const P_WEXIT: libc::c_int = 0x0000_2000;
+
+/// Whether a process that `kinfo_proc` shows with `p_stat` and `p_flag` has begun to exit: `P_WEXIT`
+/// is set, or it is already a zombie (XNU sets `P_LEXIT` first, but the state is the stronger fact).
+pub(crate) fn exit_begun(p_stat: libc::c_char, p_flag: libc::c_int) -> bool {
+    p_stat as u32 == libc::SZOMB || p_flag & P_WEXIT != 0
+}
 
 /// Read one `kinfo_proc` for `pid`. `None` means "not resolvable" — the EXPECTED miss is
 /// a nonexistent pid (sysctl SUCCESS with `size == 0`); a real sysctl failure or a
@@ -248,10 +255,26 @@ pub(crate) mod fault {
     }
 }
 
+/// [`kinfo`] without the seams that force a field, and with the failure that left the read `Unknown`: the
+/// errno of the `sysctl`, or the wrong size it wrote. Only the forced refusal of
+/// [`fault::force_unreadable_once`] is honoured here, as an `EPERM` (the other seams force fields of a
+/// record).
+pub(crate) fn kinfo_explained(pid: RawPid) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
+    #[cfg(test)]
+    if fault::take_unreadable() {
+        return (Resolved::Unknown, Some(std::io::Error::from_raw_os_error(libc::EPERM)));
+    }
+    read_record_explained(pid, libc::KERN_PROC_PID)
+}
+
+fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
+    read_record_explained(pid, selector).0
+}
+
 /// The selector-parameterized core. The `selector` parameter is a TEST SEAM (production
 /// always passes `KERN_PROC_PID` via `kinfo()`) — it lets a unit test drive the
 /// contract-violation arm with an invalid selector.
-fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
+fn read_record_explained(pid: RawPid, selector: libc::c_int) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROC, selector, pid as libc::c_int];
     loop {
         let mut info: kinfo_proc = unsafe { std::mem::zeroed() };
@@ -272,7 +295,7 @@ fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
             return match e.raw_os_error() {
                 Some(libc::EINTR) => continue,
                 // The OS positively says there is no such process.
-                Some(libc::ESRCH) => Resolved::Gone,
+                Some(libc::ESRCH) => (Resolved::Gone, None),
                 // A sandbox or hardened runtime refusing the query is the DESIGNED Unknown,
                 // not a contract violation - `debug`, like every other per-pid probe.
                 Some(libc::EPERM) | Some(libc::EACCES) => {
@@ -280,7 +303,7 @@ fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
                         "sysctl(KERN_PROC selector {selector}, {pid}) refused: {report}",
                         report = crate::error::Report(&e)
                     );
-                    Resolved::Unknown
+                    (Resolved::Unknown, Some(e))
                 }
                 // ENOMEM/EINVAL are neither race- nor permission-reachable. ENOMEM in
                 // particular is the ONLY runtime detector for a kernel `kinfo_proc` that has
@@ -292,22 +315,23 @@ fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
                         "sysctl(KERN_PROC selector {selector}, {pid}) failed: {report}",
                         report = crate::error::Report(&e)
                     ));
-                    Resolved::Unknown
+                    (Resolved::Unknown, Some(e))
                 }
             };
         }
         if size == 0 {
-            return Resolved::Gone;
+            return (Resolved::Gone, None);
         }
         if size != std::mem::size_of::<kinfo_proc>() {
             // Layout drift — never trust a partial/foreign-sized record.
-            super::contract_violation(format_args!(
+            let drift = format!(
                 "sysctl(KERN_PROC selector {selector}, {pid}) wrote {size} bytes, expected {}",
                 std::mem::size_of::<kinfo_proc>()
-            ));
-            return Resolved::Unknown;
+            );
+            super::contract_violation(format_args!("{drift}"));
+            return (Resolved::Unknown, Some(std::io::Error::other(drift)));
         }
-        return Resolved::Found(info);
+        return (Resolved::Found(info), None);
     }
 }
 

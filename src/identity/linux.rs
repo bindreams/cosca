@@ -3,8 +3,11 @@
 //! gives a proven key. Reading the pidfd the caller holds gives a key that the caller's later peek
 //! through that pidfd checks. `is_running` polls the pidfd, or reads the process state before 6.9;
 //! `created_at` reads the `starttime` (bracketed for a pidfs id) and uses `/proc/stat` `btime` and
-//! `_SC_CLK_TCK`.
+//! `_SC_CLK_TCK`. [`exit`] reads whether a process's exit has begun, from the `PF_EXITING` flag of
+//! every thread's `stat`.
 
+#[path = "linux/exit.rs"]
+pub(crate) mod exit;
 #[path = "linux/kernel.rs"]
 pub(crate) mod kernel;
 #[path = "linux/pid_file.rs"]
@@ -368,9 +371,22 @@ pub(super) fn exists(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Existence, 
 
 /// [`exists`], reading through the `/proc` at `proc_dir`: a `Pidfs` id needs no `/proc`.
 pub(super) fn exists_in(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid, key: Key) -> Existence {
+    exists_in_explained(kernel, proc_dir, pid, key).0
+}
+
+/// [`exists_in`], and why it was `Unknown` when the read knows.
+pub(super) fn exists_in_explained(
+    kernel: &dyn Kernel,
+    proc_dir: &ProcDir,
+    pid: RawPid,
+    key: Key,
+) -> (Existence, UnknownCause) {
     match key {
-        Key::Ticks(ticks) => existence_of_ticks(ticks_from(pid, read_in(kernel, proc_dir, pid).0), ticks),
-        Key::Pidfs(_) => exists(kernel, pid, key).0,
+        Key::Ticks(ticks) => {
+            let (stat, cause) = read_in(kernel, proc_dir, pid);
+            (existence_of_ticks(ticks_from(pid, stat), ticks), cause)
+        }
+        Key::Pidfs(_) => exists(kernel, pid, key),
     }
 }
 

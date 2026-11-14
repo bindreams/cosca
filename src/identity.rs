@@ -646,6 +646,31 @@ impl ProcessId {
         }
     }
 
+    /// Whether this process's exit has begun, as the kernel's own exit flag shows: `Found(true)` for a
+    /// process exiting, a zombie, or one whose threads all exit; `Found(false)` while a thread runs.
+    /// [`Resolved::Gone`] when the pid holds another process, or none, when the read is done (an exit
+    /// past its beginning, or a reuse); [`Resolved::Unknown`] when the OS refuses the query.
+    ///
+    /// The flag shows before the kernel reparents the process's children, so a walk of the tree from
+    /// this pid that is followed by a `Found(false)` read met no child the exit moved. Linux: every
+    /// thread of the group shows `PF_EXITING` (the leader alone does not tell: `pthread_exit` sets it
+    /// while the process runs), read through the checked `/proc`. macOS: `P_WEXIT` in `kinfo_proc`'s
+    /// `p_flag`. Where macOS 14's order differs the read does not see the exit, which is the window a
+    /// walk always had, never a false answer. Unlike [`is_alive`](Self::is_alive), it answers `true`
+    /// before the process is a zombie.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    pub(crate) fn exit_begun_with(&self, kernel: &dyn Kernel) -> (Resolved<bool>, UnknownCause) {
+        let _ = kernel;
+        backend::exit_begun(self.pid, self.key)
+    }
+
+    /// `exit_begun_with` on Linux (see the doc there, written for the platforms that have it), reading
+    /// through the `/proc` at `proc_dir`, known to be this pid namespace's, as a walk's table's is.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn exit_begun_in(&self, kernel: &dyn Kernel, proc_dir: &ProcDir) -> (Resolved<bool>, UnknownCause) {
+        backend::exit::exit_begun_in(kernel, proc_dir, self.pid, self.key)
+    }
+
     /// Best-effort wall-clock creation time. Lazy and allowed to drift (NTP);
     /// NEVER used for identity. `None` if the process is gone or unavailable. On Linux 6.9+ the
     /// time is read from `/proc` when asked, so a reaped process has none.
@@ -752,6 +777,9 @@ pub(crate) struct UnknownCause {
     /// The `stat` read that failed, beyond absence and refusal, and left the read `Unknown`.
     #[cfg(target_os = "linux")]
     unreadable: Option<Box<backend::pid_file::Unreadable>>,
+    /// The failed `kinfo_proc` read (a refused or mis-sized `sysctl`) that left the read `Unknown`.
+    #[cfg(target_os = "macos")]
+    kinfo: Option<std::io::Error>,
     /// The parent whose proof left an ordered read `Unknown`, when that and not the read's own pid
     /// is why.
     parent: Option<RawPid>,
@@ -822,6 +850,15 @@ impl UnknownCause {
         }
     }
 
+    /// The cause of a read that the failed `kinfo_proc` read `failure`, when there is one, left `Unknown`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn of_kinfo(failure: Option<std::io::Error>) -> UnknownCause {
+        UnknownCause {
+            kinfo: failure,
+            ..UnknownCause::default()
+        }
+    }
+
     /// The cause of a read that a failed pidfd call left `Unknown`.
     #[cfg(target_os = "linux")]
     pub(crate) fn of_call(call: FailedCall) -> UnknownCause {
@@ -867,7 +904,7 @@ impl UnknownCause {
     /// reason or the errno that failed; on Windows, `Error::Unassessable` naming the refused
     /// sequence-number query, else the refused creator-pid query, with the query's `NTSTATUS` as its
     /// source as a Win32 error ([`nt_io_error`](crate::error::nt_io_error)). `None` when nothing
-    /// is known (or on macOS, which has no view and no pidfd): `hidepid`, a racing exit, an access
+    /// is known (macOS knows only a failed `kinfo_proc` read): `hidepid`, a racing exit, an access
     /// denial.
     pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {
         #[cfg(target_os = "linux")]
@@ -894,7 +931,14 @@ impl UnknownCause {
                 source: Some(crate::error::Error::io_cause(crate::error::nt_io_error(status))),
             })
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(target_os = "macos")]
+        {
+            self.kinfo.map(|failure| crate::error::Error::Unassessable {
+                detail: format!("{subject} exists but its kinfo_proc could not be read"),
+                source: Some(crate::error::Error::io_cause(failure)),
+            })
+        }
+        #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
         {
             let _ = (self, subject);
             None
@@ -1084,6 +1128,10 @@ pub(crate) fn windows_identity_from_handle_result(
 #[cfg(test)]
 #[path = "identity_tests.rs"]
 mod identity_tests;
+
+#[cfg(all(test, unix))]
+#[path = "identity/exit_begun_tests.rs"]
+mod exit_begun_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "identity/leader_exit_tests.rs"]

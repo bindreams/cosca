@@ -52,9 +52,11 @@ impl Process {
     /// # Errors
     ///
     /// [`Error::Unassessable`] when the process table cannot be read, or the root exists but cannot
-    /// be queried: nothing is killed, the root included. Also when the root has exited, reaped or not
-    /// (its children were reparented at its exit, so a walk from its pid says nothing of the tree), or
-    /// no longer holds its pid, and the walk finds no member: no walk ran, and nothing was killed.
+    /// be queried: nothing is killed, the root included. Also when the root's exit has begun (a zombie,
+    /// a root reaped or no longer holding its pid, or one still exiting), or whether it has cannot be
+    /// read: its children are reparented at its exit, so a walk from its pid says nothing of the tree.
+    /// Members found are killed all the same, and nothing is vouched for; with none found, nothing was
+    /// killed, and a retry can read an unreadable flag.
     ///
     /// [`Error::MembersLeft`] when the walk killed what it could and left members running, each a
     /// [`Error::MemberNotKilled`] naming it and why: its identity could not be read, or its kill was
@@ -126,9 +128,9 @@ impl Process {
     /// The walk's kills, the answer they come to, and the wait for what they reached: the members, and
     /// the root through this handle once its kill landed.
     ///
-    /// A root whose exit is visible, reaped or not, whose walk finds no member answers
-    /// [`Error::Unassessable`]. `call`: a graceful call's settlement, which settles the walk as a
-    /// `Child`'s tree does ([`TreeKilled::settle`](crate::containment::dispatch::TreeKilled::settle)).
+    /// A root whose exit has begun, reaped or not, answers [`Error::Unassessable`] whether or not its
+    /// walk finds members (which are killed). `call`: a graceful call's settlement, which
+    /// settles the walk as a `Child`'s tree does ([`TreeKilled::settle`](crate::containment::dispatch::TreeKilled::settle)).
     fn sweep<'a>(
         &'a self,
         kernel: &'a dyn crate::identity::Kernel,
@@ -158,9 +160,13 @@ impl Process {
     /// # Errors
     ///
     /// [`Error::Unassessable`] when the process table cannot be read, or the root exists but cannot
-    /// be queried: nothing is signalled. Also when the root has exited, reaped or not, and its walk
-    /// finds no member: its children were reparented at its exit, so a walk from its pid says nothing
-    /// of the tree, and nothing is signalled.
+    /// be queried: nothing is signalled. Also when the root's exit has begun (a zombie, a root reaped,
+    /// or one still exiting), or whether it has cannot be read, and its walk finds no member: its
+    /// children were reparented at its exit, so a walk from its pid says nothing of the tree.
+    ///
+    /// A walk that finds members signals them whatever the flag says, and the call is `Ok` (a signal
+    /// settles nothing), but the members it found are not taken for the whole tree, and a graceful
+    /// shutdown's sweep does not stand on them.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.terminate_tree_with(&crate::identity::HostKernel)
     }
