@@ -5,8 +5,8 @@
 use std::io::BufRead as _;
 use std::process::Stdio;
 
-use crate::identity::stat_parse::{parse_num_threads, parse_state};
-use crate::identity::{Liveness, ProcessId};
+use crate::identity::stat_parse::{parse_num_threads, parse_starttime_jiffies, parse_state};
+use crate::identity::{Key, Liveness, ProcessId};
 use crate::Recursive;
 
 /// The process is alive, and a child its leader thread forked keeps the process's number as its parent's,
@@ -46,7 +46,19 @@ fn a_process_whose_leader_thread_exited_is_alive_and_keeps_its_children() {
         String::from_utf8_lossy(&stat)
     );
 
-    assert_eq!(id.is_alive(), Liveness::Alive, "the process has not exited");
+    // The `/proc` read, whatever key the host gives an id (a pidfs one, on 6.9+, is read by the pidfd).
+    let ticks = parse_starttime_jiffies(&stat).expect("the root's start time");
+    let by_stat = ProcessId::from_parts_for_test(root.id(), Key::Ticks(ticks));
+    assert_eq!(
+        by_stat.is_alive(),
+        Liveness::Alive,
+        "the /proc read: the process has not exited"
+    );
+    assert_eq!(
+        id.is_alive(),
+        Liveness::Alive,
+        "the host's own id: the process has not exited"
+    );
     assert_eq!(
         id.children(Recursive::No).expect("the root's children"),
         vec![cat],
