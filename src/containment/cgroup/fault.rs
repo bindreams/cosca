@@ -229,6 +229,16 @@ pub(crate) fn proc_hidden_as() -> Option<i32> {
         .or_else(|| PROC_HIDDEN.with(Cell::get).then_some(libc::ENOENT))
 }
 
+/// `kernel` with `pid`'s `<pid>/cgroup` failing as [`proc_hidden_as`] says (the `openat2`'s errno),
+/// or `None` while nothing hides `/proc`: the one place a hidden `/proc` becomes a `FakeKernel` row.
+pub(crate) fn hidden_cgroup_of(
+    kernel: &dyn crate::identity::Kernel,
+    pid: u32,
+) -> Option<crate::identity::FakeKernel<'_>> {
+    proc_hidden_as()
+        .map(|errno| crate::identity::FakeKernel::over(kernel).on_read(&format!("{pid}/cgroup"), Err(errno)))
+}
+
 /// While the guard lives, `PIDFD_GET_INFO` fails on this thread with `EIO`, as a kernel that has
 /// it refusing it.
 pub(crate) fn fail_pidfd_info() -> FailPidfdInfo {

@@ -185,7 +185,9 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
             // A pid outside a `pgid` listing carries no information about it; the residual (a
             // foreign-uid member of `pgid` itself, hidden by `hidepid`) is documented on
             // `Child::kill_tree`.
-            Ok(crate::identity::pid_file::ReadOutcome::Skipped(e)) => {
+            Ok(
+                crate::identity::pid_file::ReadOutcome::Exited(e) | crate::identity::pid_file::ReadOutcome::Hidden(e),
+            ) => {
                 log::debug!(
                     "containment::unix::group::members: /proc/{pid}/stat unreadable ({report}); excluding it",
                     report = crate::error::Report(&e)

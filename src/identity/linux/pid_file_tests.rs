@@ -21,7 +21,10 @@ enum Recheck {
 
 #[derive(Debug)]
 enum Want {
-    Skipped,
+    /// The pid exited.
+    Exited,
+    /// The pid is not shown to us.
+    Hidden,
     /// A refusal whose refusing errno is this.
     Refused(i32),
     /// An `Unreadable` whose words contain this.
@@ -31,8 +34,8 @@ enum Want {
 /// What a failed read of `4242/stat` is, by (call that failed, errno, re-check).
 ///
 /// Mutant: a `read(2)` errno is read as the `openat2`'s (`EPERM` asks the re-check, `ENOSYS` is a
-/// refusal, `EXDEV` is beyond a mount); `read(2)`'s `ESRCH` is no skip; a failed re-check is a skip or
-/// a refusal; a refusal is an `Unreadable`.
+/// refusal, `EXDEV` is beyond a mount); `read(2)`'s `ESRCH` is no exit; an exit is read as `Hidden` or
+/// the reverse; a failed re-check is a skip or a refusal; a refusal is an `Unreadable`.
 #[skuld::test]
 fn a_failed_read_is_what_its_call_and_errno_say() {
     use Call::{Open, Read};
@@ -41,12 +44,12 @@ fn a_failed_read_is_what_its_call_and_errno_say() {
     let dir = HostKernel.open_proc().expect("/proc opens");
     let rows = [
         // The pid is not there for us.
-        (Open, libc::ENOENT, None, Want::Skipped),
-        (Open, libc::ESRCH, None, Want::Skipped),
-        (Open, libc::EACCES, None, Want::Skipped),
-        (Open, libc::EPERM, Some(Answers), Want::Skipped),
-        // A task that exits between the open and the read.
-        (Read, libc::ESRCH, None, Want::Skipped),
+        (Open, libc::ENOENT, None, Want::Hidden),
+        (Open, libc::EACCES, None, Want::Hidden),
+        (Open, libc::EPERM, Some(Answers), Want::Hidden),
+        // The pid exited, before the open or between the open and the read.
+        (Open, libc::ESRCH, None, Want::Exited),
+        (Read, libc::ESRCH, None, Want::Exited),
         // An `openat2` refusal, by the pid's own errno or by the directory's.
         (Open, libc::ENOSYS, None, Want::Refused(libc::ENOSYS)),
         (Open, libc::ENODEV, None, Want::Refused(libc::ENODEV)),
@@ -108,7 +111,7 @@ fn a_failed_read_is_what_its_call_and_errno_say() {
         };
         let name = format!("{call:?} {errno}, re-check {recheck:?}");
         match (read(&kernel, &dir, 4242, "stat"), want) {
-            (Ok(ReadOutcome::Skipped(_)), Want::Skipped) => {}
+            (Ok(ReadOutcome::Exited(_)), Want::Exited) | (Ok(ReadOutcome::Hidden(_)), Want::Hidden) => {}
             (Ok(ReadOutcome::Refused(refusal)), Want::Refused(refusing)) => {
                 assert_eq!(crate::error::first_os_code(&refusal.cause()), Some(refusing), "{name}");
                 assert!(refusal.requirement().contains("requires openat2"), "{name}");

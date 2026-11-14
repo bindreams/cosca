@@ -92,7 +92,7 @@ fn read_in(kernel: &dyn Kernel, dir: &ProcDir, pid: RawPid) -> (Resolved<Vec<u8>
 
     let (resolved, cause) = match pid_file::read(kernel, dir, pid, "stat") {
         Ok(ReadOutcome::Read(bytes)) => return (Resolved::Found(bytes), UnknownCause::default()),
-        Ok(ReadOutcome::Skipped(e)) => (
+        Ok(ReadOutcome::Exited(e) | ReadOutcome::Hidden(e)) => (
             resolve_unreadable(kernel, pid, crate::error::Report(&e)),
             UnknownCause::default(),
         ),

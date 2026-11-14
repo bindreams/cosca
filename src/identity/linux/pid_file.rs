@@ -21,9 +21,12 @@ use super::prove::{FailedCall, Refusal};
 #[derive(Debug)]
 pub(crate) enum ReadOutcome {
     Read(Vec<u8>),
-    /// The pid exited mid-read (`ENOENT`/`ESRCH`), or `hidepid` hides it (`EACCES`, or `EPERM`
-    /// while the checked directory still answers). The error is why.
-    Skipped(io::Error),
+    /// The pid exited: `ESRCH`, of the open or of the read. The error is why.
+    Exited(io::Error),
+    /// The pid is not shown to us: it is gone (`ENOENT`), or `hidepid` hides it (`EACCES`, or `EPERM`
+    /// while the checked directory still answers). The error is why. A caller that holds the pid
+    /// unreaped, so that it cannot be gone, reads this as `/proc` hiding it.
+    Hidden(io::Error),
     /// The `openat2` was refused.
     Refused(Refusal),
 }
@@ -105,7 +108,7 @@ impl std::error::Error for Unreadable {
 }
 
 /// `pid`'s `file` (`stat`, or `cgroup`) through `dir`, and what a failure of the read means: a
-/// failure that says the pid is not there for us is [`ReadOutcome::Skipped`], a [`Refusal`] is
+/// failure that says the pid is not there for us is [`ReadOutcome::Exited`] or [`ReadOutcome::Hidden`], a [`Refusal`] is
 /// [`ReadOutcome::Refused`], every other failure is [`Unreadable`]. The one policy of every read of
 /// a pid's file. Never asks `kill(pid, 0)`: a scan covers all of `/proc`, and a `hidepid` `/proc`
 /// answers a foreign-uid probe `EPERM` too, so the first foreign-uid process would abort every scan.
@@ -133,7 +136,7 @@ fn failed_read(
         // The file opened, so no `openat2` errno is in play. A task that exited after the open is the
         // one racing exit `read(2)` reports; every other failure says nothing about the pid.
         ReadFailure::Read(source) if source.raw_os_error() == Some(libc::ESRCH) => {
-            return Ok(ReadOutcome::Skipped(source));
+            return Ok(ReadOutcome::Exited(source));
         }
         ReadFailure::Read(source) => {
             return Err(Unreadable {
@@ -146,10 +149,11 @@ fn failed_read(
         }
     };
     let (kind, cause, peer) = match source.raw_os_error() {
-        Some(libc::ENOENT | libc::ESRCH | libc::EACCES) => return Ok(ReadOutcome::Skipped(source)),
+        Some(libc::ESRCH) => return Ok(ReadOutcome::Exited(source)),
+        Some(libc::ENOENT | libc::EACCES) => return Ok(ReadOutcome::Hidden(source)),
         // `hidepid`'s answer only if the checked directory still reads.
         Some(libc::EPERM) => match kernel.read(dir, "self/stat") {
-            Ok(_) => return Ok(ReadOutcome::Skipped(source)),
+            Ok(_) => return Ok(ReadOutcome::Hidden(source)),
             Err(recheck) => match open_refusal(&recheck) {
                 Some(refusal) => {
                     let pid_failure = Unreadable {

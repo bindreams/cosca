@@ -100,19 +100,24 @@ pub(crate) fn proc_names(
     };
     // A test hides the task as `hidepid` does: the `openat2` of its file answers the hook's errno.
     #[cfg(test)]
-    let hiding = super::fault::proc_hidden_as()
-        .map(|errno| crate::identity::FakeKernel::over(kernel).on_read(&format!("{pid}/cgroup"), Err(errno)));
+    let hiding = super::fault::hidden_cgroup_of(kernel, pid);
     #[cfg(test)]
     let kernel: &dyn crate::identity::Kernel = hiding
         .as_ref()
         .map_or(kernel, |hiding| hiding as &dyn crate::identity::Kernel);
     let text = match pid_file::read(kernel, &proc_dir, pid, "cgroup") {
         Ok(ReadOutcome::Read(bytes)) => crate::identity::utf8(bytes)?,
-        Ok(ReadOutcome::Skipped(e)) => return Err(e),
+        Ok(ReadOutcome::Exited(e) | ReadOutcome::Hidden(e)) => return Err(e),
         Ok(ReadOutcome::Refused(refusal)) => {
             return Err(refusal.unsupported_io(format!("reading pid {pid}'s cgroup")));
         }
-        Err(unreadable) => return Err(io::Error::other(unreadable)),
+        // The failure with the one that came with it, as layers of the chain.
+        Err(unreadable) => {
+            return Err(crate::error::io_context_over(
+                format!("reading pid {pid}'s cgroup"),
+                unreadable.into_cause(),
+            ))
+        }
     };
     let path = parse_v2_relative_path(&text)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cgroup v2 `0::` line"))?;
@@ -435,6 +440,9 @@ pub(crate) fn front_placement(
     untraceable_cgroup_readable(kernel).map_err(refusal)
 }
 
+/// What the spawn's error says of a probe that failed.
+const PROBING: &str = "probing whether /proc shows the cgroup of a process this one may not trace";
+
 /// The spawn's refusal for `why` the cgroup of a process this one may not trace is unreadable,
 /// on a kernel with no `PIDFD_GET_INFO`.
 fn refusal(why: Unreadable) -> crate::error::Error {
@@ -456,11 +464,10 @@ fn refusal(why: Unreadable) -> crate::error::Error {
             ),
             Some(Arc::new(refusal.cause())),
         ),
-        Unreadable::Read(unreadable) => unreadable.into_cause(),
-        Unreadable::Probe(e) => crate::error::Error::Io(crate::error::io_context(
-            "probing whether /proc shows the cgroup of a process this one may not trace",
-            e,
-        )),
+        Unreadable::Read(unreadable) => {
+            crate::error::Error::Io(crate::error::io_context_over(PROBING, unreadable.into_cause()))
+        }
+        Unreadable::Probe(e) => crate::error::Error::Io(crate::error::io_context(PROBING, e)),
     }
 }
 
@@ -982,7 +989,7 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
             "the probe's child could not ask to die with its parent",
         )))),
         // The child is this process's own and unreaped, so its `/proc` entry exists: a read that
-        // skips it, as the read of a scan does, is `/proc` hiding it. The read is by the child's
+        // is not shown it is `/proc` hiding it. The read is by the child's
         // number, so it counts only if the child, which its pidfd names, had not exited by the time
         // it was made: an exited child may be reaped elsewhere and its number taken.
         Ok(2) => {
@@ -992,15 +999,16 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
             // A `/proc` that hides the child answers `ENOENT` under `hidepid=2`, `EPERM` under
             // `hidepid=1` (measured on Linux 7.0); a test forces one as the `openat2`'s answer.
             #[cfg(test)]
-            let hiding = super::fault::proc_hidden_as()
-                .map(|errno| crate::identity::FakeKernel::over(kernel).on_read(&format!("{child}/cgroup"), Err(errno)));
+            let hiding = super::fault::hidden_cgroup_of(kernel, child);
             #[cfg(test)]
             let kernel: &dyn crate::identity::Kernel = hiding
                 .as_ref()
                 .map_or(kernel, |hiding| hiding as &dyn crate::identity::Kernel);
             let read = match pid_file::read(kernel, &proc_dir, child, "cgroup") {
                 Ok(ReadOutcome::Read(bytes)) => crate::identity::utf8(bytes).map(drop).map_err(Unreadable::Probe),
-                Ok(ReadOutcome::Skipped(e)) => Err(Unreadable::Hidden(e)),
+                Ok(ReadOutcome::Hidden(e)) => Err(Unreadable::Hidden(e)),
+                // The child is unreaped, so an exit is no `hidepid`: the peek below says so too.
+                Ok(ReadOutcome::Exited(e)) => Err(Unreadable::Probe(e)),
                 Ok(ReadOutcome::Refused(refusal)) => Err(Unreadable::Refused(refusal)),
                 Err(unreadable) => Err(Unreadable::Read(unreadable)),
             };

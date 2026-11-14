@@ -28,7 +28,7 @@ pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid
         let stat = match pid_file::read(kernel, &dir, pid, "stat") {
             Ok(ReadOutcome::Read(stat)) => stat,
             // The process exited between the listing and the read, or `hidepid` hides it.
-            Ok(ReadOutcome::Skipped(e)) => {
+            Ok(ReadOutcome::Exited(e) | ReadOutcome::Hidden(e)) => {
                 log::debug!(
                     "enumerate::process_parents: {pid}/stat unreadable ({report}); omitting it",
                     report = crate::error::Report(&e)

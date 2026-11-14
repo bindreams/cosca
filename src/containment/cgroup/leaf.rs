@@ -124,7 +124,8 @@ enum StateUnknown {
     /// `/proc` is an outer pid namespace's, or could not be verified to be this process's own.
     View(crate::identity::ViewUnreadable),
     /// The pid exited, or `hidepid` hides it: [`pid_file::read`](crate::identity::pid_file::read)
-    /// skipped it. The error is why.
+    /// answered [`Exited`](crate::identity::pid_file::ReadOutcome::Exited) or
+    /// [`Hidden`](crate::identity::pid_file::ReadOutcome::Hidden). The error is why.
     Skipped(std::io::Error),
     /// `<pid>/stat` could not be read: the `openat2` was refused. The error says what cosca requires.
     Refused(crate::error::Error),
@@ -175,7 +176,7 @@ fn read_proc_state(kernel: &dyn crate::identity::Kernel, pid: u32) -> Result<cha
         .map_err(StateUnknown::View)?;
     match pid_file::read(kernel, &proc_dir, pid, "stat") {
         Ok(ReadOutcome::Read(stat)) => state_from_stat(stat),
-        Ok(ReadOutcome::Skipped(e)) => Err(StateUnknown::Skipped(e)),
+        Ok(ReadOutcome::Exited(e) | ReadOutcome::Hidden(e)) => Err(StateUnknown::Skipped(e)),
         Ok(ReadOutcome::Refused(refusal)) => Err(StateUnknown::Refused(
             refusal.unsupported(format!("reading pid {pid}'s stat")),
         )),

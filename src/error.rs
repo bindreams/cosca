@@ -658,9 +658,20 @@ pub(crate) fn io_context(context: impl Into<String>, source: std::io::Error) -> 
         source.kind(),
         IoContext {
             context: context.into(),
-            source,
+            source: Box::new(source),
         },
     )
+}
+
+/// [`io_context`] over a cause that is an [`Error`], of kind [`Other`](std::io::ErrorKind::Other). The
+/// cause is a layer of the chain, so [`Report`] prints every member of a list: std's `io::Error` skips
+/// its payload as a layer, and a list held as that payload would show its first member only.
+#[cfg(target_os = "linux")]
+pub(crate) fn io_context_over(context: impl Into<String>, cause: Error) -> std::io::Error {
+    std::io::Error::other(IoContext {
+        context: context.into(),
+        source: Box::new(cause),
+    })
 }
 
 /// [`io_context`] for a cause that may be absent: without one, an `io::Error` of kind
@@ -841,7 +852,7 @@ pub(crate) fn io_said(cause: impl std::fmt::Display) -> String {
 #[derive(Debug)]
 struct IoContext {
     context: String,
-    source: std::io::Error,
+    source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 impl std::fmt::Display for IoContext {
@@ -852,7 +863,7 @@ impl std::fmt::Display for IoContext {
 
 impl std::error::Error for IoContext {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        Some(&*self.source)
     }
 }
 

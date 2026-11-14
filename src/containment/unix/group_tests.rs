@@ -726,6 +726,27 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
     }
 }
 
+/// `EPERM` whose re-check of the checked directory fails without refusing is the re-check's own error,
+/// with the pid's `EPERM` kept as a second cause. Mutant: "the pid's `EPERM` is dropped".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn members_keeps_the_pids_eperm_when_the_checked_directory_fails_without_refusing() {
+    let kernel =
+        FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(libc::EMFILE));
+    let err =
+        members(&kernel, i32::MAX).expect_err("a pid whose stat is refused and whose re-check fails lists nothing");
+    let text = crate::error::said(&err);
+    assert!(text.contains("re-check of self/stat failed"), "{text}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EMFILE), "{text}");
+    let (_, second) = text
+        .split_once("(2) ")
+        .unwrap_or_else(|| panic!("the second failure is kept: {text}"));
+    assert!(
+        second.contains(&std::io::Error::from_raw_os_error(libc::EPERM).to_string()),
+        "the pid's EPERM is the second cause: {text}"
+    );
+}
+
 /// An `openat2` refused after the view opened (a seccomp filter installed mid-scan) is the same host
 /// condition as a refused view-open: `ErrorKind::Unsupported` naming `openat2`, with the refusing
 /// errno as the source and the pid's own failure, which names the pid, as a second cause when the

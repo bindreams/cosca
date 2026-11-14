@@ -137,6 +137,31 @@ fn the_warn_of_a_failed_stat_read_says_the_os_error() {
     );
 }
 
+/// `EPERM` whose re-check of the checked directory fails without refusing is `Unassessable` saying the
+/// re-check failed, over its own errno, with the pid's `EPERM` kept as a second cause. Mutant: "the
+/// pid's `EPERM` is dropped".
+#[skuld::test]
+fn eperm_is_unassessable_with_its_peer_when_the_checked_directory_fails_without_refusing() {
+    let kernel =
+        FakeKernel::listing_unreadable_pid(&HostKernel, PID, libc::EPERM).on_read("self/stat", Err(libc::EMFILE));
+    let Err(error @ crate::error::Error::Unassessable { .. }) = process_parents(&kernel) else {
+        panic!("expected Unassessable");
+    };
+    let text = crate::error::said(&error);
+    assert!(text.contains("re-check of self/stat failed"), "{text}");
+    let crate::error::Error::Unassessable {
+        source: Some(source), ..
+    } = &error
+    else {
+        unreachable!()
+    };
+    let crate::error::Error::Several(causes) = &**source else {
+        panic!("expected Several, got {source:?}");
+    };
+    let codes: Vec<_> = causes.iter().map(|c| crate::error::first_os_code(&**c)).collect();
+    assert_eq!(codes, [Some(libc::EMFILE), Some(libc::EPERM)], "{text}");
+}
+
 /// An `openat2` refused after the view opened (a seccomp filter installed mid-scan) is the same host
 /// condition as a refused view-open: `Unsupported` naming `openat2`, with the refusing errno as the
 /// source, and warned about. The refusal shows as the pid's `stat` answering `ENOSYS`/`ENODEV`, or as
