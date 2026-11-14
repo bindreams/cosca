@@ -8,9 +8,11 @@
 //! Each spawn runs on both backends: argv (std) and `executable()` (raw `CreateProcessW`). With the
 //! `tokio` feature, the async API gets the same two legs where a helper process matters.
 //!
-//! The death tests (`death_watch_*`, a descriptive name only) wait on a process handle with no
-//! timeout of their own; the suite's `slow-timeout` in `.config/nextest.toml` bounds them, so a containment
-//! that stops working fails the test instead of hanging the job.
+//! The two frozen-child tests (`death_watch_contained_frozen_child_*` and
+//! `death_watch_async_contained_frozen_child_*`) wait on the frozen child's process handle with no
+//! timeout. Precondition: the child dies when the helper's death closes the job (the documented
+//! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`). cosca mutants fail from the helper's own report, before
+//! the wait.
 
 #[cfg(windows)]
 use std::io::Write;

@@ -90,8 +90,11 @@ fn assert_ends_closed(ends: Option<fault::Ends>, what: &str) -> fault::Ends {
 
 // Normal spawns =====
 
-/// Mutant: a handshake that leaves the child held forever (the spawn hangs: bounded by the suite
-/// slow-timeout) or aborts it.
+/// Mutants, each failing an assertion: the handshake aborts the child (`success`, `program_ran`);
+/// it forks more than once (`spawns`); the spawning thread keeps its copy of the child's end, or the
+/// helper does not read EOF (`assert_ends_closed`). The helper shuts the parent's end on every exit,
+/// so a handshake that holds the child for good is
+/// `an_undelivered_go_ahead_fails_the_spawn_and_ends_the_childs_wait`'s mutant.
 #[skuld::test]
 fn a_normal_spawn_runs_the_program_and_forks_once() {
     let (mut cmd, reader) = marker_command();
@@ -265,7 +268,9 @@ fn only_a_closed_end_makes_an_undelivered_go_mean_gone() {
 /// A go-ahead the parent could not send fails the spawn naming why, and the waiting child still
 /// reads EOF although a process forked without `exec` holds a copy of the parent's end.
 ///
-/// Mutants: the helper does not shut the parent's end (the child would wait forever on the copy);
+/// Mutants: the helper does not shut the parent's end (`probe_shut`, in
+/// `HelperSeams::record_parent_end_shut`, finds it open and shuts it, so the child's wait ends;
+/// the assertion on the recorded `parent_end_shut` fails);
 /// every send error is taken as the child being gone (the error would be the child's abort).
 #[skuld::test]
 fn an_undelivered_go_ahead_fails_the_spawn_and_ends_the_childs_wait() {
@@ -396,8 +401,7 @@ fn a_later_hook_failure_leaves_nothing_to_kill() {
 /// A child whose hook fails before it reports ends the helper at EOF, and the spawn reports the
 /// child's error.
 ///
-/// Mutant: the spawning thread keeps its copy of the child's end open past `spawn()` (the helper
-/// then never reads EOF).
+/// Mutant: the spawning thread keeps its copy of the child's end open; `assert_ends_closed` fails.
 #[skuld::test]
 fn a_child_that_fails_before_reporting_ends_the_spawn() {
     let (mut cmd, reader) = marker_command();
@@ -419,8 +423,9 @@ fn a_child_that_fails_before_reporting_ends_the_spawn() {
 /// As above, with a process forked without `exec` holding a copy of the child's end: the helper
 /// still reads EOF, because the parent shuts its own end for reading, not just closes the child's.
 ///
-/// Mutant: the parent does not force EOF after a failed spawn (the helper would wait forever on
-/// the copy).
+/// Mutant: the parent does not force EOF after a failed spawn. The end probe ends the helper's
+/// read, and the assertion that the helper must read EOF once the wait for the child is over
+/// fails.
 #[skuld::test]
 fn eof_reaches_the_helper_through_a_forked_copy_of_the_childs_end() {
     let (mut cmd, reader) = marker_command();
@@ -445,8 +450,9 @@ fn eof_reaches_the_helper_through_a_forked_copy_of_the_childs_end() {
 /// A child killed before it reports, with a process forked without `exec` holding a copy of its
 /// end: `spawn()` returns, the child has exited, and the parent forces EOF so the helper reads it.
 ///
-/// Mutant: the parent never watches the child, so it never forces EOF (the helper would wait
-/// forever on the copy).
+/// Mutant: the parent never watches the child (`Watch::Exited` is taken as running), so it never
+/// forces EOF. The end probe ends the helper's read, and the same assertion fails: the helper must
+/// read EOF once the wait for the child is over.
 #[skuld::test]
 fn eof_reaches_the_helper_when_a_killed_child_leaves_a_forked_copy() {
     let (mut cmd, reader) = marker_command();
@@ -479,8 +485,9 @@ fn eof_reaches_the_helper_when_a_killed_child_leaves_a_forked_copy() {
 ///
 /// Runs in a process of its own: closing 1 and 2 is process-wide.
 ///
-/// Precondition: std returns from `spawn()` before the child's hooks run, so the child is gated
-/// inside `spawn()` until the release; a std that blocks until `exec` hangs the test, not fails it.
+/// Precondition on std, not a cosca mutant: `spawn()` returns before the child's hooks run, so the
+/// child is gated inside `spawn()` until the release. A std that blocks until `exec` would hold
+/// both the child and the release, and the test would not end.
 #[skuld::test]
 fn a_spawn_that_returns_before_the_hooks_run_still_runs_the_program() {
     use std::io::{Seek, Write};
@@ -676,7 +683,7 @@ fn a_number_that_names_no_child_forces_eof() {
 
 /// A spawn that fails before any fork still ends the helper thread: `run` returns.
 ///
-/// Mutant: the spawning thread keeps its copy of the child's end open (`run` hangs).
+/// Mutant: the spawning thread keeps its copy of the child's end open; `assert_ends_closed` fails.
 #[skuld::test]
 fn a_spawn_that_fails_before_the_fork_ends_the_helper() {
     let (_std_cmd, pending) = raw_command("true");
@@ -994,24 +1001,8 @@ fn fixture_unreported_death_init() {
     assert!(!program_ran(cmd, reader));
 }
 
-/// A panic in the verdict hook fails the test; it does not leave the helper parked at the hold
-/// where the scope waits for it.
-///
-/// Mutant: the gate is opened only after the hook returns. This test then hangs, bounded by the
-/// suite slow-timeout; `the_verdict_hook_runs_under_a_guard_that_opens_the_hold` fails at once.
-#[skuld::test]
-#[should_panic(expected = "the verdict hook panicked on purpose")]
-fn a_panicking_verdict_hook_fails_the_spawn_instead_of_hanging_it() {
-    let (mut cmd, _reader) = marker_command();
-    let armed = fault::arm_child_fault(ChildFault::SigkillAfterReport);
-    let held = fault::hold_verdict_until_spawn_returns(|_| panic!("the verdict hook panicked on purpose"));
-    drop(cmd.spawn());
-    drop(held);
-    drop(armed);
-}
-
-/// The verdict hook runs while a guard that opens the held verdict on unwind is live. This is the
-/// fast twin of the test above: without the guard, that one can only hang.
+/// The verdict hook runs while a guard that opens the held verdict on unwind is live, so a panic
+/// in the hook fails the test instead of leaving the helper parked at the hold.
 ///
 /// Mutant: the gate is opened only after the hook returns.
 #[skuld::test]

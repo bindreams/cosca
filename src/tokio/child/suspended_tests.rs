@@ -1048,8 +1048,9 @@ mod on_windows {
         }
     }
 
-    /// A command used for `spawn_suspended` and then for `spawn` yields a running child. A child
-    /// that stayed frozen never exits, so the wait is bounded by the suite slow-timeout.
+    /// A command used for `spawn_suspended` and then for `spawn` yields a running child.
+    ///
+    /// Mutant: the second spawn is left frozen; the suspend-count assertion fails, before the wait.
     #[skuld::test]
     async fn death_watch_the_command_spawns_an_ordinary_child_after_a_frozen_one() {
         let mut cmd = blocker(false);
@@ -1058,6 +1059,11 @@ mod on_windows {
         // A spawn takes the stdio configuration out of the command, so the second one is given its own.
         cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
         let mut child = cmd.spawn().await.expect("an ordinary spawn");
+        assert_eq!(
+            InitialThread::of(child.pid()).suspend_count(),
+            0,
+            "the spawn after a frozen one must run"
+        );
         drop(child.stdin().expect("piped stdin"));
 
         let status = child.wait().await.expect("await the exit");

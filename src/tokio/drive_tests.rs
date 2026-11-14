@@ -329,20 +329,27 @@ mod windows {
     use crate::containment::TreeDrain;
     use crate::os_process::open;
     use crate::test_child::live_blocker as blocker;
-    use crate::test_child::{let_member_exit, spawn_job_member, spawn_job_with_two_members};
-    use crate::tokio::test_runtime::single_thread_pool_runtime;
+    use crate::test_child::{
+        let_member_exit, spawn_job_gui_member, spawn_job_member, spawn_job_with_two_members, Parked,
+    };
+    use crate::tokio::test_runtime::{single_thread_pool_runtime, watched_pool_runtime};
     use crate::wait::test_clock::FrozenClockGuard;
     use crate::wait::{instant_near_ceiling, wait_ms_probe, TOKIO_TIMER_ROUNDING_MARGIN};
 
     /// Two children awaited together, the first exiting only after the second's wait has returned,
     /// both complete: the first's wait does not hold the pool the second's would need.
     ///
-    /// Mutant: an exit wait runs on the blocking pool.
+    /// The pool thread is watched ([`watched_pool_runtime`]): the test asserts after the join that
+    /// no exit wait blocked on it.
+    ///
+    /// Mutant: an exit wait runs on the blocking pool. The pool thread blocks, the hook counts it
+    /// and releases both children, and the join ends; the assertion fails.
     #[skuld::test]
     fn two_awaited_children_do_not_queue_behind_each_other() {
-        let rt = single_thread_pool_runtime();
         let (first, first_stdin, first_id) = blocker();
         let (second, second_stdin, second_id) = blocker();
+        let (first_stdin, second_stdin) = (Parked::new(first_stdin), Parked::new(second_stdin));
+        let (rt, pool_blocks) = watched_pool_runtime(vec![first_stdin.clone(), second_stdin.clone()]);
         let first_process = open(first_id).unwrap().expect("a live process opens");
         let second_process = open(second_id).unwrap().expect("a live process opens");
         rt.block_on(async {
@@ -350,25 +357,33 @@ mod windows {
             ::tokio::join!(
                 async { assert!(super::exited_held(&*first_process, None).await.unwrap()) },
                 async {
-                    drop(second_stdin);
+                    second_stdin.release();
                     assert!(super::exited_held(&*second_process, None).await.unwrap());
-                    drop(first_stdin);
+                    first_stdin.release();
                 },
             );
         });
         first.wait().expect("reap the first");
         second.wait().expect("reap the second");
+        pool_blocks.assert_none();
     }
 
     /// A task awaiting a child's exit does not stop a spawn from completing.
     ///
-    /// Mutant: an exit wait runs on the blocking pool, which the spawn needs.
+    /// The spawn runs on the blocking pool and reaches no block site: the pool thread is
+    /// watched ([`watched_pool_runtime`]), and the test asserts after the join that no exit wait
+    /// blocked on it.
+    ///
+    /// Mutant: an exit wait runs on the blocking pool, which the spawn needs. The pool thread blocks,
+    /// the hook counts it and releases the parked child, and the spawn completes; the assertion
+    /// fails.
     #[skuld::test]
     fn an_awaited_child_does_not_stop_a_spawn_from_completing() {
         use crate::test_child::{held_writer_stdin, tokio_command, Console, BLOCKER_ARGV};
 
-        let rt = single_thread_pool_runtime();
         let (parked, parked_stdin, parked_id) = blocker();
+        let parked_stdin = Parked::new(parked_stdin);
+        let (rt, pool_blocks) = watched_pool_runtime(vec![parked_stdin.clone()]);
         let parked_process = open(parked_id).unwrap().expect("a live process opens");
         rt.block_on(async {
             ::tokio::join!(
@@ -381,35 +396,41 @@ mod windows {
                     let mut spawned = cmd.spawn().await.expect("the spawn completes beside the wait");
                     drop(writer);
                     spawned.wait().await.expect("wait for the spawned child");
-                    drop(parked_stdin);
+                    parked_stdin.release();
                 },
             );
         });
         parked.wait().expect("reap the parked child");
+        pool_blocks.assert_none();
     }
 
     /// A job's drain wait and a process wait together complete: neither holds the pool the other
-    /// would need.
+    /// would need. The pool thread is watched ([`watched_pool_runtime`]): the test asserts after the
+    /// join that no exit wait blocked on it.
     ///
-    /// Mutant: the drain wait or the process wait runs on the blocking pool.
+    /// Mutant: the drain wait or the process wait runs on the blocking pool. The pool thread blocks,
+    /// the hook counts it and releases both, and the join ends; the assertion fails.
     #[skuld::test]
     fn a_drain_wait_and_a_process_wait_complete_together() {
-        let rt = single_thread_pool_runtime();
         let (parked, parked_stdin, parked_id) = blocker();
-        let parked_process = open(parked_id).unwrap().expect("a live process opens");
         let (mut member, job) = spawn_job_member();
+        let member_stdin = Parked::new(member.stdin.take().expect("piped stdin"));
+        let parked_stdin = Parked::new(parked_stdin);
+        let (rt, pool_blocks) = watched_pool_runtime(vec![parked_stdin.clone(), member_stdin.clone()]);
+        let parked_process = open(parked_id).unwrap().expect("a live process opens");
         rt.block_on(async {
             ::tokio::join!(
                 async { assert!(super::exited_held(&*parked_process, None).await.unwrap()) },
                 async {
-                    drop(member.stdin.take());
+                    member_stdin.release();
                     assert_eq!(drain(&job, None).await, TreeDrain::AllMembersExited);
-                    drop(parked_stdin);
+                    parked_stdin.release();
                 },
             );
         });
         member.wait().expect("reap the member");
         parked.wait().expect("reap the parked child");
+        pool_blocks.assert_none();
     }
 
     /// The timeouts the process wait on `process` registers with the OS for one poll of
@@ -595,19 +616,46 @@ mod windows {
         assert_eq!(drain(&job, past).await, TreeDrain::AllMembersExited);
     }
 
-    /// A deadline that passes while a member runs answers `MembersRemain`, at or after it.
+    /// A deadline that passes while a member runs answers `MembersRemain`, and the round waits for it
+    /// (never early) instead of answering at once.
     ///
-    /// Mutant: the timer is not armed, so the wait never ends; or it answers before the deadline.
-    #[skuld::test]
+    /// Both clocks are frozen (tokio's paused, the OS-wait clock held), so the deadline is exactly
+    /// 50 ms off however long the setup took. The one member is the GUI-subsystem testbin, which
+    /// starts nothing, so a round registers one arm per handle and `[left, left]` means one member;
+    /// a `cmd /C more` member would add `more.com` and `conhost.exe`. The clock is then moved to
+    /// 10 ms short of the deadline, so the wait that times out must register again for the time
+    /// left, and the hook on the second arm moves the clock the rest of the way.
+    ///
+    /// Mutants: the timer is not armed, or armed for more than the deadline (an arm check fails);
+    /// the round answers before it has waited (the first poll is ready); it answers `MembersRemain`
+    /// at the first timeout without looking at the clock (no re-arm).
+    #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
     async fn a_drain_reports_members_remaining_at_its_deadline() {
-        let (member, job) = spawn_job_member();
-        let deadline = crate::tokio::wait::deadline_from(Duration::from_millis(50)).expect("a finite deadline");
-        assert_eq!(drain(&job, Some(deadline)).await, TreeDrain::MembersRemain);
-        assert!(
-            crate::tokio::wait::tokio_now() >= deadline,
-            "answered before its deadline"
+        let (member, job) = spawn_job_gui_member();
+        let (_clock, _now) = FrozenClockGuard::install();
+        let timeout = Duration::from_millis(50);
+        let left = Duration::from_millis(10);
+        let deadline = crate::tokio::wait::deadline_from(timeout).expect("a finite deadline");
+        wait_ms_probe::take();
+        let mut wait = pin!(drain(&job, Some(deadline)));
+        let first = wait.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        let arms = wait_ms_probe::take();
+        if first.is_ready() || arms.is_empty() || arms.iter().any(|arm| arm.requested != timeout) {
+            member.exit();
+            panic!("a running member is waited for under the deadline: first poll {first:?}, arms {arms:?}");
+        }
+        crate::wait::test_clock::advance(timeout - left);
+        wait_ms_probe::on_second_arm(move || crate::wait::test_clock::advance(left));
+        let verdict = wait.await;
+        let re_arms = wait_ms_probe::take();
+        member.exit();
+        assert_eq!(verdict, TreeDrain::MembersRemain);
+        let requested: Vec<_> = re_arms.iter().map(|arm| arm.requested).collect();
+        assert_eq!(
+            requested,
+            [left, left],
+            "the timed-out wait registered again for the time that was left, then once more until the clock arrived"
         );
-        let_member_exit(member);
     }
 
     /// An empty FIRST listing is no answer, as in the sync wait: the member is alive, in the job,

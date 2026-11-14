@@ -482,25 +482,13 @@ pub(crate) fn rearm_until<T, E>(
 #[cfg(unix)]
 pub(crate) fn any_ready_now(fds: &mut [rustix::event::PollFd<'_>]) -> Result<bool, rustix::io::Errno> {
     let zero = rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 };
-    loop {
-        match rustix::event::poll(fds, Some(&zero)) {
-            Ok(ready) => return Ok(ready > 0),
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(e),
-        }
-    }
+    rustix::io::retry_on_intr(|| rustix::event::poll(fds, Some(&zero))).map(|ready| ready > 0)
 }
 
 /// Blocks until `fds` has an event, retrying `EINTR`.
 #[cfg(unix)]
 pub(crate) fn poll_ready(fds: &mut [rustix::event::PollFd<'_>]) -> Result<(), rustix::io::Errno> {
-    loop {
-        match rustix::event::poll(fds, None) {
-            Ok(_) => return Ok(()),
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(e),
-        }
-    }
+    rustix::io::retry_on_intr(|| rustix::event::poll(fds, None)).map(|_| ())
 }
 
 /// Run `wait` (one Win32 wait, armed with the `ms` it is given) until it returns something other

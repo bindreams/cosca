@@ -509,7 +509,7 @@ enum AtTheLook {
 
 /// The fault that makes the front's place read fail, once armed, parked so that
 /// [`AtTheLook::ReadsThePlaceAgain`] can end it.
-type Unreadable = Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>;
+type Unreadable = crate::test_child::Parked;
 
 /// What differs between the drops [`assert_drop_kills_the_leaf_and_reaps_the_front`] makes.
 struct FrontDrop {
@@ -537,8 +537,8 @@ fn fail_the_place_read_from_the_kill(unreadable: &Unreadable) -> Box<dyn std::an
     use crate::containment::cgroup::fault;
 
     let arming = fault::set_before_kill_write({
-        let unreadable = Arc::clone(unreadable);
-        move || *unreadable.lock().expect("lock") = Some(Box::new(fault::fail_pidfd_info()))
+        let unreadable = unreadable.clone();
+        move || unreadable.hold(fault::fail_pidfd_info())
     });
     let running = crate::elevation::front::seams::read_front_running_at_every_reach_read();
     Box::new((arming, running))
@@ -573,7 +573,7 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(
     crate::containment::cgroup::fault::record_leaf_steps();
     child.proc.script_over(|fake| fake.reaps(drop_of.reaps)).on_look({
         let awaited = Arc::clone(&awaited);
-        let unreadable = Arc::clone(&unreadable);
+        let unreadable = unreadable.clone();
         let at_the_look = drop_of.at_the_look;
         move |_| {
             if !crate::containment::cgroup::fault::peek_leaf_steps()
@@ -587,7 +587,7 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(
                     crate::test_child::wait_until_zombie(pid);
                     awaited.store(true, Ordering::SeqCst);
                 }
-                AtTheLook::ReadsThePlaceAgain => drop(unreadable.lock().expect("lock").take()),
+                AtTheLook::ReadsThePlaceAgain => unreadable.release(),
             }
         }
     });
@@ -595,7 +595,7 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(
     let warns = slow_warns_during(|| {
         let _fault = fault(&unreadable);
         drop(child);
-        drop(unreadable.lock().expect("lock").take());
+        unreadable.release();
     });
     let steps = crate::containment::cgroup::fault::take_leaf_steps();
     release.assert_killed();
