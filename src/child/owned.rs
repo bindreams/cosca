@@ -404,7 +404,7 @@ impl OwnedChild {
     /// Whether the child has exited by `deadline` (`None`: for ever), read through the OS's own look
     /// ([`OsProcess::exited`](crate::os_process::OsProcess::exited)): a zombie its tracer holds
     /// counts, and so does one launchd holds. On macOS, while another process is the parent the look
-    /// reads the zombie itself and the wait re-looks with the driver's backoff (`MacChild::exited`
+    /// reads the zombie itself and the wait re-looks with the driver's backoff (`MacosChild::exited`
     /// says why). A tracer that attaches during the wait wakes it, through the wait's own kqueue
     /// ([`OsProcess::exit_wait`](crate::os_process::OsProcess::exit_wait)).
     /// Reaps nothing: during a graceful tree shutdown the root stays an unreaped zombie until the

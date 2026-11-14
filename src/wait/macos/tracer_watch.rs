@@ -30,7 +30,7 @@ use std::time::Duration;
 
 #[cfg(not(test))]
 use crate::identity::link;
-use crate::identity::{uniq_info, Link, ReadPurpose, UniqRead, LAUNCHD};
+use crate::identity::{uniq_info, Kernel, Link, ReadPurpose, UniqRead, LAUNCHD};
 use crate::os_process::macos::kqueue::{Event, Kqueue, Subscription};
 
 /// The backoff's first interval after a walk finds a tracer gone, and its cap.
@@ -86,14 +86,14 @@ impl TracerWatch {
     /// launchd, has not necessarily released the child yet, so the wait checks again: at once the
     /// first time, then after 1 ms, doubling to 50 ms, with no cap on rounds, while walks keep
     /// finding one. Each wake re-checks the child and walks again; the elapsed time decides nothing.
-    pub(crate) fn held_by(&mut self, kq: &Kqueue, tracer: u32) -> Result<OnTracer, WalkError> {
+    pub(crate) fn held_by(&mut self, kernel: &dyn Kernel, kq: &Kqueue, tracer: u32) -> Result<OnTracer, WalkError> {
         let me = std::process::id();
         let mut walked = Vec::new();
         let mut fresh = false;
         let mut at = tracer;
         while !walked.contains(&at) {
             walked.push(at);
-            let (unique, parent, at_attach) = match link(at) {
+            let (unique, parent, at_attach) = match link(kernel, at) {
                 Link::Found {
                     unique,
                     parent,
@@ -112,12 +112,12 @@ impl TracerWatch {
             };
             if !self.armed.contains(&(at, unique)) {
                 self.disarm(kq, at)?;
-                match arm(kq, at) {
+                match kernel.subscribe(kq, watched(at)) {
                     Ok(()) => {}
                     Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => return Ok(self.gone()),
-                    Err(e) => return Err(WalkError::Watch(e.into_io())),
+                    Err(e) => return Err(WalkError::Watch(e)),
                 }
-                match uniq_info(at, ReadPurpose::Link) {
+                match uniq_info(kernel, at, ReadPurpose::Link) {
                     UniqRead::Found(info) if info.unique_id == unique => {}
                     UniqRead::Found(_) | UniqRead::Gone => {
                         // The registration may name another process: deleted, so a later one attaches.
@@ -203,15 +203,10 @@ fn refused(pid: u32, errno: i32) -> WalkError {
     ))
 }
 
-/// Subscribes to `pid`'s exit and signals.
-fn arm(kq: &Kqueue, pid: u32) -> Result<(), crate::error::Error> {
-    kq.subscribe(watched(pid))
-}
-
 /// [`crate::identity::link`], or the answer a test queued for it.
 #[cfg(test)]
-fn link(pid: u32) -> Link {
-    seams::take_link().unwrap_or_else(|| crate::identity::link(pid))
+fn link(kernel: &dyn Kernel, pid: u32) -> Link {
+    seams::take_link().unwrap_or_else(|| crate::identity::link(kernel, pid))
 }
 
 /// Test seams.

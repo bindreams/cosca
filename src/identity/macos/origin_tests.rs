@@ -1,6 +1,7 @@
 //! `origin`: whether a pid was forked by this process, before its unique id is known.
 
 use super::{origin, Origin};
+use crate::identity::HostKernel;
 
 /// A child of this process, untraced, is ours by its parent.
 ///
@@ -14,7 +15,7 @@ fn a_child_of_this_process_is_ours() {
     let mut child = cmd.spawn().expect("spawn cat");
     drop(guard);
     assert_eq!(
-        origin(child.id()),
+        origin(&HostKernel, child.id()),
         Origin::Ours {
             parent: std::process::id()
         }
@@ -30,7 +31,7 @@ fn a_child_of_this_process_is_ours() {
 fn the_parent_of_this_process_is_not_ours() {
     // SAFETY: `getppid` has no preconditions.
     let parent = unsafe { libc::getppid() } as u32;
-    assert_eq!(origin(parent), Origin::NotOurs);
+    assert_eq!(origin(&HostKernel, parent), Origin::NotOurs);
 }
 
 /// A process created before this one is not ours, though its `p_oppid` names this process's pid: an
@@ -42,7 +43,7 @@ fn a_stale_parent_at_attach_does_not_make_an_older_process_ours() {
     // SAFETY: `getppid` has no preconditions.
     let parent = unsafe { libc::getppid() } as u32;
     super::kinfo::fault::force_oppid_once(std::process::id() as libc::pid_t);
-    assert_eq!(origin(parent), Origin::NotOurs);
+    assert_eq!(origin(&HostKernel, parent), Origin::NotOurs);
 }
 
 /// A live `cat` child of this test on a held stdin, and the stdin. Dropping the stdin ends it.
@@ -71,11 +72,11 @@ fn a_pid_with_no_process_is_gone() {
     let (child, stdin) = live_child();
     {
         let _gone = uniq_fault::force_uniq_read_once(ReadPurpose::Origin, UniqRead::Gone);
-        assert_eq!(origin(child.id()), Origin::Gone);
+        assert_eq!(origin(&HostKernel, child.id()), Origin::Gone);
     }
     {
         let _gone = uniq_fault::force_uniq_read_once(ReadPurpose::Link, UniqRead::Gone);
-        assert_eq!(link(child.id()), Link::Gone);
+        assert_eq!(link(&HostKernel, child.id()), Link::Gone);
     }
     end(child, stdin);
 }
@@ -89,11 +90,11 @@ fn a_refused_unique_id_read_is_refused() {
     let (child, stdin) = live_child();
     {
         let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Origin, UniqRead::Refused(libc::EPERM));
-        assert_eq!(origin(child.id()), Origin::Refused(libc::EPERM));
+        assert_eq!(origin(&HostKernel, child.id()), Origin::Refused(libc::EPERM));
     }
     {
         let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Link, UniqRead::Refused(libc::EPERM));
-        assert_eq!(link(child.id()), Link::Refused(libc::EPERM));
+        assert_eq!(link(&HostKernel, child.id()), Link::Refused(libc::EPERM));
     }
     end(child, stdin);
 }
@@ -106,9 +107,9 @@ fn a_refused_kinfo_read_is_unreadable() {
     use super::{link, Link};
     let (child, stdin) = live_child();
     super::kinfo::fault::force_unreadable_once();
-    assert_eq!(origin(child.id()), Origin::Unreadable);
+    assert_eq!(origin(&HostKernel, child.id()), Origin::Unreadable);
     super::kinfo::fault::force_unreadable_once();
-    assert_eq!(link(child.id()), Link::Unreadable);
+    assert_eq!(link(&HostKernel, child.id()), Link::Unreadable);
     end(child, stdin);
 }
 
@@ -119,11 +120,11 @@ fn a_refused_kinfo_read_is_unreadable() {
 fn an_untraced_child_links_to_this_process() {
     use super::{link, uniq_info, Link, ReadPurpose, UniqRead};
     let (child, stdin) = live_child();
-    let UniqRead::Found(info) = uniq_info(child.id(), ReadPurpose::Kill) else {
+    let UniqRead::Found(info) = uniq_info(&HostKernel, child.id(), ReadPurpose::Kill) else {
         panic!("the child's unique id must be readable")
     };
     assert_eq!(
-        link(child.id()),
+        link(&HostKernel, child.id()),
         Link::Found {
             unique: info.unique_id,
             parent: std::process::id(),

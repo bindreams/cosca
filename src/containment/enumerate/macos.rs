@@ -57,7 +57,7 @@ fn ppid_of(pid: libc::c_int) -> Resolved<RawPid> {
     if fault::is_denied(pid) {
         return Resolved::Unknown;
     }
-    crate::identity::macos_ppid_of(pid as RawPid)
+    crate::identity::macos_ppid_of(&crate::identity::HostKernel, pid as RawPid)
 }
 
 /// Buffer capacity, in PIDS, for a sizing answer of `needed` pids.

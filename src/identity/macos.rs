@@ -11,47 +11,20 @@
 //! the sysctl fallback on a miss — and is reused whole by `containment::enumerate::macos`,
 //! rather than that module keeping a second `proc_pidinfo` call and a second copy of the
 //! zero-ppid guard ([`trusted_ppid`]) next to a duplicated `kinfo_proc` layout.
+//!
+//! Every call goes through the [`Kernel`](kernel::Kernel). The calls are Darwin's: `proc_pidinfo`,
+//! `sysctl` and `waitid` are the same on its other OSes, but the platform cosca supports is macOS
+//! (`target_os = "macos"`), the only Darwin OS on which an application may spawn processes.
 
 use std::time::{Duration, SystemTime};
 
 use super::{Key, Liveness, OrderedRead, ParentRead, RawPid, Resolved, UnknownCause};
+use kernel::Kernel;
 
+#[path = "macos/kernel.rs"]
+pub(crate) mod kernel;
 #[path = "macos/kinfo.rs"]
 pub(crate) mod kinfo;
-
-fn bsd_info(pid: RawPid) -> Option<libc::proc_bsdinfo> {
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: proc_pidinfo writes up to `size` bytes into `info`; pointer and size match.
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        )
-    };
-    if n == size {
-        return Some(info);
-    }
-    if n <= 0 {
-        let e = std::io::Error::last_os_error();
-        match e.raw_os_error() {
-            // Expected misses: gone/zombie (ESRCH) or an unprivileged cross-user query
-            // (EPERM) — the sysctl fallback covers both.
-            Some(libc::ESRCH) | Some(libc::EPERM) => {}
-            _ => contract_violation(format_args!(
-                "proc_pidinfo({pid}) failed: {report}",
-                report = crate::error::Report(&e)
-            )),
-        }
-        return None;
-    }
-    // 0 < n < size: a partial record — never trust it.
-    contract_violation(format_args!("proc_pidinfo({pid}) wrote {n} bytes, expected {size}"));
-    None
-}
 
 /// The shared contract-violation disposition for BOTH identity sources: trace FIRST (so
 /// the warn executes in every build mode), then the debug tripwire.
@@ -176,7 +149,7 @@ fn pidinfo<T>(pid: RawPid, flavor: libc::c_int, buf: &mut T) -> Result<(), ReadE
 
 /// `pid`'s unique id through `proc_pidinfo(PROC_PIDUNIQIDENTIFIERINFO)`. Unprivileged for any
 /// user's process, and it sees zombies.
-pub(crate) fn uniq_info(pid: RawPid, purpose: ReadPurpose) -> UniqRead {
+pub(crate) fn uniq_info(kernel: &dyn Kernel, pid: RawPid, purpose: ReadPurpose) -> UniqRead {
     #[cfg(test)]
     uniq_fault::note(purpose);
     #[cfg(test)]
@@ -185,16 +158,7 @@ pub(crate) fn uniq_info(pid: RawPid, purpose: ReadPurpose) -> UniqRead {
     }
     #[cfg(not(test))]
     let _ = purpose;
-    // SAFETY: all-zero is a valid `ProcUniqIdentifierInfo`.
-    let mut info: ProcUniqIdentifierInfo = unsafe { std::mem::zeroed() };
-    match pidinfo(pid, PROC_PIDUNIQIDENTIFIERINFO, &mut info) {
-        Ok(()) => UniqRead::Found(UniqInfo {
-            unique_id: info.p_uniqueid,
-            id_version: info.p_idversion,
-        }),
-        Err(ReadErr::Gone) => UniqRead::Gone,
-        Err(ReadErr::Refused(errno)) => UniqRead::Refused(errno),
-    }
+    kernel.unique_info(pid)
 }
 
 /// The calling process's own unique id, for a child to report before `exec`. **Async-signal-safe**:
@@ -238,8 +202,8 @@ pub(crate) enum Held {
 /// The parent pid of the process whose unique id is `expected`. The parent is read through
 /// `PROC_PIDT_SHORTBSDINFO`, between two unique-id reads: the same id before and after proves the
 /// parent read was of that process, because a unique id is never reused.
-pub(crate) fn held_by(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Held {
-    match short_read(pid, expected, purpose, short_ppid) {
+pub(crate) fn held_by(kernel: &dyn Kernel, pid: RawPid, expected: u64, purpose: ReadPurpose) -> Held {
+    match short_read(kernel, pid, expected, purpose, |pid| short_ppid(kernel, pid)) {
         Ok(ppid) => Held::Parent(ppid),
         Err(Mismatch::Other) => Held::Other,
         Err(Mismatch::Gone) => Held::Gone,
@@ -251,8 +215,8 @@ pub(crate) fn held_by(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Held 
 /// (`PROC_PIDT_SHORTBSDINFO`'s `SZOMB`) between two unique-id reads, as in [`held_by`]. A pid that
 /// names another process now, or none, has had its process reaped: exited. `Err` is the errno of a
 /// refused read.
-pub(crate) fn has_exited(pid: RawPid, expected: u64, purpose: ReadPurpose) -> Result<bool, i32> {
-    match short_read(pid, expected, purpose, short_status) {
+pub(crate) fn has_exited(kernel: &dyn Kernel, pid: RawPid, expected: u64, purpose: ReadPurpose) -> Result<bool, i32> {
+    match short_read(kernel, pid, expected, purpose, |pid| short_status(kernel, pid)) {
         Ok(status) => Ok(status == libc::SZOMB),
         Err(Mismatch::Other | Mismatch::Gone) => Ok(true),
         Err(Mismatch::Refused(errno)) => Err(errno),
@@ -272,6 +236,7 @@ enum Mismatch {
 /// `read` of `pid`, between two unique-id reads: the same id before and after proves the read was of
 /// the process whose unique id is `expected`, because a unique id is never reused.
 fn short_read<T>(
+    kernel: &dyn Kernel,
     pid: RawPid,
     expected: u64,
     purpose: ReadPurpose,
@@ -283,9 +248,9 @@ fn short_read<T>(
         UniqRead::Gone => Err(Mismatch::Gone),
         UniqRead::Refused(errno) => Err(Mismatch::Refused(errno)),
     };
-    same(uniq_info(pid, purpose))?;
+    same(uniq_info(kernel, pid, purpose))?;
     let read = read(pid);
-    same(uniq_info(pid, purpose))?;
+    same(uniq_info(kernel, pid, purpose))?;
     match read {
         Ok(read) => Ok(read),
         // The id matched before and after this read, so the process was in the pid hash at both
@@ -324,22 +289,22 @@ pub(crate) enum Origin {
 /// excludes a stale `p_oppid` left by an earlier holder of this process's pid: ids are allocated in
 /// increasing order and never reused, so only a process created after this one has a higher one.
 /// The `kinfo_proc` read is between two unique-id reads, as in [`held_by`].
-pub(crate) fn origin(pid: RawPid) -> Origin {
+pub(crate) fn origin(kernel: &dyn Kernel, pid: RawPid) -> Origin {
     let own = match own_unique_id() {
         Ok(own) => own,
         Err(errno) => return Origin::Refused(errno),
     };
-    let unique = match uniq_info(pid, ReadPurpose::Origin) {
+    let unique = match uniq_info(kernel, pid, ReadPurpose::Origin) {
         UniqRead::Found(info) => info.unique_id,
         UniqRead::Gone => return Origin::Gone,
         UniqRead::Refused(errno) => return Origin::Refused(errno),
     };
-    let info = match kinfo::kinfo(pid) {
+    let info = match kinfo::kinfo(kernel, pid) {
         Resolved::Found(info) => info,
         Resolved::Gone => return Origin::Gone,
         Resolved::Unknown => return Origin::Unreadable,
     };
-    match uniq_info(pid, ReadPurpose::Origin) {
+    match uniq_info(kernel, pid, ReadPurpose::Origin) {
         UniqRead::Found(again) if again.unique_id == unique => {}
         UniqRead::Found(_) => return Origin::NotOurs,
         UniqRead::Gone => return Origin::Gone,
@@ -376,18 +341,18 @@ pub(crate) enum Link {
 /// The process `pid` names on a chain of tracers, and its parents: who holds it now, and who held
 /// it when a tracer attached. The `kinfo_proc` read is between two unique-id reads, as in
 /// [`held_by`].
-pub(crate) fn link(pid: RawPid) -> Link {
-    let unique = match uniq_info(pid, ReadPurpose::Link) {
+pub(crate) fn link(kernel: &dyn Kernel, pid: RawPid) -> Link {
+    let unique = match uniq_info(kernel, pid, ReadPurpose::Link) {
         UniqRead::Found(info) => info.unique_id,
         UniqRead::Gone => return Link::Gone,
         UniqRead::Refused(errno) => return Link::Refused(errno),
     };
-    let info = match kinfo::kinfo(pid) {
+    let info = match kinfo::kinfo(kernel, pid) {
         Resolved::Found(info) => info,
         Resolved::Gone => return Link::Gone,
         Resolved::Unknown => return Link::Unreadable,
     };
-    match uniq_info(pid, ReadPurpose::Link) {
+    match uniq_info(kernel, pid, ReadPurpose::Link) {
         UniqRead::Found(again) if again.unique_id == unique => Link::Found {
             unique,
             parent: info.e_ppid() as RawPid,
@@ -405,20 +370,16 @@ pub(crate) enum ReadErr {
     Refused(i32),
 }
 
-fn short_ppid(pid: RawPid) -> Result<u32, ReadErr> {
+fn short_ppid(kernel: &dyn Kernel, pid: RawPid) -> Result<u32, ReadErr> {
     #[cfg(test)]
     if let Some(forced) = ppid_fault::take() {
         return forced;
     }
-    // SAFETY: all-zero is a valid `ProcBsdShortInfo`.
-    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
-    pidinfo(pid, libc::PROC_PIDT_SHORTBSDINFO, &mut info).map(|()| info.pbsi_ppid)
+    kernel.short_bsd(pid).map(|info| info.pbsi_ppid)
 }
 
-fn short_status(pid: RawPid) -> Result<u32, ReadErr> {
-    // SAFETY: all-zero is a valid `ProcBsdShortInfo`.
-    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
-    pidinfo(pid, libc::PROC_PIDT_SHORTBSDINFO, &mut info).map(|()| info.pbsi_status)
+fn short_status(kernel: &dyn Kernel, pid: RawPid) -> Result<u32, ReadErr> {
+    kernel.short_bsd(pid).map(|info| info.pbsi_status)
 }
 
 /// Forces [`uniq_info`] of a purpose below the syscall.
@@ -561,17 +522,17 @@ impl Record {
 }
 
 /// One read of `pid`'s record, the one read behind the by-pid start key and the parent pid:
-/// `proc_pidinfo` first, and when it misses (libproc-invisible: gone, a ZOMBIE, or EPERM-hidden)
-/// the sysctl, which alone resolves the latter two and distinguishes an empty reply (gone) from a
-/// failure (unknown). The key and the parent pid are of the one record.
-fn read_record(pid: RawPid) -> Resolved<Record> {
-    if let Some(info) = bsd_info(pid) {
+/// `proc_pidinfo` first (`arg = 1`, which reads a zombie too), and when it misses (gone, or
+/// EPERM-hidden) the sysctl, which alone resolves the latter and distinguishes an empty reply (gone)
+/// from a failure (unknown). The key and the parent pid are of the one record.
+fn read_record(kernel: &dyn Kernel, pid: RawPid) -> Resolved<Record> {
+    if let Ok(info) = kernel.bsd_info(pid) {
         return Resolved::Found(Record {
             key: token_of_bsd(&info),
             raw_ppid: info.pbi_ppid,
         });
     }
-    kinfo::kinfo(pid).map(|info| Record {
+    kinfo::kinfo(kernel, pid).map(|info| Record {
         key: token_of_kinfo(&info),
         raw_ppid: info.e_ppid() as RawPid,
     })
@@ -588,19 +549,19 @@ fn by_pid<T>(pid: RawPid, read: impl FnOnce() -> Resolved<T>) -> Resolved<T> {
     read()
 }
 
-pub(super) fn start_token(pid: RawPid) -> Resolved<Key> {
-    by_pid(pid, || read_record(pid).map(|record| record.key))
+pub(super) fn start_token(kernel: &dyn Kernel, pid: RawPid) -> Resolved<Key> {
+    by_pid(pid, || read_record(kernel, pid).map(|record| record.key))
 }
 
 /// The key, with no order key, and, when `ask_parent`, the parent pid of `pid`, from one record.
 /// With `ask_parent`, waits out a parent pid that `fork()` is still filling in ([`ppid_of`]);
 /// without, reads the record once. `expected`: see
 /// [`ProcessId::of_ordered_with`](super::ProcessId::of_ordered_with).
-pub(super) fn ordered_read(pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
+pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
     let read = if ask_parent {
-        by_pid(pid, || ppid_and_key(pid)).map(|(ppid, key)| (key, ParentRead::Is(ppid)))
+        by_pid(pid, || ppid_and_key(kernel, pid)).map(|(ppid, key)| (key, ParentRead::Is(ppid)))
     } else {
-        by_pid(pid, || read_record(pid)).map(|record| (record.key, ParentRead::NotAsked))
+        by_pid(pid, || read_record(kernel, pid)).map(|record| (record.key, ParentRead::NotAsked))
     };
     match read {
         Resolved::Found((key, parent)) => OrderedRead {
@@ -668,12 +629,12 @@ pub(crate) enum PpidRead {
 }
 
 /// One attempt: [`read_record`], whose parent pid is trusted or the attempt is `Forking`.
-fn read_ppid_once(pid: RawPid) -> PpidRead {
+fn read_ppid_once(kernel: &dyn Kernel, pid: RawPid) -> PpidRead {
     #[cfg(test)]
     if let Some(read) = fault::next_ppid_read(pid) {
         return read;
     }
-    match read_record(pid) {
+    match read_record(kernel, pid) {
         Resolved::Found(record) => match record.ppid(pid) {
             Some(ppid) => PpidRead::Found(ppid, record.key),
             None => PpidRead::Forking,
@@ -708,14 +669,14 @@ fn resolve_ppid(mut read: impl FnMut() -> PpidRead, mut pause: impl FnMut(u32)) 
 /// deterministic condition - a fork always finishes - so it has neither a count cap nor a
 /// deadline; the pid exiting meanwhile ends it as `Gone`. `Gone` is only returned when the
 /// fallback itself positively confirms the pid no longer exists.
-pub(crate) fn ppid_of(pid: RawPid) -> Resolved<RawPid> {
-    ppid_and_key(pid).map(|(ppid, _)| ppid)
+pub(crate) fn ppid_of(kernel: &dyn Kernel, pid: RawPid) -> Resolved<RawPid> {
+    ppid_and_key(kernel, pid).map(|(ppid, _)| ppid)
 }
 
 /// [`ppid_of`], with the start key of the record the parent pid was read from: the parent and the
 /// identity of the process it was read for come from one read, so they describe the same process.
-pub(super) fn ppid_and_key(pid: RawPid) -> Resolved<(RawPid, Key)> {
-    resolve_ppid(|| read_ppid_once(pid), fork_pause)
+pub(super) fn ppid_and_key(kernel: &dyn Kernel, pid: RawPid) -> Resolved<(RawPid, Key)> {
+    resolve_ppid(|| read_ppid_once(kernel, pid), fork_pause)
 }
 
 /// The pause before re-reading a pid whose `fork()` is still filling in its parent: yield first,
@@ -730,11 +691,11 @@ fn fork_pause(attempt: u32) {
 
 /// `proc_pidinfo` on self is always permitted, so the by-pid path cannot be denied here.
 pub(super) fn current_token() -> Resolved<Key> {
-    start_token(std::process::id())
+    start_token(&kernel::HostKernel, std::process::id())
 }
 
-pub(super) fn is_running(pid: RawPid, start: Key) -> Liveness {
-    if let Some(info) = bsd_info(pid) {
+pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, start: Key) -> Liveness {
+    if let Ok(info) = kernel.bsd_info(pid) {
         if token_of_bsd(&info) != start {
             return Liveness::Dead; // reused PID
         }
@@ -749,7 +710,7 @@ pub(super) fn is_running(pid: RawPid, start: Key) -> Liveness {
     // cross-user query — pid 1 on darwin CI proved a miss is NOT always gone-or-zombie).
     // The fallback keeps the same shape — token-guarded, zombie-EXCLUSIVE via `p_stat` —
     // and a kinfo layout drift fails safe to the pre-fix answer (token mismatch => false).
-    match kinfo::kinfo(pid) {
+    match kinfo::kinfo(kernel, pid) {
         Resolved::Found(info) => {
             // A reused PID names a different process; SZOMB is exited-but-unreaped. Both
             // are "not running", and neither is an unassessable read.

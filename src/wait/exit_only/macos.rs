@@ -5,9 +5,9 @@
 
 use std::io;
 
-use crate::identity::{held_by, uniq_info, Held, ReadPurpose, UniqRead, LAUNCHD};
+use crate::identity::{held_by, uniq_info, Held, Kernel, ReadPurpose, UniqRead, LAUNCHD};
 
-use super::{exit_record_of, is_exit_record, Reap, Record, Target};
+use super::{exit_record_of, is_exit_record, Reap, Target};
 use crate::os_process::child::{Foreign, PeekOutcome};
 
 fn pid_and_unique(target: &Target<'_>) -> (u32, Option<u64>) {
@@ -16,42 +16,17 @@ fn pid_and_unique(target: &Target<'_>) -> (u32, Option<u64>) {
     }
 }
 
-/// One `waitid(P_PID, pid, options)`. `Ok(None)` when nothing matched: XNU leaves a `siginfo_t`
-/// untouched then (`kern_exit.c:3364-3380`), so it is zeroed first and `si_pid == 0` means none.
-pub(crate) fn waitid_record(pid: u32, options: libc::c_int) -> io::Result<Option<Record>> {
-    // SAFETY: `siginfo_t` is plain old data; all-zero is a valid value.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    loop {
-        // SAFETY: `info` is a valid, writable `siginfo_t` for the whole call.
-        let r = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, options) };
-        if r == 0 {
-            break;
-        }
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::EINTR) {
-            return Err(e);
-        }
-    }
-    if info.si_pid == 0 {
-        return Ok(None);
-    }
-    Ok(Some(Record {
-        si_code: info.si_code,
-        si_status: info.si_status,
-    }))
-}
-
 fn is_echild(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::ECHILD)
 }
 
-/// The non-consuming look: `waitid(WEXITED | WNOHANG | WNOWAIT)`, with no start check.
-fn peek_raw(pid: u32) -> io::Result<PeekOutcome> {
+/// The non-consuming look, `kernel`'s peek, with no start check.
+fn peek_raw(kernel: &dyn Kernel, pid: u32) -> io::Result<PeekOutcome> {
     #[cfg(test)]
     if let Some(forced) = super::seams::take_forced_peek() {
         return forced;
     }
-    match waitid_record(pid, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) {
+    match kernel.peek(pid) {
         Ok(Some(record)) if is_exit_record(record.si_code) => Ok(PeekOutcome::Exit(exit_record_of(record))),
         Ok(_) => Ok(PeekOutcome::Running),
         Err(e) if is_echild(&e) => Ok(PeekOutcome::Foreign(Foreign::Gone)),
@@ -68,8 +43,8 @@ enum IdCheck {
     Unreadable(i32),
 }
 
-fn check_unique(pid: u32, unique: u64, purpose: ReadPurpose) -> IdCheck {
-    match uniq_info(pid, purpose) {
+fn check_unique(kernel: &dyn Kernel, pid: u32, unique: u64, purpose: ReadPurpose) -> IdCheck {
+    match uniq_info(kernel, pid, purpose) {
         UniqRead::Found(now) if now.unique_id == unique => IdCheck::Matches,
         UniqRead::Found(_) => IdCheck::Other,
         UniqRead::Gone => IdCheck::Gone,
@@ -77,25 +52,29 @@ fn check_unique(pid: u32, unique: u64, purpose: ReadPurpose) -> IdCheck {
     }
 }
 
-pub(super) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
-    peek_with(target, false)
+pub(super) fn peek(kernel: &dyn Kernel, target: &Target<'_>) -> io::Result<PeekOutcome> {
+    peek_with(kernel, target, false)
 }
 
 /// [`peek`]; with `verified`, a `Running` child whose id cannot be read is an error.
-pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<PeekOutcome> {
-    peek_holder(target, verified).map(|(peeked, _)| peeked)
+pub(super) fn peek_with(kernel: &dyn Kernel, target: &Target<'_>, verified: bool) -> io::Result<PeekOutcome> {
+    peek_holder(kernel, target, verified).map(|(peeked, _)| peeked)
 }
 
 /// [`peek_with`], and the tracer that holds the child when the verdict is `Running` because a
 /// process other than this one and launchd holds it.
-pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(PeekOutcome, Option<u32>)> {
+pub(super) fn peek_holder(
+    kernel: &dyn Kernel,
+    target: &Target<'_>,
+    verified: bool,
+) -> io::Result<(PeekOutcome, Option<u32>)> {
     let (pid, unique) = pid_and_unique(target);
-    let peeked = peek_raw(pid)?;
+    let peeked = peek_raw(kernel, pid)?;
     let Some(unique) = unique else {
         return Ok((peeked, None));
     };
     match peeked {
-        PeekOutcome::Exit(_) => match check_unique(pid, unique, ReadPurpose::Peek) {
+        PeekOutcome::Exit(_) => match check_unique(kernel, pid, unique, ReadPurpose::Peek) {
             IdCheck::Matches => Ok((peeked, None)),
             IdCheck::Other => Ok((PeekOutcome::Foreign(Foreign::Other), None)),
             IdCheck::Gone => Ok((PeekOutcome::Foreign(Foreign::Gone), None)),
@@ -109,7 +88,7 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
         },
         // `waitid` found a child of ours that has not exited. A foreign reap followed by a reuse
         // of the pid by another child of ours also looks like this, so the id decides.
-        PeekOutcome::Running => match check_unique(pid, unique, ReadPurpose::Running) {
+        PeekOutcome::Running => match check_unique(kernel, pid, unique, ReadPurpose::Running) {
             IdCheck::Other => Ok((PeekOutcome::Foreign(Foreign::Other), None)),
             // `waitid` found the child running and the id read finds no such process: it was
             // reaped in between, so nothing is left to call running.
@@ -135,7 +114,7 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
         // (see `Foreign::fate`). The sync child's later `wait` or `try_wait` still reaps the zombie
         // if that hand-back ever comes. A spawn that meets it fails with its child `Gone`, and its
         // child (dropped) is not reaped by pid, so a hand-back leaves the zombie.
-        PeekOutcome::Foreign(Foreign::Gone) => match held_by(pid, unique, ReadPurpose::Echild) {
+        PeekOutcome::Foreign(Foreign::Gone) => match held_by(kernel, pid, unique, ReadPurpose::Echild) {
             Held::Other => Ok((PeekOutcome::Foreign(Foreign::Other), None)),
             Held::Parent(ppid) if ppid == LAUNCHD => Ok((PeekOutcome::Foreign(Foreign::Orphaned), None)),
             // A tracer detached between the two reads: our child again.
@@ -155,18 +134,18 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
     }
 }
 
-/// The consuming `waitid(WEXITED | WNOHANG)`. `Ok(None)` when it finds nothing.
-fn consume(pid: u32) -> io::Result<Option<Record>> {
+/// The consuming `kernel.consume`. `Ok(None)` when it finds nothing.
+fn consume(kernel: &dyn Kernel, pid: u32) -> io::Result<Option<crate::identity::Record>> {
     #[cfg(test)]
     if super::seams::take_forced_empty_reap() {
         return Ok(None);
     }
-    waitid_record(pid, libc::WEXITED | libc::WNOHANG).map(|r| r.map(super::consumed))
+    kernel.consume(pid).map(|r| r.map(super::consumed))
 }
 
-pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
+pub(super) fn try_reap(kernel: &dyn Kernel, target: &Target<'_>) -> io::Result<Reap> {
     let (pid, unique) = pid_and_unique(target);
-    match peek(target)? {
+    match peek(kernel, target)? {
         PeekOutcome::Exit(_) => {}
         PeekOutcome::Running => return Ok(Reap::Running),
         PeekOutcome::Foreign(f) => return Ok(Reap::Foreign(f)),
@@ -174,11 +153,11 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     // Our own zombie's unique id, read before the first reap: the first reap does not change it
     // (`proc_reparentlocked` returns early when the parent is unchanged, `kern_exit.c:3411`),
     // and the second peek checks it.
-    let second_unique = unique.or_else(|| match uniq_info(pid, ReadPurpose::PreReap) {
+    let second_unique = unique.or_else(|| match uniq_info(kernel, pid, ReadPurpose::PreReap) {
         UniqRead::Found(now) => Some(now.unique_id),
         UniqRead::Gone | UniqRead::Refused(_) => None,
     });
-    let first = match consume(pid) {
+    let first = match consume(kernel, pid) {
         Ok(Some(record)) => exit_record_of(record),
         // A by-pid consume is never pinned: a foreign reap between the peek and here, then a
         // reuse of the pid by a child that is still running, finds nothing. A reuser that is our
@@ -188,7 +167,7 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
         Err(e) if is_echild(&e) => return Ok(Reap::Foreign(Foreign::Gone)),
         Err(e) => return Err(e),
     };
-    second_reap(pid, second_unique);
+    second_reap(kernel, pid, second_unique);
     Ok(Reap::Reaped(first))
 }
 
@@ -200,10 +179,10 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
 ///
 /// The first status is already in hand, so nothing here panics: every outcome is a quiet skip
 /// or a `warn`.
-pub(crate) fn second_reap(pid: u32, unique: Option<u64>) {
+pub(crate) fn second_reap(kernel: &dyn Kernel, pid: u32, unique: Option<u64>) {
     #[cfg(test)]
     super::seams::step(super::seams::HolderStep::SecondPeek);
-    match peek_raw(pid) {
+    match peek_raw(kernel, pid) {
         Ok(PeekOutcome::Exit(_)) => {}
         Ok(PeekOutcome::Running) => {
             log::debug!("second reap of pid {pid}: nothing to consume");
@@ -232,7 +211,7 @@ pub(crate) fn second_reap(pid: u32, unique: Option<u64>) {
         log::warn!("second reap of pid {pid}: no identity to check it against; a zombie may be left");
         return;
     };
-    match check_unique(pid, unique, ReadPurpose::SecondPeek) {
+    match check_unique(kernel, pid, unique, ReadPurpose::SecondPeek) {
         IdCheck::Matches => {}
         IdCheck::Other | IdCheck::Gone => {
             log::debug!("second reap of pid {pid}: the pid names another process now");
@@ -243,7 +222,7 @@ pub(crate) fn second_reap(pid: u32, unique: Option<u64>) {
             return;
         }
     }
-    match consume(pid) {
+    match consume(kernel, pid) {
         Ok(_) => {}
         Err(e) if is_echild(&e) => log::debug!("second reap of pid {pid}: already reaped elsewhere"),
         Err(e) => log::warn!(

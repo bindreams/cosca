@@ -8,6 +8,7 @@
 use std::process::{Child, ChildStdin};
 use std::time::Duration;
 
+use crate::identity::HostKernel;
 use crate::os_process::child::PeekOutcome;
 use crate::os_process::macos::kqueue::{test_hooks, Kqueue};
 use crate::wait::exit_only::seams as exit_seams;
@@ -46,7 +47,10 @@ fn confirm_exit(child: &Child) {
 fn await_reapable_reports_a_zombie_and_leaves_it_reapable() {
     let (mut child, stdin) = spawn_blocker();
     drop(stdin);
-    assert_eq!(await_reapable(child.id(), None, None).expect("wait"), Waited::Reapable);
+    assert_eq!(
+        await_reapable(&HostKernel, child.id(), None, None).expect("wait"),
+        Waited::Reapable
+    );
     let status = child.wait().expect("the zombie must still be there to reap");
     assert!(status.success(), "{status:?}");
 }
@@ -62,7 +66,7 @@ fn await_reapable_at_a_past_deadline_takes_its_final_peek() {
     drop(stdin);
     confirm_exit(&child);
     let _running = exit_seams::force_peek_once(Ok(PeekOutcome::Running));
-    let waited = await_reapable(child.id(), None, Some(std::time::Instant::now())).expect("wait");
+    let waited = await_reapable(&HostKernel, child.id(), None, Some(std::time::Instant::now())).expect("wait");
     assert_eq!(waited, Waited::Reapable);
     let mut child = child;
     child.wait().expect("reap");
@@ -123,7 +127,7 @@ fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
         }
     });
     exit_seams::holder_steps();
-    let waited = await_reapable(child.id(), None, Some(deadline)).expect("wait");
+    let waited = await_reapable(&HostKernel, child.id(), None, Some(deadline)).expect("wait");
     assert_eq!(waited, Waited::DeadlinePassed);
     let timeouts = test_hooks::await_requested_timeouts();
     let blocking: Vec<Duration> = timeouts
@@ -164,7 +168,7 @@ fn an_interrupted_kevent_is_retried_with_the_time_remaining_now() {
             stall(Duration::from_millis(25));
         }
     });
-    let waited = await_reapable(child.id(), None, Some(at + Duration::from_millis(30))).expect("wait");
+    let waited = await_reapable(&HostKernel, child.id(), None, Some(at + Duration::from_millis(30))).expect("wait");
     assert_eq!(waited, Waited::DeadlinePassed);
     let timeouts = test_hooks::await_requested_timeouts();
     // The drain, the interrupted call, its retry, then the drain after expiry.
@@ -190,7 +194,7 @@ fn await_reapable_with_a_deadline_beyond_the_kevent_limit_returns_the_exit() {
     let _end = test_hooks::on_kevent_round(0, move || drop(stdin.take()));
     let deadline = crate::wait::deadline_from(Duration::from_secs(u64::from(u32::MAX)))
         .expect("a deadline this far is still finite");
-    let waited = await_reapable(child.id(), None, Some(deadline)).expect("a far deadline is not an error");
+    let waited = await_reapable(&HostKernel, child.id(), None, Some(deadline)).expect("a far deadline is not an error");
     assert_eq!(waited, Waited::Reapable);
     for armed in test_hooks::await_requested_timeouts() {
         let armed = armed.expect("a deadline wait arms a bounded kevent");
@@ -251,7 +255,10 @@ fn no_evfilt_proc_event_arrives_after_the_round_that_delivered_note_exit() {
     let _repeek = test_hooks::on_before_repeek(|| {
         std::mem::forget(exit_seams::force_peek_once(Ok(PeekOutcome::Running)));
     });
-    assert_eq!(await_reapable(child.id(), None, None).expect("wait"), Waited::Reapable);
+    assert_eq!(
+        await_reapable(&HostKernel, child.id(), None, None).expect("wait"),
+        Waited::Reapable
+    );
     child.wait().expect("reap");
 
     let events = test_hooks::take_events();
@@ -337,7 +344,7 @@ fn a_macos_esrch_wait_follows_the_kernel_not_the_disposition() {
         crate::test_child::set_signal_ignored(libc::SIGCHLD, flip_to_ignored);
         drop(stdin.take());
     });
-    let waited = await_reapable(pid, None, None).expect("wait");
+    let waited = await_reapable(&HostKernel, pid, None, None).expect("wait");
     if expect_gone {
         assert_eq!(waited, Waited::Gone, "XNU reaped the child itself under SIG_IGN");
         assert_eq!(reap_by_number(pid), None, "there is nothing left to reap");
@@ -379,7 +386,7 @@ fn await_reapable_on_waits_out_a_caller_registration_that_got_esrch() {
     // The child exits only from inside the first blocking round, once the wait is about to sleep.
     let _end = test_hooks::on_kevent_round(0, move || drop(stdin.take()));
     // The first peek finds the child running (it is): the wait must then block, not spin.
-    let waited = await_reapable_on(&kq, pid, None, None).expect("wait");
+    let waited = await_reapable_on(&HostKernel, &kq, pid, None, None).expect("wait");
     assert_eq!(waited, Waited::Gone, "XNU reaped the child itself under SIG_IGN");
     std::mem::forget(child);
 }

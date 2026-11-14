@@ -264,9 +264,9 @@ fn a_nonexistent_program_fails_with_stds_io_error() {
 /// Mutant: `own_unique_id` reads another flavor or another pid.
 #[skuld::test]
 fn own_unique_id_is_the_unique_id_of_this_process() {
-    use crate::identity::{uniq_info, ReadPurpose, UniqRead};
+    use crate::identity::{uniq_info, HostKernel, ReadPurpose, UniqRead};
     let own = crate::identity::own_unique_id().expect("own id");
-    let UniqRead::Found(by_pid) = uniq_info(std::process::id(), ReadPurpose::Kill) else {
+    let UniqRead::Found(by_pid) = uniq_info(&HostKernel, std::process::id(), ReadPurpose::Kill) else {
         panic!("this process has a unique id")
     };
     assert_eq!(own, by_pid.unique_id);

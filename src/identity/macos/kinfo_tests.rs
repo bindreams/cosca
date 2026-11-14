@@ -1,6 +1,7 @@
 //! Layout/value oracles for the local kinfo_proc definition. macOS-only at runtime.
 
 use super::*;
+use crate::identity::HostKernel;
 
 // The kernel must agree with our struct size exactly: for a real one-record fetch, XNU
 // sets the written size to sizeof(struct kinfo_proc). (A NULL-buffer probe is NOT usable
@@ -73,7 +74,7 @@ fn contract_violation_traces_then_trips() {
 fn sysctl_token_matches_libproc_for_a_live_process() {
     let pid = std::process::id() as libc::c_int;
 
-    let crate::identity::Resolved::Found(ours) = kinfo(pid as super::super::RawPid) else {
+    let crate::identity::Resolved::Found(ours) = kinfo(&HostKernel, pid as super::super::RawPid) else {
         panic!("self resolves via sysctl");
     };
     let ours = {
@@ -181,7 +182,7 @@ fn sysctl_e_ppid_matches_libproc_across_the_live_process_table() {
         };
         let libproc_ppid = (n == size).then_some(info.pbi_ppid);
 
-        let sysctl_ppid = match kinfo(pid_raw) {
+        let sysctl_ppid = match kinfo(&HostKernel, pid_raw) {
             crate::identity::Resolved::Found(k) => Some(k.e_ppid() as super::super::RawPid),
             crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => None,
         };
@@ -244,7 +245,7 @@ fn p_flag_system_bit_matches_a_second_sysctl_query_and_libproc_disagrees_for_non
     const PROC_FLAG_SYSTEM: u32 = 1;
 
     // Positive: kernproc (pid 0), read via `kinfo()` (production code path, KERN_PROC_PID).
-    let crate::identity::Resolved::Found(k) = kinfo(0) else {
+    let crate::identity::Resolved::Found(k) = kinfo(&HostKernel, 0) else {
         panic!("pid 0 (kernproc) resolves via sysctl KERN_PROC_PID");
     };
     assert!(
@@ -304,7 +305,7 @@ fn p_flag_system_bit_matches_a_second_sysctl_query_and_libproc_disagrees_for_non
     // fails to resolve a foreign-uid pid without root, same as it fails for pid 0 above — so
     // only this test's own pid gets the `proc_pidinfo` cross-check, right below.
     for pid in [1, std::process::id() as libc::c_int] {
-        let crate::identity::Resolved::Found(k) = kinfo(pid as super::super::RawPid) else {
+        let crate::identity::Resolved::Found(k) = kinfo(&HostKernel, pid as super::super::RawPid) else {
             panic!("pid {pid} resolves via sysctl");
         };
         assert!(
@@ -346,7 +347,9 @@ fn exit_begun_is_p_wexit_or_a_zombie_and_no_other_flag() {
     assert!(exit_begun(running, P_WEXIT));
     assert!(exit_begun(zombie, 0));
 
-    let me = kinfo(std::process::id()).found().expect("this process resolves");
+    let me = kinfo(&HostKernel, std::process::id())
+        .found()
+        .expect("this process resolves");
     assert!(
         !exit_begun(me.kp_proc.p_stat, me.kp_proc.p_flag),
         "this process is running"

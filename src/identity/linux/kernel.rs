@@ -93,6 +93,49 @@ impl Kernel for HostKernel {
     }
 }
 
+/// Forwards every call through a pointer to a kernel, so a caller may hand a process a borrow, a
+/// `Box` or an `Arc` of one, as std's `Read` does for `&mut R` and `Box<R>`.
+macro_rules! forward_kernel {
+    ($([$pointer:ty: $($bound:tt)+])*) => {$(
+        impl<T: $($bound)+ + ?Sized> Kernel for $pointer {
+            fn pidfd_open(&self, target: Pid, flags: PidfdFlags) -> Result<OwnedFd, Errno> {
+                (**self).pidfd_open(target, flags)
+            }
+
+            fn pidfs_ino(&self, fd: BorrowedFd<'_>) -> Result<Option<u64>, Errno> {
+                (**self).pidfs_ino(fd)
+            }
+
+            fn open_proc(&self) -> Result<ProcDir, ProcOpenFailure> {
+                (**self).open_proc()
+            }
+
+            fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure> {
+                (**self).read(dir, path)
+            }
+
+            fn read_link(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure> {
+                (**self).read_link(dir, path)
+            }
+
+            fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure> {
+                (**self).pids(dir)
+            }
+
+            fn tids(&self, dir: &ProcDir, pid: u32) -> Result<Vec<u32>, ReadFailure> {
+                (**self).tids(dir, pid)
+            }
+
+            fn signal_probe(&self, target: Pid) -> Result<(), Errno> {
+                (**self).signal_probe(target)
+            }
+        }
+    )*};
+}
+
+// An `Arc<T>` is `Sync` only for a `T` that is `Send` too.
+forward_kernel!([&T: Kernel] [Box<T>: Kernel] [std::sync::Arc<T>: Kernel + Send]);
+
 #[cfg(test)]
 #[path = "kernel/fake.rs"]
 pub(crate) mod fake;

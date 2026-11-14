@@ -38,9 +38,16 @@ A question about a _pid_ and a question about a _process you hold_ go to differe
 
 The identity module asks the kernel through one interface, `Kernel` (`HostKernel` makes the calls;
 tests pass a `FakeKernel` of stated answers). The trait exists on every platform, so shared code
-takes `&dyn Kernel` with no `#[cfg]`; Linux's has the methods, and macOS's and Windows's have none
+takes `&dyn Kernel` with no `#[cfg]`; Linux's and macOS's have the methods, and Windows's has none
 yet. A method enters with its first caller. A read that a test answers takes `&dyn Kernel`; code
 that runs between fork and exec never does, and stays raw.
+
+The OS layer owns the kernel it asks. `os_process::open_with(kernel, id)` checks `id` through
+`&kernel` and, on macOS, moves the same kernel into the `MacosProcess` it returns; `MacosChild`
+takes its kernel the same way. Linux and Windows drop it once the open is done. A borrow, a `Box`
+and an `Arc` of a kernel are kernels, so the walks, which open one process per member from one
+borrowed kernel, pass `&dyn Kernel`, and tests move a `FakeKernel` in. `Process` and `OwnedChild`
+hold a `Box<dyn OsProcess>` or `Box<dyn OsChild>`: the kernel's type stops at the OS layer.
 
 The public types follow the same line:
 
@@ -116,12 +123,13 @@ In order:
      (`Child::commit_kill_on_drop`). `SuspendedChild::resume` runs it too; `# Errors` there has the
      split by arm. Windows and macOS still tear down by themselves for their other spawn failures;
      on macOS a refused kill leaves the child running, with a warn, until the macOS hand-back.
-   - Under `MacChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
-     kernel-view slice): `exit_only::{peek, peek_verified, peek_traced}` still consult the
-     `exit_only::seams` hook; five macOS tests need it, and `MacChild::event_pending` (a `cfg(test)`
-     accessor) goes with it. `LinuxProcess` no longer does. The macOS arm of the `unreadable` test
-     helper still answers through the thread-local `force_unknown` hook until that slice gives
-     macOS `Kernel` methods. That slice also removes
+   - Under `MacosChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
+     kernel-view slice): macOS's `Kernel` has its methods and is threaded through, but the
+     thread-local hooks still answer above it: `exit_only::{peek, peek_verified, peek_traced}` still
+     consult the `exit_only::seams` hook; five macOS tests need it, and `MacosChild::event_pending`
+     (a `cfg(test)` accessor) goes with it. `LinuxProcess` no longer does. The macOS arm of the
+     `unreadable` test helper still answers through the thread-local `force_unknown` hook until the
+     slices that convert them. Those slices also remove
      `block_probe::on_round` and `on_every_round`, the `cfg(test)` round hooks of `wait.rs`.
 2. **Elevation backends:** a black box that says what the tracked process is (the program, or a
    wrapper that outlives it) and what may be signalled. `Child` asks it; it stops knowing sudo,
@@ -158,8 +166,9 @@ In order:
    the async `Child` awaits them. What is
    left is to remove `child::fault::force_root_reads` and `force_next_root_read`, a
    thread-local hook that answers the root's identity read (`root_identity_now`) beside
-   `FakeKernel`: the root's read moves into `OwnedChild`, through the kernel it was built with, and
-   those tests state `FakeKernel` rows (owner, 2026-11-05: kept until then; needs
+   `FakeKernel`: the root's read moves into `OwnedChild`, which borrows the kernel its OS box owns
+   (`OsProcess::kernel()`, added with this move: nothing calls it before) for that one identity
+   read, and those tests state `FakeKernel` rows (owner, 2026-11-05: kept until then; needs
    [#877](https://github.com/bindreams/cosca/issues/877) on macOS). Beside them goes
    `containment::cgroup::fault::hide_proc` and `hide_proc_as`, a thread-local hook that makes the
    `<pid>/cgroup` reads of `proc_names` and of the placement probe fail through a `FakeKernel` of their own: the

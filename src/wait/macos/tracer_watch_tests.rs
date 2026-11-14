@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::{seams::force_links, OnTracer, TracerWatch, WalkError};
 use crate::child::spawn::identity_macos_tests::{other_unique_id, std_blocker_with_unique};
-use crate::identity::{uniq_fault, Link, ReadPurpose, UniqRead};
+use crate::identity::{uniq_fault, HostKernel, Link, ReadPurpose, UniqRead};
 use crate::os_process::macos::kqueue::test_hooks::{event_pending, send_signal};
 use crate::os_process::macos::kqueue::{Event, Kqueue};
 
@@ -73,7 +73,7 @@ fn registered(kq: &Kqueue, pid: u32) -> bool {
 
 /// One walk, which must not fail.
 fn walk(watch: &mut TracerWatch, kq: &Kqueue, tracer: u32) -> OnTracer {
-    watch.held_by(kq, tracer).expect("no read is refused")
+    watch.held_by(&HostKernel, kq, tracer).expect("no read is refused")
 }
 
 /// The identity error a walk that must fail on a read returned.
@@ -201,7 +201,11 @@ fn walks_that_find_a_tracer_gone_back_off_from_zero_doubling_to_50_ms() {
     let mut watch = TracerWatch::default();
     let _links = force_links([Link::Gone; 9]);
     let waits: Vec<_> = (0..9)
-        .map(|_| watch.held_by(&kq, u32::MAX - 1).expect("a gone tracer is no error"))
+        .map(|_| {
+            watch
+                .held_by(&HostKernel, &kq, u32::MAX - 1)
+                .expect("a gone tracer is no error")
+        })
         .collect();
     let expected = [0, 1, 2, 4, 8, 16, 32, 50, 50].map(|ms| OnTracer::Recheck(MS * ms));
     assert_eq!(waits, expected);
@@ -231,7 +235,11 @@ fn a_good_walk_resets_the_backoff() {
     let mut watch = TracerWatch::default();
     let _links = force_links([Link::Gone, Link::Gone, tracer.untraced(), Link::Gone]);
     let waits: Vec<_> = (0..4)
-        .map(|_| watch.held_by(&kq, tracer.pid()).expect("no read is refused"))
+        .map(|_| {
+            watch
+                .held_by(&HostKernel, &kq, tracer.pid())
+                .expect("no read is refused")
+        })
         .collect();
     let zero = OnTracer::Recheck(Duration::ZERO);
     assert_eq!(waits, [zero, OnTracer::Recheck(MS), zero, zero]);
@@ -247,7 +255,7 @@ fn a_refused_read_of_a_tracer_is_an_error() {
     let kq = Kqueue::new().expect("kqueue");
     let mut watch = TracerWatch::default();
     let _links = force_links([Link::Refused(libc::EPERM)]);
-    let err = identity_error(watch.held_by(&kq, u32::MAX - 1));
+    let err = identity_error(watch.held_by(&HostKernel, &kq, u32::MAX - 1));
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err}");
 }
@@ -260,7 +268,7 @@ fn an_unreadable_tracer_is_an_error() {
     let kq = Kqueue::new().expect("kqueue");
     let mut watch = TracerWatch::default();
     let _links = force_links([Link::Unreadable]);
-    let err = identity_error(watch.held_by(&kq, u32::MAX - 1));
+    let err = identity_error(watch.held_by(&HostKernel, &kq, u32::MAX - 1));
     assert!(err.to_string().contains("kinfo_proc refused"), "{err}");
 }
 
@@ -274,7 +282,7 @@ fn a_refused_re_read_after_the_registration_is_an_error() {
     let mut watch = TracerWatch::default();
     let _links = force_links([tracer.untraced()]);
     let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Link, UniqRead::Refused(libc::EPERM));
-    let err = identity_error(watch.held_by(&kq, tracer.pid()));
+    let err = identity_error(watch.held_by(&HostKernel, &kq, tracer.pid()));
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err}");
 }

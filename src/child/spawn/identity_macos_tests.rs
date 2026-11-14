@@ -9,7 +9,7 @@ use std::rc::Rc;
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::child::spawn::unique_report;
 use crate::error::Error;
-use crate::identity::{ppid_fault, uniq_fault, uniq_info, ReadPurpose, UniqInfo, UniqRead, LAUNCHD};
+use crate::identity::{ppid_fault, uniq_fault, uniq_info, HostKernel, ReadPurpose, UniqInfo, UniqRead, LAUNCHD};
 use crate::wait::exit_only::seams::force_peek_once;
 
 /// Waits for `pid` (a child of this test) to exit, then reaps it by pid, as a foreign reaper would.
@@ -85,7 +85,7 @@ pub(crate) fn vanished(err: &Error) -> bool {
 
 /// A child's unique id that differs from `pid`'s own.
 pub(crate) fn other_unique_id(pid: u32) -> UniqRead {
-    let UniqRead::Found(info) = uniq_info(pid, ReadPurpose::Kill) else {
+    let UniqRead::Found(info) = uniq_info(&HostKernel, pid, ReadPurpose::Kill) else {
         panic!("the child's unique id must be readable")
     };
     UniqRead::Found(UniqInfo {
@@ -375,7 +375,7 @@ pub(crate) fn arm_launchd_hold(
     writer: crate::PipeWriter,
 ) {
     pid.set(fault::spawn_pid());
-    let UniqRead::Found(info) = uniq_info(pid.get(), ReadPurpose::Kill) else {
+    let UniqRead::Found(info) = uniq_info(&HostKernel, pid.get(), ReadPurpose::Kill) else {
         panic!("the child's unique id must be readable")
     };
     drop(writer);
@@ -570,7 +570,7 @@ pub(crate) fn std_blocker_with_unique() -> (std::process::Child, std::process::C
     let mut child = cmd.spawn().expect("spawn the blocker");
     drop(guard);
     let stdin = child.stdin.take().expect("piped stdin");
-    let Ok(Some(unique)) = crate::signal::read_identity(child.id()) else {
+    let Ok(Some(unique)) = crate::signal::read_identity(&HostKernel, child.id()) else {
         panic!("the blocker's unique id must be readable")
     };
     (child, stdin, unique)

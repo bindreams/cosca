@@ -217,7 +217,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 Remains::collected(ChildFate::Gone),
             ),
             // A sync child's kill always verifies: the pidfd or the handle names it, and on macOS the
-            // unique id every production spawn adopts is held (`MacChild::new` takes it).
+            // unique id every production spawn adopts is held (`MacosChild::new` takes it).
             // Were it ever not, the child may still be running.
             Ok(crate::signal::Sent::Unverified) => {
                 debug_assert!(false, "a sync child's kill always verifies its target");
@@ -955,7 +955,7 @@ fn spawn_reported(
     };
     // A refused kqueue is the one way to fail, and the child is then reachable by its unique id alone.
     #[cfg(target_os = "macos")]
-    let owned = match crate::os_process::macos::child::MacChild::new(pid, unique) {
+    let owned = match crate::os_process::macos::child::MacosChild::new(crate::identity::HostKernel, pid, unique) {
         Ok(os) => {
             drop(child);
             OwnedChild::new(Box::new(os))
@@ -1204,7 +1204,7 @@ impl crate::containment::Root for LateTree {
                 source: None,
             });
         };
-        match crate::os_process::open_with(&crate::identity::HostKernel, id)
+        match crate::os_process::open_with(crate::identity::HostKernel, id)
             .map_err(crate::os_process::OpenFailure::into_open_error)?
         {
             Some(os) => os.signal(sig),
@@ -1217,7 +1217,10 @@ impl crate::containment::Root for LateTree {
             return crate::signal::RootState::Unpinned;
         }
         let target = crate::wait::exit_only::Target::pid(self.pid, Some(self.unique));
-        crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target))
+        crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(
+            &crate::identity::HostKernel,
+            &target,
+        ))
     }
 }
 
@@ -1456,7 +1459,7 @@ fn kill_and_reap_noting(
     use crate::wait::macos::Waited;
 
     let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
-    match via_audit_token(pid, Some(unique), Sig::Kill) {
+    match via_audit_token(&crate::identity::HostKernel, pid, Some(unique), Sig::Kill) {
         Ok(Sent::Delivered) => {
             // A fixture that only the kill would end is released here when no kill was sent.
             #[cfg(test)]
@@ -1523,13 +1526,14 @@ fn await_exit_warning(
     unique: u64,
     warn_after: Option<std::time::Duration>,
 ) -> std::io::Result<crate::wait::macos::Waited> {
+    use crate::identity::HostKernel;
     use crate::wait::macos::{await_reapable, Waited};
 
     // What the bounded look found, when it found the end: the unbounded wait answers it.
     crate::wait::teardown_warn::wait_warning(
         None,
         crate::wait::teardown_warn::Due::in_(warn_after),
-        |found, until| match await_reapable(pid, Some(unique), Some(until)) {
+        |found, until| match await_reapable(&HostKernel, pid, Some(unique), Some(until)) {
             Ok(Waited::DeadlinePassed) => false,
             done => {
                 *found = Some(done);
@@ -1537,7 +1541,7 @@ fn await_exit_warning(
             }
         },
         |after| warn_still_waiting(Some(pid), after),
-        |found| found.unwrap_or_else(|| await_reapable(pid, Some(unique), None)),
+        |found| found.unwrap_or_else(|| await_reapable(&HostKernel, pid, Some(unique), None)),
     )
 }
 
@@ -1575,6 +1579,7 @@ fn reap_verified(
     killed: bool,
     found: &mut Findings,
 ) -> ChildFate {
+    use crate::identity::HostKernel;
     use crate::os_process::child::{ExitRecord, Foreign, PeekOutcome};
     use crate::wait::exit_only::{peek_verified, try_reap, Reap};
 
@@ -1585,7 +1590,7 @@ fn reap_verified(
         }
         why.fate(killed)
     };
-    match peek_verified(target) {
+    match peek_verified(&HostKernel, target) {
         Err(e) => {
             found.notes.push(unverifiable(&crate::error::Report(&e)));
             found.failures.push(Error::io_cause(crate::error::io_context(
@@ -1601,7 +1606,7 @@ fn reap_verified(
         }
         Ok(PeekOutcome::Exit(_)) => {}
     }
-    match try_reap(target) {
+    match try_reap(&HostKernel, target) {
         Ok(Reap::Reaped(ExitRecord::Status(_))) => ChildFate::Reaped,
         // The consuming `waitid` collected the zombie, whatever it reported.
         Ok(Reap::Reaped(ExitRecord::Unreadable { si_code })) => {
@@ -2423,7 +2428,7 @@ pub(crate) fn resolve_identity(
         #[cfg(target_os = "linux")]
         let peeked = crate::wait::exit_only::peek(through);
         #[cfg(target_os = "macos")]
-        let peeked = crate::wait::exit_only::peek_verified(through);
+        let peeked = crate::wait::exit_only::peek_verified(kernel, through);
         match peeked {
             Ok(PeekOutcome::Running | PeekOutcome::Exit(_)) => (read, cause, Diagnosis::default()),
             // Orphaned: `Gone`, warned.

@@ -7,6 +7,7 @@
 //! and the token-vs-libproc / ppid-vs-libproc oracles (kinfo_tests.rs).
 
 use super::super::{RawPid, Resolved};
+use super::kernel::Kernel;
 
 /// `struct kinfo_proc` (LP64): `extern_proc` head + opaque `eproc` tail.
 #[repr(C)]
@@ -162,14 +163,14 @@ pub(crate) fn exit_begun(p_stat: libc::c_char, p_flag: libc::c_int) -> bool {
 /// a nonexistent pid (sysctl SUCCESS with `size == 0`); a real sysctl failure or a
 /// wrong-sized record is a contract violation and leaves a trace before the same `None`.
 /// EINTR retries, per the codebase convention.
-pub(crate) fn kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
+pub(crate) fn kinfo(kernel: &dyn Kernel, pid: RawPid) -> Resolved<kinfo_proc> {
     #[cfg(test)]
     if fault::take_unreadable() {
         return Resolved::Unknown;
     }
     #[cfg(test)]
     if let Some(oppid) = fault::take_oppid() {
-        return match read_record(pid, libc::KERN_PROC_PID) {
+        return match kernel.kinfo(pid) {
             Resolved::Found(mut info) => {
                 info.kp_proc.p_oppid = oppid;
                 Resolved::Found(info)
@@ -179,7 +180,7 @@ pub(crate) fn kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
     }
     #[cfg(test)]
     if let Some((oppid, ppid)) = fault::forced_parents(pid) {
-        return match read_record(pid, libc::KERN_PROC_PID) {
+        return match kernel.kinfo(pid) {
             Resolved::Found(mut info) => {
                 info.kp_proc.p_oppid = oppid;
                 info.set_e_ppid(ppid);
@@ -188,6 +189,11 @@ pub(crate) fn kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
             other => other,
         };
     }
+    kernel.kinfo(pid)
+}
+
+/// [`kinfo`] as the host kernel answers it: the `sysctl` itself.
+pub(super) fn host_kinfo(pid: RawPid) -> Resolved<kinfo_proc> {
     read_record(pid, libc::KERN_PROC_PID)
 }
 

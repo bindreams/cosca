@@ -122,7 +122,7 @@ pub(crate) fn child_named(pid: Option<u32>) -> String {
 /// tests' entry; the library opens through [`open_with`].
 #[cfg(test)]
 pub(crate) fn open(id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
-    open_with(&crate::identity::HostKernel, id).map_err(OpenFailure::into_open_error)
+    open_with(crate::identity::HostKernel, id).map_err(OpenFailure::into_open_error)
 }
 
 /// Why an [`open_with`] opened nothing and found nothing gone. It logs nothing: the caller that
@@ -156,26 +156,29 @@ impl OpenFailure {
     }
 }
 
-/// [`open`] through `kernel`: the one entry to the open, on every platform. Only Linux's
-/// [`Kernel`](crate::identity::Kernel) has methods yet; elsewhere `kernel` is not consulted.
-pub(crate) fn open_with(
-    kernel: &dyn crate::identity::Kernel,
+/// [`open`] through `kernel`: the one entry to the open, on every platform. The open checks `id`
+/// through `kernel`, and on macOS the process it returns owns the same `kernel`, so every later read
+/// of it asks that one. The kernel is as long-lived as the process: a borrow (what the walks pass,
+/// of one kernel they open every member from) gives a process that lives inside the walk. Linux
+/// and Windows consult the kernel for the open alone, as only Linux's
+/// [`Kernel`](crate::identity::Kernel) has methods there yet.
+pub(crate) fn open_with<'k, K: crate::identity::Kernel + Send + 'k>(
+    kernel: K,
     id: ProcessId,
-) -> Result<Option<Box<dyn OsProcess>>, OpenFailure> {
+) -> Result<Option<Box<dyn OsProcess + 'k>>, OpenFailure> {
     #[cfg(target_os = "linux")]
     {
-        Ok(linux::open::open_verified_with(kernel, id)?
-            .map(|pidfd| Box::new(linux::LinuxProcess::new(Some(id.pid()), pidfd)) as Box<dyn OsProcess>))
+        Ok(linux::open::open_verified_with(&kernel, id)?
+            .map(|pidfd| Box::new(linux::LinuxProcess::new(Some(id.pid()), pidfd)) as Box<dyn OsProcess + 'k>))
     }
     #[cfg(windows)]
     {
         let _ = kernel;
-        Ok(windows::WindowsProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess>))
+        Ok(windows::WindowsProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess + 'k>))
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = kernel;
-        Ok(macos::MacProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess>))
+        Ok(macos::MacosProcess::open(kernel, id)?.map(|p| Box::new(p) as Box<dyn OsProcess + 'k>))
     }
 }
 

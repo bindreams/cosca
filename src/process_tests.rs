@@ -42,7 +42,7 @@ fn process_is_send_and_sync() {
 fn open_pid_of_a_pid_that_cannot_be_queried_is_unassessable() {
     let (child, id) = crate::test_child::live_exiting_member();
     let (kernel, _guard) = crate::identity::unreadable(id.pid());
-    match Process::open_pid_with(&kernel, id.pid()) {
+    match Process::open_pid_with(kernel, id.pid()) {
         Err(Error::Unassessable { detail, .. }) => {
             assert!(
                 detail.contains(&format!("pid {} exists but could not be queried", id.pid())),
@@ -68,7 +68,7 @@ fn open_pid_with_opens_through_its_kernel() {
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(id.pid(), Ok(stand_in.into()))
         .on_pidfs_ino(id.pid(), Ok(Some(77)));
-    let opened = Process::open_pid_with(&kernel, id.pid()).expect("the open is not an error");
+    let opened = Process::open_pid_with(kernel, id.pid()).expect("the open is not an error");
     assert!(opened.is_some(), "the kernel's pidfd is the process");
     crate::test_child::release_unsignalled(child);
 }
@@ -86,7 +86,7 @@ fn open_pid_of_a_pid_whose_pidfd_call_failed_is_the_opens_error() {
     const PID: u32 = 4242;
     let refused = FakeKernel::new().on_pidfd_open(PID, Err(Errno::PERM));
     assert!(
-        matches!(Process::open_pid_with(&refused, PID), Err(Error::Unsupported { .. })),
+        matches!(Process::open_pid_with(refused, PID), Err(Error::Unsupported { .. })),
         "a refused pidfd_open"
     );
 
@@ -94,7 +94,7 @@ fn open_pid_of_a_pid_whose_pidfd_call_failed_is_the_opens_error() {
     let unreadable = FakeKernel::new()
         .on_pidfd_open(PID, Ok(stand_in.into()))
         .on_pidfs_ino(PID, Err(Errno::BADF));
-    let result = Process::open_pid_with(&unreadable, PID);
+    let result = Process::open_pid_with(unreadable, PID);
     let Err(e @ Error::Io(_)) = &result else {
         panic!("a failed inode read: expected Io, got {result:?}");
     };

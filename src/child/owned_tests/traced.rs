@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use crate::identity::{uniq_info, ReadPurpose, UniqRead};
+use crate::identity::{uniq_info, HostKernel, ReadPurpose, UniqRead};
 use crate::os_process::macos::kqueue::test_hooks;
 use crate::test_groups::{tracer_group, Group};
 use crate::test_support::tracer::{self, Mode, Report};
@@ -20,7 +20,7 @@ fn a_child_held_by_a_tracer_is_running_until_the_hand_back(#[fixture(tracer_grou
     let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
     let pid = tracee.pid();
-    let unique = match uniq_info(pid, ReadPurpose::Adopt) {
+    let unique = match uniq_info(&HostKernel, pid, ReadPurpose::Adopt) {
         UniqRead::Found(info) => info.unique_id,
         other => panic!("the tracee's unique id: {other:?}"),
     };
@@ -28,15 +28,21 @@ fn a_child_held_by_a_tracer_is_running_until_the_hand_back(#[fixture(tracer_grou
     assert_eq!(helper.recv(), Report::Attached);
 
     let target = Target::pid(pid, Some(unique));
-    assert_eq!(exit_only::try_reap(&target).expect("try_reap"), Reap::Running);
+    assert_eq!(
+        exit_only::try_reap(&HostKernel, &target).expect("try_reap"),
+        Reap::Running
+    );
     // An expired deadline: one look, no blocking.
-    let held = await_reapable(pid, Some(unique), Some(Instant::now())).expect("wait");
+    let held = await_reapable(&HostKernel, pid, Some(unique), Some(Instant::now())).expect("wait");
     assert_eq!(held, Waited::DeadlinePassed);
 
     drop(stdin);
     assert_eq!(helper.recv(), Report::Reaped);
     // The zombie is ours again: an unbounded wait sees the exit.
-    assert_eq!(await_reapable(pid, Some(unique), None).expect("wait"), Waited::Reapable);
+    assert_eq!(
+        await_reapable(&HostKernel, pid, Some(unique), None).expect("wait"),
+        Waited::Reapable
+    );
     drop(helper);
     let status = tracee.wait().expect("the handed-back zombie is ours to reap");
     assert!(status.success(), "{status:?}");
@@ -265,7 +271,7 @@ fn is_alive_during_the_grace_watch_does_not_swallow_its_wake(#[fixture(tracer_gr
 fn tracee_with_unique() -> (crate::Child, crate::PipeWriter, u64) {
     let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
-    let unique = match uniq_info(tracee.pid(), ReadPurpose::Adopt) {
+    let unique = match uniq_info(&HostKernel, tracee.pid(), ReadPurpose::Adopt) {
         UniqRead::Found(info) => info.unique_id,
         other => panic!("the tracee's unique id: {other:?}"),
     };

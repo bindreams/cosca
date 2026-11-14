@@ -30,6 +30,17 @@ fn host_signal_probe_is_ok_for_this_process_and_esrch_for_i32_max() {
     );
 }
 
+/// A kernel handed over as a borrow, a `Box` or an `Arc` answers as the one it points to.
+#[skuld::test]
+fn a_pointer_to_a_kernel_is_a_kernel() {
+    fn probes_itself(kernel: impl Kernel) -> Result<(), Errno> {
+        kernel.signal_probe(getpid())
+    }
+    assert_eq!(probes_itself(&HostKernel), Ok(()));
+    assert_eq!(probes_itself(Box::new(HostKernel)), Ok(()));
+    assert_eq!(probes_itself(std::sync::Arc::new(HostKernel)), Ok(()));
+}
+
 #[skuld::test]
 fn host_pidfd_open_opens_this_process_and_says_esrch_for_i32_max() {
     assert!(HostKernel.pidfd_open(getpid(), PidfdFlags::empty()).is_ok());

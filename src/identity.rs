@@ -323,9 +323,9 @@ impl OrderedRead {
 fn read_ordered(kernel: &dyn Kernel, pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
     #[cfg(all(test, target_os = "macos"))]
     seams::note_by_pid_read();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let read = backend::ordered_read(kernel, pid, expected, ask_parent);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     let read = {
         let _ = kernel;
         backend::ordered_read(pid, expected, ask_parent)
@@ -397,8 +397,7 @@ impl ProcessId {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = kernel;
-            let (read, cause) = start_token_explained(pid);
+            let (read, cause) = start_token_explained(kernel, pid);
             (read.map(|key| ProcessId { pid, key }), cause)
         }
     }
@@ -597,8 +596,7 @@ impl ProcessId {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = kernel;
-            let (read, cause) = start_token_explained(self.pid);
+            let (read, cause) = start_token_explained(kernel, self.pid);
             (self.existence_from(read), cause)
         }
     }
@@ -639,7 +637,11 @@ impl ProcessId {
         {
             backend::is_running(kernel, self.pid, self.key)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            backend::is_running(kernel, self.pid, self.key)
+        }
+        #[cfg(windows)]
         {
             let _ = kernel;
             backend::is_running(self.pid, self.key)
@@ -713,8 +715,17 @@ pub(crate) use backend::TERMINATE_EXIT_CODE as WINDOWS_TERMINATE_EXIT_CODE;
 #[cfg(target_os = "linux")]
 pub(crate) use backend::pid_file;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use backend::kernel::{HostKernel, Kernel};
+
+/// One `waitid` record: the `si_code` and `si_status` of the `siginfo_t`. What `waitid` answers on
+/// Linux and macOS, so it is the kernel's answer, beside [`Kernel`].
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Record {
+    pub(crate) si_code: i32,
+    pub(crate) si_status: i32,
+}
 
 #[cfg(target_os = "linux")]
 pub(crate) use backend::call_error;
@@ -728,20 +739,30 @@ pub(crate) use backend::refusal::{warn_refused, FailedCall, Refusal};
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::kernel::PIDFD_THREAD;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 pub(crate) use no_reads::{HostKernel, Kernel};
 
-/// The [`Kernel`] of the platforms whose reads no test answers yet.
-#[cfg(not(target_os = "linux"))]
+/// The [`Kernel`] of the platform whose reads no test answers yet.
+#[cfg(windows)]
 mod no_reads {
     /// What cosca asks the kernel about processes, so shared code takes one `&dyn Kernel` on every
-    /// platform. No methods yet: one enters with its first caller in the macOS or Windows backend.
+    /// platform. No methods yet: one enters with its first caller in the Windows backend.
     pub(crate) trait Kernel: Sync {}
 
     /// The real kernel.
     pub(crate) struct HostKernel;
 
     impl Kernel for HostKernel {}
+
+    /// A borrow, a `Box` or an `Arc` of a kernel is one, as on the platforms whose kernels have methods.
+    macro_rules! forward_kernel {
+        ($([$pointer:ty: $($bound:tt)+])*) => {$(
+            impl<T: $($bound)+ + ?Sized> Kernel for $pointer {}
+        )*};
+    }
+
+    // An `Arc<T>` is `Sync` only for a `T` that is `Send` too.
+    forward_kernel!([&T: Kernel] [Box<T>: Kernel] [std::sync::Arc<T>: Kernel + Send]);
 }
 
 #[cfg(all(target_os = "linux", test))]
@@ -947,8 +968,15 @@ impl UnknownCause {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn start_token_explained(pid: RawPid) -> (Resolved<Key>, UnknownCause) {
-    (backend::start_token(pid), UnknownCause::default())
+fn start_token_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Key>, UnknownCause) {
+    #[cfg(target_os = "macos")]
+    let token = backend::start_token(kernel, pid);
+    #[cfg(windows)]
+    let token = {
+        let _ = kernel;
+        backend::start_token(pid)
+    };
+    (token, UnknownCause::default())
 }
 
 /// macOS test seams.
@@ -1059,9 +1087,8 @@ pub(crate) fn ticks_id(pid: RawPid) -> ProcessId {
         .expect("a live pid has a starttime")
 }
 
-/// [`unreadable`] on macOS. The guard is what makes the reads refuse: `Kernel` has no macOS
-/// methods yet, so the thread-local `force_unknown` hook answers in the kernel's place until it
-/// drops.
+/// [`unreadable`] on macOS. The guard is what makes the reads refuse: the thread-local
+/// `force_unknown` hook answers above the kernel until it drops.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn unreadable(pid: RawPid) -> (impl Kernel, impl Sized) {
     (HostKernel, backend::fault::force_unknown(pid))
@@ -1074,9 +1101,14 @@ pub(crate) use backend::{
     LAUNCHD,
 };
 
+/// What a `proc_pidinfo` read by pid answers when it fails, the error of a [`Kernel`]'s short and BSD
+/// info reads.
+#[cfg(all(target_os = "macos", test))]
+pub(crate) use backend::ReadErr;
+
 /// The identity-read forcing seams.
 #[cfg(all(target_os = "macos", test))]
-pub(crate) use backend::{ppid_fault, uniq_fault, ReadErr};
+pub(crate) use backend::{ppid_fault, uniq_fault};
 
 /// `containment::enumerate::macos`'s parent-pid resolver, reused whole (primary
 /// `proc_pidinfo` read, sysctl fallback, and the shared zero-ppid guard) — see

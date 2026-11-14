@@ -336,7 +336,7 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
         let recheck = match check(pid)? {
             Check::Gone => return Ok(Watch::ChildGone),
             Check::Running => None,
-            Check::Traced(by) => match tracer.held_by(&kq, by)? {
+            Check::Traced(by) => match tracer.held_by(&crate::identity::HostKernel, &kq, by)? {
                 OnTracer::Block => None,
                 OnTracer::Recheck(after) if after.is_zero() => continue,
                 OnTracer::Recheck(after) => Some(after),
@@ -402,13 +402,13 @@ enum Check {
 /// launchd: XNU gives launchd a child whose tracer exited while the child was exiting, so it is
 /// gone. Any other answer means the child is gone. A read that is refused is an error.
 fn check(pid: u32) -> io::Result<Check> {
-    use crate::identity::{origin, Origin, LAUNCHD};
+    use crate::identity::{origin, HostKernel, Origin, LAUNCHD};
     use crate::os_process::child::PeekOutcome;
     use crate::wait::exit_only::{peek, Target};
-    Ok(match peek(&Target::pid(pid, None))? {
+    Ok(match peek(&HostKernel, &Target::pid(pid, None))? {
         PeekOutcome::Running => Check::Running,
         PeekOutcome::Exit(_) => Check::Gone,
-        PeekOutcome::Foreign(_) => match origin(pid) {
+        PeekOutcome::Foreign(_) => match origin(&HostKernel, pid) {
             Origin::Ours { parent } if parent == LAUNCHD => Check::Gone,
             // A tracer detached between the two reads: the child is ours again, and its own
             // `NOTE_EXIT` reaches this process.

@@ -527,7 +527,7 @@ pub(crate) fn walk_from(
 /// Linux reads the open's failure by call ([`OpenFailure`](crate::os_process::OpenFailure)) to build
 /// that error.
 #[cfg(any(unix, windows))]
-fn open_by_identity(kernel: &dyn Kernel, id: ProcessId) -> Result<Option<Box<dyn OsProcess>>, Error> {
+fn open_by_identity<'k>(kernel: &'k dyn Kernel, id: ProcessId) -> Result<Option<Box<dyn OsProcess + 'k>>, Error> {
     crate::os_process::open_with(kernel, id).map_err(|failure| member_error(id.pid(), failure))
 }
 
@@ -565,7 +565,7 @@ fn unproved(pid: RawPid, error: Error) -> Error {
 /// The one send to a walked member, through `opened`'s handle: nothing is sent to a process that is
 /// gone, or that another process's pid names now.
 #[cfg(any(unix, windows))]
-fn kill_opened(id: ProcessId, opened: Result<Option<Box<dyn OsProcess>>, Error>, sig: Sig) -> KillOutcome {
+fn kill_opened(id: ProcessId, opened: Result<Option<Box<dyn OsProcess + '_>>, Error>, sig: Sig) -> KillOutcome {
     match opened {
         Ok(Some(os)) => {
             // Test seam: makes the member exit between its open and its send.

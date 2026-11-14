@@ -40,6 +40,9 @@ use windows as backend;
 #[cfg(all(target_os = "macos", test))]
 pub(crate) use macos::second_reap;
 
+#[cfg(target_os = "macos")]
+use crate::identity::Kernel;
+
 #[cfg(all(target_os = "macos", test))]
 #[path = "exit_only/macos_tests.rs"]
 pub(crate) mod macos_tests;
@@ -99,7 +102,9 @@ impl Target<'_> {
     }
 }
 
-/// Look at `target` without consuming anything.
+/// Look at `target` without consuming anything. The handle `target` holds answers; macOS has no
+/// handle, so its `peek` asks a kernel.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
     #[cfg(test)]
     if let Some(forced) = seams::take_forced_peek() {
@@ -108,43 +113,55 @@ pub(crate) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
     backend::peek(target)
 }
 
-/// [`peek`] for a caller that treats `Running` as "this is our child". On macOS a running child
-/// whose unique id cannot be read (a MACF denial) is then an error, not `Running`: the id is all
-/// that tells it from a reuse of the pid. Other platforms use [`peek`].
+/// [`peek`] through `kernel`.
 #[cfg(target_os = "macos")]
-pub(crate) fn peek_verified(target: &Target<'_>) -> io::Result<PeekOutcome> {
+pub(crate) fn peek(kernel: &dyn Kernel, target: &Target<'_>) -> io::Result<PeekOutcome> {
     #[cfg(test)]
     if let Some(forced) = seams::take_forced_peek() {
         return forced;
     }
-    backend::peek_with(target, true)
+    backend::peek(kernel, target)
+}
+
+/// [`peek`] for a caller that treats `Running` as "this is our child". On macOS a running child
+/// whose unique id cannot be read (a MACF denial) is then an error, not `Running`: the id is all
+/// that tells it from a reuse of the pid. Other platforms use [`peek`].
+#[cfg(target_os = "macos")]
+pub(crate) fn peek_verified(kernel: &dyn Kernel, target: &Target<'_>) -> io::Result<PeekOutcome> {
+    #[cfg(test)]
+    if let Some(forced) = seams::take_forced_peek() {
+        return forced;
+    }
+    backend::peek_with(kernel, target, true)
 }
 
 /// [`peek`], and the tracer that holds the child when the verdict is `Running` because a process
 /// other than this one and launchd holds it (`waitid` answered `ECHILD`). **macOS only.**
 #[cfg(target_os = "macos")]
-pub(crate) fn peek_traced(target: &Target<'_>) -> io::Result<(PeekOutcome, Option<u32>)> {
+pub(crate) fn peek_traced(kernel: &dyn Kernel, target: &Target<'_>) -> io::Result<(PeekOutcome, Option<u32>)> {
     #[cfg(test)]
     if let Some(forced) = seams::take_forced_peek() {
         return forced.map(|peeked| (peeked, None));
     }
-    backend::peek_holder(target, false)
+    backend::peek_holder(kernel, target, false)
 }
 
 /// [`peek`], then consume `target`'s exit record if it has one.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     backend::try_reap(target)
 }
 
+/// [`peek`] then consume `target`'s exit record if it has one, through `kernel`.
+#[cfg(target_os = "macos")]
+pub(crate) fn try_reap(kernel: &dyn Kernel, target: &Target<'_>) -> io::Result<Reap> {
+    backend::try_reap(kernel, target)
+}
+
 // The wait status of an `si_code` record =====
 
-/// One `waitid` record: the `si_code` and `si_status` of the `siginfo_t`.
 #[cfg(unix)]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Record {
-    pub(crate) si_code: i32,
-    pub(crate) si_status: i32,
-}
+pub(crate) use crate::identity::Record;
 
 /// `record`, as the test seam [`seams::force_consuming_record_once`] may have rewritten it.
 #[cfg(unix)]
