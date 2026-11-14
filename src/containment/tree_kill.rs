@@ -68,7 +68,7 @@ impl Unnamed {
     }
 
     /// The error saying the member's exit cannot be observed, for a row that states its words.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", windows)))]
     pub(crate) fn why(&self) -> &Error {
         &self.why
     }
