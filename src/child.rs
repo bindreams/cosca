@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 use crate::child::owned::teardown::Disposition;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::command::Command;
-use crate::containment::dispatch::{SweepFailure, Swept, TeardownCaller};
 #[cfg(unix)]
-use crate::containment::dispatch::{TreeKillOutcome, TreeSignal};
+use crate::containment::dispatch::TreeSignal;
+use crate::containment::dispatch::{Retry, SweepFailure, Swept, TeardownCaller, TreeKillOutcome};
 use crate::containment::treewalk::WalkToken;
 use crate::containment::{Containment, TerminateOutcome};
 use crate::error::Error;
@@ -548,10 +548,9 @@ impl Child {
     /// - `TreeWalk`: an [`Error::MembersLeft`]. A root the walk left and the backstop could not kill
     ///   either is one [`Error::MemberNotKilled`] whose `source` is an [`Error::Several`] of the
     ///   backstop's failure and the walk's, the backstop first. A backstop that fails after a walk that
-    ///   left nothing is a `MembersLeft` of the root alone. A walk that could not be made over a root
-    ///   that runs is its [`Error::Unassessable`] (or `Unsupported`) alone: no backstop runs, so the
-    ///   root has no `MemberNotKilled` peer. Over an exited root the backstop runs, and a failed one is
-    ///   that peer.
+    ///   left nothing is a `MembersLeft` of the root alone. A walk that could not be made is its
+    ///   [`Error::Unassessable`] (or `Unsupported`) alone: no backstop runs, so the root has no
+    ///   `MemberNotKilled` peer.
     /// - Any other mechanism keeps its own error and its variant, with the root's `MemberNotKilled` as
     ///   its peer, below it after its own cause. A kill that left nothing is an [`Error::Containment`]
     ///   over the root's `MemberNotKilled`.
@@ -559,9 +558,9 @@ impl Child {
     /// On the `TreeWalk` mechanism, an [`Error::Unassessable`] (or `Unsupported`) means the
     /// process table could not be read or trusted, so the descendants could not be found: NOTHING
     /// was killed, the root included, and a retry can work. (`Drop` cannot retry, so it still
-    /// kills the root and logs that descendants may be orphaned. A retry cannot walk from a root
-    /// that has exited, so a call over one kills the held members by identity.) A root whose exit is visible
-    /// (reaped, a zombie, or no longer holding its pid) is `Unassessable` too: its children were
+    /// kills the root and the members the handle holds, and logs that descendants may be orphaned.)
+    /// A root whose exit is visible (reaped, a zombie, or no longer holding its pid) is
+    /// `Unassessable` too: its children were
     /// reparented at its exit, so a walk from its pid finds none and `Ok` would say nothing of the
     /// tree. Nothing is killed (a zombie root apart) and a retry cannot work. A zombie root whose walk
     /// finds a member is walked as usual.
@@ -575,10 +574,9 @@ impl Child {
     /// `kill_tree`, or the
     /// drop, kills those whose identity was read again, and reports the others again. That holds
     /// whatever the later walk finds, a root that is gone included, except for a walk that cannot be
-    /// made over a root that runs: a retry can walk from that root, so such a `kill_tree` kills none of
-    /// the held members and keeps them for the retry. Over an exited root, which no retry can walk,
-    /// and in the drop, which cannot retry, they are killed. Once those members are gone, a
-    /// gone root is `Unassessable` on every later call, saying the members an earlier kill left are
+    /// made: that `kill_tree` kills none of them, as it kills nothing, and keeps them for the retry,
+    /// which walks from the root. The drop, which cannot retry, kills them by identity. Once those
+    /// members are gone, a gone root is `Unassessable` on every later call, saying the members an earlier kill left are
     /// gone and the tree could not be walked: the tree cannot be vouched for again. A walk that left
     /// only the root is `Ok` once the handle backstop killed it, but the walk saw the root running
     /// and what it forked meanwhile was never looked for, so the tree is unvouched in the same way:
@@ -754,7 +752,7 @@ impl Child {
             // An answer that needs no kill ends the call: no backstop.
             answered @ TreeKillOutcome::Answered(_) => {
                 drop(held);
-                let settled = self.tree.settle_for_kill_tree(answered, false);
+                let settled = self.tree.settle_for_kill_tree(answered, false, Retry::Follows);
                 wait.reaching(settled.killed_again);
                 return Swept::new(op, settled.answer.map_err(SweepFailure::from), wait);
             }
@@ -783,17 +781,21 @@ impl Child {
                 other
             }
         };
-        // The backstop would end a root that a retry walks from.
-        let group_result = match group_result.unless_unwalked() {
-            Ok(group_result) => group_result,
-            Err(error) => return Swept::new(op, Err(SweepFailure::from(error)), wait),
+        // A walk not made is answered by the settlement, which keeps what it holds, and no backstop
+        // runs: it would end a root that the retry walks from.
+        let group_result = match group_result {
+            unwalked @ TreeKillOutcome::Unwalked(_) => {
+                let settled = self.tree.settle_for_kill_tree(unwalked, false, Retry::Follows);
+                return Swept::new(op, settled.answer.map_err(SweepFailure::from), wait);
+            }
+            walked => walked,
         };
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
         // reached it is read after it. One whose kill failed may still have its program running:
         // left alone. An exited front needs no backstop.
         #[cfg(unix)]
         if let Some(in_cgroup) = front {
-            let settled = self.tree.settle_for_kill_tree(group_result, false);
+            let settled = self.tree.settle_for_kill_tree(group_result, false, Retry::Follows);
             let answer = match (settled.answer, in_cgroup) {
                 (Ok(()), Some(front)) => self.cgroup_kill_reached(front),
                 (Err(left), Some(front)) => Err(crate::elevation::front::cgroup_kill_failed(front, self.pid(), left)),

@@ -200,14 +200,15 @@ fn foreign_graceful_sweep_whose_walk_is_not_made_kills_the_members_its_sigterm_w
     tree.child.wait().expect("reap the root");
 }
 
-// A root that outlives the grace keeps its descendants walkable, so a sweep whose walk cannot be made
-// leaves a retry everything: it kills nothing, the root and the members its `SIGTERM` walk held
-// included, and answers the walk's own `Unassessable`.
+// A foreign process keeps no members for a retry, so a sweep whose walk cannot be made over a root that
+// outlives the grace kills the member its `SIGTERM` walk held, which the root's child's exit reparented
+// out of the root's walk, by identity. The root is left running, and the answer is the walk's own
+// `Unassessable`: a retry walks from that root.
 //
-// Mutant: the sweep kills the held members, or the root, when its walk was not made.
+// Mutant: the sweep keeps the held member when its walk was not made; it kills the root.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn foreign_graceful_sweep_whose_walk_is_not_made_over_a_live_root_kills_nothing() {
+fn foreign_graceful_sweep_whose_walk_is_not_made_over_a_live_root_kills_the_held_member_and_leaves_the_root() {
     use crate::identity::{FakeKernel, HostKernel, Liveness};
     let mut tree = tree_of(crate::test_child::ROOT_OUTLIVING_THE_GRACE_ARGV);
     let middle = tree
@@ -237,9 +238,12 @@ fn foreign_graceful_sweep_whose_walk_is_not_made_over_a_live_root_kills_nothing(
         .expect_err("the walk was not made");
 
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
-    assert_eq!(running[0].is_alive(), Liveness::Alive, "the held member is not killed");
+    assert_eq!(
+        running[0].is_alive(),
+        Liveness::Dead,
+        "the reparented member was held by the SIGTERM walk and is killed by identity"
+    );
     assert_eq!(tree.process.id().is_alive(), Liveness::Alive, "the root is not killed");
-    // Closing the stdin ends the members that read it; the root ends by its own kill.
     tree.process.kill().expect("end the root");
     tree.child.wait().expect("reap the root");
 }

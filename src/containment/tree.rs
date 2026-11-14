@@ -2,7 +2,7 @@
 //! mechanism, with where that tree stands after the kills that settled it. Everything the child does to
 //! its tree goes through [`Tree`], which asks its mechanism only through [`Contains`].
 
-use crate::containment::dispatch::{Settled, TreeKillOutcome, TreeKilled};
+use crate::containment::dispatch::{Retry, Settled, TreeKillOutcome, TreeKilled};
 use crate::containment::drain_edge::DrainEdge;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
@@ -196,7 +196,8 @@ impl Tree {
     /// ended.
     #[cfg(unix)]
     pub(crate) fn kill_settled(&self, root: Option<&dyn Root>) -> Result<(), Error> {
-        self.settle_for_kill_tree(self.send_kill(root), false).answer
+        self.settle_for_kill_tree(self.send_kill(root), false, Retry::Follows)
+            .answer
     }
 
     /// Send the graceful termination signal to the tree (signal-only), as [`kill`](Self::kill) decides
@@ -360,13 +361,16 @@ impl Tree {
         self.killed.settle(self.named_by(), outcome, root_ended)
     }
 
-    /// [`settle`](Self::settle) for a `kill_tree` call: the error holds every member left.
+    /// [`settle`](Self::settle) for a `kill_tree` call: the error holds every member left. `retry`: what
+    /// a walk that was not made leaves ([`Retry`]).
     pub(crate) fn settle_for_kill_tree(
         &self,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
+        retry: Retry,
     ) -> Settled<Result<(), Error>> {
-        self.killed.settle_for_kill_tree(self.named_by(), outcome, root_ended)
+        self.killed
+            .settle_for_kill_tree(self.named_by(), outcome, root_ended, retry)
     }
 
     /// [`Contains::root_left`] of this tree's mechanism. A tree that holds none is not reached:
@@ -470,11 +474,6 @@ impl Tree {
             Holder::Contained(Mechanism::Walk(walk)) => Some(walk.root()),
             _ => None,
         }
-    }
-
-    /// The settlement this tree's kills and drops write.
-    pub(crate) fn killed_for_test(&self) -> &TreeKilled {
-        &self.killed
     }
 }
 
