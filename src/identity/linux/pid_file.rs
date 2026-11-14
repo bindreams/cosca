@@ -12,19 +12,20 @@ use std::sync::Arc;
 
 use super::kernel::Kernel;
 use super::proc_read::{read_own, OwnUnreadable, ProcDir, ReadFailure};
-use super::prove::Refusal;
+use super::refusal::Refusal;
+use crate::error::io_context;
 
 /// What reading one pid's file yielded.
 #[derive(Debug)]
 pub(crate) enum ReadOutcome {
     Read(Vec<u8>),
-    /// The pid exited: `ESRCH`, of the open or of a file's `read(2)`; or, of a link's `readlinkat`,
-    /// `ENOENT` (`ns_get_name`: the task has no namespace left). The error is why.
+    /// The pid exited: `ESRCH`, of the open, of a file's `read(2)` or of a link's `readlinkat`; or, of
+    /// a link's `readlinkat`, `ENOENT` (the task has no namespace left). The error is why.
     Exited(io::Error),
     /// The pid is not shown to us: it is gone (`ENOENT`), or `hidepid` hides it (`EACCES`, or `EPERM`
-    /// while the checked directory still answers); of a link's `readlinkat`, `EACCES` (`proc_ns_readlink`:
-    /// ptrace of the task is denied, or the task is gone). The error is why. A caller that holds the pid
-    /// unreaped, so that it cannot be gone, reads this as `/proc` hiding it.
+    /// while the checked directory still answers); of a link's `readlinkat`, `EACCES`, with its reason
+    /// (ptrace of the task is denied, or the task has exited) as the error's words. The error is why. A
+    /// caller that holds the pid unreaped, so that it cannot be gone, reads this as `/proc` hiding it.
     Hidden(io::Error),
     /// The `openat2` was refused.
     Refused(Refusal),
@@ -176,12 +177,22 @@ fn classify(
         // The entry opened, so no `openat2` errno is in play; only the read step's own say anything
         // about the pid.
         Err(ReadFailure::Read(source)) => match (entry, source.raw_os_error()) {
-            // A task that exited after the open is the one racing exit a file's `read(2)` reports.
-            (Entry::File, Some(libc::ESRCH)) => return Ok(ReadOutcome::Exited(source)),
-            // `proc_ns_readlink` (fs/proc/namespaces.c): `EACCES` when ptrace of the task is denied or
-            // the task is gone before it is looked up; `ns_get_name` (fs/nsfs.c): `ENOENT` when the
-            // task, once found, no longer has the namespace, which is exiting.
-            (Entry::Link, Some(libc::EACCES)) => return Ok(ReadOutcome::Hidden(source)),
+            // A task that exited after the open: a file's `read(2)` reports it, and so does gVisor's
+            // `checkTaskState` for a link whose task is dead.
+            (_, Some(libc::ESRCH)) => return Ok(ReadOutcome::Exited(source)),
+            // The `readlinkat` of a namespace link. Linux v6.12: `proc_ns_readlink`
+            // (fs/proc/namespaces.c) answers `EACCES` when ptrace of the task is denied or the task is
+            // gone before it is looked up, and `ns_get_name` (fs/nsfs.c) `ENOENT` when the task, once
+            // found, has no namespace left, which is exiting. gVisor ab5f509c
+            // (pkg/sentry/fsimpl/proc/task_files.go, `namespaceSymlink.Readlink`): `checkTaskState`
+            // answers `EACCES` for a zombie and `ESRCH` for a dead task, and `ENOENT` for a task with
+            // no namespace of the kind; it checks no ptrace right.
+            (Entry::Link, Some(libc::EACCES)) => {
+                return Ok(ReadOutcome::Hidden(io_context(
+                    "the link was not read: ptrace of the task is denied, or the task has exited",
+                    source,
+                )));
+            }
             (Entry::Link, Some(libc::ENOENT)) => return Ok(ReadOutcome::Exited(source)),
             _ => {
                 return Err(Unreadable {

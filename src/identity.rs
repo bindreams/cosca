@@ -529,15 +529,16 @@ impl ProcessId {
 
     /// This process's own identity. Windows reads the current-process pseudo-handle, which
     /// performs no access check at all; macOS reads the caller's own entry by pid, and Linux the
-    /// inode of the process's own pidfd (6.9+), or `/proc/self/stat` before it (no `openat2`, no
-    /// `/proc` view needed), which no `hidepid` mount or sandbox policy hides from the task itself.
-    /// Either way it is resolvable even for a process whose own DACL would deny a foreign by-pid
-    /// open.
+    /// inode of the process's own pidfd (6.9+), or `/proc/self/stat` before it (read through the
+    /// checked `/proc`, so `openat2`; no `/proc` view needed), which no `hidepid` mount hides from the
+    /// task itself. Either way it is resolvable even for a process whose own DACL would deny a
+    /// foreign by-pid open.
     ///
     /// # Panics
     /// If the process cannot read its own key: on Linux, if `pidfd_open` of itself fails (a
-    /// refusal included) or, before 6.9, if `/proc/self/stat` cannot be read or has no parseable
-    /// `starttime` (hard requirements of that backend); on Windows and macOS, if a self-directed
+    /// refusal included) or, before 6.9, if `/proc/self/stat` cannot be read (an `openat2` the
+    /// kernel or a sandbox policy refuses included) or has no parseable `starttime` (hard
+    /// requirements of that backend); on Windows and macOS, if a self-directed
     /// `GetProcessTimes` / `proc_pidinfo` fails, which has no documented cause. Infallible by
     /// design — every caller, including `Process::current()`, relies on it (which returns the
     /// failure as an error on Linux instead).
@@ -695,7 +696,10 @@ pub(crate) use backend::kernel::{HostKernel, Kernel};
 pub(crate) use backend::call_error;
 
 #[cfg(target_os = "linux")]
-pub(crate) use backend::prove::{prove, warn_refused, FailedCall, Proof, Refusal};
+pub(crate) use backend::prove::{prove, Proof};
+
+#[cfg(target_os = "linux")]
+pub(crate) use backend::refusal::{warn_refused, FailedCall, Refusal};
 
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::kernel::PIDFD_THREAD;
@@ -724,8 +728,10 @@ pub(crate) use backend::proc_view::UNREADABLE_STATUS_REASON;
 
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::proc_read::ProcOpenFailure;
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use backend::proc_read::ReadFailure;
 #[cfg(target_os = "linux")]
-pub(crate) use backend::proc_read::{utf8, OwnUnreadable, ProcDir, ReadFailure};
+pub(crate) use backend::proc_read::{utf8, OwnUnreadable, ProcDir};
 #[cfg(target_os = "linux")]
 pub(crate) use backend::proc_view::{
     pidfd_pid_in, proc_view_with, PidfdTarget, ProcView, ViewUnreadable, DIVERGED_REASON,

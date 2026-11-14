@@ -167,12 +167,12 @@ fn a_failed_read_is_what_its_call_and_errno_say() {
 
 /// What a failed read of the link `4242/ns/pid` is, by call and errno. The `openat2` is classed as a
 /// file's is. The `readlinkat` answers `EACCES` when the reader may not ptrace the task or the task is
-/// gone (`proc_ns_readlink`: `res = -EACCES`), so `Hidden`, and `ENOENT` when the task no longer has
-/// the namespace (`ns_get_name`: `res = -ENOENT`), so `Exited`; it never answers `ESRCH`, which is
-/// no exit of a link, and every other errno says nothing about the pid.
+/// gone (Linux's `proc_ns_readlink`; gVisor's `checkTaskState` for a zombie), so `Hidden`; `ENOENT`
+/// when the task no longer has the namespace (`ns_get_name`), so `Exited`; and `ESRCH` for a dead task
+/// (gVisor's `checkTaskState`), so `Exited`. Every other errno says nothing about the pid.
 ///
 /// Mutant: a link's `readlinkat` is classed as a file's `read(2)`: its `EACCES` or `ENOENT` is
-/// "could not be read", and its `ESRCH` an exit.
+/// "could not be read"; its `ESRCH` is not an exit.
 #[skuld::test]
 fn a_failed_link_read_is_what_its_call_and_errno_say() {
     use Call::{Open, Read};
@@ -182,7 +182,7 @@ fn a_failed_link_read_is_what_its_call_and_errno_say() {
         (Open, libc::ENOENT, Want::Hidden),
         (Read, libc::EACCES, Want::Hidden),
         (Read, libc::ENOENT, Want::Exited),
-        (Read, libc::ESRCH, Want::Unreadable("could not be read")),
+        (Read, libc::ESRCH, Want::Exited),
         (Read, libc::EPERM, Want::Unreadable("could not be read")),
         (Read, libc::EIO, Want::Unreadable("could not be read")),
     ];
@@ -195,7 +195,11 @@ fn a_failed_link_read_is_what_its_call_and_errno_say() {
         let name = format!("{call:?} {errno}");
         match (read_link(&kernel, &dir, 4242, "ns/pid"), want) {
             (Ok(ReadOutcome::Exited(why)), Want::Exited) | (Ok(ReadOutcome::Hidden(why)), Want::Hidden) => {
-                assert_eq!(why.raw_os_error(), Some(errno), "{name}: the pid's own error is why");
+                assert_eq!(
+                    crate::error::first_os_code(&why),
+                    Some(errno),
+                    "{name}: the pid's own error is why"
+                );
             }
             (Err(unreadable), Want::Unreadable(words)) => {
                 assert!(unreadable.to_string().contains(words), "{name}: {unreadable}");

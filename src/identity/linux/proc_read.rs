@@ -13,7 +13,7 @@ use rustix::fs::{openat2, FsWord, Mode, OFlags, ResolveFlags, CWD, PROC_SUPER_MA
 use rustix::io::Errno;
 
 use super::kernel::Kernel;
-use super::prove::{FailedCall, Refusal};
+use super::refusal::{FailedCall, Refusal};
 
 /// A failed [`ProcDir::read`], [`ProcDir::read_link`] or [`ProcDir::pids`] (and so a
 /// [`Kernel`] call that answers one), by the call that failed: only an `openat2`'s errno can be a
@@ -26,7 +26,6 @@ pub(crate) enum ReadFailure {
 }
 
 impl ReadFailure {
-    /// The OS error, whichever call failed.
     pub(crate) fn into_io(self) -> io::Error {
         match self {
             ReadFailure::Open(e) | ReadFailure::Read(e) => e,
@@ -35,8 +34,7 @@ impl ReadFailure {
 
     /// The [`Refusal`] this failure is, if any: an `openat2` errno in
     /// [`FailedCall::requirement`]'s table. A failure after the `openat2` (a `read(2)`, a
-    /// `readlinkat`, a listing) is none, whatever its errno. The one rule of every read and listing
-    /// of `/proc`.
+    /// `readlinkat`, a listing) is none, whatever its errno.
     pub(crate) fn refusal(&self) -> Option<Refusal> {
         match self {
             ReadFailure::Open(e) => FailedCall::openat2(Errno::from_io_error(e)?).refusal(),
@@ -46,7 +44,7 @@ impl ReadFailure {
 }
 
 /// Why one of this process's own files could not be read: `self/status`, `self/stat`,
-/// `thread-self/fdinfo/<fd>`, `self/ns/pid`. `hidepid` hides other users' pid directories and
+/// `thread-self/fdinfo/<fd>`, `thread-self/ns/pid`. `hidepid` hides other users' pid directories and
 /// cannot hide these, so an `EPERM` of one is nothing to re-check. The one rule: a
 /// [`ReadFailure::refusal`] is a [`Refusal`], and every other failure, any `read(2)` errno included,
 /// is the file's own.
@@ -57,23 +55,50 @@ pub(crate) enum OwnUnreadable {
 }
 
 impl OwnUnreadable {
-    pub(crate) fn of(failure: ReadFailure) -> Self {
+    fn of(failure: ReadFailure) -> Self {
         match failure.refusal() {
             Some(refusal) => OwnUnreadable::Refused(refusal),
             None => OwnUnreadable::Failed(failure.into_io()),
         }
     }
+
+    /// An `openat2` of an own file that answered `errno`.
+    pub(crate) fn opening(errno: Errno) -> Self {
+        Self::of(ReadFailure::Open(errno.into()))
+    }
 }
 
 /// This process's own file `path` under `dir`, read through `kernel`: the one read of such a file.
+/// `path` is `self/...` or `thread-self/...`, the files `hidepid` cannot hide from their reader.
 pub(crate) fn read_own(kernel: &dyn Kernel, dir: &ProcDir, path: &str) -> Result<Vec<u8>, OwnUnreadable> {
+    debug_assert_own(path);
     kernel.read(dir, path).map_err(OwnUnreadable::of)
+}
+
+/// [`read_own`] of an own symlink, its target the bytes: `None` when the `openat2` finds no such link
+/// (`ENOENT`), as a kernel with no pid namespaces has no `thread-self/ns/pid`. An `ENOENT` after the
+/// open is the link's own failure, which says nothing of the kernel.
+pub(crate) fn read_own_link(kernel: &dyn Kernel, dir: &ProcDir, path: &str) -> Result<Option<Vec<u8>>, OwnUnreadable> {
+    debug_assert_own(path);
+    match kernel.read_link(dir, path) {
+        Ok(target) => Ok(Some(target)),
+        Err(ReadFailure::Open(e)) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(failure) => Err(OwnUnreadable::of(failure)),
+    }
+}
+
+/// The own-file rule holds only of this process's own files; `hidepid` hides any other pid's.
+fn debug_assert_own(path: &str) {
+    debug_assert!(
+        path.starts_with("self/") || path.starts_with("thread-self/"),
+        "{path:?} is not one of this process's own files"
+    );
 }
 
 /// Why `/proc` could not be opened as a [`ProcDir`].
 #[derive(Debug)]
 pub(crate) enum ProcOpenFailure {
-    /// The `openat2` of `/proc` failed: an own file's failure, as `/proc` is every process's.
+    /// The `openat2` of `/proc` failed.
     Open(OwnUnreadable),
     /// The opened directory could not be checked (`fstatfs`, `fstat`).
     Check(io::Error),
@@ -88,7 +113,7 @@ pub(crate) enum ProcOpenFailure {
 impl ProcOpenFailure {
     /// The `openat2` of `/proc` answering `errno`.
     pub(crate) fn opening(errno: Errno) -> Self {
-        ProcOpenFailure::Open(OwnUnreadable::of(ReadFailure::Open(errno.into())))
+        ProcOpenFailure::Open(OwnUnreadable::opening(errno))
     }
 }
 

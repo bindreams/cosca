@@ -36,7 +36,7 @@ pub(crate) trait Kernel: Sync {
     /// or `thread-self/fdinfo/<fd>`. A failure says whether the `openat2` or `read(2)` failed.
     fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure>;
 
-    /// The target of the symlink at `path` under `dir`: `self/ns/pid` or `<pid>/ns/pid`. A
+    /// The target of the symlink at `path` under `dir`: `thread-self/ns/pid` or `<pid>/ns/pid`. A
     /// failure says whether the `openat2` or the `readlinkat` failed.
     fn read_link(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure>;
 

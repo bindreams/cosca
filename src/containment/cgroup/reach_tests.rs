@@ -642,7 +642,7 @@ fn a_task_read_through_an_unusable_view_has_the_views_error_as_its_cause() {
 fn refused_view_kernel() -> FakeKernel<'static> {
     FakeKernel::over(&HostKernel)
         .on_read("self/status", Ok(b"Name:\tcosca\n"))
-        .on_read("self/ns/pid", Ok(b"pid:[4026531836]"))
+        .on_read("thread-self/ns/pid", Ok(b"pid:[4026531836]"))
         .on_read("1/ns/pid", Err(libc::EPERM))
         .on_read("self/stat", Err(libc::ENOSYS))
 }
@@ -1463,13 +1463,16 @@ fn assert_refused_openat2(err: &crate::error::Error, errno: i32) {
 
 /// A probe child whose open of its `/proc/self/fd` is refused reports the errno on the probe's
 /// channel, and the spawn is refused as `Unsupported`, as for a refused view. Mutant: "the child's
-/// errno is dropped" (the spawn's error is the generic `ABANDONED` one).
+/// errno is dropped" (the spawn's error is the generic `ABANDONED` one); "an errno of the refusal
+/// table is missing from the child's mapping".
 #[skuld::test]
 fn a_probe_childs_refused_openat2_refuses_the_spawn_naming_it() {
     let _missing = fault::miss_pidfd_info();
-    let _no_dir = fault::fail_probe_fd_dir(libc::EPERM);
-    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe's child cannot set up");
-    assert_refused_openat2(&err, libc::EPERM);
+    for errno in [libc::ENOSYS, libc::EPERM, libc::ENODEV] {
+        let _no_dir = fault::fail_probe_fd_dir(errno);
+        let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe's child cannot set up");
+        assert_refused_openat2(&err, errno);
+    }
 }
 
 /// A refused read of the probe child's `<pid>/cgroup` refuses the spawn as `Unsupported` naming
