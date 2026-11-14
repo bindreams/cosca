@@ -1,21 +1,21 @@
 //! Whether a Linux process's exit has begun: every thread of its group shows `PF_EXITING` in its
 //! `stat`, read through the checked `/proc`, the thread list read again until it shows no thread not
 //! yet read, and the id proved after the reads. Every row is a [`FakeKernel`]'s stated facts: the
-//! kernel's own order (the flag before the reparent) is measured, in the finding the module names,
-//! and a held exit needs root and a FUSE mount.
+//! kernel's own order (the flag before the reparent) is measured, and a held exit needs root and a FUSE
+//! mount.
 
 use std::os::fd::OwnedFd;
 
 use rustix::io::Errno;
 use rustix::process::Pid;
 
-use crate::identity::{ticks_host, FakeKernel, HostKernel, Key, ProcessId, Resolved};
+use crate::identity::{proc_view_with, ticks_host, FakeKernel, HostKernel, Key, ProcessId, Resolved};
 
 const PID: u32 = 4242;
 const INO: u64 = 100;
 const START: u64 = 777;
-/// A thread's flags before its exit, and once `exit_signals` has run (`0x4`, with `0x8` beside it):
-/// the values measured on Linux 6.12.113.
+/// A thread's flags before its exit, and once `exit_signals` has run (`0x4`, with `0x8` beside it), as
+/// measured.
 const LIVE: u32 = 0x40_0140;
 const EXITING: u32 = 0x40_014c;
 
@@ -71,8 +71,12 @@ fn ticks_kernel(threads: &[(u32, u32)], start: u64) -> FakeKernel<'static> {
     )
 }
 
+/// The read of `id`'s exit, through a `/proc` view of `kernel`'s built as `process_table` builds it.
 fn begun(id: ProcessId, kernel: &FakeKernel<'_>) -> Resolved<bool> {
-    id.exit_begun_with(kernel).0
+    let Ok(dir) = proc_view_with(kernel).into_dir() else {
+        panic!("the kernel's /proc view is usable");
+    };
+    id.exit_begun_in(kernel, &dir).0
 }
 
 /// The exit has begun when every thread of the group shows the flag, never when one does not: a
@@ -122,8 +126,27 @@ fn a_thread_that_appears_in_a_later_listing_is_read() {
     assert_eq!(begun(pidfs_id(), &kernel), Resolved::Found(false));
 }
 
+/// A listing that grew is read through again before the exit is begun: the second listing holds a
+/// thread that shows the flag once and runs the next time it is read, which only a pass over a listing
+/// covered by the one before it sees. Mutants: the first all-exiting pass is the answer; the pass over
+/// the grown listing is.
+#[skuld::test]
+fn a_listing_that_grew_is_read_again_before_the_exit_is_begun() {
+    let (fd, _writer) = pidfd();
+    let kernel = FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_pidfd_open(PID, Ok(fd))
+        .on_pidfs_ino(PID, Ok(Some(INO)))
+        .on_tids(PID, Ok(&[PID]))
+        .on_tids_after(PID, 1, Ok(&[PID, 4243]))
+        .on_read(&task_stat(PID), Ok(&stat_with(EXITING, START)))
+        .on_read(&task_stat(4243), Ok(&stat_with(EXITING, START)))
+        .on_read_after(&task_stat(4243), 1, Ok(&stat_with(LIVE, START)));
+    assert_eq!(begun(pidfs_id(), &kernel), Resolved::Found(false));
+}
+
 /// Threads that all show the flag are begun once a listing is covered by the one before it, though the
-/// listing grew in between. Mutant: the first complete pass is the answer.
+/// listing grew in between. Mutant: a grown listing never ends the reads.
 #[skuld::test]
 fn a_listing_covered_by_the_one_before_it_ends_the_reads() {
     let (fd, _writer) = pidfd();
@@ -156,11 +179,9 @@ fn a_thread_id_that_changed_hands_is_read_again_by_the_next_pass() {
     assert_eq!(begun(pidfs_id(), &kernel), Resolved::Found(false));
 }
 
-/// A thread that is gone when it is read is no evidence of an exit: the listing is read afresh. In the
-/// shape of an `execve` by a thread of a live group, the old leader shows the flag and the thread that
-/// called is gone under its own id (it holds the leader's now): the next listing holds the leader's id
-/// alone, and it shows a running thread. Mutants: a vanished thread counts as exiting (`true`); it
-/// counts as running or unknown.
+/// A thread that vanishes mid-read is no evidence of an exit: the listing is read afresh (the shape of
+/// an `execve` by a non-leader thread of a live group). Mutants: a vanished thread counts as exiting
+/// (`true`); it counts as running or unknown.
 #[skuld::test]
 fn a_thread_that_vanished_is_not_an_exit_and_the_listing_is_read_afresh() {
     for errno in [libc::ENOENT, libc::ESRCH] {
@@ -239,8 +260,10 @@ fn a_listing_that_says_nothing_is_gone_when_the_process_was_reaped_and_unknown_w
     let holders: [(Result<(), Errno>, Resolved<bool>); 2] =
         [(Ok(()), Resolved::Unknown), (Err(Errno::SRCH), Resolved::Gone)];
     type Listing = fn(FakeKernel<'static>) -> FakeKernel<'static>;
-    let listings: [(&str, Listing); 3] = [
+    let listings: [(&str, Listing); 5] = [
         ("an absent listing", |k| k.on_tids(PID, Err(libc::ENOENT))),
+        ("an exited listing", |k| k.on_tids(PID, Err(libc::ESRCH))),
+        ("a hidden listing", |k| k.on_tids(PID, Err(libc::EACCES))),
         ("a listing that failed after the open", |k| {
             k.on_tids_failing_after_open(PID, libc::EIO)
         }),
@@ -264,17 +287,4 @@ fn a_listing_that_says_nothing_is_gone_when_the_process_was_reaped_and_unknown_w
             assert_eq!(begun(pidfs_id(), &kernel), expected, "{name}, holder {holds:?}");
         }
     }
-}
-
-/// A `/proc` that is not this pid namespace's names another process under the number, so the flags it
-/// shows are no answer. Mutant: the read goes by a view that was not checked.
-#[skuld::test]
-fn an_unusable_proc_view_leaves_the_exit_unknown() {
-    let target = Pid::from_raw(PID as i32).expect("a positive pid");
-    let (kernel, _writer) = pidfs_kernel(&[(PID, EXITING)]);
-    let kernel = kernel.diverged_view().on_signal_probe(target, Ok(()));
-    let (read, cause) = pidfs_id().exit_begun_with(&kernel);
-    assert_eq!(read, Resolved::Unknown);
-    let error = cause.into_error("pid 4242").expect("the view's reason is kept");
-    assert!(error.to_string().contains("outer pid namespace"), "{error}");
 }

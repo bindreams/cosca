@@ -147,9 +147,9 @@ pub(crate) const P_SYSTEM: libc::c_int = 0x00000200;
 
 /// `kinfo_proc`'s `p_flag` bit for a process that has begun to exit: `#define P_WEXIT
 /// 0x00002000` in the SDK's `usr/include/sys/proc.h`. XNU sets it from `P_LEXIT`, which is never
-/// cleared. It shows before the process's children are reparented (CI probe, 2026-11-14: macOS 15.7.9,
-/// 15.8.2 and 26.7.2, on arm64 and x86_64), so a read that finds it clear met a process none of whose
-/// children its exit had moved.
+/// cleared. It shows before the process's children are reparented (measured on macOS 15.7.9, 15.8.2 and
+/// 26.7.2; 14, the floor, is not measurable on CI), so a read that finds it clear met a process none of
+/// whose children its exit had moved.
 pub(crate) const P_WEXIT: libc::c_int = 0x0000_2000;
 
 /// Whether a process that `kinfo_proc` shows with `p_stat` and `p_flag` has begun to exit: `P_WEXIT`
@@ -255,9 +255,14 @@ pub(crate) mod fault {
     }
 }
 
-/// [`kinfo`] without the test seams, and with the failure that left the read `Unknown`: the errno of the
-/// `sysctl`, or the wrong size it wrote.
+/// [`kinfo`] without the seams that force a field, and with the failure that left the read `Unknown`: the
+/// errno of the `sysctl`, or the wrong size it wrote. A refusal forced by [`fault::force_unreadable_once`]
+/// is `EPERM`.
 pub(crate) fn kinfo_explained(pid: RawPid) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
+    #[cfg(test)]
+    if fault::take_unreadable() {
+        return (Resolved::Unknown, Some(std::io::Error::from_raw_os_error(libc::EPERM)));
+    }
     read_record_explained(pid, libc::KERN_PROC_PID)
 }
 

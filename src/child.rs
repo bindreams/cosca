@@ -566,18 +566,11 @@ impl Child {
     /// since, and its settlement kills by identity the ones reparented meanwhile. (`Drop`
     /// cannot retry, so it kills the held members and the root, and warns that its other
     /// descendants may be orphaned.)
-    /// A root whose exit has begun, as the kernel's exit flag shows (Linux: every thread of it exits;
-    /// macOS: `P_WEXIT`), and so a root that is a zombie, reaped, or no longer holding its pid, is
-    /// `Unassessable` too: its children are reparented at its exit, so a walk from its pid finds none
-    /// or only some, and `Ok` would say nothing of the tree. A walk that finds no member kills nothing
-    /// (a zombie root apart) and a retry cannot work. One that finds members kills them, and answers
-    /// as the same root a moment later would (a zombie, with none left to find): `Unassessable`, the
-    /// exit may have moved other children out of its reach, unless the tree was vouched for before
-    /// (a graceful shutdown's own complete `SIGTERM` listing, or an earlier kill). The flag is read
-    /// after the walk and before the root is killed. A flag that cannot be read leaves members found
-    /// killed as ever and the answer `Unassessable` with the read's error; with no member found,
-    /// nothing is killed and a retry can read it. macOS 14 cannot be measured and may not show the
-    /// exit: the root's children are then missed as those of any parent that exits during the walk are.
+    /// A root whose exit has begun (a zombie, a reaped root or one that no longer holds its pid
+    /// included), or whose exit flag cannot be read, is `Unassessable` too: its children are reparented
+    /// at its exit, so the walk says nothing of the tree. Members found are killed all the same; with
+    /// none found nothing is killed, and a retry can read an unreadable flag. A tree vouched for before
+    /// (a graceful shutdown's own complete `SIGTERM` listing, or an earlier kill) stays so.
     ///
     /// On the `TreeWalk` mechanism (on macOS, only where the ppid walk runs instead of the fd
     /// marker), a walk that killed what it could and left members running is an
@@ -956,13 +949,13 @@ impl Child {
     /// nothing goes out by its number, and the call returns
     /// [`Error::Unassessable`](crate::error::Error::Unassessable), with one `warn` saying so.
     ///
-    /// **`TreeWalk`: a root whose exit has begun**, as the kernel's exit flag shows (reaped, a zombie, or
-    /// still exiting), whose walk finds no member is
+    /// **`TreeWalk`: a root whose exit has begun** (reaped, a zombie, or still exiting), or whose exit
+    /// flag cannot be read, and whose walk finds no member, is
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) with nothing sent: its children were
-    /// reparented at its exit, so the walk says nothing of the tree. So is a flag that cannot be read,
-    /// with no member found. A walk that finds members signals them and is `Ok`, but the handle does
-    /// not take them for the whole tree. The handle holds the members the walk reached, and a later
-    /// [`kill_tree`](Child::kill_tree) or the drop kills them by identity.
+    /// reparented at its exit, so the walk says nothing of the tree. A walk that finds members signals
+    /// them and is `Ok`, but the handle does not take them for the whole tree. The handle holds the
+    /// members the walk reached, and a later [`kill_tree`](Child::kill_tree) or the drop kills them by
+    /// identity.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         // The mechanism looks at the root as for `kill_tree`, and on Unix this handle's reaps are held

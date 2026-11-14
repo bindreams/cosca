@@ -66,9 +66,8 @@ fn parse_pgrp_rejects_a_truncated_record() {
     assert_eq!(parse_pgrp(b"no parens here"), None);
 }
 
-/// Field 9 is the task's flags (index 6 of the tail). The values are the ones measured on Linux
-/// 6.12.113: a single-thread root before its exit `0x400140`, held inside it `0x40014c` (`PF_EXITING`
-/// and, with it, `0x8`).
+/// Field 9 is the task's flags (index 6 of the tail). The values are measured: a single-thread root
+/// before its exit `0x400140`, held inside it `0x40014c` (`PF_EXITING` and, with it, `0x8`).
 #[skuld::test]
 fn parse_flags_reads_field_nine() {
     let before = b"1234 (sh) S 1 4321 4321 0 -1 4194624 100 0 0 0 1 2 3 4 20 0 1 0 987 0 0";

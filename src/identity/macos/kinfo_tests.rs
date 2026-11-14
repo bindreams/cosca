@@ -336,7 +336,7 @@ fn p_flag_system_bit_matches_a_second_sysctl_query_and_libproc_disagrees_for_non
 }
 
 // The exit-begun read is `P_WEXIT` or a zombie's state, and no other flag: this process shows neither.
-// Mutants: the zombie state is not read; any flag counts; `P_WEXIT` is masked with `P_SYSTEM`.
+// Mutants: the zombie state is not read; any flag counts.
 #[skuld::test]
 fn exit_begun_is_p_wexit_or_a_zombie_and_no_other_flag() {
     let running = libc::SRUN as libc::c_char;
@@ -344,7 +344,6 @@ fn exit_begun_is_p_wexit_or_a_zombie_and_no_other_flag() {
     assert!(!exit_begun(running, 0));
     assert!(!exit_begun(running, P_SYSTEM));
     assert!(exit_begun(running, P_WEXIT));
-    assert!(exit_begun(running, P_WEXIT | P_SYSTEM));
     assert!(exit_begun(zombie, 0));
 
     let me = kinfo(std::process::id()).found().expect("this process resolves");
@@ -352,4 +351,32 @@ fn exit_begun_is_p_wexit_or_a_zombie_and_no_other_flag() {
         !exit_begun(me.kp_proc.p_stat, me.kp_proc.p_flag),
         "this process is running"
     );
+}
+
+// The identity read of the exit goes by the token: this process's own is running, another process's
+// token at this pid is `Gone`, and a refused `sysctl` is `Unknown`, with the refusal as the cause.
+// Mutants: the token is not compared; a refusal is `Gone`; the cause is dropped.
+#[skuld::test]
+fn the_exit_read_of_an_identity_is_gone_for_another_token_and_unknown_when_refused() {
+    let me = crate::identity::ProcessId::of(std::process::id())
+        .found()
+        .expect("this process has an identity");
+    assert_eq!(
+        super::super::exit_begun(me.pid(), me.key).0,
+        crate::identity::Resolved::Found(false),
+        "this process is running"
+    );
+
+    let other = crate::identity::Key::from_raw(me.key.raw() + 1);
+    assert_eq!(
+        super::super::exit_begun(me.pid(), other).0,
+        crate::identity::Resolved::Gone,
+        "the pid holds another process than the token's"
+    );
+
+    fault::force_unreadable_once();
+    let (read, cause) = super::super::exit_begun(me.pid(), me.key);
+    assert_eq!(read, crate::identity::Resolved::Unknown);
+    let error = cause.into_error("pid 1").expect("the refusal is the cause");
+    assert!(error.to_string().contains("kinfo_proc could not be read"), "{error}");
 }

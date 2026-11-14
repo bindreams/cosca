@@ -5,8 +5,7 @@
 //! another parent, and the flag never clears. So a read that finds the flag clear on a thread, and
 //! proves the id after, saw a process none of whose children had been reparented by its exit; a read
 //! that finds it on every thread saw an exit under way, whose children may be on their way out of
-//! the walk. Measured on Linux 6.12.113, for a same-uid, an other-uid and a non-root reader (60 of 60
-//! held exits each): the flag shows while the children still name the group, and a zombie keeps it.
+//! the walk (measured: [`PF_EXITING`](crate::identity::stat_parse::PF_EXITING)).
 //!
 //! The leader alone proves nothing: `pthread_exit` sets the flag on the leader while the process runs,
 //! and the children stay with the group. A group that exits sets the flag on every thread before the
@@ -18,8 +17,7 @@
 //!
 //! The exit has begun when a pass finds every thread of a listing exiting, and the pass before it
 //! did too over a listing that held every thread this one does. The loop ends when a pass finds a
-//! thread running, or a listing is covered by the one before; a group that keeps creating and ending
-//! threads keeps it going for as long as it does. It has no cap.
+//! thread running, or a listing is covered by the one before.
 
 use std::collections::HashSet;
 
@@ -29,16 +27,6 @@ use super::proc_read::ProcDir;
 use super::{exists_in_explained, Key};
 use crate::identity::stat_parse::exiting_from_stat;
 use crate::identity::{Existence, RawPid, Resolved, UnknownCause};
-
-/// [`exit_begun_in`], through a `/proc` view of its own. A view that cannot be had says nothing of the
-/// exit, `Gone` only if the id's process does not hold the pid.
-#[cfg(test)]
-pub(crate) fn exit_begun(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Resolved<bool>, UnknownCause) {
-    match super::proc_view::proc_view_with(kernel).into_dir() {
-        Ok(dir) => exit_begun_in(kernel, &dir, pid, key),
-        Err(why) => unsaid(super::exists(kernel, pid, key), UnknownCause::of_view(Some(why))),
-    }
-}
 
 /// Whether the exit of the process `key` names, at `pid`, has begun, reading through `dir`: `Found(true)`
 /// when every thread shows `PF_EXITING`, `Found(false)` when one does not. `Gone` when the pid holds no

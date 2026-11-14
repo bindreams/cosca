@@ -52,8 +52,8 @@ pub(crate) fn process_table(kernel: &dyn Kernel) -> Result<Table, Error> {
 
 #[cfg(unix)]
 impl Table {
-    /// [`ProcessId::exit_begun_with`](crate::identity::ProcessId::exit_begun_with) of `root`, read
-    /// through the `/proc` of this table on Linux.
+    /// Whether the exit of `root` has begun (see the treewalk module doc), read through the `/proc` of
+    /// this table on Linux.
     pub(crate) fn exit_begun(
         &self,
         kernel: &dyn Kernel,

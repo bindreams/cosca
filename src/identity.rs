@@ -655,25 +655,17 @@ impl ProcessId {
     /// this pid that is followed by a `Found(false)` read met no child the exit moved. Linux: every
     /// thread of the group shows `PF_EXITING` (the leader alone does not tell: `pthread_exit` sets it
     /// while the process runs), read through the checked `/proc`. macOS: `P_WEXIT` in `kinfo_proc`'s
-    /// `p_flag`. Measured on Linux 6.12.113 and on macOS 15.7.9, 15.8.2 and 26.7.2; the project's macOS
-    /// floor, 14.4, is not measurable on CI, and where its order differs the read does not see the
-    /// exit, which is the window a walk always had, never a false answer. Unlike
-    /// [`is_alive`](Self::is_alive), it answers `true` before the process is a zombie.
-    #[cfg(all(unix, any(test, not(target_os = "linux"))))]
+    /// `p_flag`. Where macOS 14's order differs the read does not see the exit, which is the window a
+    /// walk always had, never a false answer. Unlike [`is_alive`](Self::is_alive), it answers `true`
+    /// before the process is a zombie.
+    #[cfg(all(unix, not(target_os = "linux")))]
     pub(crate) fn exit_begun_with(&self, kernel: &dyn Kernel) -> (Resolved<bool>, UnknownCause) {
-        #[cfg(target_os = "linux")]
-        {
-            backend::exit::exit_begun(kernel, self.pid, self.key)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = kernel;
-            backend::exit_begun(self.pid, self.key)
-        }
+        let _ = kernel;
+        backend::exit_begun(self.pid, self.key)
     }
 
-    /// [`exit_begun_with`](Self::exit_begun_with), reading through the `/proc` at `proc_dir` (known to be
-    /// this pid namespace's) instead of building a view of its own.
+    /// `exit_begun_with` on Linux (see the doc there, written for the platforms that have it), reading
+    /// through the `/proc` at `proc_dir`, known to be this pid namespace's, as a walk's table's is.
     #[cfg(target_os = "linux")]
     pub(crate) fn exit_begun_in(&self, kernel: &dyn Kernel, proc_dir: &ProcDir) -> (Resolved<bool>, UnknownCause) {
         backend::exit::exit_begun_in(kernel, proc_dir, self.pid, self.key)

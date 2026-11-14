@@ -36,16 +36,16 @@ pub(crate) fn parse_ppid(stat: &[u8]) -> Option<u32> {
 }
 
 /// Field 9 (`flags`, index 6 of the tail) — the task's `PF_*` flags. An unprivileged reader sees it
-/// (not masked like the ptrace-gated fields), and the exit's flag is in it: measured on Linux
-/// 6.12.113 for a same-uid, an other-uid and a non-root reader of a root-owned task.
+/// (not masked like the ptrace-gated fields).
 pub(crate) fn parse_flags(stat: &[u8]) -> Option<u32> {
     tail(stat)?.split_whitespace().nth(6)?.parse::<u32>().ok()
 }
 
 /// `PF_EXITING`: `exit_signals` sets it, before the task's children are reparented
 /// (`exit_notify`), so a read that shows it sees an exit under way while the children still name
-/// the task's group as their parent. Measured to hold for 60 of 60 held exits, each flag read by an
-/// unprivileged reader. The exit also sets `0x8` and, once a zombie, `0x8000`; the test is the bit.
+/// the task's group as their parent. Measured on Linux 6.12.113, for a same-uid, an other-uid and a
+/// non-root reader of a root-owned task: 60 of 60 held exits showed it before the reparent, and a
+/// zombie keeps it. The exit also sets `0x8` and, once a zombie, `0x8000`; the test is the bit.
 pub(crate) const PF_EXITING: u32 = 0x4;
 
 /// Whether the task whose raw `stat` this is has begun to exit ([`PF_EXITING`] in its flags), and so

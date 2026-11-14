@@ -1,13 +1,12 @@
 //! A root whose exit has begun while its children still name it as their parent: the walk finds them,
 //! but the kernel reparents the rest at the exit's next step, so a walk from the root's pid cannot say
 //! it reached the tree. Linux only: the root shows `PF_EXITING` in every thread's `stat`, stated as a
-//! [`FakeKernel`] row. The kernel's order, the flag before the reparent, is measured (the held exit
-//! needs root and a FUSE mount); these rows are about what a walk does once it reads the flag.
+//! [`FakeKernel`] row; these rows are about what a walk does once it reads the flag.
 
 use std::io::Read as _;
 use std::os::unix::process::ExitStatusExt as _;
 
-use crate::containment::dispatch::TreeKillOutcome;
+use crate::containment::dispatch::{TreeKillOutcome, TreeKilled};
 use crate::identity::{FakeKernel, HostKernel, ProcessId};
 use crate::test_child::{live_exiting_member as live_member, release_unsignalled as release};
 
@@ -212,6 +211,86 @@ fn release_candidate(mut child: std::process::Child) {
         "the unread candidate must not have been signalled"
     );
     assert_eq!(child.wait().expect("reap the root").signal(), Some(libc::SIGKILL));
+}
+
+/// The tree-walk mechanism of a tree rooted at `root`.
+fn walker(root: ProcessId) -> crate::containment::mechanism::Mechanism {
+    crate::containment::mechanism::Mechanism::Walk(super::Walker::new(root))
+}
+
+/// What `entries` hold of the root's begun exit: the entry that names it.
+fn names_the_exit(entries: &[crate::error::Error]) -> bool {
+    entries.iter().any(|entry| {
+        matches!(entry, crate::error::Error::Unassessable { detail, .. } if detail.contains("had begun to exit"))
+    })
+}
+
+/// A root whose exit had begun, whose members were found and whose own kill was left, is not `Ok` when a
+/// later kill ends the root: the settlement drops the root's entry, and the exit's must outlive it.
+/// Mutant: the exit's entry is added only when nothing but members is left.
+#[skuld::test]
+fn a_begun_root_whose_own_kill_was_left_is_not_ok_once_a_later_kill_ends_it() {
+    use super::fault::{force_incomplete_once, LeftBehind};
+    let (child, root, _descendant) = live_member_with_descendant();
+    let kernel = exiting_root(root);
+    force_incomplete_once(LeftBehind::Root);
+
+    let outcome = super::hard_kill(&kernel, root, &super::ByIdentity::new(&kernel, root)).outcome();
+    let answer = TreeKilled::default().settle(Some(&walker(root)), outcome, true).answer;
+
+    assert!(
+        matches!(&answer, Err(crate::error::Error::Unassessable { detail, .. }) if detail.contains("had begun to exit")),
+        "{answer:?}"
+    );
+    assert_both_signalled("hard_kill", child, libc::SIGKILL);
+}
+
+/// A root whose exit had begun, with a member whose kill was refused, says the exit had begun beside
+/// the member it left. Mutant: the entry is added only for unread candidates with no member.
+#[skuld::test]
+fn a_kill_of_a_begun_root_that_leaves_a_member_says_the_exit_had_begun() {
+    use super::fault::{force_incomplete_once, LeftBehind};
+    let (child, root, _descendant) = live_member_with_descendant();
+    let kernel = exiting_root(root);
+    force_incomplete_once(LeftBehind::Descendant);
+
+    let TreeKillOutcome::Ran(Err(left)) =
+        super::hard_kill(&kernel, root, &super::ByIdentity::new(&kernel, root)).outcome()
+    else {
+        panic!("a member is left");
+    };
+
+    assert!(names_the_exit(&left.members), "{:?}", left.members);
+    assert_both_signalled("hard_kill", child, libc::SIGKILL);
+}
+
+/// A flag that cannot be read, with every member and the root killed, left nothing running: the
+/// settlement does not take the read's error for a member seen running, so a later kill that finds the
+/// root gone does not say a kill left something running. Mutant: any non-member error counts as running.
+#[skuld::test]
+fn an_unreadable_exit_flag_with_everything_killed_is_not_something_left_running() {
+    let (child, root, _descendant) = live_member_with_descendant();
+    let kernel = flag_unreadable(root);
+    let killed = TreeKilled::default();
+
+    let outcome = super::hard_kill(&kernel, root, &super::ByIdentity::new(&kernel, root)).outcome();
+    let first = killed.settle(Some(&walker(root)), outcome, true).answer;
+    assert!(
+        matches!(&first, Err(crate::error::Error::Unassessable { detail, .. }) if detail.contains("could not be read")),
+        "the read's error is the answer: {first:?}"
+    );
+
+    let later = killed
+        .settle(Some(&walker(root)), TreeKillOutcome::NoRoot(root.pid(), None), true)
+        .answer;
+    if let Err(error) = &later {
+        let said = error.to_string();
+        assert!(
+            !said.contains("a kill left something running"),
+            "nothing was left running: {said}"
+        );
+    }
+    assert_both_signalled("hard_kill", child, libc::SIGKILL);
 }
 
 /// A graceful call's own complete `SIGTERM` listing vouches for the tree over a root that its sweep

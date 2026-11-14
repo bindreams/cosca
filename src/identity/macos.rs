@@ -764,7 +764,7 @@ pub(super) fn is_running(pid: RawPid, start: Key) -> Liveness {
     }
 }
 
-/// [`ProcessId::exit_begun_with`](super::ProcessId::exit_begun_with) on macOS: `P_WEXIT` in the process's
+/// [`ProcessId::exit_begun_with`](super::ProcessId::exit_begun_with): `P_WEXIT` in the process's
 /// `kinfo_proc` (a zombie included), token-guarded as [`is_running`] is. A pid that holds another
 /// process, or none, is `Gone`.
 pub(super) fn exit_begun(pid: RawPid, start: Key) -> (Resolved<bool>, super::UnknownCause) {

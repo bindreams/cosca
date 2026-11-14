@@ -6,7 +6,7 @@ use std::io::BufRead as _;
 use std::process::Stdio;
 
 use crate::identity::stat_parse::{parse_num_threads, parse_starttime_jiffies, parse_state};
-use crate::identity::{HostKernel, Key, Liveness, ProcessId, Resolved};
+use crate::identity::{Key, Liveness, ProcessId, Resolved};
 use crate::Recursive;
 
 /// The process is alive, and a child its leader thread forked keeps the process's number as its parent's,
@@ -68,7 +68,7 @@ fn a_process_whose_leader_thread_exited_is_alive_and_keeps_its_children() {
     // (mutant: the leader's flag alone is read).
     for (who, id) in [("the /proc read", by_stat), ("the host's own id", id)] {
         assert_eq!(
-            id.exit_begun_with(&HostKernel).0,
+            super::exit_begun_tests::begun(&id),
             Resolved::Found(false),
             "{who}: a thread runs, so the group is not exiting"
         );

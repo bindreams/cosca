@@ -726,14 +726,22 @@ pub(crate) enum TreeKillOutcome {
     NoRoot(u32, Option<crate::containment::treewalk::WalkToken>),
     /// A `TreeWalk` walk found the root's exit begun, as the kernel's exit flag shows, and killed every
     /// member it found: the exit may have moved other children out of its reach, so the walk is no proof
-    /// of the tree. It settles as [`NoRoot`](Self::NoRoot) does, and the token is the same call
-    /// ([`in_call`](Self::in_call)): the root a moment later is a zombie, and answers `NoRoot`. A walk
-    /// that left a member is [`Ran`](Self::Ran), not this.
+    /// of the tree. It settles as [`NoRoot`](Self::NoRoot) does, token included
+    /// ([`in_call`](Self::in_call)). A walk that left a member is [`Ran`](Self::Ran), not this.
     #[cfg_attr(
         not(unix),
         allow(dead_code, reason = "only a Unix kernel reparents a root's children at its exit")
     )]
     RootExiting(u32, Option<crate::containment::treewalk::WalkToken>),
+    /// A `TreeWalk` walk found members and killed every one it found, the root included, but could not
+    /// read whether the root's exit had begun: the error says why the tree cannot be vouched for. It ran,
+    /// and left nothing running that it knows of, so it is not a member seen running
+    /// ([`Ran`](Self::Ran) with this error would be). A walk that left a member is `Ran`, not this.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only a Unix kernel reparents a root's children at its exit")
+    )]
+    ExitUnread(Error),
     /// The root's number is untrusted, so the kill skipped what names the tree by it. The tree is
     /// not killed. The caller that has the root's handle acts on [`Skip::root_alone`].
     #[cfg_attr(
@@ -777,7 +785,7 @@ impl TreeKillOutcome {
     }
 
     /// What [`RootExiting`](Self::RootExiting) of the root `pid` is as an error, and the entry of a walk
-    /// that left candidates unread beside a root whose exit had begun: no member is named.
+    /// that left anything of a tree whose root's exit had begun: no member is named.
     #[cfg(unix)]
     pub(crate) fn exiting_root_error(pid: u32) -> Error {
         Error::Unassessable {
@@ -825,6 +833,7 @@ impl TreeKillOutcome {
             TreeKillOutcome::RootExiting(pid, _) => Err(Unkilled::from(Self::exiting_root_error(pid))),
             #[cfg(not(unix))]
             TreeKillOutcome::RootExiting(..) => unreachable!("only a Unix walk finds a root exiting"),
+            TreeKillOutcome::ExitUnread(error) => Err(Unkilled::from(error)),
         }
     }
 
@@ -854,7 +863,7 @@ impl TreeKillOutcome {
             TreeKillOutcome::Skipped(Skip { action, .. }) => {
                 format!("the kill was skipped, and would {action}")
             }
-            TreeKillOutcome::Unwalked(error) => word(error),
+            TreeKillOutcome::Unwalked(error) | TreeKillOutcome::ExitUnread(error) => word(error),
             TreeKillOutcome::NoRoot(pid, _) => word(&Self::no_root_error(*pid)),
             TreeKillOutcome::RootExiting(pid, _) => word(&Self::exiting_root_error(*pid)),
             TreeKillOutcome::Ran(Ok(())) | TreeKillOutcome::Answered(Ok(())) => {
@@ -871,6 +880,7 @@ impl TreeKillOutcome {
             TreeKillOutcome::Ran(_)
             | TreeKillOutcome::Answered(_)
             | TreeKillOutcome::Unwalked(_)
+            | TreeKillOutcome::ExitUnread(_)
             | TreeKillOutcome::NoRoot(..)
             | TreeKillOutcome::RootExiting(..) => None,
         }
@@ -1137,11 +1147,18 @@ impl TreeKilled {
                     matches!(member, crate::containment::treewalk::Left::Termed { walk: Some(walk), .. } if walk == call)
                 })
         });
-        let ran = matches!(outcome, TreeKillOutcome::Ran(_) | TreeKillOutcome::Answered(_));
-        // What a walk not made or a gone root leaves is its error, not a member seen running.
+        let ran = matches!(
+            outcome,
+            TreeKillOutcome::Ran(_) | TreeKillOutcome::Answered(_) | TreeKillOutcome::ExitUnread(_)
+        );
+        // What a walk not made, a gone root or an unread exit flag leaves is its error, not a member seen
+        // running.
         let looked_for_no_member = matches!(
             outcome,
-            TreeKillOutcome::NoRoot(..) | TreeKillOutcome::RootExiting(..) | TreeKillOutcome::Unwalked(_)
+            TreeKillOutcome::NoRoot(..)
+                | TreeKillOutcome::RootExiting(..)
+                | TreeKillOutcome::Unwalked(_)
+                | TreeKillOutcome::ExitUnread(_)
         );
         // A walk already covered the tree unless it was never settled: a gone root adds no error of its own.
         let covered = gone_root && (listing_stands || state.vouching != Vouching::Never || !state.held.is_empty());
