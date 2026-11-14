@@ -566,11 +566,11 @@ impl Child {
     /// since, and its settlement kills by identity the ones reparented meanwhile. (`Drop`
     /// cannot retry, so it kills the held members and the root, and warns that its other
     /// descendants may be orphaned.)
-    /// A root whose exit is visible (reaped, a zombie, or no longer holding its pid) is
-    /// `Unassessable` too: its children were
-    /// reparented at its exit, so a walk from its pid finds none and `Ok` would say nothing of the
-    /// tree. Nothing is killed (a zombie root apart) and a retry cannot work. A zombie root whose walk
-    /// finds a member is walked as usual.
+    /// A root whose exit has begun (a zombie, a reaped root or one that no longer holds its pid
+    /// included), or whose exit flag cannot be read, is `Unassessable` too: its children are reparented
+    /// at its exit, so the walk says nothing of the tree. Members found are killed all the same; with
+    /// none found nothing is killed, and a retry can read an unreadable flag. A tree vouched for before
+    /// (a graceful shutdown's own complete `SIGTERM` listing, or an earlier kill) stays so.
     ///
     /// On the `TreeWalk` mechanism (on macOS, only where the ppid walk runs instead of the fd
     /// marker), a walk that killed what it could and left members running is an
@@ -949,10 +949,13 @@ impl Child {
     /// nothing goes out by its number, and the call returns
     /// [`Error::Unassessable`](crate::error::Error::Unassessable), with one `warn` saying so.
     ///
-    /// **`TreeWalk`: a root that has exited**, reaped or not, whose walk finds no member is
+    /// **`TreeWalk`: a root whose exit has begun** (reaped, a zombie, or still exiting), or whose exit
+    /// flag cannot be read, and whose walk finds no member, is
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) with nothing sent: its children were
-    /// reparented at its exit, so the walk says nothing of the tree. The handle holds the members the
-    /// walk reached, and a later [`kill_tree`](Child::kill_tree) or the drop kills them by identity.
+    /// reparented at its exit, so the walk says nothing of the tree. A walk that finds members signals
+    /// them and is `Ok`, but the handle does not take them for the whole tree. The handle holds the
+    /// members the walk reached, and a later [`kill_tree`](Child::kill_tree) or the drop kills them by
+    /// identity.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
         // The mechanism looks at the root as for `kill_tree`, and on Unix this handle's reaps are held

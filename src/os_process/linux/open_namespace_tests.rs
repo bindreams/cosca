@@ -213,6 +213,10 @@ impl Kernel for PauseKernel<'_> {
         self.inner.pids(dir)
     }
 
+    fn tids(&self, dir: &ProcDir, pid: u32) -> Result<Vec<u32>, ReadFailure> {
+        self.inner.tids(dir, pid)
+    }
+
     fn signal_probe(&self, target: Pid) -> Result<(), Errno> {
         self.inner.signal_probe(target)
     }

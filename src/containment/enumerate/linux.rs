@@ -1,6 +1,7 @@
 //! Linux `(pid, ppid)` snapshot: list the numeric entries of the checked `/proc`
 //! (`identity::linux::proc_view_with`) and read field 4 of each `stat` via the comm-safe `parse_ppid`.
 
+use super::Table;
 use crate::error::Error;
 use crate::identity::pid_file::{self, ReadOutcome};
 use crate::identity::stat_parse::parse_ppid;
@@ -13,6 +14,11 @@ use crate::identity::{warn_refused, Refusal};
 /// absence: the walk would miss that process and its subtree (see [`crate::identity::pid_file`]). A
 /// [`Refusal`], wherever in the snapshot it is met, is [`Error::Unsupported`], warned about once.
 pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
+    process_table(kernel).map(|table| table.parents)
+}
+
+/// [`process_parents`], with the `/proc` view it read through.
+pub(crate) fn process_table(kernel: &dyn Kernel) -> Result<Table, Error> {
     let mut out = Vec::new();
     let dir = crate::identity::proc_view_with(kernel)
         .into_dir()
@@ -50,7 +56,10 @@ pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid
             }
         }
     }
-    Ok(out)
+    Ok(Table {
+        parents: out,
+        view: dir,
+    })
 }
 
 /// Field 4 of `pid`'s `stat`. The kernel prints a parseable record for every pid, so a failure to

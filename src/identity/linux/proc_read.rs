@@ -189,8 +189,20 @@ impl ProcDir {
     /// The pids listed under this `/proc`: its decimal-named entries. The `openat2` of `.` is
     /// [`ReadFailure::Open`]; the directory's setup and listing are [`ReadFailure::Read`].
     pub(super) fn pids(&self) -> Result<Vec<u32>, ReadFailure> {
+        self.numeric_entries(".")
+    }
+
+    /// The thread ids listed under `pid`'s `task` directory, as [`pids`](Self::pids) lists pids:
+    /// opened fresh, so a thread created since an earlier listing is in it.
+    pub(super) fn tids(&self, pid: u32) -> Result<Vec<u32>, ReadFailure> {
+        self.numeric_entries(&format!("{pid}/task"))
+    }
+
+    /// The decimal-named entries of the directory `path`. The `openat2` of `path` is
+    /// [`ReadFailure::Open`]; the directory's setup and listing are [`ReadFailure::Read`].
+    fn numeric_entries(&self, path: &str) -> Result<Vec<u32>, ReadFailure> {
         let fd = self
-            .open_beneath(".", OFlags::RDONLY | OFlags::DIRECTORY)
+            .open_beneath(path, OFlags::RDONLY | OFlags::DIRECTORY)
             .map_err(ReadFailure::Open)?;
         let dir = rustix::fs::Dir::new(fd).map_err(|e| ReadFailure::Read(e.into()))?;
         collect_pids(dir.map(|entry| Ok(entry?.file_name().to_bytes().to_vec()))).map_err(ReadFailure::Read)
