@@ -93,7 +93,15 @@ impl Kernel for HostKernel {
 
 /// One `waitid(P_PID, pid, options)`. `Ok(None)` when nothing matched: XNU leaves a `siginfo_t`
 /// untouched then (`kern_exit.c:3364-3380`), so it is zeroed first and `si_pid == 0` means none.
+///
+/// `options` must carry `WNOHANG`. A blocking `waitid` sleeps until a child of this process changes
+/// state: under `SIGCHLD` set to `SIG_IGN`, where the kernel reaps the child itself, until the child
+/// list empties, which a live sibling can postpone for ever.
 fn waitid_record(pid: u32, options: libc::c_int) -> io::Result<Option<Record>> {
+    debug_assert!(
+        options & libc::WNOHANG != 0,
+        "a blocking waitid sleeps until the child list empties under SIG_IGN"
+    );
     // SAFETY: `siginfo_t` is plain old data; all-zero is a valid value.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     loop {

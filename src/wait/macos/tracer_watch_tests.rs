@@ -8,7 +8,7 @@ use super::{watched, OnTracer, TracerWatch, WalkError};
 use crate::child::spawn::identity_macos_tests::{other_unique_id, std_blocker_with_unique};
 use crate::identity::kinfo::kinfo_proc;
 use crate::identity::{FakeKernel, HostKernel, Kernel, UniqRead};
-use crate::os_process::macos::kqueue::test_hooks::{event_pending, send_signal};
+use crate::os_process::macos::kqueue::test_hooks::send_signal;
 use crate::os_process::macos::kqueue::{Event, Kqueue};
 use crate::wait::exit_only::macos_tests::found;
 
@@ -68,7 +68,7 @@ fn drain(kq: &Kqueue) {
 fn registered(kq: &Kqueue, pid: u32) -> bool {
     drain(kq);
     send_signal(pid, libc::SIGCONT);
-    let pending = event_pending(kq);
+    let pending = crate::os_process::poll::look_readable(std::os::fd::AsFd::as_fd(kq)).expect("poll the kqueue");
     drain(kq);
     pending
 }

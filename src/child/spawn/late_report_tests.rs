@@ -254,7 +254,7 @@ fn macos_a_spawn_waiting_for_a_late_report_lets_another_spawn_complete() {
     });
     let first_word = Rc::new(Cell::new(None));
     let second = Rc::new(std::cell::RefCell::new(None));
-    let _hook = unique_report::seams::on_first_block({
+    let _hook = crate::wait::block_probe::on_blocking({
         let (first_word, second) = (Rc::clone(&first_word), Rc::clone(&second));
         move || {
             let thread = std::thread::spawn(move || {
@@ -906,8 +906,8 @@ fn macos_late_child_held_by_a_tracer_is_not_answered_dead(#[fixture(tracer_group
             *helper.borrow_mut() = Some(attached);
         }
     });
-    let _release = unique_report::seams::on_each_block(|n, _| {
-        if n == 1 {
+    let _release = crate::wait::block_probe::on_each_block(|block| {
+        if block.n == Some(1) {
             unique_report::seams::release_the_report();
         }
     });

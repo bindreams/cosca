@@ -6,6 +6,7 @@ use super::{
     adopted_id, await_report, failed_spawn_error, read_report, register, seams, set_nonblocking, Report, Unadoptable,
 };
 use crate::error::Error;
+use crate::wait::block_probe::{self, on_blocking, on_each_block};
 
 /// A non-blocking pipe, as the parent's read end is.
 fn pipe() -> (OwnedFd, std::io::PipeWriter) {
@@ -335,8 +336,8 @@ fn end(mut child: std::process::Child, stdin: std::process::ChildStdin) {
 
 /// Arms a hook on the wait's first block that drops `copy`, a copy of the write end, so a wait that
 /// blocks where it should not ends at EOF and fails its test's assertion instead of hanging.
-fn release_on_block(copy: std::io::PipeWriter) -> crate::oneshot_hook::Armed {
-    seams::on_first_block(move || drop(copy))
+fn release_on_block(copy: std::io::PipeWriter) -> block_probe::Armed {
+    on_blocking(move || drop(copy))
 }
 
 /// An id that is already in the pipe is a late report.
@@ -384,15 +385,15 @@ fn awaiting_is_woken_by_the_report_through_the_pipe() {
     let stdin = Rc::new(RefCell::new(Some(stdin)));
     let writer = RefCell::new(Some(w));
     let pending = Rc::new(Cell::new(None));
-    let blocks = Rc::new(Cell::new(0));
-    let _hook = seams::on_each_block({
+    let blocks = Rc::new(Cell::new(None));
+    let _hook = on_each_block({
         let (stdin, pending, blocks) = (Rc::clone(&stdin), Rc::clone(&pending), Rc::clone(&blocks));
-        move |n, kq| {
-            blocks.set(n);
-            if n == 1 {
+        move |block| {
+            blocks.set(block.n);
+            if block.n == Some(1) {
                 let mut w = writer.borrow_mut().take().expect("the report's writer");
                 w.write_all(&report_bytes(1, 0xdef)).unwrap();
-                pending.set(Some(crate::os_process::macos::kqueue::test_hooks::event_pending(kq)));
+                pending.set(block.ready());
                 if pending.get() == Some(true) {
                     return;
                 }
@@ -403,7 +404,7 @@ fn awaiting_is_woken_by_the_report_through_the_pipe() {
     let _ = seams::take_wake();
     let report = await_report(&r, child.id());
     assert_eq!(pending.get(), Some(true), "the wait must watch the pipe");
-    assert_eq!(blocks.get(), 1, "a readable pipe ends the wait");
+    assert_eq!(blocks.get(), Some(1), "a readable pipe ends the wait");
     assert_eq!(seams::take_wake(), Some(seams::Wake::Pipe));
     assert!(matches!(report, Report::Late(0xdef)), "{report:?}");
     let mut child = child;
@@ -422,10 +423,10 @@ fn awaiting_a_child_that_exited_unreported_answers_missing_without_blocking() {
     let (r, copy) = pipe();
     drop(stdin);
     crate::test_child::wait_until_zombie(child.id());
-    let before = seams::block_count();
     let _release = release_on_block(copy);
+    block_probe::take();
     let report = await_report(&r, child.id());
-    assert_eq!(seams::block_count(), before, "a child already gone is not waited for");
+    assert_eq!(block_probe::take(), [], "a child already gone is not waited for");
     assert!(matches!(report, Report::Missing), "{report:?}");
     child.wait().expect("reap cat");
 }
@@ -441,7 +442,7 @@ fn awaiting_a_child_that_exits_during_the_wait_is_ended_by_its_exit() {
     let (mut child, stdin) = live_child();
     let pid = child.id();
     let (r, copy) = pipe();
-    let _hook = seams::on_first_block(move || {
+    let _hook = on_blocking(move || {
         drop(stdin);
         crate::test_child::wait_until_zombie(pid);
         drop(copy);
@@ -466,10 +467,10 @@ fn awaiting_a_pid_that_is_not_our_child_answers_missing_without_blocking() {
     let (r, copy) = pipe();
     // SAFETY: `getppid` has no preconditions.
     let stranger = unsafe { libc::getppid() } as u32;
-    let before = seams::block_count();
     let _release = release_on_block(copy);
+    block_probe::take();
     let report = await_report(&r, stranger);
-    assert_eq!(seams::block_count(), before, "a stranger is not waited for");
+    assert_eq!(block_probe::take(), [], "a stranger is not waited for");
     assert!(matches!(report, Report::Missing), "{report:?}");
 }
 
@@ -483,10 +484,10 @@ fn awaiting_a_reaped_pid_answers_missing_without_blocking() {
     let pid = child.id();
     end(child, stdin);
     let (r, copy) = pipe();
-    let before = seams::block_count();
     let _release = release_on_block(copy);
+    block_probe::take();
     let report = await_report(&r, pid);
-    assert_eq!(seams::block_count(), before, "a reaped child is not waited for");
+    assert_eq!(block_probe::take(), [], "a reaped child is not waited for");
     assert!(matches!(report, Report::Missing), "{report:?}");
 }
 
@@ -510,10 +511,10 @@ fn awaiting_a_child_launchd_holds_after_its_tracer_died_answers_missing_without_
     let (r, copy) = pipe();
     let _echild = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Gone)));
     let _parents = crate::identity::kinfo::fault::force_parents(pid, || forked_by_us_held_by(crate::identity::LAUNCHD));
-    let before = seams::block_count();
     let _release = release_on_block(copy);
+    block_probe::take();
     let report = await_report(&r, pid);
-    assert_eq!(seams::block_count(), before, "a child launchd holds is not waited for");
+    assert_eq!(block_probe::take(), [], "a child launchd holds is not waited for");
     assert!(matches!(report, Report::Missing), "{report:?}");
     end(child, stdin);
 }
@@ -556,14 +557,14 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
     let pending = Rc::new(Cell::new(None));
     let tracer_stdin = RefCell::new(Some(tracer_stdin));
     let copy = RefCell::new(Some(copy));
-    let _hook = seams::on_each_block({
+    let _hook = on_each_block({
         let pending = Rc::clone(&pending);
-        move |n, kq| {
-            if n == 1 {
+        move |block| {
+            if block.n == Some(1) {
                 drop(tracer_stdin.borrow_mut().take());
                 crate::test_child::wait_until_zombie(tracer_pid);
                 tracer_exited.set(true);
-                pending.set(Some(crate::os_process::macos::kqueue::test_hooks::event_pending(kq)));
+                pending.set(block.ready());
                 if pending.get() == Some(true) {
                     return;
                 }
@@ -601,7 +602,7 @@ fn awaiting_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
     use std::rc::Rc;
 
     use crate::os_process::child::{Foreign, PeekOutcome};
-    use crate::os_process::macos::kqueue::test_hooks::{event_pending, send_signal};
+    use crate::os_process::macos::kqueue::test_hooks::send_signal;
     use crate::wait::exit_only::seams::force_peeks;
     let (child, stdin) = live_child();
     let pid = child.id();
@@ -620,21 +621,21 @@ fn awaiting_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
     let (attach_woke, exit_woke) = (Rc::new(Cell::new(None)), Rc::new(Cell::new(None)));
     let tracer_stdin = RefCell::new(Some(tracer_stdin));
     let copy = RefCell::new(Some(copy));
-    let _hook = seams::on_each_block({
+    let _hook = on_each_block({
         let (attach_woke, exit_woke) = (Rc::clone(&attach_woke), Rc::clone(&exit_woke));
-        move |n, kq| {
-            let woke = match n {
-                1 => {
+        move |block| {
+            let woke = match block.n {
+                Some(1) => {
                     holder.set(tracer_pid);
                     send_signal(pid, libc::SIGCONT);
-                    attach_woke.set(Some(event_pending(kq)));
+                    attach_woke.set(block.ready());
                     attach_woke.get()
                 }
-                2 => {
+                Some(2) => {
                     drop(tracer_stdin.borrow_mut().take());
                     crate::test_child::wait_until_zombie(tracer_pid);
                     holder.set(crate::identity::LAUNCHD);
-                    exit_woke.set(Some(event_pending(kq)));
+                    exit_woke.set(block.ready());
                     exit_woke.get()
                 }
                 _ => None,
@@ -688,14 +689,14 @@ fn waiting_warns(mark: usize) -> usize {
 
 /// A wait on `child` (a [`live_child`]) whose checks find it held by `tracer` (another live child),
 /// with the tracer walks answering `links`. The hook on block `release_at` drops a copy of the write
-/// end, so the wait ends at EOF. Answers the report, the blocks taken and each `kevent`'s timeout.
+/// end, so the wait ends at EOF. Answers the report and each `kevent`'s timeout, one per block.
 fn await_held(
     child: u32,
     tracer: u32,
     links: Vec<crate::identity::Link>,
     say_after: std::time::Duration,
     release_at: u32,
-) -> (Report, u32, Vec<Option<std::time::Duration>>) {
+) -> (Report, Vec<Option<std::time::Duration>>) {
     use std::cell::RefCell;
 
     use crate::os_process::child::{Foreign, PeekOutcome};
@@ -704,16 +705,16 @@ fn await_held(
     let _echild = force_peeks((0..16).map(|_| Ok(PeekOutcome::Foreign(Foreign::Gone))));
     let _parents = crate::identity::kinfo::fault::force_parents(child, move || forked_by_us_held_by(tracer));
     let _links = crate::wait::macos::tracer_seams::force_links(links);
-    let recorded = seams::say_waiting_after_then_record(say_after);
+    let _warn = seams::warn_after(say_after);
     let copy = RefCell::new(Some(copy));
-    let _hook = seams::on_each_block(move |n, _| {
-        if n == release_at {
+    let _hook = on_each_block(move |block| {
+        if block.n == Some(release_at) {
             drop(copy.borrow_mut().take());
         }
     });
-    let before = seams::block_count();
+    block_probe::take();
     let report = await_report(&r, child);
-    (report, seams::block_count() - before, recorded.timeouts())
+    (report, block_probe::take())
 }
 
 /// A walk that finds the tracer gone checks again at once without blocking, then blocks for no
@@ -725,7 +726,7 @@ fn a_tracer_found_gone_arms_the_wait_with_its_backoff() {
     use crate::identity::Link;
     let (child, stdin) = live_child();
     let (tracer, tracer_stdin) = live_child();
-    let (report, blocks, timeouts) = await_held(
+    let (report, timeouts) = await_held(
         child.id(),
         tracer.id(),
         vec![Link::Gone, Link::Gone],
@@ -733,8 +734,11 @@ fn a_tracer_found_gone_arms_the_wait_with_its_backoff() {
         1,
     );
     assert!(matches!(report, Report::Missing), "{report:?}");
-    assert_eq!(blocks, 1, "a re-check at once does not block");
-    assert_eq!(timeouts, [Some(std::time::Duration::from_millis(1))]);
+    assert_eq!(
+        timeouts,
+        [Some(std::time::Duration::from_millis(1))],
+        "a re-check at once does not block"
+    );
     end(child, stdin);
     end(tracer, tracer_stdin);
 }
@@ -748,7 +752,7 @@ fn a_wait_held_by_a_tracer_blocks_for_the_sooner_of_its_backoff_and_its_warning(
     crate::log_capture::install();
     let (child, stdin) = live_child();
     let (tracer, tracer_stdin) = live_child();
-    let (report, blocks, timeouts) = await_held(
+    let (report, timeouts) = await_held(
         child.id(),
         tracer.id(),
         vec![Link::Gone, Link::Gone, Link::Gone],
@@ -756,7 +760,6 @@ fn a_wait_held_by_a_tracer_blocks_for_the_sooner_of_its_backoff_and_its_warning(
         2,
     );
     assert!(matches!(report, Report::Missing), "{report:?}");
-    assert_eq!(blocks, 2);
     let ms = std::time::Duration::from_millis;
     assert_eq!(
         timeouts,
@@ -776,18 +779,19 @@ fn a_wait_warns_once_that_the_report_is_late() {
     crate::log_capture::install();
     let (child, stdin) = live_child();
     let (r, copy) = pipe();
-    let recorded = seams::say_waiting_after_then_record(std::time::Duration::ZERO);
+    let _warn = seams::warn_after(std::time::Duration::ZERO);
     let copy = RefCell::new(Some(copy));
-    let _hook = seams::on_each_block(move |n, _| {
-        if n == 2 {
+    let _hook = on_each_block(move |block| {
+        if block.n == Some(2) {
             drop(copy.borrow_mut().take());
         }
     });
     let mark = crate::log_capture::mark();
+    block_probe::take();
     let report = await_report(&r, child.id());
     assert!(matches!(report, Report::Missing), "{report:?}");
     assert_eq!(waiting_warns(mark), 1, "one warning, however long the wait");
-    let timeouts = recorded.timeouts();
+    let timeouts = block_probe::take();
     assert_eq!(timeouts.first(), Some(&Some(std::time::Duration::ZERO)), "{timeouts:?}");
     assert!(
         timeouts[1..].iter().all(Option::is_none),

@@ -192,10 +192,14 @@ fn kevent_round(kq: &Kqueue, events: &mut [KEvent; BATCH], block: Block) -> io::
         let timeout = block.timeout().map(kevent_timeout);
         #[cfg(test)]
         {
-            let armed = timeout.map(|t| Duration::new(t.tv_sec as u64, t.tv_nsec as u32));
-            test_hooks::record_await_kevent(armed);
-            if armed != Some(Duration::ZERO) {
-                if let Some(elapsed) = test_hooks::take_forced_eintr() {
+            // A `Poll` is zero by construction and never blocks; an `Until` may block, so it records
+            // even when the clock left it nothing. The forced `EINTR` replaces a blocking call only:
+            // it is not taken at a zero timeout.
+            if matches!(block, Block::Until { .. }) {
+                kq.about_to_block(timeout);
+                let zero = timeout.is_some_and(|t| t.tv_sec == 0 && t.tv_nsec == 0);
+                let forced = if zero { None } else { test_hooks::take_forced_eintr() };
+                if let Some(elapsed) = forced {
                     crate::wait::test_clock::advance_by_elapsed_if_frozen(elapsed);
                     continue;
                 }
@@ -226,8 +230,6 @@ pub(crate) fn await_reapable_on(
     let mut interval = BACKOFF_START;
     let mut events = [blank(); BATCH];
     let mut tracer = TracerWatch::default();
-    #[cfg(test)]
-    let mut round: u32 = 0;
     #[cfg(test)]
     let mut check = crate::wait::test_clock::RoundCheck::new("await_reapable_on");
     #[cfg(test)]
@@ -272,12 +274,6 @@ pub(crate) fn await_reapable_on(
             return final_peek(kernel, pid, unique);
         }
         // Block: on the kqueue alone until `NOTE_EXIT`, then per backoff interval.
-        #[cfg(test)]
-        test_hooks::fire_kevent_round(round);
-        #[cfg(test)]
-        {
-            round += 1;
-        }
         let block = Block::Until {
             interval: match (backoff.then_some(interval), tracer_wait) {
                 (Some(backoff), Some(tracer)) => Some(backoff.min(tracer)),
