@@ -124,22 +124,13 @@ In order:
      split by arm. Windows and macOS still tear down by themselves for their other spawn failures;
      on macOS a refused kill leaves the child running, with a warn, until the macOS hand-back.
    - Under `MacosChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
-     kernel-view slice): macOS's `Kernel` has its methods and is threaded through. The tests of
-     the identity reads state `FakeKernel` rows (`unique_info`, `short_bsd`, `bsd_info`, `kinfo`,
-     and `on_every_*` rows that answer every read of a pid, as the `unreadable` test helper's do);
-     the `OwnedChild` tests build their `MacosChild` over a `FakeKernel` (`Blocker::spawn_over`).
-     The hooks that remain answer above the kernel for the paths that still hold `HostKernel` (the
-     spawn-time code: `adopt`, `unique_report`, spawn's teardown, and the public spawn that
-     `a_zombie_launchd_holds_has_exited_for_the_grace_watch_at_once` uses; the fd-marker sweep,
-     whose three tests keep `identity::force_unknown`) or whose answer no row states: `uniq_fault`
-     with `ReadPurpose`, `ppid_fault`, `kinfo::fault`'s `force_parents`,
-     `tracer_watch::seams::force_links` and `identity::seams::by_pid_reads`. Of the last kind,
-     `a_failed_start_read_in_the_second_reap_neither_panics_nor_leaves_n` needs `uniq_fault`: how
-     many unique-id reads precede the second peek depends on how many looks the wait makes before
-     the killed tracee's exit shows. `host_kinfo`'s `contract_violation` arm (a `sysctl` failure
-     that is not `ESRCH`, `EPERM` or `EACCES`) is untested by design: no row reaches
-     `HostKernel`'s own read, and a production seam for it is not worth the arm
-     (coordinator, 2026-11-14). `exit_only::{peek, peek_verified, peek_traced}` still
+     kernel-view slice): macOS's `Kernel` has its methods and is threaded through. macOS tests
+     state `FakeKernel` rows. Hooks remain only where the code still holds `HostKernel` (the
+     spawn-time code, the fd-marker sweep) or no row can state the answer (`uniq_fault`,
+     `ppid_fault`, `force_parents`, `force_links`, `by_pid_reads`). `HostKernel`'s own `sysctl`
+     read states no row, so what a sysctl result means (`ESRCH`, `EPERM`/`EACCES` quiet; any other
+     errno or a record of another size a `contract_violation`) is the pure `kinfo::classify`,
+     tested directly. `exit_only::{peek, peek_verified, peek_traced}` still
      consult the `exit_only::seams` hook; five macOS tests need it, and `MacosChild::event_pending`
      (a `cfg(test)` accessor) goes with it. `LinuxProcess` no longer does. The slices that convert
      them also remove `block_probe::on_round` and `on_every_round`, the `cfg(test)` round hooks of

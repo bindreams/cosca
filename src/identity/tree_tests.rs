@@ -90,32 +90,13 @@ fn an_anchor_that_is_access_denied_is_unassessable_blaming_access() {
     // identity. (A pidfs anchor's identity needs no `/proc`; see `tree_pidfs_tests`.)
     #[cfg(target_os = "linux")]
     let id = crate::identity::ticks_id(id.pid());
-    let (kernel, _guard) = crate::identity::unreadable(id.pid());
     let expected = format!("pid {} exists but could not be queried", id.pid());
-    // The kernel of a children walk. The macOS snapshot reads every pid's parent, the anchor's
-    // too, before the walk reads the anchor: the first record read of the anchor answers, and every
-    // later one is refused, so the refusal is the anchor's and not the snapshot's.
-    let for_a_walk = || {
-        #[cfg(target_os = "macos")]
-        let kernel = {
-            use crate::identity::{FakeKernel, Kernel as _, ReadErr};
-            let pid = id.pid();
-            let Ok(record) = HostKernel.bsd_info(pid) else {
-                panic!("the live member has a record");
-            };
-            FakeKernel::over(&HostKernel)
-                .on_bsd_info(pid, Ok(record))
-                .on_every_bsd_info_failing(pid, ReadErr::Refused(libc::EPERM))
-                .on_every_kinfo_refused(pid, libc::EPERM)
-        };
-        #[cfg(not(target_os = "macos"))]
-        let kernel = crate::identity::unreadable(id.pid()).0;
-        kernel
-    };
     for result in [
-        id.parent_with(&kernel).map(|_| ()),
-        id.children_with(&for_a_walk(), Recursive::No).map(|_| ()),
-        id.children_with(&for_a_walk(), Recursive::Yes).map(|_| ()),
+        id.parent_with(&crate::identity::unreadable(id.pid())).map(|_| ()),
+        id.children_with(&crate::identity::unreadable_anchor(id.pid()), Recursive::No)
+            .map(|_| ()),
+        id.children_with(&crate::identity::unreadable_anchor(id.pid()), Recursive::Yes)
+            .map(|_| ()),
     ] {
         match result {
             Err(Error::Unassessable { detail, .. }) => assert!(detail.contains(&expected), "{detail}"),
@@ -132,7 +113,7 @@ fn an_anchor_that_is_access_denied_is_unassessable_blaming_access() {
 fn a_parent_that_is_access_denied_is_unassessable_naming_the_ppid() {
     let (child, id) = live_member();
     let me = std::process::id();
-    let (kernel, _guard) = crate::identity::unreadable(me);
+    let kernel = crate::identity::unreadable(me);
     match id.parent_with(&kernel) {
         Err(Error::Unassessable { detail, .. }) => {
             assert!(
@@ -216,7 +197,7 @@ fn a_candidate_is_unknown_when_its_parent_cannot_be_proved() {
     let parent = crate::identity::ticks_id(me);
     #[cfg(not(target_os = "linux"))]
     let parent = ProcessId::current();
-    let (kernel, _guard) = crate::identity::unreadable(me);
+    let kernel = crate::identity::unreadable(me);
     let (read, cause) = ProcessId::of_ordered_with(&kernel, kid.pid(), Some(parent), None, None);
     release(child);
     assert_eq!(read, Resolved::Unknown);

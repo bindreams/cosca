@@ -41,10 +41,8 @@ impl kinfo_proc {
     }
 }
 
-/// Test-only: `e_jobc` is read by the tracer helper's tests (`test_support::tracer_tests`) for
-/// their preconditions; `of_host_held_by` builds the records that `origin_tests`, `os_process`'s
-/// and the tracer watch's tests state as a tracer's hold, and `set_e_ppid` serves it and
-/// `fault::force_parents`.
+/// `e_jobc` is read by the tracer helper's tests (`test_support::tracer_tests`) for their
+/// preconditions.
 #[cfg(test)]
 impl kinfo_proc {
     /// Byte offset of `eproc.e_jobc` within `kp_eproc`: after `e_ppid` and `e_pgid`
@@ -249,48 +247,79 @@ pub(super) fn host_kinfo(pid: RawPid) -> (Resolved<kinfo_proc>, Option<std::io::
                 0,
             )
         };
-        if rc != 0 {
-            let e = std::io::Error::last_os_error();
-            return match e.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                // The OS positively says there is no such process.
-                Some(libc::ESRCH) => (Resolved::Gone, None),
-                // A sandbox or hardened runtime refusing the query is the DESIGNED Unknown,
-                // not a contract violation - `debug`, like every other per-pid probe.
-                Some(libc::EPERM) | Some(libc::EACCES) => {
-                    log::debug!(
-                        "sysctl(KERN_PROC_PID, {pid}) refused: {report}",
-                        report = crate::error::Report(&e)
-                    );
-                    (Resolved::Unknown, Some(e))
-                }
-                // ENOMEM/EINVAL are neither race- nor permission-reachable. ENOMEM in
-                // particular is the ONLY runtime detector for a kernel `kinfo_proc` that has
-                // grown past our 648-byte definition: it fails before the size check below
-                // is ever reached, and the compile-time size assert cannot fire because the
-                // Rust definition is what stayed still. Keep it loud.
-                _ => {
-                    super::contract_violation(format_args!(
-                        "sysctl(KERN_PROC_PID, {pid}) failed: {report}",
-                        report = crate::error::Report(&e)
-                    ));
-                    (Resolved::Unknown, Some(e))
-                }
-            };
-        }
-        if size == 0 {
-            return (Resolved::Gone, None);
-        }
-        if size != std::mem::size_of::<kinfo_proc>() {
-            // Layout drift — never trust a partial/foreign-sized record.
-            let drift = format!(
+        let called = if rc == 0 {
+            Ok(size)
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
+        return match classify(pid, called) {
+            SysctlOutcome::Retry => continue,
+            SysctlOutcome::Gone => (Resolved::Gone, None),
+            SysctlOutcome::Refused(e) => {
+                log::debug!(
+                    "sysctl(KERN_PROC_PID, {pid}) refused: {report}",
+                    report = crate::error::Report(&e)
+                );
+                (Resolved::Unknown, Some(e))
+            }
+            SysctlOutcome::Violation { message, error } => {
+                super::contract_violation(format_args!("{message}"));
+                (Resolved::Unknown, Some(error))
+            }
+            SysctlOutcome::Record => (Resolved::Found(info), None),
+        };
+    }
+}
+
+/// What one `sysctl(KERN_PROC_PID)` call's result means.
+#[derive(Debug)]
+enum SysctlOutcome {
+    /// `EINTR`: ask again.
+    Retry,
+    /// The OS positively says there is no such process: `ESRCH`, or an empty reply.
+    Gone,
+    /// A sandbox or hardened runtime refused the query: the DESIGNED `Unknown`, not a contract
+    /// violation.
+    Refused(std::io::Error),
+    /// The kernel broke the contract: what to trace, and the error the read answers, which keeps a
+    /// failure's own errno.
+    Violation { message: String, error: std::io::Error },
+    /// A record of exactly our `kinfo_proc`'s size.
+    Record,
+}
+
+/// What `called`, the bytes the sysctl wrote or the error it failed with, means for `pid`.
+///
+/// `ENOMEM` and `EINVAL` are neither race- nor permission-reachable. `ENOMEM` in particular is the ONLY
+/// runtime detector for a kernel `kinfo_proc` that has grown past our 648-byte definition: it fails
+/// before the size check is ever reached, and the compile-time size assert cannot fire because the Rust
+/// definition is what stayed still. A record of another size is layout drift: never trusted.
+fn classify(pid: RawPid, called: std::io::Result<usize>) -> SysctlOutcome {
+    match called {
+        Err(e) => match e.raw_os_error() {
+            Some(libc::EINTR) => SysctlOutcome::Retry,
+            Some(libc::ESRCH) => SysctlOutcome::Gone,
+            Some(libc::EPERM | libc::EACCES) => SysctlOutcome::Refused(e),
+            _ => SysctlOutcome::Violation {
+                message: format!(
+                    "sysctl(KERN_PROC_PID, {pid}) failed: {report}",
+                    report = crate::error::Report(&e)
+                ),
+                error: e,
+            },
+        },
+        Ok(0) => SysctlOutcome::Gone,
+        Ok(size) if size == std::mem::size_of::<kinfo_proc>() => SysctlOutcome::Record,
+        Ok(size) => {
+            let message = format!(
                 "sysctl(KERN_PROC_PID, {pid}) wrote {size} bytes, expected {}",
                 std::mem::size_of::<kinfo_proc>()
             );
-            super::contract_violation(format_args!("{drift}"));
-            return (Resolved::Unknown, Some(std::io::Error::other(drift)));
+            SysctlOutcome::Violation {
+                error: std::io::Error::other(message.clone()),
+                message,
+            }
         }
-        return (Resolved::Found(info), None);
     }
 }
 

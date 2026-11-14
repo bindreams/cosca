@@ -802,8 +802,7 @@ fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
 /// before the watch was confirmed by a read.
 ///
 /// The confirming read is the first unique-id read, so the row refuses it; the peek's id check
-/// after it is the host's. The one row is spent by the confirming read: the `try_wait` after it
-/// reaches the exit record, where a row left for its id check would refuse it.
+/// after it is the host's.
 ///
 /// Mutant: `OwnedChild::liveness` propagates the refusal of `exited` without asking the peek; or
 /// answers `Dead` without the confirming read, leaving the row for the `try_wait`.

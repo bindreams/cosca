@@ -335,8 +335,7 @@ fn a_fired_watch_on_a_child_is_exited_only_once_it_is_a_zombie() {
 /// A look at a watch that has not fired reads no state of the process: a process's first look arms
 /// the watch, which proves the process by one unique-id read, and later looks read nothing; a child's,
 /// whose parent is this process, reads only that parent (two unique-id reads), never whether it is a
-/// zombie. Each kernel states the unique-id reads the look is to make, then a refusal: a look that
-/// reads once more is an error for a process that runs.
+/// zombie.
 ///
 /// Mutant: `ExitWatch::look` reads the process's state before it asks the watch; `MacosChild::exited`
 /// reads whether the child is a zombie while this process is its parent.

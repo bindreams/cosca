@@ -1053,17 +1053,25 @@ impl ProcessId {
 #[cfg(target_os = "macos")]
 pub(crate) use backend::kinfo;
 
-/// A kernel, and a guard to hold while it is used, under which every by-pid identity read of `pid`
-/// answers `Unknown`: an access refusal (`hidepid` on Linux, a sandbox on macOS) for a live pid.
-/// The kernel states the answer and the guard holds nothing.
+/// A kernel under which every by-pid identity read of `pid` answers `Unknown`: an access refusal
+/// (`hidepid` on Linux, a sandbox on macOS) for a live pid.
 ///
 /// Linux: a `stat` row for `pid` answering `EACCES`, which fails for every read through the kernel,
 /// a table scan's too. macOS: rows refusing every `proc_pidinfo` and `sysctl` read of the record,
 /// so `ppid_of`, `is_running`, `exit_begun` and a process snapshot fail for `pid` too, not only
-/// the identity read.
+/// the identity read. A children walk's snapshot therefore fails first on macOS: a walk whose
+/// anchor is `pid` takes [`unreadable_anchor`].
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) fn unreadable(pid: RawPid) -> (impl Kernel, impl Sized) {
-    (ticks_host(pid).on_read(&format!("{pid}/stat"), Err(libc::EACCES)), ())
+pub(crate) fn unreadable(pid: RawPid) -> impl Kernel {
+    ticks_host(pid).on_read(&format!("{pid}/stat"), Err(libc::EACCES))
+}
+
+/// [`unreadable`] for the kernel of a children walk anchored at `pid`: the walk's own reads of the
+/// anchor are refused, so the refusal is the anchor's. Linux: the same rows as `unreadable`, whose
+/// refusal reaches the anchor's read.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn unreadable_anchor(pid: RawPid) -> impl Kernel {
+    unreadable(pid)
 }
 
 /// A kernel over the host's that states a host before Linux 6.9 for live `pid` (see
@@ -1089,11 +1097,24 @@ pub(crate) fn ticks_id(pid: RawPid) -> ProcessId {
 /// [`unreadable`] on macOS: the record read `EPERM`s on both paths, as a sandbox refuses it (a
 /// cross-user read is refused by `proc_pidinfo` only).
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) fn unreadable(pid: RawPid) -> (impl Kernel, impl Sized) {
-    let kernel = FakeKernel::over(&HostKernel)
+pub(crate) fn unreadable(pid: RawPid) -> impl Kernel {
+    FakeKernel::over(&HostKernel)
         .on_every_bsd_info_failing(pid, ReadErr::Refused(libc::EPERM))
-        .on_every_kinfo_refused(pid, libc::EPERM);
-    (kernel, ())
+        .on_every_kinfo_refused(pid, libc::EPERM)
+}
+
+/// [`unreadable_anchor`] on macOS: the snapshot reads every pid's parent, the anchor's too, before
+/// the walk reads the anchor, so the first record read of `pid` answers with the host's, and every
+/// later one is refused: the refusal is the anchor's and not the snapshot's. `pid` must be live.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn unreadable_anchor(pid: RawPid) -> impl Kernel {
+    let Ok(record) = HostKernel.bsd_info(pid) else {
+        panic!("pid {pid} is live and has a record");
+    };
+    FakeKernel::over(&HostKernel)
+        .on_bsd_info(pid, Ok(record))
+        .on_every_bsd_info_failing(pid, ReadErr::Refused(libc::EPERM))
+        .on_every_kinfo_refused(pid, libc::EPERM)
 }
 
 /// The thread-local hook that makes every by-pid identity read of `pid` on this thread answer

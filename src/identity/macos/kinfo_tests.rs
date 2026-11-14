@@ -367,3 +367,43 @@ fn the_exit_read_of_an_identity_is_gone_for_another_token_and_unknown_when_refus
     let error = cause.into_error("pid 1").expect("the refusal is the cause");
     assert!(error.to_string().contains("kinfo_proc could not be read"), "{error}");
 }
+
+// What one sysctl call's result means. Mutants: `EINTR` is not retried; a refusal is a contract
+// violation (a sandbox then trips the debug tripwire), or an `ENOMEM` / `EINVAL` is quiet; a record of
+// another size is trusted; an empty reply is a violation.
+#[skuld::test]
+fn a_sysctl_result_is_classified_by_its_errno_and_size() {
+    let failed = |errno| std::io::Error::from_raw_os_error(errno);
+    let size = std::mem::size_of::<kinfo_proc>();
+    assert!(matches!(classify(7, Err(failed(libc::EINTR))), SysctlOutcome::Retry));
+    assert!(matches!(classify(7, Err(failed(libc::ESRCH))), SysctlOutcome::Gone));
+    assert!(matches!(classify(7, Ok(0)), SysctlOutcome::Gone));
+    assert!(matches!(classify(7, Ok(size)), SysctlOutcome::Record));
+    for errno in [libc::EPERM, libc::EACCES] {
+        match classify(7, Err(failed(errno))) {
+            SysctlOutcome::Refused(e) => assert_eq!(e.raw_os_error(), Some(errno)),
+            other => panic!("errno {errno} is a refusal, got {other:?}"),
+        }
+    }
+    for errno in [libc::ENOMEM, libc::EINVAL] {
+        match classify(7, Err(failed(errno))) {
+            SysctlOutcome::Violation { message, error } => {
+                assert!(message.contains("sysctl(KERN_PROC_PID, 7) failed"), "{message}");
+                assert_eq!(error.raw_os_error(), Some(errno), "the errno stays the read's cause");
+            }
+            other => panic!("errno {errno} is a contract violation, got {other:?}"),
+        }
+    }
+    for wrote in [size - 1, size + 1] {
+        match classify(7, Ok(wrote)) {
+            SysctlOutcome::Violation { message, error } => {
+                assert_eq!(
+                    message,
+                    format!("sysctl(KERN_PROC_PID, 7) wrote {wrote} bytes, expected {size}")
+                );
+                assert_eq!(error.to_string(), message);
+            }
+            other => panic!("{wrote} bytes is layout drift, got {other:?}"),
+        }
+    }
+}

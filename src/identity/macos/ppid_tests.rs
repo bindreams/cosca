@@ -122,24 +122,32 @@ fn one_parent_read_of_launchd_finds_its_parent_zero() {
 /// An ordered read waits out a fork-in-progress parent number only when it asks for the parent: one
 /// that names none reads the record once, whatever its parent number says, and one that names a parent
 /// reads again. The record states parent number `0`, which is a fork in progress for a pid other than
-/// 0 and 1.
+/// 0 and 1. Neither kernel has a host behind it: a read no row states panics.
 ///
-/// Mutant: every ordered read goes through the parent read (the first, whose kernel has the one row
-/// and no other, would read again and panic).
+/// Mutants: every ordered read goes through the parent read (the first kernel, with its one row,
+/// would read again and panic); the read under a parent trusts the `0` (the candidate is then
+/// `Gone`, its parent number not being the parent's).
 #[skuld::test]
 fn an_ordered_read_reads_the_parent_number_only_when_asked() {
     let (child, kid) = live_exiting_member();
+    let me = std::process::id();
+    let record = |pid| match HostKernel.bsd_info(pid) {
+        Ok(record) => record,
+        Err(e) => panic!("the live process {pid} has a record: {e:?}"),
+    };
     let forking = || {
-        let Ok(mut record) = HostKernel.bsd_info(kid.pid()) else {
-            panic!("the live member has a record");
-        };
+        let mut record = record(kid.pid());
         record.pbi_ppid = 0;
         Ok(record)
     };
     let alone_kernel = FakeKernel::new().on_bsd_info(kid.pid(), forking());
     let (alone, _) = ProcessId::of_ordered_with(&alone_kernel, kid.pid(), None, None, None);
     assert!(matches!(alone, Resolved::Found(_)), "{alone:?}");
-    let under_kernel = FakeKernel::over(&HostKernel).on_bsd_info(kid.pid(), forking());
+    // The candidate's two reads (parent number `0`, then the real one), then the proof of the parent.
+    let under_kernel = FakeKernel::new()
+        .on_bsd_info(kid.pid(), forking())
+        .on_bsd_info(kid.pid(), Ok(record(kid.pid())))
+        .on_bsd_info(me, Ok(record(me)));
     let parent = Some(ProcessId::current());
     let (under, _) = ProcessId::of_ordered_with(&under_kernel, kid.pid(), parent, None, None);
     release_unsignalled(child);

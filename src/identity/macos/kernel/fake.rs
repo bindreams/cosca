@@ -4,7 +4,7 @@
 //! A row answers one call for one pid, or for one [`Subscription`]. The rows of a call kind are
 //! taken in the order they were stated, the first one for what is asked about, and each answers
 //! once. A peek row never answers a consume. An `on_every_*` row answers every call of its kind
-//! for its pid that no other row answers, as every row of the Linux fake does.
+//! for its pid that no other row answers.
 
 use std::fmt::Arguments;
 use std::io;
@@ -68,6 +68,8 @@ pub(crate) struct FakeKernel<'a> {
     kinfos: Rows<RawPid, KinfoAnswer>,
     /// `Err`: the registration is refused with this errno. `Ok`: it is made and never fires.
     subscribes: Rows<Subscription, Result<(), i32>>,
+    /// How many `kinfo_proc` reads each pid has had, whoever answered them.
+    kinfo_reads: Mutex<Vec<(RawPid, usize)>>,
 }
 
 /// A row builder enters with the first test that states that call's answer.
@@ -83,6 +85,7 @@ impl<'a> FakeKernel<'a> {
             bsd_infos: Rows::new(),
             kinfos: Rows::new(),
             subscribes: Rows::new(),
+            kinfo_reads: Mutex::new(Vec::new()),
         }
     }
 
@@ -94,31 +97,31 @@ impl<'a> FakeKernel<'a> {
         }
     }
 
-    /// The next unique-id read of `pid` without a row before it answers `answer`.
+    /// The next unique-id read of `pid` answers `answer`.
     pub(crate) fn on_unique_info(mut self, pid: RawPid, answer: UniqRead) -> Self {
         self.unique_infos.push(pid, answer);
         self
     }
 
-    /// The next short BSD-info read of `pid` without a row before it answers `answer`.
+    /// The next short BSD-info read of `pid` answers `answer`.
     pub(crate) fn on_short_bsd(mut self, pid: RawPid, answer: Result<libc::proc_bsdshortinfo, ReadErr>) -> Self {
         self.short_bsds.push(pid, answer);
         self
     }
 
-    /// The next BSD-info read of `pid` without a row before it answers `answer`.
+    /// The next BSD-info read of `pid` answers `answer`.
     pub(crate) fn on_bsd_info(mut self, pid: RawPid, answer: Result<libc::proc_bsdinfo, ReadErr>) -> Self {
         self.bsd_infos.push(pid, answer);
         self
     }
 
-    /// The next `kinfo_proc` read of `pid` without a row before finds `record`.
+    /// The next `kinfo_proc` read of `pid` finds `record`.
     pub(crate) fn on_kinfo(mut self, pid: RawPid, record: kinfo_proc) -> Self {
         self.kinfos.push(pid, (Resolved::Found(record), None));
         self
     }
 
-    /// The next `kinfo_proc` read of `pid` without a row before is refused with `errno`.
+    /// The next `kinfo_proc` read of `pid` is refused with `errno`.
     pub(crate) fn on_kinfo_refused(mut self, pid: RawPid, errno: i32) -> Self {
         self.kinfos
             .push(pid, (Resolved::Unknown, Some(io::Error::from_raw_os_error(errno))));
@@ -150,10 +153,16 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
-    /// The next registration `what` without a row before is made and never fires.
+    /// The next registration `what` is made and never fires.
     pub(crate) fn on_subscribe(mut self, what: Subscription) -> Self {
         self.subscribes.push(what, Ok(()));
         self
+    }
+
+    /// How many `kinfo_proc` reads of `pid` the kernel has been asked for.
+    pub(crate) fn kinfo_reads(&self, pid: RawPid) -> usize {
+        let counts = self.kinfo_reads.lock().expect("no panic holds the counts");
+        counts.iter().find(|(p, _)| *p == pid).map_or(0, |(_, n)| *n)
     }
 
     /// The kernel that answers a call no row answers; `asked` says what the call was.
@@ -197,6 +206,13 @@ impl Kernel for FakeKernel<'_> {
     }
 
     fn kinfo(&self, pid: RawPid) -> KinfoAnswer {
+        {
+            let mut counts = self.kinfo_reads.lock().expect("no panic holds the counts");
+            match counts.iter_mut().find(|(p, _)| *p == pid) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((pid, 1)),
+            }
+        }
         self.kinfos
             .take(&pid)
             .unwrap_or_else(|| self.real(format_args!("a kinfo_proc read of pid {pid}")).kinfo(pid))

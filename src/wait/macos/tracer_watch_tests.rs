@@ -184,8 +184,10 @@ fn a_tracer_is_registered_again_after_its_note_exit() {
 }
 
 /// A chain that meets itself ends there: each process is walked once, and a second walk that
-/// registers nothing new blocks. The kernel states exactly the reads of those two walks, and no row
-/// for a third visit of a process: a walk with no cycle guard would panic for want of one.
+/// registers nothing new blocks. Each process's holder is stated for the two walks, its registration
+/// is made once, and every unique-id read finds it; a walk of a process reads its `kinfo_proc` once, so
+/// the count of those reads is the count of walks of it. A process stated for no third walk is read
+/// from the host after it, which ends the walk, so the count fails the test where a hang would not.
 ///
 /// Mutant: the walk has no cycle guard.
 #[skuld::test]
@@ -193,14 +195,11 @@ fn a_chain_that_meets_itself_is_walked_once() {
     let (a, b) = (Live::new(), Live::new());
     let kq = Kqueue::new().expect("kqueue");
     let mut watch = TracerWatch::default();
-    let mut kernel = FakeKernel::new();
+    let mut kernel = FakeKernel::over(&HostKernel);
     for (held, holder) in [(&a, &b), (&b, &a)] {
-        // The first walk reads each process for its link (the unique id before and after its
-        // `kinfo_proc`) and once more after the registration; the second walk, for its link alone.
-        for _ in 0..5 {
-            kernel = kernel.on_unique_info(held.pid(), held.found());
-        }
+        let unique = held.unique;
         kernel = kernel
+            .on_every_unique_info(held.pid(), move || found(unique))
             .on_kinfo(held.pid(), held.traced_by(holder.pid()))
             .on_kinfo(held.pid(), held.traced_by(holder.pid()))
             .on_subscribe(watched(held.pid()));
@@ -210,6 +209,9 @@ fn a_chain_that_meets_itself_is_walked_once() {
         OnTracer::Recheck(Duration::ZERO)
     );
     assert_eq!(walk(&mut watch, &kq, a.pid(), &kernel), OnTracer::Block);
+    for process in [&a, &b] {
+        assert_eq!(kernel.kinfo_reads(process.pid()), 2, "one read per walk of it");
+    }
 }
 
 // The backoff =====
