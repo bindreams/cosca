@@ -114,7 +114,7 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
-    /// Every peek of `pid` that no row answers answers what `answer` says at that peek.
+    /// Every peek of `pid` that no once row answers answers `answer()`.
     pub(crate) fn on_every_peek(
         mut self,
         pid: u32,

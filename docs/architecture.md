@@ -136,8 +136,7 @@ In order:
      code they run holds `HostKernel`. Three Linux spawn tests need the peek hooks too: the Linux
      peek is a `waitid` on a pidfd, which no `Kernel` row answers. `MacosChild::event_pending` (a
      `cfg(test)` accessor) goes with the registration hooks. `LinuxProcess` peeks through
-     `exit_only::linux::peek`, which consults no hook. The slices that convert the registration and round hooks also remove
-     `block_probe::on_round` and `on_every_round`, the `cfg(test)` round hooks of `wait.rs`.
+     `exit_only::linux::peek`, which consults no hook.
 2. **Elevation backends:** a black box that says what the tracked process is (the program, or a
    wrapper that outlives it) and what may be signalled. `Child` asks it; it stops knowing sudo,
    doas or osascript.

@@ -30,11 +30,8 @@ pub(crate) fn await_requested_timeouts() -> Vec<Option<Duration>> {
 
 /// Record one event the `await_reapable` loop got back: its `filter` and `fflags`.
 ///
-/// Kept, with [`take_events`], past K3: what the kernel handed the loop is the OS's answer to a
-/// registration, not an answer of a `Kernel` row, and no outcome shows it (a knote with and one
-/// without `EV_CLEAR` end the same wait `Reapable`). Its users:
-/// `no_evfilt_proc_event_arrives_after_the_round_that_delivered_note_exit` and
-/// `a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_exit`.
+/// The events are the OS's answer to a registration, not a `Kernel` row, and no outcome shows them
+/// (a knote with and one without `EV_CLEAR` end the same wait `Reapable`).
 pub(crate) fn record_event(filter: i16, fflags: u32) {
     AWAIT_EVENTS.with(|e| e.borrow_mut().push((filter, fflags)));
 }
