@@ -53,10 +53,7 @@ pub(crate) struct FakeKernel<'a> {
     subscribes: Rows<Subscription, Result<(), i32>>,
 }
 
-#[allow(
-    dead_code,
-    reason = "a row builder is used once a test states that call's answer; the hook families K2 to K5 convert bring them"
-)]
+/// A row builder enters with the first test that states that call's answer.
 impl<'a> FakeKernel<'a> {
     /// A kernel with no rows.
     pub(crate) fn new() -> Self {
@@ -80,61 +77,9 @@ impl<'a> FakeKernel<'a> {
         }
     }
 
-    /// The next peek of `pid` without a row before it answers `answer`.
-    pub(crate) fn on_peek(mut self, pid: u32, answer: io::Result<Option<Record>>) -> Self {
-        self.peeks.push(pid, answer);
-        self
-    }
-
-    /// The next consume of `pid` without a row before it answers `answer`.
-    pub(crate) fn on_consume(mut self, pid: u32, answer: io::Result<Option<Record>>) -> Self {
-        self.consumes.push(pid, answer);
-        self
-    }
-
     /// The next unique-id read of `pid` without a row before it answers `answer`.
     pub(crate) fn on_unique_info(mut self, pid: RawPid, answer: UniqRead) -> Self {
         self.unique_infos.push(pid, answer);
-        self
-    }
-
-    /// The next short BSD-info read of `pid` without a row before it answers `answer`.
-    pub(crate) fn on_short_bsd(mut self, pid: RawPid, answer: Result<libc::proc_bsdshortinfo, ReadErr>) -> Self {
-        self.short_bsds.push(pid, answer);
-        self
-    }
-
-    /// The next BSD-info read of `pid` without a row before it answers `answer`.
-    pub(crate) fn on_bsd_info(mut self, pid: RawPid, answer: Result<libc::proc_bsdinfo, ReadErr>) -> Self {
-        self.bsd_infos.push(pid, answer);
-        self
-    }
-
-    /// The next `kinfo_proc` read of `pid` without a row before it answers `answer`, with no failure.
-    pub(crate) fn on_kinfo(mut self, pid: RawPid, answer: Resolved<kinfo_proc>) -> Self {
-        self.kinfos.push(pid, (answer, None));
-        self
-    }
-
-    /// The next `kinfo_proc` read of `pid` without a row before it is `Unknown`, refused with
-    /// `errno`, as a sandbox refuses the `sysctl` with `EPERM`.
-    pub(crate) fn on_kinfo_refused(mut self, pid: RawPid, errno: i32) -> Self {
-        self.kinfos
-            .push(pid, (Resolved::Unknown, Some(io::Error::from_raw_os_error(errno))));
-        self
-    }
-
-    /// The next registration of `what` without a row before it is refused with `errno`, as `ESRCH`
-    /// refuses a process one past `P_REF_DEAD`.
-    pub(crate) fn on_subscribe_refused(mut self, what: Subscription, errno: i32) -> Self {
-        self.subscribes.push(what, Err(errno));
-        self
-    }
-
-    /// The next registration of `what` without a row before it is accepted and never fires: nothing
-    /// is registered on the queue.
-    pub(crate) fn on_subscribe_silent(mut self, what: Subscription) -> Self {
-        self.subscribes.push(what, Ok(()));
         self
     }
 
