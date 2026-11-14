@@ -132,10 +132,6 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
 
 /// The consuming `kernel.consume`. `Ok(None)` when it finds nothing.
 fn consume(kernel: &dyn Kernel, pid: u32) -> io::Result<Option<crate::identity::Record>> {
-    #[cfg(test)]
-    if super::seams::take_forced_empty_reap() {
-        return Ok(None);
-    }
     kernel.consume(pid).map(|r| r.map(super::consumed))
 }
 
@@ -176,8 +172,6 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
 /// The first status is already in hand, so nothing here panics: every outcome is a quiet skip
 /// or a `warn`.
 pub(crate) fn second_reap(kernel: &dyn Kernel, pid: u32, unique: Option<u64>) {
-    #[cfg(test)]
-    super::seams::step(super::seams::HolderStep::SecondPeek);
     match peek_raw(kernel, pid) {
         Ok(PeekOutcome::Exit(_)) => {}
         Ok(PeekOutcome::Running) => {

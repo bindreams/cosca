@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use super::fixtures::{spawn_std_blocker, status, try_wait, wait_status, Blocker};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::error::Error;
-use crate::identity::{ppid_fault, FakeKernel, HostKernel, UniqRead, LAUNCHD};
+use crate::identity::{ppid_fault, FakeKernel, HostKernel, Record, UniqRead, LAUNCHD};
 use crate::os_process::child::{Foreign, OsChild, PeekOutcome, TryReapOutcome};
 use crate::os_process::macos::child::MacosChild;
 use crate::os_process::macos::kqueue::test_hooks;
@@ -19,9 +19,8 @@ use crate::os_process::{Exit, OsProcess};
 use crate::signal::{Sent, Sig};
 use crate::test_groups::{setuid, Group};
 use crate::wait::exit_only::macos_tests::{
-    echild_yet_resolvable, found, held_by_a_tracer_pid, parent_reads, unique_of,
+    assert_zombie_consumed, echild_yet_resolvable, found, held_by_a_tracer_pid, parent_reads, unique_of,
 };
-use crate::wait::exit_only::seams::{self as exit_seams, HolderStep};
 
 fn far() -> Instant {
     Instant::now() + Duration::from_secs(3600)
@@ -41,30 +40,34 @@ fn is_foreign(outcome: &Result<ChildWaitOutcome, crate::error::Error>) -> bool {
 /// Mutant: a `debug_assert!` on the by-pid target.
 #[skuld::test]
 fn a_reap_that_finds_none_after_reapable_takes_the_echild_path() {
-    let mut b = Blocker::spawn();
+    let mut b = Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_consume(pid, Ok(None)));
     b.end_child_and_confirm_exit();
-    let none = exit_seams::force_empty_reap_once();
     let outcome = b.owned.wait(None);
-    drop(none);
     assert!(is_foreign(&outcome), "{outcome:?}");
     assert!(format!("{:?}", b.owned).contains("N"), "{:?}", b.owned);
-    // The zombie was never consumed (the reap was forced empty): a real wait reaps it.
+    // The zombie was never consumed (the one consume found nothing): a real wait reaps it.
     wait_status(&b.owned);
 }
 
 // The second peek =====
 
 /// The second peek runs after every first reap, traced or not. For an untraced child it
-/// answers `ECHILD` and is skipped quietly.
+/// answers `ECHILD` and is skipped quietly. The first consume states an exit record and takes
+/// nothing, as the consume of a child its tracer reparented to this process does, so only a second
+/// peek and consume can reap the zombie.
 ///
-/// Mutant: a second peek gated on `p_oppid`: no `SecondPeek` step for an untraced child.
+/// Mutant: a second peek gated on `p_oppid`: the zombie of an untraced child is left.
 #[skuld::test]
 fn a_second_peek_runs_after_every_first_reap() {
-    let mut b = Blocker::spawn();
+    let exited = Record {
+        si_code: libc::CLD_EXITED,
+        si_status: 0,
+    };
+    let mut b = Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_consume(pid, Ok(Some(exited))));
     b.end_child_and_confirm_exit();
-    exit_seams::holder_steps();
-    wait_status(&b.owned);
-    assert_eq!(exit_seams::holder_steps(), [HolderStep::SecondPeek]);
+    let status = wait_status(&b.owned);
+    assert!(status.success(), "{status:?}");
+    assert_zombie_consumed(b.pid, "the second reap");
 }
 
 // Task 2b: the `SIG_IGN` hang =====
@@ -585,19 +588,20 @@ fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
 /// Mutant: `Gone` at once: the wait answers `ECHILD`.
 #[skuld::test]
 fn a_reap_that_finds_no_exit_record_after_the_peek_saw_one_looks_again() {
-    let mut b = Blocker::spawn();
-    b.end_child_and_confirm_exit();
+    let exited = Record {
+        si_code: libc::CLD_EXITED,
+        si_status: 0,
+    };
     // The look's peek sees the exit; the reap's own peek then finds none.
-    let _forced = exit_seams::force_peeks([
-        Ok(PeekOutcome::Exit(crate::os_process::child::ExitRecord::Status(
-            std::process::ExitStatus::default(),
-        ))),
-        Ok(PeekOutcome::Running),
-    ]);
+    let mut b = Blocker::spawn_over(|pid, _| {
+        FakeKernel::over(&HostKernel)
+            .on_peek(pid, Ok(Some(exited)))
+            .on_peek(pid, Ok(None))
+    });
+    b.end_child_and_confirm_exit();
     crate::wait::block_probe::take();
     let status = wait_status(&b.owned);
     assert!(status.success(), "{status:?}");
-    exit_seams::assert_peeks_exhausted();
     assert!(
         !crate::wait::block_probe::take().is_empty(),
         "the second look follows a backoff"
@@ -784,17 +788,18 @@ fn try_wait_during_a_wait_errors_when_a_running_childs_unique_id_is_unreadable()
 /// blocks on a queue that holds nothing, for ever.
 #[skuld::test]
 fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
-    let mut b = Blocker::spawn();
-    b.end_child_and_confirm_exit();
     // Each look's peek finds no record, as when XNU is still finishing the exit: the `try_wait`'s,
     // which drains `NOTE_EXIT` from the reap kqueue, and the first of the `wait`'s, which finds
     // that queue empty. The `wait`'s second peek is the real one.
-    let forced = exit_seams::force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Running)]);
+    let mut b = Blocker::spawn_over(|pid, _| {
+        FakeKernel::over(&HostKernel)
+            .on_peek(pid, Ok(None))
+            .on_peek(pid, Ok(None))
+    });
+    b.end_child_and_confirm_exit();
     assert_eq!(try_wait(&b.owned).expect("try_wait"), ChildWaitOutcome::DeadlinePassed);
     let status = wait_status(&b.owned);
-    drop(forced);
     assert!(status.success(), "{status:?}");
-    exit_seams::assert_peeks_exhausted();
 }
 
 /// A child whose exit watch has fired and whose confirming read is refused is `Dead` when the reap

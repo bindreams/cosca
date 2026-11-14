@@ -131,8 +131,11 @@ In order:
      read states no row, so what a sysctl result means (`ESRCH`, `EPERM`/`EACCES` quiet; any other
      errno or a record of another size a `contract_violation`) is the pure `kinfo::classify`,
      tested directly. `exit_only::{peek, peek_verified, peek_traced}` still
-     consult the `exit_only::seams` hook; five macOS tests need it, and `MacosChild::event_pending`
-     (a `cfg(test)` accessor) goes with it. `LinuxProcess` no longer does. The slices that convert
+     consult the `exit_only::seams` hook (`force_peek_once`, `force_peeks`), and a macOS consume its
+     record rewrite (`force_consuming_record_once`): the spawn-time macOS tests need them, and so
+     do three Linux spawn tests, whose peek is a `waitid` on a pidfd that no kernel answers.
+     `MacosChild::event_pending` (a `cfg(test)` accessor) goes with the registration hooks.
+     `LinuxProcess` no longer does. The slices that convert
      them also remove `block_probe::on_round` and `on_every_round`, the `cfg(test)` round hooks of
      `wait.rs`.
 2. **Elevation backends:** a black box that says what the tracked process is (the program, or a

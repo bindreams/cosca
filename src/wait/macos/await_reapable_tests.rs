@@ -8,11 +8,8 @@
 use std::process::{Child, ChildStdin};
 use std::time::Duration;
 
-use crate::identity::HostKernel;
-use crate::os_process::child::PeekOutcome;
+use crate::identity::{FakeKernel, HostKernel, Record};
 use crate::os_process::macos::kqueue::{test_hooks, Kqueue};
-use crate::wait::exit_only::seams as exit_seams;
-use crate::wait::exit_only::seams::HolderStep;
 use crate::wait::macos::{await_reapable, await_reapable_on, Waited};
 
 fn spawn_blocker() -> (Child, ChildStdin) {
@@ -65,8 +62,9 @@ fn await_reapable_at_a_past_deadline_takes_its_final_peek() {
     let (child, stdin) = spawn_blocker();
     drop(stdin);
     confirm_exit(&child);
-    let _running = exit_seams::force_peek_once(Ok(PeekOutcome::Running));
-    let waited = await_reapable(&HostKernel, child.id(), None, Some(std::time::Instant::now())).expect("wait");
+    // The first peek finds no record; only the final peek reads the zombie.
+    let kernel = FakeKernel::over(&HostKernel).on_peek(child.id(), Ok(None));
+    let waited = await_reapable(&kernel, child.id(), None, Some(std::time::Instant::now())).expect("wait");
     assert_eq!(waited, Waited::Reapable);
     let mut child = child;
     child.wait().expect("reap");
@@ -100,11 +98,14 @@ fn spurious_wake() {
 /// the wait must go round again, and the test tells that wake from a round after the deadline by
 /// the frozen clock, not by counting rounds (another test's child may wake this one too). The
 /// clock is held until round 1, so a runner stall before it cannot run the deadline out first;
-/// round 0 spends 1 ms of it explicitly, so round 1 has less left than round 0.
+/// round 0 spends 1 ms of it explicitly, so round 1 has less left than round 0. The child runs, and
+/// the kernel states its exit only to a peek at or after the deadline, so only the final peek can
+/// find it.
 ///
 /// Mutant: an unbounded `kevent` under a deadline (its `debug_assert!` fires); a round after the
 /// deadline (no expiry check before the block); a timeout above the time remaining, or computed
-/// once per wait; no final peek; the clock not held (the stall at round 0 ends the wait there).
+/// once per wait; no final peek (`DeadlinePassed`); the clock not held (the stall at round 0 ends
+/// the wait there).
 #[skuld::test]
 fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
     let (mut child, stdin) = spawn_blocker();
@@ -126,9 +127,15 @@ fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
             }
         }
     });
-    exit_seams::holder_steps();
-    let waited = await_reapable(&HostKernel, child.id(), None, Some(deadline)).expect("wait");
-    assert_eq!(waited, Waited::DeadlinePassed);
+    let exited = Record {
+        si_code: libc::CLD_EXITED,
+        si_status: 0,
+    };
+    let kernel = FakeKernel::over(&HostKernel).on_every_peek(child.id(), move || {
+        Ok((crate::wait::now() >= deadline).then_some(exited))
+    });
+    let waited = await_reapable(&kernel, child.id(), None, Some(deadline)).expect("wait");
+    assert_eq!(waited, Waited::Reapable, "the final peek at expiry finds the exit");
     let timeouts = test_hooks::await_requested_timeouts();
     let blocking: Vec<Duration> = timeouts
         .iter()
@@ -144,7 +151,6 @@ fn a_deadline_kevent_backoff_is_clamped_and_ends_with_one_peek() {
     for (armed, left) in blocking.iter().zip(remainings.iter()) {
         assert!(armed <= left, "armed {armed:?} with only {left:?} remaining");
     }
-    assert_eq!(exit_seams::holder_steps(), [HolderStep::FinalPeek]);
     assert!(crate::wait::now() >= deadline);
     drop(stdin);
     child.wait().expect("reap");
@@ -251,12 +257,13 @@ fn no_evfilt_proc_event_arrives_after_the_round_that_delivered_note_exit() {
     let mut stdin = Some(stdin);
     // The child exits only after `EVFILT_PROC` is registered and the wait is about to block.
     let _end = test_hooks::on_kevent_round(0, move || drop(stdin.take()));
-    // At least one more round after the one that delivers `NOTE_EXIT`.
-    let _repeek = test_hooks::on_before_repeek(|| {
-        std::mem::forget(exit_seams::force_peek_once(Ok(PeekOutcome::Running)));
-    });
+    // At least one more round after the one that delivers `NOTE_EXIT`: the first peek, before the
+    // round that blocks, and the one after it, which the exit is not yet visible to, find no record.
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_peek(child.id(), Ok(None))
+        .on_peek(child.id(), Ok(None));
     assert_eq!(
-        await_reapable(&HostKernel, child.id(), None, None).expect("wait"),
+        await_reapable(&kernel, child.id(), None, None).expect("wait"),
         Waited::Reapable
     );
     child.wait().expect("reap");

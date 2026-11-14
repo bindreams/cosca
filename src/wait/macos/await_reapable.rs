@@ -309,8 +309,6 @@ fn expired(deadline: Option<Instant>) -> bool {
 
 /// The one non-blocking look at expiry.
 fn final_peek(kernel: &dyn Kernel, pid: u32, unique: Option<u64>) -> io::Result<Waited> {
-    #[cfg(test)]
-    exit_only::seams::step(exit_only::seams::HolderStep::FinalPeek);
     Ok(settle(peek(kernel, pid, unique)?.0).unwrap_or(Waited::DeadlinePassed))
 }
 

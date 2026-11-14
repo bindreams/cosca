@@ -8,7 +8,6 @@ use crate::identity::{
 };
 use crate::os_process::child::{adopted_blocker, Foreign, OsChild, PeekOutcome};
 use crate::test_child::wait_until_zombie;
-use crate::wait::exit_only::seams as exit_seams;
 use crate::wait::exit_only::{self, Target};
 
 pub(crate) fn found(unique_id: u64) -> UniqRead {
@@ -134,10 +133,16 @@ fn a_second_reap_with_an_id_mismatch_is_skipped() {
 #[skuld::test]
 fn a_second_reap_with_a_matching_id_consumes_the_leftover() {
     let (_os, pid) = second_reap_with_unique(found(7));
+    assert_zombie_consumed(pid, "the matching second reap");
+}
+
+/// Panics unless `pid` has no zombie left to reap: `who` must have consumed it.
+#[track_caller]
+pub(crate) fn assert_zombie_consumed(pid: u32, who: &str) {
     let mut status = 0;
     // SAFETY: `status` is a valid out-pointer.
     let r = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
-    assert_eq!(r, -1, "the matching second reap must have consumed the zombie");
+    assert_eq!(r, -1, "{who} must have consumed the zombie");
     assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
 }
 
@@ -151,9 +156,8 @@ fn a_second_reap_that_meets_echild_is_skipped() {
     let (_os, pid) = exited_unreaped_blocker();
     let marker = format!("second reap of pid {pid}");
     let mark = crate::log_capture::mark();
-    let forced = exit_seams::force_peek_once(Err(std::io::Error::from_raw_os_error(libc::ECHILD)));
-    exit_only::second_reap(&HostKernel, pid, None);
-    drop(forced);
+    let kernel = FakeKernel::over(&HostKernel).on_peek(pid, Err(std::io::Error::from_raw_os_error(libc::ECHILD)));
+    exit_only::second_reap(&kernel, pid, None);
     let levels = crate::log_capture::levels_since(mark, &marker);
     assert!(
         !levels.contains(&log::Level::Warn),
@@ -187,10 +191,10 @@ fn a_second_reap_that_finds_nothing_is_skipped() {
     let (_os, pid) = exited_unreaped_blocker();
     let marker = format!("second reap of pid {pid}");
     let mark = crate::log_capture::mark();
-    let kernel = FakeKernel::over(&HostKernel).on_unique_info(pid, found(7));
-    let none = exit_seams::force_empty_reap_once();
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_unique_info(pid, found(7))
+        .on_consume(pid, Ok(None));
     exit_only::second_reap(&kernel, pid, Some(7));
-    drop(none);
     let levels = crate::log_capture::levels_since(mark, &marker);
     assert!(
         !levels.contains(&log::Level::Warn),

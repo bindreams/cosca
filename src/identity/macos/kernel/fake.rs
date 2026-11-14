@@ -97,6 +97,28 @@ impl<'a> FakeKernel<'a> {
         }
     }
 
+    /// The next peek of `pid` answers `answer`: `Ok(None)` is a child that has not exited.
+    pub(crate) fn on_peek(mut self, pid: u32, answer: io::Result<Option<Record>>) -> Self {
+        self.peeks.push(pid, answer);
+        self
+    }
+
+    /// The next consume of `pid` answers `answer`, and takes nothing from the real process.
+    pub(crate) fn on_consume(mut self, pid: u32, answer: io::Result<Option<Record>>) -> Self {
+        self.consumes.push(pid, answer);
+        self
+    }
+
+    /// Every peek of `pid` that no row answers answers what `answer` says at that peek.
+    pub(crate) fn on_every_peek(
+        mut self,
+        pid: u32,
+        answer: impl Fn() -> io::Result<Option<Record>> + Send + Sync + 'static,
+    ) -> Self {
+        self.peeks.push_every(pid, answer);
+        self
+    }
+
     /// The next unique-id read of `pid` answers `answer`.
     pub(crate) fn on_unique_info(mut self, pid: RawPid, answer: UniqRead) -> Self {
         self.unique_infos.push(pid, answer);
