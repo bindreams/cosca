@@ -433,16 +433,16 @@ fn the_proc_dir_says_a_failed_read_is_the_reads() {
     assert_eq!(err.raw_os_error(), Some(libc::EISDIR), "{err}");
 }
 
-/// A link read says which call failed, as a file read does: a path the `openat2` refuses is `Open`
-/// (`EXDEV`), and a path that opens but is no link fails `readlinkat` (`EINVAL` for a regular file).
-/// Mutant: "every failure of `read_link` is the `openat2`'s".
+/// A link read says which call failed, as a file read does: a path the `openat2` does not open is
+/// `Open` (`ENOENT`), and a path that opens but is no link fails `readlinkat` (`EINVAL` for a regular
+/// file). Mutant: "every failure of `read_link` is the `openat2`'s".
 #[skuld::test]
 fn the_proc_dir_says_a_failed_link_read_is_the_reads() {
     let dir = ProcDir::open().expect("/proc opens");
-    let Err(ReadFailure::Open(err)) = dir.read_link("../etc/passwd") else {
-        panic!("must not leave /proc");
+    let Err(ReadFailure::Open(err)) = dir.read_link("self/no-such-link") else {
+        panic!("a missing path does not open");
     };
-    assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
+    assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "{err}");
     let Err(ReadFailure::Read(err)) = dir.read_link("self/status") else {
         panic!("a file opens and is no link");
     };
