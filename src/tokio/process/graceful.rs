@@ -40,7 +40,6 @@ impl Process {
     /// future mid-grace cancels the watch and performs no further signalling. Runtime
     /// requirements as on [`graceful_shutdown`](Process::graceful_shutdown).
     pub async fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
-        // SIGTERM-walk (Windows: Unsupported, early return); see the sync call for the settlement.
         let settling = self.inner.begin_graceful()?;
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);

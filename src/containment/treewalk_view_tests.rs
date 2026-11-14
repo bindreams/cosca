@@ -135,7 +135,7 @@ fn a_walkers_terminate_over_an_untrusted_view_says_nothing_was_sent() {
     for view in VIEWS {
         let (child, id) = live_member();
         let kernel = view.fail(FakeKernel::over(&HostKernel), 0);
-        match super::terminate_tree(&kernel, id, None) {
+        match super::terminate_tree(&kernel, id, None).0 {
             crate::containment::TerminateOutcome::NotSent(Error::Unassessable { detail, .. })
                 if detail.contains(view.cause()) => {}
             other => panic!("expected NotSent(Unassessable) naming {}, got {other:?}", view.cause()),

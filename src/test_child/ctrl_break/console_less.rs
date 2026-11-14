@@ -86,7 +86,7 @@ fn assert_refused_sends_are_not_sent() {
     let id = crate::identity::ProcessId::of(leader.id())
         .found()
         .expect("the live group leader resolves");
-    let outcome = crate::containment::treewalk::terminate_tree(&crate::identity::HostKernel, id, None);
+    let (outcome, _) = crate::containment::treewalk::terminate_tree(&crate::identity::HostKernel, id, None);
     assert!(
         matches!(outcome, TerminateOutcome::NotSent(_)),
         "a walker's refused break must be NotSent, got {outcome:?}"

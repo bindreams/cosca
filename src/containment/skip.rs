@@ -114,23 +114,14 @@ impl Why {
 pub(crate) enum TerminateOutcome {
     /// The signal went out, as usual or to what names the tree by identity, and `result` is what the
     /// check after it found. `earlier` names what a later sweep's error says was sent before it.
-    /// `termed` are the members a tree walk found and signalled, by identity: the root's exit
-    /// reparents them out of every later walk, so the tree's settlement holds them for its next kill
-    /// ([`TreeKilled::hold`](crate::containment::dispatch::TreeKilled::hold)). Every other mechanism
-    /// names its tree without a walk, and has none.
-    /// `complete`: that listing names the tree whole, as the walk saw it (a candidate it could not read
-    /// makes it incomplete); a mechanism with no walk names none and is `true`.
     Sent {
         result: Result<(), Error>,
         earlier: Option<&'static str>,
-        termed: Vec<crate::identity::ProcessId>,
-        complete: bool,
     },
     /// Nothing was sent: the call ends with this error.
     NotSent(Error),
-    /// A tree walk sent nothing because the root has exited and the walk found no member: its children
-    /// were reparented at its exit. `terminate_tree` ends with this error; a graceful shutdown goes on
-    /// to its sweep, which answers what `kill_tree` answers and kills the members the handle holds.
+    /// Nothing was sent: the root has exited and the walk found no member, so its children were
+    /// reparented at its exit.
     #[cfg_attr(not(unix), allow(dead_code, reason = "only a Unix walk finds its root exited"))]
     RootExited(Error),
     /// Nothing is sent by the root's number, and nothing else names the tree: the call ends now.
@@ -154,12 +145,7 @@ impl TerminateOutcome {
     /// ([`Sent`](Self::Sent)).
     pub(crate) fn of(sent: Result<Result<(), Error>, Error>, earlier: Option<&'static str>) -> TerminateOutcome {
         match sent {
-            Ok(result) => TerminateOutcome::Sent {
-                result,
-                earlier,
-                termed: Vec::new(),
-                complete: true,
-            },
+            Ok(result) => TerminateOutcome::Sent { result, earlier },
             Err(not_sent) => TerminateOutcome::NotSent(not_sent),
         }
     }

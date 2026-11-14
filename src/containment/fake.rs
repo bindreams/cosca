@@ -108,8 +108,6 @@ impl Contains for FakeContains {
         TerminateOutcome::Sent {
             result: Ok(()),
             earlier: Some("the SIGTERM"),
-            termed: Vec::new(),
-            complete: true,
         }
     }
 

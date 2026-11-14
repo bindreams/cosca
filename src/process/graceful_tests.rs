@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::graceful_hooks::{at, release_at, HookPoint};
 use crate::send_log::Capture;
-use crate::test_child::foreign;
+use crate::test_child::foreign::{self, survivor_tree, tree_of};
 use crate::wait::fault;
 
 /// A std child that ignores `SIGTERM` (`trap '' TERM` before `exec`; an ignored disposition
@@ -145,46 +145,6 @@ fn foreign_graceful_shutdown_graceful_path() {
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }
 
-/// A std tree on one stdin pipe: a root that a `SIGTERM` ends, and below it a subshell and its `cat`
-/// that ignore `SIGTERM`. Its descendants exist once the readiness line is read. The `Process` is open
-/// on the root, and `members` are the descendants' identities.
-struct SurvivorTree {
-    child: std::process::Child,
-    _stdout: std::process::ChildStdout,
-    process: crate::Process,
-    members: Vec<crate::identity::ProcessId>,
-}
-
-fn survivor_tree() -> SurvivorTree {
-    tree_of(crate::test_child::TERM_SURVIVOR_TREE_ARGV)
-}
-
-/// [`survivor_tree`] over `argv`, which prints `r\n` once its descendants exist.
-fn tree_of(argv: &[&str]) -> SurvivorTree {
-    let mut child = crate::test_spawn::spawn(
-        std::process::Command::new(argv[0])
-            .args(&argv[1..])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped()),
-    )
-    .expect("spawn");
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut ready = [0u8; 2];
-    stdout.read_exact(&mut ready).expect("the readiness line");
-    let process = crate::Process::open_pid(child.id()).expect("open").expect("running");
-    let members = process
-        .id()
-        .children(crate::Recursive::Yes)
-        .expect("the root's descendants");
-    assert!(!members.is_empty(), "the subshell is a descendant of the root");
-    SurvivorTree {
-        child,
-        _stdout: stdout,
-        process,
-        members,
-    }
-}
-
 // The root ends on the `SIGTERM` and a member that ignores it is left, reparented. The sweep kills the
 // members the call's own walk found, by identity, waits for them, and answers `Ok`: the call's listing
 // is clear. A root that was waited for as a zombie shows its own status.
@@ -214,15 +174,21 @@ fn foreign_graceful_shutdown_tree_kills_a_member_that_ignores_the_sigterm_after_
 // reached is killed by identity all the same, as a `Child`'s tree does through its settlement, and the
 // call is `Ok`.
 //
+// The call waits for the child to end before the sweep, so the member is reparented whatever the
+// scheduling.
+//
 // Mutant: the sweep kills only what the walk from the live root finds.
 #[skuld::test]
 fn foreign_graceful_shutdown_tree_kills_a_member_reparented_while_the_root_outlives_the_grace() {
     let mut tree = tree_of(crate::test_child::ROOT_OUTLIVING_THE_GRACE_ARGV);
     assert_eq!(tree.members.len(), 2, "the child and the member below it");
+    let reparented = crate::test_child::wait_for_the_middle_to_exit_after_the_term(tree.process.id());
 
     tree.process
         .graceful_shutdown_tree(Duration::ZERO)
         .expect("the member its walk reached is killed by identity");
+
+    reparented.assert_fired();
 
     for member in &tree.members {
         assert_eq!(

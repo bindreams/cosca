@@ -1,0 +1,59 @@
+//! A process whose leader thread has exited while another thread runs (a real one, from
+//! [`zombie_leader_root`](crate::test_child::zombie_leader_root)): the kernel shows its leader as a
+//! zombie, and the process has not exited. Linux only.
+
+use std::io::BufRead as _;
+use std::process::Stdio;
+
+use crate::identity::stat_parse::{parse_num_threads, parse_state};
+use crate::identity::{Liveness, ProcessId};
+use crate::Recursive;
+
+/// The process is alive, and a child its leader thread forked keeps the process's number as its parent's,
+/// which the tree walk reads: the kernel hands the child to the thread that runs, not to init.
+///
+/// Mutants: a `Z` record is dead whatever its thread count; the walk from such a process finds no child.
+#[skuld::test]
+fn a_process_whose_leader_thread_exited_is_alive_and_keeps_its_children() {
+    let mut root = crate::test_spawn::spawn(
+        crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
+            .args(crate::test_child::zombie_leader_root::argv())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped()),
+    )
+    .expect("spawn the root");
+    let stdin = root.stdin.take().expect("piped stdin");
+    let mut line = String::new();
+    std::io::BufReader::new(root.stdout.take().expect("piped stdout"))
+        .read_line(&mut line)
+        .expect("the cat's pid");
+    let cat = ProcessId::of(line.trim().parse().expect("the cat's pid"))
+        .found()
+        .expect("the cat's identity");
+    let id = ProcessId::of(root.id()).found().expect("the root's identity");
+    // The leader thread ends right after it printed: wait for the kernel to show it as a zombie. The
+    // condition is read again each time, with no limit, until it holds.
+    let stat = loop {
+        let stat = std::fs::read(format!("/proc/{}/stat", root.id())).expect("the root's stat");
+        if parse_state(&stat) == Some(b'Z') {
+            break stat;
+        }
+        std::thread::yield_now();
+    };
+    assert!(
+        parse_num_threads(&stat).is_some_and(|threads| threads > 1),
+        "premise: a zombie leader whose thread runs on counts it: {}",
+        String::from_utf8_lossy(&stat)
+    );
+
+    assert_eq!(id.is_alive(), Liveness::Alive, "the process has not exited");
+    assert_eq!(
+        id.children(Recursive::No).expect("the root's children"),
+        vec![cat],
+        "the cat's parent is still the root's pid"
+    );
+
+    // The thread and the cat end on the EOF, and with them the process.
+    drop(stdin);
+    root.wait().expect("reap the root");
+}

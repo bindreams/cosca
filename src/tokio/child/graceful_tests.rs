@@ -280,6 +280,100 @@ async fn async_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit()
     assert!(rest.is_empty(), "the sweep missed the grandchild: {rest:?}");
 }
 
+/// A `TreeWalk` tree on one stdin pipe over `argv`, which prints `r\n` once its descendants exist, and
+/// the identities of the root's descendants. Linux only: on macOS a `TreeWalk` root is an fd marker.
+#[cfg(target_os = "linux")]
+async fn treewalk_tree(argv: &[&str]) -> (crate::tokio::Child, Vec<crate::identity::ProcessId>) {
+    use ::tokio::io::AsyncReadExt as _;
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    cmd.args(argv.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mut child = cmd.spawn().await.expect("spawn");
+    assert_eq!(child.containment(), crate::Containment::TreeWalk);
+    let mut ready = [0u8; 2];
+    child
+        .stdout()
+        .expect("piped stdout")
+        .read_exact(&mut ready)
+        .await
+        .expect("readiness line");
+    assert_eq!(&ready, b"r\n");
+    let members = child
+        .id()
+        .expect(crate::test_child::IDENTITY_READ)
+        .children(crate::Recursive::Yes)
+        .expect("the root's descendants");
+    assert!(!members.is_empty(), "the subshell is a descendant of the root");
+    (child, members)
+}
+
+/// Async twin of `graceful_shutdown_tree_kills_the_members_its_sigterm_walk_found_after_the_root_exits`
+/// in `child/treewalk_exited_root_tests.rs`: the root ends on the `SIGTERM`, the sweep cannot walk to
+/// the members that ignore it, and kills by identity those its own walk found.
+///
+/// Mutant: the async driver's sweep carries no call, so the settlement holds nothing the call may stand
+/// on.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn async_treewalk_graceful_shutdown_tree_kills_the_members_its_sigterm_walk_found_after_the_root_exits() {
+    use std::os::unix::process::ExitStatusExt;
+    let _warns = crate::log_capture::warn_watch();
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, members) = treewalk_tree(crate::test_child::TERM_SURVIVOR_TREE_ARGV).await;
+    let _stdin = child.stdin().expect("piped stdin");
+
+    let status = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .await
+        .expect("every member its walk found is killed");
+
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "the root ended on the SIGTERM: {status:?}"
+    );
+    for member in &members {
+        assert_eq!(
+            member.is_alive(),
+            crate::identity::Liveness::Dead,
+            "{member:?} ignored the SIGTERM and must be killed by identity"
+        );
+    }
+}
+
+/// Async twin of `graceful_shutdown_tree_kills_a_member_reparented_while_the_root_outlives_the_grace`: the
+/// member is reparented before the sweep, which kills it by identity and the root by the sweep.
+///
+/// Mutant: the async driver's sweep kills only what the walk from the live root finds.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+async fn async_treewalk_graceful_shutdown_tree_kills_a_member_reparented_while_the_root_outlives_the_grace() {
+    let _warns = crate::log_capture::warn_watch();
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, members) = treewalk_tree(crate::test_child::ROOT_OUTLIVING_THE_GRACE_ARGV).await;
+    let _stdin = child.stdin().expect("piped stdin");
+    let reparented = crate::test_child::wait_for_the_middle_to_exit_after_the_term(
+        child.id().expect(crate::test_child::IDENTITY_READ),
+    );
+
+    let status = child
+        .graceful_shutdown_tree(Duration::ZERO)
+        .await
+        .expect("every member the walk reached is killed");
+
+    reparented.assert_fired();
+    crate::test_child::assert_killed("the root", status);
+    for member in &members {
+        assert_eq!(
+            member.is_alive(),
+            crate::identity::Liveness::Dead,
+            "{member:?} is killed or ended by the SIGTERM"
+        );
+    }
+}
+
 /// The tree's drain edge, awaited, answers that the tree drained: the sweep is skipped. See
 /// `child::graceful_tests::drained_tree_sweep_decision` for the same decision through the sync driver.
 /// The wait blocks no runtime thread.

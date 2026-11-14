@@ -7,7 +7,7 @@ use crate::containment::drain_edge::DrainEdge;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{Contains, Mechanism};
-use crate::containment::treewalk::WalkToken;
+use crate::containment::treewalk::{Listing, WalkToken};
 use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
 use crate::error::Error;
 
@@ -201,9 +201,7 @@ impl Tree {
 
     /// Send the graceful termination signal to the tree (signal-only), as [`kill`](Self::kill) decides
     /// it from `root`: the outcome says what went out, or what was skipped and what the caller does
-    /// about it. The members a walk reached are held for the next kill, which cannot walk to them once
-    /// the root has exited ([`hold_walked`](Self::hold_walked)); `call`, the call that will sweep, and
-    /// the token its sweep may vouch with come back as there.
+    /// about it. Returns the walk's token for `call` ([`hold_walked`](Self::hold_walked)).
     pub(crate) fn terminate(
         &self,
         pid: u32,
@@ -223,27 +221,17 @@ impl Tree {
             }
             Holder::Contained(mechanism) => {
                 debug_assert!(!self.released, "a send on a released tree");
-                let mut outcome = mechanism.send_terminate(pid, root);
-                let walk = match &mut outcome {
-                    TerminateOutcome::Sent { termed, complete, .. } => {
-                        self.hold_walked(std::mem::take(termed), *complete, call)
-                    }
-                    _ => None,
-                };
+                let (outcome, listing) = mechanism.send_terminate_listed(pid, root);
+                let walk = listing.and_then(|listing| self.hold_walked(listing, call));
                 (outcome, walk)
             }
         }
     }
 
-    /// Holds the members a `SIGTERM` walk reached ([`TreeKilled::hold`]), and returns the token `call`'s
-    /// sweep may vouch with: the one place that a walk's completeness decides it.
-    pub(crate) fn hold_walked(
-        &self,
-        members: Vec<crate::identity::ProcessId>,
-        complete: bool,
-        call: Option<&WalkToken>,
-    ) -> Option<WalkToken> {
-        self.killed.hold(members, complete, call)
+    /// Holds the members a `SIGTERM` walk reached ([`TreeKilled::hold`]) and returns `call`'s token if
+    /// the listing is `complete`.
+    pub(crate) fn hold_walked(&self, listing: Listing, call: Option<&WalkToken>) -> Option<WalkToken> {
+        self.killed.hold(listing.members, listing.complete, call)
     }
 
     /// Whether a kill sent through the mechanism would reach `pid` whatever its credentials (see
@@ -466,12 +454,6 @@ impl Tree {
             Holder::Contained(Mechanism::Cgroup(leaf)) => Some(leaf),
             _ => None,
         }
-    }
-
-    /// Leaves the tree as an earlier kill that found `kind` would ([`TreeKilled::leave_unvouched_for_test`]).
-    #[cfg(test)]
-    pub(crate) fn leave_unvouched_for_test(&self, kind: crate::containment::dispatch::UnvouchedKind) {
-        self.killed.leave_unvouched_for_test(kind);
     }
 }
 

@@ -70,7 +70,7 @@ fn every_walk_over_a_failed_listing_errors_and_signals_nothing() {
 fn a_walkers_terminate_over_a_failed_listing_says_nothing_was_sent() {
     let (child, id) = live_member();
     let forced = force_blind_snapshot();
-    let outcome = super::terminate_tree(&crate::identity::HostKernel, id, None);
+    let (outcome, _) = super::terminate_tree(&crate::identity::HostKernel, id, None);
     drop(forced);
     match outcome {
         crate::containment::TerminateOutcome::NotSent(Error::Unassessable { detail, .. })

@@ -134,6 +134,31 @@ fn running_from_stat_zombie_with_one_thread_is_dead() {
     assert_eq!(running_from_stat(&zombie_with_threads(1), tok(8675309)), Liveness::Dead);
 }
 
+/// A `Z` whose thread count cannot be read could be a leader with live threads: not evidence of death.
+/// Mutant: an unreadable count is taken as a single thread.
+#[skuld::test]
+fn running_from_stat_zombie_with_an_unreadable_thread_count_is_unknown() {
+    let stat = String::from_utf8(stat_fixture("Z", 8675309))
+        .expect("a utf-8 fixture")
+        .replacen(" 20 0 1 0 ", " 20 0 many 0 ", 1)
+        .into_bytes();
+    assert_eq!(parse_num_threads(&stat), None);
+    assert_eq!(running_from_stat(&stat, tok(8675309)), Liveness::Unknown);
+}
+
+/// A record cut off before `starttime` is `Unknown`; one cut off before `num_threads` has none.
+#[skuld::test]
+fn a_truncated_record_parses_to_nothing_and_is_unknown() {
+    let stat = b"1234 (myproc) Z 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 2";
+    assert_eq!(parse_num_threads(stat), Some(2));
+    assert_eq!(parse_starttime_jiffies(stat), None);
+    assert_eq!(running_from_stat(stat, tok(8675309)), Liveness::Unknown);
+    assert_eq!(
+        parse_num_threads(b"1234 (myproc) Z 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0"),
+        None
+    );
+}
+
 #[skuld::test]
 fn running_from_stat_dead_uppercase_is_dead() {
     let stat = stat_fixture("X", 8675309);

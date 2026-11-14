@@ -87,7 +87,8 @@ pub enum Containment {
     /// `pkexec` wrapper never reports this variant, since that wrapper closes every descriptor
     /// >= 3 before exec; an already-elevated caller's spawn has no such wrapper and can.
     FdMarker,
-    /// Identity-aware descendant enumeration at teardown. Misses reparented orphans. It names the
+    /// Identity-aware descendant enumeration at teardown. Misses reparented orphans, and the children
+    /// of a parent that exits during the call, the root included. It names the
     /// tree by the root's identity, so a spawn whose root's identity the OS refuses to report
     /// (see [`Child::id`](crate::Child::id)) fails with that error rather than returning one.
     TreeWalk,

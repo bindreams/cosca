@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
-use crate::containment::treewalk::Left;
+use crate::containment::treewalk::{Left, Listing};
 use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -174,8 +174,8 @@ impl<'a> AwaitableRelease<'a> {
 }
 
 /// The closed set of mechanisms a [`Tree`](crate::containment::Tree) is contained by, each variant
-/// cfg'd as its mechanism is. Only `impl Contains for Mechanism` and the tree's `_for_test`
-/// accessors match on it; everything else goes through [`Contains`].
+/// cfg'd as its mechanism is. Only `impl Contains for Mechanism`, [`send_terminate_listed`](Mechanism::send_terminate_listed)
+/// and the tree's `_for_test` accessors match on it; everything else goes through [`Contains`].
 #[derive(Debug)]
 pub(crate) enum Mechanism {
     /// Linux cgroup v2 leaf + `cgroup.kill`.
@@ -198,6 +198,21 @@ pub(crate) enum Mechanism {
     /// A table of stated answers, for the tests of what consumes a tree.
     #[cfg(test)]
     Fake(crate::containment::fake::FakeContains),
+}
+
+impl Mechanism {
+    /// [`send_terminate`](Contains::send_terminate) with the listing of the walk that made it: only a
+    /// tree walk has one.
+    pub(crate) fn send_terminate_listed(
+        &self,
+        pid: u32,
+        root: Option<&dyn Root>,
+    ) -> (TerminateOutcome, Option<Listing>) {
+        match self {
+            Mechanism::Walk(m) => m.terminate_listed(root),
+            other => (other.send_terminate(pid, root), None),
+        }
+    }
 }
 
 impl Contains for Mechanism {

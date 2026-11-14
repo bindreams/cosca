@@ -151,45 +151,22 @@ fn graceful_shutdown_tree_kills_the_members_its_sigterm_walk_found_after_the_roo
     drop(stdin);
 }
 
-/// A tree an earlier kill left unvouched stays so: the call's walk still holds the members it reached,
-/// and the sweep kills the one that ignores the `SIGTERM` when the root exits in the grace, but the
-/// answer is `Unassessable`, never `Ok`.
-///
-/// Mutants: a walk on an unvouched tree holds nothing, so the member survives; the call vouches.
-#[skuld::test]
-fn graceful_shutdown_tree_on_an_unvouched_tree_kills_the_member_its_walk_listed_and_is_unassessable() {
-    let (child, stdin, survivors) = survivor_tree();
-    child
-        .tree
-        .leave_unvouched_for_test(crate::containment::dispatch::UnvouchedKind::Earlier);
-
-    let err = child
-        .graceful_shutdown_tree(Duration::from_secs(30))
-        .expect_err("an earlier kill left the tree unvouched");
-
-    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
-    for survivor in &survivors {
-        assert_eq!(
-            survivor.is_alive(),
-            Liveness::Dead,
-            "{survivor:?} ignored the SIGTERM and must be killed by identity"
-        );
-    }
-    drop(stdin);
-}
-
 /// A root that ignores the `SIGTERM` outlives the grace, and the `SIGTERM` ends its child, which
 /// reparents the member below it out of the sweep's walk from the root: the member the call's own walk
-/// reached is killed by identity, and the root by the sweep.
+/// reached is killed by identity, and the root by the sweep. The call waits for the child to end
+/// before the sweep, so the member is reparented whatever the scheduling.
 ///
 /// Mutant: the sweep kills only what the walk from the live root finds.
 #[skuld::test]
 fn graceful_shutdown_tree_kills_a_member_reparented_while_the_root_outlives_the_grace() {
     let (child, stdin, members) = tree_of(crate::test_child::ROOT_OUTLIVING_THE_GRACE_ARGV);
+    let reparented = crate::test_child::wait_for_the_middle_to_exit_after_the_term(child.id().expect("the root"));
 
     let status = child
         .graceful_shutdown_tree(Duration::ZERO)
         .expect("every member the walk reached is killed");
+
+    reparented.assert_fired();
 
     std::os::unix::process::ExitStatusExt::signal(&status)
         .filter(|signal| *signal == libc::SIGKILL)
