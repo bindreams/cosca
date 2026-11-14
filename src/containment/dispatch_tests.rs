@@ -893,10 +893,27 @@ fn next_is_the_one_transition_of_state_and_facts() {
     ];
     for (label, walked, left_now, running, root_seen_running, wants) in facts {
         for (at, want) in wants.into_iter().enumerate() {
-            let got = super::next(&prev_at(at), walked, left_now.clone(), running, root_seen_running);
+            let got = super::next(
+                &prev_at(at),
+                walked,
+                left_now.clone(),
+                running,
+                root_seen_running,
+                false,
+            );
 
             assert_eq!(standing_of(&got), want, "{} x {label}", prev_names[at]);
         }
+    }
+    // A walk that killed all it found and could not read the root's exit flag: unvouched from any state,
+    // with the kind it names, nothing held.
+    for (at, name) in prev_names.iter().enumerate() {
+        let got = super::next(&prev_at(at), true, vec![], false, false, true);
+        assert_eq!(
+            standing_of(&got),
+            Standing::Unvouched(UnvouchedKind::ExitUnread),
+            "{name} x the exit flag unread"
+        );
     }
 }
 
@@ -2165,6 +2182,38 @@ fn a_gone_root_over_members_killed_by_the_settlement_says_they_are_gone_each_tim
 #[skuld::test]
 fn a_gone_root_over_a_member_that_exited_on_its_own_says_it_is_gone_each_time() {
     gone_root_answers_over_gone_members_each_time(true);
+}
+
+/// A kill that ran and killed everything but could not read the root's exit flag leaves the tree
+/// unvouched, and a drop over it warns that the root's exit could not be told begun or not: no member
+/// was seen running and no kill was skipped, so neither is said.
+///
+/// Mutants: the tree is `Killed` (no warn); the kind is `Earlier` ("left something running").
+#[skuld::test]
+fn a_drop_over_a_tree_whose_exit_flag_was_unread_warns_of_the_exit() {
+    use super::{TreeKillOutcome, TreeKilled};
+    let killed = TreeKilled::default();
+    killed
+        .settle(
+            Some(&walker()),
+            TreeKillOutcome::ExitUnread(crate::error::Error::Unassessable {
+                detail: "the exit flag could not be read".into(),
+                source: None,
+            }),
+            true,
+        )
+        .answer
+        .expect_err("the read's error is the answer");
+
+    let warn = killed
+        .settle_for_drop(Some(&walker()), skipped_kill("walk the process table", None), true)
+        .expect("an unvouched tree is warned of")
+        .text;
+
+    assert!(warn.contains("could not be vouched for"), "{warn}");
+    assert!(warn.contains("whether the root's exit had begun"), "{warn}");
+    assert!(!warn.contains("left something running"), "{warn}");
+    assert!(!warn.contains("skipped the kill"), "{warn}");
 }
 
 /// A drop that skips the kill over a tree it cannot vouch for warns of it, in words true of what

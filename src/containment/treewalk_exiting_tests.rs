@@ -266,7 +266,9 @@ fn a_kill_of_a_begun_root_that_leaves_a_member_says_the_exit_had_begun() {
 
 /// A flag that cannot be read, with every member and the root killed, left nothing running: the
 /// settlement does not take the read's error for a member seen running, so a later kill that finds the
-/// root gone does not say a kill left something running. Mutant: any non-member error counts as running.
+/// root gone does not say a kill left something running. It does not vouch for the tree either: it
+/// says the root's exit could not be told begun or not, so children it reparented may be left.
+/// Mutants: any non-member error counts as running; the tree is `Killed` (the later answer is `Ok`).
 #[skuld::test]
 fn an_unreadable_exit_flag_with_everything_killed_is_not_something_left_running() {
     let (child, root, _descendant) = live_member_with_descendant();
@@ -283,13 +285,17 @@ fn an_unreadable_exit_flag_with_everything_killed_is_not_something_left_running(
     let later = killed
         .settle(Some(&walker(root)), TreeKillOutcome::NoRoot(root.pid(), None), true)
         .answer;
-    if let Err(error) = &later {
-        let said = error.to_string();
-        assert!(
-            !said.contains("a kill left something running"),
-            "nothing was left running: {said}"
-        );
-    }
+    let Err(crate::error::Error::Unassessable { detail, .. }) = &later else {
+        panic!("the tree is not vouched for: {later:?}");
+    };
+    assert!(
+        detail.contains("whether the root's exit had begun"),
+        "the answer names the unread exit: {detail}"
+    );
+    assert!(
+        !detail.contains("a kill left something running"),
+        "nothing was left running: {detail}"
+    );
     assert_both_signalled("hard_kill", child, libc::SIGKILL);
 }
 

@@ -353,6 +353,8 @@ pub(crate) struct TreeKilled {
 ///   `Unvouched` tree's kind, unless this settlement saw the root running (the latest fact below); a
 ///   `Killed` tree is `Never`, since it was seen running on;
 /// - is a walk (`Ran`) that leaves nothing, held members included: `Killed`;
+/// - is a walk that killed all it found but could not read the root's exit flag
+///   ([`ExitUnread`](TreeKillOutcome::ExitUnread)) and leaves no member: `Unvouched`, from any state;
 /// - leaves something running that holds no identity (a member of a handle that is not a `TreeWalk`,
 ///   or a walk that left the root, whatever then ended it): `Unvouched`, from any state;
 /// - otherwise (a gone root, a walk not made, or a skipped kill whose sweep left nothing: none saw a
@@ -368,7 +370,8 @@ pub(crate) struct TreeKilled {
 /// - held members that all dropped out of a `Never` tree name
 ///   [`HeldMembersGone`](UnvouchedKind::HeldMembersGone);
 /// - something else left running with no identity names [`Earlier`](UnvouchedKind::Earlier), from
-///   any previous state.
+///   any previous state;
+/// - an unread exit flag names [`ExitUnread`](UnvouchedKind::ExitUnread).
 ///
 /// A settlement with no new fact keeps the stored kind, held members included.
 ///
@@ -427,17 +430,24 @@ impl TreeState {
 /// walk that ran; `left_now`, the members it left with identities; `running`, the outcome left
 /// something running (the root included, whatever then ended it), not merely an error for a walk it
 /// did not make (a gone root's or an unmade walk's error is not a member seen running);
-/// `root_seen_running`, the walk left the root (whatever then ended it), which is `running`.
+/// `root_seen_running`, the walk left the root (whatever then ended it), which is `running`;
+/// `exit_unread`, the walk killed all it found but could not read whether the root's exit had begun,
+/// which leaves nothing running and the tree unvouched.
 fn next(
     prev: &TreeState,
     walked: bool,
     left_now: Vec<crate::containment::treewalk::Left>,
     running: bool,
     root_seen_running: bool,
+    exit_unread: bool,
 ) -> TreeState {
     debug_assert!(
         !root_seen_running || running,
         "a root seen running is something left running"
+    );
+    debug_assert!(
+        !exit_unread || (walked && !running),
+        "an unread exit flag is a walk that left nothing running"
     );
     if !left_now.is_empty() {
         return TreeState::new(prev.vouching.under_held(root_seen_running), left_now);
@@ -451,6 +461,7 @@ fn next(
         UnvouchedKind::HeldMembersGone
     };
     let vouching = match prev.vouching {
+        _ if exit_unread => Vouching::Unvouched(UnvouchedKind::ExitUnread),
         _ if walked && !running => Vouching::Killed,
         Vouching::Never if !running && prev.held.is_empty() => Vouching::Never,
         Vouching::Killed if !running => Vouching::Killed,
@@ -638,6 +649,10 @@ pub(crate) enum UnvouchedKind {
     /// (members the handle holds no identity for, or members since gone), and the settlement
     /// no longer knows which.
     Earlier,
+    /// A walk killed everything it found, but could not read whether the root's exit had begun
+    /// ([`TreeKillOutcome::ExitUnread`]): nothing was seen running, and the children the exit may have
+    /// reparented out of the walk were never looked for.
+    ExitUnread,
 }
 
 impl UnvouchedKind {
@@ -654,6 +669,10 @@ impl UnvouchedKind {
             UnvouchedKind::Earlier => {
                 "a kill left something running that it could not name, and no later walk has checked what it forked"
             }
+            UnvouchedKind::ExitUnread => {
+                "the walk could not tell whether the root's exit had begun, so children it may have reparented out \
+                 of the walk were never looked for"
+            }
         }
     }
 
@@ -669,7 +688,7 @@ impl UnvouchedKind {
             UnvouchedKind::HeldMembersGone | UnvouchedKind::Earlier => {
                 format!("the drop skipped the kill, and {}", self.unvouched_text())
             }
-            UnvouchedKind::RootSeenRunning => self.unvouched_text(),
+            UnvouchedKind::RootSeenRunning | UnvouchedKind::ExitUnread => self.unvouched_text(),
         }
     }
 
@@ -688,6 +707,10 @@ impl UnvouchedKind {
             UnvouchedKind::Earlier => {
                 "a kill left something running that it could not name, and no walk since has checked what it \
                  forked; the tree could not be walked from its gone root"
+            }
+            UnvouchedKind::ExitUnread => {
+                "an earlier walk could not tell whether the root's exit had begun, and the root is gone now; the tree \
+                 could not be walked from it, so children its exit may have reparented are unknown"
             }
         }
     }
@@ -736,7 +759,8 @@ pub(crate) enum TreeKillOutcome {
     /// A `TreeWalk` walk found members and killed every one it found, the root included, but could not
     /// read whether the root's exit had begun: the error says why the tree cannot be vouched for. It ran,
     /// and left nothing running that it knows of, so it is not a member seen running
-    /// ([`Ran`](Self::Ran) with this error would be). A walk that left a member is `Ran`, not this.
+    /// ([`Ran`](Self::Ran) with this error would be); it leaves the tree
+    /// [`Unvouched`](UnvouchedKind::ExitUnread). A walk that left a member is `Ran`, not this.
     #[cfg_attr(
         not(unix),
         allow(dead_code, reason = "only a Unix kernel reparents a root's children at its exit")
@@ -1151,6 +1175,7 @@ impl TreeKilled {
             outcome,
             TreeKillOutcome::Ran(_) | TreeKillOutcome::Answered(_) | TreeKillOutcome::ExitUnread(_)
         );
+        let exit_unread = matches!(outcome, TreeKillOutcome::ExitUnread(_));
         // What a walk not made, a gone root or an unread exit flag leaves is its error, not a member seen
         // running.
         let looked_for_no_member = matches!(
@@ -1175,7 +1200,7 @@ impl TreeKilled {
         // forked first. Only the answer follows the root's end.
         let running = result.is_err() && !looked_for_no_member;
         let root_seen_running = matches!(&result, Err(left) if left.root.is_some());
-        let after = next(&state, ran, left_now, running, root_seen_running);
+        let after = next(&state, ran, left_now, running, root_seen_running, exit_unread);
         let listing_clear = listing_stands && result.is_ok();
         let after = if listing_clear {
             TreeState::new(Vouching::Killed, Vec::new())

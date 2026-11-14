@@ -256,8 +256,9 @@ pub(crate) mod fault {
 }
 
 /// [`kinfo`] without the seams that force a field, and with the failure that left the read `Unknown`: the
-/// errno of the `sysctl`, or the wrong size it wrote. A refusal forced by [`fault::force_unreadable_once`]
-/// is `EPERM`.
+/// errno of the `sysctl`, or the wrong size it wrote. Only the forced refusal of
+/// [`fault::force_unreadable_once`] is honoured here, as an `EPERM` (the other seams force fields of a
+/// record).
 pub(crate) fn kinfo_explained(pid: RawPid) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
     #[cfg(test)]
     if fault::take_unreadable() {
