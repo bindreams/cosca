@@ -47,7 +47,7 @@ fn a_tree_call_given_no_owner_sends_the_roots_term_by_identity() {
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
 
     match super::terminate_tree(&crate::identity::HostKernel, id, None) {
-        crate::containment::TerminateOutcome::Sent { result: Ok(()), .. } => {}
+        (crate::containment::TerminateOutcome::Sent { result: Ok(()), .. }, Some(_)) => {}
         other => panic!("the walk found the root and signalled it: {other:?}"),
     }
 
@@ -1097,9 +1097,12 @@ fn a_walk_is_skipped_by_the_roots_state_only_on_macos() {
             "kill, {name}: {killed:?}"
         );
         if !skipped {
-            assert!(matches!(killed, TreeKillOutcome::NoRoot), "kill, {name}: {killed:?}");
+            assert!(
+                matches!(killed, TreeKillOutcome::NoRoot(..)),
+                "kill, {name}: {killed:?}"
+            );
         }
-        let termed = super::terminate_tree(&crate::identity::HostKernel, self::root(), Some(&root));
+        let (termed, _) = super::terminate_tree(&crate::identity::HostKernel, self::root(), Some(&root));
         assert_eq!(
             matches!(termed, TerminateOutcome::End(_)),
             skipped,

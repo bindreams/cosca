@@ -506,14 +506,15 @@ fn late_tree_walk(spoil: impl FnOnce() + 'static) -> (u32, ChildFate, bool, usiz
 }
 
 /// A walk that cannot take its snapshot kills nothing; the root's kill then reparents the grandchild
-/// to launchd, so the walk from the zombie finds nothing and succeeds. That success does not erase
-/// the first failure: the warn says the tree may not be fully killed.
+/// to launchd, so no walk from the zombie can reach it, and none is run. The first failure stands:
+/// the warn says the tree was not fully killed.
 ///
 /// The failed sweep is also the spawn's `cleanup`, as an error: the walk's own failure, not its text.
 ///
-/// Mutants: each sweep's result overwrites the last one's; the failure is only in the warn's text.
+/// Mutants: a walk from the zombie root runs and overwrites the first one's result; the failure is
+/// only in the warn's text.
 #[skuld::test]
-fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_may_be_left() {
+fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_was_not_fully_killed() {
     let (pid, fate, survived, mark, cleanup) =
         late_tree_walk(|| crate::containment::enumerate::force_blind_snapshots(1));
     assert!(survived, "a walk that could not take its snapshot kills nothing");
@@ -521,7 +522,7 @@ fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_may_be_lef
     assert_one_warn(
         pid,
         mark,
-        &[SAID_REAPED, "its tree may not be fully killed", "test fault injected"],
+        &[SAID_REAPED, "its tree was not fully killed", "test fault injected"],
         &[],
     );
     let cleanup = cleanup.expect("the failed sweep is the cleanup");
@@ -532,12 +533,12 @@ fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_may_be_lef
     );
 }
 
-/// A walk that left a member it could not kill is an error naming it: the warn says so, even when a
-/// later walk is complete.
+/// A walk that left a member it could not kill is an error naming it: the warn says so, and no walk
+/// from the zombie root follows to say otherwise.
 ///
-/// Mutant: a later walk's `Ok` overwrites the error of the first.
+/// Mutant: a later walk's answer overwrites the error of the first.
 #[skuld::test]
-fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_may_be_left() {
+fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_was_not_fully_killed() {
     let (pid, fate, _, mark, cleanup) = late_tree_walk(|| {
         crate::containment::treewalk::fault::force_incomplete_once(
             crate::containment::treewalk::fault::LeftBehind::Descendant,
@@ -554,22 +555,54 @@ fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_may_be_left() {
     assert_one_warn(
         pid,
         mark,
-        &[SAID_REAPED, "its tree may not be fully killed", "was not killed"],
+        &[SAID_REAPED, "its tree was not fully killed", "was not killed"],
         &[],
     );
 }
 
-/// A walk that left only the root is settled by the root's kill, which follows it: the warn says
-/// nothing of the tree.
+/// A later sweep that succeeded does not show it reached what the first one missed: the note says the
+/// tree may not be fully killed, where a first failure that nothing followed says it was not.
 ///
-/// Mutant: the walk's result is judged before the root's kill.
+/// Mutant: the later success erases the first failure, or the note does not tell the two apart.
+#[skuld::test]
+fn macos_late_tree_note_hedges_a_failed_sweep_a_later_sweep_followed() {
+    use crate::containment::dispatch::Unkilled;
+    let left = || {
+        Err(Unkilled {
+            members: vec![crate::error::Error::MemberNotKilled {
+                pid: 4242,
+                source: std::sync::Arc::new(crate::error::Error::Containment {
+                    detail: "refused".into(),
+                    source: None,
+                }),
+            }],
+            root: None,
+            resolved: Vec::new(),
+        })
+    };
+    let mut followed = late_root(4242, None);
+    followed.sweeps = vec![left(), Ok(())];
+    let note = followed.failure_note(true).expect("the first sweep failed");
+    assert!(note.contains("its tree may not be fully killed"), "{note}");
+    let mut alone = late_root(4242, None);
+    alone.sweeps = vec![left()];
+    let note = alone.failure_note(true).expect("the sweep failed");
+    assert!(note.contains("its tree was not fully killed"), "{note}");
+}
+
+/// A walk that left only the root is settled by the root's kill, which follows it: the grandchild is
+/// dead, and the warn says nothing of the tree, as no walk from the zombie root runs to judge it.
+///
+/// Mutants: the walk's result is judged before the root's kill; a walk from the zombie root runs and
+/// its `NoRoot` is held as a failed sweep.
 #[skuld::test]
 fn macos_late_tree_walk_that_leaves_only_the_root_is_settled_by_the_root_kill() {
-    let (pid, fate, _, mark, cleanup) = late_tree_walk(|| {
+    let (pid, fate, survived, mark, cleanup) = late_tree_walk(|| {
         crate::containment::treewalk::fault::force_incomplete_once(
             crate::containment::treewalk::fault::LeftBehind::Root,
         );
     });
+    assert!(!survived, "the walk killed the grandchild");
     assert!(cleanup.is_none(), "the root's kill settled the walk: {cleanup:?}");
     assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
     assert_one_warn(

@@ -293,7 +293,7 @@ mod linux {
             .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
 
         let failure = child
-            .kill_tree_after("kill_tree", None)
+            .kill_tree_after("kill_tree", None, None)
             .wait()
             .expect_err("the number may name another process");
 

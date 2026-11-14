@@ -390,6 +390,7 @@ mod group_kill_and_terminate {
                     TerminateOutcome::Sent {
                         result: Ok(()),
                         earlier: Some("the SIGTERM"),
+                        ..
                     },
                 ) => assert_eq!(sent, [PGID], "{root:?}"),
                 (
@@ -397,6 +398,7 @@ mod group_kill_and_terminate {
                     TerminateOutcome::Sent {
                         result: Ok(()),
                         earlier: None,
+                        ..
                     },
                 ) => assert_eq!(sent, Vec::<i32>::new(), "{root:?}"),
                 // Only Linux has a pidfd to name the root with.

@@ -120,6 +120,10 @@ pub(crate) enum TerminateOutcome {
     },
     /// Nothing was sent: the call ends with this error.
     NotSent(Error),
+    /// Nothing was sent: the root has exited and the walk found no member, so its children were
+    /// reparented at its exit.
+    #[cfg_attr(not(unix), allow(dead_code, reason = "only a Unix walk finds its root exited"))]
+    RootExited(Error),
     /// Nothing is sent by the root's number, and nothing else names the tree: the call ends now.
     End(Skip),
     /// Linux: the root's number may name another process, but its handle names it exactly: the caller
@@ -157,7 +161,7 @@ pub(crate) use call::SkipCall;
 #[cfg(unix)]
 mod call {
     use super::{Skip, Why};
-    use crate::containment::dispatch::{Settled, TreeKillOutcome, TreeSignal, Unkilled};
+    use crate::containment::dispatch::{Keeping, Settled, TreeKillOutcome, TreeSignal, Unkilled};
     use crate::containment::root::Refusal;
     use crate::containment::Tree;
     use crate::error::Error;
@@ -202,9 +206,11 @@ mod call {
                 } => {
                     let error = self.untrusted(&action, &why, cause, holders);
                     return match self.signal {
-                        TreeSignal::Kill => {
-                            tree.settle_for_kill_tree(TreeKillOutcome::Ran(Err(Unkilled::from(error))), false)
-                        }
+                        TreeSignal::Kill => tree.settle_for_kill_tree(
+                            TreeKillOutcome::Ran(Err(Unkilled::from(error))),
+                            false,
+                            Keeping::Nothing,
+                        ),
                         TreeSignal::Term => Settled::of(Err(error)),
                     };
                 }
@@ -222,7 +228,9 @@ mod call {
                     refusal = crate::error::Report(refusal)
                 );
                 return match self.signal {
-                    TreeSignal::Kill => tree.settle_for_kill_tree(TreeKillOutcome::Skipped(skip), false),
+                    TreeSignal::Kill => {
+                        tree.settle_for_kill_tree(TreeKillOutcome::Skipped(skip), false, Keeping::Nothing)
+                    }
                     TreeSignal::Term => Settled::of(skip.holders.take().unwrap_or(Ok(()))),
                 };
             }
@@ -262,7 +270,7 @@ mod call {
             let mut killed_again = Vec::new();
             let holders = match self.signal {
                 TreeSignal::Kill => {
-                    let settled = tree.settle_for_kill_tree(TreeKillOutcome::Skipped(skip), false);
+                    let settled = tree.settle_for_kill_tree(TreeKillOutcome::Skipped(skip), false, Keeping::Nothing);
                     killed_again = settled.killed_again;
                     let settled = settled.answer;
                     debug_assert!(
@@ -354,7 +362,7 @@ mod call {
             let Settled {
                 answer: settled,
                 killed_again,
-            } = tree.settle_for_kill_tree(kill, false);
+            } = tree.settle_for_kill_tree(kill, false, Keeping::Nothing);
             // The warn says each failure in full; the returned `Unassessable` says only that it
             // failed, for the failure is a peer of the answer.
             let sent = |with_errors: bool| {

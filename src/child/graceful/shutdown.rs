@@ -147,8 +147,8 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
 
     // The mechanism's look at the root decides the cooperative signal (see `terminate_tree`), and
     // what the sweep may say was sent before it.
-    let (term, earlier) = match w.child().signal_tree_cooperatively() {
-        SignalTreeCooperativelyOutcome::Sent { result, earlier } => (result, earlier),
+    let (term, earlier, walk) = match w.child().signal_tree_cooperatively() {
+        SignalTreeCooperativelyOutcome::Sent { result, earlier, walk } => (result, earlier, walk),
         SignalTreeCooperativelyOutcome::End(e) => return Err(e),
         #[cfg(target_os = "linux")]
         SignalTreeCooperativelyOutcome::RootThroughPidfd(skip) => {
@@ -202,8 +202,11 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
         let sweep_result = match take_forced_sweep() {
             Some(failure) => Err(failure),
             None => {
-                w.sweep(w.child().kill_tree_after("graceful_shutdown_tree", earlier))
-                    .await
+                w.sweep(
+                    w.child()
+                        .kill_tree_after("graceful_shutdown_tree", earlier, walk.as_ref()),
+                )
+                .await
             }
         };
         if let Err(sweep) = sweep_result {

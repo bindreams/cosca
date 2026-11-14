@@ -31,6 +31,9 @@ pub(crate) mod unwaitable;
 #[cfg(unix)]
 pub(crate) mod blocked_tree_root;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod zombie_leader_root;
+
 #[cfg(unix)]
 pub(crate) mod foreign;
 
@@ -1644,18 +1647,49 @@ pub(crate) const TERM_IGNORING_TREE_ARGV: &[&str] = &[
     "trap '' TERM; exec 3<&0; { sh -c 'echo r; read -r _; echo leaf' <&3 3<&- && echo eof; } & exec cat",
 ];
 
-/// A root and a grandchild on one stdin pipe, in one process group. Only the grandchild ignores
-/// `SIGTERM`: the root, `cat` again after the `exec`, has the default disposition back, so the
-/// group's soft signal ends it and leaves a survivor that only a `SIGKILL` sweep reaches. The
-/// ignored disposition is the grandchild's from its fork, so the readiness line (`r`, once the
-/// grandchild is forked) says it already holds. The grandchild prints `eof` if its `cat` ends of its
-/// own accord.
+/// A root, a subshell and its leaf on one stdin pipe, in one process group. Only the subshell and the
+/// leaf ignore `SIGTERM`: the root, `cat` after its `exec`, has the default disposition, so the
+/// group's soft signal ends it and leaves survivors that only a `SIGKILL` sweep reaches. The leaf
+/// prints `r` once it runs, so all three exist when it is read. Each of the two prints its own marker
+/// once the stdin ends, if it is still alive: the leaf `leaf`, the subshell `sub`. Neither marker
+/// depends on how the other ended, so a sweep that misses either one leaves its marker on the stdout.
 #[cfg(unix)]
 pub(crate) const TERM_SURVIVOR_TREE_ARGV: &[&str] = &[
     "sh",
     "-c",
-    "trap '' TERM; exec 3<&0; { cat <&3 3<&- && echo eof; } & trap - TERM; echo r; exec cat",
+    "exec 3<&0; { trap '' TERM; sh -c 'echo r; read -r _; echo leaf' <&3 3<&- & read -r _ <&3; echo sub; wait; } & exec cat",
 ];
+
+/// A tree whose root outlives the grace and ignores `SIGTERM`: a child `sh` that a `SIGTERM` ends
+/// reparents the `SIGTERM`-ignoring `cat` below it out of every later walk. Prints `r` once both
+/// descendants exist.
+#[cfg(unix)]
+pub(crate) const ROOT_OUTLIVING_THE_GRACE_ARGV: &[&str] = &[
+    "sh",
+    "-c",
+    "trap '' TERM; exec 3<&0; ( trap - TERM; ( trap '' TERM; echo r; exec cat <&3 3<&- ) & wait ) & wait; exec cat",
+];
+
+/// Arms the wait that makes [`ROOT_OUTLIVING_THE_GRACE_ARGV`]'s reparent a precondition of the sweep:
+/// after the `SIGTERM` went out, the call waits for the root's only child, the `sh` that the signal
+/// ends, to exit. Its exit reparents the member below it, so the sweep's walk from the root cannot find
+/// it. The caller keeps the guard for the call and asserts it fired.
+#[cfg(unix)]
+pub(crate) fn wait_for_the_middle_to_exit_after_the_term(
+    root: crate::identity::ProcessId,
+) -> crate::oneshot_hook::Armed {
+    let middle = root
+        .children(crate::Recursive::No)
+        .expect("the root's children")
+        .pop()
+        .expect("the root's child");
+    let middle = crate::Process::open(middle)
+        .expect("open the middle")
+        .expect("the middle runs");
+    crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, move || {
+        middle.wait().expect("the middle exits on the SIGTERM");
+    })
+}
 
 /// A spawned, contained `SIGTERM`-ignoring [`TERM_IGNORING_BLOCKER_ARGV`] child and the write end of
 /// its stdin, returned once its readiness byte proves the trap is installed. A test whose only end

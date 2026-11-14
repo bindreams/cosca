@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::graceful_hooks::{at, release_at, HookPoint};
 use crate::send_log::Capture;
-use crate::test_child::foreign;
+use crate::test_child::foreign::{self, survivor_tree, tree_of};
 use crate::wait::fault;
 
 /// A std child that ignores `SIGTERM` (`trap '' TERM` before `exec`; an ignored disposition
@@ -143,4 +143,181 @@ fn foreign_graceful_shutdown_graceful_path() {
     p.graceful_shutdown(Duration::from_secs(30)).expect("graceful_shutdown");
     let status = child.wait().expect("reap");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
+}
+
+// The root ends on the `SIGTERM` and a member that ignores it is left, reparented. The sweep kills the
+// members the call's own walk found, by identity, waits for them, and answers `Ok`: the call's listing
+// is clear. A root that was waited for as a zombie shows its own status.
+//
+// Mutant: the sweep walks from the exited root, finds nothing, and answers `Ok` with the member running.
+#[skuld::test]
+fn foreign_graceful_shutdown_tree_kills_a_member_that_ignores_the_sigterm_after_the_root_exits() {
+    let mut tree = survivor_tree();
+
+    tree.process
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .expect("every member the walk found is killed");
+
+    for member in &tree.members {
+        assert_eq!(
+            member.is_alive(),
+            crate::identity::Liveness::Dead,
+            "{member:?} ignored the SIGTERM and is killed by identity"
+        );
+    }
+    let status = tree.child.wait().expect("reap the root");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
+}
+
+// Every sweep kills the held members by identity: when the root has exited and the
+// sweep's walk cannot be made (the process table cannot be listed), the members the call's own
+// `SIGTERM` walk held are killed by identity all the same. The call is an error, and nothing is left
+// running.
+//
+// Mutant: the sweep leaves held members alone when its walk was not made.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn foreign_graceful_sweep_whose_walk_is_not_made_kills_the_members_its_sigterm_walk_held() {
+    use crate::identity::{FakeKernel, HostKernel};
+    let mut tree = survivor_tree();
+    let settling = tree.process.begin_graceful().expect("the SIGTERM walk");
+    crate::test_child::wait_until_zombie(tree.child.id());
+    let unlistable = FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO));
+
+    let err = tree
+        .process
+        .kill_tree_settling("graceful_shutdown_tree", &unlistable, Some(&settling))
+        .expect_err("the walk was not made");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    for member in &tree.members {
+        assert_eq!(
+            member.is_alive(),
+            crate::identity::Liveness::Dead,
+            "{member:?} was held by the SIGTERM walk and is killed by identity"
+        );
+    }
+    tree.child.wait().expect("reap the root");
+}
+
+// A sweep whose walk cannot be made over a root that
+// outlives the grace kills the member its `SIGTERM` walk held, which the root's child's exit reparented
+// out of the root's walk, by identity. The root is left running, and the answer is the walk's own
+// `Unassessable`: a retry walks from that root.
+//
+// Mutant: the sweep keeps the held member when its walk was not made; it kills the root.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn foreign_graceful_sweep_whose_walk_is_not_made_over_a_live_root_kills_the_held_member_and_leaves_the_root() {
+    use crate::identity::{FakeKernel, HostKernel, Liveness};
+    let mut tree = tree_of(crate::test_child::ROOT_OUTLIVING_THE_GRACE_ARGV);
+    let middle = tree
+        .process
+        .id()
+        .children(crate::Recursive::No)
+        .expect("the root's children")
+        .pop()
+        .expect("the root's child");
+    let middle = crate::Process::open(middle)
+        .expect("open the middle")
+        .expect("the middle runs");
+    let settling = tree.process.begin_graceful().expect("the SIGTERM walk");
+    middle.wait().expect("the middle exits on the SIGTERM");
+    let running: Vec<_> = tree
+        .members
+        .iter()
+        .copied()
+        .filter(|member| member.is_alive() == Liveness::Alive)
+        .collect();
+    assert_eq!(running.len(), 1, "the member that ignores the SIGTERM runs, reparented");
+    let unlistable = FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO));
+
+    let err = tree
+        .process
+        .kill_tree_settling("graceful_shutdown_tree", &unlistable, Some(&settling))
+        .expect_err("the walk was not made");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(
+        running[0].is_alive(),
+        Liveness::Dead,
+        "the reparented member was held by the SIGTERM walk and is killed by identity"
+    );
+    assert_eq!(tree.process.id().is_alive(), Liveness::Alive, "the root is not killed");
+    tree.process.kill().expect("end the root");
+    tree.child.wait().expect("reap the root");
+}
+
+// A root that ignores the `SIGTERM` outlives the grace, and the `SIGTERM` ends its child, which
+// reparents the member below it out of the sweep's walk from the root. The member the call's own walk
+// reached is killed by identity all the same, as a `Child`'s tree does through its settlement, and the
+// call is `Ok`.
+//
+// The call waits for the child to end before the sweep, so the member is reparented whatever the
+// scheduling.
+//
+// Mutant: the sweep kills only what the walk from the live root finds.
+#[skuld::test]
+fn foreign_graceful_shutdown_tree_kills_a_member_reparented_while_the_root_outlives_the_grace() {
+    let mut tree = tree_of(crate::test_child::ROOT_OUTLIVING_THE_GRACE_ARGV);
+    assert_eq!(tree.members.len(), 2, "the child and the member below it");
+    let reparented = crate::test_child::wait_for_the_middle_to_exit_after_the_term(tree.process.id());
+
+    tree.process
+        .graceful_shutdown_tree(Duration::ZERO)
+        .expect("the member its walk reached is killed by identity");
+
+    reparented.assert_fired();
+
+    for member in &tree.members {
+        assert_eq!(
+            member.is_alive(),
+            crate::identity::Liveness::Dead,
+            "{member:?} is killed or ended by the SIGTERM"
+        );
+    }
+    let status = tree.child.wait().expect("reap the root");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the sweep killed the live root: {status:?}"
+    );
+}
+
+// A walk from an exited root finds nothing, so `kill_tree` says it could not see the tree.
+//
+// Mutant: the empty walk is `Ok`.
+#[skuld::test]
+fn foreign_kill_tree_over_an_exited_unreaped_root_is_unassessable() {
+    let mut tree = survivor_tree();
+    tree.child.kill().expect("kill the root alone");
+    crate::test_child::wait_until_zombie(tree.child.id());
+
+    let err = tree
+        .process
+        .kill_tree()
+        .expect_err("a walk from an exited root finds no member");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    tree.child.wait().expect("reap the root");
+}
+
+// `terminate_tree` over an exited root whose walk finds no member is `Unassessable` and sends nothing.
+//
+// Mutant: the empty walk is `Ok`.
+#[skuld::test]
+fn foreign_terminate_tree_over_an_exited_root_with_an_empty_walk_is_unassessable_and_sends_nothing() {
+    let mut child = foreign::blocker();
+    let p = crate::Process::open_pid(child.id()).expect("open").expect("running");
+    child.kill().expect("kill the root");
+    crate::test_child::wait_until_zombie(child.id());
+    let sends = Capture::start();
+
+    let err = p
+        .terminate_tree()
+        .expect_err("a walk from an exited root finds no member");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(sends.entries(), vec![], "nothing was sent");
+    child.wait().expect("reap the root");
 }
