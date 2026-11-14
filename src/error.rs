@@ -849,7 +849,7 @@ pub(crate) fn said(error: &(dyn std::error::Error + 'static)) -> String {
 }
 
 /// Test-only: the members of the first [`Error::Several`] layer of `error`'s chain, if it has one.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn several_in<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<Vec<&'a Error>> {
     chain(error).find_map(|layer| match cosca_error(layer)? {
         Error::Several(list) => Some(list.iter().map(|member| &**member).collect()),
