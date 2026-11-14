@@ -1,5 +1,6 @@
-//! One pid's file (`<pid>/stat`, `<pid>/cgroup`) through the checked `/proc`: [`read`] is the one
-//! read of such a file in the crate, and the one place that decides what its failure means.
+//! One pid's file (`<pid>/stat`, `<pid>/cgroup`) or link (`<pid>/ns/pid`) through the checked `/proc`:
+//! [`read`] and [`read_link`] are the one read of such a file in the crate, and the one place that
+//! decides what its failure means.
 //!
 //! A scan that skips a pid it could not read reports a table with a live process missing, and a
 //! tree walk over it misses that process and its subtree. So only the failures that mean "this pid
@@ -9,21 +10,22 @@
 use std::io;
 use std::sync::Arc;
 
-use rustix::io::Errno;
-
 use super::kernel::Kernel;
-use super::proc_view::{ProcDir, ReadFailure};
-use super::prove::{FailedCall, Refusal};
+use super::proc_read::{read_own, OwnUnreadable, ProcDir, ReadFailure};
+use super::refusal::Refusal;
+use crate::error::io_context;
 
 /// What reading one pid's file yielded.
 #[derive(Debug)]
 pub(crate) enum ReadOutcome {
     Read(Vec<u8>),
-    /// The pid exited: `ESRCH`, of the open or of the read. The error is why.
+    /// The pid exited: `ESRCH`, of the open, of a file's `read(2)` or of a link's `readlinkat`; or, of
+    /// a link's `readlinkat`, `ENOENT` (the task has no namespace left). The error is why.
     Exited(io::Error),
     /// The pid is not shown to us: it is gone (`ENOENT`), or `hidepid` hides it (`EACCES`, or `EPERM`
-    /// while the checked directory still answers). The error is why. A caller that holds the pid
-    /// unreaped, so that it cannot be gone, reads this as `/proc` hiding it.
+    /// while the checked directory still answers); of a link's `readlinkat`, `EACCES`, with its reason
+    /// (ptrace of the task is denied, or the task has exited) as the error's words. The error is why. A
+    /// caller that holds the pid unreaped, so that it cannot be gone, reads this as `/proc` hiding it.
     Hidden(io::Error),
     /// The `openat2` was refused.
     Refused(Refusal),
@@ -37,7 +39,7 @@ pub(crate) enum ReadOutcome {
 #[derive(Debug)]
 pub(crate) struct Unreadable {
     pid: u32,
-    /// The file of the pid that was read: `stat`, or `cgroup`.
+    /// The file of the pid that was read: `stat`, `cgroup`, or the link `ns/pid`.
     file: &'static str,
     kind: Kind,
     cause: io::Error,
@@ -72,10 +74,7 @@ impl Unreadable {
     /// failure alone, or both failures as the members of a list that a context ("two reads failed")
     /// holds, which names neither the pid nor the file again.
     pub(crate) fn into_io(self) -> io::Error {
-        match self.into_cause() {
-            crate::error::Error::Io(e) => e,
-            both => crate::error::io_context_over("two reads failed", both),
-        }
+        self.into_cause().into_io_over("two reads failed")
     }
 }
 
@@ -89,8 +88,8 @@ enum Kind {
     /// `EPERM`, and the `self/stat` re-check failed without refusing: whether the pid is hidden is
     /// unknown. The re-check's error is the source, and the pid's own `EPERM` is the peer.
     RecheckFailed,
-    /// `EMFILE`, `ENOMEM`, `EIO`, ... of the `openat2`, or any failure of `read(2)` but `ESRCH`:
-    /// nothing is known about the pid.
+    /// `EMFILE`, `ENOMEM`, `EIO`, ... of the `openat2`, or a failure of the read step (`read(2)`, or a
+    /// link's `readlinkat`) that is no exit or hiding of the pid: nothing is known about it.
     Other,
 }
 
@@ -115,7 +114,7 @@ impl std::error::Error for Unreadable {
     }
 }
 
-/// `pid`'s `file` (`stat` or `cgroup`) through `dir`: a pid that is not there for us is
+/// `pid`'s `file` (`stat`, `cgroup`) through `dir`: a pid that is not there for us is
 /// [`ReadOutcome::Exited`] or [`ReadOutcome::Hidden`], a [`Refusal`] is [`ReadOutcome::Refused`], any
 /// other failure is [`Unreadable`].
 ///
@@ -127,60 +126,107 @@ pub(crate) fn read(
     pid: u32,
     file: &'static str,
 ) -> Result<ReadOutcome, Unreadable> {
-    match kernel.read(dir, &format!("{pid}/{file}")) {
-        Ok(bytes) => Ok(ReadOutcome::Read(bytes)),
-        Err(failure) => failed_read(kernel, dir, pid, file, failure),
-    }
+    classify(
+        kernel,
+        dir,
+        pid,
+        file,
+        Entry::File,
+        kernel.read(dir, &format!("{pid}/{file}")),
+    )
 }
 
-fn failed_read(
+/// [`read`] of the symlink `<pid>/<file>` (`ns/pid`): its target is the [`ReadOutcome::Read`] bytes.
+/// The `readlinkat` is the read step, as `read(2)` is of a file, with its own errnos.
+pub(crate) fn read_link(
     kernel: &dyn Kernel,
     dir: &ProcDir,
     pid: u32,
     file: &'static str,
-    failure: ReadFailure,
 ) -> Result<ReadOutcome, Unreadable> {
-    let source = match failure {
-        ReadFailure::Open(source) => source,
-        // The file opened, so no `openat2` errno is in play. A task that exited after the open is the
-        // one racing exit `read(2)` reports; every other failure says nothing about the pid.
-        ReadFailure::Read(source) if source.raw_os_error() == Some(libc::ESRCH) => {
-            return Ok(ReadOutcome::Exited(source));
-        }
-        ReadFailure::Read(source) => {
-            return Err(Unreadable {
-                pid,
-                file,
-                kind: Kind::Other,
-                cause: source,
-                peer: None,
-            });
-        }
+    classify(
+        kernel,
+        dir,
+        pid,
+        file,
+        Entry::Link,
+        kernel.read_link(dir, &format!("{pid}/{file}")),
+    )
+}
+
+/// What kind of entry of a pid's directory is read, which decides what its read step's errno means.
+#[derive(Clone, Copy)]
+enum Entry {
+    File,
+    Link,
+}
+
+/// The one rule of a pid's `file`, a file or a link as `entry` says, applied to `read`, the result of
+/// reading it through `kernel` and `dir`: what the read yielded.
+fn classify(
+    kernel: &dyn Kernel,
+    dir: &ProcDir,
+    pid: u32,
+    file: &'static str,
+    entry: Entry,
+    read: Result<Vec<u8>, ReadFailure>,
+) -> Result<ReadOutcome, Unreadable> {
+    let source = match read {
+        Ok(bytes) => return Ok(ReadOutcome::Read(bytes)),
+        Err(ReadFailure::Open(source)) => source,
+        // The entry opened, so no `openat2` errno is in play; only the read step's own say anything
+        // about the pid.
+        Err(ReadFailure::Read(source)) => match (entry, source.raw_os_error()) {
+            // A task that exited after the open: a file's `read(2)` reports it, and so does gVisor's
+            // `checkTaskState` for a link whose task is dead.
+            (_, Some(libc::ESRCH)) => return Ok(ReadOutcome::Exited(source)),
+            // The `readlinkat` of a namespace link. Linux v6.12: `proc_ns_readlink`
+            // (fs/proc/namespaces.c) answers `EACCES` when ptrace of the task is denied or the task is
+            // gone before it is looked up, and `ns_get_name` (fs/nsfs.c) `ENOENT` when the task, once
+            // found, has no namespace left, which is exiting. gVisor ab5f509c
+            // (pkg/sentry/fsimpl/proc/task_files.go, `namespaceSymlink.Readlink`): `checkTaskState`
+            // answers `EACCES` for a zombie and `ESRCH` for a dead task, and `ENOENT` for a task with
+            // no namespace of the kind; it checks no ptrace right.
+            (Entry::Link, Some(libc::EACCES)) => {
+                return Ok(ReadOutcome::Hidden(io_context(
+                    "the link was not read: ptrace of the task is denied, or the task has exited",
+                    source,
+                )));
+            }
+            (Entry::Link, Some(libc::ENOENT)) => return Ok(ReadOutcome::Exited(source)),
+            _ => {
+                return Err(Unreadable {
+                    pid,
+                    file,
+                    kind: Kind::Other,
+                    cause: source,
+                    peer: None,
+                });
+            }
+        },
     };
     let (kind, cause, peer) = match source.raw_os_error() {
         Some(libc::ESRCH) => return Ok(ReadOutcome::Exited(source)),
         Some(libc::ENOENT | libc::EACCES) => return Ok(ReadOutcome::Hidden(source)),
         // `hidepid`'s answer only if the checked directory still reads.
-        Some(libc::EPERM) => match kernel.read(dir, "self/stat") {
+        Some(libc::EPERM) => match read_own(kernel, dir, "self/stat") {
             Ok(_) => return Ok(ReadOutcome::Hidden(source)),
-            Err(recheck) => match open_refusal(&recheck) {
-                Some(refusal) => {
-                    let pid_failure = Unreadable {
-                        pid,
-                        file,
-                        kind: Kind::BesideRefusal,
-                        cause: source,
-                        peer: None,
-                    };
-                    return Ok(ReadOutcome::Refused(refusal.beside(Arc::new(pid_failure.into_cause()))));
-                }
-                None => (Kind::RecheckFailed, recheck.into_io(), Some(source)),
-            },
+            Err(OwnUnreadable::Refused(refusal)) => {
+                let pid_failure = Unreadable {
+                    pid,
+                    file,
+                    kind: Kind::BesideRefusal,
+                    cause: source,
+                    peer: None,
+                };
+                return Ok(ReadOutcome::Refused(refusal.beside(Arc::new(pid_failure.into_cause()))));
+            }
+            Err(OwnUnreadable::Failed(recheck)) => (Kind::RecheckFailed, recheck, Some(source)),
         },
         Some(libc::EXDEV | libc::ELOOP) => (Kind::BeyondMount, source, None),
         _ => {
             let failure = ReadFailure::Open(source);
-            match open_refusal(&failure) {
+            match failure.refusal() {
                 Some(refusal) => return Ok(ReadOutcome::Refused(refusal)),
                 None => (Kind::Other, failure.into_io(), None),
             }
@@ -193,16 +239,6 @@ fn failed_read(
         cause,
         peer,
     })
-}
-
-/// The [`Refusal`] an `openat2` failure of the checked `/proc` is, if any. A failure after the
-/// `openat2` (a `read(2)`, a listing) is none, whatever its errno. The one rule of every read and
-/// listing of `/proc`.
-pub(crate) fn open_refusal(failure: &ReadFailure) -> Option<Refusal> {
-    match failure {
-        ReadFailure::Open(e) => FailedCall::openat2(Errno::from_io_error(e)?).refusal(),
-        ReadFailure::Read(_) => None,
-    }
 }
 
 #[cfg(test)]

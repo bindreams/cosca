@@ -11,7 +11,7 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags};
 
 use super::Kernel;
-use crate::identity::{ProcDir, ReadFailure, ViewUnreadable};
+use crate::identity::{ProcDir, ProcOpenFailure, ReadFailure};
 
 pub(crate) struct FakeKernel<'a> {
     /// What answers a call the tables have nothing for. `None`: such a call panics.
@@ -107,12 +107,13 @@ impl<'a> FakeKernel<'a> {
     }
 
     /// Reading `path` under any `/proc` answers `answer`: the bytes, or the raw errno of its
-    /// `openat2`.
+    /// `openat2`. For a symlink the bytes are its target.
     pub(crate) fn on_read(self, path: &str, answer: Result<&[u8], i32>) -> Self {
         self.on_read_after(path, 0, answer)
     }
 
-    /// Reading `path` under any `/proc` opens it, and its `read(2)` fails with the raw `errno`.
+    /// Reading `path` under any `/proc` opens it, and its `read(2)` (a symlink's `readlinkat`) fails
+    /// with the raw `errno`.
     pub(crate) fn on_read_failing_after_open(mut self, path: &str, errno: i32) -> Self {
         self.reads.push((path.to_owned(), 0, Err((ReadCall::Read, errno))));
         self
@@ -250,6 +251,20 @@ impl<'a> FakeKernel<'a> {
         }
     }
 
+    /// The read row that answers a read or readlink of `path`, if any.
+    fn answer(&self, path: &str) -> Option<Result<Vec<u8>, ReadFailure>> {
+        let earlier = self.count_read(path);
+        let row = self
+            .reads
+            .iter()
+            .filter(|(p, from, _)| p == path && *from <= earlier)
+            .max_by_key(|(_, from, _)| *from);
+        row.map(|(_, _, answer)| match answer {
+            Ok(bytes) => Ok(bytes.clone()),
+            Err((call, errno)) => Err(call.failure(*errno)),
+        })
+    }
+
     fn real(&self, call: &str) -> &'a dyn Kernel {
         self.real.unwrap_or_else(|| panic!("FakeKernel has no row for {call}"))
     }
@@ -298,25 +313,21 @@ impl Kernel for FakeKernel<'_> {
         }
     }
 
-    fn open_proc(&self) -> Result<ProcDir, ViewUnreadable> {
+    fn open_proc(&self) -> Result<ProcDir, ProcOpenFailure> {
         match self.open_proc {
-            Some(errno) => Err(ViewUnreadable::from_open_errno(errno)),
+            Some(errno) => Err(ProcOpenFailure::opening(errno)),
             None => self.real("open_proc").open_proc(),
         }
     }
 
     fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure> {
-        let earlier = self.count_read(path);
-        let row = self
-            .reads
-            .iter()
-            .filter(|(p, from, _)| p == path && *from <= earlier)
-            .max_by_key(|(_, from, _)| *from);
-        match row {
-            Some((_, _, Ok(bytes))) => Ok(bytes.clone()),
-            Some((_, _, Err((call, errno)))) => Err(call.failure(*errno)),
-            None => self.real(&format!("read of {path}")).read(dir, path),
-        }
+        self.answer(path)
+            .unwrap_or_else(|| self.real(&format!("read of {path}")).read(dir, path))
+    }
+
+    fn read_link(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure> {
+        self.answer(path)
+            .unwrap_or_else(|| self.real(&format!("read_link of {path}")).read_link(dir, path))
     }
 
     fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure> {

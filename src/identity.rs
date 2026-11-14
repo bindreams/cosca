@@ -695,7 +695,10 @@ pub(crate) use backend::kernel::{HostKernel, Kernel};
 pub(crate) use backend::call_error;
 
 #[cfg(target_os = "linux")]
-pub(crate) use backend::prove::{prove, warn_refused, FailedCall, Proof, Refusal};
+pub(crate) use backend::prove::{prove, Proof};
+
+#[cfg(target_os = "linux")]
+pub(crate) use backend::refusal::{warn_refused, FailedCall, Refusal};
 
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::kernel::PIDFD_THREAD;
@@ -722,13 +725,16 @@ pub(crate) use backend::kernel::fake::FakeKernel;
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::proc_view::UNREADABLE_STATUS_REASON;
 
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use backend::proc_read::ProcOpenFailure;
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use backend::proc_read::ReadFailure;
+#[cfg(target_os = "linux")]
+pub(crate) use backend::proc_read::{utf8, OwnUnreadable, ProcDir};
 #[cfg(target_os = "linux")]
 pub(crate) use backend::proc_view::{
-    pidfd_pid_in, proc_view_with, utf8, PidfdTarget, ProcDir, ProcView, ViewUnreadable, DIVERGED_REASON,
+    pidfd_pid_in, proc_view_with, PidfdTarget, ProcView, ViewUnreadable, DIVERGED_REASON,
 };
-
-#[cfg(all(target_os = "linux", test))]
-pub(crate) use backend::proc_view::ReadFailure;
 
 /// Why a by-pid read answered `Unknown`, when the read itself knows: on Linux, the unusable
 /// `/proc` view it went through or the failed pidfd call. Carried out of the failing read, so the
