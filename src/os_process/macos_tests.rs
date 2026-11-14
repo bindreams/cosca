@@ -816,9 +816,9 @@ fn two_threads_waiting_on_one_process_both_return_after_it_exits() {
 /// Mutant: `ESRCH` at the exit watch's registration fails the adoption, or reads as a running child.
 #[skuld::test]
 fn esrch_at_registration_reads_as_exited_and_rechecks() {
-    use crate::os_process::child::{adopt_std, PeekOutcome, TryReapOutcome};
+    use crate::identity::FakeKernel;
+    use crate::os_process::child::{adopt_std_over, TryReapOutcome};
     use crate::os_process::macos::kqueue::test_hooks::{force_proc_registration_once, Registration};
-    use crate::wait::exit_only::seams::force_peek_once;
 
     let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
@@ -826,12 +826,25 @@ fn esrch_at_registration_reads_as_exited_and_rechecks() {
     let id = ProcessId::of(child.id()).found().expect("identity");
     wait_until_zombie(id.pid());
     let forced = force_proc_registration_once(Registration::ExitWatch);
-    let os = adopt_std(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    // The zombie is not yet visible to the look's peek. The test keeps a handle to the kernel the
+    // child owns, to ask whether that row was taken.
+    let kernel = std::sync::Arc::new(FakeKernel::over(&HostKernel).on_peek(id.pid(), Ok(None)));
+    let os = adopt_std_over(
+        {
+            let kernel = std::sync::Arc::clone(&kernel);
+            move |_, _| kernel
+        },
+        child,
+        id,
+    )
+    .unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     drop(forced);
     assert!(matches!(os.exited().unwrap(), Exit::Exited));
-    // The zombie is not yet visible to the look's peek.
-    let _running = force_peek_once(Ok(PeekOutcome::Running));
     assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Recheck));
+    assert!(
+        kernel.all_rows_taken(),
+        "the first try_reap's peek must have taken the row"
+    );
     assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
 }
 

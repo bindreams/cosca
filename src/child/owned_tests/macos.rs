@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use super::fixtures::{spawn_std_blocker, status, try_wait, wait_status, Blocker};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::error::Error;
-use crate::identity::{ppid_fault, FakeKernel, HostKernel, UniqRead, LAUNCHD};
+use crate::identity::{exit_record, ppid_fault, FakeKernel, HostKernel, UniqRead, LAUNCHD};
 use crate::os_process::child::{Foreign, OsChild, PeekOutcome, TryReapOutcome};
 use crate::os_process::macos::child::MacosChild;
 use crate::os_process::macos::kqueue::test_hooks;
@@ -19,9 +19,8 @@ use crate::os_process::{Exit, OsProcess};
 use crate::signal::{Sent, Sig};
 use crate::test_groups::{setuid, Group};
 use crate::wait::exit_only::macos_tests::{
-    echild_yet_resolvable, found, held_by_a_tracer_pid, parent_reads, unique_of,
+    assert_zombie_consumed, echild_yet_resolvable, found, held_by_a_tracer_pid, parent_reads, unique_of,
 };
-use crate::wait::exit_only::seams::{self as exit_seams, HolderStep};
 
 fn far() -> Instant {
     Instant::now() + Duration::from_secs(3600)
@@ -41,30 +40,33 @@ fn is_foreign(outcome: &Result<ChildWaitOutcome, crate::error::Error>) -> bool {
 /// Mutant: a `debug_assert!` on the by-pid target.
 #[skuld::test]
 fn a_reap_that_finds_none_after_reapable_takes_the_echild_path() {
-    let mut b = Blocker::spawn();
+    let (mut b, kernel) = Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_consume(pid, Ok(None)));
     b.end_child_and_confirm_exit();
-    let none = exit_seams::force_empty_reap_once();
     let outcome = b.owned.wait(None);
-    drop(none);
     assert!(is_foreign(&outcome), "{outcome:?}");
+    assert!(kernel.all_rows_taken(), "the reap must consume");
     assert!(format!("{:?}", b.owned).contains("N"), "{:?}", b.owned);
-    // The zombie was never consumed (the reap was forced empty): a real wait reaps it.
+    // The zombie was never consumed (the one consume found nothing): a real wait reaps it.
     wait_status(&b.owned);
 }
 
 // The second peek =====
 
 /// The second peek runs after every first reap, traced or not. For an untraced child it
-/// answers `ECHILD` and is skipped quietly.
+/// answers `ECHILD` and is skipped quietly. The first consume states an exit record and takes
+/// nothing, as the consume of a child its tracer reparented to this process does, so only a second
+/// peek and consume can reap the zombie.
 ///
-/// Mutant: a second peek gated on `p_oppid`: no `SecondPeek` step for an untraced child.
+/// Mutant: a second peek gated on `p_oppid`: the zombie of an untraced child is left.
 #[skuld::test]
 fn a_second_peek_runs_after_every_first_reap() {
-    let mut b = Blocker::spawn();
+    let (mut b, kernel) =
+        Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_consume(pid, Ok(Some(exit_record(0)))));
     b.end_child_and_confirm_exit();
-    exit_seams::holder_steps();
-    wait_status(&b.owned);
-    assert_eq!(exit_seams::holder_steps(), [HolderStep::SecondPeek]);
+    let status = wait_status(&b.owned);
+    assert!(status.success(), "{status:?}");
+    assert!(kernel.all_rows_taken(), "the first reap must consume");
+    assert_zombie_consumed(b.pid, "the second reap");
 }
 
 // Task 2b: the `SIG_IGN` hang =====
@@ -178,7 +180,8 @@ fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
 #[skuld::test]
 fn try_wait_on_a_pid_with_another_unique_id_is_echild_and_consumes_nothing() {
     // The peek's id check is the first unique-id read.
-    let mut b = Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
+    let (mut b, _) =
+        Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
     b.end_child_and_confirm_exit();
     let outcome = try_wait(&b.owned);
     assert!(is_foreign(&outcome), "another process holds the pid: {outcome:?}");
@@ -192,7 +195,8 @@ fn try_wait_on_a_pid_with_another_unique_id_is_echild_and_consumes_nothing() {
 #[skuld::test]
 fn a_wait_on_a_pid_with_another_unique_id_never_reaches_the_reap() {
     // The peek's id check is the first unique-id read.
-    let mut b = Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
+    let (mut b, _) =
+        Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
     b.end_child_and_confirm_exit();
     let outcome = b.owned.wait(None);
     assert!(is_foreign(&outcome), "another process holds the pid: {outcome:?}");
@@ -207,7 +211,8 @@ fn a_wait_on_a_pid_with_another_unique_id_never_reaches_the_reap() {
 #[skuld::test]
 fn kill_sends_nothing_to_a_pid_with_another_unique_id() {
     // The kill's version read is the first unique-id read.
-    let mut b = Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
+    let (mut b, _) =
+        Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
     let log = crate::send_log::Capture::start();
     b.owned
         .signal(Sig::Kill)
@@ -499,7 +504,7 @@ fn a_wait_on_a_child_whose_tracer_is_exiting_at_launchd_peeks_again_on_a_backoff
 #[skuld::test]
 fn a_running_peek_of_a_pid_with_another_unique_id_is_foreign() {
     // Each `try_wait` makes one unique-id read, the peek's id check, so the rows answer them in order.
-    let mut b = Blocker::spawn_over(|pid, unique| {
+    let (mut b, _) = Blocker::spawn_over(|pid, unique| {
         FakeKernel::over(&HostKernel)
             .on_unique_info(pid, found(unique ^ 1))
             .on_unique_info(pid, UniqRead::Refused(libc::EPERM))
@@ -585,19 +590,17 @@ fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
 /// Mutant: `Gone` at once: the wait answers `ECHILD`.
 #[skuld::test]
 fn a_reap_that_finds_no_exit_record_after_the_peek_saw_one_looks_again() {
-    let mut b = Blocker::spawn();
-    b.end_child_and_confirm_exit();
     // The look's peek sees the exit; the reap's own peek then finds none.
-    let _forced = exit_seams::force_peeks([
-        Ok(PeekOutcome::Exit(crate::os_process::child::ExitRecord::Status(
-            std::process::ExitStatus::default(),
-        ))),
-        Ok(PeekOutcome::Running),
-    ]);
+    let (mut b, kernel) = Blocker::spawn_over(|pid, _| {
+        FakeKernel::over(&HostKernel)
+            .on_peek(pid, Ok(Some(exit_record(0))))
+            .on_peek(pid, Ok(None))
+    });
+    b.end_child_and_confirm_exit();
     crate::wait::block_probe::take();
     let status = wait_status(&b.owned);
     assert!(status.success(), "{status:?}");
-    exit_seams::assert_peeks_exhausted();
+    assert!(kernel.all_rows_taken(), "the look and the reap must each peek");
     assert!(
         !crate::wait::block_probe::take().is_empty(),
         "the second look follows a backoff"
@@ -674,7 +677,7 @@ fn setuid_child_kill_is_permission_denied(#[fixture(setuid)] _group: &Group) {
 #[skuld::test]
 fn a_refused_id_read_at_the_exit_check_consumes_nothing() {
     // Each call's peek makes one unique-id read, its id check, so the rows answer them in order.
-    let mut b = Blocker::spawn_over(|pid, _| {
+    let (mut b, _) = Blocker::spawn_over(|pid, _| {
         FakeKernel::over(&HostKernel)
             .on_unique_info(pid, UniqRead::Refused(libc::EPERM))
             .on_unique_info(pid, UniqRead::Refused(libc::EACCES))
@@ -738,7 +741,7 @@ fn try_wait_during_a_wait_errors_when_a_running_childs_unique_id_is_unreadable()
     // holder is parked in its blocking hook, making no read: the holder's looks before it blocks
     // find the child's id, whatever their number, and every read the `try_wait` makes is refused.
     let refused = Arc::new(AtomicBool::new(false));
-    let mut b = Blocker::spawn_over({
+    let (mut b, _) = Blocker::spawn_over({
         let refused = Arc::clone(&refused);
         move |pid, unique| {
             FakeKernel::over(&HostKernel).on_every_unique_info(pid, move || {
@@ -784,17 +787,19 @@ fn try_wait_during_a_wait_errors_when_a_running_childs_unique_id_is_unreadable()
 /// blocks on a queue that holds nothing, for ever.
 #[skuld::test]
 fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
-    let mut b = Blocker::spawn();
-    b.end_child_and_confirm_exit();
     // Each look's peek finds no record, as when XNU is still finishing the exit: the `try_wait`'s,
     // which drains `NOTE_EXIT` from the reap kqueue, and the first of the `wait`'s, which finds
     // that queue empty. The `wait`'s second peek is the real one.
-    let forced = exit_seams::force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Running)]);
+    let (mut b, kernel) = Blocker::spawn_over(|pid, _| {
+        FakeKernel::over(&HostKernel)
+            .on_peek(pid, Ok(None))
+            .on_peek(pid, Ok(None))
+    });
+    b.end_child_and_confirm_exit();
     assert_eq!(try_wait(&b.owned).expect("try_wait"), ChildWaitOutcome::DeadlinePassed);
     let status = wait_status(&b.owned);
-    drop(forced);
     assert!(status.success(), "{status:?}");
-    exit_seams::assert_peeks_exhausted();
+    assert!(kernel.all_rows_taken(), "the try_wait and the wait must each peek");
 }
 
 /// A child whose exit watch has fired and whose confirming read is refused is `Dead` when the reap
@@ -808,7 +813,7 @@ fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
 /// answers `Dead` without the confirming read, leaving the row for the `try_wait`.
 #[skuld::test]
 fn a_refused_confirmation_is_dead_when_the_peek_shows_the_exit_record() {
-    let mut b =
+    let (mut b, _) =
         Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_unique_info(pid, UniqRead::Refused(libc::EPERM)));
     b.end_child_and_confirm_exit();
     assert!(
@@ -828,7 +833,7 @@ fn a_refused_confirmation_is_dead_when_the_peek_shows_the_exit_record() {
 #[skuld::test]
 fn a_refused_confirmation_is_the_refusal_when_the_peek_reads_the_child_running() {
     let forced_watch = test_hooks::force_proc_registration_once(test_hooks::Registration::ExitWatch);
-    let b =
+    let (b, _) =
         Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_unique_info(pid, UniqRead::Refused(libc::EPERM)));
     drop(forced_watch);
     let err = b.owned.liveness().expect_err("a running peek does not answer");

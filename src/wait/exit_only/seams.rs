@@ -1,42 +1,22 @@
-//! Test seams for `exit_only` and the holder that drives it. Thread-local, take-once, and armed
-//! on the thread that makes the call; each `force_*` returns a guard that disarms an unconsumed
-//! force on drop, so a leftover never leaks into the next test on this thread.
+//! Test seams for `exit_only`. Thread-local, take-once, and armed on the thread that makes the
+//! call; each `force_*` returns a guard that disarms an unconsumed force on drop, so a leftover
+//! never leaks into the next test on this thread.
+//!
+//! Only code that holds no kernel it can be given still needs them: the spawn-time macOS code
+//! (`HostKernel`) and every Linux peek (a `waitid` on a pidfd). Code over a macOS `Kernel` states
+//! `FakeKernel` peek and consume rows instead.
 
-use std::cell::{Cell, RefCell};
+#[cfg(target_os = "macos")]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::io;
 
 use crate::os_process::child::PeekOutcome;
 
-/// A step of a wait on a child, in the order it took them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HolderStep {
-    /// The one non-blocking look a deadline wait takes at expiry.
-    FinalPeek,
-    #[cfg_attr(
-        not(target_os = "macos"),
-        allow(dead_code, reason = "only macOS takes a second peek")
-    )]
-    SecondPeek,
-}
-
-type StepHook = Box<dyn FnOnce()>;
-
-/// A registered step hook and the id its guard removes it by.
-struct RegisteredHook {
-    id: u64,
-    step: HolderStep,
-    hook: StepHook,
-}
-
 thread_local! {
     static FORCED_PEEK: RefCell<std::collections::VecDeque<io::Result<PeekOutcome>>> = const { RefCell::new(std::collections::VecDeque::new()) };
     #[cfg(target_os = "macos")]
-    static FORCED_EMPTY_REAP: Cell<bool> = const { Cell::new(false) };
-    #[cfg(target_os = "macos")]
     static FORCED_SI_CODE: Cell<Option<i32>> = const { Cell::new(None) };
-    static STEPS: RefCell<Vec<HolderStep>> = const { RefCell::new(Vec::new()) };
-    static STEP_HOOKS: RefCell<Vec<RegisteredHook>> = const { RefCell::new(Vec::new()) };
-    static NEXT_HOOK_ID: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Disarms an unconsumed force on drop.
@@ -72,18 +52,6 @@ pub(crate) fn take_forced_peek() -> Option<io::Result<PeekOutcome>> {
     FORCED_PEEK.with(|f| f.borrow_mut().pop_front())
 }
 
-/// The next consuming reap on this thread finds nothing to consume instead of calling the OS.
-#[cfg(target_os = "macos")]
-pub(crate) fn force_empty_reap_once() -> Forced {
-    FORCED_EMPTY_REAP.with(|f| f.set(true));
-    Forced(|| FORCED_EMPTY_REAP.with(|f| f.set(false)))
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn take_forced_empty_reap() -> bool {
-    FORCED_EMPTY_REAP.with(Cell::take)
-}
-
 /// The next consuming `waitid` on this thread hands back a record with this `si_code`.
 #[cfg(target_os = "macos")]
 pub(crate) fn force_consuming_record_once(si_code: i32) -> Forced {
@@ -94,44 +62,4 @@ pub(crate) fn force_consuming_record_once(si_code: i32) -> Forced {
 #[cfg(target_os = "macos")]
 pub(crate) fn take_forced_si_code() -> Option<i32> {
     FORCED_SI_CODE.with(Cell::take)
-}
-
-/// Record that the holder is about to take `step`, and run the hook registered for it, if any.
-pub(crate) fn step(step: HolderStep) {
-    STEPS.with(|s| s.borrow_mut().push(step));
-    let hook = STEP_HOOKS.with(|h| {
-        let mut hooks = h.borrow_mut();
-        hooks.iter().position(|h| h.step == step).map(|i| hooks.remove(i).hook)
-    });
-    if let Some(hook) = hook {
-        hook();
-    }
-}
-
-/// Every step the holder took on this thread since the last call, in order.
-pub(crate) fn holder_steps() -> Vec<HolderStep> {
-    STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()))
-}
-
-/// Removes its own unfired step hook on drop, and no other.
-#[must_use = "dropping this immediately removes the hook; bind it for the probe's duration"]
-pub(crate) struct StepHookGuard(u64);
-
-impl Drop for StepHookGuard {
-    fn drop(&mut self) {
-        STEP_HOOKS.with(|h| h.borrow_mut().retain(|hook| hook.id != self.0));
-    }
-}
-
-/// Run `hook` on this thread just before its next `step`.
-pub(crate) fn on_holder_step(step: HolderStep, hook: impl FnOnce() + 'static) -> StepHookGuard {
-    let id = NEXT_HOOK_ID.with(|n| n.replace(n.get() + 1));
-    STEP_HOOKS.with(|h| {
-        h.borrow_mut().push(RegisteredHook {
-            id,
-            step,
-            hook: Box::new(hook),
-        });
-    });
-    StepHookGuard(id)
 }

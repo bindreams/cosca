@@ -41,6 +41,11 @@ impl<A: PartialEq, T> Rows<A, T> {
         self.every.push((asked, Box::new(answer)));
     }
 
+    /// Whether every once row has answered. An `every` row is never left over.
+    fn spent(&self) -> bool {
+        self.once.lock().expect("no thread panics holding the rows").is_empty()
+    }
+
     /// The first row for `asked`, which it removes; else the first `every` row for it.
     fn take(&self, asked: &A) -> Option<T> {
         let mut rows = self.once.lock().expect("no thread panics holding the rows");
@@ -95,6 +100,28 @@ impl<'a> FakeKernel<'a> {
             real: Some(real),
             ..Self::new()
         }
+    }
+
+    /// The next peek of `pid` answers `answer`: `Ok(None)` is a child that has not exited.
+    pub(crate) fn on_peek(mut self, pid: u32, answer: io::Result<Option<Record>>) -> Self {
+        self.peeks.push(pid, answer);
+        self
+    }
+
+    /// The next consume of `pid` answers `answer`, and takes nothing from the real process.
+    pub(crate) fn on_consume(mut self, pid: u32, answer: io::Result<Option<Record>>) -> Self {
+        self.consumes.push(pid, answer);
+        self
+    }
+
+    /// Every peek of `pid` that no once row answers answers `answer()`.
+    pub(crate) fn on_every_peek(
+        mut self,
+        pid: u32,
+        answer: impl Fn() -> io::Result<Option<Record>> + Send + Sync + 'static,
+    ) -> Self {
+        self.peeks.push_every(pid, answer);
+        self
     }
 
     /// The next unique-id read of `pid` answers `answer`.
@@ -165,6 +192,18 @@ impl<'a> FakeKernel<'a> {
         counts.iter().find(|(p, _)| *p == pid).map_or(0, |(_, n)| *n)
     }
 
+    /// Whether every row stated for one call has answered it, `on_every_*` rows aside. A row left
+    /// over is a call the test expected and the code never made, or made in another order.
+    pub(crate) fn all_rows_taken(&self) -> bool {
+        self.peeks.spent()
+            && self.consumes.spent()
+            && self.unique_infos.spent()
+            && self.short_bsds.spent()
+            && self.bsd_infos.spent()
+            && self.kinfos.spent()
+            && self.subscribes.spent()
+    }
+
     /// The kernel that answers a call no row answers; `asked` says what the call was.
     fn real(&self, asked: Arguments<'_>) -> &'a dyn Kernel {
         self.real
@@ -224,6 +263,14 @@ impl Kernel for FakeKernel<'_> {
             Some(Err(errno)) => Err(io::Error::from_raw_os_error(errno)),
             None => self.real(format_args!("the registration {what:?}")).subscribe(kq, what),
         }
+    }
+}
+
+/// The `waitid` record of a child that exited with `status`.
+pub(crate) fn exit_record(status: i32) -> Record {
+    Record {
+        si_code: libc::CLD_EXITED,
+        si_status: status,
     }
 }
 
