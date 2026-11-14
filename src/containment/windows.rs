@@ -1860,8 +1860,8 @@ impl Looks {
     /// gone does not use up the budget a live member needs. `settling`: they are the pids the
     /// settling listing named again ([`settle_unproved`]), so one still unproved, or a member that
     /// refuses the wait open, is `Unassessable` naming it at once. On a last round the settling
-    /// listing is the round's answer (`MembersRemain`), so a member found is not opened for a wait that
-    /// will not happen.
+    /// listing is the round's answer (`MembersRemain`), so a member's wait handle is closed, not held:
+    /// it is opened only so that a refusal answers as the first look's does.
     fn look(&mut self, pids: &[u32], settling: bool) -> Result<(), crate::error::Error> {
         use crate::error::Error;
 
@@ -1871,12 +1871,7 @@ impl Looks {
                 break;
             }
             let holds = !(settling && self.last_round);
-            let standing = if holds {
-                member_to_watch_for_wait(pid, self.job)
-            } else {
-                Ok(member_to_watch(open_for_membership(pid), self.job))
-            };
-            match standing {
+            match member_to_watch_for_wait(pid, self.job) {
                 Ok(Standing::Member(h)) if holds => {
                     // SAFETY: `member_to_watch` hands over the handle `OpenProcess` returned, owned
                     // nowhere else.

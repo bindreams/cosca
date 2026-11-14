@@ -1070,9 +1070,11 @@ fn wait_drained_raw_answers_for_a_live_member_that_refuses_the_query_open() {
 }
 
 /// A pid unproved on the first look (forced) that the second look proves a member refusing only the
-/// wait: `Unassessable` naming it, with the second look's cause (`ACCESS_DENIED`).
+/// wait: `Unassessable` naming it, with the second look's cause (`ACCESS_DENIED`), on a last round as
+/// on any other (as the first look answers it).
 ///
-/// Mutant: the recheck treats that `Err` as an unproved pid, or drops it.
+/// Mutant: the recheck treats that `Err` as an unproved pid, or drops it; or a last round's second
+/// look skips the wait open and answers `MembersRemain`.
 #[skuld::test]
 fn wait_drained_raw_names_a_pid_the_second_look_proves_a_member_that_refuses_the_wait() {
     use std::error::Error as _;
@@ -1090,30 +1092,32 @@ fn wait_drained_raw_names_a_pid_the_second_look_proves_a_member_that_refuses_the
     let job = super::JobHandle::create_empty_for_test();
     job.assign_for_test(member.handle().0)
         .expect("assign the restricted member to the job");
-    let first_look =
-        super::fault::force_next_for_thread(super::fault::Step::Membership, ERROR_GEN_FAILURE.0, member.pid());
-    let forced = super::fault::force_job_pid_lists([vec![member.pid()], vec![member.pid()]]);
+    for deadline in [None, Some(std::time::Instant::now())] {
+        let first_look =
+            super::fault::force_next_for_thread(super::fault::Step::Membership, ERROR_GEN_FAILURE.0, member.pid());
+        let forced = super::fault::force_job_pid_lists([vec![member.pid()], vec![member.pid()]]);
 
-    let verdict = super::wait_drained_raw(&job, None);
+        let verdict = super::wait_drained_raw(&job, deadline);
 
-    assert_eq!(
-        super::fault::job_pid_list_queries(),
-        2,
-        "answered by the second look, before any further listing"
-    );
-    drop(forced);
-    drop(first_look);
-    let error = verdict.expect_err("a member that cannot be waited for is not a drained tree");
-    assert!(
-        matches!(&error, crate::error::Error::Unassessable { detail, source: Some(_) }
-            if detail.contains(&member.pid().to_string())),
-        "{error:?}"
-    );
-    assert_eq!(
-        crate::error::first_os_code(error.source().expect("the OS error is the cause")),
-        Some(ERROR_ACCESS_DENIED.0 as i32),
-        "{error:?}"
-    );
+        assert_eq!(
+            super::fault::job_pid_list_queries(),
+            2,
+            "answered by the second look, before any further listing (deadline {deadline:?})"
+        );
+        drop(forced);
+        drop(first_look);
+        let error = verdict.expect_err("a member that cannot be waited for is not a drained tree");
+        assert!(
+            matches!(&error, crate::error::Error::Unassessable { detail, source: Some(_) }
+                if detail.contains(&member.pid().to_string())),
+            "deadline {deadline:?}: {error:?}"
+        );
+        assert_eq!(
+            crate::error::first_os_code(error.source().expect("the OS error is the cause")),
+            Some(ERROR_ACCESS_DENIED.0 as i32),
+            "deadline {deadline:?}: {error:?}"
+        );
+    }
 }
 
 /// A pid unproved on the first look (forced) that the second look proves a member the caller may open
@@ -1272,39 +1276,6 @@ fn drain_round_confirms_an_empty_settling_listing() {
         drop(first_look);
         assert!(matches!(round, Ok(super::Round::Confirm)), "last round: {last_round}");
     }
-}
-
-/// A last round whose settling listing names a pid the second look proves a member answers
-/// `MembersRemain` and opens no wait handle for it: the armed `WaitOpen` is not consumed.
-///
-/// Mutant: the last round's second look opens the member for a wait it drops.
-#[skuld::test]
-fn drain_round_opens_no_wait_handle_in_a_last_rounds_second_look() {
-    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_GEN_FAILURE};
-
-    let (child, job) = spawn_job_member();
-    let pid = child.id();
-    let first_look = super::fault::force_next_for_thread(super::fault::Step::Membership, ERROR_GEN_FAILURE.0, pid);
-    let wait_open = super::fault::force_next_for_thread(super::fault::Step::WaitOpen, ERROR_ACCESS_DENIED.0, pid);
-    let forced = super::fault::force_job_pid_lists([vec![pid], vec![pid]]);
-
-    let round = super::drain_round(job.raw, true);
-
-    assert_eq!(super::fault::job_pid_list_queries(), 2);
-    let untouched = super::fault::forced_is_armed();
-    drop(forced);
-    drop(wait_open);
-    drop(first_look);
-    job.hard_kill().expect("end the member");
-    let_member_exit(child);
-    assert!(
-        matches!(
-            round,
-            Ok(super::Round::Answer(crate::containment::TreeDrain::MembersRemain))
-        ),
-        "the member remains"
-    );
-    assert!(untouched, "no wait handle was opened");
 }
 
 /// A last round whose settling listing names the unproved pid again, still unprovable, answers
