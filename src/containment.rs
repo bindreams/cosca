@@ -265,14 +265,11 @@ pub enum ContainMode {
 
 impl ContainMode {
     /// Whether the mechanism this mode picks is the only one it accepts: a failure to set it up
-    /// fails the spawn, where every other mode degrades to the mechanism below it. Windows has
-    /// no session: `Session` is `Strongest` there.
+    /// fails the spawn, where every other mode degrades to the mechanism below it. Windows has its
+    /// own, in the Windows module.
+    #[cfg(unix)]
     pub(crate) fn is_strict(self) -> bool {
-        match self {
-            ContainMode::Strongest => true,
-            ContainMode::Session => cfg!(windows),
-            ContainMode::BestEffort | ContainMode::TreeWalk => false,
-        }
+        matches!(self, ContainMode::Strongest)
     }
 }
 

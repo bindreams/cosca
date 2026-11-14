@@ -296,7 +296,8 @@ pub enum Error {
     /// A containment mechanism could not be established, or could not tear the tree down: a member
     /// confirmed running, a failed `killpg` or kill write, or the mechanism's own stale bookkeeping.
     ///
-    /// A [`Strongest`](crate::ContainMode::Strongest) spawn returns it when the mechanism the
+    /// A [`Strongest`](crate::ContainMode::Strongest) spawn (on Windows a
+    /// [`Session`](crate::ContainMode::Session) one too) returns it when the mechanism the
     /// host offers cannot be set up (the cgroup leaf, the fd marker, or on Windows the Job Object
     /// the child cannot be assigned to): the program did not run, and `detail` names the
     /// mechanism. A
@@ -403,8 +404,9 @@ pub enum Error {
     ///
     /// Every error a spawn returns answers whether the program could have started, meaning the
     /// child reached `exec` (on Windows: `CreateProcess` or `ShellExecuteEx` succeeded; a `Strongest`
-    /// root that is created suspended and ended, never resumed, because it could not be put in its
-    /// Job Object did not start). This variant says it may have. Any other variant from a spawn says
+    /// or `Session` root that is created suspended and ended, never resumed, because it could not be
+    /// put in its Job Object did not start, as its still-suspended initial thread shows). This
+    /// variant says it may have. Any other variant from a spawn says
     /// it did not, and cosca has proved it. Where cosca cannot prove it, the answer is this variant:
     ///
     /// - every failure after `exec`, such as an identity read that finds the child gone, a

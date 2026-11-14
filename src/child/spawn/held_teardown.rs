@@ -82,25 +82,23 @@ pub(crate) fn tear_down_held(child: OwnedChild, how: HeldTeardown<'_>, why: &mut
 /// Tears `child` down after a failed attach that proved it never ran the program (on Linux its hook
 /// ended it before `exec`, as the handshake ends a child it never told to go; on Windows it is still
 /// suspended): killed and reaped, whether or not it is an elevation front, which never ran its
-/// `sudo`. It has this process's credentials, so nothing but its being gone refuses its kill
-/// ([`Past::Unexecuted`]). Its failures are said in the failed spawn's one warn, led by `why`; a
+/// `sudo`. Nothing but its being gone refuses its kill ([`Past::Unexecuted`]): on Linux it has this
+/// process's credentials; on Windows the handle is `CreateProcess`'s own and holds
+/// `PROCESS_TERMINATE` (`KillRefusal::Never`), so only an exiting child refuses, and that is
+/// answered as an exit. Its failures are said in the failed spawn's one warn, led by `why`; a
 /// not-started error has no place for them, and the child is never handed back.
 ///
-/// `id`: the identity the spawn read, `None` when that read failed. On Linux a look on the pidfd that
-/// failed may have left the wait on it failing too ([`Past::WaitMayFail`]), so a child it cannot
-/// collect is left, as `abandon_unreported` leaves one, and the warn says so. A Windows handle's
-/// wait does not depend on the identity read.
+/// `id`: the identity the spawn read, `None` when that read failed. `past`: what the caller knows
+/// became of the handle ([`Past::Unexecuted`], or [`Past::WaitMayFail`] when a look at it failed,
+/// so a child the teardown cannot collect is left, as `abandon_unreported` leaves one, and the warn
+/// says so).
 pub(crate) fn tear_down_unexecuted(
     child: OwnedChild,
     id: Option<ProcessId>,
+    past: Past,
     policy: SpawnPolicy,
     why: &mut Diagnosis,
 ) -> Torn {
-    let past = if id.is_some() || cfg!(windows) {
-        Past::Unexecuted
-    } else {
-        Past::WaitMayFail
-    };
     let kill = Kill {
         disposition: Disposition::Leave,
         tree: None,
@@ -112,6 +110,64 @@ pub(crate) fn tear_down_unexecuted(
         unreaped: None,
         cleanup: None,
     }
+}
+
+/// What a Linux spawn knows of its pidfd when it ends a child that never ran: with the identity read,
+/// nothing happened to it ([`Past::Unexecuted`]); without it, a look on the pidfd failed, and may have
+/// left the wait on it failing too ([`Past::WaitMayFail`]).
+#[cfg(target_os = "linux")]
+pub(crate) fn unexecuted_past(id: Option<ProcessId>) -> Past {
+    if id.is_some() {
+        Past::Unexecuted
+    } else {
+        Past::WaitMayFail
+    }
+}
+
+/// The failure of a spawn whose attach failed as `failure` says, after `child` was torn down: as
+/// [`tear_down_unexecuted`] ends it (with `unexecuted`) when the attach proved the program never ran
+/// ([`failed_attach`] then answers not started), and as `otherwise` ends it for any other failure.
+/// `otherwise` returns what the teardown did beyond its fate (the `detail` of
+/// [`Error::MayHaveStarted`](crate::Error::MayHaveStarted)) and the child's [`Torn`]; it is each
+/// platform's own teardown of a child that may have run.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn tear_down_after_failed_attach(
+    child: OwnedChild,
+    id: Option<ProcessId>,
+    failure: crate::containment::dispatch::AttachFailure,
+    unexecuted: Past,
+    policy: SpawnPolicy,
+    why: &mut Diagnosis,
+    otherwise: impl FnOnce(OwnedChild, &mut Diagnosis) -> (Option<String>, Torn),
+) -> super::SpawnFailure {
+    let crate::containment::dispatch::AttachFailure {
+        cause,
+        cleanup,
+        not_started,
+    } = failure;
+    let (detail, torn) = if not_started {
+        (None, tear_down_unexecuted(child, id, unexecuted, policy, why))
+    } else {
+        otherwise(child, why)
+    };
+    super::failure::failed_attach(not_started, cause, detail, cleanup, torn)
+}
+
+/// [`tear_down_after_failed_attach`] for a Windows spawn (std or raw): a suspended root that never ran
+/// is ended with a handle nothing happened to ([`Past::Unexecuted`]); any other child is killed over
+/// its handle and handed back if it cannot be ([`tear_down_failed_spawn`]).
+#[cfg(windows)]
+pub(crate) fn tear_down_after_failed_windows_attach(
+    child: OwnedChild,
+    id: Option<ProcessId>,
+    failure: crate::containment::dispatch::AttachFailure,
+    policy: SpawnPolicy,
+    why: &mut Diagnosis,
+) -> super::SpawnFailure {
+    tear_down_after_failed_attach(child, id, failure, Past::Unexecuted, policy, why, |child, why| {
+        let torn = tear_down_failed_spawn(child, id, Past::Clean, Disposition::HandBack, policy, why);
+        (None, torn)
+    })
 }
 
 /// Says `torn` as the failed spawn's one warn, and logs at warn ([`warn_of_teardown_failures`]) each

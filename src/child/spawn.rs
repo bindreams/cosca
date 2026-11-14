@@ -789,7 +789,13 @@ fn spawn_reported(
             #[cfg(target_os = "linux")]
             if let Some(failure) = never_ran {
                 drop(prepared);
-                let torn = held_teardown::tear_down_unexecuted(owned, None, policy, &mut why);
+                let torn = held_teardown::tear_down_unexecuted(
+                    owned,
+                    None,
+                    held_teardown::unexecuted_past(None),
+                    policy,
+                    &mut why,
+                );
                 return Err(failure::failed_attach(true, failure.cause, None, None, torn));
             }
             // Only Linux's verdict says so.
@@ -885,17 +891,48 @@ fn spawn_reported(
     ) {
         Ok(v) => v,
         Err(failure) => {
-            // Only Linux's and Windows' attach say the program never ran.
-            #[cfg(any(target_os = "linux", windows))]
-            let not_started = failure.not_started;
+            log::debug!("attach failed: {report}", report = crate::error::Report(&failure.cause));
+            // Off macOS: kill + reap so a failed attach never leaks the child (a dropped handle
+            // neither kills nor reaps). Only Linux's and Windows' attach say the program never ran,
+            // and that child, front or not (a front never ran its `sudo`), is killed and reaped.
+            // On Linux a front is the exception to the kill otherwise, and a failed attach has
+            // dropped the containment already: a cgroup leaf's drop kills it, so a front in it is
+            // dying, and is waited for (`tear_down_held`). On Windows any other child is killed
+            // and handed back if it cannot be.
+            #[cfg(target_os = "linux")]
+            return Err(held_teardown::tear_down_after_failed_attach(
+                owned,
+                id_read,
+                failure,
+                held_teardown::unexecuted_past(id_read),
+                policy,
+                &mut why,
+                |owned, why| {
+                    held_teardown::tear_down_held(
+                        owned,
+                        held_teardown::HeldTeardown {
+                            front,
+                            id: id_read,
+                            subtree: subtree.as_ref(),
+                            disposition: crate::child::owned::teardown::Disposition::HandBack,
+                            policy,
+                        },
+                        why,
+                    )
+                },
+            ));
+            #[cfg(windows)]
+            return Err(held_teardown::tear_down_after_failed_windows_attach(
+                owned, id_read, failure, policy, &mut why,
+            ));
+            // macOS: a front is left running and unreaped, sent nothing; any other child is killed
+            // and reaped through its verified unique id.
+            #[cfg(target_os = "macos")]
             let crate::containment::dispatch::AttachFailure {
                 cause: error,
                 cleanup: attach_cleanup,
                 ..
             } = failure;
-            log::debug!("attach failed: {report}", report = crate::error::Report(&error));
-            // macOS: a front is left running and unreaped, sent nothing; any other child is killed
-            // and reaped through its verified unique id.
             #[cfg(target_os = "macos")]
             let (fate, child_fate, teardown_cleanup) = {
                 if id_read.is_some() {
@@ -913,52 +950,6 @@ fn spawn_reported(
                     (None, child_fate, failures)
                 }
             };
-            // Off macOS: kill + reap so a failed attach never leaks the child (a dropped handle
-            // neither kills nor reaps). On Linux a front is the exception, and a failed attach has
-            // dropped the containment already: a cgroup leaf's drop kills it, so a front in it is
-            // dying, and is waited for (`tear_down_held`). A not-started child, front or not (a
-            // front never ran its `sudo`), is killed and reaped.
-            #[cfg(target_os = "linux")]
-            let (detail, torn) = if not_started {
-                (
-                    None,
-                    held_teardown::tear_down_unexecuted(owned, id_read, policy, &mut why),
-                )
-            } else {
-                held_teardown::tear_down_held(
-                    owned,
-                    held_teardown::HeldTeardown {
-                        front,
-                        id: id_read,
-                        subtree: subtree.as_ref(),
-                        disposition: crate::child::owned::teardown::Disposition::HandBack,
-                        policy,
-                    },
-                    &mut why,
-                )
-            };
-            // A not-started failure carries only the cause and fate; the teardown's failures went
-            // to its warn. Otherwise the attach's cleanup failures come before the teardown's.
-            #[cfg(target_os = "linux")]
-            return Err(failure::failed_attach(not_started, error, detail, attach_cleanup, torn));
-            #[cfg(windows)]
-            {
-                // A suspended root that never ran is ended as one that did not start; any other
-                // child is killed and handed back if it cannot be.
-                let torn = if not_started {
-                    held_teardown::tear_down_unexecuted(owned, id_read, policy, &mut why)
-                } else {
-                    held_teardown::tear_down_failed_spawn(
-                        owned,
-                        id_read,
-                        crate::child::owned::teardown::Past::Clean,
-                        crate::child::owned::teardown::Disposition::HandBack,
-                        policy,
-                        &mut why,
-                    )
-                };
-                return Err(failure::failed_attach(not_started, error, None, attach_cleanup, torn));
-            }
             #[cfg(target_os = "macos")]
             return Err(SpawnFailure::started(error, child_fate, None)
                 .with_detail(front_detail(fate, front, Some(pid)))

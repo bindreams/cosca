@@ -381,8 +381,11 @@ pub(crate) enum Past {
     /// teardown left uncollected need not be one whose kill was refused. What the kill may be refused
     /// for is the handle's.
     WaitMayFail,
-    /// As [`Clean`](Past::Clean), and the child never ran the program, so it has this process's
-    /// credentials: nothing but its being gone can refuse its kill, and the teardown collects it.
+    /// As [`Clean`](Past::Clean), and the child never ran the program, so nothing but its being gone
+    /// can refuse its kill, and the teardown collects it. On Linux the child has this process's
+    /// credentials (it exited in its hook before `exec`); on Windows the handle is `CreateProcess`'s
+    /// own and holds `PROCESS_TERMINATE` ([`KillRefusal::Never`]), and a refusal that says the
+    /// process is exiting is answered as an exit.
     Unexecuted,
 }
 

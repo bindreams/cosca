@@ -1187,6 +1187,15 @@ fn thread_snapshot(created: windows::core::Result<HANDLE>) -> io::Result<HANDLE>
     created.map_err(win32_io_error)
 }
 
+/// Every thread the system lists now, from one Toolhelp snapshot.
+fn thread_entries() -> io::Result<Vec<windows::Win32::System::Diagnostics::ToolHelp::THREADENTRY32>> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD};
+
+    // SAFETY: the snapshot is an owned handle, closed by `thread_entries_closing`.
+    let snap = thread_snapshot(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) })?;
+    thread_entries_closing(snap)
+}
+
 /// Every entry of the thread snapshot `snap`, which is closed on every path. A failure of the
 /// snapshot API has the plain Win32 code; the end of the walk is not one.
 fn thread_entries_closing(
@@ -1827,6 +1836,16 @@ fn resume_thread(thread: &ThreadHandle) -> windows::core::Result<u32> {
     }
 }
 
+/// `SuspendThread`, answering the suspend count the thread had before.
+fn suspend_thread(thread: &ThreadHandle) -> windows::core::Result<u32> {
+    // SuspendThread returns the previous suspend count, or u32::MAX on failure.
+    // SAFETY: `thread` is a live handle with THREAD_SUSPEND_RESUME.
+    match unsafe { windows::Win32::System::Threading::SuspendThread(thread.0) } {
+        u32::MAX => Err(windows::core::Error::from_thread()),
+        previous => Ok(previous),
+    }
+}
+
 /// Walk one snapshot entry; `None` if the snapshot lists it under another pid. Ownership is then
 /// re-checked on the opened handle by [`resume_if_owned`].
 fn visit_thread_entry(
@@ -2004,6 +2023,21 @@ fn initial_thread_id(process_pid: u32, tids: &[u32], walk: &mut Walk) -> Option<
     }
 }
 
+/// The initial thread of `process_pid` among the snapshot's `entries`: [`initial_thread_id`] over the
+/// ids the snapshot lists under that pid.
+fn initial_thread_among(
+    entries: &[windows::Win32::System::Diagnostics::ToolHelp::THREADENTRY32],
+    process_pid: u32,
+    walk: &mut Walk,
+) -> Option<u32> {
+    let own: Vec<u32> = entries
+        .iter()
+        .filter(|e| e.th32OwnerProcessID == process_pid)
+        .map(|e| e.th32ThreadID)
+        .collect();
+    initial_thread_id(process_pid, &own, walk)
+}
+
 /// Which of some `(creation time, thread id)` pairs is the earliest.
 #[derive(Debug, PartialEq, Eq)]
 enum Earliest {
@@ -2105,8 +2139,6 @@ pub(crate) fn resume_initial_threads(
     proc_handle: std::os::windows::io::RawHandle,
     expected: SuspendCount,
 ) -> io::Result<()> {
-    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD};
-
     let raw_handle = HANDLE(proc_handle.cast());
 
     let mut walk = Walk {
@@ -2121,26 +2153,16 @@ pub(crate) fn resume_initial_threads(
     );
     let process_pid = process_pid?;
 
-    // SAFETY: snapshot/iterate with an owned handle, closed before return.
-    unsafe {
-        let snap = thread_snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0))?;
-        let entries = thread_entries_closing(snap)?;
-
-        if walk.expected == SuspendCount::ExactlyOne {
-            // Only the initial thread is resumed. The others are opened query-only, to read their
-            // creation time, and that read failing fails the release.
-            let own: Vec<u32> = entries
-                .iter()
-                .filter(|e| e.th32OwnerProcessID == process_pid)
-                .map(|e| e.th32ThreadID)
-                .collect();
-            if let Some(initial) = initial_thread_id(process_pid, &own, &mut walk) {
-                resume_if_owned(initial, process_pid, &mut walk);
-            }
-        } else {
-            for entry in &entries {
-                visit_thread_entry(entry, process_pid, &mut walk);
-            }
+    let entries = thread_entries()?;
+    if walk.expected == SuspendCount::ExactlyOne {
+        // Only the initial thread is resumed. The others are opened query-only, to read their
+        // creation time, and that read failing fails the release.
+        if let Some(initial) = initial_thread_among(&entries, process_pid, &mut walk) {
+            resume_if_owned(initial, process_pid, &mut walk);
+        }
+    } else {
+        for entry in &entries {
+            visit_thread_entry(entry, process_pid, &mut walk);
         }
     }
 
@@ -2158,6 +2180,52 @@ pub(crate) fn resume_initial_threads(
     walk_verdict(process_pid, walk)
 }
 
+/// Whether the Job Object `mode` asks for is the only mechanism it accepts: a failure to create it or
+/// assign the child to it fails the spawn, where every other mode degrades to a process-tree walk.
+/// Windows has no session, so `Session` is `Strongest` here.
+pub(crate) fn is_strict(mode: crate::ContainMode) -> bool {
+    matches!(mode, crate::ContainMode::Strongest | crate::ContainMode::Session)
+}
+
+/// Whether the initial thread of the process at `proc_handle` is still suspended, as its creator
+/// left it: the program has not run. It finds the thread as the [`SuspendCount::ExactlyOne`]
+/// release does, and reads its suspend count by suspending and resuming it once, since the OS has
+/// no read of it. A count of 0 (something resumed the thread) is `false`; the read itself leaves a
+/// running thread stopped for the length of two calls. A count that is not 0 is `true`, though a
+/// thread something resumed and suspended again has one too, as the release's check cannot tell.
+///
+/// `Err` when the thread cannot be found or read: the count is unknown.
+pub(crate) fn initial_thread_still_suspended(proc_handle: std::os::windows::io::RawHandle) -> io::Result<bool> {
+    let process_pid = process_pid_of(HANDLE(proc_handle.cast()))?;
+    let mut walk = Walk {
+        expected: SuspendCount::ExactlyOne,
+        ..Walk::default()
+    };
+    let entries = thread_entries()?;
+    let Some(initial) = initial_thread_among(&entries, process_pid, &mut walk) else {
+        return Err(walk
+            .last_err
+            .take()
+            .unwrap_or_else(|| none_resumed_error(process_pid, walk.last_skip.as_deref())));
+    };
+    let call = |call: &str, e: windows::core::Error| {
+        io_context(
+            format!("{call} failed for thread {initial} of pid {process_pid}"),
+            win32_io_error(e),
+        )
+    };
+    let thread = open_for_resume(initial).map_err(|e| call("OpenThread(suspend/resume)", e))?;
+    let owner = owner_of(&thread).map_err(|e| call("GetProcessIdOfThread", e))?;
+    if owner != process_pid {
+        return Err(io::Error::other(format!(
+            "thread {initial} belongs to pid {owner}, not to pid {process_pid}"
+        )));
+    }
+    let previous = suspend_thread(&thread).map_err(|e| call("SuspendThread", e))?;
+    resume_thread(&thread).map_err(|e| call("ResumeThread", e))?;
+    Ok(previous != 0)
+}
+
 /// Assign the process at `proc_handle` to a `KILL_ON_JOB_CLOSE` job and resume its
 /// initial threads. `strict`: the request accepts no weaker mechanism than the job.
 ///
@@ -2170,7 +2238,9 @@ pub(crate) fn resume_initial_threads(
 /// resumed, the failure is logged at `warn`, and the caller falls back to the universal
 /// `Containment::TreeWalk` mechanism (identity teardown).
 /// Returns `Err` when job assignment fails and the request is `strict`: the child is left
-/// suspended, for the caller to terminate, and the failure says the program never ran.
+/// suspended, for the caller to terminate, and the failure says the program never ran when the
+/// root's initial thread is still suspended ([`initial_thread_still_suspended`]); a root that was
+/// resumed, or whose thread cannot be read, fails as one that may have started.
 /// Returns `Err` when resume fails — a frozen child is unacceptable; the
 /// child+job are killed and the failure propagates to fail the spawn. The resume failure is its
 /// cause; a failure of the job's kill after it is its cleanup (a teardown failure of the failed
@@ -2181,13 +2251,31 @@ pub(crate) fn attach_job(
 ) -> Result<Option<JobHandle>, crate::containment::dispatch::AttachFailure> {
     let job_result = match assign_held(proc_handle) {
         Err(e) if strict => {
+            // The program did not run only if its initial thread is still as the spawn left it; a
+            // root something resumed (a debugger, an EDR agent) may have run, and is torn down as
+            // one that may have started. A thread that cannot be read proves nothing.
+            let not_started = match initial_thread_still_suspended(proc_handle) {
+                Ok(suspended) => suspended,
+                Err(read) => {
+                    log::warn!(
+                        "the child's initial thread could not be read, so it is not known not to have run: {report}",
+                        report = crate::error::Report(&read)
+                    );
+                    false
+                }
+            };
+            let detail = "the child could not be put in its Job Object";
             return Err(crate::containment::dispatch::AttachFailure {
                 cause: crate::error::Error::Containment {
-                    detail: "the child could not be put in its Job Object, so the program did not run".to_owned(),
+                    detail: if not_started {
+                        format!("{detail}, so the program did not run")
+                    } else {
+                        detail.to_owned()
+                    },
                     source: Some(crate::error::Error::io_cause(e)),
                 },
                 cleanup: None,
-                not_started: true,
+                not_started,
             });
         }
         other => other,
@@ -2226,8 +2314,11 @@ pub(crate) fn attach_job(
         Err(e) => {
             // Job assignment failed, and the request accepts a weaker mechanism: dispatch
             // falls back to the TreeWalk mechanism.
+            let child = process_pid_of(HANDLE(proc_handle.cast()))
+                .map_or_else(|_| "the child".to_owned(), |pid| format!("pid {pid}"));
             log::warn!(
-                "Job Object containment: the child could not be put in its Job Object ({e}); falling back to a process-tree walk"
+                "Job Object containment: {child} could not be put in its Job Object ({report}); falling back to a process-tree walk",
+                report = crate::error::Report(&e)
             );
             Ok(None)
         }

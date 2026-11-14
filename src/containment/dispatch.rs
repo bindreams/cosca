@@ -1675,13 +1675,13 @@ fn attach_tree(
                 return match crate::containment::windows::assign_held(proc_handle) {
                     Ok(job) => Ok(Tree::contained(Mechanism::Job(job))),
                     Err(e) => Err(Error::Containment {
-                        detail: "the frozen child could not be assigned to its job".to_owned(),
+                        detail: "the frozen child could not be put in its Job Object".to_owned(),
                         source: Some(Error::io_cause(e)),
                     }
                     .into()),
                 };
             }
-            let strict = prepared.mode.is_some_and(ContainMode::is_strict);
+            let strict = prepared.mode.is_some_and(crate::containment::windows::is_strict);
             match crate::containment::windows::attach_job(proc_handle, strict) {
                 Ok(Some(job)) => return Ok(Tree::contained(Mechanism::Job(job))),
                 Ok(None) => {
