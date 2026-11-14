@@ -194,11 +194,12 @@ fn run_pump(shared: &Shared, stop: &OwnedFd) {
             if watch.saw_removal() {
                 shared.gone.store(true, Ordering::Release);
             }
+            // Reported before the broadcast, so a wait it wakes finds its batch already counted.
+            #[cfg(test)]
+            super::fault::notify_pump_batch(&shared.name, changed);
             if changed {
                 shared.changed.notify(usize::MAX);
             }
-            #[cfg(test)]
-            super::fault::notify_pump_batch(&shared.name, changed);
         }
     } else {
         // Every leaf a wait can block on holds a watch: a waitable leaf without one reads as
