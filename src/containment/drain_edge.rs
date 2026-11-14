@@ -347,9 +347,9 @@ async fn snapshot_members_on_pool(
 /// each job member it names, except those `settled`, is awaited in turn through the by-identity wait
 /// a kill's wait uses.
 ///
-/// The round's own work (a listing and up to 63 opens) runs on the polling thread: it waits for no
-/// exit and is bounded. The snapshot of an empty listing, with one open per process on the system,
-/// runs on the blocking pool ([`snapshot_members_on_pool`]).
+/// The round's own work (up to two listings and the opens of the pids they name) runs on the polling
+/// thread: it waits for no exit and is bounded. The snapshot of an empty listing, with one open per
+/// process on the system, runs on the blocking pool ([`snapshot_members_on_pool`]).
 #[cfg(all(feature = "tokio", windows))]
 async fn job_wait_tree_drained(
     job: &crate::containment::windows::JobHandle,
