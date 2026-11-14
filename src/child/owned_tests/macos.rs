@@ -18,7 +18,9 @@ use crate::os_process::macos::kqueue::test_hooks;
 use crate::os_process::{Exit, OsProcess};
 use crate::signal::{Sent, Sig};
 use crate::test_groups::{setuid, Group};
-use crate::wait::exit_only::macos_tests::{echild_yet_resolvable, found, held_by_a_tracer, unique_of};
+use crate::wait::exit_only::macos_tests::{
+    echild_yet_resolvable, found, held_by_a_tracer_pid, parent_reads, unique_of,
+};
 use crate::wait::exit_only::seams::{self as exit_seams, HolderStep};
 
 fn far() -> Instant {
@@ -530,9 +532,9 @@ fn the_kqueue_wait_keeps_waiting_for_a_child_that_answers_echild_yet_resolves() 
     use crate::wait::macos::{await_reapable, Waited};
     let (pid, unique) = echild_yet_resolvable();
     // The first look, and the final one at expiry.
-    let _forced = (held_by_a_tracer(), held_by_a_tracer());
+    let kernel = parent_reads(pid, held_by_a_tracer_pid(), 2);
     // An expired deadline: no blocking.
-    let waited = await_reapable(&HostKernel, pid, Some(unique), Some(Instant::now())).expect("wait");
+    let waited = await_reapable(&kernel, pid, Some(unique), Some(Instant::now())).expect("wait");
     assert_eq!(waited, Waited::DeadlinePassed);
 }
 

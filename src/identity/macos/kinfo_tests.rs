@@ -1,7 +1,7 @@
 //! Layout/value oracles for the local kinfo_proc definition. macOS-only at runtime.
 
 use super::*;
-use crate::identity::HostKernel;
+use crate::identity::{FakeKernel, HostKernel};
 
 // The kernel must agree with our struct size exactly: for a real one-record fetch, XNU
 // sets the written size to sizeof(struct kinfo_proc). (A NULL-buffer probe is NOT usable
@@ -377,8 +377,8 @@ fn the_exit_read_of_an_identity_is_gone_for_another_token_and_unknown_when_refus
         "the pid holds another process than the token's"
     );
 
-    fault::force_unreadable_once();
-    let (read, cause) = super::super::exit_begun(&HostKernel, me.pid(), me.key);
+    let refused = FakeKernel::over(&HostKernel).on_kinfo_refused(me.pid(), libc::EPERM);
+    let (read, cause) = super::super::exit_begun(&refused, me.pid(), me.key);
     assert_eq!(read, crate::identity::Resolved::Unknown);
     let error = cause.into_error("pid 1").expect("the refusal is the cause");
     assert!(error.to_string().contains("kinfo_proc could not be read"), "{error}");

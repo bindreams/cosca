@@ -59,6 +59,17 @@ impl kinfo_proc {
         let at = kinfo_proc::E_PPID_OFFSET;
         self.kp_eproc[at..at + std::mem::size_of::<libc::pid_t>()].copy_from_slice(&ppid.to_ne_bytes());
     }
+
+    /// The host's record of the live process `pid`, stating the parent it had when a tracer attached
+    /// (`oppid`) and the parent it has now (`ppid`).
+    pub(crate) fn of_host_held_by(pid: RawPid, oppid: libc::pid_t, ppid: libc::pid_t) -> kinfo_proc {
+        let (Resolved::Found(mut record), _) = super::kernel::HostKernel.kinfo(pid) else {
+            panic!("pid {pid} is live and has a kinfo_proc");
+        };
+        record.kp_proc.p_oppid = oppid;
+        record.set_e_ppid(ppid);
+        record
+    }
 }
 
 // E_PPID_OFFSET must stay inside the opaque tail it reads from - a compile-time companion to
@@ -166,20 +177,6 @@ pub(crate) fn exit_begun(p_stat: libc::c_char, p_flag: libc::c_int) -> bool {
 /// EINTR retries, per the codebase convention.
 pub(crate) fn kinfo(kernel: &dyn Kernel, pid: RawPid) -> Resolved<kinfo_proc> {
     #[cfg(test)]
-    if fault::take_unreadable() {
-        return Resolved::Unknown;
-    }
-    #[cfg(test)]
-    if let Some(oppid) = fault::take_oppid() {
-        return match kernel.kinfo(pid).0 {
-            Resolved::Found(mut info) => {
-                info.kp_proc.p_oppid = oppid;
-                Resolved::Found(info)
-            }
-            other => other,
-        };
-    }
-    #[cfg(test)]
     if let Some((oppid, ppid)) = fault::forced_parents(pid) {
         return match kernel.kinfo(pid).0 {
             Resolved::Found(mut info) => {
@@ -199,35 +196,9 @@ pub(super) fn host_kinfo(pid: RawPid) -> (Resolved<kinfo_proc>, Option<std::io::
     read_record_explained(pid, libc::KERN_PROC_PID)
 }
 
-/// Forces a field of the next [`kinfo`] read.
+/// Forces the parents of a [`kinfo`] read.
 #[cfg(test)]
 pub(crate) mod fault {
-    use std::cell::Cell;
-
-    thread_local! {
-        static OPPID: Cell<Option<libc::pid_t>> = const { Cell::new(None) };
-        static UNREADABLE: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// The next [`kinfo`](super::kinfo) on this thread is refused (`Unknown`).
-    pub(crate) fn force_unreadable_once() {
-        UNREADABLE.with(|u| u.set(true));
-    }
-
-    pub(super) fn take_unreadable() -> bool {
-        UNREADABLE.with(Cell::take)
-    }
-
-    /// The next [`kinfo`](super::kinfo) on this thread that finds its process reports `oppid` as its
-    /// `p_oppid`, the parent it had when a tracer attached.
-    pub(crate) fn force_oppid_once(oppid: libc::pid_t) {
-        OPPID.with(|o| o.set(Some(oppid)));
-    }
-
-    pub(super) fn take_oppid() -> Option<libc::pid_t> {
-        OPPID.with(Cell::take)
-    }
-
     /// What [`force_parents`] answers: `(p_oppid, e_ppid)`.
     type Parents = Box<dyn FnMut() -> (libc::pid_t, libc::pid_t)>;
 
@@ -261,18 +232,6 @@ pub(crate) mod fault {
             _ => None,
         })
     }
-}
-
-/// [`kinfo`] without the seams that force a field, and with the failure that left the read `Unknown`: the
-/// errno of the `sysctl`, or the wrong size it wrote. Only the forced refusal of
-/// [`fault::force_unreadable_once`] is honoured here, as an `EPERM` (the other seams force fields of a
-/// record).
-pub(crate) fn kinfo_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
-    #[cfg(test)]
-    if fault::take_unreadable() {
-        return (Resolved::Unknown, Some(std::io::Error::from_raw_os_error(libc::EPERM)));
-    }
-    kernel.kinfo(pid)
 }
 
 /// The selector-parameterized core. The `selector` parameter is a TEST SEAM (production

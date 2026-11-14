@@ -83,6 +83,37 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
+    /// The next short BSD-info read of `pid` without a row before it answers `answer`.
+    pub(crate) fn on_short_bsd(mut self, pid: RawPid, answer: Result<libc::proc_bsdshortinfo, ReadErr>) -> Self {
+        self.short_bsds.push(pid, answer);
+        self
+    }
+
+    /// The next BSD-info read of `pid` without a row before it answers `answer`.
+    pub(crate) fn on_bsd_info(mut self, pid: RawPid, answer: Result<libc::proc_bsdinfo, ReadErr>) -> Self {
+        self.bsd_infos.push(pid, answer);
+        self
+    }
+
+    /// The next `kinfo_proc` read of `pid` without a row before finds `record`.
+    pub(crate) fn on_kinfo(mut self, pid: RawPid, record: kinfo_proc) -> Self {
+        self.kinfos.push(pid, (Resolved::Found(record), None));
+        self
+    }
+
+    /// The next `kinfo_proc` read of `pid` without a row before is refused with `errno`.
+    pub(crate) fn on_kinfo_refused(mut self, pid: RawPid, errno: i32) -> Self {
+        self.kinfos
+            .push(pid, (Resolved::Unknown, Some(io::Error::from_raw_os_error(errno))));
+        self
+    }
+
+    /// The next registration `what` without a row before is made and never fires.
+    pub(crate) fn on_subscribe(mut self, what: Subscription) -> Self {
+        self.subscribes.push(what, Ok(()));
+        self
+    }
+
     /// The kernel that answers a call no row answers; `asked` says what the call was.
     fn real(&self, asked: Arguments<'_>) -> &'a dyn Kernel {
         self.real
@@ -136,4 +167,13 @@ impl Kernel for FakeKernel<'_> {
             None => self.real(format_args!("the registration {what:?}")).subscribe(kq, what),
         }
     }
+}
+
+/// A short BSD-info record that states a parent and a state, and nothing else.
+pub(crate) fn short_info(ppid: u32, status: u32) -> libc::proc_bsdshortinfo {
+    // SAFETY: all-zero is a valid `proc_bsdshortinfo`.
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    info.pbsi_ppid = ppid;
+    info.pbsi_status = status;
+    info
 }

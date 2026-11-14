@@ -764,6 +764,9 @@ mod no_reads {
 #[cfg(all(any(target_os = "linux", target_os = "macos"), test))]
 pub(crate) use backend::kernel::fake::FakeKernel;
 
+#[cfg(all(target_os = "macos", test))]
+pub(crate) use backend::kernel::fake::short_info;
+
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::proc_view::UNREADABLE_STATUS_REASON;
 
@@ -1112,10 +1115,6 @@ pub(crate) use backend::{ppid_fault, uniq_fault};
 /// the guard or `kinfo_proc`'s layout.
 #[cfg(target_os = "macos")]
 pub(crate) use backend::ppid_of as macos_ppid_of;
-
-/// The macOS parent-pid read's test seams and its attempt type.
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) use backend::{fault as macos_fault, PpidRead};
 
 /// What an ALREADY-OPEN Windows handle says about an identity. The held handle pins the
 /// kernel object, so this is pid-reuse-safe (unlike re-resolving by raw pid).

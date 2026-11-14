@@ -70,7 +70,7 @@ mod macos {
     use std::io;
 
     use super::*;
-    use crate::identity::{uniq_fault, uniq_info, HostKernel, ReadPurpose, UniqInfo, UniqRead};
+    use crate::identity::{uniq_info, FakeKernel, HostKernel, ReadPurpose, UniqInfo, UniqRead};
     use crate::signal::{read_identity, via_audit_token};
 
     /// `PID_MAX` is 99999, so this pid names nothing, ever.
@@ -181,8 +181,8 @@ mod macos {
         let (mut child, stdin) = spawn();
         let known = Some(unique_id_of(child.id()));
         let log = Capture::start();
-        let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Kill, UniqRead::Refused(libc::EPERM));
-        let err = via_audit_token(&HostKernel, child.id(), known, Sig::Kill).expect_err("unverifiable");
+        let kernel = FakeKernel::over(&HostKernel).on_unique_info(child.id(), UniqRead::Refused(libc::EPERM));
+        let err = via_audit_token(&kernel, child.id(), known, Sig::Kill).expect_err("unverifiable");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
         assert_eq!(err.raw_os_error(), None);
         assert!(err.to_string().contains("identity could not be read"), "{err}");
@@ -195,15 +195,16 @@ mod macos {
     #[skuld::test]
     fn a_pid_that_vanishes_after_the_check_is_gone_and_the_attempt_is_recorded() {
         let log = Capture::start();
-        let _forced = uniq_fault::force_uniq_read_once(
-            ReadPurpose::Kill,
+        // The check finds the process; the read after the send's `ESRCH` is the host's, and finds none.
+        let kernel = FakeKernel::over(&HostKernel).on_unique_info(
+            NEVER_A_PID,
             UniqRead::Found(UniqInfo {
                 unique_id: 7,
                 id_version: 0,
             }),
         );
         assert_eq!(
-            via_audit_token(&HostKernel, NEVER_A_PID, Some(7), Sig::Kill).expect("gone is Ok"),
+            via_audit_token(&kernel, NEVER_A_PID, Some(7), Sig::Kill).expect("gone is Ok"),
             Sent::Gone
         );
         assert_eq!(log.entries(), [(NEVER_A_PID, Sig::Kill, Via::Identity)]);
