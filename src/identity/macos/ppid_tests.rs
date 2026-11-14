@@ -4,7 +4,7 @@
 //! for a candidate and its parent that run on every platform are in `identity::tree_tests`.
 
 use super::{fault, read_ppid_once, resolve_ppid, trusted_ppid, PpidRead};
-use crate::identity::{Key, ProcessId, Resolved};
+use crate::identity::{HostKernel, Key, ProcessId, Resolved};
 use crate::test_child::{live_exiting_member, release_unsignalled};
 
 /// The start key of the record the ppid was read from, as a stated value.
@@ -104,13 +104,13 @@ fn a_zero_parent_is_trusted_only_for_the_kernel_and_launchd() {
 /// the record under another pid.
 #[skuld::test]
 fn one_parent_read_of_launchd_finds_its_parent_zero() {
-    let read = read_ppid_once(1);
+    let read = read_ppid_once(&HostKernel, 1);
     // Any user can read launchd's record (unsandboxed, as CI's runners are).
     let PpidRead::Found(0, key) = read else {
         panic!("one parent read of launchd must find parent 0, got {read:?}");
     };
     assert_eq!(
-        super::start_token(1),
+        super::start_token(&HostKernel, 1),
         Resolved::Found(key),
         "the parent read's key is launchd's"
     );

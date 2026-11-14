@@ -217,7 +217,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 Remains::collected(ChildFate::Gone),
             ),
             // A sync child's kill always verifies: the pidfd or the handle names it, and on macOS the
-            // unique id every production spawn adopts is held (`MacChild::new` takes it).
+            // unique id every production spawn adopts is held (`MacosChild::new` takes it).
             // Were it ever not, the child may still be running.
             Ok(crate::signal::Sent::Unverified) => {
                 debug_assert!(false, "a sync child's kill always verifies its target");
@@ -762,7 +762,7 @@ fn spawn_reported(
     #[cfg(target_os = "linux")]
     let through = crate::wait::exit_only::Target::PidFd(owned.os_handle());
     #[cfg(target_os = "macos")]
-    let through = crate::wait::exit_only::Target::pid(pid, Some(unique));
+    let through = crate::wait::exit_only::Target::pid(&crate::identity::HostKernel, pid, Some(unique));
     #[cfg(windows)]
     let through = crate::wait::exit_only::Target::Handle(owned.os_handle());
     #[cfg(target_os = "linux")]
@@ -770,7 +770,12 @@ fn spawn_reported(
         pid,
         pidfd: owned.os_handle(),
     };
-    let (resolved, cause, mut why) = resolve_identity(&crate::identity::HostKernel, pid, &through);
+    let (resolved, cause, mut why) = resolve_identity(
+        #[cfg(not(target_os = "macos"))]
+        &crate::identity::HostKernel,
+        pid,
+        &through,
+    );
     let id = match resolved {
         crate::identity::Resolved::Found(id) => Ok(id),
         // Kept with no identity; see `Child::id`.
@@ -955,7 +960,7 @@ fn spawn_reported(
     };
     // A refused kqueue is the one way to fail, and the child is then reachable by its unique id alone.
     #[cfg(target_os = "macos")]
-    let owned = match crate::os_process::macos::child::MacChild::new(pid, unique) {
+    let owned = match crate::os_process::macos::child::MacosChild::new(crate::identity::HostKernel, pid, unique) {
         Ok(os) => {
             drop(child);
             OwnedChild::new(Box::new(os))
@@ -1204,7 +1209,7 @@ impl crate::containment::Root for LateTree {
                 source: None,
             });
         };
-        match crate::os_process::open_with(&crate::identity::HostKernel, id)
+        match crate::os_process::open_with(crate::identity::HostKernel, id)
             .map_err(crate::os_process::OpenFailure::into_open_error)?
         {
             Some(os) => os.signal(sig),
@@ -1216,7 +1221,7 @@ impl crate::containment::Root for LateTree {
         if matches!(self.sweep, Sweep::RootKilled { zombie: false }) {
             return crate::signal::RootState::Unpinned;
         }
-        let target = crate::wait::exit_only::Target::pid(self.pid, Some(self.unique));
+        let target = crate::wait::exit_only::Target::pid(&crate::identity::HostKernel, self.pid, Some(self.unique));
         crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target))
     }
 }
@@ -1267,9 +1272,8 @@ impl LateTree {
             return tree;
         }
         let (resolved, _, mut why) = resolve_identity(
-            &crate::identity::HostKernel,
             pid,
-            &crate::wait::exit_only::Target::pid(pid, Some(unique)),
+            &crate::wait::exit_only::Target::pid(&crate::identity::HostKernel, pid, Some(unique)),
         );
         let unshown = match resolved {
             Resolved::Found(id) => {
@@ -1455,8 +1459,8 @@ fn kill_and_reap_noting(
     use crate::signal::{via_audit_token, Sent, Sig};
     use crate::wait::macos::Waited;
 
-    let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
-    match via_audit_token(pid, Some(unique), Sig::Kill) {
+    let target = crate::wait::exit_only::Target::pid(&crate::identity::HostKernel, pid, Some(unique));
+    match via_audit_token(&crate::identity::HostKernel, pid, Some(unique), Sig::Kill) {
         Ok(Sent::Delivered) => {
             // A fixture that only the kill would end is released here when no kill was sent.
             #[cfg(test)]
@@ -1523,13 +1527,14 @@ fn await_exit_warning(
     unique: u64,
     warn_after: Option<std::time::Duration>,
 ) -> std::io::Result<crate::wait::macos::Waited> {
+    use crate::identity::HostKernel;
     use crate::wait::macos::{await_reapable, Waited};
 
     // What the bounded look found, when it found the end: the unbounded wait answers it.
     crate::wait::teardown_warn::wait_warning(
         None,
         crate::wait::teardown_warn::Due::in_(warn_after),
-        |found, until| match await_reapable(pid, Some(unique), Some(until)) {
+        |found, until| match await_reapable(&HostKernel, pid, Some(unique), Some(until)) {
             Ok(Waited::DeadlinePassed) => false,
             done => {
                 *found = Some(done);
@@ -1537,7 +1542,7 @@ fn await_exit_warning(
             }
         },
         |after| warn_still_waiting(Some(pid), after),
-        |found| found.unwrap_or_else(|| await_reapable(pid, Some(unique), None)),
+        |found| found.unwrap_or_else(|| await_reapable(&HostKernel, pid, Some(unique), None)),
     )
 }
 
@@ -2395,7 +2400,8 @@ pub(crate) fn spawn_identity_error(
 /// (see the `Diagnosis` keep rule). The
 /// [`UnknownCause`](crate::identity::UnknownCause) is the read's own, for [`spawn_identity_error`].
 pub(crate) fn resolve_identity(
-    kernel: &dyn crate::identity::Kernel,
+    // On macOS `through` carries the kernel.
+    #[cfg(not(target_os = "macos"))] kernel: &dyn crate::identity::Kernel,
     pid: u32,
     through: &crate::wait::exit_only::Target<'_>,
 ) -> (
@@ -2410,7 +2416,12 @@ pub(crate) fn resolve_identity(
         let crate::wait::exit_only::Target::PidFd(held) = *through;
         resolve_identity_unchecked(kernel, pid, held)
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let (read, cause) = {
+        let crate::wait::exit_only::Target::Pid { kernel, .. } = *through;
+        resolve_identity_unchecked(kernel, pid)
+    };
+    #[cfg(windows)]
     let (read, cause) = resolve_identity_unchecked(kernel, pid);
     let Resolved::Found(_) = read else {
         return (read, cause, Diagnosis::default());

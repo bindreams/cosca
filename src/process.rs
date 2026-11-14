@@ -45,11 +45,15 @@ impl Process {
     ///   pidfd's inode read, or its `poll`, named for the call below the `Io`). macOS opens no kqueue:
     ///   the first look at the process does ([`wait`](Self::wait)).
     pub fn open(id: ProcessId) -> Result<Option<Process>, Error> {
-        Self::open_with(&crate::identity::HostKernel, id)
+        Self::open_with(crate::identity::HostKernel, id)
     }
 
-    /// [`open`](Self::open), re-verifying `id` through `kernel`.
-    pub(crate) fn open_with(kernel: &dyn crate::identity::Kernel, id: ProcessId) -> Result<Option<Process>, Error> {
+    /// [`open`](Self::open), re-verifying `id` through `kernel`. On macOS the handle owns `kernel`,
+    /// so it lives as long as the handle; Linux and Windows drop it once the open is done.
+    pub(crate) fn open_with<K: crate::identity::Kernel + Send + 'static>(
+        kernel: K,
+        id: ProcessId,
+    ) -> Result<Option<Process>, Error> {
         Ok(crate::os_process::open_with(kernel, id)
             .map_err(crate::os_process::OpenFailure::into_open_error)?
             .map(|os| Process { id, os }))
@@ -59,12 +63,16 @@ impl Process {
     /// an exited but unreaped one opens as for [`open`](Self::open). Errors as for `open`; a pid
     /// whose identity cannot be read is [`Error::Unassessable`].
     pub fn open_pid(pid: RawPid) -> Result<Option<Process>, Error> {
-        Self::open_pid_with(&crate::identity::HostKernel, pid)
+        Self::open_pid_with(crate::identity::HostKernel, pid)
     }
 
-    /// [`open_pid`](Self::open_pid), reading the pid's identity and opening it through `kernel`.
-    pub(crate) fn open_pid_with(kernel: &dyn crate::identity::Kernel, pid: RawPid) -> Result<Option<Process>, Error> {
-        match ProcessId::of_with(kernel, pid) {
+    /// [`open_pid`](Self::open_pid), reading the pid's identity and opening it through `kernel`, as
+    /// [`open_with`](Self::open_with) does.
+    pub(crate) fn open_pid_with<K: crate::identity::Kernel + Send + 'static>(
+        kernel: K,
+        pid: RawPid,
+    ) -> Result<Option<Process>, Error> {
+        match ProcessId::of_with(&kernel, pid) {
             (Resolved::Found(id), _) => Process::open_with(kernel, id),
             (Resolved::Gone, _) => Ok(None),
             (Resolved::Unknown, cause) => {

@@ -227,9 +227,9 @@ pub(crate) fn send_pidfd(
 /// (`ESRCH`); `Err(errno)` is a refused read. Tests only: production spawns take the child's own
 /// report (`child::spawn::unique_report`).
 #[cfg(all(target_os = "macos", test))]
-pub(crate) fn read_identity(pid: u32) -> Result<Option<u64>, i32> {
+pub(crate) fn read_identity(kernel: &dyn crate::identity::Kernel, pid: u32) -> Result<Option<u64>, i32> {
     use crate::identity::{uniq_info, ReadPurpose, UniqRead};
-    match uniq_info(pid, ReadPurpose::Adopt) {
+    match uniq_info(kernel, pid, ReadPurpose::Adopt) {
         UniqRead::Found(info) => Ok(Some(info.unique_id)),
         UniqRead::Gone => Ok(None),
         UniqRead::Refused(errno) => Err(errno),
@@ -256,18 +256,23 @@ pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
 /// A child that has exited and is not reaped is [`Sent::Delivered`], as on Linux: it is ours, and
 /// its zombie holds the pid.
 #[cfg(target_os = "macos")]
-pub(crate) fn via_audit_token(pid: u32, identity: Option<u64>, sig: Sig) -> io::Result<Sent> {
+pub(crate) fn via_audit_token(
+    kernel: &dyn crate::identity::Kernel,
+    pid: u32,
+    identity: Option<u64>,
+    sig: Sig,
+) -> io::Result<Sent> {
     use crate::os_process::macos::{read_version, signal_by_token, SignalByTokenOutcome};
 
     let Some(unique) = identity else {
         log::debug!("child {pid} holds no unique id; {sig:?} not sent");
         return Ok(Sent::Unverified);
     };
-    let Some(mut idversion) = read_version(pid, unique, sig)? else {
+    let Some(mut idversion) = read_version(kernel, pid, unique, sig)? else {
         log::debug!("child {pid} is gone or its pid names another process; {sig:?} not sent");
         return Ok(Sent::Gone);
     };
-    let sent = signal_by_token(pid, unique, &mut idversion, sig);
+    let sent = signal_by_token(kernel, pid, unique, &mut idversion, sig);
     // Every return of `signal_by_token` follows a send attempt, whatever it answered.
     #[cfg(test)]
     crate::send_log::record(pid, sig, crate::send_log::Via::Identity);

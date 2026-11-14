@@ -112,7 +112,7 @@ fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
 /// nothing warns that the zombie is not ours to reap: the grace watch ends at once on the exit, with
 /// the grace unspent, and the reap's own answer, that launchd holds it, is the refusal, saying the
 /// exit status cannot be collected. The root's exit watch reading past `NOTE_EXIT` for a parent that
-/// is launchd is pinned beside `MacChild::exited`.
+/// is launchd is pinned beside `MacosChild::exited`.
 ///
 /// Mutants: the grace watch or the reap warns that the zombie is not ours to reap; the call looks
 /// at the root before the reap instead of asking the reap; the escalation kills an exited root; the

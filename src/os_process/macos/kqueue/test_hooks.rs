@@ -43,7 +43,7 @@ pub(crate) fn take_events() -> Vec<(i16, u32)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Registration {
     /// The reap registration (`await_reapable`'s `register`), which `await_reapable` makes for a
-    /// wait and `MacChild::new` makes through `register_exit_events`.
+    /// wait and `MacosChild::new` makes through `register_exit_events`.
     Reap,
     /// An exit watch's (`ExitWatch::proc_exit`): the process reads as exited, as one past
     /// `P_REF_DEAD` does before it is a zombie.

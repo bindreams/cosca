@@ -40,6 +40,9 @@ use windows as backend;
 #[cfg(all(target_os = "macos", test))]
 pub(crate) use macos::second_reap;
 
+#[cfg(target_os = "macos")]
+use crate::identity::Kernel;
+
 #[cfg(all(target_os = "macos", test))]
 #[path = "exit_only/macos_tests.rs"]
 pub(crate) mod macos_tests;
@@ -69,7 +72,7 @@ pub(crate) enum Reap {
 }
 
 /// The handle that names the child.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(crate) enum Target<'a> {
     /// The child's pidfd: pinned, so a reused pid cannot be mistaken for it.
     #[cfg(target_os = "linux")]
@@ -80,26 +83,37 @@ pub(crate) enum Target<'a> {
         pid: u32,
         /// The child's unique id (`proc_pidinfo` flavor 17): never reused, so it names the child.
         unique: Option<u64>,
-        _lt: std::marker::PhantomData<&'a ()>,
+        /// What answers every read about the child: macOS has no handle that does.
+        kernel: &'a dyn Kernel,
     },
     /// A process handle: pinned.
     #[cfg(windows)]
     Handle(std::os::windows::io::BorrowedHandle<'a>),
 }
 
-#[cfg(target_os = "macos")]
-impl Target<'_> {
-    /// The child `pid`, checked against `unique` when there is one.
-    pub(crate) fn pid(pid: u32, unique: Option<u64>) -> Target<'static> {
-        Target::Pid {
-            pid,
-            unique,
-            _lt: std::marker::PhantomData,
+impl std::fmt::Debug for Target<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(target_os = "linux")]
+            Target::PidFd(fd) => f.debug_tuple("PidFd").field(fd).finish(),
+            #[cfg(target_os = "macos")]
+            Target::Pid { pid, unique, .. } => f.debug_struct("Pid").field("pid", pid).field("unique", unique).finish(),
+            #[cfg(windows)]
+            Target::Handle(handle) => f.debug_tuple("Handle").field(handle).finish(),
         }
     }
 }
 
-/// Look at `target` without consuming anything.
+#[cfg(target_os = "macos")]
+impl<'a> Target<'a> {
+    /// The child `pid`, checked against `unique` when there is one, read through `kernel`.
+    pub(crate) fn pid(kernel: &'a dyn Kernel, pid: u32, unique: Option<u64>) -> Target<'a> {
+        Target::Pid { pid, unique, kernel }
+    }
+}
+
+/// Look at `target` without consuming anything. The handle `target` holds answers; macOS has no
+/// handle, so its target carries the kernel that does.
 pub(crate) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
     #[cfg(test)]
     if let Some(forced) = seams::take_forced_peek() {
@@ -138,13 +152,8 @@ pub(crate) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
 
 // The wait status of an `si_code` record =====
 
-/// One `waitid` record: the `si_code` and `si_status` of the `siginfo_t`.
 #[cfg(unix)]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Record {
-    pub(crate) si_code: i32,
-    pub(crate) si_status: i32,
-}
+pub(crate) use crate::identity::Record;
 
 /// `record`, as the test seam [`seams::force_consuming_record_once`] may have rewritten it.
 #[cfg(unix)]
