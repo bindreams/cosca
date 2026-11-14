@@ -90,7 +90,7 @@ static_assertions = "1"
 #   `TRUSTEE_W`, to build a real deny ACE on a real Windows host rather than simulate one. (Its
 #   thread-impersonation guard needs no feature beyond `Win32_Security`/`Win32_System_Threading`,
 #   both already enabled: `DuplicateTokenEx` lives in the former, `SetThreadToken` in the latter.)
-# - `Win32_System_Diagnostics_Debug`, `Win32_System_LibraryLoader` and `Win32_System_Memory`: only `test_frozen.rs`
+# - `Win32_System_LibraryLoader` and `Win32_System_Memory`: only `test_frozen.rs`
 #   needs them, to start a thread in a suspended child that blocks for good (`WriteProcessMemory`, `GetProcAddress`
 #   on ntdll for an address valid in both processes, `VirtualAllocEx`).
 # - `Win32_System_TaskScheduler` (with `Win32_System_Ole` and `Win32_System_Variant`, which its `Connect` needs):
@@ -117,7 +117,6 @@ windows = { version = "0.62", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
-    "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
@@ -152,6 +151,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Kernel",
     "Win32_System_IO",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Environment",
     "Win32_Security",

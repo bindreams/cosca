@@ -213,18 +213,21 @@ pub enum ContainMode {
     /// - **macOS:** the inherited-fd marker, always offered. A failure to install it fails the
     ///   spawn. An explicit [`Session`](ContainMode::Session) or [`TreeWalk`](ContainMode::TreeWalk)
     ///   installs the marker too, and degrades when it fails.
-    /// - **Windows:** a Job Object, falling back to [`ContainMode::TreeWalk`] when the child
-    ///   cannot be assigned to it, as `BestEffort` does. This is unchanged for now: Windows will
-    ///   fail instead, as the other platforms do.
+    /// - **Windows:** a Job Object, always offered. A failure to create the Job or assign the child
+    ///   to it fails the spawn: the child, created suspended, is terminated and reaped before it
+    ///   runs, and the error names the Job Object, with the OS error as its source. The spawn
+    ///   answers not started only when it has proved that from the process: its initial thread is
+    ///   still suspended, it has no other thread, and the loader has not initialised it. Otherwise
+    ///   it answers [`Error::MayHaveStarted`].
     ///
     /// [`Error::Containment`]: crate::error::Error::Containment
+    /// [`Error::MayHaveStarted`]: crate::error::Error::MayHaveStarted
     Strongest,
     /// The strongest kernel container that sets up, else the next one down, rather than an error.
     /// A cgroup v2 leaf on Linux, a Job Object on Windows and the inherited-fd marker on macOS,
     /// each falling back (to a process group on Linux and macOS, to [`ContainMode::TreeWalk`] on
-    /// Windows) rather than to no containment. A fallback is logged at `warn` (on Windows it is
-    /// not, yet), and [`Child::containment`](crate::Child::containment) reports what the spawn
-    /// got.
+    /// Windows) rather than to no containment. A fallback is logged at `warn`, and
+    /// [`Child::containment`](crate::Child::containment) reports what the spawn got.
     ///
     /// - **Linux:** a failed step of setting up the leaf (no cgroup offered, no `cgroup.kill`, the
     ///   leaf's directory, `cgroup.procs`, report channel or inotify watch), or a child whose
@@ -233,6 +236,8 @@ pub enum ContainMode {
     ///   that spawn fails with [`Error::Containment`], as under `Strongest`, instead of handing
     ///   back a child that never ran.
     /// - **macOS:** a failed install of the fd marker degrades to the process group.
+    /// - **Windows:** a child that cannot be assigned to its Job Object is resumed anyway and
+    ///   contained by [`ContainMode::TreeWalk`].
     ///
     /// [`Error::Containment`]: crate::error::Error::Containment
     BestEffort,
@@ -257,16 +262,20 @@ pub enum ContainMode {
     /// session grouping; it is not a security sandbox.
     ///
     /// On macOS this request installs the fd marker as well, and still degrades to the session
-    /// when that fails. On non-Unix platforms this request is silently treated as `Strongest`.
+    /// when that fails. On Windows this request is treated as `Strongest`, failures included.
     Session,
 }
 
 impl ContainMode {
     /// Whether the mechanism this mode picks is the only one it accepts: a failure to set it up
-    /// fails the spawn, where every other mode degrades to the mechanism below it.
-    #[cfg(unix)]
+    /// fails the spawn, where every other mode degrades to the mechanism below it. `Session` has no
+    /// session on Windows, and is a Job Object there as `Strongest` is.
     pub(crate) fn is_strict(self) -> bool {
-        matches!(self, ContainMode::Strongest)
+        match self {
+            ContainMode::Strongest => true,
+            ContainMode::Session => cfg!(windows),
+            ContainMode::BestEffort | ContainMode::TreeWalk => false,
+        }
     }
 }
 
@@ -402,3 +411,7 @@ mod containment_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "containment/strongest_tests.rs"]
 mod strongest_tests;
+
+#[cfg(all(test, windows))]
+#[path = "containment/strongest_windows_tests.rs"]
+mod strongest_windows_tests;

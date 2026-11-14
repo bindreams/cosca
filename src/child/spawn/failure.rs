@@ -18,13 +18,24 @@ use crate::Unreaped;
 pub(crate) enum SpawnFailure {
     /// The program did not start, and cosca has proved it.
     NotStarted(Error),
-    /// As [`NotStarted`](Self::NotStarted), after the spawn forked a child it held and dealt with:
-    /// `fate` is what became of it.
-    #[cfg(target_os = "linux")]
+    /// As [`NotStarted`](Self::NotStarted), after the spawn created a child it held and dealt with:
+    /// `fate` is what became of it. Linux (a child ended before `exec`) and Windows (a child still
+    /// suspended) produce it.
+    #[cfg_attr(
+        not(any(target_os = "linux", windows)),
+        allow(
+            dead_code,
+            reason = "only the Linux and Windows spawns hold a child they prove never ran"
+        )
+    )]
     NotStartedWithChild {
         /// What failed.
         cause: Error,
         /// What the failed spawn did with the child it held.
+        #[cfg_attr(
+            windows,
+            allow(dead_code, reason = "read by `map`, which no Windows spawn calls, and by tests")
+        )]
         fate: ChildFate,
     },
     /// The program may have started: the child reached `exec` (on Windows, `CreateProcess` or
@@ -63,7 +74,6 @@ impl SpawnFailure {
 
     /// This failure with `detail`, what the spawn did with its child beyond its fate, if there is
     /// any. A failure that says the program did not start has no child to say it of.
-    #[cfg(unix)]
     pub(crate) fn with_detail(self, detail: Option<String>) -> SpawnFailure {
         let Some(detail) = detail else {
             return self;
@@ -135,7 +145,6 @@ impl SpawnFailure {
     pub(crate) fn map(self, f: impl FnOnce(Error) -> Error) -> SpawnFailure {
         match self {
             SpawnFailure::NotStarted(e) => SpawnFailure::NotStarted(f(e)),
-            #[cfg(target_os = "linux")]
             SpawnFailure::NotStartedWithChild { cause, fate } => {
                 SpawnFailure::NotStartedWithChild { cause: f(cause), fate }
             }
@@ -227,7 +236,7 @@ pub(crate) fn failed_after_teardown(cause: Error, behind_front: bool, torn_down:
 /// said in the spawn's warn, which that variant has no place for.
 ///
 /// [`NotStartedWithChild`]: SpawnFailure::NotStartedWithChild
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn failed_attach(
     not_started: bool,
     cause: Error,
@@ -281,7 +290,6 @@ impl SpawnFailure {
                 cause, fate, unreaped, ..
             } => (*cause, fate, unreaped.map(|unreaped| *unreaped)),
             SpawnFailure::NotStarted(e) => panic!("expected `may have started`, got `not started`: {e:?}"),
-            #[cfg(target_os = "linux")]
             SpawnFailure::NotStartedWithChild { cause, .. } => {
                 panic!("expected `may have started`, got `not started`: {cause:?}")
             }
@@ -311,7 +319,6 @@ impl SpawnFailure {
     pub(crate) fn expect_not_started(self) -> Error {
         match self {
             SpawnFailure::NotStarted(e) => e,
-            #[cfg(target_os = "linux")]
             SpawnFailure::NotStartedWithChild { cause, .. } => cause,
             SpawnFailure::MayHaveStarted { cause, fate, .. } => {
                 panic!("expected `not started`, got `may have started` ({fate:?}): {cause:?}")
@@ -385,7 +392,6 @@ impl From<SpawnFailure> for Error {
                 );
                 error
             }
-            #[cfg(target_os = "linux")]
             SpawnFailure::NotStartedWithChild { cause: error, .. } => {
                 debug_assert!(
                     !matches!(error, Error::MayHaveStarted { .. }),

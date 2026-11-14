@@ -81,7 +81,7 @@ use windows::Win32::System::Threading::{
 use crate::child::drop_teardown::Torn;
 use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
-use crate::child::spawn::held_teardown::tear_down_failed_spawn;
+use crate::child::spawn::held_teardown::{tear_down_after_failed_windows_attach, tear_down_failed_spawn};
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::{
     attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
@@ -236,29 +236,14 @@ pub(crate) fn spawn_raw(
         }
     };
     let id_read = id.as_ref().ok().copied();
+    #[cfg(test)]
+    crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach, pid);
     let attachment = match attach_or_fault(id, raw_handle, prepared) {
         Ok(v) => v,
-        Err(crate::containment::dispatch::AttachFailure {
-            cause: e,
-            cleanup: attach_cleanup,
-            ..
-        }) => {
-            let Torn {
-                fate,
-                unreaped,
-                cleanup,
-            } = tear_down_failed_spawn(
-                owned,
-                id_read,
-                Past::Clean,
-                Disposition::HandBack,
-                policy,
-                &mut Diagnosis::default(),
-            );
-            // What failed in the attach's own cleanup comes first: it happened before the teardown.
-            return Err(SpawnFailure::started(e, fate, unreaped)
-                .with_cleanup(attach_cleanup)
-                .with_cleanup(cleanup));
+        Err(failure) => {
+            return Err(tear_down_after_failed_windows_attach(
+                owned, id_read, failure, policy, &mut why,
+            ));
         }
     };
 
