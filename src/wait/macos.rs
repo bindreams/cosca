@@ -6,9 +6,9 @@
 mod await_reapable;
 #[path = "macos/tracer_watch.rs"]
 mod tracer_watch;
-#[cfg(test)]
-pub(crate) use await_reapable::await_reapable_on;
 pub(crate) use await_reapable::{await_reapable, drain_exit_events, register_exit_events, Waited};
+#[cfg(test)]
+pub(crate) use await_reapable::{await_reapable_on, reap_registration};
 #[cfg(test)]
 pub(crate) use tracer_watch::seams as tracer_seams;
 pub(crate) use tracer_watch::{OnTracer, TracerWatch};

@@ -282,28 +282,19 @@ impl ExitWatch {
         self
     }
 
-    /// Arm `NOTE_EXIT` for `pid`. A pid that is already gone is a watch that reads as exited.
-    pub(crate) fn proc_exit(kernel: &dyn Kernel, pid: u32) -> Result<Self, Error> {
-        let kq = Kqueue::new()?;
-        let exit = Subscription::Process {
+    /// What [`ExitWatch::proc_exit`] registers: the exit of `pid` and nothing else.
+    pub(crate) fn registration(pid: u32) -> Subscription {
+        Subscription::Process {
             pid,
             signals: false,
             reap: false,
-        };
-        #[cfg(test)]
-        if kqueue::test_hooks::take_forced_registration(kqueue::test_hooks::Registration::SilentExitWatch) {
-            return Ok(Self::new(kq));
         }
-        #[cfg(test)]
-        let forced = kqueue::test_hooks::take_forced_registration(kqueue::test_hooks::Registration::ExitWatch);
-        #[cfg(not(test))]
-        let forced = false;
-        let subscribed = if forced {
-            Err(io::Error::from_raw_os_error(libc::ESRCH))
-        } else {
-            kernel.subscribe(&kq, exit)
-        };
-        match subscribed {
+    }
+
+    /// Arm `NOTE_EXIT` for `pid`. A pid that is already gone is a watch that reads as exited.
+    pub(crate) fn proc_exit(kernel: &dyn Kernel, pid: u32) -> Result<Self, Error> {
+        let kq = Kqueue::new()?;
+        match kernel.subscribe(&kq, Self::registration(pid)) {
             Ok(()) => Ok(Self::new(kq)),
             Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => Ok(Self::new(kq).exited_now()),
             Err(e) => Err(Error::Io(e)),

@@ -186,6 +186,12 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
+    /// The next registration `what` is refused with `errno` (a pid past `P_REF_DEAD` answers `ESRCH`).
+    pub(crate) fn on_subscribe_refused(mut self, what: Subscription, errno: i32) -> Self {
+        self.subscribes.push(what, Err(errno));
+        self
+    }
+
     /// How many `kinfo_proc` reads of `pid` the kernel has been asked for.
     pub(crate) fn kinfo_reads(&self, pid: RawPid) -> usize {
         let counts = self.kinfo_reads.lock().expect("no panic holds the counts");
