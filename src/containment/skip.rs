@@ -161,7 +161,7 @@ pub(crate) use call::SkipCall;
 #[cfg(unix)]
 mod call {
     use super::{Skip, Why};
-    use crate::containment::dispatch::{Retry, Settled, TreeKillOutcome, TreeSignal, Unkilled};
+    use crate::containment::dispatch::{Settled, TreeKillOutcome, TreeSignal, Unkilled};
     use crate::containment::root::Refusal;
     use crate::containment::Tree;
     use crate::error::Error;
@@ -206,11 +206,9 @@ mod call {
                 } => {
                     let error = self.untrusted(&action, &why, cause, holders);
                     return match self.signal {
-                        TreeSignal::Kill => tree.settle_for_kill_tree(
-                            TreeKillOutcome::Ran(Err(Unkilled::from(error))),
-                            false,
-                            Retry::Follows,
-                        ),
+                        TreeSignal::Kill => {
+                            tree.settle_for_kill_tree(TreeKillOutcome::Ran(Err(Unkilled::from(error))), false)
+                        }
                         TreeSignal::Term => Settled::of(Err(error)),
                     };
                 }
@@ -228,9 +226,7 @@ mod call {
                     refusal = crate::error::Report(refusal)
                 );
                 return match self.signal {
-                    TreeSignal::Kill => {
-                        tree.settle_for_kill_tree(TreeKillOutcome::Skipped(skip), false, Retry::Follows)
-                    }
+                    TreeSignal::Kill => tree.settle_for_kill_tree(TreeKillOutcome::Skipped(skip), false),
                     TreeSignal::Term => Settled::of(skip.holders.take().unwrap_or(Ok(()))),
                 };
             }
@@ -270,7 +266,7 @@ mod call {
             let mut killed_again = Vec::new();
             let holders = match self.signal {
                 TreeSignal::Kill => {
-                    let settled = tree.settle_for_kill_tree(TreeKillOutcome::Skipped(skip), false, Retry::Follows);
+                    let settled = tree.settle_for_kill_tree(TreeKillOutcome::Skipped(skip), false);
                     killed_again = settled.killed_again;
                     let settled = settled.answer;
                     debug_assert!(
@@ -362,7 +358,7 @@ mod call {
             let Settled {
                 answer: settled,
                 killed_again,
-            } = tree.settle_for_kill_tree(kill, false, Retry::Follows);
+            } = tree.settle_for_kill_tree(kill, false);
             // The warn says each failure in full; the returned `Unassessable` says only that it
             // failed, for the failure is a peer of the answer.
             let sent = |with_errors: bool| {

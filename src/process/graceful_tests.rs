@@ -169,7 +169,7 @@ fn foreign_graceful_shutdown_tree_kills_a_member_that_ignores_the_sigterm_after_
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }
 
-// A foreign process has no retry that a held member could wait for: when the root has exited and the
+// Every sweep kills the held members by identity: when the root has exited and the
 // sweep's walk cannot be made (the process table cannot be listed), the members the call's own
 // `SIGTERM` walk held are killed by identity all the same. The call is an error, and nothing is left
 // running.
@@ -200,7 +200,7 @@ fn foreign_graceful_sweep_whose_walk_is_not_made_kills_the_members_its_sigterm_w
     tree.child.wait().expect("reap the root");
 }
 
-// A foreign process keeps no members for a retry, so a sweep whose walk cannot be made over a root that
+// A sweep whose walk cannot be made over a root that
 // outlives the grace kills the member its `SIGTERM` walk held, which the root's child's exit reparented
 // out of the root's walk, by identity. The root is left running, and the answer is the walk's own
 // `Unassessable`: a retry walks from that root.

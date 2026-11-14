@@ -8,7 +8,7 @@ use crate::child::spawn::policy::SpawnPolicy;
 use crate::command::Command;
 #[cfg(unix)]
 use crate::containment::dispatch::TreeSignal;
-use crate::containment::dispatch::{Retry, SweepFailure, Swept, TeardownCaller, TreeKillOutcome};
+use crate::containment::dispatch::{SweepFailure, Swept, TeardownCaller, TreeKillOutcome};
 use crate::containment::treewalk::WalkToken;
 use crate::containment::{Containment, TerminateOutcome};
 use crate::error::Error;
@@ -550,15 +550,16 @@ impl Child {
     ///   backstop's failure and the walk's, the backstop first. A backstop that fails after a walk that
     ///   left nothing is a `MembersLeft` of the root alone. A walk that could not be made is its
     ///   [`Error::Unassessable`] (or `Unsupported`) alone: no backstop runs, so the root has no
-    ///   `MemberNotKilled` peer.
+    ///   `MemberNotKilled` peer. The members the handle holds are killed by identity all the same.
     /// - Any other mechanism keeps its own error and its variant, with the root's `MemberNotKilled` as
     ///   its peer, below it after its own cause. A kill that left nothing is an [`Error::Containment`]
     ///   over the root's `MemberNotKilled`.
     ///
     /// On the `TreeWalk` mechanism, an [`Error::Unassessable`] (or `Unsupported`) means the
     /// process table could not be read or trusted, so the descendants could not be found: NOTHING
-    /// was killed, the root included, and a retry can work. (`Drop` cannot retry, so it still
-    /// kills the root and the members the handle holds, and logs that descendants may be orphaned.)
+    /// was killed, the root included, and a retry can work. The members the handle holds are the
+    /// exception: they are killed by identity, as in every sweep. (`Drop` cannot retry, so it still
+    /// kills the root, and logs that its other descendants may be orphaned.)
     /// A root whose exit is visible (reaped, a zombie, or no longer holding its pid) is
     /// `Unassessable` too: its children were
     /// reparented at its exit, so a walk from its pid finds none and `Ok` would say nothing of the
@@ -573,9 +574,9 @@ impl Child {
     /// [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) `SIGTERM` walk reached: a later
     /// `kill_tree`, or the
     /// drop, kills those whose identity was read again, and reports the others again. That holds
-    /// whatever the later walk finds, a root that is gone included, except for a walk that cannot be
-    /// made: that `kill_tree` kills none of them, as it kills nothing, and keeps them for the retry,
-    /// which walks from the root. The drop, which cannot retry, kills them by identity. Once those
+    /// whatever the later walk finds, a root that is gone included, and whether the walk was made at
+    /// all: a walk that cannot be made kills nothing of its own (the root stays for a retry's walk of
+    /// what is still under it), and the members held are killed by identity like any sweep's. Once those
     /// members are gone, a gone root is `Unassessable` on every later call, saying the members an earlier kill left are
     /// gone and the tree could not be walked: the tree cannot be vouched for again. A walk that left
     /// only the root is `Ok` once the handle backstop killed it, but the walk saw the root running
@@ -752,7 +753,7 @@ impl Child {
             // An answer that needs no kill ends the call: no backstop.
             answered @ TreeKillOutcome::Answered(_) => {
                 drop(held);
-                let settled = self.tree.settle_for_kill_tree(answered, false, Retry::Follows);
+                let settled = self.tree.settle_for_kill_tree(answered, false);
                 wait.reaching(settled.killed_again);
                 return Swept::new(op, settled.answer.map_err(SweepFailure::from), wait);
             }
@@ -781,11 +782,13 @@ impl Child {
                 other
             }
         };
-        // A walk not made is answered by the settlement, which keeps what it holds, and no backstop
-        // runs: it would end a root that the retry walks from.
+        // A walk not made runs no backstop: it would end a root that a retry walks from. The settlement
+        // kills the members it holds all the same, which a retry's walk never reaches, and answers the
+        // walk's error.
         let group_result = match group_result {
             unwalked @ TreeKillOutcome::Unwalked(_) => {
-                let settled = self.tree.settle_for_kill_tree(unwalked, false, Retry::Follows);
+                let settled = self.tree.settle_for_kill_tree(unwalked, false);
+                wait.reaching(settled.killed_again);
                 return Swept::new(op, settled.answer.map_err(SweepFailure::from), wait);
             }
             walked => walked,
@@ -795,7 +798,7 @@ impl Child {
         // left alone. An exited front needs no backstop.
         #[cfg(unix)]
         if let Some(in_cgroup) = front {
-            let settled = self.tree.settle_for_kill_tree(group_result, false, Retry::Follows);
+            let settled = self.tree.settle_for_kill_tree(group_result, false);
             let answer = match (settled.answer, in_cgroup) {
                 (Ok(()), Some(front)) => self.cgroup_kill_reached(front),
                 (Err(left), Some(front)) => Err(crate::elevation::front::cgroup_kill_failed(front, self.pid(), left)),

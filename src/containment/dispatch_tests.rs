@@ -215,7 +215,6 @@ fn a_kill_that_left_several_members_warns_of_none_of_them_by_itself() {
                 resolved: Vec::new(),
             })),
             false,
-            super::Retry::Follows,
         )
         .answer
         .expect_err("members were left");
@@ -1415,63 +1414,61 @@ fn a_gone_root_over_a_marked_tree_still_answers_a_held_member() {
     ));
 }
 
-/// The one rule of an unwalked sweep: a walk not made, when a retry follows, is the walk's own
-/// `Unassessable`; every other outcome, a walk not made with no retry included, is handed back.
+/// A `Child`'s `kill_tree` whose walk was not made answers the walk's own `Unassessable`, does not kill
+/// the root through its handle (its own retry walks from it), and settles the tree all the same: the
+/// held member the root's exit reparented, which no walk reaches, is killed by identity and waited for.
+/// The fake mechanism kills nothing and states that it killed the member again, so the row reads the
+/// wait the sweep made of it; the kill itself is the settlement's
+/// (`a_settlement_of_a_walk_not_made_kills_the_held_members`).
 ///
-/// Mutants: a walk not made is handed back with a retry to follow, or answered with none; an outcome
-/// of a walk made is answered.
-#[skuld::test]
-fn only_a_walk_not_made_that_a_retry_follows_is_answered_with_its_own_error() {
-    use super::{Retry, TreeKillOutcome};
-    use crate::error::Error;
-    for retry in [Retry::Follows, Retry::Never] {
-        assert!(
-            matches!(
-                TreeKillOutcome::Ran(Ok(())).unless_unwalked(retry),
-                Ok(TreeKillOutcome::Ran(Ok(())))
-            ),
-            "{retry:?}: a walk made is the settlement's"
-        );
-    }
-    assert!(
-        matches!(
-            unwalked().unless_unwalked(Retry::Never),
-            Ok(TreeKillOutcome::Unwalked(_))
-        ),
-        "no retry reaches what the root's exit reparented, so the settlement kills the held members"
-    );
-    let Err(error) = unwalked().unless_unwalked(Retry::Follows) else {
-        panic!("a retry walks from the root");
-    };
-    assert!(matches!(error, Error::Unassessable { .. }), "{error:?}");
-}
-
-/// A `Child`'s `kill_tree` whose walk was not made answers the walk's own `Unassessable` and does not
-/// kill the root through its handle, whether the handle sees the root running or exited: a `Child`'s
-/// settlement outlives the call, so a retry walks from the root, and the drop settles what it holds.
+/// The "exited" root is shown to the handle on Linux; on macOS the sweep reads a peek, and the fake
+/// answers `Running` there, so only the running root is covered.
 ///
 /// Mutants: the sweep runs the root's backstop over an unwalked walk; it answers that walk with another
-/// error.
+/// error; it leaves the held member unsettled, so nothing is waited for.
 #[cfg(unix)]
 #[skuld::test]
-fn a_child_kill_tree_over_an_unwalked_walk_answers_it_and_leaves_the_root_alone() {
+fn a_child_kill_tree_over_an_unwalked_walk_settles_the_held_member_and_leaves_the_root_alone() {
     use crate::containment::fake::FakeContains;
+    use crate::containment::treewalk::Listing;
     use crate::containment::Containment;
     use crate::error::Error;
     use crate::os_process::fake::Answer;
-    use crate::test_child::over_fake::{child_with, root_looking};
-    for (root_looks, looks) in [("running", Answer::Running), ("exited", Answer::Exited)] {
+    use crate::test_child::over_fake::{child_with, live_member, root_looking};
+    let looks = [
+        ("running", Answer::Running),
+        #[cfg(not(target_os = "macos"))]
+        ("exited", Answer::Exited),
+    ];
+    for (root_looks, looks) in looks {
+        let (member, stdin, id) = live_member();
         let (fake, _) = FakeContains::new(Containment::TreeWalk, false);
         let root = root_looking([looks; 4]);
-        let child = child_with(&root, fake.unwalked());
+        let child = child_with(&root, fake.unwalked().killing_again([id]));
+        child.tree.hold_walked(
+            Listing {
+                members: vec![id],
+                complete: true,
+            },
+            None,
+        );
 
-        let error = child.kill_tree().expect_err("the walk was not made");
+        let swept = child.kill_tree_after("kill_tree", None, None);
 
-        assert!(matches!(error, Error::Unassessable { .. }), "{error:?}");
+        let failure = swept.answer.as_ref().expect_err("the walk was not made");
+        assert!(
+            matches!(failure.error, Error::Unassessable { .. }),
+            "{:?}",
+            failure.error
+        );
+        assert_eq!(swept.wait.members_for_test(), [id], "the held member is waited for");
         assert!(
             root.signal_calls().is_empty(),
             "a root that looks {root_looks} is not killed"
         );
+        // Released after the checks: the fake kills nothing, so only the end of the member's stdin ends it.
+        drop((swept, stdin));
+        member.wait().expect("reap the member");
     }
 }
 
@@ -1598,15 +1595,15 @@ fn members_a_cooperative_walk_reached_are_killed_by_identity_when_the_root_is_go
 }
 
 /// A settlement of a walk that could not be made kills the held members, a `SIGTERM` walk's and a
-/// refused kill's, by identity, and answers the walk's own `Unassessable`, when no retry follows: a
-/// drop settles so, and a `kill_tree` call that states none (a foreign `Process`'s). With a retry to
-/// follow, a `kill_tree` settles nothing and keeps them (the row after).
+/// refused kill's, by identity, and answers the walk's own `Unassessable`, for every caller: a drop's
+/// settlement and a `kill_tree` call's. The root's exit reparented the members, so no retry's walk
+/// reaches them.
 ///
 /// Mutants: an unmade walk leaves held members running (`Termed` or `Resolved`); it answers none of
 /// the walk's error.
 #[skuld::test]
-fn a_settlement_that_no_retry_follows_kills_the_held_members_of_a_walk_not_made() {
-    use super::{Retry, TreeKillOutcome, TreeKilled, Unkilled};
+fn a_settlement_of_a_walk_not_made_kills_the_held_members() {
+    use super::{TreeKillOutcome, TreeKilled, Unkilled};
     use crate::error::Error;
     for by_kill_tree in [false, true] {
         let (termed, termed_stdin) = crate::test_child::held_uncontained_blocker(false);
@@ -1631,7 +1628,7 @@ fn a_settlement_that_no_retry_follows_kills_the_held_members_of_a_walk_not_made(
         assert_eq!(standing(&killed), held);
 
         let (error, killed_again) = if by_kill_tree {
-            let settled = killed.settle_for_kill_tree(Some(&walker()), unwalked(), false, Retry::Never);
+            let settled = killed.settle_for_kill_tree(Some(&walker()), unwalked(), false);
             (settled.answer.expect_err("a walk not made"), settled.killed_again)
         } else {
             let settled = killed.settle(Some(&walker()), unwalked(), false);
@@ -1646,37 +1643,6 @@ fn a_settlement_that_no_retry_follows_kills_the_held_members_of_a_walk_not_made(
         crate::test_child::assert_killed("the termed member", termed.wait().expect("reap the member"));
         crate::test_child::assert_killed("the refused member", refused.wait().expect("reap the member"));
     }
-}
-
-/// A `kill_tree` settlement of a walk not made, with a retry to follow, answers the walk's
-/// `Unassessable` and kills nothing: the held member stays alive, and the walked `kill_tree` that
-/// follows kills it by identity.
-///
-/// Mutants: the unmade walk kills the held member; the walked kill after it does not.
-#[skuld::test]
-fn a_kill_tree_settlement_of_a_walk_not_made_that_a_retry_follows_keeps_the_member_for_the_retry() {
-    use super::{Retry, TreeKillOutcome, TreeKilled};
-    use crate::error::Error;
-    use crate::identity::Liveness;
-    let (termed, termed_stdin) = crate::test_child::held_uncontained_blocker(false);
-    let termed_id = termed.id().expect(crate::test_child::IDENTITY_READ);
-    let killed = TreeKilled::default();
-    killed.hold(vec![termed_id], true, None);
-
-    let unmade = killed.settle_for_kill_tree(Some(&walker()), unwalked(), false, Retry::Follows);
-
-    let error = unmade.answer.expect_err("a walk not made");
-    assert!(matches!(error, Error::Unassessable { .. }), "{error:?}");
-    assert_eq!(unmade.killed_again, vec![]);
-    assert_eq!(termed_id.is_alive(), Liveness::Alive, "the settlement kills nothing");
-
-    let retried = killed.settle_for_kill_tree(Some(&walker()), TreeKillOutcome::Ran(Ok(())), true, Retry::Follows);
-
-    assert_eq!(retried.killed_again, vec![termed_id]);
-    // Released after the kill: a member the retry left alive would exit on EOF, with a status that
-    // `assert_killed` refuses.
-    drop(termed_stdin);
-    crate::test_child::assert_killed("the held member", termed.wait().expect("reap the member"));
 }
 
 /// A call whose own complete `SIGTERM` walk reached the held members stands on it when the root has
@@ -2543,37 +2509,6 @@ fn a_backstop_failure_after_a_clean_walk_is_a_members_left_of_the_root_alone() {
         "{error:?}"
     );
     assert_eq!(crate::error::first_os_code(&error), Some(CODES[1]));
-}
-
-/// A walk that could not be made, and a backstop that failed too: the walk's `Unassessable` keeps its
-/// variant, with the root as a `MemberNotKilled` below it after its own cause.
-#[skuld::test]
-fn a_walk_not_made_and_a_failed_backstop_keep_the_walks_variant_with_the_root_below_it() {
-    use super::TreeKillOutcome;
-    use crate::error::Error;
-    let [a, b, _] = CODES;
-    let error = swept(
-        TreeKillOutcome::Unwalked(Error::Unassessable {
-            detail: "the table could not be read".into(),
-            source: Some(Error::io_cause(std::io::Error::from_raw_os_error(a))),
-        }),
-        Err(io_error(b)),
-    );
-
-    let Error::Unassessable {
-        source: Some(source), ..
-    } = &error
-    else {
-        panic!("{error:?}");
-    };
-    let Error::Several(list) = &**source else {
-        panic!("expected Several, got {source:?}");
-    };
-    assert_eq!(crate::error::first_os_code(&**list.first()), Some(a));
-    assert!(matches!(
-        &**list.iter().nth(1).expect("the root"),
-        Error::MemberNotKilled { pid: 1, .. }
-    ));
 }
 
 /// With the root ended by the backstop, the answer is what the walk left, as it was.

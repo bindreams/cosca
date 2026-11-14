@@ -704,9 +704,10 @@ pub(crate) enum TreeKillOutcome {
     )]
     Answered(Result<(), Unkilled>),
     /// A `TreeWalk` walk could not be made (the snapshot could not be taken, or the root exists but
-    /// could not be queried), so NOTHING was killed, the root included: killing the root anyway would
-    /// reparent its descendants out of the ppid walk, so a retry could no longer find them. The
-    /// error says why. Every other failure is a kill that was attempted, a `TreeWalk`'s
+    /// could not be queried), so the walk killed NOTHING, the root included: killing the root anyway
+    /// would reparent its descendants out of the ppid walk, so a retry could no longer find them. The
+    /// error says why. The settlement still kills the members the tree holds, which no walk reaches.
+    /// Every other failure is a kill that was attempted, a `TreeWalk`'s
     /// [`Error::MemberNotKilled`] included.
     Unwalked(Error),
     /// A `TreeWalk` walk found its root gone, or holding its pid no longer, or (Unix) exited and not
@@ -727,20 +728,6 @@ pub(crate) enum TreeKillOutcome {
     Skipped(Skip),
 }
 
-/// Whether a settlement is settled again after a `kill_tree`-shaped call: a fact of the caller, which
-/// decides what a walk that was not made leaves ([`TreeKillOutcome::unless_unwalked`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Retry {
-    /// The settlement outlives the call: a `Child`'s handle, which a later `kill_tree` or the drop
-    /// settles again, walking from a root that still runs. A walk not made keeps the members the
-    /// settlement holds and kills nothing, the root included.
-    Follows,
-    /// The settlement ends with the call (a foreign `Process`'s graceful sweep), or no call follows it
-    /// (the drop). A walk not made kills the members the settlement holds by identity: nothing else
-    /// reaches the members the root's exit or a dying parent reparented out of its walk.
-    Never,
-}
-
 /// A kill that ran: what [`Tree::kill`] and the paths that send by hand return.
 impl From<Result<(), Unkilled>> for TreeKillOutcome {
     fn from(result: Result<(), Unkilled>) -> TreeKillOutcome {
@@ -755,16 +742,6 @@ impl TreeKillOutcome {
         match self {
             TreeKillOutcome::NoRoot(pid, _) => TreeKillOutcome::NoRoot(pid, call.cloned()),
             other => other,
-        }
-    }
-
-    /// The one decision of a walk that was not made ([`Unwalked`](Self::Unwalked)): when a `retry`
-    /// follows, its own error, which settles nothing; every other outcome handed back to be settled,
-    /// an unwalked one with no retry included.
-    pub(crate) fn unless_unwalked(self, retry: Retry) -> Result<TreeKillOutcome, Error> {
-        match (self, retry) {
-            (TreeKillOutcome::Unwalked(error), Retry::Follows) => Err(error),
-            (other, _) => Ok(other),
         }
     }
 
@@ -895,6 +872,7 @@ pub(crate) struct Settled<A = Result<SettleOutcome, Error>> {
 
 impl<A> Settled<A> {
     /// An answer that killed nothing again.
+    #[cfg(unix)]
     pub(crate) fn of(answer: A) -> Settled<A> {
         Settled {
             answer,
@@ -1009,8 +987,7 @@ impl SweepFailure {
         root: u32,
         root_ended: bool,
     ) -> Settled<Result<(), SweepFailure>> {
-        // A `Child`'s sweep: its settlement outlives the call.
-        tree.settle_for_kill_tree(walk, root_ended, Retry::Follows).map(|walk| {
+        tree.settle_for_kill_tree(walk, root_ended).map(|walk| {
             let error = match (walk, backstop) {
                 (Ok(()), Ok(())) => return Ok(()),
                 (Err(walk), Ok(())) => walk,
@@ -1066,11 +1043,15 @@ impl TreeKilled {
     /// an unvouched one (held members that are all gone, or left so earlier) it is
     /// [`TreeKillOutcome::no_root_after_kills_error`].
     ///
-    /// `kill_tree` reads `root_ended` from its backstop, which it runs for every outcome but a walk
-    /// not made that a retry follows ([`settle_for_kill_tree`](Self::settle_for_kill_tree) answers
-    /// that one, and no backstop runs); a drop or a failed spawn's cleanup reads it from the fate of
-    /// the root kill it made after the walk. A walk not made reaches `settle` only where no retry
-    /// follows, and the held members are killed by identity like any other outcome's.
+    /// A `Child`'s `kill_tree` reads `root_ended` from its backstop. The backstop does not run for
+    /// an [`Answered`](TreeKillOutcome::Answered) or [`Skipped`](TreeKillOutcome::Skipped) outcome
+    /// (the sweep's own sends decide the root), for a tree held by a cgroup front, for a macOS root
+    /// launchd holds, or for a walk not made ([`Unwalked`](TreeKillOutcome::Unwalked)): ending the
+    /// root would strand its descendants beyond a retry's walk, so the root stays. A foreign
+    /// `Process`'s sweep has no backstop, and a drop or a failed spawn's cleanup reads `root_ended`
+    /// from the fate of the root kill it made after the walk. Whichever the caller and whether the
+    /// walk was made, the held members are killed by identity: the root's exit reparented them out of
+    /// every later walk, so only their identities reach them.
     ///
     /// A gone root whose outcome names a call ([`TreeKillOutcome::in_call`]) is that call's sweep, and
     /// it may stand on the call's own `SIGTERM` walk, which was a kill's walk before the root exited:
@@ -1162,23 +1143,14 @@ impl TreeKilled {
 
     /// [`settle`](Self::settle) for a `kill_tree` call: the error holds every member left, so the call
     /// reports each of them once, in it.
-    ///
-    /// When a `retry` follows, a walk not made ([`unless_unwalked`](TreeKillOutcome::unless_unwalked))
-    /// is answered with its own error and settles nothing: the state and the members it holds stay for
-    /// the retry, which walks from the root.
     pub(crate) fn settle_for_kill_tree(
         &self,
         mechanism: Option<&Mechanism>,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
-        retry: Retry,
     ) -> Settled<Result<(), Error>> {
-        match outcome.into().unless_unwalked(retry) {
-            Ok(outcome) => self
-                .settle(mechanism, outcome, root_ended)
-                .map(|answer| answer.map(drop)),
-            Err(error) => Settled::of(Err(error)),
-        }
+        self.settle(mechanism, outcome, root_ended)
+            .map(|answer| answer.map(drop))
     }
 
     /// [`settle`](Self::settle) for a drop: what is left when the tree is not settled, the text of the
@@ -1193,7 +1165,10 @@ impl TreeKilled {
         let outcome = outcome.into();
         let after = match &outcome {
             // A drop cannot retry a walk that was not made.
-            TreeKillOutcome::Unwalked(_) => "; the root is killed regardless, so its descendants may be orphaned",
+            TreeKillOutcome::Unwalked(_) => {
+                "; any members this handle held were killed by identity, and the root is killed regardless, so its \
+                 other descendants may be orphaned"
+            }
             TreeKillOutcome::Ran(_)
             | TreeKillOutcome::Answered(_)
             | TreeKillOutcome::NoRoot(..)
