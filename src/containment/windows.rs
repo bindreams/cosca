@@ -1492,8 +1492,9 @@ impl Watch {
     fn wait(&self, deadline: Option<std::time::Instant>) -> Result<Ended, crate::error::Error> {
         self.ended(crate::wait::wait_until(deadline, |ms| {
             #[cfg(test)]
-            crate::wait::block_probe::record_blocking(
+            crate::wait::block_probe::blocking(
                 (ms != u32::MAX).then(|| std::time::Duration::from_millis(ms.into())),
+                crate::wait::block_probe::WaitObject::Handles,
             );
             self.wait_for(ms)
         }))

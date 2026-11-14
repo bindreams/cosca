@@ -265,12 +265,17 @@ fn a_spurious_wake_re_arms_a_deadline_waiter_with_less_time() {
         let child = Arc::clone(&child);
         move || {
             let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
-            let _first = crate::wait::block_probe::on_condvar_block(move || {
-                _ = blocked_tx.send(());
-                // The second round's hook arms from inside the first, under the lock. Forgotten:
-                // the guard would disarm the hook when this closure returns.
-                let second = crate::wait::block_probe::on_condvar_block(move || _ = again_tx.send(()));
-                std::mem::forget(second);
+            // The second round's hook arms from inside the first, under the lock, and its guard
+            // stays in the first hook's captures: it disarms with the first.
+            let mut second = None;
+            let _first = crate::wait::block_probe::on_each_block(move |block| {
+                if matches!(block.on, crate::wait::block_probe::WaitObject::Condvar) && second.is_none() {
+                    _ = blocked_tx.send(());
+                    let again_tx = again_tx.clone();
+                    second = Some(crate::wait::block_probe::on_condvar_block(move || {
+                        _ = again_tx.send(());
+                    }));
+                }
             });
             crate::wait::block_probe::take();
             let got = child.wait(Some(at + Duration::from_secs(3600)));

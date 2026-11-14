@@ -283,7 +283,7 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
         let exited = Rc::clone(&exited);
         move || Ok(if exited.get() { LAUNCHD } else { tracer_pid })
     });
-    let _end = crate::wait::block_probe::on_round(0, move || {
+    let _end = crate::wait::block_probe::on_blocking(move || {
         drop(tracer_stdin);
         crate::test_child::wait_until_zombie(tracer_pid);
         exited.set(true);
@@ -305,9 +305,17 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
 /// whose hook answers `false` gets a `SIGCHLD` to this process, which the wait also watches: the
 /// wake that ends a round the test stages no wake for. A wake the hook stages itself is not checked
 /// here: a wait that misses it blocks until nextest's `slow-timeout`.
-pub(super) fn on_rounds(mut hook: impl FnMut(u32) -> bool + 'static) -> crate::wait::block_probe::Rounds {
-    crate::wait::block_probe::on_every_round(move |round| {
-        if !hook(round) {
+pub(super) fn on_rounds(mut hook: impl FnMut(u32) -> bool + 'static) -> crate::wait::block_probe::Armed {
+    use crate::wait::block_probe::WaitObject;
+
+    let mut round = 0;
+    crate::wait::block_probe::on_each_block(move |block| {
+        // A round is a block on a descriptor: another waiter's `Condvar` block is none.
+        if matches!(block.on, WaitObject::Condvar) {
+            return;
+        }
+        round += 1;
+        if !hook(round - 1) {
             test_hooks::send_signal(std::process::id(), libc::SIGCHLD);
         }
     })

@@ -291,7 +291,10 @@ fn block(wait_for: &WaitFor<'_>, deadline: Option<Instant>) -> Result<bool, Erro
             let handle = HANDLE(process.as_raw_handle());
             let waited = crate::wait::wait_until(deadline, |ms| {
                 #[cfg(test)]
-                crate::wait::block_probe::record_blocking((ms != u32::MAX).then(|| Duration::from_millis(ms.into())));
+                crate::wait::block_probe::blocking(
+                    (ms != u32::MAX).then(|| Duration::from_millis(ms.into())),
+                    crate::wait::block_probe::WaitObject::Handles,
+                );
                 // SAFETY: `handle` is borrowed from `wait_for`, which outlives the call.
                 unsafe { WaitForSingleObject(handle, ms) }
             });

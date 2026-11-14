@@ -629,7 +629,7 @@ impl CgroupLeaf {
                     deadline: None,
                 } => {
                     #[cfg(test)]
-                    crate::wait::block_probe::record_blocking(None);
+                    crate::wait::block_probe::blocking(None, crate::wait::block_probe::WaitObject::Listener);
                     listener.wait();
                     #[cfg(test)]
                     fault::notify_wait_site_park(fault::WaitSitePark {
@@ -645,9 +645,10 @@ impl CgroupLeaf {
                     #[cfg(test)]
                     check.round();
                     #[cfg(test)]
-                    crate::wait::block_probe::record_blocking(Some(
-                        at.saturating_duration_since(std::time::Instant::now()),
-                    ));
+                    crate::wait::block_probe::blocking(
+                        Some(at.saturating_duration_since(std::time::Instant::now())),
+                        crate::wait::block_probe::WaitObject::Listener,
+                    );
                     #[cfg(test)]
                     let call_start = std::time::Instant::now();
                     #[cfg_attr(
