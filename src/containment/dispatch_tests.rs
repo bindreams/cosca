@@ -834,7 +834,7 @@ fn standing_of(state: &super::TreeState) -> Standing {
 /// Mutants: a fact that walked nothing vouches; a member seen running leaves a state as it was
 /// (`Never` included: it means only that nothing has settled the tree); held members outlive their
 /// own end; an unvouched tree keeps its kind over a newer fact (a root seen running over
-/// `HeldMembersGone`); a kind changes without a fact (a skipped kill, a gone root or a walk not made
+/// `HeldMembersGone` or `Earlier`, with members left or none); a kind changes without a fact (a skipped kill, a gone root or a walk not made
 /// over a stored kind); members left or gone over an unvouched tree lose its kind; a killed tree
 /// stays vouched over members seen running.
 #[skuld::test]
@@ -890,8 +890,8 @@ fn next_is_the_one_transition_of_state_and_facts() {
             [left_8(), left_8(), left_8(), on(UnvouchedKind::HeldMembersGone), on(UnvouchedKind::RootSeenRunning),
              on(UnvouchedKind::Earlier), on(UnvouchedKind::Earlier)]),
         ("walk, member 8 left and the root seen running", true, vec![unread(8)], true, true,
-            [left_8(), left_8(), left_8(), on(UnvouchedKind::HeldMembersGone), on(UnvouchedKind::RootSeenRunning),
-             on(UnvouchedKind::Earlier), on(UnvouchedKind::Earlier)]),
+            [left_8(), left_8(), left_8(), on(UnvouchedKind::RootSeenRunning), on(UnvouchedKind::RootSeenRunning),
+             on(UnvouchedKind::RootSeenRunning), on(UnvouchedKind::RootSeenRunning)]),
         ("no walk, member 8 left", false, vec![unread(8)], true, false,
             [left_8(), left_8(), left_8(), on(UnvouchedKind::HeldMembersGone), on(UnvouchedKind::RootSeenRunning),
              on(UnvouchedKind::Earlier), on(UnvouchedKind::Earlier)]),
@@ -1663,12 +1663,12 @@ fn a_gone_roots_error_names_the_pid_and_says_what_is_true_on_the_platform() {
 /// for an unvouched tree.
 #[skuld::test]
 fn a_walk_on_an_unvouched_tree_holds_its_members_and_keeps_the_kind() {
-    use super::{TreeKillOutcome, TreeKilled, UnvouchedKind, Vouching};
+    use super::{TreeKillOutcome, TreeKilled, UnvouchedKind};
     use crate::containment::treewalk::WalkToken;
     let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
     let id = blocker.id().expect(crate::test_child::IDENTITY_READ);
     let killed = TreeKilled::default();
-    *killed.lock() = super::TreeState::new(Vouching::Unvouched(UnvouchedKind::RootSeenRunning), Vec::new());
+    killed.leave_unvouched_for_test(UnvouchedKind::RootSeenRunning);
     let call = WalkToken::new();
 
     let walk = killed.hold(vec![id], true, Some(&call));
@@ -1748,12 +1748,12 @@ fn a_walk_that_finds_members_on_a_killed_tree_unvouches_it_until_its_own_complet
 fn a_held_member_that_refuses_its_kill_and_then_exits_leaves_the_unvouched_kind_as_it_was(
     #[fixture(setuid)] _group: &crate::test_groups::Group,
 ) {
-    use super::{TreeKillOutcome, TreeKilled, UnvouchedKind, Vouching};
+    use super::{TreeKillOutcome, TreeKilled, UnvouchedKind};
     use crate::containment::treewalk::WalkToken;
     let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let killed = TreeKilled::default();
-    *killed.lock() = super::TreeState::new(Vouching::Unvouched(UnvouchedKind::RootSeenRunning), Vec::new());
+    killed.leave_unvouched_for_test(UnvouchedKind::RootSeenRunning);
     let walk = killed.hold(vec![id], true, Some(&WalkToken::new()));
 
     killed
