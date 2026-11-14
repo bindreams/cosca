@@ -142,7 +142,7 @@ fn an_unknown_state_has_what_it_wraps_as_its_source() {
     assert_eq!(crate::error::first_os_code(cause), Some(libc::EIO), "{cause}");
     assert!(crate::error::said(cause).contains(&stat), "{cause}");
 
-    let view = StateUnknown::View(crate::identity::ViewUnreadable::from_open_errno(rustix::io::Errno::IO));
+    let view = StateUnknown::View(crate::identity::ProcOpenFailure::opening(rustix::io::Errno::IO).into());
     let source = std::error::Error::source(&view).expect("an unusable view has a source");
     assert!(
         source.downcast_ref::<crate::identity::ViewUnreadable>().is_some(),
@@ -199,7 +199,7 @@ fn an_unknown_state_says_what_failed_and_not_the_os_error() {
         .on_read(&format!("{me}/stat"), Err(libc::EIO));
     let unreadable = read_proc_state(&kernel, me).expect_err("no state").to_string();
     assert!(!unreadable.contains(&os_error), "{unreadable}");
-    let view = StateUnknown::View(crate::identity::ViewUnreadable::from_open_errno(rustix::io::Errno::IO)).to_string();
+    let view = StateUnknown::View(crate::identity::ProcOpenFailure::opening(rustix::io::Errno::IO).into()).to_string();
     assert!(!view.contains(&os_error), "{view}");
 }
 
