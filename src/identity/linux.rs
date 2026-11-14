@@ -371,9 +371,22 @@ pub(super) fn exists(kernel: &dyn Kernel, pid: RawPid, key: Key) -> (Existence, 
 
 /// [`exists`], reading through the `/proc` at `proc_dir`: a `Pidfs` id needs no `/proc`.
 pub(super) fn exists_in(kernel: &dyn Kernel, proc_dir: &ProcDir, pid: RawPid, key: Key) -> Existence {
+    exists_in_explained(kernel, proc_dir, pid, key).0
+}
+
+/// [`exists_in`], and why it was `Unknown` when the read knows.
+pub(super) fn exists_in_explained(
+    kernel: &dyn Kernel,
+    proc_dir: &ProcDir,
+    pid: RawPid,
+    key: Key,
+) -> (Existence, UnknownCause) {
     match key {
-        Key::Ticks(ticks) => existence_of_ticks(ticks_from(pid, read_in(kernel, proc_dir, pid).0), ticks),
-        Key::Pidfs(_) => exists(kernel, pid, key).0,
+        Key::Ticks(ticks) => {
+            let (stat, cause) = read_in(kernel, proc_dir, pid);
+            (existence_of_ticks(ticks_from(pid, stat), ticks), cause)
+        }
+        Key::Pidfs(_) => exists(kernel, pid, key),
     }
 }
 

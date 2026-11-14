@@ -659,7 +659,7 @@ impl ProcessId {
     /// floor, 14.4, is not measurable on CI, and where its order differs the read does not see the
     /// exit, which is the window a walk always had, never a false answer. Unlike
     /// [`is_alive`](Self::is_alive), it answers `true` before the process is a zombie.
-    #[cfg(unix)]
+    #[cfg(all(unix, any(test, not(target_os = "linux"))))]
     pub(crate) fn exit_begun_with(&self, kernel: &dyn Kernel) -> (Resolved<bool>, UnknownCause) {
         #[cfg(target_os = "linux")]
         {
@@ -668,8 +668,15 @@ impl ProcessId {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = kernel;
-            (backend::exit_begun(self.pid, self.key), UnknownCause::default())
+            backend::exit_begun(self.pid, self.key)
         }
+    }
+
+    /// [`exit_begun_with`](Self::exit_begun_with), reading through the `/proc` at `proc_dir` (known to be
+    /// this pid namespace's) instead of building a view of its own.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn exit_begun_in(&self, kernel: &dyn Kernel, proc_dir: &ProcDir) -> (Resolved<bool>, UnknownCause) {
+        backend::exit::exit_begun_in(kernel, proc_dir, self.pid, self.key)
     }
 
     /// Best-effort wall-clock creation time. Lazy and allowed to drift (NTP);
@@ -778,6 +785,9 @@ pub(crate) struct UnknownCause {
     /// The `stat` read that failed, beyond absence and refusal, and left the read `Unknown`.
     #[cfg(target_os = "linux")]
     unreadable: Option<Box<backend::pid_file::Unreadable>>,
+    /// The failed `kinfo_proc` read (a refused or mis-sized `sysctl`) that left the read `Unknown`.
+    #[cfg(target_os = "macos")]
+    kinfo: Option<std::io::Error>,
     /// The parent whose proof left an ordered read `Unknown`, when that and not the read's own pid
     /// is why.
     parent: Option<RawPid>,
@@ -848,6 +858,15 @@ impl UnknownCause {
         }
     }
 
+    /// The cause of a read that the failed `kinfo_proc` read `failure`, when there is one, left `Unknown`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn of_kinfo(failure: Option<std::io::Error>) -> UnknownCause {
+        UnknownCause {
+            kinfo: failure,
+            ..UnknownCause::default()
+        }
+    }
+
     /// The cause of a read that a failed pidfd call left `Unknown`.
     #[cfg(target_os = "linux")]
     pub(crate) fn of_call(call: FailedCall) -> UnknownCause {
@@ -893,7 +912,7 @@ impl UnknownCause {
     /// reason or the errno that failed; on Windows, `Error::Unassessable` naming the refused
     /// sequence-number query, else the refused creator-pid query, with the query's `NTSTATUS` as its
     /// source as a Win32 error ([`nt_io_error`](crate::error::nt_io_error)). `None` when nothing
-    /// is known (or on macOS, which has no view and no pidfd): `hidepid`, a racing exit, an access
+    /// is known (macOS knows only a failed `kinfo_proc` read): `hidepid`, a racing exit, an access
     /// denial.
     pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {
         #[cfg(target_os = "linux")]
@@ -920,7 +939,14 @@ impl UnknownCause {
                 source: Some(crate::error::Error::io_cause(crate::error::nt_io_error(status))),
             })
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(target_os = "macos")]
+        {
+            self.kinfo.map(|failure| crate::error::Error::Unassessable {
+                detail: format!("{subject} exists but its kinfo_proc could not be read"),
+                source: Some(crate::error::Error::io_cause(failure)),
+            })
+        }
+        #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
         {
             let _ = (self, subject);
             None

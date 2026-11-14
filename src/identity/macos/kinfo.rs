@@ -255,10 +255,20 @@ pub(crate) mod fault {
     }
 }
 
+/// [`kinfo`] without the test seams, and with the failure that left the read `Unknown`: the errno of the
+/// `sysctl`, or the wrong size it wrote.
+pub(crate) fn kinfo_explained(pid: RawPid) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
+    read_record_explained(pid, libc::KERN_PROC_PID)
+}
+
+fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
+    read_record_explained(pid, selector).0
+}
+
 /// The selector-parameterized core. The `selector` parameter is a TEST SEAM (production
 /// always passes `KERN_PROC_PID` via `kinfo()`) — it lets a unit test drive the
 /// contract-violation arm with an invalid selector.
-fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
+fn read_record_explained(pid: RawPid, selector: libc::c_int) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROC, selector, pid as libc::c_int];
     loop {
         let mut info: kinfo_proc = unsafe { std::mem::zeroed() };
@@ -279,7 +289,7 @@ fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
             return match e.raw_os_error() {
                 Some(libc::EINTR) => continue,
                 // The OS positively says there is no such process.
-                Some(libc::ESRCH) => Resolved::Gone,
+                Some(libc::ESRCH) => (Resolved::Gone, None),
                 // A sandbox or hardened runtime refusing the query is the DESIGNED Unknown,
                 // not a contract violation - `debug`, like every other per-pid probe.
                 Some(libc::EPERM) | Some(libc::EACCES) => {
@@ -287,7 +297,7 @@ fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
                         "sysctl(KERN_PROC selector {selector}, {pid}) refused: {report}",
                         report = crate::error::Report(&e)
                     );
-                    Resolved::Unknown
+                    (Resolved::Unknown, Some(e))
                 }
                 // ENOMEM/EINVAL are neither race- nor permission-reachable. ENOMEM in
                 // particular is the ONLY runtime detector for a kernel `kinfo_proc` that has
@@ -299,22 +309,23 @@ fn read_record(pid: RawPid, selector: libc::c_int) -> Resolved<kinfo_proc> {
                         "sysctl(KERN_PROC selector {selector}, {pid}) failed: {report}",
                         report = crate::error::Report(&e)
                     ));
-                    Resolved::Unknown
+                    (Resolved::Unknown, Some(e))
                 }
             };
         }
         if size == 0 {
-            return Resolved::Gone;
+            return (Resolved::Gone, None);
         }
         if size != std::mem::size_of::<kinfo_proc>() {
             // Layout drift — never trust a partial/foreign-sized record.
-            super::contract_violation(format_args!(
+            let drift = format!(
                 "sysctl(KERN_PROC selector {selector}, {pid}) wrote {size} bytes, expected {}",
                 std::mem::size_of::<kinfo_proc>()
-            ));
-            return Resolved::Unknown;
+            );
+            super::contract_violation(format_args!("{drift}"));
+            return (Resolved::Unknown, Some(std::io::Error::other(drift)));
         }
-        return Resolved::Found(info);
+        return (Resolved::Found(info), None);
     }
 }
 

@@ -43,11 +43,21 @@
 //! begun when the walk ends, as the kernel's exit flag shows, may find none of them or only some, and an
 //! empty walk says nothing of the tree. Such a kill that found no member is [`TreeKillOutcome::NoRoot`]
 //! and such a [`terminate`] is [`Terminated::RootExited`], never an empty success. One that found
-//! members signals them and is not `Ok` either: a [`hard_kill`] adds an [`Error::Unassessable`] that
-//! names no member to what it left, and a [`terminate`]'s [`Listing`] is not complete.
+//! members signals them and is not `Ok` either: a [`hard_kill`] that left none is
+//! [`TreeKillOutcome::RootExiting`], which settles as a gone root does (so a graceful call's own
+//! complete `SIGTERM` listing may vouch for the tree, as it does a moment later, when the root is a
+//! zombie), and one that left members, or candidates it could not read, adds an [`Error::Unassessable`]
+//! that names no member; a [`terminate`]'s [`Listing`] is not complete.
+//!
+//! A flag that cannot be read, with members found, changes nothing for them: they are killed or
+//! signalled as they were before the flag was read, and the answer says why the tree cannot be
+//! vouched for (a [`hard_kill`]'s [`Unkilled`] holds the read's error; a [`terminate`]'s [`Listing`] is
+//! not complete). With no member found, the walk is [`TreeKillOutcome::Unwalked`] (a [`terminate`]'s
+//! `Err`): nothing is sent, and a retry can read it.
 //!
 //! The read ([`ProcessId::exit_begun_with`]) runs after every walk and before the root is signalled
-//! (cosca's own signal would begin its exit). The flag shows before the exit reparents the children and
+//! (cosca's own signal would begin its exit), through the `/proc` view the walk's own snapshot was
+//! read through ([`Table`]). The flag shows before the exit reparents the children and
 //! never clears, so a root that shows it clear after the walk's last read had no child moved by its
 //! exit. Linux: every thread of the group shows `PF_EXITING` (field 9 of `stat`; the leader alone is no
 //! sign, for `pthread_exit` sets it while the process runs). macOS: `P_WEXIT` in `kinfo_proc`'s
@@ -105,6 +115,7 @@
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
+use crate::containment::enumerate::Table;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{Contains, KillLeftOutcome};
@@ -600,19 +611,20 @@ pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
     kill_opened(id, open_by_identity(&crate::identity::HostKernel, id), Sig::Kill)
 }
 
-/// Whether `root`'s exit has begun, as the kernel's exit flag shows ([`ProcessId::exit_begun_with`]); a
-/// root that is a zombie, reaped, or no longer holding its pid is past its beginning. Always `false` on
-/// Windows, which never reparents. Asked after a walk and before the root is signalled: the flag shows
-/// before the exit reparents the root's children and never clears, so a read that finds it clear
-/// proves the walk met no child that the exit moved, and a root cosca itself killed would show it.
+/// Whether `root`'s exit has begun, as the kernel's exit flag shows ([`ProcessId::exit_begun_with`]),
+/// read through the view `table` was; a root that is a zombie, reaped, or no longer holding its pid is
+/// past its beginning. Always `false` on Windows, which never reparents. Asked after a walk and before
+/// the root is signalled: the flag shows before the exit reparents the root's children and never
+/// clears, so a read that finds it clear proves the walk met no child that the exit moved, and a root
+/// cosca itself killed would show it.
 ///
 /// # Errors
 ///
 /// [`Error::Unassessable`] when the flag cannot be read.
-fn exit_begun(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Error> {
+fn exit_begun(kernel: &dyn Kernel, table: &Table, root: ProcessId) -> Result<bool, Error> {
     #[cfg(unix)]
     {
-        let (read, cause) = root.exit_begun_with(kernel);
+        let (read, cause) = table.exit_begun(kernel, root);
         match read {
             Resolved::Found(begun) => Ok(begun),
             Resolved::Gone => Ok(true),
@@ -630,22 +642,8 @@ fn exit_begun(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Error> {
     }
     #[cfg(not(unix))]
     {
-        let _ = (kernel, root);
+        let _ = (kernel, table, root);
         Ok(false)
-    }
-}
-
-/// The entry a walk adds to what it left when the root's exit had begun and the walk found members:
-/// the exit moves the root's children to another parent, so the walk that found these may have missed
-/// others, and the members it killed are not the whole tree. It names no member.
-#[cfg(unix)]
-fn exit_begun_error(root: RawPid) -> Error {
-    Error::Unassessable {
-        detail: format!(
-            "the root (pid {root}) had begun to exit when the walk ended, so its children may have been reparented \
-             out of the walk: the members it found were signalled, and the tree cannot be vouched for"
-        ),
-        source: None,
     }
 }
 
@@ -674,10 +672,13 @@ fn exit_begun_error(root: RawPid) -> Error {
 /// (each re-opened by identity, through `kernel`, when a caller waits), and whether the root's landed.
 ///
 /// A root whose exit has begun (a zombie included) and whose walk finds no member is
-/// [`TreeKillOutcome::NoRoot`] too; one whose walk finds members kills them and is not `Ok`: its
-/// [`Unkilled`] holds an [`Error::Unassessable`] that names no member (see the module doc). The flag
-/// is read after the walk and before the root's own kill; a flag that cannot be read is
-/// [`TreeKillOutcome::Unwalked`], with nothing killed.
+/// [`TreeKillOutcome::NoRoot`] too. One whose walk finds members kills them, and is
+/// [`TreeKillOutcome::RootExiting`] when none is left: settled as `NoRoot` is, so the call's own
+/// `SIGTERM` listing may vouch for the tree. With candidates the walk could not read and no member, or
+/// members left, its [`Unkilled`] is those, with an [`Error::Unassessable`] that names no member for the
+/// first (see the module doc). The flag is read after the walk and before the root's own kill. One that
+/// cannot be read, with no member found, is [`TreeKillOutcome::Unwalked`] with nothing killed; with
+/// members found they are killed as if it were clear, and the [`Unkilled`] holds the read's error.
 ///
 /// [`Tree::settle`]: crate::containment::Tree::settle
 pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn Root) -> TreeKill<'a> {
@@ -687,12 +688,14 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
     let skip_root = fault::take_force_root_kill_noop();
     #[cfg(not(test))]
     let skip_root = false;
+    let table = match crate::containment::enumerate::process_table(kernel) {
+        Ok(table) => table,
+        Err(error) => return TreeKill::of(TreeKillOutcome::Unwalked(error)).through(kernel),
+    };
     let Walk {
         members: descendants,
         unassessed,
-    } = match crate::containment::enumerate::process_parents(kernel)
-        .and_then(|parents| walk_from(kernel, root, &parents, Recursive::Yes))
-    {
+    } = match walk_from(kernel, root, &table.parents, Recursive::Yes) {
         Ok(Some(walk)) => walk,
         Ok(None) => return TreeKill::of(TreeKillOutcome::NoRoot(root.pid(), None)).through(kernel),
         Err(error) => return TreeKill::of(TreeKillOutcome::Unwalked(error)).through(kernel),
@@ -723,17 +726,27 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
     }
     // After the walk and before the root is killed (its own kill would set the flag): a root whose exit
     // had begun when the walk ended may have had children reparented out of it.
-    match exit_begun(kernel, root) {
-        Ok(true) if descendants.is_empty() && left.is_empty() && root_left.is_none() => {
-            return TreeKill::of(TreeKillOutcome::NoRoot(root.pid(), None)).through(kernel);
-        }
-        // Members were walked: the exit may have moved others out of the walk's reach.
-        #[cfg(unix)]
-        Ok(true) if !descendants.is_empty() => left.push(exit_begun_error(root.pid())),
-        Ok(_) => {}
+    let found_nothing = descendants.is_empty() && left.is_empty() && root_left.is_none();
+    let begun_with_members = match exit_begun(kernel, &table, root) {
+        Ok(true) if found_nothing => return TreeKill::of(TreeKillOutcome::NoRoot(root.pid(), None)).through(kernel),
         // Nothing is killed, the root included: a retry can read it.
-        Err(unreadable) => return TreeKill::of(TreeKillOutcome::Unwalked(unreadable)).through(kernel),
-    }
+        Err(unreadable) if found_nothing => {
+            return TreeKill::of(TreeKillOutcome::Unwalked(unreadable)).through(kernel);
+        }
+        // Candidates the walk could not read, and no member: the answer says why the walk is no proof.
+        #[cfg(unix)]
+        Ok(true) if descendants.is_empty() && !left.is_empty() => {
+            left.push(TreeKillOutcome::exiting_root_error(root.pid()));
+            false
+        }
+        Ok(begun) => begun,
+        // Members were walked and are killed all the same, as before the flag was read; the answer says
+        // the tree cannot be vouched for.
+        Err(unreadable) => {
+            left.push(unreadable);
+            false
+        }
+    };
     let mut resolved = Vec::new();
     let mut killed = Vec::new();
     let mut root_killed = false;
@@ -758,7 +771,13 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
     #[cfg(not(any(unix, windows)))]
     let _ = (kernel, root, descendants, skip_root, held);
     let outcome = if left.is_empty() && root_left.is_none() {
-        TreeKillOutcome::Ran(Ok(()))
+        if begun_with_members {
+            // Every member found was killed; the exit may have moved others out of the walk, as a root
+            // that had exited when the walk ran leaves none to find.
+            TreeKillOutcome::RootExiting(root.pid(), None)
+        } else {
+            TreeKillOutcome::Ran(Ok(()))
+        }
     } else {
         TreeKillOutcome::Ran(Err(Unkilled {
             members: left,
@@ -1163,13 +1182,14 @@ pub(crate) mod fault {
 /// they are reparented out of every later walk, so a later kill can reach them only by these
 /// identities. A root whose exit has begun, reaped or not, and whose walk finds no member sends
 /// nothing ([`Terminated::RootExited`], see the module doc); one whose walk finds members signals
-/// them, and its [`Listing`] is not complete.
+/// them, and its [`Listing`] is not complete. So is the listing of a walk whose members were signalled
+/// though the flag could not be read; with no member found, that error is the walk's.
 pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -> Result<Terminated, Error> {
     debug_assert_eq!(held.pid(), root.pid(), "the held root is not the walk's root");
     #[cfg(unix)]
     {
-        let parents = crate::containment::enumerate::process_parents(kernel)?;
-        let Some(walk) = walk_from(kernel, root, &parents, Recursive::Yes)? else {
+        let table = crate::containment::enumerate::process_table(kernel)?;
+        let Some(walk) = walk_from(kernel, root, &table.parents, Recursive::Yes)? else {
             return Ok(Terminated::RootExited(exited_root_error(root.pid())));
         };
         #[cfg(test)]
@@ -1177,10 +1197,22 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -
         // A root whose exit has begun, and whose walk finds no member, sends nothing, whether or not the
         // walk could read every candidate: a signal to its zombie reaches no one, and the exit may have
         // reparented every child. Read before the root's own `SIGTERM`, which would begin its exit.
-        let begun = exit_begun(kernel, root)?;
-        if begun && walk.members.is_empty() {
-            return Ok(Terminated::RootExited(exited_root_error(root.pid())));
-        }
+        let begun = match exit_begun(kernel, &table, root) {
+            Ok(true) if walk.members.is_empty() => {
+                return Ok(Terminated::RootExited(exited_root_error(root.pid())));
+            }
+            Ok(begun) => begun,
+            Err(unreadable) if walk.members.is_empty() => return Err(unreadable),
+            // The members are signalled as before the flag was read; the listing cannot vouch for the tree.
+            Err(unreadable) => {
+                log::warn!(
+                    "treewalk: the SIGTERM walk of pid {pid} cannot vouch for its tree: {report}",
+                    pid = root.pid(),
+                    report = crate::error::Report(&unreadable)
+                );
+                true
+            }
+        };
         // Best effort by contract: a candidate that could not be read is warned of and not signalled.
         warn_unassessed(&walk.unassessed);
         warn_if_not_attempted(root, Signal::SIGTERM, &KillOutcome::of(held.signal(Sig::Term)));
@@ -1188,7 +1220,8 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -
             warn_if_not_attempted(*id, Signal::SIGTERM, &kill_by_identity(kernel, *id, Signal::SIGTERM));
         }
         Ok(Terminated::Walked(Listing {
-            // A root whose exit had begun may have had children reparented out of the walk.
+            // A root whose exit had begun, or whose flag could not be read, may have had children
+            // reparented out of the walk.
             complete: walk.unassessed.is_empty() && !begun,
             members: walk.members,
         }))

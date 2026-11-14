@@ -5,8 +5,9 @@
 //! 1-second start-time granularity is useless as an ordering key, and it pulls a
 //! second major `windows` version.
 
-#[cfg(target_os = "macos")]
-use crate::identity::RawPid;
+#[cfg(not(target_os = "linux"))]
+use crate::error::Error;
+use crate::identity::{Kernel, RawPid};
 
 #[cfg_attr(windows, path = "enumerate/windows.rs")]
 #[cfg_attr(target_os = "linux", path = "enumerate/linux.rs")]
@@ -27,6 +28,47 @@ compile_error!("cosca::containment::enumerate is implemented only for Windows, L
 /// `openat2`). An empty `Ok` means the host has no processes: a walk over a failed snapshot would
 /// find no descendants and skip every kill and wait.
 pub(crate) use backend::process_parents;
+
+/// The `(pid, ppid)` snapshot of a walk ([`process_table`]), and on Linux the checked `/proc` it was read
+/// through, which the walk's other reads about the same tree share: the snapshot and the root's exit
+/// flag are read from one view.
+pub(crate) struct Table {
+    pub(crate) parents: Vec<(RawPid, RawPid)>,
+    #[cfg(target_os = "linux")]
+    view: crate::identity::ProcDir,
+}
+
+/// [`process_parents`], kept with the view it was read through. The errors are those of `process_parents`.
+#[cfg(target_os = "linux")]
+pub(crate) use backend::process_table;
+
+/// [`process_parents`], in a [`Table`]. The errors are those of `process_parents`.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn process_table(kernel: &dyn Kernel) -> Result<Table, Error> {
+    Ok(Table {
+        parents: backend::process_parents(kernel)?,
+    })
+}
+
+#[cfg(unix)]
+impl Table {
+    /// [`ProcessId::exit_begun_with`](crate::identity::ProcessId::exit_begun_with) of `root`, read
+    /// through the `/proc` of this table on Linux.
+    pub(crate) fn exit_begun(
+        &self,
+        kernel: &dyn Kernel,
+        root: crate::identity::ProcessId,
+    ) -> (crate::identity::Resolved<bool>, crate::identity::UnknownCause) {
+        #[cfg(target_os = "linux")]
+        {
+            root.exit_begun_in(kernel, &self.view)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            root.exit_begun_with(kernel)
+        }
+    }
+}
 
 /// Every listable pid plus the `(pid, ppid)` edges plus the denied-ppid-read count, from one
 /// enumeration (macOS only — the fd-marker sweep needs all three, consistently, so it cannot

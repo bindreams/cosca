@@ -122,11 +122,10 @@ fn a_thread_that_appears_in_a_later_listing_is_read() {
     assert_eq!(begun(pidfs_id(), &kernel), Resolved::Found(false));
 }
 
-/// Threads that all show the flag are begun once a listing shows nothing new, and the listing that
-/// shows nothing new is the last: each thread is read once. Mutant: a thread already read is read
-/// again by every listing.
+/// Threads that all show the flag are begun once a listing is covered by the one before it, though the
+/// listing grew in between. Mutant: the first complete pass is the answer.
 #[skuld::test]
-fn a_listing_with_no_new_thread_ends_the_reads() {
+fn a_listing_covered_by_the_one_before_it_ends_the_reads() {
     let (fd, _writer) = pidfd();
     let kernel = FakeKernel::over(&HostKernel)
         .same_view()
@@ -135,20 +134,63 @@ fn a_listing_with_no_new_thread_ends_the_reads() {
         .on_tids(PID, Ok(&[PID]))
         .on_tids_after(PID, 1, Ok(&[PID, 4243]))
         .on_read(&task_stat(PID), Ok(&stat_with(EXITING, START)))
-        .on_read(&task_stat(4243), Ok(&stat_with(EXITING, START)))
-        // Read again, it would show a live thread: the answer would be false.
-        .on_read_after(&task_stat(PID), 1, Ok(&stat_with(LIVE, START)));
+        .on_read(&task_stat(4243), Ok(&stat_with(EXITING, START)));
     assert_eq!(begun(pidfs_id(), &kernel), Resolved::Found(true));
 }
 
-/// A thread that exited between the listing and its read is not a live one. Mutant: its failed read
-/// is `Unknown`, or the thread is taken for live.
+/// A thread id can change hands: a thread that calls `execve` takes the leader's id and the process
+/// runs on. The leader showed the flag in the first pass (its thread was being ended), and the id shows
+/// a running thread in the second, so every pass reads every thread of its listing. Mutant: a thread
+/// already read is not read again.
 #[skuld::test]
-fn a_thread_that_exited_after_the_listing_does_not_stop_the_exit_from_being_begun() {
+fn a_thread_id_that_changed_hands_is_read_again_by_the_next_pass() {
+    let (fd, _writer) = pidfd();
+    let kernel = FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_pidfd_open(PID, Ok(fd))
+        .on_pidfs_ino(PID, Ok(Some(INO)))
+        .on_tids(PID, Ok(&[PID]))
+        .on_tids_after(PID, 1, Ok(&[PID]))
+        .on_read(&task_stat(PID), Ok(&stat_with(EXITING, START)))
+        .on_read_after(&task_stat(PID), 1, Ok(&stat_with(LIVE, START)));
+    assert_eq!(begun(pidfs_id(), &kernel), Resolved::Found(false));
+}
+
+/// A thread that is gone when it is read is no evidence of an exit: the listing is read afresh. In the
+/// shape of an `execve` by a thread of a live group, the old leader shows the flag and the thread that
+/// called is gone under its own id (it holds the leader's now): the next listing holds the leader's id
+/// alone, and it shows a running thread. Mutants: a vanished thread counts as exiting (`true`); it
+/// counts as running or unknown.
+#[skuld::test]
+fn a_thread_that_vanished_is_not_an_exit_and_the_listing_is_read_afresh() {
     for errno in [libc::ENOENT, libc::ESRCH] {
-        let (kernel, _writer) = pidfs_kernel(&[(PID, EXITING), (4243, EXITING)]);
-        let kernel = kernel.on_read(&task_stat(4243), Err(errno));
-        assert_eq!(begun(pidfs_id(), &kernel), Resolved::Found(true), "errno {errno}");
+        let (fd, _writer) = pidfd();
+        let exec = FakeKernel::over(&HostKernel)
+            .same_view()
+            .on_pidfd_open(PID, Ok(fd))
+            .on_pidfs_ino(PID, Ok(Some(INO)))
+            .on_tids(PID, Ok(&[PID, 4243]))
+            .on_tids_after(PID, 1, Ok(&[PID]))
+            .on_read(&task_stat(PID), Ok(&stat_with(EXITING, START)))
+            .on_read_after(&task_stat(PID), 1, Ok(&stat_with(LIVE, START)))
+            .on_read(&task_stat(4243), Err(errno));
+        assert_eq!(begun(pidfs_id(), &exec), Resolved::Found(false), "exec, errno {errno}");
+
+        // The vanished thread was one of a group that exits: the fresh listing shows the rest exiting.
+        let (fd, _writer) = pidfd();
+        let exiting = FakeKernel::over(&HostKernel)
+            .same_view()
+            .on_pidfd_open(PID, Ok(fd))
+            .on_pidfs_ino(PID, Ok(Some(INO)))
+            .on_tids(PID, Ok(&[PID, 4243]))
+            .on_tids_after(PID, 1, Ok(&[PID]))
+            .on_read(&task_stat(PID), Ok(&stat_with(EXITING, START)))
+            .on_read(&task_stat(4243), Err(errno));
+        assert_eq!(
+            begun(pidfs_id(), &exiting),
+            Resolved::Found(true),
+            "exiting, errno {errno}"
+        );
     }
 }
 
@@ -187,42 +229,41 @@ fn a_proof_that_cannot_be_made_is_unknown() {
     assert_eq!(begun(pidfs_id(), &kernel), Resolved::Unknown);
 }
 
-/// A listing that cannot be read is `Gone` only when `kill(pid, 0)` says `ESRCH`, as an unreadable
-/// `stat` is.
+/// A listing that cannot be read, or lists no thread, is settled by what holds the pid then, as a read
+/// that succeeded is: `Gone` when the process was reaped meanwhile, else `Unknown`. Mutants: a failed
+/// listing is `Unknown` whatever holds the pid; the kill probe alone decides.
 #[skuld::test]
-fn a_listing_that_cannot_be_read_is_gone_only_when_kill_says_esrch() {
+fn a_listing_that_says_nothing_is_gone_when_the_process_was_reaped_and_unknown_when_it_holds_the_pid() {
     let target = Pid::from_raw(PID as i32).expect("a positive pid");
-    let rows: [(Result<(), Errno>, Resolved<bool>); 2] =
-        [(Err(Errno::SRCH), Resolved::Gone), (Ok(()), Resolved::Unknown)];
-    for (probe, expected) in rows {
-        let (fd, _writer) = pidfd();
-        let kernel = FakeKernel::over(&HostKernel)
-            .same_view()
-            .on_pidfd_open(PID, Ok(fd))
-            .on_pidfs_ino(PID, Ok(Some(INO)))
-            .on_tids(PID, Err(libc::ENOENT))
-            .on_signal_probe(target, probe);
-        assert_eq!(begun(pidfs_id(), &kernel), expected, "kill {probe:?}");
+    // The pid held by the process (the proof passes) or by none (`pidfd_open` says `ESRCH`).
+    let holders: [(Result<(), Errno>, Resolved<bool>); 2] =
+        [(Ok(()), Resolved::Unknown), (Err(Errno::SRCH), Resolved::Gone)];
+    type Listing = fn(FakeKernel<'static>) -> FakeKernel<'static>;
+    let listings: [(&str, Listing); 3] = [
+        ("an absent listing", |k| k.on_tids(PID, Err(libc::ENOENT))),
+        ("a listing that failed after the open", |k| {
+            k.on_tids_failing_after_open(PID, libc::EIO)
+        }),
+        ("an empty listing", |k| k.on_tids(PID, Ok(&[]))),
+    ];
+    for (holds, expected) in holders {
+        for (name, listing) in listings {
+            let kernel = FakeKernel::over(&HostKernel).same_view();
+            let (kernel, _writer) = match holds {
+                Ok(()) => {
+                    let (fd, writer) = pidfd();
+                    (
+                        kernel.on_pidfd_open(PID, Ok(fd)).on_pidfs_ino(PID, Ok(Some(INO))),
+                        Some(writer),
+                    )
+                }
+                Err(errno) => (kernel.on_pidfd_open(PID, Err(errno)), None),
+            };
+            // `kill(pid, 0)` says nothing here: it answers `ESRCH` for both rows.
+            let kernel = listing(kernel).on_signal_probe(target, Err(Errno::SRCH));
+            assert_eq!(begun(pidfs_id(), &kernel), expected, "{name}, holder {holds:?}");
+        }
     }
-    // The same rule for a listing that opened and failed to read.
-    for (probe, expected) in rows {
-        let (fd, _writer) = pidfd();
-        let kernel = FakeKernel::over(&HostKernel)
-            .same_view()
-            .on_pidfd_open(PID, Ok(fd))
-            .on_pidfs_ino(PID, Ok(Some(INO)))
-            .on_tids_failing_after_open(PID, libc::EIO)
-            .on_signal_probe(target, probe);
-        assert_eq!(begun(pidfs_id(), &kernel), expected, "after open, kill {probe:?}");
-    }
-}
-
-/// No thread is listed for a pid that is still held: the record contradicts itself, so nothing is
-/// said of the exit.
-#[skuld::test]
-fn an_empty_listing_of_a_held_pid_is_unknown() {
-    let (kernel, _writer) = pidfs_kernel(&[]);
-    assert_eq!(begun(pidfs_id(), &kernel), Resolved::Unknown);
 }
 
 /// A `/proc` that is not this pid namespace's names another process under the number, so the flags it

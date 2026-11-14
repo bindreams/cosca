@@ -31,9 +31,11 @@ pub(super) fn with_exiting_root(kernel: FakeKernel<'static>, root: ProcessId) ->
 }
 
 /// What a signalled root and descendant leave: the descendant printed nothing, and the root died of
-/// `signo`.
+/// `signo`. The stdin is released first, so a descendant that was not signalled prints and fails the
+/// assertion instead of blocking the read.
 #[track_caller]
 fn assert_both_signalled(who: &str, mut child: std::process::Child, signo: i32) {
+    drop(child.stdin.take());
     let mut printed = String::new();
     child
         .stdout
@@ -100,4 +102,144 @@ fn a_root_that_has_begun_to_exit_with_no_member_is_no_root_and_nothing_is_sent()
     );
     // Never signalled: the member ends by its own clean exit.
     release(child);
+}
+
+/// A kernel in which the threads of `root` cannot be read, so whether its exit has begun cannot be told.
+fn flag_unreadable(root: ProcessId) -> FakeKernel<'static> {
+    FakeKernel::over(&HostKernel).on_tids_failing_after_open(root.pid(), libc::EIO)
+}
+
+/// A flag that cannot be read leaves the walk as it was before the flag was read: the members found are
+/// killed, with the root, and the answer is the read's error, not `Ok`. Mutants: the unreadable flag
+/// fails the walk before any kill (`Unwalked`) whatever it found; the error is dropped (`Ok`).
+#[skuld::test]
+fn a_kill_whose_exit_flag_cannot_be_read_kills_its_members_and_answers_with_the_read_error() {
+    for (name, walk) in walks().into_iter().filter(|(name, _)| name.contains("kill")) {
+        let (child, root, _descendant) = live_member_with_descendant();
+        let kernel = flag_unreadable(root);
+        let result = walk(&kernel, root);
+        assert_unassessable_naming(
+            result,
+            &["exit has begun could not be read", &format!("pid {}", root.pid())],
+        );
+        assert_both_signalled(name, child, libc::SIGKILL);
+    }
+}
+
+/// The same for the `SIGTERM` walk: members and root are signalled, and the listing cannot vouch for the
+/// tree. Mutant: the walk is `NotSent` with nothing signalled, or its listing is `complete`.
+#[skuld::test]
+fn a_terminate_whose_exit_flag_cannot_be_read_signals_its_members_and_lists_them_incomplete() {
+    let (child, root, descendant) = live_member_with_descendant();
+    let kernel = flag_unreadable(root);
+    let walked = super::terminate(&kernel, root, &super::ByIdentity::new(&kernel, root)).expect("members were found");
+    let super::Terminated::Walked(listing) = walked else {
+        panic!("the members were walked");
+    };
+    assert_eq!(listing.members, [descendant]);
+    assert!(
+        !listing.complete,
+        "a listing with an unread flag cannot vouch for the tree"
+    );
+    assert_both_signalled("terminate", child, libc::SIGTERM);
+}
+
+/// With no member found, a flag that cannot be read is a walk not made: nothing is killed or sent, the
+/// root included, and a retry can read it.
+#[skuld::test]
+fn a_walk_with_no_member_whose_exit_flag_cannot_be_read_sends_nothing() {
+    let (child, root) = live_member();
+    let kernel = flag_unreadable(root);
+    assert!(
+        matches!(
+            super::hard_kill(&kernel, root, &super::ByIdentity::new(&kernel, root)).outcome(),
+            TreeKillOutcome::Unwalked(crate::error::Error::Unassessable { .. })
+        ),
+        "no member was found and the flag is unread"
+    );
+    let termed = super::terminate(&kernel, root, &super::ByIdentity::new(&kernel, root));
+    assert!(
+        matches!(termed, Err(crate::error::Error::Unassessable { .. })),
+        "nothing is sent"
+    );
+    release(child);
+}
+
+/// A root whose exit has begun, with candidates the walk could not read and no member, is not `Ok` for
+/// want of members to answer for: the answer says the exit had begun, as `terminate`'s `RootExited` does.
+/// Mutant: the entry is added only when members were found.
+#[skuld::test]
+fn a_kill_of_a_root_that_has_begun_to_exit_with_only_unread_candidates_says_so() {
+    let (child, root, descendant) = live_member_with_descendant();
+    let kernel = with_exiting_root(
+        FakeKernel::over(&HostKernel).on_pidfd_open(descendant.pid(), Err(rustix::io::Errno::MFILE)),
+        root,
+    );
+    let TreeKillOutcome::Ran(Err(left)) =
+        super::hard_kill(&kernel, root, &super::ByIdentity::new(&kernel, root)).outcome()
+    else {
+        panic!("the unread candidate is left");
+    };
+    let said = left
+        .members
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        said.contains(&format!("pid {}", descendant.pid())),
+        "the candidate is named: {said}"
+    );
+    assert!(said.contains("had begun to exit"), "the root's exit is named: {said}");
+    // The root was killed; the candidate was not, and ends on the EOF.
+    release_candidate(child);
+}
+
+/// The root of `live_member_with_descendant`, killed, and the descendant released by the EOF of its
+/// stdin: it prints, so it was not signalled.
+fn release_candidate(mut child: std::process::Child) {
+    use std::os::unix::process::ExitStatusExt as _;
+    let mut printed = String::new();
+    drop(child.stdin.take());
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut printed)
+        .expect("read to EOF");
+    assert_eq!(
+        printed, "released\n",
+        "the unread candidate must not have been signalled"
+    );
+    assert_eq!(child.wait().expect("reap the root").signal(), Some(libc::SIGKILL));
+}
+
+/// A graceful call's own complete `SIGTERM` listing vouches for the tree over a root that its sweep
+/// catches between the exit flag and the reparent, as it does a moment later, when the root is a
+/// zombie: the sweep's members are killed, the listed ones are killed by identity, and the answer is
+/// `Ok`. Mutant: a root seen exiting with members found is `Unassessable` whatever the call listed.
+#[skuld::test]
+fn a_graceful_sweep_over_a_root_caught_exiting_stands_on_its_own_listing() {
+    let tree = crate::test_child::foreign::tree_of(crate::test_child::TERM_IGNORING_TREE_ARGV);
+    let crate::test_child::foreign::SurvivorTree {
+        mut child,
+        process,
+        members,
+        ..
+    } = tree;
+    let settling = process.begin_graceful().expect("the SIGTERM walk");
+    let kernel = with_exiting_root(FakeKernel::over(&HostKernel), process.id());
+
+    process
+        .kill_tree_settling("graceful_shutdown_tree", &kernel, Some(&settling))
+        .expect("every member the call's own listing reached is killed");
+
+    for member in &members {
+        assert_eq!(
+            member.is_alive(),
+            crate::identity::Liveness::Dead,
+            "{member:?} ignored the SIGTERM and is killed"
+        );
+    }
+    assert_eq!(child.wait().expect("reap the root").signal(), Some(libc::SIGKILL));
 }
