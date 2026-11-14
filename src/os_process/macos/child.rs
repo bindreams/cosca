@@ -87,14 +87,6 @@ impl<K: Kernel + Send> MacosChild<K> {
     }
 }
 
-#[cfg(test)]
-impl<K> MacosChild<K> {
-    /// Whether the reap kqueue has an event pending, read without taking it.
-    pub(crate) fn event_pending(&self) -> bool {
-        crate::os_process::macos::kqueue::test_hooks::event_pending(&self.reap)
-    }
-}
-
 impl<K: Kernel + Send> OsProcess for MacosChild<K> {
     /// By audit token, which the kernel checks against the pid's `p_idversion`: a bare errno on a
     /// refused send; `Gone` once the unique id says the pid names another process; `Delivered` for

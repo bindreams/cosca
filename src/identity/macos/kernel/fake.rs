@@ -186,6 +186,13 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
+    /// The next registration `what` is refused with `errno`, as a pid past `P_REF_DEAD` refuses it
+    /// (`ESRCH`).
+    pub(crate) fn on_subscribe_refused(mut self, what: Subscription, errno: i32) -> Self {
+        self.subscribes.push(what, Err(errno));
+        self
+    }
+
     /// How many `kinfo_proc` reads of `pid` the kernel has been asked for.
     pub(crate) fn kinfo_reads(&self, pid: RawPid) -> usize {
         let counts = self.kinfo_reads.lock().expect("no panic holds the counts");
@@ -271,6 +278,25 @@ pub(crate) fn exit_record(status: i32) -> Record {
     Record {
         si_code: libc::CLD_EXITED,
         si_status: status,
+    }
+}
+
+/// The registration of an exit watch (`ExitWatch::proc_exit`): the exit of `pid` and nothing else.
+pub(crate) fn exit_watch(pid: u32) -> Subscription {
+    Subscription::Process {
+        pid,
+        signals: false,
+        reap: false,
+    }
+}
+
+/// The registration of a reap waiter (`await_reapable::register`): the exit, the signals and the
+/// reap of `pid`.
+pub(crate) fn reap_watch(pid: u32) -> Subscription {
+    Subscription::Process {
+        pid,
+        signals: true,
+        reap: true,
     }
 }
 

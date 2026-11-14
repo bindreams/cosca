@@ -77,10 +77,6 @@ fn blank() -> KEvent {
 /// `EVFILT_PROC` receipt says `ESRCH` (the child is already past `P_REF_DEAD`).
 fn register(kernel: &dyn Kernel, kq: &Kqueue, pid: u32) -> io::Result<bool> {
     kernel.subscribe(kq, Subscription::Signal(libc::SIGCHLD))?;
-    #[cfg(test)]
-    if test_hooks::take_forced_registration(test_hooks::Registration::Reap) {
-        return Ok(true);
-    }
     let child = Subscription::Process {
         pid,
         signals: true,

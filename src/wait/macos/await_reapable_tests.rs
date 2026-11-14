@@ -8,7 +8,7 @@
 use std::process::{Child, ChildStdin};
 use std::time::Duration;
 
-use crate::identity::{FakeKernel, HostKernel};
+use crate::identity::{reap_watch, FakeKernel, HostKernel};
 use crate::os_process::macos::kqueue::{test_hooks, Kqueue};
 use crate::wait::macos::{await_reapable, await_reapable_on, Waited};
 
@@ -351,14 +351,18 @@ fn a_macos_esrch_wait_follows_the_kernel_not_the_disposition() {
     };
     let (mut child, stdin) = spawn_blocker();
     let pid = child.id();
-    let _esrch = test_hooks::force_proc_registration_once(test_hooks::Registration::Reap);
+    let kernel = FakeKernel::over(&HostKernel).on_subscribe_refused(reap_watch(pid), libc::ESRCH);
     let mut stdin = Some(stdin);
     // Between re-peeks: flip the disposition, then let the child exit.
     let _flip = test_hooks::on_esrch_repeek(move || {
         crate::test_child::set_signal_ignored(libc::SIGCHLD, flip_to_ignored);
         drop(stdin.take());
     });
-    let waited = await_reapable(&HostKernel, pid, None, None).expect("wait");
+    let waited = await_reapable(&kernel, pid, None, None).expect("wait");
+    assert!(
+        kernel.all_rows_taken(),
+        "the wait's registration must have been refused"
+    );
     if expect_gone {
         assert_eq!(waited, Waited::Gone, "XNU reaped the child itself under SIG_IGN");
         assert_eq!(reap_by_number(pid), None, "there is nothing left to reap");

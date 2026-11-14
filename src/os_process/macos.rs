@@ -290,20 +290,7 @@ impl ExitWatch {
             signals: false,
             reap: false,
         };
-        #[cfg(test)]
-        if kqueue::test_hooks::take_forced_registration(kqueue::test_hooks::Registration::SilentExitWatch) {
-            return Ok(Self::new(kq));
-        }
-        #[cfg(test)]
-        let forced = kqueue::test_hooks::take_forced_registration(kqueue::test_hooks::Registration::ExitWatch);
-        #[cfg(not(test))]
-        let forced = false;
-        let subscribed = if forced {
-            Err(io::Error::from_raw_os_error(libc::ESRCH))
-        } else {
-            kernel.subscribe(&kq, exit)
-        };
-        match subscribed {
+        match kernel.subscribe(&kq, exit) {
             Ok(()) => Ok(Self::new(kq)),
             Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => Ok(Self::new(kq).exited_now()),
             Err(e) => Err(Error::Io(e)),
