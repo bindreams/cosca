@@ -2,10 +2,9 @@
 //! [`FakeProcess`] answers where a test must make the OS refuse, fail or slow down: a failed
 //! spawn's ([`tear_down_failed_spawn`]) and the drop's ([`OwnedChild::tear_down`]).
 //!
-//! A "UAC handle" is a handle a UAC elevation returned, opened without `PROCESS_TERMINATE` (the
-//! access of a higher-integrity child), so its `TerminateProcess` is denied. A row that says "a fake
-//! answers" needs an answer no real handle gives: a `CreateProcess` handle is never refused and
-//! never fails a wait.
+//! A "UAC handle" is one a UAC elevation returned, opened without `PROCESS_TERMINATE`, so its
+//! `TerminateProcess` is denied. A `CreateProcess` handle is never refused and never fails a wait,
+//! so a row where "a fake answers" needs an answer no real handle gives.
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::time::Duration;
@@ -311,9 +310,13 @@ fn a_failed_spawn_teardown_with_a_failed_terminate_of_an_exited_child_is_reaped_
 /// ended it (exit code 1). The child is uncollected: handed back under `HandBack`, warned of as left
 /// under `Leave`.
 ///
+/// The test ends the process with code 0 itself, on the same thread after the teardown returned and
+/// before it waits: the teardown's kill is the only earlier call that can end it, so the exit code
+/// says who did, and the wait is on a process that is ending either way.
+///
 /// Mutants: the teardown answers `Unknown` for any failed wait; the kill sends nothing, so the
-/// process never exits and the owner's wait hangs; the teardown waits a second time; `HandBack` drops
-/// the child, or says it is left.
+/// process exits with code 0 and the exit code assertion fails; the teardown waits a second time;
+/// `HandBack` drops the child, or says it is left.
 #[skuld::test]
 fn a_failed_spawn_teardown_with_a_delivered_terminate_and_a_failed_wait_is_killed() {
     for disposition in DISPOSITIONS {
@@ -329,6 +332,7 @@ fn a_failed_spawn_teardown_with_a_delivered_terminate_and_a_failed_wait_is_kille
             "an uncollected child is handed back by HandBack alone: {disposition:?}"
         );
         assert_eq!(fake.looks(), 1, "the teardown made the wait that failed");
+        owner.end_with_code_zero()();
         assert_eq!(
             owner.wait_for_exit().code(),
             Some(1),

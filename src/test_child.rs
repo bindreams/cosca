@@ -45,6 +45,11 @@ pub(crate) mod member;
 
 pub(crate) mod over_fake;
 
+#[cfg(any(target_os = "linux", all(windows, feature = "tokio")))]
+mod parked;
+#[cfg(any(target_os = "linux", all(windows, feature = "tokio")))]
+pub(crate) use parked::Parked;
+
 #[cfg(target_os = "macos")]
 use crate::test_own_process;
 #[cfg(target_os = "macos")]
@@ -327,6 +332,48 @@ pub(crate) fn spawn_job_member() -> (std::process::Child, crate::containment::wi
     let child = spawn_more_blocker();
     let job = crate::containment::windows::assign_to_kill_on_close_job(child.as_raw_handle()).expect("assign to job");
     (child, job)
+}
+
+/// The one member of a [`spawn_job_gui_member`] job, and the control socket that keeps it running.
+#[cfg(all(windows, feature = "tokio"))]
+pub(crate) struct GuiMember {
+    child: std::process::Child,
+    sock: std::net::TcpStream,
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+impl GuiMember {
+    /// Ends the member (its socket closes) and reaps it.
+    pub(crate) fn exit(self) {
+        let GuiMember { mut child, sock } = self;
+        drop(sock);
+        child.wait().expect("wait for the GUI member to exit");
+    }
+}
+
+/// A live job whose only member is the GUI-subsystem testbin, after its handshake. Unlike
+/// [`spawn_job_member`]'s `cmd /C more`, which starts `more.com` and a `conhost.exe` into the job
+/// as it runs, this image starts nothing: the job holds exactly one process for as long as the
+/// member lives.
+#[cfg(all(windows, feature = "tokio"))]
+pub(crate) fn spawn_job_gui_member() -> (GuiMember, crate::containment::windows::JobHandle) {
+    use std::os::windows::io::AsRawHandle as _;
+
+    let (listener, addr) = registration_rendezvous();
+    let mut cmd = std::process::Command::new(testbin("cosca_testbin_gui"));
+    cmd.arg(&addr)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    cmd.env(ack::ACK_ENV, "1");
+    let child = crate::test_spawn::spawn(&mut cmd).expect("spawn the GUI-subsystem member");
+    let job = crate::containment::windows::assign_to_kill_on_close_job(child.as_raw_handle()).expect("assign to job");
+    let id = crate::identity::ProcessId::of(child.id())
+        .found()
+        .expect("the member's identity");
+    let sock = ctrl_break::accept_tagged(&listener, id, b'G');
+    (GuiMember { child, sock }, job)
 }
 
 /// A live job with `count` (at least one) running members, each a [`spawn_more_blocker`]:

@@ -638,7 +638,7 @@ mod poll {
         assert_eq!(set, 0, "lower RLIMIT_NOFILE");
     }
 
-    /// Mutant: `Ok(ready) => return Ok(false)`.
+    /// Mutant: a ready poll answers `Ok(false)`.
     #[skuld::test]
     fn any_ready_now_is_true_for_a_readable_descriptor() {
         let (rx, mut tx) = std::io::pipe().unwrap();
@@ -651,7 +651,7 @@ mod poll {
         );
     }
 
-    /// Mutant: `Ok(ready) => return Ok(ready >= 0)` or `Ok(true)`.
+    /// Mutant: a poll that found nothing answers `Ok(true)`.
     #[skuld::test]
     fn any_ready_now_is_false_when_nothing_is_ready() {
         let (rx, _tx) = std::io::pipe().unwrap();
@@ -662,7 +662,7 @@ mod poll {
 
     /// A failed poll is an error, never "nothing ready".
     ///
-    /// Mutant: `Err(e) => return Err(e)` becomes `Err(_) => return Ok(false)`.
+    /// Mutant: a failed poll answers `Ok(false)`.
     #[skuld::test]
     fn any_ready_now_reports_a_failed_poll_as_an_error() {
         let Some(_done) = own_process(
@@ -677,7 +677,9 @@ mod poll {
         assert_eq!(any_ready_now(&mut fds), Err(Errno::INVAL));
     }
 
-    /// Mutant: `Ok(_) => return Ok(())` becomes `Ok(_) => continue`, which blocks for good here.
+    /// The events the poll found are in the caller's slice.
+    ///
+    /// Mutant: `poll_ready` returns `Ok(())` without polling, so the slice's events stay empty.
     #[skuld::test]
     fn poll_ready_returns_once_a_descriptor_is_ready() {
         let (rx, mut tx) = std::io::pipe().unwrap();
@@ -692,7 +694,7 @@ mod poll {
 
     /// A failed poll is an error, not a return that looks like readiness.
     ///
-    /// Mutant: `Err(e) => return Err(e)` becomes `Err(_) => return Ok(())`.
+    /// Mutant: a failed poll answers `Ok(())`.
     #[skuld::test]
     fn poll_ready_reports_a_failed_poll_as_an_error() {
         let Some(_done) = own_process(
@@ -712,7 +714,7 @@ mod poll {
     /// after the kernel shows it inside the poll, so the signal cannot land before or after it.
     /// Runs in a process of its own: a signal's disposition is process-wide.
     ///
-    /// Mutant: `Err(Errno::INTR) => continue` is dropped, so the `EINTR` is returned.
+    /// Mutant: `poll_ready` polls without `retry_on_intr`, so the `EINTR` is returned.
     #[cfg(target_os = "linux")]
     #[skuld::test]
     fn poll_ready_retries_an_interrupted_poll() {

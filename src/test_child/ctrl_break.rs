@@ -219,7 +219,7 @@ pub(crate) fn accept_root(listener: &TcpListener, root: crate::identity::Process
 }
 
 /// Accepts `root` (death-watched) and reads its tag, which must be `tag`.
-fn accept_tagged(listener: &TcpListener, root: crate::identity::ProcessId, tag: u8) -> TcpStream {
+pub(crate) fn accept_tagged(listener: &TcpListener, root: crate::identity::ProcessId, tag: u8) -> TcpStream {
     let mut sock = accept_or_die(listener, root);
     let mut got = [0u8; 1];
     sock.read_exact(&mut got).expect("the root's tag");

@@ -485,19 +485,37 @@ mod in_a_cgroup {
     /// and the `Unreaped` is waited for later. The child sits outside the leaf, as a program that
     /// moved itself out does, so the leaf's `cgroup.kill` does not end it.
     ///
-    /// Mutants: the leaf is held by the handed-back child; the call blocks on the root (that one is
-    /// caught by the suite slow-timeout, not by an assertion).
+    /// The root's stdin is released at the first block the call makes on a descriptor
+    /// (`WaitObject::Fd`): the wait on the root is one, the leaf's drain is not a descriptor block.
+    /// The hook runs just before the blocking call, so the root exits as the call blocks, whatever
+    /// the wait's deadline, and a call that waits for it reaps it. The hook owns the stdin and is
+    /// the hand-back's `release`, which drops first, so a call that never blocks and a failed
+    /// assertion both end the test.
+    ///
+    /// Mutants: the leaf is held by the handed-back child; the call waits on the root, which the
+    /// hook then ends, so the fate is `Reaped` and the fate assertion fails.
     #[skuld::test]
     fn a_handed_back_child_does_not_hold_up_its_leaf(#[fixture(cgroup)] _group: &Group) {
+        use crate::wait::block_probe::{on_each_block, WaitObject};
+
         let (mut child, stdin) = blocker_in_a_leaf();
         let pid = child.pid();
         let leaf = cgroup_dir_of(pid);
         move_out_of_its_leaf(pid);
         refuse_the_kill(&mut child);
+        let mut stdin = Some(stdin);
+        let release_at_the_block = on_each_block(move |block| {
+            if matches!(block.on, WaitObject::Fd(_)) {
+                drop(stdin.take());
+            }
+        });
 
-        let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
+        let (fate, handed_back) = tear_down_holding(child, release_at_the_block, Disposition::HandBack);
 
-        assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
+        assert!(
+            matches!(fate, ChildFate::Running { .. }),
+            "the call blocked on the root, which the hook ended: {fate:?}"
+        );
         handed_back.unreaped();
         assert!(!Path::new(&leaf).exists(), "the leaf {leaf} was removed by the call");
         handed_back.wait();

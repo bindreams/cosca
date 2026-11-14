@@ -1045,9 +1045,16 @@ fn wait_drained_raw_names_a_pid_listed_twice_that_cannot_be_proved_a_member() {
 /// A live member in the job that refuses even the query-only open, no deadline: `Unassessable` naming
 /// it, not a listing again for as long as it lives.
 ///
-/// Mutant: an unproved pid is not a member, so the round lists again and never answers.
+/// The member is listed twice and a third listing fails, where the real job would list it for as
+/// long as it lives; that the real job lists such a member twice is
+/// `a_pid_listed_twice_whose_membership_cannot_be_established_is_unobserved_with_its_pid`'s.
+///
+/// Mutant: an unproved pid is not a member, so the round lists a third time and the error and
+/// listing-count assertions fail.
 #[skuld::test]
 fn wait_drained_raw_answers_for_a_live_member_that_refuses_the_query_open() {
+    use windows::Win32::Foundation::ERROR_GEN_FAILURE;
+
     let Some(done) = crate::test_own_process::own_process(
         crate::test_own_process::test_path!(wait_drained_raw_answers_for_a_live_member_that_refuses_the_query_open),
         crate::test_spawn::spawn,
@@ -1058,9 +1065,17 @@ fn wait_drained_raw_answers_for_a_live_member_that_refuses_the_query_open() {
     let job = super::JobHandle::create_empty_for_test();
     job.assign_for_test(refused.handle().0)
         .expect("assign the refusing member to the job");
+    let forced =
+        super::fault::force_job_pid_lists_then_failure([vec![refused.pid()], vec![refused.pid()]], ERROR_GEN_FAILURE.0);
 
     let verdict = super::wait_drained_raw(&job, None);
 
+    assert_eq!(
+        super::fault::job_pid_list_queries(),
+        2,
+        "answered by the settling listing, before any further one: {verdict:?}"
+    );
+    drop(forced);
     let error = verdict.expect_err("a live member that cannot be waited for is not a drained tree");
     assert!(
         matches!(&error, crate::error::Error::Unassessable { detail, .. }

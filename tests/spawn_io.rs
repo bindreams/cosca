@@ -355,8 +355,8 @@ fn testbin_child(mode: &[&str]) -> cosca::Child {
 /// A child that closes its stdin ends the input but not the output: everything it goes on to
 /// print is still collected, though input was left unwritten.
 ///
-/// Mutant: a broken pipe on stdin ends the draining of stdout and stderr (the child then hangs
-/// on a full pipe, or the output is cut short).
+/// Mutant: a broken pipe on stdin ends the draining of stdout and stderr; the `stdout` assertion
+/// fails on the cut-short output, the status assertion alone would pass.
 #[skuld::test]
 fn a_child_that_closes_stdin_is_still_drained() {
     let mut child = testbin_child(&["close-std", "stdin", "1000000"]);

@@ -146,7 +146,12 @@ fn a_listing_that_grew_is_read_again_before_the_exit_is_begun() {
 }
 
 /// Threads that all show the flag are begun once a listing is covered by the one before it, though the
-/// listing grew in between. Mutant: a grown listing never ends the reads.
+/// listing grew in between.
+///
+/// The fourth listing fails (`EIO`), so a read that goes on past the third ends in an unknown answer
+/// and fails the assertion.
+///
+/// Mutant: a grown listing never ends the reads.
 #[skuld::test]
 fn a_listing_covered_by_the_one_before_it_ends_the_reads() {
     let (fd, _writer) = pidfd();
@@ -156,6 +161,7 @@ fn a_listing_covered_by_the_one_before_it_ends_the_reads() {
         .on_pidfs_ino(PID, Ok(Some(INO)))
         .on_tids(PID, Ok(&[PID]))
         .on_tids_after(PID, 1, Ok(&[PID, 4243]))
+        .on_tids_after(PID, 3, Err(libc::EIO))
         .on_read(&task_stat(PID), Ok(&stat_with(EXITING, START)))
         .on_read(&task_stat(4243), Ok(&stat_with(EXITING, START)));
     assert_eq!(begun(pidfs_id(), &kernel), Resolved::Found(true));

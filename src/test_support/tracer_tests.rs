@@ -619,8 +619,11 @@ fn a_stop_record_of_an_exiting_tracee_is_its_kill(#[fixture(tracer_group)] _grou
     assert_sigkilled(tracee);
 }
 
-/// Mutant: `stopped_by` takes a tracee that is only stopped for one that ends, so
-/// `assert_sigkilled` would wait on it forever.
+/// The verdict is checked on the stop record before `end_stopped`, whose wait would not end for a
+/// tracee that reads as ending.
+///
+/// Mutant: `stopped_by` takes a tracee that is only stopped for one that ends, so the assertion
+/// fails.
 #[skuld::test]
 fn a_stopped_tracee_reads_as_stopped(#[fixture(tracer_group)] _group: &Group) {
     let (tracee, _stdin) = tracee();
