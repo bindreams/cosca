@@ -299,9 +299,8 @@ fn wait_drained_raw_with_an_elapsed_deadline_lists_no_third_time() {
     drop(forced);
 }
 
-/// On a round past the deadline, the listing that settles the pids the first left unproved is the one
-/// more listing: it names a pid that was not among them (here a live member), so the answer is
-/// `MembersRemain`, with no third listing. A third would be the real, empty job.
+/// Past the deadline the settling listing is the final one: it names a live member, so `MembersRemain`,
+/// with no third listing.
 ///
 /// Mutant: the round falls through to the final listing after it.
 #[skuld::test]
@@ -660,14 +659,19 @@ fn a_pid_listed_once_whose_membership_cannot_be_established_is_dropped() {
 
     let (members, unobserved) = job.list_members(None);
 
+    assert_eq!(
+        super::fault::job_pid_list_queries(),
+        2,
+        "the listing, and the one that settles it"
+    );
     drop(forced);
     assert!(members.is_empty(), "{members:?}");
     assert!(unobserved.is_empty(), "{unobserved:?}");
 }
 
 /// When the listing that settles the unproved pids fails, neither those pids nor the listing can be
-/// cleared: each is returned (the pid named, the listing nameless, with its own cause), for the kill's
-/// wait to report.
+/// cleared: each is returned (the pid named, the listing nameless, with its own cause and its own
+/// text, which does not say the first listing failed), for the kill's wait to report.
 ///
 /// Mutant: the failed second listing is dropped, as an empty one is, and the unproved pid with it.
 #[skuld::test]
@@ -706,6 +710,11 @@ fn list_members_reports_the_unproved_pids_and_the_listing_when_the_second_listin
     assert_eq!(
         crate::error::first_os_code(listing.why()),
         Some(ERROR_NOT_ENOUGH_MEMORY.0 as i32),
+        "{listing:?}"
+    );
+    assert!(
+        matches!(listing.why(), crate::error::Error::Unassessable { detail, .. }
+            if !detail.contains("before the kill")),
         "{listing:?}"
     );
 }
@@ -970,9 +979,8 @@ fn wait_drained_raw_names_a_member_it_may_not_wait_on_while_the_job_lists_it() {
     );
 }
 
-/// A listed pid that nothing lets the caller open (a deleted member's pid, reused by a process whose
-/// DACL grants nothing: the fixture's empty DACL) is not shown to be a member, so the round lists again
-/// and the drain answers `AllMembersExited` once the listing is empty. The fixture is not in the job.
+/// A listed pid nothing lets the caller open (a deleted member's, reused by the fixture with an empty
+/// DACL, not in the job) is no member: with the listing empty after it, `AllMembersExited`.
 ///
 /// Mutant: a refused open of a listed pid is the drain's error whatever membership it could prove.
 #[skuld::test]
@@ -989,6 +997,11 @@ fn wait_drained_raw_lists_again_when_every_listed_pid_is_refused_and_unproved() 
 
     let verdict = super::wait_drained_raw(&job, None);
 
+    assert_eq!(
+        super::fault::job_pid_list_queries(),
+        2,
+        "the listing, and the one that settles it"
+    );
     drop(forced);
     assert_eq!(
         verdict.expect("a refused pid the job cannot be shown to hold is not a failed drain"),
@@ -996,12 +1009,11 @@ fn wait_drained_raw_lists_again_when_every_listed_pid_is_refused_and_unproved() 
     );
 }
 
-/// A pid the job's list names twice in a row that nothing lets the caller open is not a deleted member's
-/// (that shows for one listing): the drain answers `Unassessable` naming it instead of listing again.
-/// The fixture is outside the job, so the forced listings stand for a live member that refuses.
+/// A pid listed twice in a row and unprovable the second time: `Unassessable` naming it, with no
+/// further listing. The fixture is outside the job; the forced listings stand for a live member.
 ///
-/// Mutant: a round whose listed pids are all unproved lists again without the second listing, and the
-/// drain never answers.
+/// Mutant: the round lists again through `Round::List`, so a third (real, empty) listing answers
+/// `AllMembersExited` and `expect_err` fails.
 #[skuld::test]
 fn wait_drained_raw_names_a_pid_listed_twice_that_cannot_be_proved_a_member() {
     let Some(done) = crate::test_own_process::own_process(
@@ -1016,6 +1028,11 @@ fn wait_drained_raw_names_a_pid_listed_twice_that_cannot_be_proved_a_member() {
 
     let verdict = super::wait_drained_raw(&job, None);
 
+    assert_eq!(
+        super::fault::job_pid_list_queries(),
+        2,
+        "answered by the settling listing, before any further one"
+    );
     drop(forced);
     let error = verdict.expect_err("a pid that stays unproved is not a drained tree");
     assert!(
@@ -1025,9 +1042,8 @@ fn wait_drained_raw_names_a_pid_listed_twice_that_cannot_be_proved_a_member() {
     );
 }
 
-/// A live member that refuses the caller even the query-only open (its DACL grants nothing), in the
-/// job, with no deadline: the drain answers (`Unassessable` naming it) instead of listing it again for
-/// as long as it lives.
+/// A live member in the job that refuses even the query-only open, no deadline: `Unassessable` naming
+/// it, not a listing again for as long as it lives.
 ///
 /// Mutant: an unproved pid is not a member, so the round lists again and never answers.
 #[skuld::test]
@@ -1053,9 +1069,8 @@ fn wait_drained_raw_answers_for_a_live_member_that_refuses_the_query_open() {
     );
 }
 
-/// A pid the first look could not prove (forced) and the second listing names again, which the second
-/// look proves a member that refuses only the wait, is the member's refusal: `Unassessable` naming it,
-/// with the second look's cause (`ACCESS_DENIED`), not the first look's.
+/// A pid unproved on the first look (forced) that the second look proves a member refusing only the
+/// wait: `Unassessable` naming it, with the second look's cause (`ACCESS_DENIED`).
 ///
 /// Mutant: the recheck treats that `Err` as an unproved pid, or drops it.
 #[skuld::test]
@@ -1101,9 +1116,8 @@ fn wait_drained_raw_names_a_pid_the_second_look_proves_a_member_that_refuses_the
     );
 }
 
-/// A pid the first look could not prove (forced) that the second listing names again and the second
-/// look proves a member (it is a live member the caller may open) is held: the round watches it, instead
-/// of closing it and listing a third time.
+/// A pid unproved on the first look (forced) that the second look proves a member the caller may open
+/// is watched by the round, not closed for a third listing.
 ///
 /// Mutant: the recheck closes a proved member and answers `Round::List`.
 #[skuld::test]
@@ -1129,6 +1143,286 @@ fn drain_round_watches_a_pid_the_second_look_proves_a_member() {
     job.hard_kill().expect("end the member");
     let_member_exit(child);
     assert!(watched, "the proved member is watched");
+}
+
+/// A wait open that was refused (for another process, which held the pid then) of a pid a member the
+/// caller can wait on holds now: the member is watched, with the handle of the retry made while the
+/// membership proof holds the pid, not blamed for the first open's refusal.
+///
+/// Mutant: the first open's refusal is the member's, returned at once.
+#[skuld::test]
+fn a_refused_wait_open_of_a_pid_a_waitable_member_holds_now_is_that_member() {
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    let (child, job) = spawn_job_member();
+    let refused = Err(windows::core::Error::from_hresult(HRESULT::from_win32(
+        ERROR_ACCESS_DENIED.0,
+    )));
+
+    let standing = super::member_to_watch_for_wait(child.id(), job.raw, refused);
+
+    job.hard_kill().expect("end the member");
+    let_member_exit(child);
+    let Ok(super::Standing::Member(held)) = standing else {
+        panic!("a member the caller can wait on is watched: {standing:?}");
+    };
+    // SAFETY: opened by `member_to_watch_for_wait`, kept nowhere else.
+    _ = unsafe { windows::Win32::Foundation::CloseHandle(held) };
+}
+
+/// The pids a listing left unproved, each with a refusal, for [`super::settle_unproved`].
+fn unproved_pids(pids: &[u32]) -> Vec<(u32, std::io::Error)> {
+    pids.iter()
+        .map(|pid| (*pid, std::io::Error::from_raw_os_error(5)))
+        .collect()
+}
+
+/// A failed settling listing is `ListingFailed`, with its own cause.
+///
+/// Mutant: it is read as an empty listing.
+#[skuld::test]
+fn settle_unproved_reports_a_failed_listing() {
+    use windows::Win32::Foundation::ERROR_NOT_ENOUGH_MEMORY;
+
+    let job = super::JobHandle::create_empty_for_test();
+    let forced = super::fault::force_job_pid_lists_then_failure([], ERROR_NOT_ENOUGH_MEMORY.0);
+
+    let outcome = super::settle_unproved(job.raw, &unproved_pids(&[5]));
+
+    drop(forced);
+    let super::SettleOutcome::ListingFailed(cause) = outcome else {
+        panic!("the failed listing is reported");
+    };
+    assert_eq!(
+        cause.raw_os_error(),
+        Some(ERROR_NOT_ENOUGH_MEMORY.0 as i32),
+        "{cause:?}"
+    );
+}
+
+/// An empty settling listing is `Empty`: the caller must not read it as a listing that names no
+/// unproved pid, because it is the drain's confirmation.
+///
+/// Mutant: it is `Named` with no pids.
+#[skuld::test]
+fn settle_unproved_reports_an_empty_listing() {
+    let job = super::JobHandle::create_empty_for_test();
+    let forced = super::fault::force_job_pid_list(Vec::new());
+
+    let outcome = super::settle_unproved(job.raw, &unproved_pids(&[5]));
+
+    drop(forced);
+    assert!(matches!(outcome, super::SettleOutcome::Empty));
+}
+
+/// The settling listing keeps the unproved pids it names again, in order, and drops the others (a
+/// deleted member's pid, which it no longer names); a pid only it names is not one to look at.
+///
+/// Mutant: every unproved pid is kept, or every listed pid is.
+#[skuld::test]
+fn settle_unproved_keeps_only_the_unproved_pids_the_listing_names_again() {
+    let job = super::JobHandle::create_empty_for_test();
+    let forced = super::fault::force_job_pid_list(vec![9, 7, 5]);
+
+    let outcome = super::settle_unproved(job.raw, &unproved_pids(&[5, 6, 7]));
+
+    drop(forced);
+    let super::SettleOutcome::Named(named) = outcome else {
+        panic!("a non-empty listing names pids");
+    };
+    assert_eq!(named, vec![5, 7]);
+}
+
+/// A non-empty settling listing that names none of the unproved pids is `Named` with none.
+///
+/// Mutant: it is `Empty`, which the drain confirms as drained.
+#[skuld::test]
+fn settle_unproved_reports_a_listing_that_names_none_of_them() {
+    let job = super::JobHandle::create_empty_for_test();
+    let forced = super::fault::force_job_pid_list(vec![9]);
+
+    let outcome = super::settle_unproved(job.raw, &unproved_pids(&[5]));
+
+    drop(forced);
+    assert!(matches!(outcome, super::SettleOutcome::Named(named) if named.is_empty()));
+}
+
+/// The round's own settling listing, when it is empty, is confirmed at once, on any round, with no
+/// listing after it.
+///
+/// Mutant: the round answers `Round::List`, which lists a third time.
+#[skuld::test]
+fn drain_round_confirms_an_empty_settling_listing() {
+    use windows::Win32::Foundation::ERROR_GEN_FAILURE;
+
+    let job = super::JobHandle::create_empty_for_test();
+    let pid = std::process::id();
+    for last_round in [false, true] {
+        let first_look = super::fault::force_next_for_thread(super::fault::Step::Membership, ERROR_GEN_FAILURE.0, pid);
+        let forced = super::fault::force_job_pid_lists([vec![pid], Vec::new()]);
+
+        let round = super::drain_round(job.raw, last_round);
+
+        assert_eq!(
+            super::fault::job_pid_list_queries(),
+            2,
+            "the listing, and the one that settles it (last round: {last_round})"
+        );
+        drop(forced);
+        drop(first_look);
+        assert!(matches!(round, Ok(super::Round::Confirm)), "last round: {last_round}");
+    }
+}
+
+/// A last round whose settling listing names the unproved pid again, still unprovable, answers
+/// `Unassessable` naming it: not `MembersRemain`.
+///
+/// Mutant: the last-round answer is `MembersRemain` before the pid is looked at again.
+#[skuld::test]
+fn drain_round_names_an_unproved_pid_the_last_rounds_settling_listing_names_again() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(
+            drain_round_names_an_unproved_pid_the_last_rounds_settling_listing_names_again
+        ),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let refused = crate::identity::windows_fixture::spawn_unkillable(&done);
+    let job = super::JobHandle::create_empty_for_test();
+    let forced = super::fault::force_job_pid_lists([vec![refused.pid()], vec![refused.pid()]]);
+
+    let round = super::drain_round(job.raw, true);
+
+    assert_eq!(super::fault::job_pid_list_queries(), 2);
+    drop(forced);
+    assert!(
+        matches!(&round, Err(crate::error::Error::Unassessable { detail, source: Some(_) })
+            if detail.contains(&refused.pid().to_string())),
+        "{:?}",
+        round.map(|_| ())
+    );
+}
+
+/// A failed settling listing fails the round with its own error.
+///
+/// Mutant: the unproved pids are dropped as if the listing were empty.
+#[skuld::test]
+fn drain_round_fails_when_the_settling_listing_fails() {
+    use windows::Win32::Foundation::{ERROR_GEN_FAILURE, ERROR_NOT_ENOUGH_MEMORY};
+
+    let job = super::JobHandle::create_empty_for_test();
+    let pid = std::process::id();
+    let first_look = super::fault::force_next_for_thread(super::fault::Step::Membership, ERROR_GEN_FAILURE.0, pid);
+    let forced = super::fault::force_job_pid_lists_then_failure([vec![pid]], ERROR_NOT_ENOUGH_MEMORY.0);
+
+    let round = super::drain_round(job.raw, false);
+
+    drop(forced);
+    drop(first_look);
+    let Err(crate::error::Error::Io(cause)) = round else {
+        panic!("the failed listing fails the round");
+    };
+    assert_eq!(
+        cause.raw_os_error(),
+        Some(ERROR_NOT_ENOUGH_MEMORY.0 as i32),
+        "{cause:?}"
+    );
+}
+
+/// A pid unproved on the first look and named again, which the second look proves is not in the job
+/// (its number was reused), is dropped: the round lists again.
+///
+/// Mutant: the pid is an error, or the round watches it.
+#[skuld::test]
+fn drain_round_drops_a_pid_the_second_look_proves_not_a_member() {
+    use windows::Win32::Foundation::ERROR_GEN_FAILURE;
+
+    let job = super::JobHandle::create_empty_for_test();
+    let pid = std::process::id();
+    let first_look = super::fault::force_next_for_thread(super::fault::Step::Membership, ERROR_GEN_FAILURE.0, pid);
+    let forced = super::fault::force_job_pid_lists([vec![pid], vec![pid]]);
+
+    let round = super::drain_round(job.raw, false);
+
+    assert_eq!(super::fault::job_pid_list_queries(), 2);
+    drop(forced);
+    drop(first_look);
+    assert!(matches!(round, Ok(super::Round::List)));
+}
+
+/// The kill's listing: a pid unproved on the first look that the second listing names again and the
+/// second look proves a member is one of the members the kill's wait waits for.
+///
+/// Mutant: the second look's member is dropped.
+#[skuld::test]
+fn list_members_names_a_pid_the_second_look_proves_a_member() {
+    use windows::Win32::Foundation::ERROR_GEN_FAILURE;
+
+    let (child, job) = spawn_job_member();
+    let pid = child.id();
+    let first_look = super::fault::force_next_for_thread(super::fault::Step::Membership, ERROR_GEN_FAILURE.0, pid);
+    let forced = super::fault::force_job_pid_lists([vec![pid], vec![pid]]);
+
+    let (members, unobserved) = job.list_members(None);
+
+    drop(forced);
+    drop(first_look);
+    job.hard_kill().expect("end the member");
+    let_member_exit(child);
+    assert_eq!(members.iter().filter(|id| id.pid() == pid).count(), 1, "{members:?}");
+    assert!(unobserved.is_empty(), "{unobserved:?}");
+}
+
+/// The kill's listing: a pid the second look proves not in the job is neither a member nor
+/// unobserved.
+///
+/// Mutant: it is returned as unobserved.
+#[skuld::test]
+fn list_members_drops_a_pid_the_second_look_proves_not_a_member() {
+    use windows::Win32::Foundation::ERROR_GEN_FAILURE;
+
+    let job = super::JobHandle::create_empty_for_test();
+    let pid = std::process::id();
+    let first_look = super::fault::force_next_for_thread(super::fault::Step::Membership, ERROR_GEN_FAILURE.0, pid);
+    let forced = super::fault::force_job_pid_lists([vec![pid], vec![pid]]);
+
+    let (members, unobserved) = job.list_members(None);
+
+    drop(forced);
+    drop(first_look);
+    assert!(members.is_empty(), "{members:?}");
+    assert!(unobserved.is_empty(), "{unobserved:?}");
+}
+
+/// The kill's listing: a pid the second look proves a member whose start time cannot be read is
+/// unobserved, with its pid.
+///
+/// Mutant: the identity error of the second look is dropped.
+#[skuld::test]
+fn list_members_reports_a_member_the_second_look_cannot_identify() {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_GEN_FAILURE};
+
+    let (child, job) = spawn_job_member();
+    let pid = child.id();
+    let identity = super::fault::force_next_for_thread(super::fault::Step::Identity, ERROR_ACCESS_DENIED.0, pid);
+    let first_look = super::fault::force_next_for_thread(super::fault::Step::Membership, ERROR_GEN_FAILURE.0, pid);
+    let forced = super::fault::force_job_pid_lists([vec![pid], vec![pid]]);
+
+    let (members, unobserved) = job.list_members(None);
+
+    drop(forced);
+    drop(first_look);
+    drop(identity);
+    job.hard_kill().expect("end the member");
+    let_member_exit(child);
+    assert!(members.is_empty(), "{members:?}");
+    assert_eq!(
+        unobserved.iter().filter(|unnamed| unnamed.pid == Some(pid)).count(),
+        1,
+        "{unobserved:?}"
+    );
 }
 
 /// A kill's wait names a member it may not wait on once: the edge's confirmation of the empty listing
