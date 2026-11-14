@@ -625,8 +625,9 @@ pub(crate) enum SettleOutcome {
     /// left for the caller to report, and the tree is vouched for.
     Killed,
     /// The kill was skipped (and the sweep by identity of a macOS fd marker left nothing): it killed
-    /// nothing, and the state left is not unvouched.
-    Skipped,
+    /// nothing, and the state left is not unvouched. `over_killed`: the tree was already killed when
+    /// the settlement found it, read under the one lock that settled it.
+    Skipped { over_killed: bool },
     /// The state left is [`Unvouched`](Vouching::Unvouched), whatever the call did: a skipped kill
     /// over a tree a skip moved there from held members (refused ones, or ones a `SIGTERM` walk
     /// reached) that are gone, or a walk that left only the root, whose own end then made the answer
@@ -773,6 +774,14 @@ pub(crate) enum TreeKillOutcome {
         allow(dead_code, reason = "only a Unix mechanism skips by the root's number")
     )]
     Skipped(Skip),
+    /// A skipped kill as a tree call settles it ([`SkipCall`](crate::containment::SkipCall)): the call
+    /// keeps the [`Skip`] to word it, and the settlement takes only the sweep by identity of a macOS fd
+    /// marker's holders (`None`: the mechanism has none). It settles as [`Skipped`](Self::Skipped) does.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only a Unix mechanism skips by the root's number")
+    )]
+    SkippedHolders(Option<Result<(), Error>>),
 }
 
 /// What a `kill_tree` call's settlement keeps for the walk that may follow it
@@ -850,7 +859,9 @@ impl TreeKillOutcome {
     pub(crate) fn into_result(self) -> Result<(), Unkilled> {
         match self {
             TreeKillOutcome::Ran(result) | TreeKillOutcome::Answered(result) => result,
-            TreeKillOutcome::Skipped(skip) => skip.holders.unwrap_or(Ok(())).map_err(Unkilled::from),
+            TreeKillOutcome::Skipped(Skip { holders, .. }) | TreeKillOutcome::SkippedHolders(holders) => {
+                holders.unwrap_or(Ok(())).map_err(Unkilled::from)
+            }
             TreeKillOutcome::Unwalked(error) => Err(Unkilled::from(error)),
             TreeKillOutcome::NoRoot(pid, _) => Err(Unkilled::from(Self::no_root_error(pid))),
             #[cfg(unix)]
@@ -883,10 +894,12 @@ impl TreeKillOutcome {
             TreeKillOutcome::Skipped(Skip {
                 holders: Some(Err(error)),
                 ..
-            }) => word(error),
+            })
+            | TreeKillOutcome::SkippedHolders(Some(Err(error))) => word(error),
             TreeKillOutcome::Skipped(Skip { action, .. }) => {
                 format!("the kill was skipped, and would {action}")
             }
+            TreeKillOutcome::SkippedHolders(_) => "the kill was skipped".to_owned(),
             TreeKillOutcome::Unwalked(error) | TreeKillOutcome::ExitUnread(error) => word(error),
             TreeKillOutcome::NoRoot(pid, _) => word(&Self::no_root_error(*pid)),
             TreeKillOutcome::RootExiting(pid, _) => word(&Self::exiting_root_error(*pid)),
@@ -902,6 +915,7 @@ impl TreeKillOutcome {
         match self {
             TreeKillOutcome::Skipped(skip) => Some(&skip.action),
             TreeKillOutcome::Ran(_)
+            | TreeKillOutcome::SkippedHolders(_)
             | TreeKillOutcome::Answered(_)
             | TreeKillOutcome::Unwalked(_)
             | TreeKillOutcome::ExitUnread(_)
@@ -1234,7 +1248,9 @@ impl TreeKilled {
                 debug_assert!(after.vouching == Vouching::Killed, "`Killed` answers a killed tree");
                 SettleOutcome::Killed
             }
-            _ => SettleOutcome::Skipped,
+            _ => SettleOutcome::Skipped {
+                over_killed: was_killed,
+            },
         });
         *state = after;
         Settled { answer, killed_again }
@@ -1292,7 +1308,7 @@ impl TreeKilled {
         let (left, failure) = match settled.answer {
             Err(left) => (crate::error::Report(&left).to_string(), Some(left)),
             Ok(SettleOutcome::Unvouched { kind }) => (kind.drop_text(), None),
-            Ok(SettleOutcome::Killed | SettleOutcome::Skipped) => return None,
+            Ok(SettleOutcome::Killed | SettleOutcome::Skipped { .. }) => return None,
         };
         let after = match (unwalked, &settled.killed_again[..]) {
             (false, _) => String::new(),

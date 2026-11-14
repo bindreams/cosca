@@ -26,29 +26,19 @@ pub(crate) struct Skip {
 #[cfg(unix)]
 impl Skip {
     /// Whether the handle already killed the tree and the reason for the skip is one a kill does not
-    /// outlive: this handle's own reap left the root's pid naming no process or unreadable, or the
-    /// root's number cannot be trusted (macOS). There is nothing left for the skip to leave undone.
+    /// outlive ([`moot_after_kill`](Skip::moot_after_kill)). There is nothing left for the skip to
+    /// leave undone.
     pub(crate) fn is_moot(&self, tree: &crate::containment::Tree) -> bool {
-        tree.is_killed()
-            && matches!(
-                &self.why,
-                Why::MayNameAnother(Refusal::ReapedPidGone(_) | Refusal::ReapedPidUnread(..), _)
-                    | Why::Untrusted { .. }
-            )
+        tree.is_killed() && self.moot_after_kill()
     }
 
-    /// A skip that carries only the holders' sweep, which is all a settlement reads of one
-    /// ([`TreeKillOutcome::into_result`](crate::containment::dispatch::TreeKillOutcome)).
-    fn of_holders(holders: Option<Result<(), Error>>) -> Skip {
-        Skip {
-            action: String::new(),
-            why: Why::Untrusted {
-                why: String::new(),
-                cause: None,
-            },
-            root_alone: false,
-            holders,
-        }
+    /// Whether the reason is one a kill of the tree does not outlive: this handle's own reap left the
+    /// root's pid naming no process or unreadable, or the root's number cannot be trusted (macOS).
+    fn moot_after_kill(&self) -> bool {
+        matches!(
+            &self.why,
+            Why::MayNameAnother(Refusal::ReapedPidGone(_) | Refusal::ReapedPidUnread(..), _) | Why::Untrusted { .. }
+        )
     }
 
     /// The error of a sweep that skipped what the root's number names: the holders' sweep's own
@@ -177,7 +167,7 @@ pub(crate) use call::SkipCall;
 #[cfg(unix)]
 mod call {
     use super::{Skip, Why};
-    use crate::containment::dispatch::{Keeping, Settled, TreeKillOutcome, TreeSignal};
+    use crate::containment::dispatch::{Keeping, SettleOutcome, Settled, TreeKillOutcome, TreeSignal};
     use crate::containment::root::Refusal;
     use crate::containment::Tree;
     use crate::error::Error;
@@ -234,24 +224,25 @@ mod call {
         /// skipped and what was sent (a skip over an untrusted root, which never warns, words it in
         /// the error only). The error is the settlement's when it left members (the holders' sweep
         /// that failed, a member an earlier kill refused), else the root signal's, or `Unassessable`
-        /// naming the members the settlement killed by identity, with each other failure of the call,
-        /// and the error behind the skip's reason, below its variant ([`Error::with_peers`]); a root
-        /// signal that failed with an [`Error::Io`], a leaf with no slot, goes below the
-        /// `Unassessable`, after the reason. `Ok` only for a skip that is moot ([`Skip::is_moot`]):
-        /// the tree is already killed.
+        /// naming the members the settlement killed by identity. The skip's own `Unassessable` and each
+        /// other failure of the call, with the error behind the skip's reason below that, join it
+        /// ([`Error::with_peers`]); a root signal that failed with an [`Error::Io`], a leaf with no
+        /// slot, goes below the `Unassessable`, after the reason. `Ok` only for a skip that is moot
+        /// ([`Skip::is_moot`]): the settlement found the tree already killed.
         pub(crate) fn answer(
             &self,
             tree: &Tree,
             mut skip: Skip,
             root: Option<Result<Sent, Error>>,
         ) -> Settled<Result<(), Error>> {
-            if skip.is_moot(tree) {
-                self.log_moot(&skip);
-                return self.settle_skip(tree, &mut skip);
-            }
             let swept = skip.holders.is_some();
             let went = self.went(&skip.holders, &root);
-            let Settled { answer, killed_again } = self.settle_skip(tree, &mut skip);
+            let root = root.and_then(Result::err);
+            let (Settled { answer, killed_again }, over_killed) = self.settle_skip(tree, skip.holders.take());
+            if over_killed && skip.moot_after_kill() {
+                self.log_moot(&skip, root.as_ref());
+                return Settled { answer, killed_again };
+            }
             let held = (!killed_again.is_empty()).then(|| {
                 let pids: Vec<String> = killed_again.iter().map(|id| id.pid().to_string()).collect();
                 format!("killed the members it held by identity (pid {})", pids.join(", "))
@@ -260,23 +251,26 @@ mod call {
             // The warn says each failure in full; the returned `Unassessable` says only that it
             // failed, for the failure is a peer or a cause of the answer.
             let detail = match &skip.why {
-                Why::Untrusted { why, cause: io } => self.untrusted_detail(
-                    &skip.action,
-                    why,
-                    io.as_deref(),
-                    swept,
-                    &went.said(held.as_deref(), false),
-                ),
+                Why::Untrusted { why, cause: io } => {
+                    if swept {
+                        self.log_untrusted_sweep(&skip.action, why, io.as_deref());
+                    }
+                    self.untrusted_detail(&skip.action, why, swept, &went.said(held.as_deref(), false))
+                }
                 Why::MayNameAnother(..) => {
                     skip.why
                         .warn(&self.skipped_detail(&skip, &went.said(held.as_deref(), true)));
                     self.skipped_detail(&skip, &went.said(held.as_deref(), false))
                 }
             };
-            // The other failures of the call join the one it returns, and the warn above still says
-            // each in one line.
-            let answer = match (answer, root.and_then(Result::err)) {
-                (Err(left), root) => left.with_peers(root.map(Arc::new).into_iter().chain(cause)),
+            // The other failures of the call join the one it returns.
+            let answer = match (answer, root) {
+                // The skip's words go with the members left: nothing else says it was skipped.
+                (Err(left), root) => left.with_peers(
+                    root.map(Arc::new)
+                        .into_iter()
+                        .chain([Arc::new(Error::Unassessable { detail, source: cause })]),
+                ),
                 // An `Io` is a leaf with no slot: it goes below the call's `Unassessable`.
                 (Ok(()), Some(root)) if !swept => root.with_peers_or_unassessable(|| detail, cause, []),
                 (Ok(()), root) => Error::Unassessable { detail, source: cause }.with_peers(root.map(Arc::new)),
@@ -287,19 +281,29 @@ mod call {
             }
         }
 
-        /// The one settlement of a skip, for every kind of skip: a `Kill` is settled as a drop settles
-        /// it, a skip, so the error holds every member the tree is left with (the holders' sweep that
-        /// failed, a member an earlier kill refused) and the members killed again by identity come with
-        /// it; a `Term` settles nothing and answers the holders' sweep. Takes the holders out of `skip`.
-        fn settle_skip(&self, tree: &Tree, skip: &mut Skip) -> Settled<Result<(), Error>> {
-            let holders = skip.holders.take();
+        /// The one settlement of a skip, whatever its kind; `holders` is the sweep by identity of the
+        /// marker holders. `Kill` settles as a drop does: the error holds every member the tree is left
+        /// with (a failed holders' sweep, a member an earlier kill refused), and the members killed
+        /// again by identity come back with it. `Term` settles nothing and answers the holders' sweep.
+        /// The `bool`: the tree was already killed when settled, read under the settlement's lock.
+        fn settle_skip(&self, tree: &Tree, holders: Option<Result<(), Error>>) -> (Settled<Result<(), Error>>, bool) {
             match self.signal {
-                TreeSignal::Kill => tree.settle_for_kill_tree(
-                    TreeKillOutcome::Skipped(Skip::of_holders(holders)),
-                    false,
-                    Keeping::Nothing,
-                ),
-                TreeSignal::Term => Settled::of(holders.unwrap_or(Ok(()))),
+                TreeSignal::Kill => {
+                    let Settled { answer, killed_again } = tree.settle(TreeKillOutcome::SkippedHolders(holders), false);
+                    let over_killed = matches!(answer, Ok(SettleOutcome::Skipped { over_killed: true }));
+                    (
+                        Settled {
+                            answer: answer.map(drop),
+                            killed_again,
+                        },
+                        over_killed,
+                    )
+                }
+                TreeSignal::Term => {
+                    let answer = holders.unwrap_or(Ok(()));
+                    let over_killed = answer.is_ok() && tree.is_killed();
+                    (Settled::of(answer), over_killed)
+                }
             }
         }
 
@@ -308,21 +312,23 @@ mod call {
         fn went(&self, holders: &Option<Result<(), Error>>, root: &Option<Result<Sent, Error>>) -> Went {
             let (sent_root, failed_root) = match self.signal {
                 TreeSignal::Kill => (
-                    "killed the root through its pidfd, which names it exactly, and sent nothing else",
+                    "killed the root through its pidfd, which names it exactly",
                     "the kill of the root",
                 ),
                 TreeSignal::Term => (
-                    "sent the SIGTERM to the root through its pidfd, which names it exactly, and sent nothing else",
+                    "sent the SIGTERM to the root through its pidfd, which names it exactly",
                     "the SIGTERM to the root",
                 ),
             };
+            // Every row says only what went to the root or the holders, so it stays true beside the
+            // members the settlement killed by identity.
             let same = |text: &str| Went::of(text.to_owned(), text.to_owned());
             match (holders, root) {
-                (Some(Ok(())), _) => same("signalled only the marker holders"),
+                (Some(Ok(())), _) => same("signalled the marker holders"),
                 (Some(Err(e)), _) => Went::of(
-                    "signalled only the marker holders, which failed".to_owned(),
+                    "signalled the marker holders, which failed".to_owned(),
                     format!(
-                        "signalled only the marker holders, which failed ({})",
+                        "signalled the marker holders, which failed ({})",
                         crate::error::Report(e)
                     ),
                 ),
@@ -331,50 +337,49 @@ mod call {
                     ..same("sent nothing")
                 },
                 (None, Some(Ok(Sent::Delivered))) => same(sent_root),
-                (None, Some(Ok(Sent::Gone))) => same("sent nothing: the root's pidfd shows it is gone"),
-                (None, Some(Ok(_))) => same("sent nothing: the root's handle no longer reaches it"),
+                (None, Some(Ok(Sent::Gone))) => same("sent nothing to the root: its pidfd shows it is gone"),
+                (None, Some(Ok(_))) => same("sent nothing to the root: its handle no longer reaches it"),
                 (None, Some(Err(e))) => Went::of(
-                    format!("sent nothing: {failed_root} through its pidfd failed"),
+                    format!("sent nothing to the root: {failed_root} through its pidfd failed"),
                     format!(
-                        "sent nothing: {failed_root} through its pidfd failed ({})",
+                        "sent nothing to the root: {failed_root} through its pidfd failed ({})",
                         crate::error::Report(e)
                     ),
                 ),
             }
         }
 
-        /// The line of a skip whose root's number cannot be trusted (macOS), `why`, with the error of an
-        /// `Unknown` as `cause`: no `warn`, only a debug line when holders were signalled. `skipped`:
-        /// what the call left undone; `sent`: what it sent.
-        fn untrusted_detail(
-            &self,
-            skipped: &str,
-            why: &str,
-            cause: Option<&std::io::Error>,
-            swept: bool,
-            sent: &str,
-        ) -> String {
+        /// The detail of a skip whose root's number cannot be trusted (macOS), `why`. It never warns,
+        /// so the error holds it.
+        fn untrusted_detail(&self, skipped: &str, why: &str, swept: bool, sent: &str) -> String {
             let (root_pid, op) = (self.pid, self.op);
             let earlier = self
                 .earlier
                 .map_or_else(String::new, |sent| format!(", though {sent} was sent before it"));
-            if swept {
-                let said = cause.map_or_else(
-                    || why.to_owned(),
-                    |cause| format!("{why}: {}", crate::error::Report(cause)),
-                );
-                log::debug!("{op}: {said}, so it does not {skipped}; it signals the marker holders");
-            }
             let because = if swept {
                 ""
             } else {
-                "its signals are all named by the root's number, so "
+                "its signals to the tree are all named by the root's number, so "
             };
             format!("pid {root_pid}: {why}; {op} {sent}{earlier}: {because}it did not {skipped}")
         }
 
-        /// The debug line of a skip that is moot: this handle already killed the tree.
-        fn log_moot(&self, skip: &Skip) {
+        /// The debug line of a skip over an untrusted root (`why`, with the error of an `Unknown` as
+        /// `cause`) whose marker holders were signalled.
+        fn log_untrusted_sweep(&self, skipped: &str, why: &str, cause: Option<&std::io::Error>) {
+            let said = cause.map_or_else(
+                || why.to_owned(),
+                |cause| format!("{why}: {}", crate::error::Report(cause)),
+            );
+            log::debug!(
+                "{}: {said}, so it does not {skipped}; it signals the marker holders",
+                self.op
+            );
+        }
+
+        /// The debug line of a skip that is moot: this handle already killed the tree. `root`: the
+        /// failure of the signal to the root, which nothing else reports.
+        fn log_moot(&self, skip: &Skip, root: Option<&Error>) {
             let (op, pid, action) = (self.op, self.pid, &skip.action);
             match &skip.why {
                 Why::MayNameAnother(refusal, _) => log::debug!(
@@ -384,6 +389,12 @@ mod call {
                 Why::Untrusted { why, .. } => {
                     log::debug!("{op}({pid}): {why}, and this handle already killed the tree, so it does not {action}")
                 }
+            }
+            if let Some(root) = root {
+                log::debug!(
+                    "{op}({pid}): the signal to the root failed, which the killed tree makes moot: {}",
+                    crate::error::Report(root)
+                );
             }
         }
 
