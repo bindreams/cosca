@@ -296,9 +296,11 @@ pub enum Error {
     /// A containment mechanism could not be established, or could not tear the tree down: a member
     /// confirmed running, a failed `killpg` or kill write, or the mechanism's own stale bookkeeping.
     ///
-    /// A [`Strongest`](crate::ContainMode::Strongest) spawn returns it, on Linux and macOS, when
-    /// the mechanism the host offers cannot be set up (the cgroup leaf, or the fd marker): the
-    /// program did not run, and `detail` names the mechanism. A
+    /// A [`Strongest`](crate::ContainMode::Strongest) spawn (on Windows a
+    /// [`Session`](crate::ContainMode::Session) one too) returns it when the mechanism the
+    /// host offers cannot be set up (the cgroup leaf, the fd marker, or on Windows the Job Object
+    /// the child cannot be assigned to): the program did not run, and `detail` names the
+    /// mechanism. A
     /// [`BestEffort`](crate::ContainMode::BestEffort) spawn returns it on Linux too, for a child
     /// that sent no report of its placement in its cgroup leaf and so never ran the program.
     Containment {
@@ -401,9 +403,11 @@ pub enum Error {
     /// where `fate` does not say it all).
     ///
     /// Every error a spawn returns answers whether the program could have started, meaning the
-    /// child reached `exec` (on Windows: `CreateProcess` or `ShellExecuteEx` succeeded). This
-    /// variant says it may have. Any other variant from a spawn says it did not, and cosca has
-    /// proved it. Where cosca cannot prove it, the answer is this variant:
+    /// child reached `exec` (on Windows: `CreateProcess` or `ShellExecuteEx` succeeded; a suspended
+    /// root ended before its first resume did not start). This variant says it may have. Any other
+    /// variant from a spawn says it did not, and cosca has proved it (on Windows, for such a root: its
+    /// initial thread is still suspended, it has no other thread, and the loader has not initialised
+    /// it). Where cosca cannot prove it, the answer is this variant:
     ///
     /// - every failure after `exec`, such as an identity read that finds the child gone, a
     ///   containment attach (one that needs the child's identity fails with the error of the read

@@ -1424,15 +1424,21 @@ pub(crate) fn prepare(
 pub(crate) struct AttachFailure {
     pub(crate) cause: Error,
     pub(crate) cleanup: Option<Failures>,
-    /// The program never ran, and the child's own report proves it: a `Strongest` child stopped
-    /// before `exec` because its placement in its leaf was refused, or a child (in any mode) sent
-    /// no report, which its hook only leaves unsent by ending the child before `exec`. Every other
-    /// failure may have started the program.
+    /// The program never ran, and the attach proves it: on Linux the child's own report (a
+    /// `Strongest` child stopped before `exec` because its placement in its leaf was refused, or a
+    /// child in any mode sent no report, which its hook only leaves unsent by ending the child
+    /// before `exec`); on Windows a strict root that could not be put in its Job Object and is proved not
+    /// to have run (`prove_not_started`). Every other failure may have started the program.
     #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "read only by the Linux arm of the spawn")
+        not(any(target_os = "linux", windows)),
+        allow(dead_code, reason = "read only by the Linux and Windows arms of the spawn")
     )]
     pub(crate) not_started: bool,
+    /// Windows: the root's initial thread, held suspended by the proof that the program never ran,
+    /// until the caller has ended the process (see [`ProvenRoot`](crate::containment::windows::ProvenRoot)).
+    /// Boxed so that a `Result` of an `AttachFailure` stays small (`clippy::result_large_err`).
+    #[cfg(windows)]
+    pub(crate) proven: Option<Box<crate::containment::windows::ProvenRoot>>,
 }
 
 /// The not-started failure of a child that is not in its leaf (`reason`, in the leaf at `path`), or
@@ -1472,6 +1478,8 @@ pub(crate) fn not_started_failure(
         cause,
         cleanup: None,
         not_started: true,
+        #[cfg(windows)]
+        proven: None,
     })
 }
 
@@ -1481,6 +1489,8 @@ impl From<Error> for AttachFailure {
             cause,
             cleanup: None,
             not_started: false,
+            #[cfg(windows)]
+            proven: None,
         }
     }
 }
@@ -1659,7 +1669,7 @@ fn attach_tree(
         }
     }
 
-    // Windows: Job Object (strongest available on this OS), or TreeWalk.
+    // Windows: a Job Object, or for a request that accepts less, TreeWalk.
     #[cfg(windows)]
     {
         if prepared.mode.is_some() && prepared.is_root {
@@ -1674,19 +1684,20 @@ fn attach_tree(
                 return match crate::containment::windows::assign_held(proc_handle) {
                     Ok(job) => Ok(Tree::contained(Mechanism::Job(job))),
                     Err(e) => Err(Error::Containment {
-                        detail: "the frozen child could not be assigned to its job".to_owned(),
+                        detail: "the frozen child could not be put in its Job Object".to_owned(),
                         source: Some(Error::io_cause(e)),
                     }
                     .into()),
                 };
             }
-            match crate::containment::windows::attach_job(proc_handle) {
+            let strict = prepared.mode.is_some_and(ContainMode::is_strict);
+            match crate::containment::windows::attach_job(proc_handle, strict) {
                 Ok(Some(job)) => return Ok(Tree::contained(Mechanism::Job(job))),
                 Ok(None) => {
-                    // Job assignment failed: fall back to the universal TreeWalk
-                    // mechanism rather than silently yielding no containment. The
-                    // root was spawned with CREATE_NEW_PROCESS_GROUP (root_flags),
-                    // so `terminate`'s CTRL_BREAK still reaches the group.
+                    // Fall back to the universal TreeWalk mechanism rather than silently yielding no
+                    // containment.
+                    // The root was spawned with CREATE_NEW_PROCESS_GROUP (root_flags), so
+                    // `terminate`'s CTRL_BREAK still reaches the group.
                     return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?))));
                 }
                 Err(failure) => return Err(failure),
