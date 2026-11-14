@@ -206,34 +206,59 @@ impl JobHandle {
     /// and a drain is only an empty listing. `root`, the root's pid, is left out: its owner waits for
     /// it. A member that cannot be named, or the listing itself failing, is returned as an error
     /// saying its exit cannot be observed, with its pid where it has one; the kill goes ahead
-    /// regardless. A pid the job's own list names whose membership cannot be established is one such
-    /// member, not an absent one.
+    /// regardless. A pid the job's list names whose membership cannot be established is not an error
+    /// the first time: the list shows a deleted member's pid for at most one listing, and the system
+    /// may have reused the number. The listing is taken once more at once, and a pid it names again
+    /// that still cannot be shown to be a member is one whose exit cannot be observed ([`drain_round`]
+    /// applies the same rule).
     pub(crate) fn list_members(&self, root: Option<u32>) -> (Vec<ProcessId>, Vec<Unnamed>) {
         use crate::error::Error;
 
         let pids = match query_job_pid_list(self.raw) {
             Ok(pids) => pids,
-            Err(e) => {
-                let why = Error::Unassessable {
-                    detail: "the members of the job could not be listed before the kill, so their exit cannot be \
-                             observed"
-                        .to_owned(),
-                    source: Some(Error::io_cause(e)),
-                };
-                return (Vec::new(), vec![Unnamed::nameless(why)]);
-            }
+            Err(e) => return (Vec::new(), vec![unlisted(e)]),
         };
         let (mut members, mut unobserved) = (Vec::new(), Vec::new());
+        let mut unproved = Vec::new();
         for pid in pids.into_iter().filter(|pid| Some(*pid) != root) {
             match member_identity(self.raw, pid, open_for_membership(pid)) {
                 Ok(Some(id)) => members.push(id),
                 Ok(None) => {}
-                Err(NotNamed::Membership(e)) => unobserved.push(Unnamed::member(pid, Error::Io(e))),
+                Err(NotNamed::Membership(e)) => unproved.push((pid, e)),
                 Err(NotNamed::Identity(cause)) => unobserved.push(Unnamed::member(pid, cause)),
+            }
+        }
+        if unproved.is_empty() {
+            return (members, unobserved);
+        }
+        match query_job_pid_list(self.raw) {
+            Err(e) => {
+                // Neither named nor cleared: each stays unobserved, as does the listing.
+                unobserved.push(unlisted(e));
+                unobserved.extend(unproved.into_iter().map(|(pid, e)| Unnamed::member(pid, Error::Io(e))));
+            }
+            Ok(again) => {
+                for (pid, _) in unproved.into_iter().filter(|(pid, _)| again.contains(pid)) {
+                    match member_identity(self.raw, pid, open_for_membership(pid)) {
+                        Ok(Some(id)) => members.push(id),
+                        Ok(None) => {}
+                        Err(NotNamed::Membership(e)) => unobserved.push(Unnamed::member(pid, Error::Io(e))),
+                        Err(NotNamed::Identity(cause)) => unobserved.push(Unnamed::member(pid, cause)),
+                    }
+                }
             }
         }
         (members, unobserved)
     }
+}
+
+/// The failure to list the job's members before a kill: none can be named, so none can be waited for.
+fn unlisted(cause: io::Error) -> Unnamed {
+    Unnamed::nameless(crate::error::Error::Unassessable {
+        detail: "the members of the job could not be listed before the kill, so their exit cannot be observed"
+            .to_owned(),
+        source: Some(crate::error::Error::io_cause(cause)),
+    })
 }
 
 /// `OpenProcess` for what proving membership and reading the identity need, and no more:
@@ -1073,9 +1098,20 @@ impl JobHandle {
     /// [`hard_kill`](JobHandle::hard_kill), so this also waits out a killed tree. A member
     /// the caller may open for membership but not wait on (an elevated one, under a caller that is not)
     /// is a member whose exit cannot be observed: the answer is `Unassessable` naming its pid, with the
-    /// OS error as the cause, never `AllMembersExited`. A listed pid the caller may not even open for
-    /// membership is not shown to be a member (the list can name a deleted member's pid, reused by a
-    /// process of another user, for one listing): the round lists again instead of failing.
+    /// OS error as the cause, never `AllMembersExited`.
+    ///
+    /// A pid the list names is a member only if shown to be one, and a deleted member's pid shows in the
+    /// list for at most one listing (measured, Windows 10.0.26100, 1000 trials per case), where the
+    /// system may since have reused its number. So a round treats a listed pid by what the caller can
+    /// prove of it: not in the job (opened, `IsProcessInJob` false) is dropped; a member that refuses
+    /// only the wait open (query-only open and `IsProcessInJob` prove it) is `Unassessable` naming
+    /// the pid, at once; a pid whose membership cannot be established (the query-only open is refused, or
+    /// `IsProcessInJob` fails) is neither: when no listed pid can be waited for, the round takes one
+    /// more listing at once, carrying nothing across rounds, and a pid that listing names again that
+    /// is still unproved is `Unassessable` naming it, with the refusal as the cause. Listing again
+    /// without that check would spin for as long as such a member lives. A pid reused twice in
+    /// that gap is `Unassessable` too, never a false drain. [`JobHandle::list_members`], the
+    /// kill's listing, applies the same rule.
     ///
     /// `deadline`: `None` is no deadline (see [`crate::wait::remaining`]). No interval is chosen
     /// anywhere in this path: every round blocks in one `WaitForMultipleObjects` call for exactly
@@ -1187,26 +1223,56 @@ fn member_to_watch(opened: windows::core::Result<HANDLE>, job: HANDLE) -> io::Re
     }
 }
 
-/// [`member_to_watch`] for the listed pid `pid`, opened for the round's any-wait ([`open_for_wait`]). A
-/// refused open leaves membership unknown, and a pid is a member only if shown to be: the job's list
-/// can still name a deleted member's pid for one listing, and the system may have reused it for a
-/// process the caller may not open. So a refused open is the member's refusal (`Err`) only if the
-/// query-only open ([`open_for_membership`]) proves the pid a member the caller may not wait on; if
-/// that is refused too, or `IsProcessInJob` fails on it, or the pid is not in the job, it is not a
-/// member (`None`), as the snapshot scan treats such a pid ([`unsignalled_members`]).
-fn member_to_watch_for_wait(pid: u32, job: HANDLE) -> io::Result<Option<HANDLE>> {
+/// What the job's list naming a pid amounts to once the caller has tried to open it.
+enum Standing {
+    /// In the job; the handle is open.
+    Member(HANDLE),
+    /// Shown not to be one: its number is gone or was reused by a process that is not in the job.
+    NotMember,
+    /// Membership could not be established (the open was refused, or `IsProcessInJob` failed), for
+    /// this reason. A pid the list names is not an error on that alone: a deleted member's pid can
+    /// show for one listing ([`drain_round`]).
+    Unproved(io::Error),
+}
+
+/// The [`Standing`] of the process `OpenProcess` returned as `opened` ([`member_to_watch`]'s rule).
+fn standing(opened: windows::core::Result<HANDLE>, job: HANDLE) -> Standing {
+    match member_to_watch(opened, job) {
+        Ok(Some(h)) => Standing::Member(h),
+        Ok(None) => Standing::NotMember,
+        Err(e) => Standing::Unproved(e),
+    }
+}
+
+/// The [`Standing`] of the listed pid `pid`, opened for the round's any-wait ([`open_for_wait`]). A
+/// refused open leaves membership to the query-only open ([`open_for_membership`]): a pid it proves a
+/// member the caller may not wait on is the member's refusal, the `Err` here, at once; a pid it
+/// proves not in the job is [`Standing::NotMember`]; one it cannot prove either way is
+/// [`Standing::Unproved`], with the query-only open's (or `IsProcessInJob`'s) error.
+fn member_to_watch_for_wait(pid: u32, job: HANDLE) -> io::Result<Standing> {
     match open_for_wait(pid) {
         Err(refused) if refused.code() != windows::Win32::Foundation::ERROR_INVALID_PARAMETER.to_hresult() => {
-            match member_to_watch(open_for_membership(pid), job) {
-                Ok(Some(proof)) => {
-                    // SAFETY: `member_to_watch` handed over the handle it opened; closed once, here.
+            match standing(open_for_membership(pid), job) {
+                Standing::Member(proof) => {
+                    // SAFETY: `standing` handed over the handle it opened; closed once, here.
                     _ = unsafe { CloseHandle(proof) };
                     Err(win32_io_error(refused))
                 }
-                Ok(None) | Err(_) => Ok(None),
+                other => Ok(other),
             }
         }
-        opened => member_to_watch(opened, job),
+        opened => Ok(standing(opened, job)),
+    }
+}
+
+/// The failure of a drain that was twice told a pid is in the job and could twice not tell whether it
+/// is, for `cause`: its exit cannot be observed.
+fn unproved_member(pid: u32, cause: io::Error) -> crate::error::Error {
+    crate::error::Error::Unassessable {
+        detail: format!(
+            "pid {pid}, which the job lists, could not be shown to be a member or not, so its exit cannot be observed"
+        ),
+        source: Some(crate::error::Error::io_cause(cause)),
     }
 }
 
@@ -1653,6 +1719,7 @@ fn drain_round(job: HANDLE, last_round: bool) -> Result<Round, crate::error::Err
 
     let mut handles: Vec<std::os::windows::io::OwnedHandle> = Vec::new();
     let mut denied: Option<(u32, io::Error)> = None;
+    let mut unproved: Vec<u32> = Vec::new();
     // Every listed pid is looked at unless the wait set is already full: a pid that is gone
     // does not use up the budget a live member needs.
     for pid in &pids {
@@ -1660,9 +1727,12 @@ fn drain_round(job: HANDLE, last_round: bool) -> Result<Round, crate::error::Err
             break;
         }
         match member_to_watch_for_wait(*pid, job) {
-            // SAFETY: `member_to_watch` hands over the handle `OpenProcess` returned.
-            Ok(Some(h)) => handles.push(unsafe { std::os::windows::io::FromRawHandle::from_raw_handle(h.0) }),
-            Ok(None) => {}
+            // SAFETY: `standing` hands over the handle `OpenProcess` returned.
+            Ok(Standing::Member(h)) => {
+                handles.push(unsafe { std::os::windows::io::FromRawHandle::from_raw_handle(h.0) });
+            }
+            Ok(Standing::NotMember) => {}
+            Ok(Standing::Unproved(_)) => unproved.push(*pid),
             Err(e) => denied = Some((*pid, e)),
         }
     }
@@ -1676,6 +1746,29 @@ fn drain_round(job: HANDLE, last_round: bool) -> Result<Round, crate::error::Err
                 report = crate::error::Report(&e)
             );
             return Err(member_unobserved(pid, Error::Io(e)));
+        }
+        if !unproved.is_empty() {
+            // A pid the list names that cannot be shown to be a member is a deleted member's, reused,
+            // or a live member that refuses the caller. The list shows a deleted pid for at most one
+            // listing, so one taken now settles which: a pid it names again, still unproved, is a
+            // member that cannot be waited for. Looping back through `Round::List` instead would
+            // spin on it for as long as it lives.
+            let again = query_job_pid_list(job).map_err(Error::Io)?;
+            if again.is_empty() {
+                return Ok(Round::Confirm);
+            }
+            for pid in unproved.into_iter().filter(|pid| again.contains(pid)) {
+                match member_to_watch_for_wait(pid, job) {
+                    Ok(Standing::Unproved(cause)) => return Err(unproved_member(pid, cause)),
+                    Err(e) => return Err(member_unobserved(pid, Error::Io(e))),
+                    // Provable now (it was a race with the pid's own start): the next round holds it.
+                    Ok(Standing::Member(h)) => {
+                        // SAFETY: `standing` handed over the handle it opened; closed once, here.
+                        _ = unsafe { CloseHandle(h) };
+                    }
+                    Ok(Standing::NotMember) => {}
+                }
+            }
         }
         // Every listed pid is gone (`OpenProcess` found no such process) or no longer a
         // member (its number was reused). That says nothing of a member that joined after the

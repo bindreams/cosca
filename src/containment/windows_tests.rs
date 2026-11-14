@@ -577,29 +577,59 @@ fn a_snapshot_pid_whose_membership_cannot_be_established_is_skipped() {
     );
 }
 
-/// A pid the job's own list names whose membership cannot be established is a member whose exit cannot
-/// be observed, and stays an error: it is returned with its pid, for the kill's wait to report.
+/// A pid the job's list names twice in a row, and whose membership cannot be established either time
+/// (a live member whose DACL grants the caller nothing), is a member whose exit cannot be observed: it
+/// is returned with its pid, for the kill's wait to report.
 ///
 /// Mutant: the listing skips it as the snapshot does.
 #[skuld::test]
-fn a_listed_pid_whose_membership_cannot_be_established_is_unobserved_with_its_pid() {
-    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
-
-    let (child, job) = spawn_job_member();
-    let pid = child.id();
-    let failed = super::fault::force_next_for_thread(super::fault::Step::Membership, ERROR_ACCESS_DENIED.0, pid);
+fn a_pid_listed_twice_whose_membership_cannot_be_established_is_unobserved_with_its_pid() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(
+            a_pid_listed_twice_whose_membership_cannot_be_established_is_unobserved_with_its_pid
+        ),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let refused = crate::identity::windows_fixture::spawn_unkillable(&done);
+    let pid = refused.pid();
+    let job = super::JobHandle::create_empty_for_test();
+    job.assign_for_test(refused.handle().0)
+        .expect("assign the refusing member to the job");
 
     let (members, unobserved) = job.list_members(None);
 
-    drop(failed);
-    job.hard_kill().expect("end the member");
-    let_member_exit(child);
     assert!(members.iter().all(|id| id.pid() != pid), "{members:?}");
     assert_eq!(
         unobserved.iter().filter(|unnamed| unnamed.pid == Some(pid)).count(),
         1,
         "{unobserved:?}"
     );
+}
+
+/// A pid the job's list names once whose membership cannot be established, and that the next listing
+/// does not name (a deleted member's pid, reused by a process the caller may not open), is dropped, not
+/// reported.
+///
+/// Mutant: the first listing's failure is the answer.
+#[skuld::test]
+fn a_pid_listed_once_whose_membership_cannot_be_established_is_dropped() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(a_pid_listed_once_whose_membership_cannot_be_established_is_dropped),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let refused = crate::identity::windows_fixture::spawn_unkillable(&done);
+    let job = super::JobHandle::create_empty_for_test();
+    let forced = super::fault::force_job_pid_list(vec![refused.pid()]);
+
+    let (members, unobserved) = job.list_members(None);
+
+    drop(forced);
+    assert!(members.is_empty(), "{members:?}");
+    assert!(unobserved.is_empty(), "{unobserved:?}");
 }
 
 /// A snapshot member whose start time cannot be read (a forced failure) is an error naming its pid:
@@ -885,6 +915,63 @@ fn wait_drained_raw_lists_again_when_every_listed_pid_is_refused_and_unproved() 
     assert_eq!(
         verdict.expect("a refused pid the job cannot be shown to hold is not a failed drain"),
         crate::containment::TreeDrain::AllMembersExited
+    );
+}
+
+/// A pid the job's list names twice in a row that nothing lets the caller open is not a deleted member's
+/// (that shows for one listing): the drain answers `Unassessable` naming it instead of listing again.
+/// The fixture is outside the job, so the forced listings stand for a live member that refuses.
+///
+/// Mutant: a round whose listed pids are all unproved lists again without the second listing, and the
+/// drain never answers.
+#[skuld::test]
+fn wait_drained_raw_names_a_pid_listed_twice_that_cannot_be_proved_a_member() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(wait_drained_raw_names_a_pid_listed_twice_that_cannot_be_proved_a_member),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let refused = crate::identity::windows_fixture::spawn_unkillable(&done);
+    let job = super::JobHandle::create_empty_for_test();
+    let forced = super::fault::force_job_pid_lists([vec![refused.pid()], vec![refused.pid()]]);
+
+    let verdict = super::wait_drained_raw(&job, None);
+
+    drop(forced);
+    let error = verdict.expect_err("a pid that stays unproved is not a drained tree");
+    assert!(
+        matches!(&error, crate::error::Error::Unassessable { detail, source: Some(_) }
+            if detail.contains(&refused.pid().to_string())),
+        "{error:?}"
+    );
+}
+
+/// A live member that refuses the caller even the query-only open (its DACL grants nothing), in the
+/// job, with no deadline: the drain answers (`Unassessable` naming it) instead of listing it again for
+/// as long as it lives.
+///
+/// Mutant: an unproved pid is not a member, so the round lists again and never answers.
+#[skuld::test]
+fn wait_drained_raw_answers_for_a_live_member_that_refuses_the_query_open() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(wait_drained_raw_answers_for_a_live_member_that_refuses_the_query_open),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let refused = crate::identity::windows_fixture::spawn_unkillable(&done);
+    let job = super::JobHandle::create_empty_for_test();
+    job.assign_for_test(refused.handle().0)
+        .expect("assign the refusing member to the job");
+
+    let verdict = super::wait_drained_raw(&job, None);
+
+    let error = verdict.expect_err("a live member that cannot be waited for is not a drained tree");
+    assert!(
+        matches!(&error, crate::error::Error::Unassessable { detail, .. }
+            if detail.contains(&refused.pid().to_string())),
+        "{error:?}"
     );
 }
 
