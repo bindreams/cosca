@@ -73,10 +73,11 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> 
 /// (see [`names_leaf`]): `other_id` says the task's pidfd gave a cgroup id other than the leaf's,
 /// and `recorded` answers for the leaf's own path with ` (deleted)` after it.
 ///
-/// Reads `pid`'s cgroup through `kernel`. A refusal is an [`Error::Unsupported`](crate::error::Error::Unsupported),
-/// the `io::Error` this returns holding it (the error's kind says nothing of it); a pid that is not there for us fails with the read's own error; any
-/// other failure is the [`Unreadable`](crate::identity::pid_file::Unreadable), which names the pid and
-/// its file (with the pid's `EPERM` beside a failed re-check).
+/// Reads `pid`'s cgroup through `kernel`. A refusal is an
+/// [`Error::Unsupported`](crate::error::Error::Unsupported), held by the `io::Error` this returns (its
+/// kind says nothing of it); a pid that is not there for us fails with the read's own error; any other
+/// failure is the [`Unreadable`](crate::identity::pid_file::Unreadable), which names the pid and its file
+/// (with the pid's `EPERM` beside a failed re-check).
 pub(crate) fn proc_names(
     kernel: &dyn crate::identity::Kernel,
     leaf_path: &str,
@@ -125,8 +126,9 @@ fn read_cgroup(
 }
 
 /// The error of reading `pid`'s cgroup through a `/proc` view that could not be established, `why`:
-/// an [`Error::Unsupported`](crate::error::Error::Unsupported) naming the requirement when the view was refused, as a refused cgroup read is;
-/// otherwise of the view's error's kind, with that error as its source.
+/// an [`Error::Unsupported`](crate::error::Error::Unsupported) naming the requirement when the view was
+/// refused, as a refused cgroup read is; otherwise of the view's error's kind, with that error as its
+/// source.
 fn view_unreadable(pid: u32, why: crate::identity::ViewUnreadable) -> io::Error {
     if let Some(refusal) = why.refusal() {
         return refusal.unsupported(format!("reading pid {pid}'s cgroup")).into_io();
