@@ -108,8 +108,8 @@ fn a_sweep_that_skipped_has_the_handles_error_as_its_source_unless_the_holders_f
 }
 
 /// A skip is moot only over a tree this handle killed, and only because its own reap left the pid
-/// naming no process or unreadable: a root reaped elsewhere, a handle that could not say, and an
-/// untrusted root (macOS) leave the tree's number in doubt for another reason.
+/// naming no process or unreadable, or the root's number cannot be trusted (macOS): a root reaped
+/// elsewhere and a handle that could not say leave the tree's number in doubt for another reason.
 ///
 /// Mutants: any one of the refusals reads as moot; a skip is moot over a tree never killed.
 #[skuld::test]
@@ -153,7 +153,7 @@ fn a_skip_is_moot_only_over_a_killed_tree_after_the_own_reap() {
                 why: "forced".to_owned(),
                 cause: None,
             },
-            false,
+            true,
         ),
     ];
     for (name, why, moot) in whys {
@@ -205,6 +205,200 @@ fn a_tree_call_that_skipped_an_untrusted_root_leaves_the_drop_what_a_drop_alone_
             left.is_none(),
             "swept {swept}: the drop after a skipped tree call warns as a drop alone does: {:?}",
             left.map(|left| left.text)
+        );
+    }
+}
+
+/// A kind of skip: its name, and a reason of that kind.
+type Kind = (&'static str, fn() -> Why);
+
+/// The two kinds of skip a tree call settles: the root's number cannot be trusted (macOS), and it may
+/// name another process.
+fn kinds() -> [Kind; 2] {
+    [
+        ("untrusted", || Why::untrusted(&crate::signal::RootState::Unpinned)),
+        ("may name another", || {
+            Why::MayNameAnother(Refusal::ReapedElsewhere(PID), None)
+        }),
+    ]
+}
+
+fn kill_call(op: &'static str) -> super::SkipCall<'static> {
+    super::SkipCall {
+        op,
+        pid: PID,
+        signal: crate::containment::dispatch::TreeSignal::Kill,
+        earlier: None,
+    }
+}
+
+/// A tree that names its members by a walk, which settles held members by identity.
+fn walking_tree() -> Tree {
+    use crate::containment::mechanism::Mechanism;
+    Tree::contained(Mechanism::Walk(crate::containment::treewalk::Walker::new(
+        crate::identity::ProcessId::current(),
+    )))
+}
+
+/// A member an earlier kill refused, as a settlement holds it: `id` is its identity, if it was read.
+fn refused(tree: &Tree, pid: u32, id: Option<crate::identity::ProcessId>) {
+    use crate::containment::dispatch::Unkilled;
+    tree.settle(
+        TreeKillOutcome::Ran(Err(Unkilled {
+            members: vec![crate::error::Error::MemberNotKilled {
+                pid,
+                source: std::sync::Arc::new(crate::error::Error::Unassessable {
+                    detail: "its identity could not be read".into(),
+                    source: None,
+                }),
+            }],
+            root: None,
+            resolved: id.into_iter().collect(),
+        })),
+        true,
+    )
+    .answer
+    .expect_err("the member was left");
+}
+
+/// A skipped kill over a tree that holds a member an earlier kill refused answers that member, for
+/// either kind of skip: the answer holds every member the tree is left with, whether or not the
+/// skip's sweep of the marker holders ran.
+///
+/// Mutant: the settlement's answer is dropped when no holders were swept.
+#[skuld::test]
+fn a_skipped_kill_answers_a_member_the_tree_holds_for_either_kind() {
+    for (kind, why) in kinds() {
+        let tree = walking_tree();
+        refused(&tree, 7, None);
+
+        let answer = kill_call("skip_held_probe_e1")
+            .answer(&tree, skip(why()), None)
+            .answer
+            .expect_err("a skipped kill is no success");
+
+        let members = answer.left_members();
+        assert!(
+            members
+                .iter()
+                .any(|member| matches!(member, crate::error::Error::MemberNotKilled { pid: 7, .. })),
+            "{kind}: the member the tree holds is named: {answer:?}"
+        );
+    }
+}
+
+/// A skipped kill that killed the members the handle held by identity says so, for either kind of
+/// skip, and does not claim it sent nothing.
+///
+/// Mutant: the answer says "sent nothing" over a settlement that killed a held member.
+#[skuld::test]
+fn a_skipped_kill_that_killed_a_held_member_says_so_for_either_kind() {
+    use crate::error::Error;
+    for (kind, why) in kinds() {
+        let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
+        let id = blocker.id().expect(crate::test_child::IDENTITY_READ);
+        let tree = walking_tree();
+        refused(&tree, id.pid(), Some(id));
+
+        let settled = kill_call("skip_held_probe_e2").answer(&tree, skip(why()), None);
+
+        // Released after the kill: a settlement that sent nothing lets the member exit on EOF, which
+        // fails the assertion instead of leaving a wait unbounded.
+        drop(stdin);
+        crate::test_child::assert_killed("the held member", blocker.wait().expect("reap the member"));
+        assert_eq!(settled.killed_again, vec![id], "{kind}");
+        let answer = settled.answer.expect_err("a skipped kill is no success");
+        let Error::Unassessable { detail, .. } = &answer else {
+            panic!("{kind}: got {answer:?}");
+        };
+        let said = format!("killed the members it held by identity (pid {})", id.pid());
+        assert!(detail.contains(&said), "{kind}: {detail}");
+        assert!(!detail.contains("sent nothing"), "{kind}: {detail}");
+    }
+}
+
+/// A skipped kill whose sweep of the marker holders failed answers that failure and leaves the drop a
+/// warn, whichever of the tree call and the drop ran first, for either kind of skip: the drop after the
+/// call warns as the drop before it did.
+///
+/// Mutant: a kind of skip settles differently in a tree call than in a drop.
+#[skuld::test]
+fn a_skipped_kill_whose_holders_failed_leaves_the_drop_a_warn_in_either_order() {
+    use crate::error::Error;
+    for (kind, why) in kinds() {
+        let failing = || Skip {
+            holders: Some(Err(Error::Containment {
+                detail: "the holders' sweep failed".into(),
+                source: None,
+            })),
+            ..skip(why())
+        };
+        let call = kill_call("skip_failed_probe_f1");
+        let says = |answer: Error| {
+            assert!(
+                matches!(&answer, Error::Containment { detail, .. } if detail == "the holders' sweep failed"),
+                "{kind}: {answer:?}"
+            );
+        };
+
+        let called_first = killed(false);
+        says(
+            call.answer(&called_first, failing(), None)
+                .answer
+                .expect_err("a failed sweep is no success"),
+        );
+        let after = called_first
+            .settle_for_drop(TreeKillOutcome::Skipped(failing()), false)
+            .unwrap_or_else(|| panic!("{kind}: the drop after the call warns"));
+
+        let dropped_first = killed(false);
+        let before = dropped_first
+            .settle_for_drop(TreeKillOutcome::Skipped(failing()), false)
+            .unwrap_or_else(|| panic!("{kind}: the drop alone warns"));
+        says(
+            call.answer(&dropped_first, failing(), None)
+                .answer
+                .expect_err("a failed sweep is no success"),
+        );
+
+        assert_eq!(
+            after.text, before.text,
+            "{kind}: the drop warns the same in both orders"
+        );
+    }
+}
+
+/// A skipped call over a tree this handle already killed is moot, for either kind of skip: a kill
+/// answers `Ok` and warns of nothing, as a drop over it is silent.
+///
+/// Mutant: an untrusted skip over a killed tree answers `Unassessable`.
+#[skuld::test]
+fn a_skipped_call_over_a_killed_tree_is_moot_for_either_kind() {
+    use crate::containment::dispatch::TreeSignal;
+    for (kind, why) in kinds() {
+        let moot = |signal: TreeSignal| {
+            super::SkipCall {
+                op: "skip_moot_probe_g1",
+                pid: PID,
+                signal,
+                earlier: None,
+            }
+            .answer(&killed(true), skip(why()), None)
+            .answer
+        };
+        // The refusals that outlive a kill, a root reaped elsewhere, are not moot: only the untrusted
+        // root (and the own reap's) is. The other kind is the control.
+        if kind == "untrusted" {
+            moot(TreeSignal::Kill).expect("a kill over a killed tree");
+            moot(TreeSignal::Term).expect("a terminate over a killed tree");
+        } else {
+            moot(TreeSignal::Kill).expect_err("a root reaped elsewhere leaves the tree in doubt");
+        }
+        assert!(
+            killed(true)
+                .settle_for_drop(TreeKillOutcome::Skipped(skip(why())), false)
+                .is_none(),
+            "{kind}: the drop over a killed tree is silent"
         );
     }
 }
