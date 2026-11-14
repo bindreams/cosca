@@ -77,8 +77,9 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> 
 /// [`pid_file::read`](crate::identity::pid_file::read) decides a failure. A read that is a
 /// [`Refusal`](crate::identity::Refusal) fails with an `Unsupported` error that says so, carried as
 /// the `io::Error` this returns; a pid that is not there for us (`ENOENT`, `ESRCH`, `hidepid`) fails
-/// with the read's own error; any other failure is the layered
-/// [`Unreadable`](crate::identity::pid_file::Unreadable).
+/// with the read's own error; any other failure fails with a context, "reading pid N's cgroup", over
+/// the classified cause: the [`Unreadable`](crate::identity::pid_file::Unreadable) as the one layer
+/// below it, or a list of it and the failure that came with it.
 pub(crate) fn proc_names(
     kernel: &dyn crate::identity::Kernel,
     leaf_path: &str,
@@ -504,7 +505,8 @@ enum Unreadable {
     /// The probe child's cgroup read failed, and says nothing about whether `/proc` hides it
     /// ([`pid_file::Unreadable`](crate::identity::pid_file::Unreadable), whole, with its peer).
     Read(crate::identity::pid_file::Unreadable),
-    /// The probe itself failed: its socket, fork or reap.
+    /// The probe itself failed: its socket, fork or reap, or its child's cgroup read that found the
+    /// child exited (`ESRCH`), which an unreaped child cannot be.
     Probe(io::Error),
 }
 
@@ -989,9 +991,9 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
             "the probe's child could not ask to die with its parent",
         )))),
         // The child is this process's own and unreaped, so its `/proc` entry exists: a read that
-        // is not shown it is `/proc` hiding it. The read is by the child's
-        // number, so it counts only if the child, which its pidfd names, had not exited by the time
-        // it was made: an exited child may be reaped elsewhere and its number taken.
+        // is not shown it is `/proc` hiding it. The read is by the child's number, so it counts only
+        // if the child, which its pidfd names, had not exited when the read was made: an exited
+        // child may be reaped elsewhere and its number taken.
         Ok(2) => {
             use crate::identity::pid_file::{self, ReadOutcome};
 
@@ -1007,7 +1009,8 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
             let read = match pid_file::read(kernel, &proc_dir, child, "cgroup") {
                 Ok(ReadOutcome::Read(bytes)) => crate::identity::utf8(bytes).map(drop).map_err(Unreadable::Probe),
                 Ok(ReadOutcome::Hidden(e)) => Err(Unreadable::Hidden(e)),
-                // The child is unreaped, so an exit is no `hidepid`: the peek below says so too.
+                // The child is unreaped, so an exit is no `hidepid`. The peek below answering `Running`
+                // contradicts the read, and the probe's own failure is then `Probe(ESRCH)`.
                 Ok(ReadOutcome::Exited(e)) => Err(Unreadable::Probe(e)),
                 Ok(ReadOutcome::Refused(refusal)) => Err(Unreadable::Refused(refusal)),
                 Err(unreadable) => Err(Unreadable::Read(unreadable)),

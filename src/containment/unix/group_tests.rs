@@ -737,14 +737,9 @@ fn members_keeps_the_pids_eperm_when_the_checked_directory_fails_without_refusin
         members(&kernel, i32::MAX).expect_err("a pid whose stat is refused and whose re-check fails lists nothing");
     let text = crate::error::said(&err);
     assert!(text.contains("re-check of self/stat failed"), "{text}");
-    assert_eq!(crate::error::first_os_code(&err), Some(libc::EMFILE), "{text}");
-    let (_, second) = text
-        .split_once("(2) ")
-        .unwrap_or_else(|| panic!("the second failure is kept: {text}"));
-    assert!(
-        second.contains(&std::io::Error::from_raw_os_error(libc::EPERM).to_string()),
-        "the pid's EPERM is the second cause: {text}"
-    );
+    let members = crate::error::several_in(&err).unwrap_or_else(|| panic!("a list of both failures: {text}"));
+    let codes: Vec<_> = members.iter().map(|m| crate::error::first_os_code(*m)).collect();
+    assert_eq!(codes, [Some(libc::EMFILE), Some(libc::EPERM)], "{text}");
 }
 
 /// An `openat2` refused after the view opened (a seccomp filter installed mid-scan) is the same host

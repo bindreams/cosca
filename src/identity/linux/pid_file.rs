@@ -108,9 +108,9 @@ impl std::error::Error for Unreadable {
 }
 
 /// `pid`'s `file` (`stat`, or `cgroup`) through `dir`, and what a failure of the read means: a
-/// failure that says the pid is not there for us is [`ReadOutcome::Exited`] or [`ReadOutcome::Hidden`], a [`Refusal`] is
-/// [`ReadOutcome::Refused`], every other failure is [`Unreadable`]. The one policy of every read of
-/// a pid's file. Never asks `kill(pid, 0)`: a scan covers all of `/proc`, and a `hidepid` `/proc`
+/// failure that says the pid is not there for us is [`ReadOutcome::Exited`] or
+/// [`ReadOutcome::Hidden`], a [`Refusal`] is [`ReadOutcome::Refused`], every other failure is
+/// [`Unreadable`]. The one policy of every read of a pid's file. Never asks `kill(pid, 0)`: a scan covers all of `/proc`, and a `hidepid` `/proc`
 /// answers a foreign-uid probe `EPERM` too, so the first foreign-uid process would abort every scan.
 pub(crate) fn read(
     kernel: &dyn Kernel,

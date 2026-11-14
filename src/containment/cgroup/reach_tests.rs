@@ -1481,8 +1481,8 @@ fn an_exited_answer_to_the_probes_cgroup_read_is_no_hidepid() {
 }
 
 /// `proc_names` keeps the failure that came with the unreadable cgroup: `EPERM` whose re-check
-/// failed is the re-check's error with the pid's `EPERM` beside it, both in the returned error's
-/// chain. Mutant: "the pid's `EPERM` is dropped".
+/// failed is the re-check's error with the pid's `EPERM` beside it, as the members of one list in the
+/// returned error's chain. Mutant: "the pid's `EPERM` is dropped".
 #[skuld::test]
 fn proc_names_keeps_the_pids_eperm_beside_a_failed_recheck() {
     let pid = std::process::id();
@@ -1492,10 +1492,39 @@ fn proc_names_keeps_the_pids_eperm_beside_a_failed_recheck() {
         .on_read("self/stat", Err(libc::EIO));
     let err = proc_names(&kernel, "/leaf", pid, || None, false).expect_err("an unreadable cgroup");
     let said = crate::error::Report(&err).to_string();
-    assert!(said.contains("re-check of self/stat failed"), "{said}");
-    let peer = std::io::Error::from_raw_os_error(libc::EPERM).to_string();
-    assert!(said.contains(&peer), "the pid's EPERM is kept: {said}");
-    assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{said}");
+    let members = crate::error::several_in(&err).unwrap_or_else(|| panic!("a list of both failures: {said}"));
+    let codes: Vec<_> = members.iter().map(|m| crate::error::first_os_code(*m)).collect();
+    assert_eq!(codes, [Some(libc::EIO), Some(libc::EPERM)], "{said}");
+}
+
+/// `proc_names` over an unreadable cgroup says the pid's file once, in one context over the failure:
+/// no layer of a cosca `Error` between them. Mutant: "the cause is wrapped as an `Error::Io` layer".
+#[skuld::test]
+fn proc_names_says_an_unreadable_cgroup_once() {
+    let pid = std::process::id();
+    let kernel = FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_read(&format!("{pid}/cgroup"), Err(libc::EIO));
+    let err = proc_names(&kernel, "/leaf", pid, || None, false).expect_err("an unreadable cgroup");
+    let eio = std::io::Error::from_raw_os_error(libc::EIO);
+    assert_eq!(
+        crate::error::said(&err),
+        format!("reading pid {pid}'s cgroup: {pid}/cgroup could not be read: {eio}")
+    );
+}
+
+/// The spawn's error for a probe whose child's cgroup read fails (`EIO`) says the pid's file once and
+/// has the one `Error::Io` layer of the spawn's own error. Mutant: "the unreadable pid's cause is
+/// wrapped as a second `Error::Io` layer".
+#[skuld::test]
+fn a_probe_whose_cgroup_read_fails_says_the_file_once() {
+    let _missing = fault::miss_pidfd_info();
+    let _failing = fault::hide_proc_as(libc::EIO);
+    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("an unreadable cgroup fails the probe");
+    let said = crate::error::said(&err);
+    assert_eq!(said.matches("an I/O operation failed").count(), 1, "{said}");
+    assert_eq!(said.matches("/cgroup").count(), 1, "{said}");
+    assert!(said.contains("probing whether /proc shows"), "{said}");
 }
 
 /// A task's `<pid>/cgroup` read that is refused is an error that says what cosca requires, of kind

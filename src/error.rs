@@ -658,20 +658,25 @@ pub(crate) fn io_context(context: impl Into<String>, source: std::io::Error) -> 
         source.kind(),
         IoContext {
             context: context.into(),
-            source: Box::new(source),
+            source: IoContextSource::Io(source),
         },
     )
 }
 
-/// [`io_context`] over a cause that is an [`Error`], of kind [`Other`](std::io::ErrorKind::Other). The
-/// cause is a layer of the chain, so [`Report`] prints every member of a list: std's `io::Error` skips
-/// its payload as a layer, and a list held as that payload would show its first member only.
+/// [`io_context`] over a cause that is an [`Error`]. An [`Error::Io`] is its `io::Error`, as
+/// [`io_context`] holds it: its kind is kept and no layer of a cosca `Error` is added. Any other
+/// cause, a list above all, is a layer of the chain, of kind [`Other`](std::io::ErrorKind::Other), so
+/// [`Report`] prints every member: std's `io::Error` skips its payload as a layer, and a list held
+/// as that payload would show its first member only.
 #[cfg(target_os = "linux")]
 pub(crate) fn io_context_over(context: impl Into<String>, cause: Error) -> std::io::Error {
-    std::io::Error::other(IoContext {
-        context: context.into(),
-        source: Box::new(cause),
-    })
+    match cause {
+        Error::Io(source) => io_context(context, source),
+        cause => std::io::Error::other(IoContext {
+            context: context.into(),
+            source: IoContextSource::Cosca(cause),
+        }),
+    }
 }
 
 /// [`io_context`] for a cause that may be absent: without one, an `io::Error` of kind
@@ -843,6 +848,15 @@ pub(crate) fn said(error: &(dyn std::error::Error + 'static)) -> String {
     Report::new(error).to_string()
 }
 
+/// Test-only: the members of the first [`Error::Several`] layer of `error`'s chain, if it has one.
+#[cfg(test)]
+pub(crate) fn several_in<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<Vec<&'a Error>> {
+    chain(error).find_map(|layer| match cosca_error(layer)? {
+        Error::Several(list) => Some(list.iter().map(|member| &**member).collect()),
+        _ => None,
+    })
+}
+
 /// Test-only: the [`Report`] text of an [`Error::Io`] whose `io::Error` says `cause`.
 #[cfg(test)]
 pub(crate) fn io_said(cause: impl std::fmt::Display) -> String {
@@ -852,7 +866,16 @@ pub(crate) fn io_said(cause: impl std::fmt::Display) -> String {
 #[derive(Debug)]
 struct IoContext {
     context: String,
-    source: Box<dyn std::error::Error + Send + Sync>,
+    source: IoContextSource,
+}
+
+/// What an [`IoContext`] says the failure was over.
+#[derive(Debug)]
+enum IoContextSource {
+    Io(std::io::Error),
+    /// Linux only: [`io_context_over`]'s cause that is no [`Error::Io`].
+    #[cfg(target_os = "linux")]
+    Cosca(Error),
 }
 
 impl std::fmt::Display for IoContext {
@@ -863,7 +886,11 @@ impl std::fmt::Display for IoContext {
 
 impl std::error::Error for IoContext {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&*self.source)
+        Some(match &self.source {
+            IoContextSource::Io(source) => source as &(dyn std::error::Error + 'static),
+            #[cfg(target_os = "linux")]
+            IoContextSource::Cosca(source) => source,
+        })
     }
 }
 
