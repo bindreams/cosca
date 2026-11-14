@@ -73,7 +73,7 @@ fn assert_refused_sends_are_not_sent() {
         std::os::windows::io::AsRawHandle::as_raw_handle(&leader),
     )
     .expect("assign the group leader to a job");
-    let outcome = job.send_terminate(leader.id(), None);
+    let (outcome, _) = job.send_terminate(leader.id(), None);
     assert!(
         matches!(outcome, TerminateOutcome::NotSent(_)),
         "a job's refused break must be NotSent, got {outcome:?}"

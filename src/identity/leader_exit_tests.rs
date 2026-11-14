@@ -23,16 +23,19 @@ fn a_process_whose_leader_thread_exited_is_alive_and_keeps_its_children() {
     )
     .expect("spawn the root");
     let stdin = root.stdin.take().expect("piped stdin");
+    let mut stdout = std::io::BufReader::new(root.stdout.take().expect("piped stdout"));
     let mut line = String::new();
-    std::io::BufReader::new(root.stdout.take().expect("piped stdout"))
-        .read_line(&mut line)
-        .expect("the cat's pid");
+    stdout.read_line(&mut line).expect("the cat's pid");
     let cat = ProcessId::of(line.trim().parse().expect("the cat's pid"))
         .found()
         .expect("the cat's identity");
     let id = ProcessId::of(root.id()).found().expect("the root's identity");
-    // The leader thread ends right after it printed: wait for the kernel to show it as a zombie. The
-    // condition is read again each time, with no limit, until it holds.
+    // The process's other thread reports that the leader began to exit: a real event, which this read
+    // blocks on. The kernel marks the leader a zombie a few steps after it (the report is the exit's
+    // `clear_child_tid` wake), so the `stat` is read again, with no limit, until it shows `Z`.
+    line.clear();
+    stdout.read_line(&mut line).expect("the leader's exit report");
+    assert_eq!(line, "exited\n");
     let stat = loop {
         let stat = std::fs::read(format!("/proc/{}/stat", root.id())).expect("the root's stat");
         if parse_state(&stat) == Some(b'Z') {

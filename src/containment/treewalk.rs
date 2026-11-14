@@ -122,15 +122,6 @@ impl Walker {
         Walker { root }
     }
 
-    /// [`send_terminate`](Contains::send_terminate) with the listing of its walk: the members the
-    /// settlement holds ([`Tree::terminate`](crate::containment::Tree::terminate)).
-    pub(crate) fn terminate_listed(
-        &self,
-        root: Option<&dyn crate::containment::Root>,
-    ) -> (TerminateOutcome, Option<Listing>) {
-        terminate_tree(&crate::identity::HostKernel, self.root, root)
-    }
-
     /// The root the walk starts from.
     #[cfg(all(test, unix))]
     pub(crate) fn root(&self) -> ProcessId {
@@ -162,8 +153,12 @@ impl Contains for Walker {
         }
     }
 
-    fn send_terminate(&self, _pid: u32, root: Option<&dyn crate::containment::Root>) -> TerminateOutcome {
-        self.terminate_listed(root).0
+    fn send_terminate(
+        &self,
+        _pid: u32,
+        root: Option<&dyn crate::containment::Root>,
+    ) -> (TerminateOutcome, Option<Listing>) {
+        terminate_tree(&crate::identity::HostKernel, self.root, root)
     }
 
     /// No kernel object says "every member has exited".

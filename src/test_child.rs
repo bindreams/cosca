@@ -1650,13 +1650,14 @@ pub(crate) const TERM_IGNORING_TREE_ARGV: &[&str] = &[
 /// A root, a subshell and its leaf on one stdin pipe, in one process group. Only the subshell and the
 /// leaf ignore `SIGTERM`: the root, `cat` after its `exec`, has the default disposition, so the
 /// group's soft signal ends it and leaves survivors that only a `SIGKILL` sweep reaches. The leaf
-/// prints `r` once it runs and ignores `SIGTERM`, so all three exist when it is read. The subshell
-/// prints `eof` if the leaf's `cat` ends of its own accord.
+/// prints `r` once it runs, so all three exist when it is read, and `leaf` once the stdin ends, if it
+/// is still alive: only a live leaf writes it, so a sweep that kills the subshell and misses the
+/// leaf leaves `leaf` on the stdout. The subshell prints `eof` after a leaf that ended on its own.
 #[cfg(unix)]
 pub(crate) const TERM_SURVIVOR_TREE_ARGV: &[&str] = &[
     "sh",
     "-c",
-    "exec 3<&0; { trap '' TERM; ( trap '' TERM; echo r; exec cat <&3 3<&- ) && echo eof; } & exec cat",
+    "exec 3<&0; { trap '' TERM; sh -c 'echo r; read -r _; echo leaf' <&3 3<&- && echo eof; } & exec cat",
 ];
 
 /// A tree whose root outlives the grace and ignores `SIGTERM`: a child `sh` that a `SIGTERM` ends

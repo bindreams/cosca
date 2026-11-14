@@ -286,7 +286,10 @@ impl Child {
     /// whole for nobody: its members are still killed by identity, but the call is
     /// [`Error::Unassessable`](crate::error::Error::Unassessable). A root already exited before the
     /// call sends nothing and answers as `kill_tree` does. A root that outlives the grace is walked
-    /// and killed as usual, and the members reparented meanwhile are killed by identity too.
+    /// and killed as usual, and the members reparented meanwhile are killed by identity too. A sweep
+    /// whose walk cannot be made (the process table cannot be read) kills nothing, the root
+    /// included: the call is that walk's error, and the members the `SIGTERM` walk listed stay held
+    /// for a retry, which kills them by identity (a later `kill_tree`, or the drop).
     ///
     /// **macOS, a root the handle cannot vouch for** is signalled as for
     /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A

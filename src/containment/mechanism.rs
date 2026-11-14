@@ -101,8 +101,10 @@ pub(crate) trait Contains: fmt::Debug {
     }
 
     /// The cooperative signal to every member it names, as [`send_kill`](Self::send_kill) decides it
-    /// from `root`: `SIGTERM`, or `CTRL_BREAK` to the root's group `pid` on Windows. Signal-only.
-    fn send_terminate(&self, pid: u32, root: Option<&dyn Root>) -> TerminateOutcome;
+    /// from `root`: `SIGTERM`, or `CTRL_BREAK` to the root's group `pid` on Windows. Signal-only. Beside
+    /// the outcome, the listing of the walk that made it, which the settlement holds
+    /// ([`Tree::terminate`](crate::containment::Tree::terminate)); `None` for a mechanism with no walk.
+    fn send_terminate(&self, pid: u32, root: Option<&dyn Root>) -> (TerminateOutcome, Option<Listing>);
 
     /// The tree's own kernel edge for "no member runs" (a cgroup's `populated`, a job's process
     /// list, a marker pipe's EOF); `None` for a group, a session and a walk.
@@ -174,8 +176,8 @@ impl<'a> AwaitableRelease<'a> {
 }
 
 /// The closed set of mechanisms a [`Tree`](crate::containment::Tree) is contained by, each variant
-/// cfg'd as its mechanism is. Only `impl Contains for Mechanism`, [`send_terminate_listed`](Mechanism::send_terminate_listed)
-/// and the tree's `_for_test` accessors match on it; everything else goes through [`Contains`].
+/// cfg'd as its mechanism is. Only `impl Contains for Mechanism` and the tree's `_for_test` accessors
+/// match on it; everything else goes through [`Contains`].
 #[derive(Debug)]
 pub(crate) enum Mechanism {
     /// Linux cgroup v2 leaf + `cgroup.kill`.
@@ -198,21 +200,6 @@ pub(crate) enum Mechanism {
     /// A table of stated answers, for the tests of what consumes a tree.
     #[cfg(test)]
     Fake(crate::containment::fake::FakeContains),
-}
-
-impl Mechanism {
-    /// [`send_terminate`](Contains::send_terminate) with the listing of the walk that made it: only a
-    /// tree walk has one.
-    pub(crate) fn send_terminate_listed(
-        &self,
-        pid: u32,
-        root: Option<&dyn Root>,
-    ) -> (TerminateOutcome, Option<Listing>) {
-        match self {
-            Mechanism::Walk(m) => m.terminate_listed(root),
-            other => (other.send_terminate(pid, root), None),
-        }
-    }
 }
 
 impl Contains for Mechanism {
@@ -280,7 +267,7 @@ impl Contains for Mechanism {
         }
     }
 
-    fn send_terminate(&self, pid: u32, root: Option<&dyn Root>) -> TerminateOutcome {
+    fn send_terminate(&self, pid: u32, root: Option<&dyn Root>) -> (TerminateOutcome, Option<Listing>) {
         match self {
             #[cfg(target_os = "linux")]
             Mechanism::Cgroup(m) => m.send_terminate(pid, root),

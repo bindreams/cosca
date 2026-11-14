@@ -568,7 +568,9 @@ impl Child {
     /// marker), a walk that killed what it could and left members running is an
     /// [`Error::MembersLeft`] of every member, each an [`Error::MemberNotKilled`] naming it and why:
     /// its identity could not be read, or its kill was refused. The handle keeps the members the walk
-    /// left: a later `kill_tree`, or the
+    /// left, and those a [`terminate_tree`](Child::terminate_tree) or
+    /// [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) `SIGTERM` walk reached: a later
+    /// `kill_tree`, or the
     /// drop, kills those whose identity was read again, and reports the others again. That holds
     /// whatever the later walk finds, a root that is gone included. Once those members are gone, a
     /// gone root is `Unassessable` on every later call, saying the members an earlier kill left are
@@ -776,12 +778,9 @@ impl Child {
                 other
             }
         };
-        let group_result = match self.tree.unless_unwalked(group_result) {
+        let group_result = match group_result.unless_unwalked() {
             Ok(group_result) => group_result,
-            Err(settled) => {
-                wait.reaching(settled.killed_again);
-                return Swept::new(op, Err(settled.answer), wait);
-            }
+            Err(failure) => return Swept::new(op, Err(failure), wait),
         };
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
         // reached it is read after it. One whose kill failed may still have its program running:

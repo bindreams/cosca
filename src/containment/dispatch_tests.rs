@@ -1424,48 +1424,31 @@ fn a_gone_root_over_a_marked_tree_still_answers_a_held_member() {
     ));
 }
 
-/// The early return of both `kill_tree`s: a walk not made is answered here, with its own error, no held
-/// member killed and the tree as it was; every other walk is handed back untouched for the backstop.
+/// The early return of a `Child`'s `kill_tree`: a walk not made is answered with its own error and
+/// the root is not ended, with nothing settled, so what the tree holds is kept for the retry; every
+/// other outcome is handed back for the backstop.
 #[skuld::test]
 fn only_a_walk_not_made_is_answered_before_the_backstop() {
-    use super::{TreeKillOutcome, TreeKilled, Unkilled};
-    let killed = TreeKilled::default();
-    killed
-        .settle(
-            Some(&walker()),
-            TreeKillOutcome::Ran(Err(Unkilled {
-                members: vec![member_left(7)],
-                root: None,
-                resolved: Vec::new(),
-            })),
-            true,
-        )
-        .answer
-        .expect_err("a member was left");
-
-    let handed_back = killed.unless_unwalked(Some(&walker()), TreeKillOutcome::Ran(Ok(())));
+    use super::TreeKillOutcome;
+    let handed_back = TreeKillOutcome::Ran(Ok(())).unless_unwalked();
     assert!(
         matches!(handed_back, Ok(TreeKillOutcome::Ran(Ok(())))),
         "a walk made is the backstop's to settle"
     );
 
-    let Err(failure) = killed.unless_unwalked(
-        Some(&walker()),
-        TreeKillOutcome::Unwalked(crate::error::Error::Unassessable {
-            detail: "the snapshot failed".into(),
-            source: None,
-        }),
-    ) else {
+    let Err(failure) = TreeKillOutcome::Unwalked(crate::error::Error::Unassessable {
+        detail: "the snapshot failed".into(),
+        source: None,
+    })
+    .unless_unwalked() else {
         panic!("a walk not made is an error");
     };
-    let failure = failure.answer;
     assert!(
         matches!(failure.error, crate::error::Error::Unassessable { .. }),
-        "nothing was killed, and the held member is the retry's: {:?}",
+        "{:?}",
         failure.error
     );
     assert!(!failure.root_ended);
-    assert_eq!(standing(&killed), Standing::Left(vec![7]), "the tree is as it was");
 }
 
 /// A member whose identity was read and whose kill was refused is killed by identity again by the
@@ -1590,14 +1573,14 @@ fn members_a_cooperative_walk_reached_are_killed_by_identity_when_the_root_is_go
     crate::test_child::assert_killed("the held member", blocker.wait().expect("reap the member"));
 }
 
-/// A `kill_tree` whose walk could not be made kills no held member, a `SIGTERM` walk's or a refused
-/// kill's, and leaves the state as it was: nothing was killed, the root included, and a retry's walk
-/// answers them. A drop cannot retry, so its settlement of the same outcome still kills them.
+/// A settlement of a walk that could not be made kills the held members, a `SIGTERM` walk's and a
+/// refused kill's, by identity, and answers the walk's own error: whoever settles has no retry to
+/// keep them for (a drop, a foreign `Process`'s sweep, a skipped kill).
 ///
-/// Mutants: an unmade walk kills held members by identity (`Termed` or `Resolved`); it clears or
-/// changes what the tree holds; a drop's settlement keeps them.
+/// Mutants: an unmade walk leaves held members running (`Termed` or `Resolved`); it answers none of
+/// the walk's error.
 #[skuld::test]
-fn a_kill_tree_whose_walk_was_not_made_kills_no_held_member_and_keeps_the_state() {
+fn a_settlement_of_a_walk_not_made_kills_the_held_members() {
     use super::{TreeKillOutcome, TreeKilled, Unkilled};
     use crate::error::Error;
     let unwalked = || {
@@ -1629,23 +1612,6 @@ fn a_kill_tree_whose_walk_was_not_made_kills_no_held_member_and_keeps_the_state(
 
     let settled = killed.settle_for_kill_tree(Some(&walker()), unwalked(), false);
 
-    let error = settled.answer.expect_err("nothing was killed");
-    assert!(matches!(error, Error::Unassessable { .. }), "{error}");
-    assert!(settled.killed_again.is_empty(), "no held member was killed");
-    assert_eq!(standing(&killed), held, "the state is as it was");
-    assert_eq!(
-        termed.try_wait().expect("read the member"),
-        None,
-        "the termed member runs"
-    );
-    assert_eq!(
-        refused.try_wait().expect("read the member"),
-        None,
-        "the refused member runs"
-    );
-
-    // The same outcome in a drop's settlement kills them: it cannot retry.
-    let settled = killed.settle(Some(&walker()), unwalked(), true);
     settled.answer.expect_err("a walk not made");
     assert_eq!(settled.killed_again, vec![refused_id, termed_id]);
     // Released after the kills: a settlement that sent nothing lets a member exit on EOF, which fails

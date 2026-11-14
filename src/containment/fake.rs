@@ -11,7 +11,7 @@ use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{nothing_held, Contains, KillLeftOutcome};
 #[cfg(unix)]
 use crate::containment::tree_kill::refused_unobserved;
-use crate::containment::treewalk::Left;
+use crate::containment::treewalk::{Left, Listing};
 use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
 use crate::identity::ProcessId;
 
@@ -103,12 +103,13 @@ impl Contains for FakeContains {
         }
     }
 
-    fn send_terminate(&self, _pid: u32, _root: Option<&dyn Root>) -> TerminateOutcome {
+    fn send_terminate(&self, _pid: u32, _root: Option<&dyn Root>) -> (TerminateOutcome, Option<Listing>) {
         self.record("terminate");
-        TerminateOutcome::Sent {
+        let sent = TerminateOutcome::Sent {
             result: Ok(()),
             earlier: Some("the SIGTERM"),
-        }
+        };
+        (sent, None)
     }
 
     /// It has no drain edge.

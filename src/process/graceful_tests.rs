@@ -169,6 +169,35 @@ fn foreign_graceful_shutdown_tree_kills_a_member_that_ignores_the_sigterm_after_
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
 }
 
+// A foreign process has no retry that a held member could wait for: when the root has exited and the
+// sweep's walk cannot be made (the process table cannot be listed), the members the call's own
+// `SIGTERM` walk held are killed by identity all the same. The call is an error, and nothing is left
+// running.
+//
+// Mutant: the sweep leaves held members alone when its walk was not made.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn foreign_graceful_sweep_whose_walk_is_not_made_kills_the_members_its_sigterm_walk_held() {
+    use crate::identity::{FakeKernel, HostKernel};
+    let mut tree = survivor_tree();
+    let settling = tree.process.begin_graceful().expect("the SIGTERM walk");
+    crate::test_child::wait_until_zombie(tree.child.id());
+    let unlistable = FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO));
+
+    tree.process
+        .kill_tree_settling("graceful_shutdown_tree", &unlistable, Some(&settling))
+        .expect_err("the walk was not made");
+
+    for member in &tree.members {
+        assert_eq!(
+            member.is_alive(),
+            crate::identity::Liveness::Dead,
+            "{member:?} was held by the SIGTERM walk and is killed by identity"
+        );
+    }
+    tree.child.wait().expect("reap the root");
+}
+
 // A root that ignores the `SIGTERM` outlives the grace, and the `SIGTERM` ends its child, which
 // reparents the member below it out of the sweep's walk from the root. The member the call's own walk
 // reached is killed by identity all the same, as a `Child`'s tree does through its settlement, and the

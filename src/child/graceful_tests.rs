@@ -366,7 +366,7 @@ fn child_graceful_shutdown_tree_tears_down_tree() {
 // within the grace, but the grandchild ignores it and survives, so only the hard sweep, which runs
 // while the unreaped root still pins the group, can end it. The grandchild never ends on its own,
 // so the grace runs out (1 s, the call's own bound). Its stdin is released once the sweep returned
-// (`release_at`): a grandchild the sweep missed then ends of its own accord and prints `eof`, so an
+// (`release_at`): a leaf the sweep missed then ends of its own accord and prints `leaf`, so an
 // empty stdout shows it was killed. The root's own status is not asserted: the sweep's `SIGKILL`
 // may reach it before its `SIGTERM` has ended it.
 #[cfg(unix)]

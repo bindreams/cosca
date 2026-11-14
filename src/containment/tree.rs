@@ -2,7 +2,7 @@
 //! mechanism, with where that tree stands after the kills that settled it. Everything the child does to
 //! its tree goes through [`Tree`], which asks its mechanism only through [`Contains`].
 
-use crate::containment::dispatch::{Settled, SweepFailure, TreeKillOutcome, TreeKilled};
+use crate::containment::dispatch::{Settled, TreeKillOutcome, TreeKilled};
 use crate::containment::drain_edge::DrainEdge;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
@@ -221,7 +221,7 @@ impl Tree {
             }
             Holder::Contained(mechanism) => {
                 debug_assert!(!self.released, "a send on a released tree");
-                let (outcome, listing) = mechanism.send_terminate_listed(pid, root);
+                let (outcome, listing) = mechanism.send_terminate(pid, root);
                 let walk = listing.and_then(|listing| self.hold_walked(listing, call));
                 (outcome, walk)
             }
@@ -379,12 +379,6 @@ impl Tree {
                 crate::containment::mechanism::root_left_alone(root)
             }
         }
-    }
-
-    /// `outcome` for a `kill_tree` that goes on to the root's backstop (see
-    /// [`TreeKilled::unless_unwalked`]).
-    pub(crate) fn unless_unwalked(&self, outcome: TreeKillOutcome) -> Result<TreeKillOutcome, Settled<SweepFailure>> {
-        self.killed.unless_unwalked(self.named_by(), outcome)
     }
 
     /// [`settle`](Self::settle) for a drop: what is left when the tree is not settled, worded here and

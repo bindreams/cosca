@@ -744,6 +744,17 @@ impl TreeKillOutcome {
         }
     }
 
+    /// This outcome for a `kill_tree` that goes on to the root's backstop, unless it is a walk that was
+    /// not made ([`Unwalked`](Self::Unwalked)): the root's death would strand the descendants beyond a
+    /// retry, so the walk's own error is the answer, and nothing is settled. The state stays as it
+    /// was, and the members it holds are kept for the retry's walk.
+    pub(crate) fn unless_unwalked(self) -> Result<TreeKillOutcome, SweepFailure> {
+        match self {
+            TreeKillOutcome::Unwalked(error) => Err(SweepFailure::from(error)),
+            other => Ok(other),
+        }
+    }
+
     /// What [`NoRoot`](Self::NoRoot) of the root `pid` is as an error: nothing was killed, because no
     /// walk ran.
     pub(crate) fn no_root_error(pid: u32) -> Error {
@@ -1059,21 +1070,7 @@ impl TreeKilled {
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Settled {
-        self.settle_with(mechanism, outcome, root_ended, false)
-    }
-
-    /// [`settle`](Self::settle); `retryable`: the call can be made again, so a walk not made
-    /// ([`TreeKillOutcome::Unwalked`]) kills no held member and leaves the state as it was, and the
-    /// retry's walk answers them.
-    fn settle_with(
-        &self,
-        mechanism: Option<&Mechanism>,
-        outcome: impl Into<TreeKillOutcome>,
-        root_ended: bool,
-        retryable: bool,
-    ) -> Settled {
         let outcome = outcome.into();
-        let keeps_held = retryable && matches!(outcome, TreeKillOutcome::Unwalked(_));
         let mut state = self.lock();
         let was_killed = state.vouching == Vouching::Killed;
         // Copied, not taken: the state is written once, at the end, so an unwind between leaves it as it was.
@@ -1100,11 +1097,6 @@ impl TreeKilled {
             left: left_now,
             killed: killed_again,
         } = match mechanism {
-            Some(_) if keeps_held => crate::containment::mechanism::KillLeftOutcome {
-                result,
-                left: held,
-                killed: Vec::new(),
-            },
             Some(mechanism) => mechanism.kill_left(result, held),
             None => crate::containment::mechanism::nothing_held(result),
         };
@@ -1160,27 +1152,8 @@ impl TreeKilled {
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Settled<Result<(), Error>> {
-        self.settle_with(mechanism, outcome, root_ended, true)
+        self.settle(mechanism, outcome, root_ended)
             .map(|answer| answer.map(drop))
-    }
-
-    /// `outcome` for a `kill_tree` that goes on to the root's backstop: a `TreeWalk` that could not
-    /// walk killed nothing, and the root's death would strand the descendants beyond a retry, so it is
-    /// settled here and returned as the error with the tree intact. Any other `outcome` is handed back.
-    pub(crate) fn unless_unwalked(
-        &self,
-        mechanism: Option<&Mechanism>,
-        outcome: TreeKillOutcome,
-    ) -> Result<TreeKillOutcome, Settled<SweepFailure>> {
-        if !matches!(outcome, TreeKillOutcome::Unwalked(_)) {
-            return Ok(outcome);
-        }
-        let settled = self.settle_for_kill_tree(mechanism, outcome, false);
-        Err(settled.map(|answer| match answer {
-            Err(error) => SweepFailure::from(error),
-            // The walk's error is a member left, and the root is not ended.
-            Ok(()) => unreachable!("a walk not made leaves its error"),
-        }))
     }
 
     /// [`settle`](Self::settle) for a drop: what is left when the tree is not settled, the text of the
