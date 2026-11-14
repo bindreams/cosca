@@ -92,13 +92,18 @@ fn an_anchor_that_is_access_denied_is_unassessable_blaming_access() {
     let id = crate::identity::ticks_id(id.pid());
     let (kernel, _guard) = crate::identity::unreadable(id.pid());
     let expected = format!("pid {} exists but could not be queried", id.pid());
-    for result in [
-        id.parent_with(&kernel).map(|_| ()),
-        id.children_with(&kernel, Recursive::No).map(|_| ()),
-        id.children_with(&kernel, Recursive::Yes).map(|_| ()),
+    // The macOS snapshot reads every pid's parent through the kernel, so it meets the refusal first.
+    #[cfg(target_os = "macos")]
+    let in_the_snapshot = "pids denied a ppid read".to_owned();
+    #[cfg(not(target_os = "macos"))]
+    let in_the_snapshot = expected.clone();
+    for (result, expected) in [
+        (id.parent_with(&kernel).map(|_| ()), &expected),
+        (id.children_with(&kernel, Recursive::No).map(|_| ()), &in_the_snapshot),
+        (id.children_with(&kernel, Recursive::Yes).map(|_| ()), &in_the_snapshot),
     ] {
         match result {
-            Err(Error::Unassessable { detail, .. }) => assert!(detail.contains(&expected), "{detail}"),
+            Err(Error::Unassessable { detail, .. }) => assert!(detail.contains(expected), "{detail}"),
             other => panic!("expected Unassessable, got {other:?}"),
         }
     }

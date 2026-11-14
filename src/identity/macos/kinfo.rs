@@ -190,12 +190,6 @@ pub(crate) fn kinfo(kernel: &dyn Kernel, pid: RawPid) -> Resolved<kinfo_proc> {
     kernel.kinfo(pid).0
 }
 
-/// [`Kernel::kinfo`] as the host kernel answers it: the `sysctl` itself, with the failure that left
-/// the read `Unknown`.
-pub(super) fn host_kinfo(pid: RawPid) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
-    read_record_explained(pid, libc::KERN_PROC_PID)
-}
-
 /// Forces the parents of a [`kinfo`] read.
 #[cfg(test)]
 pub(crate) mod fault {
@@ -234,11 +228,10 @@ pub(crate) mod fault {
     }
 }
 
-/// The selector-parameterized core. The `selector` parameter is a TEST SEAM (production
-/// always passes `KERN_PROC_PID` via `kinfo()`) — it lets a unit test drive the
-/// contract-violation arm with an invalid selector.
-fn read_record_explained(pid: RawPid, selector: libc::c_int) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, selector, pid as libc::c_int];
+/// [`Kernel::kinfo`] as the host kernel answers it: the `sysctl` itself, with the failure that left
+/// the read `Unknown`.
+pub(super) fn host_kinfo(pid: RawPid) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as libc::c_int];
     loop {
         let mut info: kinfo_proc = unsafe { std::mem::zeroed() };
         let mut size = std::mem::size_of::<kinfo_proc>();
@@ -263,7 +256,7 @@ fn read_record_explained(pid: RawPid, selector: libc::c_int) -> (Resolved<kinfo_
                 // not a contract violation - `debug`, like every other per-pid probe.
                 Some(libc::EPERM) | Some(libc::EACCES) => {
                     log::debug!(
-                        "sysctl(KERN_PROC selector {selector}, {pid}) refused: {report}",
+                        "sysctl(KERN_PROC_PID, {pid}) refused: {report}",
                         report = crate::error::Report(&e)
                     );
                     (Resolved::Unknown, Some(e))
@@ -275,7 +268,7 @@ fn read_record_explained(pid: RawPid, selector: libc::c_int) -> (Resolved<kinfo_
                 // Rust definition is what stayed still. Keep it loud.
                 _ => {
                     super::contract_violation(format_args!(
-                        "sysctl(KERN_PROC selector {selector}, {pid}) failed: {report}",
+                        "sysctl(KERN_PROC_PID, {pid}) failed: {report}",
                         report = crate::error::Report(&e)
                     ));
                     (Resolved::Unknown, Some(e))
@@ -288,7 +281,7 @@ fn read_record_explained(pid: RawPid, selector: libc::c_int) -> (Resolved<kinfo_
         if size != std::mem::size_of::<kinfo_proc>() {
             // Layout drift — never trust a partial/foreign-sized record.
             let drift = format!(
-                "sysctl(KERN_PROC selector {selector}, {pid}) wrote {size} bytes, expected {}",
+                "sysctl(KERN_PROC_PID, {pid}) wrote {size} bytes, expected {}",
                 std::mem::size_of::<kinfo_proc>()
             );
             super::contract_violation(format_args!("{drift}"));

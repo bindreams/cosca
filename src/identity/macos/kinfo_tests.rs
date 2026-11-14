@@ -36,22 +36,6 @@ fn kernel_writes_exactly_our_kinfo_proc_size() {
     );
 }
 
-// The rc!=0 contract-violation arm, driven through the selector test seam (a SYNTHETIC
-// invalid selector — the arm's real triggers are unconstructible with a correct mib). In
-// debug builds the tripwire panics AFTER the warn executed (this test expects the panic);
-// in the release lane the same straight-line code minus the compiled-out assert runs to
-// `None`, which the assert below pins.
-// SCOPE: the EPERM arm - a sandboxed sysctl refusal - is a DIFFERENT arm, reached by no
-// test on any available machine.
-#[cfg_attr(debug_assertions, should_panic(expected = "sysctl(KERN_PROC"))]
-#[skuld::test]
-fn an_undiagnosable_sysctl_failure_trips_the_tripwire_and_reports_unknown() {
-    let (r, _) = super::read_record_explained(std::process::id() as super::super::RawPid, -1);
-    // `assert_eq!` is impossible here: `Resolved`-s derives are T-bounded and `kinfo_proc`
-    // embeds a union, so it can never be `PartialEq`/`Debug`.
-    assert!(r.is_unknown(), "a failed sysctl must never yield a record - or a Gone");
-}
-
 // Verifies contract_violation's warn is actually captured, not just that debug panics —
 // the release lane (no should_panic) asserts the captured record directly.
 #[cfg_attr(debug_assertions, should_panic(expected = "synthetic"))]

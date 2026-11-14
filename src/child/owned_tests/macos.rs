@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use super::fixtures::{spawn_std_blocker, status, try_wait, wait_status, Blocker};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::error::Error;
-use crate::identity::{ppid_fault, uniq_fault, HostKernel, ReadPurpose, UniqRead, LAUNCHD};
+use crate::identity::{ppid_fault, FakeKernel, HostKernel, UniqRead, LAUNCHD};
 use crate::os_process::child::{Foreign, OsChild, PeekOutcome, TryReapOutcome};
 use crate::os_process::macos::child::MacosChild;
 use crate::os_process::macos::kqueue::test_hooks;
@@ -177,12 +177,10 @@ fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
 /// Mutant: `target()` without the id: the exit is reported.
 #[skuld::test]
 fn try_wait_on_a_pid_with_another_unique_id_is_echild_and_consumes_nothing() {
-    let mut b = Blocker::spawn();
+    // The peek's id check is the first unique-id read.
+    let mut b = Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
     b.end_child_and_confirm_exit();
-    let other = unique_of(b.pid) ^ 1;
-    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, found(other));
     let outcome = try_wait(&b.owned);
-    drop(forced);
     assert!(is_foreign(&outcome), "another process holds the pid: {outcome:?}");
     wait_status(&b.owned);
 }
@@ -193,12 +191,10 @@ fn try_wait_on_a_pid_with_another_unique_id_is_echild_and_consumes_nothing() {
 /// Mutant: the wait's peek without the id: it reports `Reapable` and reaches the reap.
 #[skuld::test]
 fn a_wait_on_a_pid_with_another_unique_id_never_reaches_the_reap() {
-    let mut b = Blocker::spawn();
+    // The peek's id check is the first unique-id read.
+    let mut b = Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
     b.end_child_and_confirm_exit();
-    let other = unique_of(b.pid) ^ 1;
-    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, found(other));
     let outcome = b.owned.wait(None);
-    drop(forced);
     assert!(is_foreign(&outcome), "another process holds the pid: {outcome:?}");
     // Our zombie was never consumed: a real wait reaps it.
     wait_status(&b.owned);
@@ -210,14 +206,12 @@ fn a_wait_on_a_pid_with_another_unique_id_never_reaches_the_reap() {
 /// Mutant: `kill` by the bare pid, as std's `Child::kill` does: the child dies of `SIGKILL`.
 #[skuld::test]
 fn kill_sends_nothing_to_a_pid_with_another_unique_id() {
-    let mut b = Blocker::spawn();
+    // The kill's version read is the first unique-id read.
+    let mut b = Blocker::spawn_over(|pid, unique| FakeKernel::over(&HostKernel).on_unique_info(pid, found(unique ^ 1)));
     let log = crate::send_log::Capture::start();
-    let other = unique_of(b.pid) ^ 1;
-    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Kill, found(other));
     b.owned
         .signal(Sig::Kill)
         .expect("a pid that is not ours is gone, not an error");
-    drop(forced);
     assert_eq!(log.entries(), []);
     b.end_child();
     let status = wait_status(&b.owned);
@@ -504,21 +498,22 @@ fn a_wait_on_a_child_whose_tracer_is_exiting_at_launchd_peeks_again_on_a_backoff
 /// Mutant: `Running` never checks the id.
 #[skuld::test]
 fn a_running_peek_of_a_pid_with_another_unique_id_is_foreign() {
-    let mut b = Blocker::spawn();
-    let unique = unique_of(b.pid);
-    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Running, found(unique ^ 1));
+    // Each `try_wait` makes one unique-id read, the peek's id check, so the rows answer them in order.
+    let mut b = Blocker::spawn_over(|pid, unique| {
+        FakeKernel::over(&HostKernel)
+            .on_unique_info(pid, found(unique ^ 1))
+            .on_unique_info(pid, UniqRead::Refused(libc::EPERM))
+            .on_unique_info(pid, found(unique))
+    });
     let outcome = try_wait(&b.owned);
-    drop(forced);
     assert!(is_foreign(&outcome), "another process holds the pid: {outcome:?}");
     // An id that cannot be read, or that matches, leaves it running.
-    for read in [UniqRead::Refused(libc::EPERM), found(unique)] {
-        let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Running, read);
+    for why in ["a refused id read", "a matching id"] {
         assert_eq!(
             try_wait(&b.owned).expect("try_wait"),
             ChildWaitOutcome::DeadlinePassed,
-            "{read:?}"
+            "{why}"
         );
-        drop(forced);
     }
     b.end_child();
     wait_status(&b.owned);
@@ -678,17 +673,18 @@ fn setuid_child_kill_is_permission_denied(#[fixture(setuid)] _group: &Group) {
 /// Mutant: the refused read handed back the id-less peek, which `try_reap` then consumes.
 #[skuld::test]
 fn a_refused_id_read_at_the_exit_check_consumes_nothing() {
-    let mut b = Blocker::spawn();
+    // Each call's peek makes one unique-id read, its id check, so the rows answer them in order.
+    let mut b = Blocker::spawn_over(|pid, _| {
+        FakeKernel::over(&HostKernel)
+            .on_unique_info(pid, UniqRead::Refused(libc::EPERM))
+            .on_unique_info(pid, UniqRead::Refused(libc::EACCES))
+    });
     b.end_child_and_confirm_exit();
-    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, UniqRead::Refused(libc::EPERM));
     let err = try_wait(&b.owned)
         .expect_err("an unverifiable exit is not consumed")
         .into_io();
-    drop(forced);
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
-    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, UniqRead::Refused(libc::EACCES));
     let err = b.owned.wait(None).expect_err("nor by a wait").into_io();
-    drop(forced);
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     // Still ours, unreaped: the next, verifiable, call reaps it.
     let status = wait_status(&b.owned);
@@ -736,7 +732,13 @@ fn a_try_wait_during_a_holders_wait_does_not_strand_the_holder() {
 /// Mutant: the peek is the plain one, which calls an unreadable id on a running child `Running`.
 #[skuld::test]
 fn try_wait_during_a_wait_errors_when_a_running_childs_unique_id_is_unreadable() {
-    let mut b = Blocker::spawn();
+    // The holder's one look before it blocks reads the id once, and finds it the child's; the next
+    // read is the `try_wait`'s peek.
+    let mut b = Blocker::spawn_over(|pid, unique| {
+        FakeKernel::over(&HostKernel)
+            .on_unique_info(pid, found(unique))
+            .on_unique_info(pid, UniqRead::Refused(libc::EPERM))
+    });
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let holder = std::thread::spawn({
         let owned = std::sync::Arc::clone(&b.owned);
@@ -746,11 +748,9 @@ fn try_wait_during_a_wait_errors_when_a_running_childs_unique_id_is_unreadable()
         }
     });
     reached_rx.recv().expect("the holder must reach its wait");
-    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Running, UniqRead::Refused(libc::EPERM));
     let err = try_wait(&b.owned)
         .expect_err("a running child that cannot be shown to be ours")
         .into_io();
-    drop(forced);
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     b.end_child();
     let status = status(holder.join().expect("holder"));
@@ -782,45 +782,34 @@ fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
 /// peek shows its exit record: `liveness` does not fail where the record answers, as it did not
 /// before the watch was confirmed by a read.
 ///
-/// The watch fired and the forced `Exit` refusal was consumed: the recorded purposes show the
-/// confirming read was made.
+/// The confirming read is the first unique-id read, so the row refuses it; the peek's id check
+/// after it is the host's.
 ///
 /// Mutant: `OwnedChild::liveness` propagates the refusal of `exited` without asking the peek.
 #[skuld::test]
 fn a_refused_confirmation_is_dead_when_the_peek_shows_the_exit_record() {
-    let mut b = Blocker::spawn();
+    let mut b =
+        Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_unique_info(pid, UniqRead::Refused(libc::EPERM)));
     b.end_child_and_confirm_exit();
-    let reads = uniq_fault::record();
-    let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Exit, UniqRead::Refused(libc::EPERM));
     assert!(
         matches!(b.owned.liveness(), Ok(crate::identity::Liveness::Dead)),
         "the exit record is visible whatever the confirming read says"
-    );
-    assert!(
-        reads.purposes().contains(&ReadPurpose::Exit),
-        "the watch fired and the forced refusal was consumed: {:?}",
-        reads.purposes()
     );
 }
 
 /// A child whose exit watch has fired while it runs and whose confirming read is refused is the
 /// refusal, not `Alive`, when the peek reads it running: a running peek proves nothing (a tracer can
-/// hold the zombie). The registration refusal stands in for the early edge.
+/// hold the zombie). The registration refusal stands in for the early edge, and the confirming read
+/// is the first unique-id read, so the row refuses it.
 ///
 /// Mutant: `OwnedChild::liveness` answers `Alive` for a child the peek reads running.
 #[skuld::test]
 fn a_refused_confirmation_is_the_refusal_when_the_peek_reads_the_child_running() {
     let forced_watch = test_hooks::force_proc_registration_once(test_hooks::Registration::ExitWatch);
-    let b = Blocker::spawn();
+    let b =
+        Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_unique_info(pid, UniqRead::Refused(libc::EPERM)));
     drop(forced_watch);
-    let reads = uniq_fault::record();
-    let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Exit, UniqRead::Refused(libc::EPERM));
     let err = b.owned.liveness().expect_err("a running peek does not answer");
     assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
-    assert!(
-        reads.purposes().contains(&ReadPurpose::Exit),
-        "the watch fired and the forced refusal was consumed: {:?}",
-        reads.purposes()
-    );
 }

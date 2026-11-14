@@ -3,7 +3,8 @@
 //!
 //! A row answers one call for one pid, or for one [`Subscription`]. The rows of a call kind are
 //! taken in the order they were stated, the first one for what is asked about, and each answers
-//! once. A peek row never answers a consume.
+//! once. A peek row never answers a consume. An `on_every_*` row answers every call of its kind
+//! for its pid that no other row answers, as every row of the Linux fake does.
 
 use std::fmt::Arguments;
 use std::io;
@@ -14,26 +15,42 @@ use crate::identity::kinfo::kinfo_proc;
 use crate::identity::{RawPid, ReadErr, Record, Resolved, UniqRead};
 use crate::os_process::macos::kqueue::{Kqueue, Subscription};
 
-/// The rows of one call kind: what each answers for, and the answer.
-struct Rows<A, T>(Mutex<Vec<(A, T)>>);
+/// The rows of one call kind: what each answers for, and the answer. A row answers once; an
+/// `every` row answers each call no row of the kind answers.
+struct Rows<A, T> {
+    once: Mutex<Vec<(A, T)>>,
+    every: Vec<(A, Box<dyn Fn() -> T + Send + Sync>)>,
+}
 
 impl<A: PartialEq, T> Rows<A, T> {
     fn new() -> Self {
-        Rows(Mutex::new(Vec::new()))
+        Rows {
+            once: Mutex::new(Vec::new()),
+            every: Vec::new(),
+        }
     }
 
     fn push(&mut self, asked: A, answer: T) {
-        self.0
+        self.once
             .get_mut()
             .expect("no thread holds the rows")
             .push((asked, answer));
     }
 
-    /// The first row for `asked`, which it removes.
+    fn push_every(&mut self, asked: A, answer: impl Fn() -> T + Send + Sync + 'static) {
+        self.every.push((asked, Box::new(answer)));
+    }
+
+    /// The first row for `asked`, which it removes; else the first `every` row for it.
     fn take(&self, asked: &A) -> Option<T> {
-        let mut rows = self.0.lock().expect("no thread panics holding the rows");
-        let at = rows.iter().position(|(row, _)| row == asked)?;
-        Some(rows.remove(at).1)
+        let mut rows = self.once.lock().expect("no thread panics holding the rows");
+        if let Some(at) = rows.iter().position(|(row, _)| row == asked) {
+            return Some(rows.remove(at).1);
+        }
+        self.every
+            .iter()
+            .find(|(row, _)| row == asked)
+            .map(|(_, answer)| answer())
     }
 }
 
@@ -105,6 +122,20 @@ impl<'a> FakeKernel<'a> {
     pub(crate) fn on_kinfo_refused(mut self, pid: RawPid, errno: i32) -> Self {
         self.kinfos
             .push(pid, (Resolved::Unknown, Some(io::Error::from_raw_os_error(errno))));
+        self
+    }
+
+    /// Every BSD-info read of `pid` that no row answers fails with `error`.
+    pub(crate) fn on_every_bsd_info_failing(mut self, pid: RawPid, error: ReadErr) -> Self {
+        self.bsd_infos.push_every(pid, move || Err(error));
+        self
+    }
+
+    /// Every `kinfo_proc` read of `pid` that no row answers is refused with `errno`.
+    pub(crate) fn on_every_kinfo_refused(mut self, pid: RawPid, errno: i32) -> Self {
+        self.kinfos.push_every(pid, move || {
+            (Resolved::Unknown, Some(io::Error::from_raw_os_error(errno)))
+        });
         self
     }
 

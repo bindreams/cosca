@@ -1055,12 +1055,10 @@ pub(crate) use backend::kinfo;
 
 /// A kernel, and a guard to hold while it is used, under which every by-pid identity read of `pid`
 /// answers `Unknown`: an access refusal (`hidepid` on Linux, a sandboxed or cross-user read on
-/// macOS) for a live pid.
+/// macOS) for a live pid. The kernel states the answer and the guard holds nothing.
 ///
-/// Linux: the returned kernel states the answer, a `stat` row for `pid` answering `EACCES`, and the
-/// guard holds nothing. That `stat` fails for every read through the kernel, a table scan's too.
-/// macOS: the kernel is the host's and the guard hooks the reads of this thread; see the macOS
-/// arm.
+/// Linux: a `stat` row for `pid` answering `EACCES`, which fails for every read through the kernel,
+/// a table scan's too. macOS: rows refusing every `proc_pidinfo` and `sysctl` read of the record.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn unreadable(pid: RawPid) -> (impl Kernel, impl Sized) {
     (ticks_host(pid).on_read(&format!("{pid}/stat"), Err(libc::EACCES)), ())
@@ -1086,12 +1084,19 @@ pub(crate) fn ticks_id(pid: RawPid) -> ProcessId {
         .expect("a live pid has a starttime")
 }
 
-/// [`unreadable`] on macOS. The guard is what makes the reads refuse: the thread-local
-/// `force_unknown` hook answers above the kernel until it drops.
+/// [`unreadable`] on macOS: the record read `EPERM`s on both paths, as a cross-user read does.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn unreadable(pid: RawPid) -> (impl Kernel, impl Sized) {
-    (HostKernel, backend::fault::force_unknown(pid))
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_every_bsd_info_failing(pid, ReadErr::Refused(libc::EPERM))
+        .on_every_kinfo_refused(pid, libc::EPERM);
+    (kernel, ())
 }
+
+/// The thread-local hook that makes every by-pid identity read of `pid` on this thread answer
+/// `Unknown`, for the fd-marker sweep, which takes no kernel.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use backend::fault::force_unknown;
 
 /// The assert-free identity reads every `exit_only` check uses, and the purpose that names each.
 #[cfg(target_os = "macos")]
