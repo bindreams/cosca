@@ -124,13 +124,17 @@ In order:
      split by arm. Windows and macOS still tear down by themselves for their other spawn failures;
      on macOS a refused kill leaves the child running, with a warn, until the macOS hand-back.
    - Under `MacosChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
-     kernel-view slice): macOS's `Kernel` has its methods and is threaded through, but the
-     thread-local hooks still answer above it: `exit_only::{peek, peek_verified, peek_traced}` still
+     kernel-view slice): macOS's `Kernel` has its methods and is threaded through. macOS tests
+     state `FakeKernel` rows. Hooks remain only where the code still holds `HostKernel` (the
+     spawn-time code, the fd-marker sweep) or no row can state the answer (`uniq_fault`,
+     `ppid_fault`, `force_parents`, `force_links`, `by_pid_reads`). `HostKernel`'s own `sysctl`
+     read states no row, so what a sysctl result means (`ESRCH`, `EPERM`/`EACCES` quiet; any other
+     errno or a record of another size a `contract_violation`) is the pure `kinfo::classify`,
+     tested directly. `exit_only::{peek, peek_verified, peek_traced}` still
      consult the `exit_only::seams` hook; five macOS tests need it, and `MacosChild::event_pending`
-     (a `cfg(test)` accessor) goes with it. `LinuxProcess` no longer does. The macOS arm of the
-     `unreadable` test helper still answers through the thread-local `force_unknown` hook until the
-     slices that convert them. Those slices also remove
-     `block_probe::on_round` and `on_every_round`, the `cfg(test)` round hooks of `wait.rs`.
+     (a `cfg(test)` accessor) goes with it. `LinuxProcess` no longer does. The slices that convert
+     them also remove `block_probe::on_round` and `on_every_round`, the `cfg(test)` round hooks of
+     `wait.rs`.
 2. **Elevation backends:** a black box that says what the tracked process is (the program, or a
    wrapper that outlives it) and what may be signalled. `Child` asks it; it stops knowing sudo,
    doas or osascript.

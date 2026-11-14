@@ -3,7 +3,8 @@
 //!
 //! A row answers one call for one pid, or for one [`Subscription`]. The rows of a call kind are
 //! taken in the order they were stated, the first one for what is asked about, and each answers
-//! once. A peek row never answers a consume.
+//! once. A peek row never answers a consume. An `on_every_*` row answers every call of its kind
+//! for its pid that no other row answers.
 
 use std::fmt::Arguments;
 use std::io;
@@ -14,26 +15,42 @@ use crate::identity::kinfo::kinfo_proc;
 use crate::identity::{RawPid, ReadErr, Record, Resolved, UniqRead};
 use crate::os_process::macos::kqueue::{Kqueue, Subscription};
 
-/// The rows of one call kind: what each answers for, and the answer.
-struct Rows<A, T>(Mutex<Vec<(A, T)>>);
+/// The rows of one call kind: what each answers for, and the answer. A row answers once; an
+/// `every` row answers each call no row of the kind answers.
+struct Rows<A, T> {
+    once: Mutex<Vec<(A, T)>>,
+    every: Vec<(A, Box<dyn Fn() -> T + Send + Sync>)>,
+}
 
 impl<A: PartialEq, T> Rows<A, T> {
     fn new() -> Self {
-        Rows(Mutex::new(Vec::new()))
+        Rows {
+            once: Mutex::new(Vec::new()),
+            every: Vec::new(),
+        }
     }
 
     fn push(&mut self, asked: A, answer: T) {
-        self.0
+        self.once
             .get_mut()
             .expect("no thread holds the rows")
             .push((asked, answer));
     }
 
-    /// The first row for `asked`, which it removes.
+    fn push_every(&mut self, asked: A, answer: impl Fn() -> T + Send + Sync + 'static) {
+        self.every.push((asked, Box::new(answer)));
+    }
+
+    /// The first row for `asked`, which it removes; else the first `every` row for it.
     fn take(&self, asked: &A) -> Option<T> {
-        let mut rows = self.0.lock().expect("no thread panics holding the rows");
-        let at = rows.iter().position(|(row, _)| row == asked)?;
-        Some(rows.remove(at).1)
+        let mut rows = self.once.lock().expect("no thread panics holding the rows");
+        if let Some(at) = rows.iter().position(|(row, _)| row == asked) {
+            return Some(rows.remove(at).1);
+        }
+        self.every
+            .iter()
+            .find(|(row, _)| row == asked)
+            .map(|(_, answer)| answer())
     }
 }
 
@@ -51,6 +68,8 @@ pub(crate) struct FakeKernel<'a> {
     kinfos: Rows<RawPid, KinfoAnswer>,
     /// `Err`: the registration is refused with this errno. `Ok`: it is made and never fires.
     subscribes: Rows<Subscription, Result<(), i32>>,
+    /// How many `kinfo_proc` reads each pid has had, whoever answered them.
+    kinfo_reads: Mutex<Vec<(RawPid, usize)>>,
 }
 
 /// A row builder enters with the first test that states that call's answer.
@@ -66,6 +85,7 @@ impl<'a> FakeKernel<'a> {
             bsd_infos: Rows::new(),
             kinfos: Rows::new(),
             subscribes: Rows::new(),
+            kinfo_reads: Mutex::new(Vec::new()),
         }
     }
 
@@ -77,10 +97,72 @@ impl<'a> FakeKernel<'a> {
         }
     }
 
-    /// The next unique-id read of `pid` without a row before it answers `answer`.
+    /// The next unique-id read of `pid` answers `answer`.
     pub(crate) fn on_unique_info(mut self, pid: RawPid, answer: UniqRead) -> Self {
         self.unique_infos.push(pid, answer);
         self
+    }
+
+    /// The next short BSD-info read of `pid` answers `answer`.
+    pub(crate) fn on_short_bsd(mut self, pid: RawPid, answer: Result<libc::proc_bsdshortinfo, ReadErr>) -> Self {
+        self.short_bsds.push(pid, answer);
+        self
+    }
+
+    /// The next BSD-info read of `pid` answers `answer`.
+    pub(crate) fn on_bsd_info(mut self, pid: RawPid, answer: Result<libc::proc_bsdinfo, ReadErr>) -> Self {
+        self.bsd_infos.push(pid, answer);
+        self
+    }
+
+    /// The next `kinfo_proc` read of `pid` finds `record`.
+    pub(crate) fn on_kinfo(mut self, pid: RawPid, record: kinfo_proc) -> Self {
+        self.kinfos.push(pid, (Resolved::Found(record), None));
+        self
+    }
+
+    /// The next `kinfo_proc` read of `pid` is refused with `errno`.
+    pub(crate) fn on_kinfo_refused(mut self, pid: RawPid, errno: i32) -> Self {
+        self.kinfos
+            .push(pid, (Resolved::Unknown, Some(io::Error::from_raw_os_error(errno))));
+        self
+    }
+
+    /// Every unique-id read of `pid` that no row answers answers what `answer` says at that read, so
+    /// a test that reads from two threads states what each sees, not an order of reads.
+    pub(crate) fn on_every_unique_info(
+        mut self,
+        pid: RawPid,
+        answer: impl Fn() -> UniqRead + Send + Sync + 'static,
+    ) -> Self {
+        self.unique_infos.push_every(pid, answer);
+        self
+    }
+
+    /// Every BSD-info read of `pid` that no row answers fails with `error`.
+    pub(crate) fn on_every_bsd_info_failing(mut self, pid: RawPid, error: ReadErr) -> Self {
+        self.bsd_infos.push_every(pid, move || Err(error));
+        self
+    }
+
+    /// Every `kinfo_proc` read of `pid` that no row answers is refused with `errno`.
+    pub(crate) fn on_every_kinfo_refused(mut self, pid: RawPid, errno: i32) -> Self {
+        self.kinfos.push_every(pid, move || {
+            (Resolved::Unknown, Some(io::Error::from_raw_os_error(errno)))
+        });
+        self
+    }
+
+    /// The next registration `what` is made and never fires.
+    pub(crate) fn on_subscribe(mut self, what: Subscription) -> Self {
+        self.subscribes.push(what, Ok(()));
+        self
+    }
+
+    /// How many `kinfo_proc` reads of `pid` the kernel has been asked for.
+    pub(crate) fn kinfo_reads(&self, pid: RawPid) -> usize {
+        let counts = self.kinfo_reads.lock().expect("no panic holds the counts");
+        counts.iter().find(|(p, _)| *p == pid).map_or(0, |(_, n)| *n)
     }
 
     /// The kernel that answers a call no row answers; `asked` says what the call was.
@@ -124,6 +206,13 @@ impl Kernel for FakeKernel<'_> {
     }
 
     fn kinfo(&self, pid: RawPid) -> KinfoAnswer {
+        {
+            let mut counts = self.kinfo_reads.lock().expect("no panic holds the counts");
+            match counts.iter_mut().find(|(p, _)| *p == pid) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((pid, 1)),
+            }
+        }
         self.kinfos
             .take(&pid)
             .unwrap_or_else(|| self.real(format_args!("a kinfo_proc read of pid {pid}")).kinfo(pid))
@@ -136,4 +225,13 @@ impl Kernel for FakeKernel<'_> {
             None => self.real(format_args!("the registration {what:?}")).subscribe(kq, what),
         }
     }
+}
+
+/// A short BSD-info record that states a parent and a state, and nothing else.
+pub(crate) fn short_info(ppid: u32, status: u32) -> libc::proc_bsdshortinfo {
+    // SAFETY: all-zero is a valid `proc_bsdshortinfo`.
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    info.pbsi_ppid = ppid;
+    info.pbsi_status = status;
+    info
 }

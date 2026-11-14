@@ -330,7 +330,7 @@ fn a_live_root_missing_from_the_table_still_has_its_descendant_walked_and_killed
 fn a_pid_the_kernel_cannot_read_is_an_error_the_walk_does_not_warn_of() {
     crate::log_capture::install();
     let (child, id) = live_member();
-    let (kernel, _guard) = unreadable(id.pid());
+    let kernel = unreadable(id.pid());
     let mark = crate::log_capture::mark();
     let Err(Error::Unassessable { detail, .. }) = super::resolve_or_drop(&kernel, id.pid(), ProcessId::current(), None)
     else {
@@ -404,7 +404,7 @@ fn descendants_and_children_the_kernel_cannot_read_are_dropped() {
     let me = ProcessId::current();
     // `me` has a row, as a live root does in a snapshot.
     let parents = [(me.pid(), 1), (id.pid(), me.pid())];
-    let (kernel, _guard) = unreadable(id.pid());
+    let kernel = unreadable(id.pid());
     assert!(descendants(&kernel, me, &parents)
         .expect("a readable anchor")
         .is_empty());

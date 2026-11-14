@@ -673,10 +673,6 @@ pub(crate) enum PpidRead {
 
 /// One attempt: [`read_record`], whose parent pid is trusted or the attempt is `Forking`.
 fn read_ppid_once(kernel: &dyn Kernel, pid: RawPid) -> PpidRead {
-    #[cfg(test)]
-    if let Some(read) = fault::next_ppid_read(pid) {
-        return read;
-    }
     match read_record(kernel, pid) {
         Resolved::Found(record) => match record.ppid(pid) {
             Some(ppid) => PpidRead::Found(ppid, record.key),
@@ -773,7 +769,7 @@ pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, start: Key) -> Livene
 /// `kinfo_proc` (a zombie included), token-guarded as [`is_running`] is. A pid that holds another
 /// process, or none, is `Gone`.
 pub(super) fn exit_begun(kernel: &dyn Kernel, pid: RawPid, start: Key) -> (Resolved<bool>, super::UnknownCause) {
-    let (read, failure) = kinfo::kinfo_explained(kernel, pid);
+    let (read, failure) = kernel.kinfo(pid);
     let begun = match read {
         Resolved::Found(info) if token_of_kinfo(&info) != start => Resolved::Gone,
         Resolved::Found(info) => Resolved::Found(kinfo::exit_begun(info.kp_proc.p_stat, info.kp_proc.p_flag)),
@@ -800,9 +796,6 @@ pub(crate) mod fault {
 
     thread_local! {
         static UNKNOWN: RefCell<Vec<super::RawPid>> = const { RefCell::new(Vec::new()) };
-        static PPID_READS: RefCell<Vec<(super::RawPid, std::collections::VecDeque<super::PpidRead>)>> =
-            const { RefCell::new(Vec::new()) };
-        static PPID_READ_COUNT: RefCell<Vec<(super::RawPid, usize)>> = const { RefCell::new(Vec::new()) };
     }
 
     /// Disarms [`force_unknown`] on drop.
@@ -812,39 +805,7 @@ pub(crate) mod fault {
     impl Drop for Forced {
         fn drop(&mut self) {
             UNKNOWN.with(|u| u.borrow_mut().clear());
-            PPID_READS.with(|p| p.borrow_mut().clear());
-            PPID_READ_COUNT.with(|p| p.borrow_mut().clear());
         }
-    }
-
-    /// Script the first attempts of `pid`'s parent read on THIS thread: each attempt takes the
-    /// next of `reads`; once they run out the real read answers. Every attempt is counted, real
-    /// or scripted ([`ppid_read_attempts`]).
-    pub(crate) fn force_ppid_reads(pid: super::RawPid, reads: &[super::PpidRead]) -> Forced {
-        PPID_READ_COUNT.with(|c| c.borrow_mut().retain(|&(p, _)| p != pid));
-        PPID_READS.with(|p| p.borrow_mut().push((pid, reads.iter().copied().collect())));
-        Forced(())
-    }
-
-    /// How many attempts `pid`'s parent read has made on THIS thread since the guard was made.
-    pub(crate) fn ppid_read_attempts(pid: super::RawPid) -> usize {
-        PPID_READ_COUNT.with(|c| c.borrow().iter().find(|&&(p, _)| p == pid).map_or(0, |&(_, n)| n))
-    }
-
-    pub(super) fn next_ppid_read(pid: super::RawPid) -> Option<super::PpidRead> {
-        PPID_READ_COUNT.with(|c| {
-            let mut c = c.borrow_mut();
-            match c.iter_mut().find(|(p, _)| *p == pid) {
-                Some((_, n)) => *n += 1,
-                None => c.push((pid, 1)),
-            }
-        });
-        PPID_READS.with(|p| {
-            p.borrow_mut()
-                .iter_mut()
-                .find(|(q, _)| *q == pid)
-                .and_then(|(_, reads)| reads.pop_front())
-        })
     }
 
     /// Make every by-pid identity read of `pid` on THIS thread answer `Resolved::Unknown`.

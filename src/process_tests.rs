@@ -41,7 +41,7 @@ fn process_is_send_and_sync() {
 #[skuld::test]
 fn open_pid_of_a_pid_that_cannot_be_queried_is_unassessable() {
     let (child, id) = crate::test_child::live_exiting_member();
-    let (kernel, _guard) = crate::identity::unreadable(id.pid());
+    let kernel = crate::identity::unreadable(id.pid());
     match Process::open_pid_with(kernel, id.pid()) {
         Err(Error::Unassessable { detail, .. }) => {
             assert!(
