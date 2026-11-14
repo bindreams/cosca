@@ -848,7 +848,7 @@ static PUMP_SEAMS: std::sync::Mutex<Vec<(std::ffi::OsString, PumpSeam)>> = std::
 enum PumpSeam {
     /// Fail the pump the next time its watch is readable.
     Fail,
-    /// Report, after each batch the pump takes in, whether it notified.
+    /// Report, for each batch the pump takes in, whether it notifies.
     Batches(std::sync::mpsc::Sender<bool>),
 }
 
@@ -868,7 +868,8 @@ pub(crate) fn take_force_pump_failure(name: &std::ffi::OsStr) -> bool {
     at.map(|at| seams.remove(at)).is_some()
 }
 
-/// Send, after each batch the pump of the leaf named `name` takes in, whether it notified.
+/// Send, for each batch the pump of the leaf named `name` takes in, whether it notifies. The pump
+/// sends before it notifies, so a wait the batch wakes finds it sent.
 pub(crate) fn set_pump_batch_notifier(name: &str, notify: std::sync::mpsc::Sender<bool>) {
     PUMP_SEAMS
         .lock()
