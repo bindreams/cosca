@@ -471,6 +471,11 @@ impl Tree {
             _ => None,
         }
     }
+
+    /// The settlement this tree's kills and drops write.
+    pub(crate) fn killed_for_test(&self) -> &TreeKilled {
+        &self.killed
+    }
 }
 
 #[cfg(target_os = "macos")]

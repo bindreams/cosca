@@ -237,9 +237,10 @@ impl Process {
     /// As for a `Child` on a `TreeWalk` tree ([`Child::graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree)): the members the call's
     /// own `SIGTERM` walk found are killed by identity if the root exits within the grace, and the call
     /// is `Ok` when every one is gone. A root that had exited before the call is
-    /// [`Error::Unassessable`]. A foreign handle keeps no members for a retry: when the sweep's walk
-    /// cannot be made (the process table cannot be read), the members the call's own `SIGTERM` walk
-    /// found are killed by identity all the same and waited for, and the call is the walk's error.
+    /// [`Error::Unassessable`]. When the sweep's walk cannot be made (the process table cannot be
+    /// read), the call is the walk's error. Over a root that runs it kills nothing, the root and the
+    /// members its `SIGTERM` walk found included: a retry walks from the root. Over an exited root,
+    /// which no walk reaches the members from, it kills those members by identity and waits for them.
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
         let settling = self.begin_graceful()?;
         #[cfg(test)]

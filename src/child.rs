@@ -548,9 +548,10 @@ impl Child {
     /// - `TreeWalk`: an [`Error::MembersLeft`]. A root the walk left and the backstop could not kill
     ///   either is one [`Error::MemberNotKilled`] whose `source` is an [`Error::Several`] of the
     ///   backstop's failure and the walk's, the backstop first. A backstop that fails after a walk that
-    ///   left nothing is a `MembersLeft` of the root alone. A walk that could not be made, with nothing
-    ///   left by an earlier kill, stays its [`Error::Unassessable`] (or `Unsupported`), with the root's
-    ///   `MemberNotKilled` as its peer.
+    ///   left nothing is a `MembersLeft` of the root alone. A walk that could not be made over a root
+    ///   that runs is its [`Error::Unassessable`] (or `Unsupported`) alone: no backstop runs, so the
+    ///   root has no `MemberNotKilled` peer. Over an exited root the backstop runs, and a failed one is
+    ///   that peer.
     /// - Any other mechanism keeps its own error and its variant, with the root's `MemberNotKilled` as
     ///   its peer, below it after its own cause. A kill that left nothing is an [`Error::Containment`]
     ///   over the root's `MemberNotKilled`.
@@ -558,7 +559,8 @@ impl Child {
     /// On the `TreeWalk` mechanism, an [`Error::Unassessable`] (or `Unsupported`) means the
     /// process table could not be read or trusted, so the descendants could not be found: NOTHING
     /// was killed, the root included, and a retry can work. (`Drop` cannot retry, so it still
-    /// kills the root and logs that descendants may be orphaned.) A root whose exit is visible
+    /// kills the root and logs that descendants may be orphaned. A retry cannot walk from a root
+    /// that has exited, so a call over one kills the held members by identity.) A root whose exit is visible
     /// (reaped, a zombie, or no longer holding its pid) is `Unassessable` too: its children were
     /// reparented at its exit, so a walk from its pid finds none and `Ok` would say nothing of the
     /// tree. Nothing is killed (a zombie root apart) and a retry cannot work. A zombie root whose walk
@@ -572,7 +574,10 @@ impl Child {
     /// [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) `SIGTERM` walk reached: a later
     /// `kill_tree`, or the
     /// drop, kills those whose identity was read again, and reports the others again. That holds
-    /// whatever the later walk finds, a root that is gone included. Once those members are gone, a
+    /// whatever the later walk finds, a root that is gone included, except for a walk that cannot be
+    /// made over a root that runs: a retry can walk from that root, so such a `kill_tree` kills none of
+    /// the held members and keeps them for the retry. Over an exited root, which no retry can walk,
+    /// and in the drop, which cannot retry, they are killed. Once those members are gone, a
     /// gone root is `Unassessable` on every later call, saying the members an earlier kill left are
     /// gone and the tree could not be walked: the tree cannot be vouched for again. A walk that left
     /// only the root is `Ok` once the handle backstop killed it, but the walk saw the root running
@@ -778,9 +783,10 @@ impl Child {
                 other
             }
         };
+        // The backstop would end a root that a retry walks from.
         let group_result = match group_result.unless_unwalked() {
             Ok(group_result) => group_result,
-            Err(failure) => return Swept::new(op, Err(failure), wait),
+            Err(error) => return Swept::new(op, Err(SweepFailure::from(error)), wait),
         };
         // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
         // reached it is read after it. One whose kill failed may still have its program running:

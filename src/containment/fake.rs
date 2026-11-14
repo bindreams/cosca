@@ -33,6 +33,8 @@ pub(crate) struct FakeContains {
     /// The pids its kill states it reached but whose exit cannot be observed, which fail the wait.
     #[cfg(unix)]
     unobserved: Vec<u32>,
+    /// Whether its kill states that its walk was not made, and over a root that `root_exited`.
+    unwalked: Option<bool>,
     sends: Sends,
 }
 
@@ -48,6 +50,7 @@ impl FakeContains {
             killed_again: Vec::new(),
             #[cfg(unix)]
             unobserved: Vec::new(),
+            unwalked: None,
             sends: sends.clone(),
         };
         (fake, sends)
@@ -75,6 +78,14 @@ impl FakeContains {
         self
     }
 
+    /// A mechanism whose kill states that its walk was not made, over a root that `root_exited`
+    /// ([`TreeKillOutcome::Unwalked`]).
+    #[cfg_attr(windows, allow(dead_code, reason = "only a Unix row states an unwalked walk"))]
+    pub(crate) fn unwalked(mut self, root_exited: bool) -> FakeContains {
+        self.unwalked = Some(root_exited);
+        self
+    }
+
     fn record(&self, send: &'static str) {
         self.sends
             .lock()
@@ -87,6 +98,13 @@ impl Contains for FakeContains {
     /// A kill that leaves nothing running, and states the members it reached.
     fn kill(&self, _root: Option<&dyn Root>) -> TreeKill<'_> {
         self.record("kill");
+        if let Some(root_exited) = self.unwalked {
+            let error = crate::error::Error::Unassessable {
+                detail: "the process table could not be read".into(),
+                source: None,
+            };
+            return TreeKill::of(TreeKillOutcome::Unwalked { error, root_exited });
+        }
         let kill = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching(self.killed.iter().copied());
         #[cfg(unix)]
         let kill = self

@@ -627,8 +627,10 @@ fn root_exited(kernel: &dyn Kernel, root: ProcessId) -> Result<bool, Error> {
 /// [`TreeKillOutcome::Unwalked`], an [`Error::Unassessable`], when the process snapshot cannot be
 /// taken, or `root` cannot be proved to hold its pid after it (a root that exists but cannot be
 /// queried). Nothing is killed, the root included: killing the root first would reparent its
-/// descendants out of the ppid walk, so a retry could no longer find them. A root that no longer
-/// holds its pid is [`TreeKillOutcome::NoRoot`], with nothing killed.
+/// descendants out of the ppid walk, so a retry could no longer find them. The outcome says whether
+/// the root had exited (`root_exited`: read when the snapshot failed, never when the root could not
+/// be read), which no retry can walk from. A root that no longer holds its pid is
+/// [`TreeKillOutcome::NoRoot`], with nothing killed.
 ///
 /// [`Error::MemberNotKilled`] when the walk ran but left a member behind: a candidate whose identity
 /// could not be read (so it and its subtree were not walked), or an identity it resolved whose kill
@@ -661,7 +663,11 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
     {
         Ok(Some(walk)) => walk,
         Ok(None) => return TreeKill::of(TreeKillOutcome::NoRoot(root.pid(), None)).through(kernel),
-        Err(error) => return TreeKill::of(TreeKillOutcome::Unwalked(error)).through(kernel),
+        Err(error) => {
+            // A root that cannot be read is not read as exited: a retry can read it.
+            let root_exited = root_exited(kernel, root).unwrap_or(false);
+            return TreeKill::of(TreeKillOutcome::Unwalked { error, root_exited }).through(kernel);
+        }
     };
     #[cfg(test)]
     fault::note_walk(root.pid());
@@ -692,7 +698,13 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
             Ok(true) => return TreeKill::of(TreeKillOutcome::NoRoot(root.pid(), None)).through(kernel),
             Ok(false) => {}
             // Nothing is killed, the root included: a retry can read it.
-            Err(unreadable) => return TreeKill::of(TreeKillOutcome::Unwalked(unreadable)).through(kernel),
+            Err(error) => {
+                return TreeKill::of(TreeKillOutcome::Unwalked {
+                    error,
+                    root_exited: false,
+                })
+                .through(kernel)
+            }
         }
     }
     let mut resolved = Vec::new();

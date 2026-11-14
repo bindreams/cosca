@@ -184,10 +184,12 @@ fn foreign_graceful_sweep_whose_walk_is_not_made_kills_the_members_its_sigterm_w
     crate::test_child::wait_until_zombie(tree.child.id());
     let unlistable = FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO));
 
-    tree.process
+    let err = tree
+        .process
         .kill_tree_settling("graceful_shutdown_tree", &unlistable, Some(&settling))
         .expect_err("the walk was not made");
 
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
     for member in &tree.members {
         assert_eq!(
             member.is_alive(),
@@ -195,6 +197,50 @@ fn foreign_graceful_sweep_whose_walk_is_not_made_kills_the_members_its_sigterm_w
             "{member:?} was held by the SIGTERM walk and is killed by identity"
         );
     }
+    tree.child.wait().expect("reap the root");
+}
+
+// A root that outlives the grace keeps its descendants walkable, so a sweep whose walk cannot be made
+// leaves a retry everything: it kills nothing, the root and the members its `SIGTERM` walk held
+// included, and answers the walk's own `Unassessable`.
+//
+// Mutant: the sweep kills the held members, or the root, when its walk was not made.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn foreign_graceful_sweep_whose_walk_is_not_made_over_a_live_root_kills_nothing() {
+    use crate::identity::{FakeKernel, HostKernel, Liveness};
+    let mut tree = tree_of(crate::test_child::ROOT_OUTLIVING_THE_GRACE_ARGV);
+    let middle = tree
+        .process
+        .id()
+        .children(crate::Recursive::No)
+        .expect("the root's children")
+        .pop()
+        .expect("the root's child");
+    let middle = crate::Process::open(middle)
+        .expect("open the middle")
+        .expect("the middle runs");
+    let settling = tree.process.begin_graceful().expect("the SIGTERM walk");
+    middle.wait().expect("the middle exits on the SIGTERM");
+    let running: Vec<_> = tree
+        .members
+        .iter()
+        .copied()
+        .filter(|member| member.is_alive() == Liveness::Alive)
+        .collect();
+    assert_eq!(running.len(), 1, "the member that ignores the SIGTERM runs, reparented");
+    let unlistable = FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO));
+
+    let err = tree
+        .process
+        .kill_tree_settling("graceful_shutdown_tree", &unlistable, Some(&settling))
+        .expect_err("the walk was not made");
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(running[0].is_alive(), Liveness::Alive, "the held member is not killed");
+    assert_eq!(tree.process.id().is_alive(), Liveness::Alive, "the root is not killed");
+    // Closing the stdin ends the members that read it; the root ends by its own kill.
+    tree.process.kill().expect("end the root");
     tree.child.wait().expect("reap the root");
 }
 

@@ -277,7 +277,7 @@ async fn async_graceful_shutdown_tree_sweeps_survivor_after_graceful_root_exit()
         .read_to_end(&mut rest)
         .await
         .expect("every member is gone, so the pipe ends");
-    assert!(rest.is_empty(), "the sweep missed the grandchild: {rest:?}");
+    assert!(rest.is_empty(), "the sweep missed a survivor: {rest:?}");
 }
 
 /// A `TreeWalk` tree on one stdin pipe over `argv`, which prints `r\n` once its descendants exist, and

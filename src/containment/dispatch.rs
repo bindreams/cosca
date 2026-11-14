@@ -705,10 +705,11 @@ pub(crate) enum TreeKillOutcome {
     Answered(Result<(), Unkilled>),
     /// A `TreeWalk` walk could not be made (the snapshot could not be taken, or the root exists but
     /// could not be queried), so NOTHING was killed, the root included: killing the root anyway would
-    /// reparent its descendants out of the ppid walk, so a retry could no longer find them. The
-    /// error says why. Every other failure is a kill that was attempted, a `TreeWalk`'s
-    /// [`Error::MemberNotKilled`] included.
-    Unwalked(Error),
+    /// reparent its descendants out of the ppid walk, so a retry could no longer find them. `error`
+    /// says why; `root_exited`: the walk read the root as exited, so its descendants are reparented and
+    /// no retry can reach them ([`unless_unwalked`](Self::unless_unwalked)). Every other failure is a
+    /// kill that was attempted, a `TreeWalk`'s [`Error::MemberNotKilled`] included.
+    Unwalked { error: Error, root_exited: bool },
     /// A `TreeWalk` walk found its root gone, or holding its pid no longer, or (Unix) exited and not
     /// yet reaped: its children were reparented at its exit, so there is no tree to
     /// walk from, and this kill killed nothing. It is [`Error::Unassessable`]:
@@ -744,13 +745,15 @@ impl TreeKillOutcome {
         }
     }
 
-    /// This outcome for a `kill_tree` that goes on to the root's backstop, unless it is a walk that was
-    /// not made ([`Unwalked`](Self::Unwalked)): the root's death would strand the descendants beyond a
-    /// retry, so the walk's own error is the answer, and nothing is settled. The state stays as it
-    /// was, and the members it holds are kept for the retry's walk.
-    pub(crate) fn unless_unwalked(self) -> Result<TreeKillOutcome, SweepFailure> {
+    /// The outcome's own error when it is [`Unwalked`](Self::Unwalked) over a root that runs (a retry
+    /// walks from that root); every other outcome, an unwalked one over an exited root included, handed
+    /// back.
+    pub(crate) fn unless_unwalked(self) -> Result<TreeKillOutcome, Error> {
         match self {
-            TreeKillOutcome::Unwalked(error) => Err(SweepFailure::from(error)),
+            TreeKillOutcome::Unwalked {
+                error,
+                root_exited: false,
+            } => Err(error),
             other => Ok(other),
         }
     }
@@ -785,7 +788,7 @@ impl TreeKillOutcome {
         match self {
             TreeKillOutcome::Ran(result) | TreeKillOutcome::Answered(result) => result,
             TreeKillOutcome::Skipped(skip) => skip.holders.unwrap_or(Ok(())).map_err(Unkilled::from),
-            TreeKillOutcome::Unwalked(error) => Err(Unkilled::from(error)),
+            TreeKillOutcome::Unwalked { error, .. } => Err(Unkilled::from(error)),
             TreeKillOutcome::NoRoot(pid, _) => Err(Unkilled::from(Self::no_root_error(pid))),
         }
     }
@@ -816,7 +819,7 @@ impl TreeKillOutcome {
             TreeKillOutcome::Skipped(Skip { action, .. }) => {
                 format!("the kill was skipped, and would {action}")
             }
-            TreeKillOutcome::Unwalked(error) => word(error),
+            TreeKillOutcome::Unwalked { error, .. } => word(error),
             TreeKillOutcome::NoRoot(pid, _) => word(&Self::no_root_error(*pid)),
             TreeKillOutcome::Ran(Ok(())) | TreeKillOutcome::Answered(Ok(())) => {
                 unreachable!("a completed kill has nothing left")
@@ -831,7 +834,7 @@ impl TreeKillOutcome {
             TreeKillOutcome::Skipped(skip) => Some(&skip.action),
             TreeKillOutcome::Ran(_)
             | TreeKillOutcome::Answered(_)
-            | TreeKillOutcome::Unwalked(_)
+            | TreeKillOutcome::Unwalked { .. }
             | TreeKillOutcome::NoRoot(..) => None,
         }
     }
@@ -882,7 +885,6 @@ pub(crate) struct Settled<A = Result<SettleOutcome, Error>> {
 
 impl<A> Settled<A> {
     /// An answer that killed nothing again.
-    #[cfg(unix)]
     pub(crate) fn of(answer: A) -> Settled<A> {
         Settled {
             answer,
@@ -1088,7 +1090,7 @@ impl TreeKilled {
         });
         let ran = matches!(outcome, TreeKillOutcome::Ran(_) | TreeKillOutcome::Answered(_));
         // What a walk not made or a gone root leaves is its error, not a member seen running.
-        let looked_for_no_member = matches!(outcome, TreeKillOutcome::NoRoot(..) | TreeKillOutcome::Unwalked(_));
+        let looked_for_no_member = matches!(outcome, TreeKillOutcome::NoRoot(..) | TreeKillOutcome::Unwalked { .. });
         // A walk already covered the tree unless it was never settled: a gone root adds no error of its own.
         let covered = gone_root && (listing_stands || state.vouching != Vouching::Never || !state.held.is_empty());
         let result = if covered { Ok(()) } else { outcome.into_result() };
@@ -1146,14 +1148,22 @@ impl TreeKilled {
 
     /// [`settle`](Self::settle) for a `kill_tree` call: the error holds every member left, so the call
     /// reports each of them once, in it.
+    ///
+    /// A call can be retried, so a walk not made over a root that runs
+    /// ([`unless_unwalked`](TreeKillOutcome::unless_unwalked)) is answered with its own error and
+    /// settles nothing: the state and the members it holds stay for the retry.
     pub(crate) fn settle_for_kill_tree(
         &self,
         mechanism: Option<&Mechanism>,
         outcome: impl Into<TreeKillOutcome>,
         root_ended: bool,
     ) -> Settled<Result<(), Error>> {
-        self.settle(mechanism, outcome, root_ended)
-            .map(|answer| answer.map(drop))
+        match outcome.into().unless_unwalked() {
+            Ok(outcome) => self
+                .settle(mechanism, outcome, root_ended)
+                .map(|answer| answer.map(drop)),
+            Err(error) => Settled::of(Err(error)),
+        }
     }
 
     /// [`settle`](Self::settle) for a drop: what is left when the tree is not settled, the text of the
@@ -1168,7 +1178,7 @@ impl TreeKilled {
         let outcome = outcome.into();
         let after = match &outcome {
             // A drop cannot retry a walk that was not made.
-            TreeKillOutcome::Unwalked(_) => "; the root is killed regardless, so its descendants may be orphaned",
+            TreeKillOutcome::Unwalked { .. } => "; the root is killed regardless, so its descendants may be orphaned",
             TreeKillOutcome::Ran(_)
             | TreeKillOutcome::Answered(_)
             | TreeKillOutcome::NoRoot(..)

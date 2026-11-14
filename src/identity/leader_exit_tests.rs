@@ -32,7 +32,9 @@ fn a_process_whose_leader_thread_exited_is_alive_and_keeps_its_children() {
     let id = ProcessId::of(root.id()).found().expect("the root's identity");
     // The process's other thread reports that the leader began to exit: a real event, which this read
     // blocks on. The kernel marks the leader a zombie a few steps after it (the report is the exit's
-    // `clear_child_tid` wake), so the `stat` is read again, with no limit, until it shows `Z`.
+    // `clear_child_tid` wake), so the `stat` is read again, with no limit, until it shows `Z`. A thread
+    // pidfd of the leader does not turn readable while the process lives (measured on 6.12), so none
+    // can stand in for the re-read.
     line.clear();
     stdout.read_line(&mut line).expect("the leader's exit report");
     assert_eq!(line, "exited\n");
