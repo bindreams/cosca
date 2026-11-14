@@ -276,6 +276,11 @@ fn pid_1s_namespace_link_follows_the_pid_file_rule() {
     );
     assert_eq!(crate::error::first_os_code(&hidden), Some(libc::EPERM));
     assert!(hidden.reason.contains("1/ns/pid"), "{hidden}");
+    assert!(
+        crate::error::said(&hidden).contains("hidden"),
+        "pid 1's verdict is kept: {}",
+        crate::error::said(&hidden)
+    );
 
     let unknown = cause_of(init_link_verdict(
         FakeKernel::new()
@@ -297,6 +302,11 @@ fn pid_1s_namespace_link_follows_the_pid_file_rule() {
     ));
     let refusal = refused.refusal().expect("a refused re-check is a refusal");
     assert_eq!(crate::error::first_os_code(&refusal.cause()), Some(libc::ENOSYS));
+    let chain = crate::error::said(refused.source.as_ref().expect("a refusal's chain is the view's source"));
+    for errno in [libc::ENOSYS, libc::EPERM] {
+        let said = io::Error::from_raw_os_error(errno).to_string();
+        assert!(chain.contains(&said), "the source names {said:?}: {chain}");
+    }
 
     let refused = cause_of(init_link_verdict(
         FakeKernel::new().on_read("1/ns/pid", Err(libc::ENODEV)),
@@ -311,6 +321,60 @@ fn pid_1s_namespace_link_follows_the_pid_file_rule() {
         failed.refusal().is_none(),
         "a readlinkat errno is no refusal: {failed:?}"
     );
+}
+
+/// Pid 1's link that the `openat2` does not show says what the pid-file rule says of it: gone
+/// (`ESRCH`) or hidden (`ENOENT`, `EACCES`); any other errno says nothing about pid 1. None is a
+/// refusal. Mutant: "every failure of `1/ns/pid` is a bare errno".
+#[skuld::test]
+fn pid_1s_namespace_link_that_the_open_does_not_show_says_why() {
+    let rows = [
+        (libc::ENOENT, "hidden"),
+        (libc::EACCES, "hidden"),
+        (libc::ESRCH, "exited"),
+        (libc::EMFILE, "could not be read"),
+    ];
+    for (errno, says) in rows {
+        let Verdict::Unassessable(why) = init_link_verdict(FakeKernel::new().on_read("1/ns/pid", Err(errno))) else {
+            panic!("{errno}: expected Unassessable");
+        };
+        let said = crate::error::said(&why);
+        assert!(why.refusal().is_none(), "{errno}: {why:?}");
+        assert!(said.contains(says), "{errno}: {said}");
+        assert_eq!(crate::error::first_os_code(&why), Some(errno), "{errno}: {said}");
+    }
+}
+
+/// `self/ns/pid`'s existence is asked of the kernel like every other read: an `openat2` the kernel
+/// refuses leaves the view refused, `ENOENT` is a kernel with no pid namespaces (`Same`), and a
+/// `readlinkat` failure is no refusal. Mutant: "the existence check opens `/proc` by itself".
+#[skuld::test]
+fn self_ns_pid_is_asked_of_the_kernel() {
+    let no_nspid = || {
+        FakeKernel::over(&HostKernel)
+            .on_read("self/status", Ok(b"Name:\tcosca\n"))
+            .on_read("thread-self/ns/pid", Ok(b"pid:[4026531836]"))
+            .on_read("1/ns/pid", Ok(b"pid:[4026531836]"))
+    };
+
+    let kernel = no_nspid().on_read("self/ns/pid", Err(libc::EPERM));
+    let ProcView::Unassessable(why) = proc_view_with(&kernel) else {
+        panic!("a refused existence check is Unassessable");
+    };
+    let refusal = why.refusal().expect("an openat2 errno in the table is a refusal");
+    assert_eq!(crate::error::first_os_code(&refusal.cause()), Some(libc::EPERM));
+
+    let kernel = no_nspid().on_read("self/ns/pid", Err(libc::ENOENT));
+    assert!(
+        matches!(proc_view_with(&kernel), ProcView::Same(_)),
+        "no self/ns/pid is a kernel with no pid namespaces"
+    );
+
+    let kernel = no_nspid().on_read_failing_after_open("self/ns/pid", libc::EPERM);
+    let ProcView::Unassessable(why) = proc_view_with(&kernel) else {
+        panic!("a failed existence check is Unassessable");
+    };
+    assert!(why.refusal().is_none(), "a readlinkat errno is no refusal: {why:?}");
 }
 
 // Checked /proc dirfd =====
@@ -369,11 +433,27 @@ fn the_proc_dir_says_a_failed_read_is_the_reads() {
     assert_eq!(err.raw_os_error(), Some(libc::EISDIR), "{err}");
 }
 
+/// A link read says which call failed, as a file read does: a path the `openat2` refuses is `Open`
+/// (`EXDEV`), and a path that opens but is no link fails `readlinkat` (`EINVAL` for a regular file).
+/// Mutant: "every failure of `read_link` is the `openat2`'s".
+#[skuld::test]
+fn the_proc_dir_says_a_failed_link_read_is_the_reads() {
+    let dir = ProcDir::open().expect("/proc opens");
+    let Err(ReadFailure::Open(err)) = dir.read_link("../etc/passwd") else {
+        panic!("must not leave /proc");
+    };
+    assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
+    let Err(ReadFailure::Read(err)) = dir.read_link("self/status") else {
+        panic!("a file opens and is no link");
+    };
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL), "{err}");
+}
+
 // Namespace-link cross-check (no NSpid) =====
 
 const NO_NSPID: &str = "Name:\tcosca\nState:\tR (running)\n";
 
-fn link(target: &str) -> Result<Vec<u8>, OwnUnreadable> {
+fn link<E>(target: &str) -> Result<Vec<u8>, E> {
     Ok(target.as_bytes().to_vec())
 }
 
@@ -392,7 +472,8 @@ fn a_procfs_whose_pid_1_is_in_another_namespace_is_diverged() {
 
 #[skuld::test]
 fn an_unreadable_pid_1_link_is_unassessable_with_the_cause() {
-    let Verdict::Unassessable(why) = classify_ns_links(link("pid:[4026531836]"), || Err(denied(libc::EACCES))) else {
+    let Verdict::Unassessable(why) = classify_ns_links(link("pid:[4026531836]"), || Err(denied(libc::EACCES).into()))
+    else {
         panic!("expected Unassessable");
     };
     assert!(why.reason.contains("1/ns/pid"), "{why}");

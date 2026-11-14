@@ -634,6 +634,43 @@ fn a_task_read_through_an_unusable_view_has_the_views_error_as_its_cause() {
     assert!(err.to_string().contains("pid 7's cgroup cannot be read"), "{err}");
 }
 
+/// A kernel whose `/proc` cannot say its namespace: no `NSpid`, and pid 1's `ns/pid` fails `EPERM`
+/// beside a checked directory that refuses `self/stat` (`ENOSYS`), so the view is a refusal with the
+/// pid's failure beside it.
+fn refused_view_kernel() -> FakeKernel<'static> {
+    FakeKernel::over(&HostKernel)
+        .on_read("self/status", Ok(b"Name:\tcosca\n"))
+        .on_read("self/ns/pid", Ok(b"pid:[4026531836]"))
+        .on_read("thread-self/ns/pid", Ok(b"pid:[4026531836]"))
+        .on_read("1/ns/pid", Err(libc::EPERM))
+        .on_read("self/stat", Err(libc::ENOSYS))
+}
+
+/// A refused view's error, wherever the view is read, has the refusal's whole chain below it: the
+/// refusing errno and the pid failure it was met beside, not the bare errno. Mutant: "the view's source
+/// is the refusing errno alone".
+#[skuld::test]
+fn a_refused_views_errors_carry_the_refusals_chain() {
+    let said_all = |said: String| {
+        for errno in [libc::ENOSYS, libc::EPERM] {
+            let words = std::io::Error::from_raw_os_error(errno).to_string();
+            assert!(said.contains(&words), "names {words:?}: {said}");
+        }
+        assert!(said.contains("1/ns/pid was refused"), "{said}");
+    };
+    let kernel = refused_view_kernel();
+
+    let crate::identity::ProcView::Unassessable(why) = crate::identity::proc_view_with(&kernel) else {
+        panic!("precondition: the view is refused");
+    };
+    said_all(crate::error::said(&super::view_unreadable(7, why)));
+
+    let Err(unreadable) = super::untraceable_cgroup_readable(&kernel) else {
+        panic!("a refused view reads no cgroup");
+    };
+    said_all(crate::error::said(&super::refusal(unreadable)));
+}
+
 /// A forked probe, killed and reaped when dropped, so a probe a failing assertion would leave
 /// running does not outlive the test.
 struct ProbeGuard(OwnedFd);

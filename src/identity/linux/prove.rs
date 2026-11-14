@@ -156,6 +156,15 @@ impl Refusal {
         }
     }
 
+    /// [`cause`](Self::cause) as an `io::Error`, for a caller whose cause is one: the refusing errno
+    /// alone, or, with a failure beside it, a layer that holds both, so every member is reported.
+    pub(crate) fn cause_io(&self) -> std::io::Error {
+        match self.beside {
+            None => self.os_error(),
+            Some(_) => crate::error::io_context_over("the refusal and the failure it was met beside", self.cause()),
+        }
+    }
+
     /// [`Error::Unsupported`] naming `op` and the requirement, with [`cause`](Self::cause) as its
     /// `source`.
     pub(crate) fn unsupported(&self, op: impl Into<String>) -> Error {
