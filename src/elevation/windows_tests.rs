@@ -1080,6 +1080,7 @@ fn a_failed_shell_execute_has_the_windows_error_as_its_cause() {
         let error = match super::shell_execute_failure(HRESULT::from_win32(code), inst_app) {
             SpawnFailure::NotStarted(error) => error,
             SpawnFailure::MayHaveStarted { cause, .. } => *cause,
+            failure @ SpawnFailure::NotStartedWithChild { .. } => panic!("a launch holds no child: {failure:?}"),
         };
         assert_eq!(crate::error::first_os_code(&error), Some(code as i32), "{error:?}");
         match error {

@@ -789,7 +789,13 @@ fn spawn_reported(
             #[cfg(target_os = "linux")]
             if let Some(failure) = never_ran {
                 drop(prepared);
-                let torn = held_teardown::tear_down_unexecuted(owned, None, policy, &mut why);
+                let torn = held_teardown::tear_down_unexecuted(
+                    owned,
+                    None,
+                    held_teardown::unexecuted_past(None),
+                    policy,
+                    &mut why,
+                );
                 return Err(failure::failed_attach(true, failure.cause, None, None, torn));
             }
             // Only Linux's verdict says so.
@@ -885,17 +891,44 @@ fn spawn_reported(
     ) {
         Ok(v) => v,
         Err(failure) => {
-            // Only Linux's attach says the program never ran.
+            log::debug!("attach failed: {report}", report = crate::error::Report(&failure.cause));
+            // Off macOS: kill + reap, since a dropped handle neither kills nor reaps. A Linux front
+            // is the exception: a failed attach has dropped the containment, a cgroup leaf's drop
+            // kills it, and the front is waited for (`tear_down_held`).
             #[cfg(target_os = "linux")]
-            let not_started = failure.not_started;
+            return Err(held_teardown::tear_down_after_failed_attach(
+                owned,
+                id_read,
+                failure,
+                held_teardown::unexecuted_past(id_read),
+                policy,
+                &mut why,
+                |owned, why| {
+                    held_teardown::tear_down_held(
+                        owned,
+                        held_teardown::HeldTeardown {
+                            front,
+                            id: id_read,
+                            subtree: subtree.as_ref(),
+                            disposition: crate::child::owned::teardown::Disposition::HandBack,
+                            policy,
+                        },
+                        why,
+                    )
+                },
+            ));
+            #[cfg(windows)]
+            return Err(held_teardown::tear_down_after_failed_windows_attach(
+                owned, id_read, failure, policy, &mut why,
+            ));
+            // macOS: a front is left running and unreaped, sent nothing; any other child is killed
+            // and reaped through its verified unique id.
+            #[cfg(target_os = "macos")]
             let crate::containment::dispatch::AttachFailure {
                 cause: error,
                 cleanup: attach_cleanup,
                 ..
             } = failure;
-            log::debug!("attach failed: {report}", report = crate::error::Report(&error));
-            // macOS: a front is left running and unreaped, sent nothing; any other child is killed
-            // and reaped through its verified unique id.
             #[cfg(target_os = "macos")]
             let (fate, child_fate, teardown_cleanup) = {
                 if id_read.is_some() {
@@ -913,52 +946,6 @@ fn spawn_reported(
                     (None, child_fate, failures)
                 }
             };
-            // Off macOS: kill + reap so a failed attach never leaks the child (a dropped handle
-            // neither kills nor reaps). On Linux a front is the exception, and a failed attach has
-            // dropped the containment already: a cgroup leaf's drop kills it, so a front in it is
-            // dying, and is waited for (`tear_down_held`). A not-started child, front or not (a
-            // front never ran its `sudo`), is killed and reaped.
-            #[cfg(target_os = "linux")]
-            let (detail, torn) = if not_started {
-                (
-                    None,
-                    held_teardown::tear_down_unexecuted(owned, id_read, policy, &mut why),
-                )
-            } else {
-                held_teardown::tear_down_held(
-                    owned,
-                    held_teardown::HeldTeardown {
-                        front,
-                        id: id_read,
-                        subtree: subtree.as_ref(),
-                        disposition: crate::child::owned::teardown::Disposition::HandBack,
-                        policy,
-                    },
-                    &mut why,
-                )
-            };
-            // A not-started failure carries only the cause and fate; the teardown's failures went
-            // to its warn. Otherwise the attach's cleanup failures come before the teardown's.
-            #[cfg(target_os = "linux")]
-            return Err(failure::failed_attach(not_started, error, detail, attach_cleanup, torn));
-            #[cfg(windows)]
-            {
-                let Torn {
-                    fate: child_fate,
-                    unreaped,
-                    cleanup,
-                } = held_teardown::tear_down_failed_spawn(
-                    owned,
-                    id_read,
-                    crate::child::owned::teardown::Past::Clean,
-                    crate::child::owned::teardown::Disposition::HandBack,
-                    policy,
-                    &mut why,
-                );
-                return Err(SpawnFailure::started(error, child_fate, unreaped)
-                    .with_cleanup(attach_cleanup)
-                    .with_cleanup(cleanup));
-            }
             #[cfg(target_os = "macos")]
             return Err(SpawnFailure::started(error, child_fate, None)
                 .with_detail(front_detail(fate, front, Some(pid)))
@@ -3015,8 +3002,11 @@ pub(crate) mod fault {
 
     /// Run `hook` once at the next `point` on this thread; the guard clears it on drop.
     #[cfg_attr(
-        not(all(feature = "tokio", target_os = "linux")),
-        allow(dead_code, reason = "only the Linux async spawn's tests arm a spawn point so far")
+        not(any(all(feature = "tokio", target_os = "linux"), windows)),
+        allow(
+            dead_code,
+            reason = "only the Linux async spawn's and the Windows spawn's tests arm a spawn point"
+        )
     )]
     pub(crate) fn set_at(point: SpawnPoint, hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
         crate::oneshot_hook::arm(hook_at(point), hook)
@@ -3066,8 +3056,11 @@ pub(crate) mod fault {
 
     /// The pid of the child the spawn that fired the running hook has just forked.
     #[cfg_attr(
-        not(all(feature = "tokio", target_os = "linux")),
-        allow(dead_code, reason = "only the Linux async spawn's tests arm a spawn point so far")
+        not(any(all(feature = "tokio", target_os = "linux"), windows)),
+        allow(
+            dead_code,
+            reason = "only the Linux async spawn's and the Windows spawn's tests arm a spawn point"
+        )
     )]
     pub(crate) fn spawn_pid() -> u32 {
         SPAWN_PID.with(Cell::get).expect("spawn_pid is read from a spawn hook")

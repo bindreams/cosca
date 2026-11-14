@@ -287,7 +287,7 @@ const PROCESS_SEQUENCE_NUMBER: PROCESSINFOCLASS = PROCESSINFOCLASS(92);
 ///
 /// # Safety
 /// `T` must be the buffer `class` writes.
-unsafe fn query<T>(handle: HANDLE, class: PROCESSINFOCLASS, out: &mut T) -> Result<(), NTSTATUS> {
+pub(crate) unsafe fn query<T>(handle: HANDLE, class: PROCESSINFOCLASS, out: &mut T) -> Result<(), NTSTATUS> {
     // SAFETY: `handle` is live; `out` is the buffer the caller says `class` writes, and its size is
     // passed.
     let status = unsafe {

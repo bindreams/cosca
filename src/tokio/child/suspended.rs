@@ -54,8 +54,9 @@ impl Command {
     /// As [`spawn`](Self::spawn), and the extra ones of
     /// [`cosca::Command::spawn_suspended`](crate::Command::spawn_suspended): [`Error::Unsupported`]
     /// off Windows and with [`elevate`](Self::elevate), before the command is touched, and
-    /// [`Error::Containment`] for a [`Strongest`](crate::ContainMode::Strongest) or
-    /// [`BestEffort`](crate::ContainMode::BestEffort) root whose job assignment fails.
+    /// [`Error::Containment`] (inside [`Error::MayHaveStarted`]) for a
+    /// [`Strongest`](crate::ContainMode::Strongest), [`BestEffort`](crate::ContainMode::BestEffort)
+    /// or [`Session`](crate::ContainMode::Session) root whose Job Object assignment fails.
     pub async fn spawn_suspended(&mut self) -> Result<SuspendedChild, Error> {
         platform::spawn(self).await
     }

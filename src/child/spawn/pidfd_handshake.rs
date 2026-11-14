@@ -73,9 +73,9 @@ use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, ReturnFlags, SendFlags, Shutdown, SocketFlags, SocketType};
 
 use super::fd_channel::{above_stdio, above_stdio_keeping, publish_ends, register as register_hook, Shared};
-use super::held_teardown::tear_down_pidfd;
+use super::held_teardown::{say_teardown_of_failed_spawn, tear_down_pidfd};
 use super::{SpawnFailure, SpawnLockGuard};
-use crate::child::owned::teardown::{HandleTeardown, Past, Remains};
+use crate::child::owned::teardown::{Past, Remains};
 use crate::error::{ChildFate, Error};
 
 const GO: u8 = 1;
@@ -906,29 +906,6 @@ fn end_through_pidfd(
     why: &mut super::Diagnosis,
 ) -> Remains {
     say_teardown_of_failed_spawn(tear_down_pidfd(pid, pidfd, None, past, warn_after), why)
-}
-
-/// Says `torn` as the failed spawn's one warn, and logs at warn ([`warn_of_teardown_failures`]) each
-/// failure that warn does not hold.
-pub(super) fn say_teardown_of_failed_spawn(torn: HandleTeardown, why: &mut super::Diagnosis) -> Remains {
-    let held = torn.outcome.said_in_the_one_warn(why);
-    let remains = torn.say_as_failed_spawn(why);
-    warn_of_teardown_failures(&remains, held);
-    remains
-}
-
-/// Logs at warn each failure of a failed spawn's teardown that the event's one warn
-/// ([`say_as_failed_spawn`](HandleTeardown::say_as_failed_spawn)) does not hold. That warn holds them
-/// all when it was said (`held`: its clause is at warn, or the spawn's diagnosis was owed and folded
-/// into it); a clause below warn (a refused kill whose look found the child gone) is said at its
-/// level only.
-fn warn_of_teardown_failures(remains: &Remains, held: bool) {
-    if held {
-        return;
-    }
-    for failure in remains.failures.iter().flat_map(|failures| failures.iter()) {
-        warn_beside_the_answer("the failed spawn's teardown of its child failed", failure.as_ref());
-    }
 }
 
 /// [`end_through_pidfd`] for a child that was never told to go, so it never ran the program
