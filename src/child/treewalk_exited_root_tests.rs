@@ -151,6 +151,33 @@ fn graceful_shutdown_tree_kills_the_members_its_sigterm_walk_found_after_the_roo
     drop(stdin);
 }
 
+/// A tree an earlier kill left unvouched stays so: the call's walk still holds the members it reached,
+/// and the sweep kills the one that ignores the `SIGTERM` when the root exits in the grace, but the
+/// answer is `Unassessable`, never `Ok`.
+///
+/// Mutants: a walk on an unvouched tree holds nothing, so the member survives; the call vouches.
+#[skuld::test]
+fn graceful_shutdown_tree_on_an_unvouched_tree_kills_the_member_its_walk_listed_and_is_unassessable() {
+    let (child, stdin, survivors) = survivor_tree();
+    child
+        .tree
+        .leave_unvouched_for_test(crate::containment::dispatch::UnvouchedKind::Earlier);
+
+    let err = child
+        .graceful_shutdown_tree(Duration::from_secs(30))
+        .expect_err("an earlier kill left the tree unvouched");
+
+    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    for survivor in &survivors {
+        assert_eq!(
+            survivor.is_alive(),
+            Liveness::Dead,
+            "{survivor:?} ignored the SIGTERM and must be killed by identity"
+        );
+    }
+    drop(stdin);
+}
+
 /// A root that ignores the `SIGTERM` outlives the grace, and the `SIGTERM` ends its child, which
 /// reparents the member below it out of the sweep's walk from the root: the member the call's own walk
 /// reached is killed by identity, and the root by the sweep.

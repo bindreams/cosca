@@ -798,6 +798,9 @@ enum Standing {
     Never,
     Killed,
     Left(Vec<u32>),
+    /// Members a walk held on a tree already `Killed`, or left unvouched with this kind.
+    HeldOnKilled(Vec<u32>),
+    HeldOnUnvouched(Vec<u32>, super::UnvouchedKind),
     Unvouched(super::UnvouchedKind),
 }
 
@@ -813,16 +816,20 @@ fn standing_of(state: &super::TreeState) -> Standing {
         super::TreeState::Never => Standing::Never,
         super::TreeState::Killed => Standing::Killed,
         super::TreeState::Unvouched(kind) => Standing::Unvouched(*kind),
-        super::TreeState::Left(held) => {
+        super::TreeState::Left(held, beneath) => {
             assert!(!held.is_empty(), "a tree left holds a member");
-            Standing::Left(
-                held.iter()
-                    .map(|left| match left {
-                        Left::Resolved(id) | Left::Termed { id, .. } => id.pid(),
-                        Left::Unread { pid, .. } => *pid,
-                    })
-                    .collect(),
-            )
+            let pids = held
+                .iter()
+                .map(|left| match left {
+                    Left::Resolved(id) | Left::Termed { id, .. } => id.pid(),
+                    Left::Unread { pid, .. } => *pid,
+                })
+                .collect();
+            match beneath {
+                super::Beneath::Open => Standing::Left(pids),
+                super::Beneath::Killed => Standing::HeldOnKilled(pids),
+                super::Beneath::Unvouched(kind) => Standing::HeldOnUnvouched(pids, *kind),
+            }
         }
     }
 }
@@ -857,17 +864,21 @@ fn next_is_the_one_transition_of_state_and_facts() {
         "Unvouched(HeldMembersGone)",
         "Unvouched(RootSeenRunning)",
         "Unvouched(Earlier)",
+        "Left(7) held on Killed",
+        "Left(7) held on Unvouched(Earlier)",
     ];
     let prev_at = |at: usize| match at {
         0 => TreeState::Never,
         1 => TreeState::Killed,
-        2 => TreeState::Left(vec![unread(7)]),
+        2 => TreeState::Left(vec![unread(7)], super::Beneath::Open),
         3 => TreeState::Unvouched(UnvouchedKind::HeldMembersGone),
         4 => TreeState::Unvouched(UnvouchedKind::RootSeenRunning),
-        _ => TreeState::Unvouched(UnvouchedKind::Earlier),
+        5 => TreeState::Unvouched(UnvouchedKind::Earlier),
+        6 => TreeState::Left(vec![unread(7)], super::Beneath::Killed),
+        _ => TreeState::Left(vec![unread(7)], super::Beneath::Unvouched(UnvouchedKind::Earlier)),
     };
     // (label, walked, left_now, running, root_seen_running, next from each state of `prev_names`)
-    type Row = (&'static str, bool, Vec<Left>, bool, bool, [Standing; 6]);
+    type Row = (&'static str, bool, Vec<Left>, bool, bool, [Standing; 8]);
     let killed = || Standing::Killed;
     let left_8 = || Standing::Left(vec![8]);
     let held = || Standing::Unvouched(UnvouchedKind::HeldMembersGone);
@@ -876,21 +887,21 @@ fn next_is_the_one_transition_of_state_and_facts() {
     #[rustfmt::skip]
     let facts: Vec<Row> = vec![
         ("walk, nothing left", true, vec![], false, false,
-            [killed(), killed(), killed(), killed(), killed(), killed()]),
+            [killed(), killed(), killed(), killed(), killed(), killed(), killed(), killed()]),
         ("walk, something running with no identity", true, vec![], true, false,
-            [earlier(), earlier(), earlier(), earlier(), earlier(), earlier()]),
+            [earlier(), earlier(), earlier(), earlier(), earlier(), earlier(), earlier(), earlier()]),
         ("walk, the root seen running", true, vec![], true, true,
-            [root(), root(), root(), root(), root(), root()]),
+            [root(), root(), root(), root(), root(), root(), root(), root()]),
         ("no walk, nothing left (skipped kill, gone root, walk not made)", false, vec![], false, false,
-            [Standing::Never, killed(), held(), held(), root(), earlier()]),
+            [Standing::Never, killed(), held(), held(), root(), earlier(), killed(), earlier()]),
         ("no walk, something running with no identity", false, vec![], true, false,
-            [earlier(), earlier(), earlier(), earlier(), earlier(), earlier()]),
+            [earlier(), earlier(), earlier(), earlier(), earlier(), earlier(), earlier(), earlier()]),
         ("walk, member 8 left", true, vec![unread(8)], true, false,
-            [left_8(), left_8(), left_8(), left_8(), left_8(), left_8()]),
+            [left_8(), left_8(), left_8(), left_8(), left_8(), left_8(), left_8(), left_8()]),
         ("walk, member 8 left and the root seen running", true, vec![unread(8)], true, true,
-            [left_8(), left_8(), left_8(), left_8(), left_8(), left_8()]),
+            [left_8(), left_8(), left_8(), left_8(), left_8(), left_8(), left_8(), left_8()]),
         ("no walk, member 8 left", false, vec![unread(8)], true, false,
-            [left_8(), left_8(), left_8(), left_8(), left_8(), left_8()]),
+            [left_8(), left_8(), left_8(), left_8(), left_8(), left_8(), left_8(), left_8()]),
     ];
     for (label, walked, left_now, running, root_seen_running, wants) in facts {
         for (at, want) in wants.into_iter().enumerate() {
@@ -1648,26 +1659,46 @@ fn a_gone_roots_error_names_the_pid_and_says_what_is_true_on_the_platform() {
     );
 }
 
-/// A walk never overwrites a state an earlier kill vouched for or left unvouched: the stored kind
-/// stays, and the walk's call cannot vouch for such a tree.
+/// A walk on a tree an earlier kill vouched for or left unvouched holds its members all the same, to be
+/// killed by identity, and the vouching stays as it was: the call cannot vouch for what the earlier
+/// kill did not, an unvouched tree keeps its kind (the answer is `Unassessable`, never `Ok`), and a
+/// killed tree stays killed.
 ///
-/// Mutant: `hold` turns an unvouched or killed tree into `Left`.
+/// Mutants: `hold` drops the members of such a tree; `hold` turns it into an open `Left`; the call's
+/// token vouches for an unvouched tree.
 #[skuld::test]
-fn a_walk_does_not_overwrite_an_unvouched_or_killed_tree() {
-    use super::{TreeKilled, TreeState, UnvouchedKind};
+fn a_walk_on_an_unvouched_or_killed_tree_holds_its_members_and_keeps_the_vouching() {
+    use super::{Beneath, TreeKillOutcome, TreeKilled, TreeState, UnvouchedKind};
     use crate::containment::treewalk::WalkToken;
-    let id = crate::identity::ProcessId::current();
-    for (state, standing_kept) in [
+    for (state, held_on, kept, answers_ok) in [
         (
             TreeState::Unvouched(UnvouchedKind::RootSeenRunning),
+            Beneath::Unvouched(UnvouchedKind::RootSeenRunning),
             Standing::Unvouched(UnvouchedKind::RootSeenRunning),
+            false,
         ),
-        (TreeState::Killed, Standing::Killed),
+        (TreeState::Killed, Beneath::Killed, Standing::Killed, true),
     ] {
+        let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
+        let id = blocker.id().expect(crate::test_child::IDENTITY_READ);
         let killed = TreeKilled::default();
         *killed.lock() = state;
-        killed.hold(vec![id], true, Some(&WalkToken::new()));
-        assert_eq!(standing(&killed), standing_kept);
+        let call = WalkToken::new();
+
+        let walk = killed.hold(vec![id], true, Some(&call));
+
+        let held = match held_on {
+            Beneath::Killed => Standing::HeldOnKilled(vec![id.pid()]),
+            Beneath::Unvouched(kind) => Standing::HeldOnUnvouched(vec![id.pid()], kind),
+            Beneath::Open => unreachable!("the rows hold on a settled tree"),
+        };
+        assert_eq!(standing(&killed), held);
+        let settled = killed.settle(Some(&walker()), TreeKillOutcome::NoRoot(ROOT_PID, walk), true);
+        assert_eq!(settled.answer.is_ok(), answers_ok, "{:?}", settled.answer);
+        assert_eq!(settled.killed_again, vec![id], "the held member was killed by identity");
+        assert_eq!(standing(&killed), kept);
+        drop(stdin);
+        crate::test_child::assert_killed("the held member", blocker.wait().expect("reap the member"));
     }
 }
 
