@@ -205,14 +205,15 @@ impl Drop for HideProc {
     }
 }
 
-/// While the guard lives, this thread's reads of another task's `/proc/<pid>/cgroup` that
-/// fail with `errno`, as `hidepid` answers: `EPERM` under `hidepid=1`.
+/// While the guard lives, this thread's reads of another task's `/proc/<pid>/cgroup` fail with
+/// `errno`: any errno the open can answer, such as `hidepid`'s (`EPERM` under `hidepid=1`, `ENOENT`
+/// under `hidepid=2`) or an exit's `ESRCH`. It does not make the task hidden, only its reads fail.
 pub(crate) fn hide_proc_as(errno: i32) -> HideProcAs {
     PROC_HIDDEN_AS.with(|f| f.set(Some(errno)));
     HideProcAs(())
 }
 
-#[must_use = "/proc is visible again as soon as the guard is dropped"]
+#[must_use = "the reads succeed again as soon as the guard is dropped"]
 pub(crate) struct HideProcAs(());
 
 impl Drop for HideProcAs {
@@ -221,12 +222,22 @@ impl Drop for HideProcAs {
     }
 }
 
-/// The errno a hidden `/proc` answers on this thread: [`hide_proc_as`]'s, `ENOENT` under
-/// [`hide_proc`], or `None` while nothing hides it.
+/// The errno this thread's `<pid>/cgroup` reads fail with: [`hide_proc_as`]'s, `ENOENT` under
+/// [`hide_proc`], or `None` while neither is armed.
 pub(crate) fn proc_hidden_as() -> Option<i32> {
     PROC_HIDDEN_AS
         .with(Cell::get)
         .or_else(|| PROC_HIDDEN.with(Cell::get).then_some(libc::ENOENT))
+}
+
+/// `kernel` with `pid`'s `<pid>/cgroup` read failing with [`proc_hidden_as`]'s errno (as the `openat2`'s
+/// answer), or `None` while neither hook is armed.
+pub(crate) fn hidden_cgroup_of(
+    kernel: &dyn crate::identity::Kernel,
+    pid: u32,
+) -> Option<crate::identity::FakeKernel<'_>> {
+    proc_hidden_as()
+        .map(|errno| crate::identity::FakeKernel::over(kernel).on_read(&format!("{pid}/cgroup"), Err(errno)))
 }
 
 /// While the guard lives, `PIDFD_GET_INFO` fails on this thread with `EIO`, as a kernel that has

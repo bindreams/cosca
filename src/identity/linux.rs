@@ -7,8 +7,8 @@
 
 #[path = "linux/kernel.rs"]
 pub(crate) mod kernel;
-#[path = "linux/pid_stat.rs"]
-pub(crate) mod pid_stat;
+#[path = "linux/pid_file.rs"]
+pub(crate) mod pid_file;
 #[path = "linux/proc_view.rs"]
 pub(crate) mod proc_view;
 #[path = "linux/prove.rs"]
@@ -84,23 +84,29 @@ fn read_stat_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Vec<u8>>, 
 
 /// The one by-pid read of `pid`'s `stat`, via `openat` on `dir`, not a `/proc` path lookup. A failed
 /// read is `Gone` only when `kill(pid, 0)` says so ([`resolve_unreadable`]), else `Unknown`, and
-/// `Unknown` carries what the read knows: a refusal or an unreadable `stat`, as
-/// [`pid_stat::failed_read`] classes it, and no cause for an absence (`hidepid`, a racing exit). A
-/// whole-table scan has the other policy for `Gone` (`pid_stat::read_in_scan`).
+/// `Unknown` carries what the read knows: a refusal or an unreadable `stat`, as [`pid_file::read`]
+/// classes it, and no cause for an absence (`hidepid`, a racing exit). A whole-table scan has the
+/// other policy for `Gone`: it never asks `kill(pid, 0)`.
 fn read_in(kernel: &dyn Kernel, dir: &ProcDir, pid: RawPid) -> (Resolved<Vec<u8>>, UnknownCause) {
-    let e = match pid_stat::read_stat_file(kernel, dir, pid) {
-        Ok(bytes) => return (Resolved::Found(bytes), UnknownCause::default()),
-        Err(e) => e,
+    use pid_file::ReadOutcome;
+
+    let (resolved, cause) = match pid_file::read(kernel, dir, pid, "stat") {
+        Ok(ReadOutcome::Read(bytes)) => return (Resolved::Found(bytes), UnknownCause::default()),
+        Ok(ReadOutcome::Exited(e) | ReadOutcome::Hidden(e)) => (
+            resolve_unreadable(kernel, pid, crate::error::Report(&e)),
+            UnknownCause::default(),
+        ),
+        Ok(ReadOutcome::Refused(refusal)) => (
+            resolve_unreadable(kernel, pid, refusal.requirement()),
+            UnknownCause::of_refusal(refusal),
+        ),
+        Err(unreadable) => (
+            resolve_unreadable(kernel, pid, crate::error::Report(&unreadable)),
+            UnknownCause::of_unreadable(unreadable),
+        ),
     };
-    match resolve_unreadable(kernel, pid, crate::error::Report(&e)) {
-        Resolved::Unknown => {
-            let cause = match pid_stat::failed_read(kernel, dir, pid, "stat", e) {
-                Ok(pid_stat::PidStat::Refused(refusal)) => UnknownCause::of_refusal(refusal),
-                Ok(_) => UnknownCause::default(),
-                Err(unreadable) => UnknownCause::of_unreadable(unreadable),
-            };
-            (Resolved::Unknown, cause)
-        }
+    match resolved {
+        Resolved::Unknown => (Resolved::Unknown, cause),
         resolved => (resolved, UnknownCause::default()),
     }
 }
@@ -517,7 +523,7 @@ pub(crate) fn call_error(subject: &str, call: prove::FailedCall) -> Error {
 /// The error for a by-pid identity read of `subject` whose `stat` could not be read, beyond absence
 /// and refusal: [`Error::Unassessable`] with the unreadable `stat` (which names the pid, and holds
 /// the errno below it) as its source.
-pub(crate) fn unreadable_error(subject: &str, unreadable: pid_stat::Unreadable) -> Error {
+pub(crate) fn unreadable_error(subject: &str, unreadable: pid_file::Unreadable) -> Error {
     Error::Unassessable {
         detail: format!("{subject} identity could not be read"),
         source: Some(std::sync::Arc::new(unreadable.into_cause())),

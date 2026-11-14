@@ -123,8 +123,16 @@ fn proc_state(kernel: &dyn crate::identity::Kernel, child: crate::containment::C
 enum StateUnknown {
     /// `/proc` is an outer pid namespace's, or could not be verified to be this process's own.
     View(crate::identity::ViewUnreadable),
-    /// `<pid>/stat` could not be read.
-    Unreadable(std::io::Error),
+    /// The pid exited, or `hidepid` hides it: [`pid_file::read`](crate::identity::pid_file::read)
+    /// answered [`Exited`](crate::identity::pid_file::ReadOutcome::Exited) or
+    /// [`Hidden`](crate::identity::pid_file::ReadOutcome::Hidden). The error is why.
+    Skipped(std::io::Error),
+    /// `<pid>/stat` could not be read: the `openat2` was refused. The error says what cosca requires.
+    Refused(crate::error::Error),
+    /// `<pid>/stat` could not be read, for another reason: the failure as
+    /// [`Unreadable::into_cause`](crate::identity::pid_file::Unreadable::into_cause) makes it, with the
+    /// pid's own `EPERM` beside a failed re-check.
+    Unreadable(crate::error::Error),
     /// `<pid>/stat` has no state field.
     Unparsable(Vec<u8>),
 }
@@ -134,6 +142,8 @@ impl std::fmt::Display for StateUnknown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::View(_) => f.write_str("the /proc view cannot be relied on"),
+            Self::Skipped(_) => f.write_str("its stat is not there for us"),
+            Self::Refused(_) => f.write_str("its stat read was refused"),
             Self::Unreadable(_) => f.write_str("its stat could not be read"),
             Self::Unparsable(stat) => write!(f, "its stat has no state field: {:?}", String::from_utf8_lossy(stat)),
         }
@@ -145,6 +155,8 @@ impl std::error::Error for StateUnknown {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::View(why) => Some(why),
+            Self::Skipped(e) => Some(e),
+            Self::Refused(e) => Some(e),
             Self::Unreadable(e) => Some(e),
             Self::Unparsable(_) => None,
         }
@@ -155,20 +167,23 @@ impl std::error::Error for StateUnknown {
 /// unknown.
 ///
 /// The only consumer, [`proc_state`], logs why at `debug` and drops no member: an unknown state only
-/// leaves a failed placement undiagnosed. So a `stat` read that is a refusal
-/// ([`Refusal`](crate::identity::Refusal)) has no slot of its own: its `Unreadable` error says what
-/// cosca requires, for the line that is logged.
+/// leaves a failed placement undiagnosed. So the failure of the `stat` read stays as
+/// [`pid_file::read`](crate::identity::pid_file::read) classed it.
 #[cfg(target_os = "linux")]
 fn read_proc_state(kernel: &dyn crate::identity::Kernel, pid: u32) -> Result<char, StateUnknown> {
+    use crate::identity::pid_file::{self, ReadOutcome};
+
     let proc_dir = crate::identity::proc_view_with(kernel)
         .into_dir()
         .map_err(StateUnknown::View)?;
-    let stat = crate::identity::pid_stat::read_stat_file(kernel, &proc_dir, pid).map_err(|e| {
-        StateUnknown::Unreadable(crate::identity::pid_stat::explained_read_failure(
-            kernel, &proc_dir, pid, "stat", e,
-        ))
-    })?;
-    state_from_stat(stat)
+    match pid_file::read(kernel, &proc_dir, pid, "stat") {
+        Ok(ReadOutcome::Read(stat)) => state_from_stat(stat),
+        Ok(ReadOutcome::Exited(e) | ReadOutcome::Hidden(e)) => Err(StateUnknown::Skipped(e)),
+        Ok(ReadOutcome::Refused(refusal)) => Err(StateUnknown::Refused(
+            refusal.unsupported(format!("reading pid {pid}'s stat")),
+        )),
+        Err(unreadable) => Err(StateUnknown::Unreadable(unreadable.into_cause())),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -464,7 +479,7 @@ impl CgroupLeaf {
             let opened = self.dir.open("cgroup.events", rustix::fs::OFlags::PATH);
             opened.ok().map(|_| false)
         };
-        match super::proc_names(path, pid, outside_if_live, false) {
+        match super::proc_names(&crate::identity::HostKernel, path, pid, outside_if_live, false) {
             Ok(inside) => self.placed.record(pid, inside),
             Err(e) => {
                 log::debug!(

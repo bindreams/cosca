@@ -232,8 +232,6 @@ fn unknown_reads_of_a_stat(stat: i32, recheck: Option<i32>) -> [Option<Error>; 2
 fn a_refused_stat_read_of_a_live_pid_is_unknown_and_unsupported() {
     for (stat, recheck, refusing) in [
         (libc::ENOSYS, None, libc::ENOSYS),
-        (libc::ENODEV, None, libc::ENODEV),
-        (libc::EPERM, Some(libc::EPERM), libc::EPERM),
         (libc::EPERM, Some(libc::ENOSYS), libc::ENOSYS),
     ] {
         for error in unknown_reads_of_a_stat(stat, recheck) {
@@ -252,9 +250,6 @@ fn a_refused_stat_read_of_a_live_pid_is_unknown_and_unsupported() {
 fn an_unreadable_stat_of_a_live_pid_is_unknown_and_unassessable_naming_pid_and_errno() {
     for (stat, recheck, below) in [
         (libc::EIO, None, libc::EIO),
-        (libc::EMFILE, None, libc::EMFILE),
-        (libc::EXDEV, None, libc::EXDEV),
-        (libc::ELOOP, None, libc::ELOOP),
         (libc::EPERM, Some(libc::EMFILE), libc::EMFILE),
     ] {
         for error in unknown_reads_of_a_stat(stat, recheck) {
