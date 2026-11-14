@@ -55,8 +55,8 @@ fn a_nonexistent_pid_has_no_state_under_the_ordinary_view() {
         proc_state(&HostKernel, handle_of(pid, &pidfd_of(std::process::id()))),
         None
     );
-    let Err(StateUnknown::Unreadable(e)) = read_proc_state(&HostKernel, pid) else {
-        panic!("expected Unreadable");
+    let Err(StateUnknown::Skipped(e)) = read_proc_state(&HostKernel, pid) else {
+        panic!("expected Skipped");
     };
     assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
 }
@@ -68,13 +68,13 @@ fn a_nonexistent_pid_has_no_state_under_the_ordinary_view() {
 fn a_refused_stat_read_is_an_unknown_state_that_names_openat2() {
     crate::log_capture::install();
     let me = std::process::id();
-    for errno in [libc::ENOSYS, libc::EPERM, libc::ENODEV] {
+    for errno in [libc::ENOSYS, libc::EPERM] {
         let kernel = FakeKernel::over(&HostKernel)
             .same_view()
             .on_read(&format!("{me}/stat"), Err(errno))
             .on_read("self/stat", Err(libc::ENODEV));
-        let Err(StateUnknown::Unreadable(e)) = read_proc_state(&kernel, me) else {
-            panic!("{errno}: expected Unreadable");
+        let Err(StateUnknown::Refused(e)) = read_proc_state(&kernel, me) else {
+            panic!("{errno}: expected Refused");
         };
         let said = crate::error::Report(&e).to_string();
         assert!(said.contains("requires openat2"), "{errno}: {said}");
@@ -94,28 +94,25 @@ fn a_refused_stat_read_is_an_unknown_state_that_names_openat2() {
     }
 }
 
-/// A `stat` read that is no refusal stays the read's own error, with its code and no requirement:
-/// `EIO`, and `EPERM` while the checked directory still answers (`hidepid`).
+/// A `stat` the checked `/proc` would not read across a mount (`EXDEV`, `ELOOP`) is named so in the
+/// unknown state, not left a bare errno. Mutant: "the leaf's state read keeps the raw errno".
 #[skuld::test]
-fn a_stat_read_that_is_no_refusal_is_the_reads_own_error() {
+fn a_stat_beyond_a_mount_is_an_unknown_state_that_says_so() {
     let me = std::process::id();
-    for errno in [libc::EIO, libc::EPERM] {
+    for errno in [libc::EXDEV, libc::ELOOP] {
         let kernel = FakeKernel::over(&HostKernel)
             .same_view()
             .on_read(&format!("{me}/stat"), Err(errno));
-        let Err(StateUnknown::Unreadable(e)) = read_proc_state(&kernel, me) else {
-            panic!("{errno}: expected Unreadable");
-        };
-        assert_eq!(e.raw_os_error(), Some(errno), "{e}");
-        let said = crate::error::Report(&e).to_string();
-        assert!(!said.contains("requires"), "{errno}: {said}");
+        let why = read_proc_state(&kernel, me).expect_err("no state");
+        let said = crate::error::Report(&why).to_string();
+        assert!(said.contains("lies beyond a mount"), "{errno}: {said}");
     }
 }
 
 /// An unreadable stat's `io::Error`, and an unusable view, are `StateUnknown`'s `source()`.
 #[skuld::test]
 fn an_unknown_state_has_what_it_wraps_as_its_source() {
-    let unreadable = StateUnknown::Unreadable(std::io::Error::from_raw_os_error(libc::EIO));
+    let unreadable = StateUnknown::Skipped(std::io::Error::from_raw_os_error(libc::EIO));
     let source = std::error::Error::source(&unreadable).expect("an unreadable stat has a source");
     assert_eq!(
         source
@@ -155,7 +152,7 @@ fn the_line_of_an_unknown_state_says_the_os_error_once() {
 #[skuld::test]
 fn an_unknown_state_says_what_failed_and_not_the_os_error() {
     let os_error = std::io::Error::from_raw_os_error(libc::EIO).to_string();
-    let unreadable = StateUnknown::Unreadable(std::io::Error::from_raw_os_error(libc::EIO)).to_string();
+    let unreadable = StateUnknown::Skipped(std::io::Error::from_raw_os_error(libc::EIO)).to_string();
     assert!(!unreadable.contains(&os_error), "{unreadable}");
     let view = StateUnknown::View(crate::identity::ViewUnreadable::from_open_errno(rustix::io::Errno::IO)).to_string();
     assert!(!view.contains(&os_error), "{view}");

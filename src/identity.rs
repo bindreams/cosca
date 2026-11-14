@@ -686,7 +686,7 @@ pub(crate) use backend::fault as windows_fault;
 pub(crate) use backend::TERMINATE_EXIT_CODE as WINDOWS_TERMINATE_EXIT_CODE;
 
 #[cfg(target_os = "linux")]
-pub(crate) use backend::pid_stat;
+pub(crate) use backend::pid_file;
 
 #[cfg(target_os = "linux")]
 pub(crate) use backend::kernel::{HostKernel, Kernel};
@@ -727,6 +727,9 @@ pub(crate) use backend::proc_view::{
     pidfd_pid_in, proc_view_with, utf8, PidfdTarget, ProcDir, ProcView, ViewUnreadable, DIVERGED_REASON,
 };
 
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use backend::proc_view::ReadFailure;
+
 /// Why a by-pid read answered `Unknown`, when the read itself knows: on Linux, the unusable
 /// `/proc` view it went through or the failed pidfd call. Carried out of the failing read, so the
 /// error describes that read and not a second look at a view that may have recovered.
@@ -742,7 +745,7 @@ pub(crate) struct UnknownCause {
     refusal: Option<Box<Refusal>>,
     /// The `stat` read that failed, beyond absence and refusal, and left the read `Unknown`.
     #[cfg(target_os = "linux")]
-    unreadable: Option<Box<backend::pid_stat::Unreadable>>,
+    unreadable: Option<Box<backend::pid_file::Unreadable>>,
     /// The parent whose proof left an ordered read `Unknown`, when that and not the read's own pid
     /// is why.
     parent: Option<RawPid>,
@@ -833,7 +836,7 @@ impl UnknownCause {
 
     /// The cause of a read whose `stat` failed as `unreadable` says and left it `Unknown`.
     #[cfg(target_os = "linux")]
-    pub(crate) fn of_unreadable(unreadable: backend::pid_stat::Unreadable) -> UnknownCause {
+    pub(crate) fn of_unreadable(unreadable: backend::pid_file::Unreadable) -> UnknownCause {
         UnknownCause {
             unreadable: Some(Box::new(unreadable)),
             ..UnknownCause::default()

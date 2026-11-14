@@ -8,7 +8,7 @@ use super::ProbeEnd;
 use super::{dying_in, front_placement, Subtree};
 use crate::containment::cgroup::fault::{self, ProbeStep};
 use crate::containment::cgroup::test_support::{alone, kill_record};
-use crate::identity::{FakeKernel, HostKernel, Kernel, ProcDir, ViewUnreadable, UNREADABLE_STATUS_REASON};
+use crate::identity::{FakeKernel, HostKernel, Kernel, ProcDir, ReadFailure, ViewUnreadable, UNREADABLE_STATUS_REASON};
 use crate::log_capture::warns_since;
 use crate::test_groups::{cgroup, Group};
 
@@ -1036,7 +1036,7 @@ impl Kernel for ChildExitsAfterCgroupRead {
         HostKernel.open_proc()
     }
 
-    fn read(&self, dir: &ProcDir, path: &str) -> std::io::Result<Vec<u8>> {
+    fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure> {
         let read = HostKernel.read(dir, path);
         if let Some(pid) = path.strip_suffix("/cgroup").and_then(|pid| pid.parse().ok()) {
             // SAFETY: `pid` is this test's own unreaped child.
@@ -1424,39 +1424,38 @@ fn a_refused_cgroup_read_of_the_probes_child_refuses_the_spawn_naming_openat2() 
     }
 }
 
-/// `EPERM` is `hidepid`'s answer, and a refusal only if the checked directory refuses `self/stat`
-/// too, as for a pid's `stat` in a scan: the re-check's errno is the refusal, the read's `EPERM` a
-/// second cause. Mutant: "an `EPERM` read is always `hidepid`".
+/// `EPERM` beside a checked directory that still answers is `hidepid`'s: the refusal says so.
 #[skuld::test]
-fn an_eperm_cgroup_read_beside_a_refusing_proc_directory_is_a_refusal() {
+fn an_eperm_cgroup_read_beside_a_proc_directory_that_answers_is_hidepid() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc_as(libc::EPERM);
-    for errno in REFUSALS {
-        let kernel = FakeKernel::over(&HostKernel)
-            .same_view()
-            .on_read("self/stat", Err(errno));
-        let err = front_placement(&kernel, || Ok(HIGH)).expect_err("a refused re-check refuses");
-        assert_refused_openat2(&err, errno);
-        let said = crate::error::Report(&err).to_string();
-        assert!(
-            said.contains("cgroup was refused, and the checked /proc refused self/stat too"),
-            "{said}"
-        );
+    let kernel = FakeKernel::over(&HostKernel).same_view();
+    match front_placement(&kernel, || Ok(HIGH)) {
+        Err(crate::error::Error::Unsupported { detail, .. }) => assert!(detail.contains("hidepid"), "{detail}"),
+        other => panic!("expected Unsupported, got {other:?}"),
     }
 }
 
-/// `EPERM` beside a checked directory that still answers, or whose re-check fails without refusing,
-/// is `hidepid`'s: the refusal says so.
+/// `EPERM` whose re-check of `self/stat` fails without refusing says nothing about `hidepid`: it is
+/// the probe's own failure, not `Unsupported`, naming the failed re-check and keeping the pid's
+/// `EPERM` beside it as a second failure. Mutant: "a failed re-check is `hidepid`'s"; "the pid's
+/// `EPERM` is dropped".
 #[skuld::test]
-fn an_eperm_cgroup_read_beside_a_proc_directory_that_is_no_refusal_is_hidepid() {
+fn an_eperm_cgroup_read_whose_recheck_fails_is_an_unknown_not_hidepid() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc_as(libc::EPERM);
     let kernel = FakeKernel::over(&HostKernel)
         .same_view()
         .on_read("self/stat", Err(libc::EIO));
     match front_placement(&kernel, || Ok(HIGH)) {
-        Err(crate::error::Error::Unsupported { detail, .. }) => assert!(detail.contains("hidepid"), "{detail}"),
-        other => panic!("expected Unsupported, got {other:?}"),
+        Err(err @ crate::error::Error::Several(_)) => {
+            let said = crate::error::Report(&err).to_string();
+            assert!(said.contains("re-check of self/stat failed"), "{said}");
+            assert!(!said.contains("hidepid"), "{said}");
+            let peer = std::io::Error::from_raw_os_error(libc::EPERM).to_string();
+            assert!(said.contains(&peer), "the pid's EPERM is kept: {said}");
+        }
+        other => panic!("expected Several, got {other:?}"),
     }
 }
 
@@ -1476,15 +1475,17 @@ fn a_refused_cgroup_read_of_a_task_says_what_cosca_requires() {
     }
 }
 
-/// A `<pid>/cgroup` read that is no refusal stays the read's own error: `EIO`, `ENOENT` (a task
-/// that left), and `EPERM` while the checked directory still answers (`hidepid`).
+/// A `<pid>/cgroup` read that is no refusal is not one in the error: a task that is not there for us
+/// (`ENOENT`, a task that left; `EPERM` while the checked directory still answers, `hidepid`) is the
+/// read's own error, and any other failure (`EIO`) is the unreadable pid, with the errno below it.
 #[skuld::test]
-fn a_cgroup_read_of_a_task_that_is_no_refusal_is_the_reads_own_error() {
+fn a_cgroup_read_of_a_task_that_is_no_refusal_is_no_refusal_in_the_error() {
     let (leaf, _dir) = stand_in_subtree(None);
     for errno in [libc::EIO, libc::ENOENT, libc::EPERM] {
         let _failing = fault::hide_proc_as(errno);
         let err = leaf.holds(std::process::id(), None).expect_err("a failed read");
-        assert_eq!(err.raw_os_error(), Some(errno), "{err:?}");
+        assert_ne!(err.kind(), std::io::ErrorKind::Unsupported, "{errno}: {err:?}");
+        assert_eq!(crate::error::first_os_code(&err), Some(errno), "{err:?}");
         assert!(
             !crate::error::Report(&err).to_string().contains("requires"),
             "{errno}: {err}"

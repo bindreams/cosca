@@ -11,7 +11,7 @@ use rustix::fs::{fstat, fstatfs};
 use rustix::io::Errno;
 use rustix::process::{pidfd_open, test_kill_process, Pid, PidfdFlags};
 
-use super::proc_view::{ProcDir, ViewUnreadable};
+use super::proc_view::{ProcDir, ReadFailure, ViewUnreadable};
 
 /// `PIDFD_THREAD`: open a pidfd for a thread that is not a thread-group leader. rustix has no
 /// name for it.
@@ -34,8 +34,8 @@ pub(crate) trait Kernel: Sync {
     fn open_proc(&self) -> Result<ProcDir, ViewUnreadable>;
 
     /// The file at `path` under `dir`: `<pid>/stat`, `<pid>/cgroup`, `self/stat`, `self/status`
-    /// or `thread-self/fdinfo/<fd>`.
-    fn read(&self, dir: &ProcDir, path: &str) -> io::Result<Vec<u8>>;
+    /// or `thread-self/fdinfo/<fd>`. A failure says whether the `openat2` or `read(2)` failed.
+    fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure>;
 
     /// The numeric entries of `dir` (`ProcDir::pids`).
     fn pids(&self, dir: &ProcDir) -> io::Result<Vec<u32>>;
@@ -64,7 +64,7 @@ impl Kernel for HostKernel {
         ProcDir::open()
     }
 
-    fn read(&self, dir: &ProcDir, path: &str) -> io::Result<Vec<u8>> {
+    fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure> {
         dir.read(path)
     }
 

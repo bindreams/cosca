@@ -8,7 +8,7 @@ use crate::test_groups::{namespaces, Group};
 
 use super::{
     classify_ns_links, classify_status, collect_pids, parse_fdinfo_pid, pidfd_pid_in, proc_view_with, PidfdTarget,
-    ProcDir, ProcView, Verdict, ViewUnreadable, UNREADABLE_STATUS_REASON,
+    ProcDir, ProcView, ReadFailure, Verdict, ViewUnreadable, UNREADABLE_STATUS_REASON,
 };
 use crate::identity::{FakeKernel, HostKernel};
 
@@ -197,17 +197,20 @@ fn a_refused_read_that_establishes_the_view_is_a_refused_openat2() {
 fn the_proc_dir_reads_a_file_beneath_it() {
     let status = ProcDir::open()
         .expect("/proc opens")
-        .read_to_string("thread-self/status")
+        .read("thread-self/status")
         .expect("read");
+    let status = String::from_utf8(status).expect("UTF-8");
     assert!(status.contains("Name:"), "{status}");
 }
 
-/// A path that leaves the directory it is opened under is refused. Mutant: "plain `openat`
-/// without `RESOLVE_BENEATH`" — `..` reaches `/`.
+/// A path that leaves the directory it is opened under is refused, by the `openat2`. Mutant: "plain
+/// `openat` without `RESOLVE_BENEATH`" — `..` reaches `/`.
 #[skuld::test]
 fn the_proc_dir_refuses_a_path_that_climbs_out_of_it() {
     let dir = ProcDir::open().expect("/proc opens");
-    let err = dir.read("../etc/passwd").expect_err("must not leave /proc");
+    let Err(ReadFailure::Open(err)) = dir.read("../etc/passwd") else {
+        panic!("must not leave /proc");
+    };
     assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
 }
 
@@ -216,7 +219,9 @@ fn the_proc_dir_refuses_a_path_that_climbs_out_of_it() {
 #[skuld::test]
 fn the_proc_dir_refuses_an_absolute_path() {
     let dir = ProcDir::open().expect("/proc opens");
-    let err = dir.read("/etc/passwd").expect_err("must not leave /proc");
+    let Err(ReadFailure::Open(err)) = dir.read("/etc/passwd") else {
+        panic!("must not leave /proc");
+    };
     assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{err}");
 }
 
@@ -225,8 +230,21 @@ fn the_proc_dir_refuses_an_absolute_path() {
 #[skuld::test]
 fn the_proc_dir_refuses_a_magic_link() {
     let dir = ProcDir::open().expect("/proc opens");
-    let err = dir.read("self/exe").expect_err("a magic link must not be followed");
+    let Err(ReadFailure::Open(err)) = dir.read("self/exe") else {
+        panic!("a magic link must not be followed");
+    };
     assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+}
+
+/// A file that opens and then fails `read(2)` is a failure of the read, not of the `openat2`: a
+/// directory opens, and reading it is `EISDIR`. Mutant: "every failure is the `openat2`'s".
+#[skuld::test]
+fn the_proc_dir_says_a_failed_read_is_the_reads() {
+    let dir = ProcDir::open().expect("/proc opens");
+    let Err(ReadFailure::Read(err)) = dir.read("self/task") else {
+        panic!("a directory opens and cannot be read");
+    };
+    assert_eq!(err.raw_os_error(), Some(libc::EISDIR), "{err}");
 }
 
 // Namespace-link cross-check (no NSpid) =====

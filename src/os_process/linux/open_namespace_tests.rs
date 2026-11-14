@@ -13,7 +13,8 @@ use rustix::process::Pid;
 use super::open_tests::LiveNonLeaderTid;
 use crate::error::Error;
 use crate::identity::{
-    proc_view_with, FakeKernel, HostKernel, Kernel, ProcDir, ProcView, ViewUnreadable, UNREADABLE_STATUS_REASON,
+    proc_view_with, FakeKernel, HostKernel, Kernel, ProcDir, ProcView, ReadFailure, ViewUnreadable,
+    UNREADABLE_STATUS_REASON,
 };
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
@@ -195,7 +196,7 @@ impl Kernel for PauseKernel<'_> {
         self.inner.open_proc()
     }
 
-    fn read(&self, dir: &ProcDir, path: &str) -> io::Result<Vec<u8>> {
+    fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure> {
         if path == format!("{}/stat", self.pid) {
             let pause = self.pause.lock().expect("no panic holds the pause").take();
             if let Some(pause) = pause {
