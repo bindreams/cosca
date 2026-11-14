@@ -636,7 +636,11 @@ pub(super) fn word_front(
         }),
         LookOutcome::PlaceUnreadable(e) => left(unreadable(format!(
             "where it is cannot be read ({})",
-            crate::error::Report(&e)
+            // An I/O failure reads as the OS says it, as the subtree's does; a refusal, as its own words.
+            match &e {
+                Error::Io(io) => crate::error::Report(io).to_string(),
+                other => crate::error::Report(other).to_string(),
+            }
         )))
         .failing([std::sync::Arc::new(
             e.with_note(&format!("where {front} is cannot be read")),

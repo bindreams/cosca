@@ -314,7 +314,8 @@ fn a_task_the_walk_cannot_place_is_placed_through_proc() {
             std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
         }
         let err = holds_hidden(&leaf, HIGH + 1).expect_err("placed through the hidden /proc");
-        assert!(err.to_string().contains("maybe one under it"), "{stat:?} {sub}: {err}");
+        let said = crate::error::said(&err);
+        assert!(said.contains("maybe one under it"), "{stat:?} {sub}: {said}");
         // What `/proc` answered is the cause, with its code.
         assert_eq!(
             crate::error::first_os_code(&err),
@@ -1573,8 +1574,9 @@ fn proc_names_keeps_the_pids_eperm_beside_a_failed_recheck() {
 }
 
 /// `proc_names` over an unreadable cgroup says the pid and its file once, in the `Unreadable`'s words:
-/// no context of its own above them and no layer of a cosca `Error` between. Mutant: "the cause is
-/// wrapped in a context that names the pid again, or as an `Error::Io` layer".
+/// no context of its own above them and no second layer of a cosca `Error` (the one is `proc_names`'s
+/// own error). Mutant: "the cause is wrapped in a context that names the pid again, or as a second
+/// `Error::Io` layer".
 #[skuld::test]
 fn proc_names_says_an_unreadable_cgroup_once() {
     let pid = std::process::id();
@@ -1582,10 +1584,11 @@ fn proc_names_says_an_unreadable_cgroup_once() {
         .same_view()
         .on_read(&format!("{pid}/cgroup"), Err(libc::EIO));
     let err = proc_names(&kernel, "/leaf", pid, || None, false).expect_err("an unreadable cgroup");
+    assert!(matches!(err, crate::error::Error::Io(_)), "{err:?}");
     let eio = std::io::Error::from_raw_os_error(libc::EIO);
     assert_eq!(
         crate::error::said(&err),
-        format!("{pid}/cgroup could not be read: {eio}")
+        format!("an I/O operation failed: {pid}/cgroup could not be read: {eio}")
     );
 }
 
