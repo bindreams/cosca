@@ -1,6 +1,7 @@
 //! `members` against REAL namespace layouts, in re-exec'd children (see `test_child::namespaces`
 //! for the group's gating).
 
+use super::group_tests::failed;
 use super::members;
 use crate::identity::HostKernel;
 use crate::test_child::namespaces as ns;
@@ -29,7 +30,7 @@ fn fixture_group_inner() {
     if !ns::is_child_in_new_pid_ns() {
         return;
     }
-    let err = members(&HostKernel, 1).expect_err("an outer procfs must not be scanned");
+    let err = failed(members(&HostKernel, 1), "an outer procfs must not be scanned");
     assert!(err.to_string().contains("outer pid namespace"), "{err}");
 }
 
@@ -48,7 +49,10 @@ fn fixture_group_stat_overmount() {
     }
     let (mut child, pid, _scratch) = overmounted_member();
 
-    let err = members(&HostKernel, pid as i32).expect_err("a stat behind a mount must not be read or skipped");
+    let err = failed(
+        members(&HostKernel, pid as i32),
+        "a stat behind a mount must not be read or skipped",
+    );
     let text = crate::error::said(&err);
     assert!(text.contains("mount"), "{text}");
 

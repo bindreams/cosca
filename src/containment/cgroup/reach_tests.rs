@@ -672,15 +672,25 @@ fn a_refused_views_errors_carry_the_refusals_chain() {
     said_all(crate::error::said(&super::refusal(unreadable)));
 }
 
-/// A refused view stays a refusal wherever the view is read: a task's cgroup read is `Unsupported` and
-/// names the requirement, as its cgroup read's refusal is, and the probe's answer is the refusal itself.
-/// Mutant: "a refused view is only an unreadable one" (an `Other` error; a `View` string).
+/// Whether `err`, a refusal's `io::Error` (see `proc_names`), holds an [`Error::Unsupported`](crate::error::Error::Unsupported).
+/// The error's own kind says nothing of it.
+fn holds_unsupported(err: &std::io::Error) -> bool {
+    matches!(
+        err.get_ref()
+            .and_then(|inner| inner.downcast_ref::<crate::error::Error>()),
+        Some(crate::error::Error::Unsupported { .. })
+    )
+}
+
+/// A refused view stays a refusal wherever the view is read: a task's cgroup read is an
+/// `Error::Unsupported` and names the requirement, as its cgroup read's refusal is, and the probe's answer
+/// is the refusal itself. Mutant: "a refused view is only an unreadable one" (an `Other` error; a `View` string).
 #[skuld::test]
 fn a_refused_view_is_a_refusal_where_it_is_read() {
     let kernel = refused_view_kernel();
 
     let err = proc_names(&kernel, "/leaf", 7, || None, false).expect_err("a refused view reads no cgroup");
-    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{err:?}");
+    assert!(holds_unsupported(&err), "{err:?}");
     assert!(
         crate::error::said(&err).contains("cosca requires openat2"),
         "{}",
@@ -1597,8 +1607,8 @@ fn a_probe_whose_cgroup_read_fails_says_the_file_once() {
     assert!(said.contains("probing whether /proc shows"), "{said}");
 }
 
-/// A task's `<pid>/cgroup` read that is refused is an error that says what cosca requires, of kind
-/// `Unsupported`, with the refusing errno as its code, so the placement's callers carry it.
+/// A task's `<pid>/cgroup` read that is refused is an error that says what cosca requires, holding an
+/// `Error::Unsupported`, with the refusing errno as its code, so the placement's callers carry it.
 /// Mutant: "the read's error is returned as it is".
 #[skuld::test]
 fn a_refused_cgroup_read_of_a_task_says_what_cosca_requires() {
@@ -1606,7 +1616,7 @@ fn a_refused_cgroup_read_of_a_task_says_what_cosca_requires() {
     for errno in [libc::ENOSYS, libc::ENODEV] {
         let _refused = fault::hide_proc_as(errno);
         let err = leaf.holds(std::process::id(), None).expect_err("a refused read");
-        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{errno}: {err}");
+        assert!(holds_unsupported(&err), "{errno}: {err}");
         assert_eq!(crate::error::first_os_code(&err), Some(errno), "{err:?}");
         let said = crate::error::Report(&err).to_string();
         assert!(said.contains("requires openat2"), "{errno}: {said}");
@@ -1622,7 +1632,7 @@ fn a_cgroup_read_of_a_task_that_is_no_refusal_is_no_refusal_in_the_error() {
     for errno in [libc::EIO, libc::ENOENT, libc::EPERM] {
         let _failing = fault::hide_proc_as(errno);
         let err = leaf.holds(std::process::id(), None).expect_err("a failed read");
-        assert_ne!(err.kind(), std::io::ErrorKind::Unsupported, "{errno}: {err:?}");
+        assert!(!holds_unsupported(&err), "{errno}: {err:?}");
         assert_eq!(crate::error::first_os_code(&err), Some(errno), "{err:?}");
         assert!(
             !crate::error::Report(&err).to_string().contains("requires"),

@@ -166,12 +166,6 @@ impl Refusal {
             source: Some(Arc::new(self.cause())),
         }
     }
-
-    /// [`unsupported`](Self::unsupported) as an `io::Error` of kind `Unsupported`, for a caller whose
-    /// error type is `io::Error`: the refusing errno is still found down its source chain.
-    pub(crate) fn unsupported_io(&self, op: impl Into<String>) -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::Unsupported, self.unsupported(op))
-    }
 }
 
 /// `error`, what a [`Refusal`] ended the scan `caller` with, logged at `warn` and handed back. The

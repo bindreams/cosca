@@ -807,15 +807,19 @@ fn answer_of(state: group::GroupState, pgid: i32, signal: Signal) -> Result<(), 
         }
         // A listing that can never work here (no `openat2`) is the platform's `Unsupported`, as
         // from a wait or a spawn, not an unassessable group.
-        group::GroupState::Unlistable { source, .. } if source.kind() == io::ErrorKind::Unsupported => {
-            Err(Error::Unsupported {
-                op: format!("listing process group {pgid}"),
-                platform: std::env::consts::OS,
-                detail: "the group could not be listed".to_owned(),
-                source: Some(Error::io_cause(source)),
-            })
-        }
-        group::GroupState::Unlistable { detail, source } => Err(Error::Unassessable {
+        group::GroupState::Unlistable {
+            source: group::ListingFailure::Unsupported(source),
+            ..
+        } => Err(Error::Unsupported {
+            op: format!("listing process group {pgid}"),
+            platform: std::env::consts::OS,
+            detail: "the group could not be listed".to_owned(),
+            source: Some(Error::io_cause(source)),
+        }),
+        group::GroupState::Unlistable {
+            detail,
+            source: group::ListingFailure::Failed(source),
+        } => Err(Error::Unassessable {
             detail,
             source: Some(Error::io_cause(source)),
         }),

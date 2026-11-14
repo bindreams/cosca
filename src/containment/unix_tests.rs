@@ -623,3 +623,53 @@ fn a_group_with_only_unassessable_members_answers_unassessable_with_every_cause(
     let codes: Vec<_> = members_below(&answer).iter().map(|(_, code)| *code).collect();
     assert_eq!(codes, [Some(libc::EIO), Some(libc::EACCES)]);
 }
+
+/// A group whose listing is refused answers `Unsupported` naming the listing, as a wait or a spawn does.
+/// Mutant: "a refused listing is an unassessable group".
+#[skuld::test]
+fn a_group_whose_listing_is_refused_answers_unsupported() {
+    use super::group::{GroupState, ListingFailure};
+    use crate::error::Error;
+
+    let answer = super::answer_of(
+        GroupState::Unlistable {
+            detail: "process group 42 could not be listed".to_owned(),
+            source: ListingFailure::Unsupported(std::io::Error::from_raw_os_error(libc::EPERM)),
+        },
+        42,
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect_err("the group was not cleared");
+    let Error::Unsupported { op, .. } = &answer else {
+        panic!("{answer:?}");
+    };
+    assert_eq!(op, "listing process group 42");
+    assert_eq!(crate::error::first_os_code(&answer), Some(libc::EPERM));
+}
+
+/// A listing that failed is no refusal, whatever its error's kind: std maps `ENOSYS` to `Unsupported`,
+/// and a listing that answers `ENOSYS` of its own is an unassessable group. Mutant: "an `io::Error` of
+/// kind `Unsupported` is a refusal".
+#[skuld::test]
+fn a_group_whose_listing_failed_with_an_enosys_of_its_own_answers_unassessable() {
+    use super::group::{GroupState, ListingFailure};
+    use crate::error::Error;
+
+    let source = std::io::Error::from_raw_os_error(libc::ENOSYS);
+    assert_eq!(
+        source.kind(),
+        std::io::ErrorKind::Unsupported,
+        "std maps ENOSYS to Unsupported"
+    );
+    let answer = super::answer_of(
+        GroupState::Unlistable {
+            detail: "process group 42 could not be listed".to_owned(),
+            source: ListingFailure::Failed(source),
+        },
+        42,
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect_err("the group was not cleared");
+    assert!(matches!(answer, Error::Unassessable { .. }), "{answer:?}");
+    assert_eq!(crate::error::first_os_code(&answer), Some(libc::ENOSYS));
+}

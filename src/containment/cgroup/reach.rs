@@ -73,8 +73,8 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> 
 /// (see [`names_leaf`]): `other_id` says the task's pidfd gave a cgroup id other than the leaf's,
 /// and `recorded` answers for the leaf's own path with ` (deleted)` after it.
 ///
-/// Reads `pid`'s cgroup through `kernel`. A refusal is an `Unsupported` error, carried as the
-/// `io::Error` this returns; a pid that is not there for us fails with the read's own error; any
+/// Reads `pid`'s cgroup through `kernel`. A refusal is an [`Error::Unsupported`](crate::error::Error::Unsupported),
+/// the `io::Error` this returns holding it (the error's kind says nothing of it); a pid that is not there for us fails with the read's own error; any
 /// other failure is the [`Unreadable`](crate::identity::pid_file::Unreadable), which names the pid and
 /// its file (with the pid's `EPERM` beside a failed re-check).
 pub(crate) fn proc_names(
@@ -100,7 +100,7 @@ pub(crate) fn proc_names(
         Ok(ReadOutcome::Read(bytes)) => crate::identity::utf8(bytes)?,
         Ok(ReadOutcome::Exited(e) | ReadOutcome::Hidden(e)) => return Err(e),
         Ok(ReadOutcome::Refused(refusal)) => {
-            return Err(refusal.unsupported_io(format!("reading pid {pid}'s cgroup")));
+            return Err(refusal.unsupported(format!("reading pid {pid}'s cgroup")).into_io());
         }
         Err(unreadable) => return Err(unreadable.into_io()),
     };
@@ -125,11 +125,11 @@ fn read_cgroup(
 }
 
 /// The error of reading `pid`'s cgroup through a `/proc` view that could not be established, `why`:
-/// `Unsupported` naming the requirement when the view was refused, as a refused cgroup read is;
+/// an [`Error::Unsupported`](crate::error::Error::Unsupported) naming the requirement when the view was refused, as a refused cgroup read is;
 /// otherwise of the view's error's kind, with that error as its source.
 fn view_unreadable(pid: u32, why: crate::identity::ViewUnreadable) -> io::Error {
     if let Some(refusal) = why.refusal() {
-        return refusal.unsupported_io(format!("reading pid {pid}'s cgroup"));
+        return refusal.unsupported(format!("reading pid {pid}'s cgroup")).into_io();
     }
     let context = format!(
         "the /proc view could not be established, so pid {pid}'s cgroup cannot be read: {}",
