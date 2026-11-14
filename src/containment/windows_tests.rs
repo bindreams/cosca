@@ -862,6 +862,32 @@ fn wait_drained_raw_names_a_member_it_may_not_wait_on_while_the_job_lists_it() {
     );
 }
 
+/// A listed pid that nothing lets the caller open (a deleted member's pid, reused by a process whose
+/// DACL grants nothing: the fixture's empty DACL) is not shown to be a member, so the round lists again
+/// and the drain answers `AllMembersExited` once the listing is empty. The fixture is not in the job.
+///
+/// Mutant: a refused open of a listed pid is the drain's error whatever membership it could prove.
+#[skuld::test]
+fn wait_drained_raw_lists_again_when_every_listed_pid_is_refused_and_unproved() {
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(wait_drained_raw_lists_again_when_every_listed_pid_is_refused_and_unproved),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let refused = crate::identity::windows_fixture::spawn_unkillable(&done);
+    let job = super::JobHandle::create_empty_for_test();
+    let forced = super::fault::force_job_pid_lists([vec![refused.pid()], Vec::new()]);
+
+    let verdict = super::wait_drained_raw(&job, None);
+
+    drop(forced);
+    assert_eq!(
+        verdict.expect("a refused pid the job cannot be shown to hold is not a failed drain"),
+        crate::containment::TreeDrain::AllMembersExited
+    );
+}
+
 /// A kill's wait names a member it may not wait on once: the edge's confirmation of the empty listing
 /// does not report a member the wait for the members already did.
 ///

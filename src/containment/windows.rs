@@ -1073,7 +1073,9 @@ impl JobHandle {
     /// [`hard_kill`](JobHandle::hard_kill), so this also waits out a killed tree. A member
     /// the caller may open for membership but not wait on (an elevated one, under a caller that is not)
     /// is a member whose exit cannot be observed: the answer is `Unassessable` naming its pid, with the
-    /// OS error as the cause, never `AllMembersExited`.
+    /// OS error as the cause, never `AllMembersExited`. A listed pid the caller may not even open for
+    /// membership is not shown to be a member (the list can name a deleted member's pid, reused by a
+    /// process of another user, for one listing): the round lists again instead of failing.
     ///
     /// `deadline`: `None` is no deadline (see [`crate::wait::remaining`]). No interval is chosen
     /// anywhere in this path: every round blocks in one `WaitForMultipleObjects` call for exactly
@@ -1182,6 +1184,29 @@ fn member_to_watch(opened: windows::core::Result<HANDLE>, job: HANDLE) -> io::Re
         // between the enumeration and the open. Not a failure, and not a member either.
         Err(e) if e.code() == windows::Win32::Foundation::ERROR_INVALID_PARAMETER.to_hresult() => Ok(None),
         Err(e) => Err(win32_io_error(e)),
+    }
+}
+
+/// [`member_to_watch`] for the listed pid `pid`, opened for the round's any-wait ([`open_for_wait`]). A
+/// refused open leaves membership unknown, and a pid is a member only if shown to be: the job's list
+/// can still name a deleted member's pid for one listing, and the system may have reused it for a
+/// process the caller may not open. So a refused open is the member's refusal (`Err`) only if the
+/// query-only open ([`open_for_membership`]) proves the pid a member the caller may not wait on; if
+/// that is refused too, or `IsProcessInJob` fails on it, or the pid is not in the job, it is not a
+/// member (`None`), as the snapshot scan treats such a pid ([`unsignalled_members`]).
+fn member_to_watch_for_wait(pid: u32, job: HANDLE) -> io::Result<Option<HANDLE>> {
+    match open_for_wait(pid) {
+        Err(refused) if refused.code() != windows::Win32::Foundation::ERROR_INVALID_PARAMETER.to_hresult() => {
+            match member_to_watch(open_for_membership(pid), job) {
+                Ok(Some(proof)) => {
+                    // SAFETY: `member_to_watch` handed over the handle it opened; closed once, here.
+                    _ = unsafe { CloseHandle(proof) };
+                    Err(win32_io_error(refused))
+                }
+                Ok(None) | Err(_) => Ok(None),
+            }
+        }
+        opened => member_to_watch(opened, job),
     }
 }
 
@@ -1634,7 +1659,7 @@ fn drain_round(job: HANDLE, last_round: bool) -> Result<Round, crate::error::Err
         if handles.len() == budget {
             break;
         }
-        match member_to_watch(open_for_wait(*pid), job) {
+        match member_to_watch_for_wait(*pid, job) {
             // SAFETY: `member_to_watch` hands over the handle `OpenProcess` returned.
             Ok(Some(h)) => handles.push(unsafe { std::os::windows::io::FromRawHandle::from_raw_handle(h.0) }),
             Ok(None) => {}
