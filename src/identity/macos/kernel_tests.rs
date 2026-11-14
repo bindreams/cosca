@@ -134,12 +134,14 @@ fn kinfo_rows_answer_in_order_then_the_kernel_under_it() {
     let under = FakeKernel::new().on_kinfo(PID, Resolved::Found(kinfo_of(3)));
     let kernel = FakeKernel::over(&under)
         .on_kinfo(PID, Resolved::Gone)
-        .on_kinfo(PID, Resolved::Unknown);
+        .on_kinfo_refused(PID, libc::EPERM);
 
-    assert!(matches!(kernel.kinfo(PID), Resolved::Gone));
-    assert!(matches!(kernel.kinfo(PID), Resolved::Unknown));
+    assert!(matches!(kernel.kinfo(PID), (Resolved::Gone, None)));
+    let (read, failure) = kernel.kinfo(PID);
+    assert!(read.is_unknown());
+    assert_eq!(failure.expect("the refusal").raw_os_error(), Some(libc::EPERM));
     match kernel.kinfo(PID) {
-        Resolved::Found(info) => assert_eq!(info.kp_proc.p_pid, 3),
+        (Resolved::Found(info), None) => assert_eq!(info.kp_proc.p_pid, 3),
         _ => panic!("the kernel under it answers a record"),
     }
 }
@@ -154,10 +156,10 @@ fn subscribe_rows_answer_in_order_then_the_kernel_under_it() {
         signals: false,
         reap: false,
     };
-    let under = FakeKernel::new().on_subscribe_refused(PID, libc::EPERM);
+    let under = FakeKernel::new().on_subscribe_refused(exit, libc::EPERM);
     let kernel = FakeKernel::over(&under)
-        .on_subscribe_refused(PID, libc::ESRCH)
-        .on_subscribe_silent(PID);
+        .on_subscribe_refused(exit, libc::ESRCH)
+        .on_subscribe_silent(exit);
 
     assert_eq!(
         kernel.subscribe(&kq, exit).expect_err("the refusal").raw_os_error(),
@@ -171,6 +173,51 @@ fn subscribe_rows_answer_in_order_then_the_kernel_under_it() {
             .raw_os_error(),
         Some(libc::EPERM)
     );
+}
+
+/// Every kind of registration has rows, and a row answers only the registration it names.
+#[skuld::test]
+fn subscribe_rows_answer_every_kind_of_registration_by_what_it_names() {
+    let kq = Kqueue::new().expect("a kqueue");
+    let exit = Subscription::Process {
+        pid: PID,
+        signals: false,
+        reap: false,
+    };
+    let reaped = Subscription::Process {
+        pid: PID,
+        signals: true,
+        reap: true,
+    };
+    let readable = Subscription::Readable { fd: 9, low_water: 1 };
+    let sigchld = Subscription::Signal(libc::SIGCHLD);
+    let under = FakeKernel::new().on_subscribe_silent(exit);
+    let kernel = FakeKernel::over(&under)
+        .on_subscribe_refused(sigchld, libc::EINVAL)
+        .on_subscribe_silent(readable)
+        .on_subscribe_refused(reaped, libc::ESRCH);
+
+    assert_eq!(
+        kernel.subscribe(&kq, reaped).expect_err("reaped").raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    assert_eq!(
+        kernel.subscribe(&kq, sigchld).expect_err("sigchld").raw_os_error(),
+        Some(libc::EINVAL)
+    );
+    kernel.subscribe(&kq, readable).expect("readable");
+    // The plain exit has no row here: it goes to the kernel under, whose row answers.
+    kernel.subscribe(&kq, exit).expect("exit, from the kernel under it");
+}
+
+/// A call no row answers names what was asked.
+#[skuld::test]
+#[should_panic(expected = "Signal(")]
+fn a_registration_no_row_answers_is_named_in_the_panic() {
+    let kq = Kqueue::new().expect("a kqueue");
+    FakeKernel::new()
+        .subscribe(&kq, Subscription::Signal(libc::SIGCHLD))
+        .expect("no row answers, so the call panics before this");
 }
 
 /// A kernel handed over as a borrow, a `Box` or an `Arc` answers as the one it points to.

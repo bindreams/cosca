@@ -1,10 +1,11 @@
 //! macOS process-identity backend: `proc_pidinfo` (Apple's stable public libproc API) is
 //! the PRIMARY source; `sysctl(KERN_PROC_PID)` (the `kinfo` module) is the FALLBACK for
-//! what libproc cannot see — ZOMBIES and EPERM-hidden cross-user processes — keeping
-//! identity resolution zombie-inclusive like Linux procfs while the common live path stays
-//! on the stable ABI. Both sources report the process start time in µs (cross-source
+//! what libproc cannot see — EPERM-hidden cross-user processes — while the common live path
+//! stays on the stable ABI. libproc's `PROC_PIDTBSDINFO` is read with `arg = 1`, which sees a
+//! ZOMBIE as well, so identity resolution is zombie-inclusive like Linux procfs on either source.
+//! Both sources report the process start time in µs (cross-source
 //! equality pinned by the kinfo_tests oracle), so a layout drift in the undocumented
-//! kinfo_proc ABI degrades only zombie/cross-user resolution (a token mismatch — the
+//! kinfo_proc ABI degrades only cross-user resolution (a token mismatch — the
 //! pre-fix behavior), never live same-uid identity.
 //!
 //! [`ppid_of`] resolves a pid's parent the same primary/fallback way — `proc_pidinfo` first,
@@ -26,7 +27,8 @@ pub(crate) mod kernel;
 #[path = "macos/kinfo.rs"]
 pub(crate) mod kinfo;
 
-/// The shared contract-violation disposition for BOTH identity sources: trace FIRST (so
+/// The shared contract-violation disposition for BOTH identity sources, libproc ([`pidinfo`], and
+/// [`libproc_record`] for an errno it does not expect) and the sysctl (`kinfo`): trace FIRST (so
 /// the warn executes in every build mode), then the debug tripwire.
 pub(super) fn contract_violation(what: std::fmt::Arguments<'_>) {
     log::warn!("{what}");
@@ -143,7 +145,10 @@ fn pidinfo<T>(pid: RawPid, flavor: libc::c_int, buf: &mut T) -> Result<(), ReadE
             ReadErr::Refused(errno)
         });
     }
-    log::warn!("proc_pidinfo({pid}, {flavor}) wrote {n} bytes, expected {size}");
+    // 0 < n < size: a partial record, never trusted.
+    contract_violation(format_args!(
+        "proc_pidinfo({pid}, {flavor}) wrote {n} bytes, expected {size}"
+    ));
     Err(ReadErr::Refused(libc::EIO))
 }
 
@@ -521,12 +526,29 @@ impl Record {
     }
 }
 
+/// `pid`'s `proc_bsdinfo` through the kernel, when libproc has it. `None` sends the caller to the
+/// sysctl: `ESRCH` (gone) and `EPERM` (an unprivileged cross-user query) are the expected misses and
+/// pass quietly; any other errno breaks the libproc contract and is a [`contract_violation`] first.
+fn libproc_record(kernel: &dyn Kernel, pid: RawPid) -> Option<libc::proc_bsdinfo> {
+    match kernel.bsd_info(pid) {
+        Ok(info) => Some(info),
+        Err(ReadErr::Gone | ReadErr::Refused(libc::EPERM)) => None,
+        Err(ReadErr::Refused(errno)) => {
+            contract_violation(format_args!(
+                "proc_pidinfo({pid}) failed: {report}",
+                report = crate::error::Report(&std::io::Error::from_raw_os_error(errno))
+            ));
+            None
+        }
+    }
+}
+
 /// One read of `pid`'s record, the one read behind the by-pid start key and the parent pid:
 /// `proc_pidinfo` first (`arg = 1`, which reads a zombie too), and when it misses (gone, or
 /// EPERM-hidden) the sysctl, which alone resolves the latter and distinguishes an empty reply (gone)
 /// from a failure (unknown). The key and the parent pid are of the one record.
 fn read_record(kernel: &dyn Kernel, pid: RawPid) -> Resolved<Record> {
-    if let Ok(info) = kernel.bsd_info(pid) {
+    if let Some(info) = libproc_record(kernel, pid) {
         return Resolved::Found(Record {
             key: token_of_bsd(&info),
             raw_ppid: info.pbi_ppid,
@@ -695,7 +717,7 @@ pub(super) fn current_token() -> Resolved<Key> {
 }
 
 pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, start: Key) -> Liveness {
-    if let Ok(info) = kernel.bsd_info(pid) {
+    if let Some(info) = libproc_record(kernel, pid) {
         if token_of_bsd(&info) != start {
             return Liveness::Dead; // reused PID
         }
@@ -706,8 +728,9 @@ pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, start: Key) -> Livene
             Liveness::Alive
         };
     }
-    // libproc-invisible: gone, a ZOMBIE, or an EPERM-hidden LIVE process (an unprivileged
-    // cross-user query — pid 1 on darwin CI proved a miss is NOT always gone-or-zombie).
+    // libproc-invisible: gone, or an EPERM-hidden LIVE process (an unprivileged cross-user
+    // query — pid 1 on darwin CI proved a miss is NOT always gone). A zombie is not a miss: libproc
+    // reads it with `arg = 1`, and the check above answers `Dead` for it.
     // The fallback keeps the same shape — token-guarded, zombie-EXCLUSIVE via `p_stat` —
     // and a kinfo layout drift fails safe to the pre-fix answer (token mismatch => false).
     match kinfo::kinfo(kernel, pid) {
@@ -728,8 +751,8 @@ pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, start: Key) -> Livene
 /// [`ProcessId::exit_begun_with`](super::ProcessId::exit_begun_with): `P_WEXIT` in the process's
 /// `kinfo_proc` (a zombie included), token-guarded as [`is_running`] is. A pid that holds another
 /// process, or none, is `Gone`.
-pub(super) fn exit_begun(pid: RawPid, start: Key) -> (Resolved<bool>, super::UnknownCause) {
-    let (read, failure) = kinfo::kinfo_explained(pid);
+pub(super) fn exit_begun(kernel: &dyn Kernel, pid: RawPid, start: Key) -> (Resolved<bool>, super::UnknownCause) {
+    let (read, failure) = kinfo::kinfo_explained(kernel, pid);
     let begun = match read {
         Resolved::Found(info) if token_of_kinfo(&info) != start => Resolved::Gone,
         Resolved::Found(info) => Resolved::Found(kinfo::exit_begun(info.kp_proc.p_stat, info.kp_proc.p_flag)),

@@ -46,7 +46,7 @@ fn kernel_writes_exactly_our_kinfo_proc_size() {
 #[cfg_attr(debug_assertions, should_panic(expected = "sysctl(KERN_PROC"))]
 #[skuld::test]
 fn an_undiagnosable_sysctl_failure_trips_the_tripwire_and_reports_unknown() {
-    let r = super::read_record(std::process::id() as super::super::RawPid, -1);
+    let (r, _) = super::read_record_explained(std::process::id() as super::super::RawPid, -1);
     // `assert_eq!` is impossible here: `Resolved`-s derives are T-bounded and `kinfo_proc`
     // embeds a union, so it can never be `PartialEq`/`Debug`.
     assert!(r.is_unknown(), "a failed sysctl must never yield a record - or a Gone");
@@ -365,20 +365,20 @@ fn the_exit_read_of_an_identity_is_gone_for_another_token_and_unknown_when_refus
         .found()
         .expect("this process has an identity");
     assert_eq!(
-        super::super::exit_begun(me.pid(), me.key).0,
+        super::super::exit_begun(&HostKernel, me.pid(), me.key).0,
         crate::identity::Resolved::Found(false),
         "this process is running"
     );
 
     let other = crate::identity::Key::from_raw(me.key.raw() + 1);
     assert_eq!(
-        super::super::exit_begun(me.pid(), other).0,
+        super::super::exit_begun(&HostKernel, me.pid(), other).0,
         crate::identity::Resolved::Gone,
         "the pid holds another process than the token's"
     );
 
     fault::force_unreadable_once();
-    let (read, cause) = super::super::exit_begun(me.pid(), me.key);
+    let (read, cause) = super::super::exit_begun(&HostKernel, me.pid(), me.key);
     assert_eq!(read, crate::identity::Resolved::Unknown);
     let error = cause.into_error("pid 1").expect("the refusal is the cause");
     assert!(error.to_string().contains("kinfo_proc could not be read"), "{error}");

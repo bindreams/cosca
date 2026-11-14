@@ -32,8 +32,9 @@ pub(crate) trait Kernel: Sync {
     fn bsd_info(&self, pid: RawPid) -> Result<libc::proc_bsdinfo, ReadErr>;
 
     /// `sysctl(KERN_PROC_PID)`. `Unknown` folds `EPERM`/`EACCES`, `ENOMEM`/`EINVAL` and a wrong-sized
-    /// record: no caller tells them apart.
-    fn kinfo(&self, pid: RawPid) -> Resolved<kinfo_proc>;
+    /// record; the second element is the failure that left it so (the errno, or the size written), and
+    /// `None` for every other answer. Only [`exit_begun`](super::exit_begun) reads it.
+    fn kinfo(&self, pid: RawPid) -> (Resolved<kinfo_proc>, Option<io::Error>);
 
     /// The registration [`Kqueue::subscribe`] makes, through the kernel: every registration (exit
     /// watch, reap waiter, tracer arm) goes here.
@@ -77,7 +78,7 @@ impl Kernel for HostKernel {
         pidinfo(pid, libc::PROC_PIDTBSDINFO, &mut info).map(|()| info)
     }
 
-    fn kinfo(&self, pid: RawPid) -> Resolved<kinfo_proc> {
+    fn kinfo(&self, pid: RawPid) -> (Resolved<kinfo_proc>, Option<io::Error>) {
         kinfo::host_kinfo(pid)
     }
 
@@ -111,44 +112,15 @@ fn waitid_record(pid: u32, options: libc::c_int) -> io::Result<Option<Record>> {
     }))
 }
 
-/// Forwards every call through a pointer to a kernel, so a caller may hand a process a borrow, a
-/// `Box` or an `Arc` of one, as std's `Read` does for `&mut R` and `Box<R>`.
-macro_rules! forward_kernel {
-    ($([$pointer:ty: $($bound:tt)+])*) => {$(
-        impl<T: $($bound)+ + ?Sized> Kernel for $pointer {
-            fn peek(&self, pid: u32) -> io::Result<Option<Record>> {
-                (**self).peek(pid)
-            }
-
-            fn consume(&self, pid: u32) -> io::Result<Option<Record>> {
-                (**self).consume(pid)
-            }
-
-            fn unique_info(&self, pid: RawPid) -> UniqRead {
-                (**self).unique_info(pid)
-            }
-
-            fn short_bsd(&self, pid: RawPid) -> Result<libc::proc_bsdshortinfo, ReadErr> {
-                (**self).short_bsd(pid)
-            }
-
-            fn bsd_info(&self, pid: RawPid) -> Result<libc::proc_bsdinfo, ReadErr> {
-                (**self).bsd_info(pid)
-            }
-
-            fn kinfo(&self, pid: RawPid) -> Resolved<kinfo_proc> {
-                (**self).kinfo(pid)
-            }
-
-            fn subscribe(&self, kq: &Kqueue, what: Subscription) -> io::Result<()> {
-                (**self).subscribe(kq, what)
-            }
-        }
-    )*};
+forward_kernel! {
+    fn peek(&self, pid: u32) -> io::Result<Option<Record>>;
+    fn consume(&self, pid: u32) -> io::Result<Option<Record>>;
+    fn unique_info(&self, pid: RawPid) -> UniqRead;
+    fn short_bsd(&self, pid: RawPid) -> Result<libc::proc_bsdshortinfo, ReadErr>;
+    fn bsd_info(&self, pid: RawPid) -> Result<libc::proc_bsdinfo, ReadErr>;
+    fn kinfo(&self, pid: RawPid) -> (Resolved<kinfo_proc>, Option<io::Error>);
+    fn subscribe(&self, kq: &Kqueue, what: Subscription) -> io::Result<()>;
 }
-
-// An `Arc<T>` is `Sync` only for a `T` that is `Send` too.
-forward_kernel!([&T: Kernel] [Box<T>: Kernel] [std::sync::Arc<T>: Kernel + Send]);
 
 #[cfg(test)]
 #[path = "kernel/fake.rs"]

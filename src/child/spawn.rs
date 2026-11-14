@@ -762,7 +762,7 @@ fn spawn_reported(
     #[cfg(target_os = "linux")]
     let through = crate::wait::exit_only::Target::PidFd(owned.os_handle());
     #[cfg(target_os = "macos")]
-    let through = crate::wait::exit_only::Target::pid(pid, Some(unique));
+    let through = crate::wait::exit_only::Target::pid(&crate::identity::HostKernel, pid, Some(unique));
     #[cfg(windows)]
     let through = crate::wait::exit_only::Target::Handle(owned.os_handle());
     #[cfg(target_os = "linux")]
@@ -1216,11 +1216,8 @@ impl crate::containment::Root for LateTree {
         if matches!(self.sweep, Sweep::RootKilled { zombie: false }) {
             return crate::signal::RootState::Unpinned;
         }
-        let target = crate::wait::exit_only::Target::pid(self.pid, Some(self.unique));
-        crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(
-            &crate::identity::HostKernel,
-            &target,
-        ))
+        let target = crate::wait::exit_only::Target::pid(&crate::identity::HostKernel, self.pid, Some(self.unique));
+        crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target))
     }
 }
 
@@ -1272,7 +1269,7 @@ impl LateTree {
         let (resolved, _, mut why) = resolve_identity(
             &crate::identity::HostKernel,
             pid,
-            &crate::wait::exit_only::Target::pid(pid, Some(unique)),
+            &crate::wait::exit_only::Target::pid(&crate::identity::HostKernel, pid, Some(unique)),
         );
         let unshown = match resolved {
             Resolved::Found(id) => {
@@ -1458,7 +1455,7 @@ fn kill_and_reap_noting(
     use crate::signal::{via_audit_token, Sent, Sig};
     use crate::wait::macos::Waited;
 
-    let target = crate::wait::exit_only::Target::pid(pid, Some(unique));
+    let target = crate::wait::exit_only::Target::pid(&crate::identity::HostKernel, pid, Some(unique));
     match via_audit_token(&crate::identity::HostKernel, pid, Some(unique), Sig::Kill) {
         Ok(Sent::Delivered) => {
             // A fixture that only the kill would end is released here when no kill was sent.
@@ -1579,7 +1576,6 @@ fn reap_verified(
     killed: bool,
     found: &mut Findings,
 ) -> ChildFate {
-    use crate::identity::HostKernel;
     use crate::os_process::child::{ExitRecord, Foreign, PeekOutcome};
     use crate::wait::exit_only::{peek_verified, try_reap, Reap};
 
@@ -1590,7 +1586,7 @@ fn reap_verified(
         }
         why.fate(killed)
     };
-    match peek_verified(&HostKernel, target) {
+    match peek_verified(target) {
         Err(e) => {
             found.notes.push(unverifiable(&crate::error::Report(&e)));
             found.failures.push(Error::io_cause(crate::error::io_context(
@@ -1606,7 +1602,7 @@ fn reap_verified(
         }
         Ok(PeekOutcome::Exit(_)) => {}
     }
-    match try_reap(&HostKernel, target) {
+    match try_reap(target) {
         Ok(Reap::Reaped(ExitRecord::Status(_))) => ChildFate::Reaped,
         // The consuming `waitid` collected the zombie, whatever it reported.
         Ok(Reap::Reaped(ExitRecord::Unreadable { si_code })) => {
@@ -2428,7 +2424,7 @@ pub(crate) fn resolve_identity(
         #[cfg(target_os = "linux")]
         let peeked = crate::wait::exit_only::peek(through);
         #[cfg(target_os = "macos")]
-        let peeked = crate::wait::exit_only::peek_verified(kernel, through);
+        let peeked = crate::wait::exit_only::peek_verified(through);
         match peeked {
             Ok(PeekOutcome::Running | PeekOutcome::Exit(_)) => (read, cause, Diagnosis::default()),
             // Orphaned: `Gone`, warned.

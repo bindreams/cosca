@@ -10,9 +10,9 @@ use crate::identity::{held_by, uniq_info, Held, Kernel, ReadPurpose, UniqRead, L
 use super::{exit_record_of, is_exit_record, Reap, Target};
 use crate::os_process::child::{Foreign, PeekOutcome};
 
-fn pid_and_unique(target: &Target<'_>) -> (u32, Option<u64>) {
+fn parts<'a>(target: &Target<'a>) -> (&'a dyn Kernel, u32, Option<u64>) {
     match target {
-        Target::Pid { pid, unique, .. } => (*pid, *unique),
+        Target::Pid { pid, unique, kernel } => (*kernel, *pid, *unique),
     }
 }
 
@@ -52,23 +52,19 @@ fn check_unique(kernel: &dyn Kernel, pid: u32, unique: u64, purpose: ReadPurpose
     }
 }
 
-pub(super) fn peek(kernel: &dyn Kernel, target: &Target<'_>) -> io::Result<PeekOutcome> {
-    peek_with(kernel, target, false)
+pub(super) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
+    peek_with(target, false)
 }
 
 /// [`peek`]; with `verified`, a `Running` child whose id cannot be read is an error.
-pub(super) fn peek_with(kernel: &dyn Kernel, target: &Target<'_>, verified: bool) -> io::Result<PeekOutcome> {
-    peek_holder(kernel, target, verified).map(|(peeked, _)| peeked)
+pub(super) fn peek_with(target: &Target<'_>, verified: bool) -> io::Result<PeekOutcome> {
+    peek_holder(target, verified).map(|(peeked, _)| peeked)
 }
 
 /// [`peek_with`], and the tracer that holds the child when the verdict is `Running` because a
 /// process other than this one and launchd holds it.
-pub(super) fn peek_holder(
-    kernel: &dyn Kernel,
-    target: &Target<'_>,
-    verified: bool,
-) -> io::Result<(PeekOutcome, Option<u32>)> {
-    let (pid, unique) = pid_and_unique(target);
+pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(PeekOutcome, Option<u32>)> {
+    let (kernel, pid, unique) = parts(target);
     let peeked = peek_raw(kernel, pid)?;
     let Some(unique) = unique else {
         return Ok((peeked, None));
@@ -143,9 +139,9 @@ fn consume(kernel: &dyn Kernel, pid: u32) -> io::Result<Option<crate::identity::
     kernel.consume(pid).map(|r| r.map(super::consumed))
 }
 
-pub(super) fn try_reap(kernel: &dyn Kernel, target: &Target<'_>) -> io::Result<Reap> {
-    let (pid, unique) = pid_and_unique(target);
-    match peek(kernel, target)? {
+pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
+    let (kernel, pid, unique) = parts(target);
+    match peek(target)? {
         PeekOutcome::Exit(_) => {}
         PeekOutcome::Running => return Ok(Reap::Running),
         PeekOutcome::Foreign(f) => return Ok(Reap::Foreign(f)),

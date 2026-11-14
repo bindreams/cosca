@@ -72,7 +72,7 @@ pub(crate) enum Reap {
 }
 
 /// The handle that names the child.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(crate) enum Target<'a> {
     /// The child's pidfd: pinned, so a reused pid cannot be mistaken for it.
     #[cfg(target_os = "linux")]
@@ -83,28 +83,37 @@ pub(crate) enum Target<'a> {
         pid: u32,
         /// The child's unique id (`proc_pidinfo` flavor 17): never reused, so it names the child.
         unique: Option<u64>,
-        _lt: std::marker::PhantomData<&'a ()>,
+        /// What answers every read about the child: macOS has no handle that does.
+        kernel: &'a dyn Kernel,
     },
     /// A process handle: pinned.
     #[cfg(windows)]
     Handle(std::os::windows::io::BorrowedHandle<'a>),
 }
 
-#[cfg(target_os = "macos")]
-impl Target<'_> {
-    /// The child `pid`, checked against `unique` when there is one.
-    pub(crate) fn pid(pid: u32, unique: Option<u64>) -> Target<'static> {
-        Target::Pid {
-            pid,
-            unique,
-            _lt: std::marker::PhantomData,
+impl std::fmt::Debug for Target<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(target_os = "linux")]
+            Target::PidFd(fd) => f.debug_tuple("PidFd").field(fd).finish(),
+            #[cfg(target_os = "macos")]
+            Target::Pid { pid, unique, .. } => f.debug_struct("Pid").field("pid", pid).field("unique", unique).finish(),
+            #[cfg(windows)]
+            Target::Handle(handle) => f.debug_tuple("Handle").field(handle).finish(),
         }
     }
 }
 
+#[cfg(target_os = "macos")]
+impl<'a> Target<'a> {
+    /// The child `pid`, checked against `unique` when there is one, read through `kernel`.
+    pub(crate) fn pid(kernel: &'a dyn Kernel, pid: u32, unique: Option<u64>) -> Target<'a> {
+        Target::Pid { pid, unique, kernel }
+    }
+}
+
 /// Look at `target` without consuming anything. The handle `target` holds answers; macOS has no
-/// handle, so its `peek` asks a kernel.
-#[cfg(not(target_os = "macos"))]
+/// handle, so its target carries the kernel that does.
 pub(crate) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
     #[cfg(test)]
     if let Some(forced) = seams::take_forced_peek() {
@@ -113,49 +122,32 @@ pub(crate) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
     backend::peek(target)
 }
 
-/// [`peek`] through `kernel`.
-#[cfg(target_os = "macos")]
-pub(crate) fn peek(kernel: &dyn Kernel, target: &Target<'_>) -> io::Result<PeekOutcome> {
-    #[cfg(test)]
-    if let Some(forced) = seams::take_forced_peek() {
-        return forced;
-    }
-    backend::peek(kernel, target)
-}
-
 /// [`peek`] for a caller that treats `Running` as "this is our child". On macOS a running child
 /// whose unique id cannot be read (a MACF denial) is then an error, not `Running`: the id is all
 /// that tells it from a reuse of the pid. Other platforms use [`peek`].
 #[cfg(target_os = "macos")]
-pub(crate) fn peek_verified(kernel: &dyn Kernel, target: &Target<'_>) -> io::Result<PeekOutcome> {
+pub(crate) fn peek_verified(target: &Target<'_>) -> io::Result<PeekOutcome> {
     #[cfg(test)]
     if let Some(forced) = seams::take_forced_peek() {
         return forced;
     }
-    backend::peek_with(kernel, target, true)
+    backend::peek_with(target, true)
 }
 
 /// [`peek`], and the tracer that holds the child when the verdict is `Running` because a process
 /// other than this one and launchd holds it (`waitid` answered `ECHILD`). **macOS only.**
 #[cfg(target_os = "macos")]
-pub(crate) fn peek_traced(kernel: &dyn Kernel, target: &Target<'_>) -> io::Result<(PeekOutcome, Option<u32>)> {
+pub(crate) fn peek_traced(target: &Target<'_>) -> io::Result<(PeekOutcome, Option<u32>)> {
     #[cfg(test)]
     if let Some(forced) = seams::take_forced_peek() {
         return forced.map(|peeked| (peeked, None));
     }
-    backend::peek_holder(kernel, target, false)
+    backend::peek_holder(target, false)
 }
 
 /// [`peek`], then consume `target`'s exit record if it has one.
-#[cfg(not(target_os = "macos"))]
 pub(crate) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     backend::try_reap(target)
-}
-
-/// [`peek`] then consume `target`'s exit record if it has one, through `kernel`.
-#[cfg(target_os = "macos")]
-pub(crate) fn try_reap(kernel: &dyn Kernel, target: &Target<'_>) -> io::Result<Reap> {
-    backend::try_reap(kernel, target)
 }
 
 // The wait status of an `si_code` record =====

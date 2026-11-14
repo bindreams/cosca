@@ -32,6 +32,11 @@ pub use persist::{Platform, ProcessIdRecord, TokenKind, RECORD_VERSION};
 mod tree;
 pub use tree::Recursive;
 
+// Before `backend`: its `Kernel` impls use the macro.
+#[macro_use]
+#[path = "identity/forward_kernel.rs"]
+mod forward_kernel;
+
 #[cfg_attr(windows, path = "identity/windows.rs")]
 #[cfg_attr(target_os = "linux", path = "identity/linux.rs")]
 #[cfg_attr(target_os = "macos", path = "identity/macos.rs")]
@@ -662,8 +667,7 @@ impl ProcessId {
     /// before the process is a zombie.
     #[cfg(all(unix, not(target_os = "linux")))]
     pub(crate) fn exit_begun_with(&self, kernel: &dyn Kernel) -> (Resolved<bool>, UnknownCause) {
-        let _ = kernel;
-        backend::exit_begun(self.pid, self.key)
+        backend::exit_begun(kernel, self.pid, self.key)
     }
 
     /// `exit_begun_with` on Linux (see the doc there, written for the platforms that have it), reading
@@ -754,15 +758,7 @@ mod no_reads {
 
     impl Kernel for HostKernel {}
 
-    /// A borrow, a `Box` or an `Arc` of a kernel is one, as on the platforms whose kernels have methods.
-    macro_rules! forward_kernel {
-        ($([$pointer:ty: $($bound:tt)+])*) => {$(
-            impl<T: $($bound)+ + ?Sized> Kernel for $pointer {}
-        )*};
-    }
-
-    // An `Arc<T>` is `Sync` only for a `T` that is `Send` too.
-    forward_kernel!([&T: Kernel] [Box<T>: Kernel] [std::sync::Arc<T>: Kernel + Send]);
+    forward_kernel!();
 }
 
 #[cfg(all(target_os = "linux", test))]

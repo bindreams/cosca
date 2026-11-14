@@ -160,8 +160,8 @@ impl OpenFailure {
 /// through `kernel`, and on macOS the process it returns owns the same `kernel`, so every later read
 /// of it asks that one. The kernel is as long-lived as the process: a borrow (what the walks pass,
 /// of one kernel they open every member from) gives a process that lives inside the walk. Linux
-/// and Windows consult the kernel for the open alone, as only Linux's
-/// [`Kernel`](crate::identity::Kernel) has methods there yet.
+/// consults the kernel for the open alone, and Windows drops it unread: its
+/// [`Kernel`](crate::identity::Kernel) has no methods yet.
 pub(crate) fn open_with<'k, K: crate::identity::Kernel + Send + 'k>(
     kernel: K,
     id: ProcessId,

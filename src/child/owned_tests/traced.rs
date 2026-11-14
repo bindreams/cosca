@@ -27,11 +27,8 @@ fn a_child_held_by_a_tracer_is_running_until_the_hand_back(#[fixture(tracer_grou
     let mut helper = tracer::start(Mode::Auto).attach(&mut tracee);
     assert_eq!(helper.recv(), Report::Attached);
 
-    let target = Target::pid(pid, Some(unique));
-    assert_eq!(
-        exit_only::try_reap(&HostKernel, &target).expect("try_reap"),
-        Reap::Running
-    );
+    let target = Target::pid(&HostKernel, pid, Some(unique));
+    assert_eq!(exit_only::try_reap(&target).expect("try_reap"), Reap::Running);
     // An expired deadline: one look, no blocking.
     let held = await_reapable(&HostKernel, pid, Some(unique), Some(Instant::now())).expect("wait");
     assert_eq!(held, Waited::DeadlinePassed);

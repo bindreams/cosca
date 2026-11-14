@@ -640,7 +640,7 @@ pub(crate) fn refuse_the_kill() -> uniq_fault::Forced {
 /// foreign reap, so `debug`, and nothing taken. The child is left running.
 ///
 /// Mutants: the teardown kills with `child.kill()`; the reap is `child.try_wait()`; the target
-/// carries no id (`Target::pid(pid, None)`), so the peek answers `Running` and warns.
+/// carries no id (`Target::pid(kernel, pid, None)`), so the peek answers `Running` and warns.
 #[skuld::test]
 fn macos_attach_failure_teardown_with_a_refused_kill_leaves_the_child_and_reaps_by_id() {
     crate::log_capture::install();

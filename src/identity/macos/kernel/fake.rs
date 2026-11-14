@@ -1,10 +1,11 @@
 //! A stated-facts [`Kernel`]: the answers its tables hold, and nothing the kernel would do. A call
 //! with no row left panics, except under [`FakeKernel::over`], which passes it to the real kernel.
 //!
-//! A row answers one call for one pid. The rows of a call kind are taken in the order they were
-//! stated, the first one for the pid asked about, and each answers once. A peek row never answers a
-//! consume.
+//! A row answers one call for one pid, or for one [`Subscription`]. The rows of a call kind are
+//! taken in the order they were stated, the first one for what is asked about, and each answers
+//! once. A peek row never answers a consume.
 
+use std::fmt::Arguments;
 use std::io;
 use std::sync::Mutex;
 
@@ -13,37 +14,43 @@ use crate::identity::kinfo::kinfo_proc;
 use crate::identity::{RawPid, ReadErr, Record, Resolved, UniqRead};
 use crate::os_process::macos::kqueue::{Kqueue, Subscription};
 
-/// The rows of one call kind: the pid each answers for, and the answer.
-struct Rows<T>(Mutex<Vec<(u32, T)>>);
+/// The rows of one call kind: what each answers for, and the answer.
+struct Rows<A, T>(Mutex<Vec<(A, T)>>);
 
-impl<T> Rows<T> {
+impl<A: PartialEq, T> Rows<A, T> {
     fn new() -> Self {
         Rows(Mutex::new(Vec::new()))
     }
 
-    fn push(&mut self, pid: u32, answer: T) {
-        self.0.get_mut().expect("no thread holds the rows").push((pid, answer));
+    fn push(&mut self, asked: A, answer: T) {
+        self.0
+            .get_mut()
+            .expect("no thread holds the rows")
+            .push((asked, answer));
     }
 
-    /// The first row for `pid`, which it removes.
-    fn take(&self, pid: u32) -> Option<T> {
+    /// The first row for `asked`, which it removes.
+    fn take(&self, asked: &A) -> Option<T> {
         let mut rows = self.0.lock().expect("no thread panics holding the rows");
-        let at = rows.iter().position(|(row, _)| *row == pid)?;
+        let at = rows.iter().position(|(row, _)| row == asked)?;
         Some(rows.remove(at).1)
     }
 }
 
+/// What `sysctl(KERN_PROC_PID)` answers: the read, and the failure that left it `Unknown`.
+type KinfoAnswer = (Resolved<kinfo_proc>, Option<io::Error>);
+
 pub(crate) struct FakeKernel<'a> {
     /// What answers a call the rows have nothing for. `None`: such a call panics.
     real: Option<&'a dyn Kernel>,
-    peeks: Rows<io::Result<Option<Record>>>,
-    consumes: Rows<io::Result<Option<Record>>>,
-    unique_infos: Rows<UniqRead>,
-    short_bsds: Rows<Result<libc::proc_bsdshortinfo, ReadErr>>,
-    bsd_infos: Rows<Result<libc::proc_bsdinfo, ReadErr>>,
-    kinfos: Rows<Resolved<kinfo_proc>>,
+    peeks: Rows<u32, io::Result<Option<Record>>>,
+    consumes: Rows<u32, io::Result<Option<Record>>>,
+    unique_infos: Rows<RawPid, UniqRead>,
+    short_bsds: Rows<RawPid, Result<libc::proc_bsdshortinfo, ReadErr>>,
+    bsd_infos: Rows<RawPid, Result<libc::proc_bsdinfo, ReadErr>>,
+    kinfos: Rows<RawPid, KinfoAnswer>,
     /// `Err`: the registration is refused with this errno. `Ok`: it is made and never fires.
-    subscribes: Rows<Result<(), i32>>,
+    subscribes: Rows<Subscription, Result<(), i32>>,
 }
 
 impl<'a> FakeKernel<'a> {
@@ -99,76 +106,85 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
-    /// The next `kinfo_proc` read of `pid` without a row before it answers `answer`.
+    /// The next `kinfo_proc` read of `pid` without a row before it answers `answer`, with no failure.
     pub(crate) fn on_kinfo(mut self, pid: RawPid, answer: Resolved<kinfo_proc>) -> Self {
-        self.kinfos.push(pid, answer);
+        self.kinfos.push(pid, (answer, None));
         self
     }
 
-    /// The next registration for process `pid` without a row before it is refused with `errno`, as
-    /// `ESRCH` refuses one past `P_REF_DEAD`.
-    pub(crate) fn on_subscribe_refused(mut self, pid: u32, errno: i32) -> Self {
-        self.subscribes.push(pid, Err(errno));
+    /// The next `kinfo_proc` read of `pid` without a row before it is `Unknown`, refused with
+    /// `errno`, as a sandbox refuses the `sysctl` with `EPERM`.
+    pub(crate) fn on_kinfo_refused(mut self, pid: RawPid, errno: i32) -> Self {
+        self.kinfos
+            .push(pid, (Resolved::Unknown, Some(io::Error::from_raw_os_error(errno))));
         self
     }
 
-    /// The next registration for process `pid` without a row before it is accepted and never
-    /// fires: nothing is registered on the queue.
-    pub(crate) fn on_subscribe_silent(mut self, pid: u32) -> Self {
-        self.subscribes.push(pid, Ok(()));
+    /// The next registration of `what` without a row before it is refused with `errno`, as `ESRCH`
+    /// refuses a process one past `P_REF_DEAD`.
+    pub(crate) fn on_subscribe_refused(mut self, what: Subscription, errno: i32) -> Self {
+        self.subscribes.push(what, Err(errno));
         self
     }
 
-    /// The kernel that answers a call no row answers.
-    fn real(&self, call: &str, pid: u32) -> &'a dyn Kernel {
+    /// The next registration of `what` without a row before it is accepted and never fires: nothing
+    /// is registered on the queue.
+    pub(crate) fn on_subscribe_silent(mut self, what: Subscription) -> Self {
+        self.subscribes.push(what, Ok(()));
+        self
+    }
+
+    /// The kernel that answers a call no row answers; `asked` says what the call was.
+    fn real(&self, asked: Arguments<'_>) -> &'a dyn Kernel {
         self.real
-            .unwrap_or_else(|| panic!("the fake kernel has no row left for {call} of pid {pid}"))
+            .unwrap_or_else(|| panic!("the fake kernel has no row left for {asked}"))
     }
 }
 
 impl Kernel for FakeKernel<'_> {
     fn peek(&self, pid: u32) -> io::Result<Option<Record>> {
-        self.peeks.take(pid).unwrap_or_else(|| self.real("peek", pid).peek(pid))
+        self.peeks
+            .take(&pid)
+            .unwrap_or_else(|| self.real(format_args!("a peek of pid {pid}")).peek(pid))
     }
 
     fn consume(&self, pid: u32) -> io::Result<Option<Record>> {
         self.consumes
-            .take(pid)
-            .unwrap_or_else(|| self.real("consume", pid).consume(pid))
+            .take(&pid)
+            .unwrap_or_else(|| self.real(format_args!("a consume of pid {pid}")).consume(pid))
     }
 
     fn unique_info(&self, pid: RawPid) -> UniqRead {
-        self.unique_infos
-            .take(pid)
-            .unwrap_or_else(|| self.real("unique_info", pid).unique_info(pid))
+        self.unique_infos.take(&pid).unwrap_or_else(|| {
+            self.real(format_args!("a unique-id read of pid {pid}"))
+                .unique_info(pid)
+        })
     }
 
     fn short_bsd(&self, pid: RawPid) -> Result<libc::proc_bsdshortinfo, ReadErr> {
-        self.short_bsds
-            .take(pid)
-            .unwrap_or_else(|| self.real("short_bsd", pid).short_bsd(pid))
+        self.short_bsds.take(&pid).unwrap_or_else(|| {
+            self.real(format_args!("a short BSD-info read of pid {pid}"))
+                .short_bsd(pid)
+        })
     }
 
     fn bsd_info(&self, pid: RawPid) -> Result<libc::proc_bsdinfo, ReadErr> {
         self.bsd_infos
-            .take(pid)
-            .unwrap_or_else(|| self.real("bsd_info", pid).bsd_info(pid))
+            .take(&pid)
+            .unwrap_or_else(|| self.real(format_args!("a BSD-info read of pid {pid}")).bsd_info(pid))
     }
 
-    fn kinfo(&self, pid: RawPid) -> Resolved<kinfo_proc> {
+    fn kinfo(&self, pid: RawPid) -> KinfoAnswer {
         self.kinfos
-            .take(pid)
-            .unwrap_or_else(|| self.real("kinfo", pid).kinfo(pid))
+            .take(&pid)
+            .unwrap_or_else(|| self.real(format_args!("a kinfo_proc read of pid {pid}")).kinfo(pid))
     }
 
     fn subscribe(&self, kq: &Kqueue, what: Subscription) -> io::Result<()> {
-        let Subscription::Process { pid, .. } = what else {
-            return self.real("subscribe", 0).subscribe(kq, what);
-        };
-        match self.subscribes.take(pid) {
+        match self.subscribes.take(&what) {
             Some(Ok(())) => Ok(()),
             Some(Err(errno)) => Err(io::Error::from_raw_os_error(errno)),
-            None => self.real("subscribe", pid).subscribe(kq, what),
+            None => self.real(format_args!("the registration {what:?}")).subscribe(kq, what),
         }
     }
 }

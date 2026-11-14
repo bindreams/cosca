@@ -96,7 +96,7 @@ fn register(kernel: &dyn Kernel, kq: &Kqueue, pid: u32) -> io::Result<bool> {
 /// One non-consuming look, by number and checked against `unique` when there is one, and the tracer
 /// that holds a running child, if one does.
 fn peek(kernel: &dyn Kernel, pid: u32, unique: Option<u64>) -> io::Result<(PeekOutcome, Option<u32>)> {
-    exit_only::peek_traced(kernel, &Target::pid(pid, unique))
+    exit_only::peek_traced(&Target::pid(kernel, pid, unique))
 }
 
 /// The peek's verdict as a wait verdict, or `None` when the child is still running.

@@ -69,8 +69,8 @@ impl<K: Kernel + Send> MacosChild<K> {
         })
     }
 
-    fn target(&self) -> Target<'static> {
-        Target::pid(self.pid, Some(self.unique))
+    fn target(&self) -> Target<'_> {
+        Target::pid(&self.kernel, self.pid, Some(self.unique))
     }
 
     /// The tracer watch, for the one `try_reap` caller. A second concurrent caller breaks the
@@ -214,7 +214,7 @@ impl<K: Kernel + Send> OsChild for MacosChild<K> {
     /// `waitid(WNOWAIT)` by pid, checked against the unique id; a running child whose id cannot be
     /// read is an error. Touches no kqueue.
     fn peek(&self) -> Result<PeekOutcome, Error> {
-        exit_only::peek_verified(&self.kernel, &self.target()).map_err(Error::Io)
+        exit_only::peek_verified(&self.target()).map_err(Error::Io)
     }
 
     /// In this order: drain the reap kqueue (a `NOTE_REAP` is a foreign reap), peek, then consume the
@@ -227,9 +227,9 @@ impl<K: Kernel + Send> OsChild for MacosChild<K> {
             return Ok(TryReapOutcome::Foreign(Foreign::Gone));
         }
         let target = self.target();
-        let (peeked, holder) = exit_only::peek_traced(&self.kernel, &target).map_err(Error::Io)?;
+        let (peeked, holder) = exit_only::peek_traced(&target).map_err(Error::Io)?;
         match peeked {
-            PeekOutcome::Exit(_) => Ok(match exit_only::try_reap(&self.kernel, &target).map_err(Error::Io)? {
+            PeekOutcome::Exit(_) => Ok(match exit_only::try_reap(&target).map_err(Error::Io)? {
                 Reap::Reaped(record) => TryReapOutcome::Reaped(record),
                 Reap::Foreign(foreign) => TryReapOutcome::Foreign(foreign),
                 // The record went between the two looks: a tracer took it, so look again.

@@ -405,7 +405,7 @@ fn check(pid: u32) -> io::Result<Check> {
     use crate::identity::{origin, HostKernel, Origin, LAUNCHD};
     use crate::os_process::child::PeekOutcome;
     use crate::wait::exit_only::{peek, Target};
-    Ok(match peek(&HostKernel, &Target::pid(pid, None))? {
+    Ok(match peek(&Target::pid(&HostKernel, pid, None))? {
         PeekOutcome::Running => Check::Running,
         PeekOutcome::Exit(_) => Check::Gone,
         PeekOutcome::Foreign(_) => match origin(&HostKernel, pid) {
