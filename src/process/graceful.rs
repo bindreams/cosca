@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use super::Process;
+use crate::containment::dispatch::Keeping;
 use crate::containment::mechanism::Mechanism;
 use crate::containment::treewalk::{Terminated, WalkToken, Walker};
 use crate::containment::Tree;
@@ -138,7 +139,8 @@ impl Process {
         // No handle backstop: the root is left as any member is, and the error holds every member.
         let answer = match call {
             Some(Settling { tree, walk }) => {
-                let settled = tree.settle_for_kill_tree(outcome.in_call(walk.as_ref()), landed);
+                // A foreign handle has no retry of its own to keep anything for.
+                let settled = tree.settle_for_kill_tree(outcome.in_call(walk.as_ref()), landed, Keeping::Nothing);
                 wait.reaching(settled.killed_again);
                 settled.answer
             }
@@ -237,10 +239,12 @@ impl Process {
     /// As for a `Child` on a `TreeWalk` tree ([`Child::graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree)): the members the call's
     /// own `SIGTERM` walk found are killed by identity if the root exits within the grace, and the call
     /// is `Ok` when every one is gone. A root that had exited before the call is
-    /// [`Error::Unassessable`]. The members the call's own `SIGTERM` walk found are killed by identity
-    /// on every sweep, walked or not: when the sweep's walk cannot be made (the process table cannot
-    /// be read), they are killed and waited for, the root's reparented ones included, and the call is
-    /// the walk's error. The root is not killed, and a retry walks from it.
+    /// [`Error::Unassessable`]. A foreign handle keeps nothing for a retry: the members the call's own
+    /// `SIGTERM` walk found are killed by identity on every sweep, walked or not. When the sweep's walk
+    /// cannot be made (the process table cannot be read), they are killed and waited for, the root's
+    /// reparented ones included, and the call is the walk's error. Children one of them forked after
+    /// that walk are not seen (the limit of [`kill_tree`](Process::kill_tree)). The root is not
+    /// killed, and a retry walks from it.
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
         let settling = self.begin_graceful()?;
         #[cfg(test)]

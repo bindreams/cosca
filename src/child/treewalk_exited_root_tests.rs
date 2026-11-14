@@ -245,6 +245,66 @@ fn kill_tree_after_a_separate_terminate_tree_kills_the_held_members_and_is_unass
     child.wait().expect("reap the root");
 }
 
+/// A `kill_tree` whose walk was not made over a root its handle sees running keeps the members the tree
+/// holds, and the retry's walk from that root reaches what an interior member forked since: the held
+/// subshell is not killed in the first call, so the leaf below it is still under the root when the
+/// retry walks, and ends with it. The first call is the sweep's own settlement, which the tree's
+/// settlement answers as `Child::kill_tree`'s unwalked arm does over a running root: no real walk can
+/// be made to fail.
+///
+/// Mutant: the held subshell is killed in the first call, so its leaf is reparented out of the retry's
+/// walk and survives it.
+#[skuld::test]
+fn a_retry_after_an_unwalked_kill_tree_over_a_running_root_reaches_what_a_held_member_forked() {
+    use crate::containment::dispatch::{Keeping, TreeKillOutcome};
+    use crate::containment::treewalk::Listing;
+    let (child, stdin, survivors) = survivor_tree();
+    let root = child.id().expect("the root's identity");
+    let [subshell] = root.children(Recursive::No).expect("the root's child")[..] else {
+        panic!("the root has one child, the subshell");
+    };
+    let leaf = *survivors.iter().find(|member| **member != subshell).expect("the leaf");
+    child.tree.hold_walked(
+        Listing {
+            members: vec![subshell],
+            complete: true,
+        },
+        None,
+    );
+    let unwalked = Error::Unassessable {
+        detail: "the process table could not be read".into(),
+        source: None,
+    };
+
+    let settled = child.tree.settle_for_kill_tree(
+        TreeKillOutcome::Unwalked(unwalked),
+        false,
+        Keeping::ForWalkFromRunningRoot,
+    );
+
+    assert!(
+        matches!(settled.answer, Err(Error::Unassessable { .. })),
+        "{:?}",
+        settled.answer
+    );
+    assert_eq!(settled.killed_again, [], "the held subshell is kept for the retry");
+    assert_eq!(subshell.is_alive(), Liveness::Alive, "the held subshell runs on");
+
+    child
+        .kill_tree()
+        .expect("the walk from the running root reaches the whole tree");
+
+    for member in [subshell, leaf] {
+        assert_eq!(
+            member.is_alive(),
+            Liveness::Dead,
+            "{member:?} is under the root, and killed"
+        );
+    }
+    drop(stdin);
+    child.wait().expect("reap the root");
+}
+
 /// The drop of such a child warns once, as for any tree it cannot vouch for.
 ///
 /// Mutant: a held member that is gone excuses the drop.

@@ -215,6 +215,7 @@ fn a_kill_that_left_several_members_warns_of_none_of_them_by_itself() {
                 resolved: Vec::new(),
             })),
             false,
+            super::Keeping::Nothing,
         )
         .answer
         .expect_err("members were left");
@@ -1435,12 +1436,14 @@ fn a_child_kill_tree_over_an_unwalked_walk_settles_the_held_member_and_leaves_th
     use crate::error::Error;
     use crate::os_process::fake::Answer;
     use crate::test_child::over_fake::{child_with, live_member, root_looking};
+    // What the sweep waits for: nothing over a running root (the members are kept for a walk from it),
+    // the held member over an exited one (no walk reaches it).
     let looks = [
-        ("running", Answer::Running),
+        ("running", Answer::Running, false),
         #[cfg(not(target_os = "macos"))]
-        ("exited", Answer::Exited),
+        ("exited", Answer::Exited, true),
     ];
-    for (root_looks, looks) in looks {
+    for (root_looks, looks, killed_in_call) in looks {
         let (member, stdin, id) = live_member();
         let (fake, _) = FakeContains::new(Containment::TreeWalk, false);
         let root = root_looking([looks; 4]);
@@ -1461,7 +1464,12 @@ fn a_child_kill_tree_over_an_unwalked_walk_settles_the_held_member_and_leaves_th
             "{:?}",
             failure.error
         );
-        assert_eq!(swept.wait.members_for_test(), [id], "the held member is waited for");
+        let waited_for: &[crate::identity::ProcessId] = if killed_in_call { &[id] } else { &[] };
+        assert_eq!(
+            swept.wait.members_for_test(),
+            waited_for,
+            "a root that looks {root_looks}: the held member is killed in the call only when no walk can reach it"
+        );
         assert!(
             root.signal_calls().is_empty(),
             "a root that looks {root_looks} is not killed"
@@ -1594,16 +1602,15 @@ fn members_a_cooperative_walk_reached_are_killed_by_identity_when_the_root_is_go
     crate::test_child::assert_killed("the held member", blocker.wait().expect("reap the member"));
 }
 
-/// A settlement of a walk that could not be made kills the held members, a `SIGTERM` walk's and a
-/// refused kill's, by identity, and answers the walk's own `Unassessable`, for every caller: a drop's
-/// settlement and a `kill_tree` call's. The root's exit reparented the members, so no retry's walk
-/// reaches them.
+/// A settlement of a walk that could not be made, with nothing kept for a walk from a running root,
+/// kills the held members, a `SIGTERM` walk's and a refused kill's, by identity, and answers the walk's
+/// own `Unassessable`, for a drop's settlement and a `kill_tree` call's alike.
 ///
 /// Mutants: an unmade walk leaves held members running (`Termed` or `Resolved`); it answers none of
 /// the walk's error.
 #[skuld::test]
 fn a_settlement_of_a_walk_not_made_kills_the_held_members() {
-    use super::{TreeKillOutcome, TreeKilled, Unkilled};
+    use super::{Keeping, TreeKillOutcome, TreeKilled, Unkilled};
     use crate::error::Error;
     for by_kill_tree in [false, true] {
         let (termed, termed_stdin) = crate::test_child::held_uncontained_blocker(false);
@@ -1628,7 +1635,7 @@ fn a_settlement_of_a_walk_not_made_kills_the_held_members() {
         assert_eq!(standing(&killed), held);
 
         let (error, killed_again) = if by_kill_tree {
-            let settled = killed.settle_for_kill_tree(Some(&walker()), unwalked(), false);
+            let settled = killed.settle_for_kill_tree(Some(&walker()), unwalked(), false, Keeping::Nothing);
             (settled.answer.expect_err("a walk not made"), settled.killed_again)
         } else {
             let settled = killed.settle(Some(&walker()), unwalked(), false);

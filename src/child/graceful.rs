@@ -288,9 +288,11 @@ impl Child {
     /// call sends nothing and answers as `kill_tree` does. A root that outlives the grace is walked
     /// and killed as usual, and the members reparented meanwhile are killed by identity too. A sweep
     /// whose walk cannot be made (the process table cannot be read) kills nothing of its own, the root
-    /// included: the call is that walk's error. The members the `SIGTERM` walk listed, and any other the
-    /// handle holds, are killed by identity and waited for all the same, the members the root's exit
-    /// reparented too, which no retry's walk would reach.
+    /// included: the call is that walk's error. While the handle sees the root running, the members the
+    /// `SIGTERM` walk listed, and any other it holds, are kept for the retry (a later `kill_tree`, or
+    /// the drop), whose walk from the root reaches them and what they forked since, or whose kill by
+    /// identity reaches the ones reparented meanwhile. Once the handle sees the root exited no walk
+    /// reaches anything: the call kills them by identity and waits for them.
     ///
     /// **macOS, a root the handle cannot vouch for** is signalled as for
     /// [`terminate_tree`](Child::terminate_tree) and swept as for [`kill_tree`](Child::kill_tree). A

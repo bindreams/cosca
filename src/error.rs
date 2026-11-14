@@ -342,9 +342,10 @@ pub enum Error {
     /// A tree-walk kill killed what it could and left members running, one or more. Each of `members`
     /// is an [`Error::MemberNotKilled`], in the order the walk found them. `others` holds the call's
     /// failures besides the members left, none of which names a process: a walk that could not be made,
-    /// or found no root, after an earlier kill left members (that kill's [`Error::Unassessable`] or
-    /// [`Error::Unsupported`]; the call returns this variant in place of the `Unassessable` that means
-    /// nothing was killed), and, from a graceful tree call, its refused cooperative signal and its
+    /// or found no root, over members the handle holds, which an earlier kill left or a `SIGTERM` walk
+    /// reached, and which this call's kill by identity did not end (the walk's [`Error::Unassessable`]
+    /// or [`Error::Unsupported`]; the call returns this variant in place of the `Unassessable` that
+    /// means nothing was killed), and, from a graceful tree call, its refused cooperative signal and its
     /// failed grace wait. It is one error, or an [`Error::Several`] of them in the order they happened.
     /// Its `source` is the first member.
     ///
