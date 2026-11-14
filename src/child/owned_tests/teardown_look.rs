@@ -9,7 +9,7 @@ use std::time::Duration;
 use super::teardown::{child_with_an_unreadable_exit, due_now, exit, fake, fire_on_block, id, slow_warns, PID};
 use crate::child::owned::teardown::{FrontLook, LookOutcome, Reach};
 use crate::child::owned::OwnedChild;
-use crate::error::ChildFate;
+use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
@@ -34,9 +34,9 @@ impl FakeReach {
 }
 
 impl Reach for FakeReach {
-    fn reached(&self, child: &OwnedChild) -> io::Result<bool> {
+    fn reached(&self, child: &OwnedChild) -> Result<bool, Error> {
         self.asked.borrow_mut().push(child.pid());
-        self.answer.map_err(io::Error::from)
+        self.answer.map_err(|kind| Error::Io(io::Error::from(kind)))
     }
 }
 

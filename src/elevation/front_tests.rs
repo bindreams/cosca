@@ -65,7 +65,7 @@ fn in_turn(answers: Vec<io::Result<bool>>) -> impl Fn() -> io::Result<bool> {
 fn kill_gate_asking(
     report: Option<ElevationReport>,
     running: io::Result<bool>,
-    in_cgroup: io::Result<bool>,
+    in_cgroup: Result<bool, Error>,
 ) -> (Gate, String) {
     kill_gate_asking_in_turn(report, vec![running], in_cgroup)
 }
@@ -74,7 +74,7 @@ fn kill_gate_asking(
 fn kill_gate_asking_in_turn(
     report: Option<ElevationReport>,
     running: Vec<io::Result<bool>>,
-    in_cgroup: io::Result<bool>,
+    in_cgroup: Result<bool, Error>,
 ) -> (Gate, String) {
     let asked = Cell::new(String::new());
     let note = |c: char| {
@@ -194,13 +194,13 @@ fn assert_refused_by_one_read(error: &Error, words: &str) {
 fn a_front_whose_state_cannot_be_read_is_closed_and_says_why() {
     let g = kill_gate(Some(Front::Sudo), PID, || Err(os_error()), || Ok(false));
     assert_refused_by_one_read(&refusal(g), "whether it had exited could not be read");
-    let g = kill_gate(Some(Front::Sudo), PID, || Ok(true), || Err(os_error()));
+    let g = kill_gate(Some(Front::Sudo), PID, || Ok(true), || Err(Error::Io(os_error())));
     assert_refused_by_one_read(&refusal(g), "whether its cgroup kill reaches it could not be read");
 }
 
 #[skuld::test]
 fn a_front_whose_place_cannot_be_read_after_the_kill_has_the_read_as_its_cause() {
-    let (r, _) = reached_asking(Ok(false), Err(os_error()));
+    let (r, _) = reached_asking(Ok(false), Err(Error::Io(os_error())));
     assert_refused_by_one_read(&r.expect_err("not shown reached"), "its cgroup could not be read");
 }
 
@@ -297,12 +297,15 @@ fn a_sigterm_to_a_live_osascript_is_closed() {
 }
 
 /// What `cgroup_kill_reached` asked, in order (`e`xited, `u`nder the leaf), and its answer.
-fn reached_asking(exited: io::Result<bool>, under_leaf: io::Result<bool>) -> (Result<(), Error>, String) {
+fn reached_asking(exited: io::Result<bool>, under_leaf: Result<bool, Error>) -> (Result<(), Error>, String) {
     reached_asking_in_turn(vec![exited], under_leaf)
 }
 
 /// [`reached_asking`], with `exited` answering in turn.
-fn reached_asking_in_turn(exited: Vec<io::Result<bool>>, under_leaf: io::Result<bool>) -> (Result<(), Error>, String) {
+fn reached_asking_in_turn(
+    exited: Vec<io::Result<bool>>,
+    under_leaf: Result<bool, Error>,
+) -> (Result<(), Error>, String) {
     let asked = Cell::new(String::new());
     let note = |c: char| {
         let mut s = asked.take();
@@ -373,7 +376,10 @@ fn assert_refused_by_two_reads(error: &Error, words: &[&str], reads: [&str; 2]) 
 /// Mutants: only the first read is the cause; the reads are in the detail's text.
 #[skuld::test]
 fn a_front_whose_place_after_the_kill_cannot_be_read_is_refused() {
-    let (r, _) = reached_asking(Err(io::Error::other("peek refused")), Err(io::Error::other("hidepid")));
+    let (r, _) = reached_asking(
+        Err(io::Error::other("peek refused")),
+        Err(Error::Io(io::Error::other("hidepid"))),
+    );
     let error = r.expect_err("not shown reached");
     assert_refused_by_two_reads(
         &error,
@@ -395,7 +401,7 @@ fn a_front_whose_two_gate_reads_fail_is_closed_with_both_as_its_cause() {
         Some(Front::Sudo),
         PID,
         || Err(io::Error::other("peek refused")),
-        || Err(io::Error::other("hidepid")),
+        || Err(Error::Io(io::Error::other("hidepid"))),
     );
     assert_refused_by_two_reads(
         &refusal(g),
@@ -412,7 +418,7 @@ fn a_front_whose_two_gate_reads_fail_is_closed_with_both_as_its_cause() {
 #[skuld::test]
 fn a_front_reaped_between_the_gates_reads_has_exited() {
     let sudo = ElevatedVia::Wrapped(Backend::Sudo);
-    let reaped = || Err(io::Error::other("ESRCH: reaped"));
+    let reaped = || Err(Error::Io(io::Error::other("ESRCH: reaped")));
     let (g, asked) = kill_gate_asking_in_turn(Some(report(sudo.clone())), vec![Ok(true), Ok(false)], reaped());
     assert!(matches!(g, Gate::Exited), "{g:?}");
     assert_eq!(asked, "rcr");
@@ -424,7 +430,7 @@ fn a_front_reaped_between_the_gates_reads_has_exited() {
 /// was reached: the check reads its exit again.
 #[skuld::test]
 fn a_front_reaped_before_its_cgroup_is_read_was_reached() {
-    let reaped = || Err(io::Error::other("ESRCH: reaped"));
+    let reaped = || Err(Error::Io(io::Error::other("ESRCH: reaped")));
     let (r, asked) = reached_asking_in_turn(vec![Ok(false), Ok(true)], reaped());
     assert!(r.is_ok(), "{r:?}");
     assert_eq!(asked, "eue");

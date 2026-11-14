@@ -638,10 +638,9 @@ pub(super) fn word_front(
             "where it is cannot be read ({})",
             crate::error::Report(&e)
         )))
-        .failing([Error::io_cause(crate::error::io_context(
-            format!("where {front} is cannot be read"),
-            e,
-        ))]),
+        .failing([std::sync::Arc::new(
+            e.with_note(&format!("where {front} is cannot be read")),
+        )]),
         LookOutcome::SubtreeUnreadable(e) => left(unreadable(format!(
             "its leaf's subtree cannot be read ({})",
             crate::error::Report(&e)

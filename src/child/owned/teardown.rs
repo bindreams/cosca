@@ -114,7 +114,7 @@ pub(crate) struct Kill<'a> {
 pub(crate) trait Reach {
     /// `Ok(true)`: the kill landed and reached `child`, so its exit follows. `Err`: where `child` is
     /// could not be read, so whether the kill reached it is not known.
-    fn reached(&self, child: &OwnedChild) -> io::Result<bool>;
+    fn reached(&self, child: &OwnedChild) -> Result<bool, Error>;
 }
 
 /// How the look at an elevation front went ([`OwnedChild::look_at_front`]). The policy words none
@@ -133,7 +133,7 @@ pub(crate) enum LookOutcome {
     LeftRunning,
     /// It is running and where it is could not be read, so whether a kill reached it is not known:
     /// it is left unreaped, or handed back by a caller that does ([`Disposition::HandBack`]).
-    PlaceUnreadable(io::Error),
+    PlaceUnreadable(Error),
     /// It is running and the subtree the kill went through could not be read, so whether it reached
     /// the front is not known: it is left unreaped, or handed back as above.
     SubtreeUnreadable(io::Error),

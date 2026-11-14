@@ -1092,7 +1092,7 @@ enum PlacedOrExitedOutcome<T> {
     /// The placement's answer.
     Placed(T),
     /// The placement failed with this error because the process exited and was reaped.
-    Exited(io::Error),
+    Exited(crate::error::Error),
 }
 
 /// `Exited` if the placement of the process `pidfd` pins failed because the process exited and was
@@ -1102,17 +1102,19 @@ enum PlacedOrExitedOutcome<T> {
 /// [`Error::Several`](crate::error::Error::Several).
 fn placed_or_exited<T>(
     pidfd: std::os::fd::BorrowedFd<'_>,
-    placed: io::Result<T>,
+    placed: Result<T, crate::error::Error>,
 ) -> Result<PlacedOrExitedOutcome<T>, crate::error::Error> {
     use crate::error::Error;
     match placed {
         Ok(placed) => Ok(PlacedOrExitedOutcome::Placed(placed)),
         Err(e) => match member_exited(pidfd) {
             Ok(true) => Ok(PlacedOrExitedOutcome::Exited(e)),
-            Ok(false) => Err(Error::Io(e)),
+            Ok(false) => Err(e),
             Err(exited) => Err(Error::Unassessable {
                 detail: "its placement and its exit could not be read".to_owned(),
-                source: Some(crate::error::Failures::new(Error::io_cause(e), [Error::io_cause(exited)]).into_cause()),
+                source: Some(
+                    crate::error::Failures::new(std::sync::Arc::new(e), [Error::io_cause(exited)]).into_cause(),
+                ),
             }),
         },
     }

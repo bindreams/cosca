@@ -22,11 +22,11 @@ pub(super) fn failed(listed: Result<Vec<Member>, ListingFailure>, why: &str) -> 
     }
 }
 
-/// The error of a listing that was refused; `why` says what the row expected.
+/// The public error of a listing that was refused; `why` says what the row expected.
 #[cfg(target_os = "linux")]
-fn refused(listed: Result<Vec<Member>, ListingFailure>, why: &str) -> std::io::Error {
+fn refused(listed: Result<Vec<Member>, ListingFailure>, why: &str) -> crate::error::Error {
     match listed {
-        Err(ListingFailure::Unsupported(error)) => error,
+        Err(ListingFailure::Unsupported(refusal)) => refusal.unsupported("listing"),
         other => panic!("{why}: expected a refusal, got {other:?}"),
     }
 }
@@ -148,6 +148,7 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
     assert!(
         matches!(
             state(
+                &HostKernel,
                 pgid,
                 Signal::SIGKILL,
                 Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
@@ -183,7 +184,7 @@ fn a_group_kill_names_no_root_among_the_members_it_reached() {
         crate::test_support::stated_root::StatedRoot::with_state(child.id(), || crate::signal::RootState::Unreaped);
 
     let mut killed = Vec::new();
-    let verdict = state(pgid, Signal::SIGKILL, Some(&root), &mut killed);
+    let verdict = state(&HostKernel, pgid, Signal::SIGKILL, Some(&root), &mut killed);
 
     assert!(matches!(verdict, GroupState::Cleared), "got {verdict:?}");
     assert_eq!(
@@ -209,6 +210,7 @@ fn state_of_an_all_zombie_group_is_cleared() {
     assert!(
         matches!(
             state(
+                &HostKernel,
                 pid as i32,
                 Signal::SIGKILL,
                 Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
@@ -384,6 +386,7 @@ fn term_group_probe_reports_pid_1_as_a_refuser_unless_reachable(#[fixture(stray_
     let reachable = unsafe { libc::kill(1, 0) } == 0;
     match (
         state(
+            &HostKernel,
             pgid,
             Signal::SIGTERM,
             Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
@@ -1060,11 +1063,15 @@ fn members_fails_for_a_member_whose_pidfd_cannot_be_opened_and_keeps_a_refusal_u
             .on_pidfd_open(PID, Err(errno));
         // `stat_fixture` puts the process in group 1234.
         let listed = members(&kernel, 1234);
-        let err = if is_refusal {
-            refused(listed, "an unopenable member lists nothing")
+        if is_refusal {
+            let err = refused(listed, "an unopenable member lists nothing");
+            assert!(
+                crate::error::said(&err).contains("requires pidfd_open"),
+                "{errno}: {err:?}"
+            );
         } else {
-            failed(listed, "an unopenable member lists nothing")
-        };
-        assert!(err.to_string().contains(&format!("pid {PID}")), "{errno}: {err}");
+            let err = failed(listed, "an unopenable member lists nothing");
+            assert!(err.to_string().contains(&format!("pid {PID}")), "{errno}: {err}");
+        }
     }
 }

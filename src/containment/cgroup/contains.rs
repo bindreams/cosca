@@ -107,13 +107,13 @@ impl Contains for CgroupLeaf {
     /// Whether the task `pid` (which `pidfd` names, when there is one) is in this leaf or a cgroup
     /// under it (see [`Subtree::holds`](super::Subtree::holds)): a `cgroup.kill` reaches it whatever
     /// its credentials.
-    fn would_reach(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> std::io::Result<bool> {
+    fn would_reach(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> Result<bool, crate::error::Error> {
         self.subtree()?.holds(pid, pidfd)
     }
 
     /// A `cgroup.kill` that landed (or found the leaf gone) and where `child` is says it was in the
     /// leaf (see [`Subtree::reached_by`](super::Subtree::reached_by)).
-    fn reached(&self, child: &crate::child::owned::OwnedChild) -> std::io::Result<bool> {
+    fn reached(&self, child: &crate::child::owned::OwnedChild) -> Result<bool, crate::error::Error> {
         self.subtree()?.reached(child)
     }
 
