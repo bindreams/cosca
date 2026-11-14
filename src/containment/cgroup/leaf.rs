@@ -417,10 +417,10 @@ impl CgroupLeaf {
     /// The leaf as a place to read a task's membership in, once the leaf may be gone: its own
     /// cgroup id, its directory, its path, what its sweep removed, and whether a kill through it
     /// has landed.
-    pub(crate) fn subtree(&self) -> io::Result<Subtree> {
+    pub(crate) fn subtree(&self) -> Result<Subtree, crate::error::Error> {
         #[cfg(test)]
         if let Some(errno) = fault::subtree_fails() {
-            return Err(io::Error::from_raw_os_error(errno));
+            return Err(io::Error::from_raw_os_error(errno).into());
         }
         Ok(self.subtree_with(Some(self.id()?)))
     }

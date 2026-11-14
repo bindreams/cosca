@@ -26,7 +26,7 @@ pub(super) fn failed(listed: Result<Vec<Member>, ListingFailure>, why: &str) -> 
 #[cfg(target_os = "linux")]
 fn refused(listed: Result<Vec<Member>, ListingFailure>, why: &str) -> crate::error::Error {
     match listed {
-        Err(ListingFailure::Unsupported(refusal)) => refusal.unsupported("listing"),
+        Err(ListingFailure::Unsupported(error)) => error,
         other => panic!("{why}: expected a refusal, got {other:?}"),
     }
 }
@@ -1069,6 +1069,10 @@ fn members_fails_for_a_member_whose_pidfd_cannot_be_opened_and_keeps_a_refusal_u
                 crate::error::said(&err).contains("requires pidfd_open"),
                 "{errno}: {err:?}"
             );
+            let crate::error::Error::Unsupported { op, .. } = &err else {
+                panic!("{errno}: {err:?}");
+            };
+            assert_eq!(op, &format!("listing process group 1234 at pid {PID}"), "{errno}");
         } else {
             let err = failed(listed, "an unopenable member lists nothing");
             assert!(err.to_string().contains(&format!("pid {PID}")), "{errno}: {err}");

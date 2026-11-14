@@ -38,18 +38,20 @@ pub(crate) struct Member {
 #[derive(Debug)]
 pub(crate) enum ListingFailure {
     /// The listing can never work here: a [`Refusal`](crate::identity::Refusal) of `openat2`, or of the
-    /// `pidfd_open` of a member. The caller reports it as the platform's [`Error::Unsupported`]
-    /// ([`refused_error`]), not as an unassessable group. Only Linux's listing is refused.
-    #[cfg(target_os = "linux")]
-    Unsupported(crate::identity::Refusal),
+    /// `pidfd_open` of a member, as the [`Error::Unsupported`] built where it was met
+    /// ([`refused_error`]). The caller answers with it, not with an unassessable group.
+    #[cfg_attr(target_os = "macos", allow(dead_code, reason = "only Linux's listing is refused"))]
+    Unsupported(Error),
     /// The listing failed this time, or nothing can be said of the group; the failure says why.
     Failed(std::io::Error),
 }
 
-/// The platform's [`Error::Unsupported`] for the listing of process group `pgid` that `refusal` ended.
+/// The `Error::Unsupported` of a listing of process group `pgid` that `refusal` ended, met at `pid` when
+/// it was a member's.
 #[cfg(target_os = "linux")]
-pub(crate) fn refused_error(refusal: &crate::identity::Refusal, pgid: i32) -> Error {
-    refusal.unsupported(format!("listing process group {pgid}"))
+fn refused_error(refusal: &crate::identity::Refusal, pgid: i32, pid: Option<RawPid>) -> Error {
+    let at = pid.map_or(String::new(), |pid| format!(" at pid {pid}"));
+    refusal.unsupported(format!("listing process group {pgid}{at}"))
 }
 
 /// Every process the kernel currently lists in process group `pgid`. An empty result means
@@ -60,9 +62,7 @@ pub(crate) fn refused_error(refusal: &crate::identity::Refusal, pgid: i32) -> Er
 /// the same record as its pid. libproc's `proc_listpgrppids` is deliberately NOT used: it
 /// returns a COUNT where its siblings return bytes, and it carries no start time.
 ///
-/// Every failure of the `sysctl` is [`ListingFailure::Failed`], an unassessable group, whatever its
-/// errno: one that std maps to [`ErrorKind::Unsupported`](std::io::ErrorKind::Unsupported) (`ENOSYS`,
-/// `EOPNOTSUPP`) is no claim that the listing can never work here, and macOS has no refusal table.
+/// Every `sysctl` failure is [`ListingFailure::Failed`], whatever its errno: macOS has no refusal table.
 #[cfg(target_os = "macos")]
 pub(crate) fn members(_kernel: &dyn crate::identity::Kernel, pgid: i32) -> Result<Vec<Member>, ListingFailure> {
     use crate::identity::kinfo::kinfo_proc;
@@ -186,7 +186,7 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> Result
     let proc_dir = crate::identity::proc_view_with(kernel)
         .into_dir()
         .map_err(|why| match why.refusal() {
-            Some(refusal) => refused_listing(pgid, refusal),
+            Some(refusal) => refused_listing(pgid, None, &refusal),
             None => {
                 let message = format!(
                     "containment::unix::group::members: {why}, so its process listing says nothing about pgid {pgid}"
@@ -197,7 +197,7 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> Result
     let mut out = Vec::new();
     // A listing error makes the whole scan unreliable; propagate it.
     let pids = kernel.pids(&proc_dir).map_err(|failure| match failure.refusal() {
-        Some(refusal) => refused_listing(pgid, refusal),
+        Some(refusal) => refused_listing(pgid, None, &refusal),
         None => ListingFailure::Failed(failure.into_io()),
     })?;
     for pid in pids {
@@ -215,7 +215,9 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> Result
                 );
                 continue;
             }
-            Ok(crate::identity::pid_file::ReadOutcome::Refused(refusal)) => return Err(refused_listing(pgid, refusal)),
+            Ok(crate::identity::pid_file::ReadOutcome::Refused(refusal)) => {
+                return Err(refused_listing(pgid, Some(pid), &refusal))
+            }
             // Excluding it could clear a live group. `Unreadable` is a layer of the chain (see its doc),
             // and the failure that came with its read is its peer: both are causes of the listing.
             Err(e) => {
@@ -250,7 +252,7 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> Result
             // parse): the read knows no cause then. Every cause it knows fails the listing, because
             // excluding a live member could clear a live group.
             (Resolved::Unknown, cause) => match cause.into_refusal() {
-                Ok(refusal) => return Err(refused_listing(pgid, refusal)),
+                Ok(refusal) => return Err(refused_listing(pgid, Some(pid), &refusal)),
                 Err(cause) => match cause.into_error(&format!("pid {pid}")) {
                     Some(why) => {
                         let message = format!(
@@ -285,16 +287,15 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> Result
     Ok(out)
 }
 
-/// The listing failure of a refusal (see [`Refusal`](crate::identity::Refusal)) met anywhere in the
-/// listing of `pgid`: [`ListingFailure::Unsupported`], holding it. Its caller (`unix.rs`'s `signal_group`)
-/// does not log it, so it is warned about here, once, as the error the answer will be.
+/// Wraps a refusal as [`ListingFailure::Unsupported`], warning once here: `signal_group` does not log it.
 #[cfg(target_os = "linux")]
-fn refused_listing(pgid: i32, refusal: crate::identity::Refusal) -> ListingFailure {
-    crate::identity::warn_refused("containment::unix::group::members", refused_error(&refusal, pgid));
-    ListingFailure::Unsupported(refusal)
+fn refused_listing(pgid: i32, pid: Option<RawPid>, refusal: &crate::identity::Refusal) -> ListingFailure {
+    ListingFailure::Unsupported(crate::identity::warn_refused(
+        "containment::unix::group::members",
+        refused_error(refusal, pgid, pid),
+    ))
 }
 
-/// A listing failure that is no refusal, saying `message` and keeping `cause`.
 #[cfg(target_os = "linux")]
 fn failed_listing(message: String, cause: Option<Box<dyn std::error::Error + Send + Sync>>) -> ListingFailure {
     ListingFailure::Failed(listing_error(message, cause))

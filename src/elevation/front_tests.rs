@@ -204,6 +204,43 @@ fn a_front_whose_place_cannot_be_read_after_the_kill_has_the_read_as_its_cause()
     assert_refused_by_one_read(&r.expect_err("not shown reached"), "its cgroup could not be read");
 }
 
+/// A cgroup read refused as the platform lacks what it needs, over the errno it was refused with.
+fn refused_read() -> Error {
+    Error::Unsupported {
+        op: "reading the cgroup of the front".to_owned(),
+        platform: "linux",
+        detail: "cosca requires openat2".to_owned(),
+        source: Some(Error::io_cause(os_error())),
+    }
+}
+
+/// The refusal a read left as a refusal's cause, still the `Unsupported` it was, with its errno.
+#[track_caller]
+fn assert_refused_by_a_refusal(error: &Error) {
+    let Error::Elevation {
+        kind: ElevationErrorKind::Unkillable,
+        source: Some(source),
+        ..
+    } = error
+    else {
+        panic!("expected Unkillable with a source, got {error:?}");
+    };
+    assert!(matches!(&**source, Error::Unsupported { .. }), "{error:?}");
+    assert_eq!(crate::error::first_os_code(error), Some(CODE), "{error:?}");
+}
+
+/// A refused read of the front's cgroup, in either gate, is the refusal's cause as it is: neither
+/// rebuilt as an I/O failure nor flattened.
+///
+/// Mutant: `unread_reason` wraps each read in `Error::io_cause`.
+#[skuld::test]
+fn a_front_whose_cgroup_read_is_refused_has_the_refusal_as_its_cause() {
+    let g = kill_gate(Some(Front::Sudo), PID, || Ok(true), || Err(refused_read()));
+    assert_refused_by_a_refusal(&refusal(g));
+    let (r, _) = reached_asking(Ok(false), Err(refused_read()));
+    assert_refused_by_a_refusal(&r.expect_err("not shown reached"));
+}
+
 #[skuld::test]
 fn a_front_whose_cgroup_kill_failed_has_the_failure_as_its_cause() {
     let e = super::cgroup_kill_failed(Front::Sudo, PID, Error::Io(os_error()));

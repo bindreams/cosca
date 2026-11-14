@@ -809,14 +809,11 @@ fn answer_of(state: group::GroupState, pgid: i32, signal: Signal) -> Result<(), 
                 source: Failures::collect(members).map(Failures::into_cause),
             })
         }
-        // A listing that can never work here (no `openat2`, or a member's `pidfd_open` refused) is the
-        // platform's `Unsupported`, as from a wait, a spawn or the process snapshot, not an unassessable
-        // group.
-        #[cfg(target_os = "linux")]
+        // A refused listing is the platform's `Unsupported`, like a wait's or spawn's, not an unassessable group.
         group::GroupState::Unlistable {
-            source: group::ListingFailure::Unsupported(refusal),
+            source: group::ListingFailure::Unsupported(refused),
             ..
-        } => Err(group::refused_error(&refusal, pgid)),
+        } => Err(refused),
         group::GroupState::Unlistable {
             detail,
             source: group::ListingFailure::Failed(source),

@@ -4191,6 +4191,39 @@ fn a_failed_placement_whose_exit_read_fails_too_keeps_its_os_code_as_the_source(
     assert_eq!(codes, [Some(libc::EIO), Some(libc::EBADF)]);
 }
 
+/// A placement refused while its member is alive stays the `Unsupported` it was: the member is not
+/// taken for exited, and the refusal is not wrapped as an I/O failure.
+///
+/// Mutant: `placed_or_exited` wraps the placement's error as `Error::Io` when the member lives.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_refused_placement_of_a_live_member_is_returned_as_unsupported() {
+    use crate::containment::cgroup::fault::hide_proc_as;
+    use crate::containment::cgroup::test_support::kill_record;
+
+    // No leaf id: the task is placed through `/proc`, which the fault refuses.
+    let subtree = crate::containment::cgroup::Subtree::new(
+        None,
+        None,
+        Some("/leaf".to_owned()),
+        crate::containment::cgroup::Swept::default(),
+        crate::containment::cgroup::PlacedAtRemoval::default(),
+        kill_record(true),
+    );
+    let pidfd = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty())
+        .expect("pidfd_open");
+    let _refused = hide_proc_as(libc::ENOSYS);
+
+    let result = super::placed_or_exited(pidfd.as_fd(), subtree.holds(std::process::id(), Some(pidfd.as_fd())));
+
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!("a refused placement of a live member is no answer"),
+    };
+    assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::ENOSYS), "{err:?}");
+}
+
 /// A member whose placement fails while it is alive got no `SIGTERM`, and the message names the OS's
 /// error once.
 ///

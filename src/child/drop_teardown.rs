@@ -365,7 +365,7 @@ impl Child {
             Err(e) => Err(e),
         };
         #[cfg(not(target_os = "linux"))]
-        let reach: Result<Option<&dyn Reach>, std::io::Error> = Ok(None);
+        let reach: Result<Option<&dyn Reach>, crate::error::Error> = Ok(None);
         self.proc
             .begin_look_at_front(self.id, reach, self.policy.teardown_warn_after)
     }
@@ -454,7 +454,7 @@ enum RootWait {
     /// read before its first step. `why` is why the front was not killed.
     #[cfg(all(unix, feature = "tokio"))]
     Releasing {
-        released: Option<(Release, FrontReach)>,
+        released: Option<Box<(Release, FrontReach)>>,
         why: NotKilled,
     },
     /// The look at the front is under way, as an awaited teardown leaves it; `why` is why the front
@@ -510,7 +510,7 @@ impl DropWait {
             }
             #[cfg(all(unix, feature = "tokio"))]
             RootWait::Releasing { released, why } => {
-                let released = released.expect("held until its wait completes");
+                let released = *released.expect("held until its wait completes");
                 child.look_at_front_after_releasing(released, &why, parts.disposition)
             }
             #[cfg(all(unix, feature = "tokio"))]
@@ -534,16 +534,16 @@ impl DropWait {
             // which may remove it, and the leaf is kept until its wait completes.
             self.wait = RootWait::Releasing {
                 why: why.clone(),
-                released: Some(child.release_tree_for_front()),
+                released: Some(Box::new(child.release_tree_for_front())),
             };
         }
         #[cfg(unix)]
         if let RootWait::Releasing { released, why } = &mut self.wait {
             // The leaf is killed through and its drain awaited, so dropping it waits for nothing.
-            let (release, _) = released.as_ref().expect("held until its wait completes");
+            let release = &released.as_ref().expect("held until its wait completes").0;
             release.wait_async(child.pid()).await;
             let why = std::mem::take(why);
-            let (release, reach) = released.take().expect("held until its wait completes");
+            let (release, reach) = *released.take().expect("held until its wait completes");
             release.wait();
             match child.look_at_front_after_leaf(reach) {
                 BeginOutcome::Done(look) => return why.word_front(child.proc.pid(), self.parts.disposition, look),
@@ -601,7 +601,6 @@ pub(super) fn word_front(
     look: FrontLook,
 ) -> TeardownOutcome {
     use crate::child::owned::teardown::LookOutcome;
-    use crate::error::Error;
 
     let front = crate::elevation::front::front_named(pid.into());
     let FrontLook { fate, look } = look;
@@ -636,11 +635,7 @@ pub(super) fn word_front(
         }),
         LookOutcome::PlaceUnreadable(e) => left(unreadable(format!(
             "where it is cannot be read ({})",
-            // An I/O failure reads as the OS says it, as the subtree's does; a refusal, as its own words.
-            match &e {
-                Error::Io(io) => crate::error::Report(io).to_string(),
-                other => crate::error::Report(other).to_string(),
-            }
+            crate::error::Report(&e)
         )))
         .failing([std::sync::Arc::new(
             e.with_note(&format!("where {front} is cannot be read")),
@@ -649,9 +644,8 @@ pub(super) fn word_front(
             "its leaf's subtree cannot be read ({})",
             crate::error::Report(&e)
         )))
-        .failing([Error::io_cause(crate::error::io_context(
-            format!("the subtree of {front}'s leaf cannot be read"),
-            e,
-        ))]),
+        .failing([std::sync::Arc::new(
+            e.with_note(&format!("the subtree of {front}'s leaf cannot be read")),
+        )]),
     }
 }

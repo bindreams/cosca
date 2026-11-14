@@ -419,7 +419,7 @@ impl Contains for Mechanism {
 /// read. Linux only; elsewhere there is no leaf to read.
 #[cfg(unix)]
 pub(crate) struct FrontReach(
-    #[cfg(target_os = "linux")] pub(crate) std::io::Result<Option<crate::containment::cgroup::Subtree>>,
+    #[cfg(target_os = "linux")] pub(crate) Result<Option<crate::containment::cgroup::Subtree>, crate::error::Error>,
 );
 
 /// The end of a mechanism's resource, which [`wait`](Self::wait) completes by dropping it: a cgroup

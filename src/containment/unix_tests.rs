@@ -640,7 +640,7 @@ fn a_group_whose_listing_is_refused_answers_unsupported() {
     let answer = super::answer_of(
         GroupState::Unlistable {
             detail: "process group 42 could not be listed".to_owned(),
-            source: ListingFailure::Unsupported(refusal),
+            source: ListingFailure::Unsupported(refusal.unsupported("listing process group 42")),
         },
         42,
         nix::sys::signal::Signal::SIGKILL,
@@ -681,9 +681,8 @@ fn a_group_whose_listing_failed_with_an_enosys_of_its_own_answers_unassessable()
     assert_eq!(crate::error::first_os_code(&answer), Some(libc::ENOSYS));
 }
 
-/// The same, end to end: a `/proc` listing that opened and then failed with an `ENOSYS` of its own is
-/// no refusal of `openat2`, so `members`, `state` and `answer_of` answer `Unassessable` carrying the
-/// errno. Mutant: "a failure after the open that std maps to `Unsupported` is a refusal".
+/// End to end, from a `/proc` listing: `members`, `state` and `answer_of` answer `Unassessable` carrying
+/// the errno. Mutant: "a failure after the open that std maps to `Unsupported` is a refusal".
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_listing_that_fails_after_its_open_with_enosys_answers_unassessable() {

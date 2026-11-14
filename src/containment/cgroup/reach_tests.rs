@@ -681,7 +681,7 @@ fn a_refused_views_errors_carry_the_refusals_chain() {
 
 /// A refused view stays a refusal wherever the view is read: a task's cgroup read is an
 /// `Error::Unsupported` and names the requirement, as its cgroup read's refusal is, and the probe's answer
-/// is the refusal itself. Mutant: "a refused view is only an unreadable one" (an `Other` error; a `View` string).
+/// is the refusal itself. Mutant: "a refused view is only an unreadable one".
 #[skuld::test]
 fn a_refused_view_is_a_refusal_where_it_is_read() {
     let kernel = refused_view_kernel();

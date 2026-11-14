@@ -77,8 +77,7 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> 
 /// Reads `pid`'s cgroup through `kernel`. A refusal is an
 /// [`Error::Unsupported`](crate::error::Error::Unsupported); a pid that is not there for us fails with the
 /// read's own error; any other failure is an [`Error::Io`](crate::error::Error::Io) of the
-/// [`Unreadable`](crate::identity::pid_file::Unreadable), which names the pid and its file (with the pid's
-/// `EPERM` beside a failed re-check).
+/// [`Unreadable`](crate::identity::pid_file::Unreadable), which names the pid and its file.
 pub(crate) fn proc_names(
     kernel: &dyn crate::identity::Kernel,
     leaf_path: &str,
