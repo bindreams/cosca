@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use super::fixtures::{spawn_std_blocker, status, try_wait, wait_status, Blocker};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::error::Error;
-use crate::identity::{ppid_fault, FakeKernel, HostKernel, Record, UniqRead, LAUNCHD};
+use crate::identity::{exit_record, ppid_fault, FakeKernel, HostKernel, UniqRead, LAUNCHD};
 use crate::os_process::child::{Foreign, OsChild, PeekOutcome, TryReapOutcome};
 use crate::os_process::macos::child::MacosChild;
 use crate::os_process::macos::kqueue::test_hooks;
@@ -40,10 +40,11 @@ fn is_foreign(outcome: &Result<ChildWaitOutcome, crate::error::Error>) -> bool {
 /// Mutant: a `debug_assert!` on the by-pid target.
 #[skuld::test]
 fn a_reap_that_finds_none_after_reapable_takes_the_echild_path() {
-    let mut b = Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_consume(pid, Ok(None)));
+    let (mut b, kernel) = Blocker::spawn_over_rows(|pid| FakeKernel::over(&HostKernel).on_consume(pid, Ok(None)));
     b.end_child_and_confirm_exit();
     let outcome = b.owned.wait(None);
     assert!(is_foreign(&outcome), "{outcome:?}");
+    assert!(kernel.all_rows_taken(), "the reap must consume");
     assert!(format!("{:?}", b.owned).contains("N"), "{:?}", b.owned);
     // The zombie was never consumed (the one consume found nothing): a real wait reaps it.
     wait_status(&b.owned);
@@ -59,14 +60,12 @@ fn a_reap_that_finds_none_after_reapable_takes_the_echild_path() {
 /// Mutant: a second peek gated on `p_oppid`: the zombie of an untraced child is left.
 #[skuld::test]
 fn a_second_peek_runs_after_every_first_reap() {
-    let exited = Record {
-        si_code: libc::CLD_EXITED,
-        si_status: 0,
-    };
-    let mut b = Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_consume(pid, Ok(Some(exited))));
+    let (mut b, kernel) =
+        Blocker::spawn_over_rows(|pid| FakeKernel::over(&HostKernel).on_consume(pid, Ok(Some(exit_record(0)))));
     b.end_child_and_confirm_exit();
     let status = wait_status(&b.owned);
     assert!(status.success(), "{status:?}");
+    assert!(kernel.all_rows_taken(), "the first reap must consume");
     assert_zombie_consumed(b.pid, "the second reap");
 }
 
@@ -588,20 +587,17 @@ fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
 /// Mutant: `Gone` at once: the wait answers `ECHILD`.
 #[skuld::test]
 fn a_reap_that_finds_no_exit_record_after_the_peek_saw_one_looks_again() {
-    let exited = Record {
-        si_code: libc::CLD_EXITED,
-        si_status: 0,
-    };
     // The look's peek sees the exit; the reap's own peek then finds none.
-    let mut b = Blocker::spawn_over(|pid, _| {
+    let (mut b, kernel) = Blocker::spawn_over_rows(|pid| {
         FakeKernel::over(&HostKernel)
-            .on_peek(pid, Ok(Some(exited)))
+            .on_peek(pid, Ok(Some(exit_record(0))))
             .on_peek(pid, Ok(None))
     });
     b.end_child_and_confirm_exit();
     crate::wait::block_probe::take();
     let status = wait_status(&b.owned);
     assert!(status.success(), "{status:?}");
+    assert!(kernel.all_rows_taken(), "the look and the reap must each peek");
     assert!(
         !crate::wait::block_probe::take().is_empty(),
         "the second look follows a backoff"
@@ -791,7 +787,7 @@ fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
     // Each look's peek finds no record, as when XNU is still finishing the exit: the `try_wait`'s,
     // which drains `NOTE_EXIT` from the reap kqueue, and the first of the `wait`'s, which finds
     // that queue empty. The `wait`'s second peek is the real one.
-    let mut b = Blocker::spawn_over(|pid, _| {
+    let (mut b, kernel) = Blocker::spawn_over_rows(|pid| {
         FakeKernel::over(&HostKernel)
             .on_peek(pid, Ok(None))
             .on_peek(pid, Ok(None))
@@ -800,6 +796,7 @@ fn a_try_wait_that_drains_note_exit_then_a_wait_still_returns() {
     assert_eq!(try_wait(&b.owned).expect("try_wait"), ChildWaitOutcome::DeadlinePassed);
     let status = wait_status(&b.owned);
     assert!(status.success(), "{status:?}");
+    assert!(kernel.all_rows_taken(), "the try_wait and the wait must each peek");
 }
 
 /// A child whose exit watch has fired and whose confirming read is refused is `Dead` when the reap

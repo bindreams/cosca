@@ -179,12 +179,9 @@ pub(crate) fn second_reap(kernel: &dyn Kernel, pid: u32, unique: Option<u64>) {
             return;
         }
         // The first consume was this handle's, so an untraced child is gone, not reaped by another:
-        // a peek that answers `Foreign` or `ECHILD` finds nothing left to consume.
+        // a peek that answers `Foreign` (`peek_raw` maps `ECHILD` to it) finds nothing left to
+        // consume.
         Ok(PeekOutcome::Foreign(_)) => {
-            log::debug!("second reap of pid {pid}: nothing left to consume");
-            return;
-        }
-        Err(e) if is_echild(&e) => {
             log::debug!("second reap of pid {pid}: nothing left to consume");
             return;
         }

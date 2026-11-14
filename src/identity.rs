@@ -765,7 +765,7 @@ mod no_reads {
 pub(crate) use backend::kernel::fake::FakeKernel;
 
 #[cfg(all(target_os = "macos", test))]
-pub(crate) use backend::kernel::fake::short_info;
+pub(crate) use backend::kernel::fake::{exit_record, short_info};
 
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::proc_view::UNREADABLE_STATUS_REASON;

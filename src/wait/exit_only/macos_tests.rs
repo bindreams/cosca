@@ -136,20 +136,24 @@ fn a_second_reap_with_a_matching_id_consumes_the_leftover() {
     assert_zombie_consumed(pid, "the matching second reap");
 }
 
-/// Panics unless `pid` has no zombie left to reap: `who` must have consumed it.
+/// Panics unless `pid` has no zombie left to reap: `who` must have consumed it. A peek, so a zombie
+/// that is left stays for whatever the test does next.
 #[track_caller]
 pub(crate) fn assert_zombie_consumed(pid: u32, who: &str) {
-    let mut status = 0;
-    // SAFETY: `status` is a valid out-pointer.
-    let r = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
-    assert_eq!(r, -1, "{who} must have consumed the zombie");
-    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    use crate::identity::Kernel as _;
+
+    let peeked = HostKernel.peek(pid);
+    assert!(
+        matches!(&peeked, Err(e) if e.raw_os_error() == Some(libc::ECHILD)),
+        "{who} must have consumed the zombie: {peeked:?}"
+    );
 }
 
-/// A second peek that meets `ECHILD` is skipped quietly, not logged as a foreign reap or a
-/// warning.
+/// A second peek that meets `ECHILD` reads as `Foreign` (`peek_raw` maps it) and is skipped
+/// quietly: nothing is consumed, and no warning is logged. The unique id is `None`, so a second
+/// peek that went on would warn.
 ///
-/// Mutant: the `ECHILD` logged at `warn`.
+/// Mutant: the `Foreign` arm of `second_reap` logs at `warn`, or falls through to the consume.
 #[skuld::test]
 fn a_second_reap_that_meets_echild_is_skipped() {
     crate::log_capture::install();
@@ -163,6 +167,7 @@ fn a_second_reap_that_meets_echild_is_skipped() {
         !levels.contains(&log::Level::Warn),
         "an ECHILD must not warn: {levels:?}"
     );
+    assert!(kernel.all_rows_taken(), "the second reap must peek");
     reap_by_pid(pid);
 }
 
@@ -200,6 +205,7 @@ fn a_second_reap_that_finds_nothing_is_skipped() {
         !levels.contains(&log::Level::Warn),
         "finding nothing must not warn: {levels:?}"
     );
+    assert!(kernel.all_rows_taken(), "the second reap must read the id and consume");
     reap_by_pid(pid);
 }
 

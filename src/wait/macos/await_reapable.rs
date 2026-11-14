@@ -230,20 +230,17 @@ pub(crate) fn await_reapable_on(
     let mut round: u32 = 0;
     #[cfg(test)]
     let mut check = crate::wait::test_clock::RoundCheck::new("await_reapable_on");
+    #[cfg(test)]
     let mut repeek = false;
     loop {
         #[cfg(test)]
-        check.round();
-        if repeek {
-            #[cfg(test)]
-            {
-                test_hooks::fire_before_repeek();
-                if backoff {
-                    test_hooks::fire_esrch_repeek();
-                }
+        {
+            check.round();
+            if repeek && backoff {
+                test_hooks::fire_esrch_repeek();
             }
+            repeek = true;
         }
-        repeek = true;
         // Peeks until the wait may block: once more at once after a tracer's watch is registered.
         let mut tracer_wait = None;
         loop {

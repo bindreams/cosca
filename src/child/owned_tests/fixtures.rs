@@ -77,6 +77,21 @@ impl Blocker {
         }
     }
 
+    /// [`Blocker::spawn_over`] with a `FakeKernel` the test keeps a handle to, so that it can ask
+    /// whether every row was taken.
+    #[cfg(target_os = "macos")]
+    pub(super) fn spawn_over_rows(
+        rows: impl FnOnce(u32) -> crate::identity::FakeKernel<'static>,
+    ) -> (Blocker, Arc<crate::identity::FakeKernel<'static>>) {
+        let mut kernel = None;
+        let blocker = Self::spawn_over(|pid, _| {
+            let shared = Arc::new(rows(pid));
+            kernel = Some(Arc::clone(&shared));
+            shared
+        });
+        (blocker, kernel.expect("spawn_over builds the kernel"))
+    }
+
     /// End the child: close its stdin, so it reads EOF and exits.
     pub(super) fn end_child(&mut self) {
         drop(self.stdin.take());
