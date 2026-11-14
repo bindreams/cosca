@@ -73,6 +73,24 @@ fn open_pid_with_opens_through_its_kernel() {
     crate::test_child::release_unsignalled(child);
 }
 
+/// The open reads the pid's unique id through the kernel it is given: a kernel that says the pid is
+/// gone makes the open `Ok(None)` for a live process, which the real kernel would open. Mutant:
+/// "`Process::open_with` opens through `HostKernel`": the live process opens.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn open_with_opens_through_its_kernel() {
+    use crate::identity::{FakeKernel, HostKernel, UniqRead};
+
+    let (child, id) = crate::test_child::live_exiting_member();
+    let kernel = FakeKernel::over(&HostKernel).on_unique_info(id.pid(), UniqRead::Gone);
+    let opened = Process::open_with(kernel, id).expect("the open is not an error");
+    assert!(
+        opened.is_none(),
+        "the kernel's answer decides the open, not the live process"
+    );
+    crate::test_child::release_unsignalled(child);
+}
+
 /// A pidfd call that failed while reading the pid's identity is the open's own failure, as for
 /// `open`: a refused `pidfd_open` is `Unsupported`, a failed inode read `Io` naming `pidfs_ino` with
 /// the raw errno. Mutant: "the identity read's failed call is `Unassessable`".

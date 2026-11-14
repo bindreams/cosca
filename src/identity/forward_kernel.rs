@@ -1,6 +1,5 @@
 //! The one `forward_kernel!`: every platform's `Kernel` is also implemented by a borrow, a `Box` and
-//! an `Arc` of a kernel, so a caller may hand a process any of them, as std's `Read` does for
-//! `&mut R` and `Box<R>`.
+//! an `Arc` of a kernel, so a caller may hand a process any of them.
 //!
 //! Each platform lists its trait's methods in the call, as `fn name(&self, arg: Type, ..) -> Ret;`,
 //! beside the trait that declares them. A trait with no methods writes `forward_kernel!();`.

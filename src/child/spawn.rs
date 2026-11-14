@@ -770,7 +770,12 @@ fn spawn_reported(
         pid,
         pidfd: owned.os_handle(),
     };
-    let (resolved, cause, mut why) = resolve_identity(&crate::identity::HostKernel, pid, &through);
+    let (resolved, cause, mut why) = resolve_identity(
+        #[cfg(not(target_os = "macos"))]
+        &crate::identity::HostKernel,
+        pid,
+        &through,
+    );
     let id = match resolved {
         crate::identity::Resolved::Found(id) => Ok(id),
         // Kept with no identity; see `Child::id`.
@@ -1267,7 +1272,6 @@ impl LateTree {
             return tree;
         }
         let (resolved, _, mut why) = resolve_identity(
-            &crate::identity::HostKernel,
             pid,
             &crate::wait::exit_only::Target::pid(&crate::identity::HostKernel, pid, Some(unique)),
         );
@@ -2396,7 +2400,8 @@ pub(crate) fn spawn_identity_error(
 /// (see the `Diagnosis` keep rule). The
 /// [`UnknownCause`](crate::identity::UnknownCause) is the read's own, for [`spawn_identity_error`].
 pub(crate) fn resolve_identity(
-    kernel: &dyn crate::identity::Kernel,
+    // On macOS `through` carries the kernel.
+    #[cfg(not(target_os = "macos"))] kernel: &dyn crate::identity::Kernel,
     pid: u32,
     through: &crate::wait::exit_only::Target<'_>,
 ) -> (
@@ -2411,7 +2416,12 @@ pub(crate) fn resolve_identity(
         let crate::wait::exit_only::Target::PidFd(held) = *through;
         resolve_identity_unchecked(kernel, pid, held)
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let (read, cause) = {
+        let crate::wait::exit_only::Target::Pid { kernel, .. } = *through;
+        resolve_identity_unchecked(kernel, pid)
+    };
+    #[cfg(windows)]
     let (read, cause) = resolve_identity_unchecked(kernel, pid);
     let Resolved::Found(_) = read else {
         return (read, cause, Diagnosis::default());

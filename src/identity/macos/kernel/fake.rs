@@ -53,6 +53,10 @@ pub(crate) struct FakeKernel<'a> {
     subscribes: Rows<Subscription, Result<(), i32>>,
 }
 
+#[allow(
+    dead_code,
+    reason = "a row builder is used once a test states that call's answer; the hook families K2 to K5 convert bring them"
+)]
 impl<'a> FakeKernel<'a> {
     /// A kernel with no rows.
     pub(crate) fn new() -> Self {

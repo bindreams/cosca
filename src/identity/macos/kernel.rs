@@ -4,14 +4,12 @@
 //! stated answers and models no kernel.
 //!
 //! Every decision stays in a function above the trait, over a `&dyn Kernel` or a kernel the
-//! caller owns. The macOS OS-layer types ([`MacosProcess`](crate::os_process::macos::MacosProcess),
-//! [`MacosChild`](crate::os_process::macos::child::MacosChild)) own the kernel they are given;
-//! the blanket impls let a caller hand over a borrow, a `Box` or an `Arc` of one.
+//! caller owns.
 
 use std::io;
 
 use super::kinfo::{self, kinfo_proc};
-use super::{pidinfo, ProcUniqIdentifierInfo, ReadErr, UniqInfo, UniqRead, PROC_PIDUNIQIDENTIFIERINFO};
+use super::{pidinfo, warn_partial, ProcUniqIdentifierInfo, ReadErr, UniqInfo, UniqRead, PROC_PIDUNIQIDENTIFIERINFO};
 use crate::identity::{RawPid, Record, Resolved};
 use crate::os_process::macos::kqueue::{Kqueue, Subscription};
 
@@ -28,12 +26,12 @@ pub(crate) trait Kernel: Sync {
     /// `proc_pidinfo(PROC_PIDT_SHORTBSDINFO, 1)`.
     fn short_bsd(&self, pid: RawPid) -> Result<libc::proc_bsdshortinfo, ReadErr>;
 
-    /// `proc_pidinfo(PROC_PIDTBSDINFO, 1)`. `arg = 1` reads a zombie, as the other flavors do.
+    /// `proc_pidinfo(PROC_PIDTBSDINFO, 1)`.
     fn bsd_info(&self, pid: RawPid) -> Result<libc::proc_bsdinfo, ReadErr>;
 
     /// `sysctl(KERN_PROC_PID)`. `Unknown` folds `EPERM`/`EACCES`, `ENOMEM`/`EINVAL` and a wrong-sized
     /// record; the second element is the failure that left it so (the errno, or the size written), and
-    /// `None` for every other answer. Only [`exit_begun`](super::exit_begun) reads it.
+    /// `None` for every other answer.
     fn kinfo(&self, pid: RawPid) -> (Resolved<kinfo_proc>, Option<io::Error>);
 
     /// The registration [`Kqueue::subscribe`] makes, through the kernel: every registration (exit
@@ -63,13 +61,19 @@ impl Kernel for HostKernel {
             }),
             Err(ReadErr::Gone) => UniqRead::Gone,
             Err(ReadErr::Refused(errno)) => UniqRead::Refused(errno),
+            Err(partial @ ReadErr::Partial { .. }) => {
+                warn_partial(pid, PROC_PIDUNIQIDENTIFIERINFO, &partial);
+                UniqRead::Refused(libc::EIO)
+            }
         }
     }
 
     fn short_bsd(&self, pid: RawPid) -> Result<libc::proc_bsdshortinfo, ReadErr> {
         // SAFETY: all-zero is a valid `proc_bsdshortinfo`.
         let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
-        pidinfo(pid, libc::PROC_PIDT_SHORTBSDINFO, &mut info).map(|()| info)
+        pidinfo(pid, libc::PROC_PIDT_SHORTBSDINFO, &mut info)
+            .inspect_err(|e| warn_partial(pid, libc::PROC_PIDT_SHORTBSDINFO, e))
+            .map(|()| info)
     }
 
     fn bsd_info(&self, pid: RawPid) -> Result<libc::proc_bsdinfo, ReadErr> {

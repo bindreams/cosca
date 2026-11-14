@@ -750,7 +750,7 @@ pub(crate) use no_reads::{HostKernel, Kernel};
 #[cfg(windows)]
 mod no_reads {
     /// What cosca asks the kernel about processes, so shared code takes one `&dyn Kernel` on every
-    /// platform. No methods yet: one enters with its first caller in the Windows backend.
+    /// platform.
     pub(crate) trait Kernel: Sync {}
 
     /// The real kernel.
@@ -761,7 +761,7 @@ mod no_reads {
     forward_kernel!();
 }
 
-#[cfg(all(target_os = "linux", test))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), test))]
 pub(crate) use backend::kernel::fake::FakeKernel;
 
 #[cfg(all(target_os = "linux", test))]

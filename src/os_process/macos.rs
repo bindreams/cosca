@@ -5,10 +5,8 @@
 //! that names the pid and the process's `p_idversion`: the kernel checks the version and signals
 //! while it holds a reference, so a process that took a reused pid is never signalled.
 //!
-//! The calls are Darwin's, and the platform cosca supports is macOS (`target_os = "macos"`): the
-//! other Darwin OSes do not let an application spawn processes. A [`MacosProcess`] owns the
-//! [`Kernel`] it asks, and [`open_with`](super::open_with) moves the kernel it checked through into
-//! it.
+//! A [`MacosProcess`] owns the [`Kernel`] it asks, and [`open_with`](super::open_with) moves the
+//! kernel it checked through into it.
 
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd};

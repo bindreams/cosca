@@ -67,6 +67,34 @@ fn one_open_serves_look_signal_and_wait() {
     );
 }
 
+/// A held process keeps the kernel it was opened with: a later look is answered by it. The fake's
+/// rows are the open's unique-id read (the process's own), then the exit watch's arming read and
+/// the look's, which both say the pid is gone, so the live blocker reads exited. Mutant: "the held
+/// process looks through `HostKernel`": the blocker reads `Running`.
+#[skuld::test]
+fn a_held_process_looks_through_the_kernel_it_was_opened_with() {
+    use crate::identity::FakeKernel;
+    use crate::os_process::open_with;
+
+    let (mut child, id) = blocker();
+    let UniqRead::Found(own) = uniq_info(&HostKernel, id.pid(), ReadPurpose::Open) else {
+        panic!("the live blocker has a unique id");
+    };
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_unique_info(id.pid(), UniqRead::Found(own))
+        .on_unique_info(id.pid(), UniqRead::Gone)
+        .on_unique_info(id.pid(), UniqRead::Gone);
+    let p = open_with(kernel, id)
+        .unwrap()
+        .expect("the open reads the process's own id");
+    assert!(
+        matches!(p.exited().unwrap(), Exit::Exited),
+        "the look is the kernel's, not the live blocker's"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
 #[skuld::test]
 fn open_with_wrong_start_token_is_none_and_sends_nothing() {
     let (mut child, id) = blocker();

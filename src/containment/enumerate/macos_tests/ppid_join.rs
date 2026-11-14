@@ -16,7 +16,7 @@ fn join_edges_filters_non_positive_pids() {
     // Read before and after, same reasoning as `parents_contains_this_process_edge`:
     // nothing holds this process's real parent fixed across the call.
     let parent_before = std::os::unix::process::parent_id();
-    let (out, denied, sample) = join_edges(&[0, -1, me]).expect("edge buffer");
+    let (out, denied, sample) = join_edges(&HostKernel, &[0, -1, me]).expect("edge buffer");
     let parent_after = std::os::unix::process::parent_id();
     assert_eq!(denied, 0, "0 and -1 must not be counted as denied ppid lookups");
     assert!(
@@ -38,7 +38,7 @@ fn join_edges_filters_non_positive_pids() {
 #[skuld::test]
 fn join_edges_does_not_count_gone_pids_as_denied() {
     let unresolvable = vec![libc::c_int::MAX; 8];
-    let (out, denied, sample) = join_edges(&unresolvable).expect("edge buffer");
+    let (out, denied, sample) = join_edges(&HostKernel, &unresolvable).expect("edge buffer");
     assert!(out.is_empty(), "none of these pids can resolve to an edge");
     assert_eq!(denied, 0, "a pid that is simply gone must not be counted as denied");
     assert!(
@@ -121,7 +121,7 @@ fn ppid_of_resolves_a_different_users_process_via_the_sysctl_fallback() {
          sysctl fallback - re-run as a non-root user"
     );
     assert_eq!(
-        ppid_of(1),
+        ppid_of(&HostKernel, 1),
         Resolved::Found(0),
         "pid 1 (launchd)'s parent is the kernel (ppid 0), resolvable via the sysctl fallback"
     );
@@ -133,7 +133,7 @@ fn ppid_of_resolves_a_different_users_process_via_the_sysctl_fallback() {
 #[skuld::test]
 fn ppid_of_reports_gone_for_an_unallocatable_pid() {
     assert_eq!(
-        ppid_of(libc::c_int::MAX),
+        ppid_of(&HostKernel, libc::c_int::MAX),
         Resolved::Gone,
         "a pid beyond PID_MAX can never resolve to a ppid, and is not a denial"
     );
@@ -222,7 +222,7 @@ fn a_fork_in_progress_resolves_and_is_not_counted_as_denied() {
             PpidRead::Found(1, Key::for_test(1)),
         ],
     );
-    let (edges, denied, _) = join_edges(&[me]).expect("edge buffer");
+    let (edges, denied, _) = join_edges(&HostKernel, &[me]).expect("edge buffer");
     assert_eq!(denied, 0);
     assert_eq!(edges, [(me as u32, 1)]);
     assert_eq!(macos_fault::ppid_read_attempts(me as u32), 3);

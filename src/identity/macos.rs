@@ -27,8 +27,8 @@ pub(crate) mod kernel;
 #[path = "macos/kinfo.rs"]
 pub(crate) mod kinfo;
 
-/// The shared contract-violation disposition for BOTH identity sources, libproc ([`pidinfo`], and
-/// [`libproc_record`] for an errno it does not expect) and the sysctl (`kinfo`): trace FIRST (so
+/// The shared contract-violation disposition for BOTH identity sources, libproc ([`libproc_record`],
+/// for an errno it does not expect or a partial record) and the sysctl (`kinfo`): trace FIRST (so
 /// the warn executes in every build mode), then the debug tripwire.
 pub(super) fn contract_violation(what: std::fmt::Arguments<'_>) {
     log::warn!("{what}");
@@ -145,11 +145,19 @@ fn pidinfo<T>(pid: RawPid, flavor: libc::c_int, buf: &mut T) -> Result<(), ReadE
             ReadErr::Refused(errno)
         });
     }
-    // 0 < n < size: a partial record, never trusted.
-    contract_violation(format_args!(
-        "proc_pidinfo({pid}, {flavor}) wrote {n} bytes, expected {size}"
-    ));
-    Err(ReadErr::Refused(libc::EIO))
+    // 0 < n < size: a partial record, never trusted. Each caller reports it by its own disposition.
+    Err(ReadErr::Partial {
+        wrote: n,
+        expected: size,
+    })
+}
+
+/// The warn a flavor-17 or flavor-13 read gives a partial record ([`ReadErr::Partial`]); the
+/// `PROC_PIDTBSDINFO` read reports it in [`libproc_record`] instead.
+fn warn_partial(pid: RawPid, flavor: libc::c_int, err: &ReadErr) {
+    if let ReadErr::Partial { wrote, expected } = err {
+        log::warn!("proc_pidinfo({pid}, {flavor}) wrote {wrote} bytes, expected {expected}");
+    }
 }
 
 /// `pid`'s unique id through `proc_pidinfo(PROC_PIDUNIQIDENTIFIERINFO)`. Unprivileged for any
@@ -267,6 +275,7 @@ fn short_read<T>(
             Err(Mismatch::Gone)
         }
         Err(ReadErr::Refused(errno)) => Err(Mismatch::Refused(errno)),
+        Err(ReadErr::Partial { .. }) => Err(Mismatch::Refused(libc::EIO)),
     }
 }
 
@@ -368,11 +377,16 @@ pub(crate) fn link(kernel: &dyn Kernel, pid: RawPid) -> Link {
     }
 }
 
-/// Why a `proc_pidinfo` read by pid failed: `ESRCH`, or any other errno.
+/// Why a `proc_pidinfo` read by pid failed: `ESRCH`, any other errno, or a short write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadErr {
     Gone,
     Refused(i32),
+    /// The call wrote `wrote` of `expected` bytes: a partial record, never trusted.
+    Partial {
+        wrote: i32,
+        expected: i32,
+    },
 }
 
 fn short_ppid(kernel: &dyn Kernel, pid: RawPid) -> Result<u32, ReadErr> {
@@ -528,11 +542,18 @@ impl Record {
 
 /// `pid`'s `proc_bsdinfo` through the kernel, when libproc has it. `None` sends the caller to the
 /// sysctl: `ESRCH` (gone) and `EPERM` (an unprivileged cross-user query) are the expected misses and
-/// pass quietly; any other errno breaks the libproc contract and is a [`contract_violation`] first.
+/// pass quietly; any other errno, and a partial record, break the libproc contract and are a
+/// [`contract_violation`] first, each reported once with its own cause.
 fn libproc_record(kernel: &dyn Kernel, pid: RawPid) -> Option<libc::proc_bsdinfo> {
     match kernel.bsd_info(pid) {
         Ok(info) => Some(info),
         Err(ReadErr::Gone | ReadErr::Refused(libc::EPERM)) => None,
+        Err(ReadErr::Partial { wrote, expected }) => {
+            contract_violation(format_args!(
+                "proc_pidinfo({pid}) wrote {wrote} bytes, expected {expected}"
+            ));
+            None
+        }
         Err(ReadErr::Refused(errno)) => {
             contract_violation(format_args!(
                 "proc_pidinfo({pid}) failed: {report}",
