@@ -162,6 +162,53 @@ fn a_skip_is_moot_only_over_a_killed_tree_after_the_own_reap() {
     }
 }
 
+// A skip over an untrusted root settles the same for a tree call and a drop =====
+
+/// A kill that skipped what the root's number names, because the root is untrusted, saw no member
+/// running: a tree call (`kill_tree`) answers it with an error but leaves the tree as it was, so a
+/// later drop over it settles as a drop alone does, with nothing to warn of beyond the skip it already
+/// words. `holders`: the macOS fd marker's sweep of its holders, or none for a mechanism without one.
+///
+/// Mutant: the tree call settles the skip as a kill that ran and left something, which leaves the
+/// tree unvouched, so a drop after it warns that the tree could not be vouched for.
+#[skuld::test]
+fn a_tree_call_that_skipped_an_untrusted_root_leaves_the_drop_what_a_drop_alone_finds() {
+    use super::SkipCall;
+    use crate::containment::dispatch::TreeSignal;
+
+    let untrusted = |swept: bool| Skip {
+        holders: swept.then_some(Ok(())),
+        ..skip(Why::untrusted(&crate::signal::RootState::Unpinned))
+    };
+    let call = SkipCall {
+        op: "skip_untrusted_probe_c3",
+        pid: PID,
+        signal: TreeSignal::Kill,
+        earlier: None,
+    };
+    for swept in [false, true] {
+        let alone = killed(false);
+        assert!(
+            alone
+                .settle_for_drop(TreeKillOutcome::Skipped(untrusted(swept)), false)
+                .is_none(),
+            "swept {swept}: a drop alone has nothing to warn of"
+        );
+
+        let called = killed(false);
+        call.answer(&called, untrusted(swept), None)
+            .answer
+            .expect_err("a skipped kill is no success");
+        assert!(!called.is_killed(), "swept {swept}: a skip kills nothing");
+        let left = called.settle_for_drop(TreeKillOutcome::Skipped(untrusted(swept)), false);
+        assert!(
+            left.is_none(),
+            "swept {swept}: the drop after a skipped tree call warns as a drop alone does: {:?}",
+            left.map(|left| left.text)
+        );
+    }
+}
+
 // The other failures of a skipped call join the error it returns =====
 
 /// A skip whose reason holds an error with the code `code`.

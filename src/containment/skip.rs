@@ -161,7 +161,7 @@ pub(crate) use call::SkipCall;
 #[cfg(unix)]
 mod call {
     use super::{Skip, Why};
-    use crate::containment::dispatch::{Keeping, Settled, TreeKillOutcome, TreeSignal, Unkilled};
+    use crate::containment::dispatch::{Keeping, Settled, TreeKillOutcome, TreeSignal};
     use crate::containment::root::Refusal;
     use crate::containment::Tree;
     use crate::error::Error;
@@ -201,17 +201,33 @@ mod call {
                 Skip {
                     why: Why::Untrusted { why, cause },
                     action,
+                    root_alone,
                     holders,
-                    ..
                 } => {
-                    let error = self.untrusted(&action, &why, cause, holders);
-                    return match self.signal {
-                        TreeSignal::Kill => tree.settle_for_kill_tree(
-                            TreeKillOutcome::Ran(Err(Unkilled::from(error))),
-                            false,
-                            Keeping::Nothing,
-                        ),
-                        TreeSignal::Term => Settled::of(Err(error)),
+                    let swept = holders.is_some();
+                    let mut killed_again = Vec::new();
+                    let holders = match self.signal {
+                        // The kill is settled as a drop settles it, a skip: it saw no member running.
+                        TreeSignal::Kill => {
+                            let skipped = Skip {
+                                action: action.clone(),
+                                why: Why::Untrusted {
+                                    why: why.clone(),
+                                    cause: cause.clone(),
+                                },
+                                root_alone,
+                                holders,
+                            };
+                            let settled =
+                                tree.settle_for_kill_tree(TreeKillOutcome::Skipped(skipped), false, Keeping::Nothing);
+                            killed_again = settled.killed_again;
+                            swept.then_some(settled.answer)
+                        }
+                        TreeSignal::Term => holders,
+                    };
+                    return Settled {
+                        answer: Err(self.untrusted(&action, &why, cause, holders)),
+                        killed_again,
                     };
                 }
                 skip => skip,
