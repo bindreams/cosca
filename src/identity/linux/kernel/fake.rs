@@ -11,19 +11,17 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags};
 
 use super::Kernel;
-use crate::identity::{ProcDir, ViewUnreadable};
+use crate::identity::{ProcDir, ReadFailure, ViewUnreadable};
 
 pub(crate) struct FakeKernel<'a> {
     /// What answers a call the tables have nothing for. `None`: such a call panics.
     real: Option<&'a dyn Kernel>,
     open_proc: Option<Errno>,
-    /// A path, the number of earlier reads of it before the row answers, and the answer. `Err` is a
-    /// raw errno.
-    reads: Vec<(String, usize, Result<Vec<u8>, i32>)>,
+    reads: Vec<ReadRow>,
     /// How many times each path has been read.
     read_counts: Mutex<Vec<(String, usize)>>,
-    /// The listing of any `/proc`: the pids, or a raw errno.
-    pids: Option<Result<Vec<u32>, i32>>,
+    /// The listing of any `/proc`: the pids, or the call that failed and its raw errno.
+    pids: Option<Result<Vec<u32>, (ReadCall, i32)>>,
     signal_probes: Vec<(Pid, Result<(), Errno>)>,
     /// A pid, the flags the row answers (`None`: any), and the answer.
     pidfd_opens: Vec<(Pid, Option<PidfdFlags>, PidfdRow)>,
@@ -32,6 +30,27 @@ pub(crate) struct FakeKernel<'a> {
     /// The descriptors this kernel has handed out, so that `pidfs_ino` can tell whose they are.
     opened: Mutex<Vec<Opened>>,
 }
+
+/// The call of a read or listing that a row's errno answers for.
+#[derive(Clone, Copy)]
+enum ReadCall {
+    Open,
+    Read,
+}
+
+impl ReadCall {
+    fn failure(self, errno: i32) -> ReadFailure {
+        let error = io::Error::from_raw_os_error(errno);
+        match self {
+            ReadCall::Open => ReadFailure::Open(error),
+            ReadCall::Read => ReadFailure::Read(error),
+        }
+    }
+}
+
+/// A read row: the path, the number of earlier reads of it before the row answers, and the answer.
+/// `Err` is the call that failed and its raw errno.
+type ReadRow = (String, usize, Result<Vec<u8>, (ReadCall, i32)>);
 
 /// A `pidfs_ino` row: the pid, the path whose earlier read it waits for, and the answer.
 type PidfsRow = (Pid, Option<String>, Result<Option<u64>, Errno>);
@@ -87,22 +106,40 @@ impl<'a> FakeKernel<'a> {
             .on_read(&format!("{pid}/stat"), Err(errno))
     }
 
-    /// Reading `path` under any `/proc` answers `answer`: the bytes, or a raw errno.
+    /// Reading `path` under any `/proc` answers `answer`: the bytes, or the raw errno of its
+    /// `openat2`.
     pub(crate) fn on_read(self, path: &str, answer: Result<&[u8], i32>) -> Self {
         self.on_read_after(path, 0, answer)
     }
 
-    /// From the read of `path` that follows `earlier_reads` reads of it, answers `answer`. Of the
-    /// rows whose count has been reached, the one with the highest count wins.
-    pub(crate) fn on_read_after(mut self, path: &str, earlier_reads: usize, answer: Result<&[u8], i32>) -> Self {
-        self.reads
-            .push((path.to_owned(), earlier_reads, answer.map(<[u8]>::to_vec)));
+    /// Reading `path` under any `/proc` opens it, and its `read(2)` fails with the raw `errno`.
+    pub(crate) fn on_read_failing_after_open(mut self, path: &str, errno: i32) -> Self {
+        self.reads.push((path.to_owned(), 0, Err((ReadCall::Read, errno))));
         self
     }
 
-    /// Listing any `/proc` answers `answer`: the pids, or a raw errno.
+    /// From the read of `path` that follows `earlier_reads` reads of it, answers `answer`, as
+    /// [`on_read`](Self::on_read) does. Of the rows whose count has been reached, the one with the
+    /// highest count wins.
+    pub(crate) fn on_read_after(mut self, path: &str, earlier_reads: usize, answer: Result<&[u8], i32>) -> Self {
+        self.reads.push((
+            path.to_owned(),
+            earlier_reads,
+            answer.map(<[u8]>::to_vec).map_err(|errno| (ReadCall::Open, errno)),
+        ));
+        self
+    }
+
+    /// Listing any `/proc` answers `answer`: the pids, or the raw errno of its `openat2`.
     pub(crate) fn on_pids(mut self, answer: Result<&[u32], i32>) -> Self {
-        self.pids = Some(answer.map(<[u32]>::to_vec));
+        self.pids = Some(answer.map(<[u32]>::to_vec).map_err(|errno| (ReadCall::Open, errno)));
+        self
+    }
+
+    /// Listing any `/proc` opens it, and the listing itself (the directory's setup, or `getdents64`)
+    /// fails with the raw `errno`.
+    pub(crate) fn on_pids_failing_after_open(mut self, errno: i32) -> Self {
+        self.pids = Some(Err((ReadCall::Read, errno)));
         self
     }
 
@@ -268,7 +305,7 @@ impl Kernel for FakeKernel<'_> {
         }
     }
 
-    fn read(&self, dir: &ProcDir, path: &str) -> io::Result<Vec<u8>> {
+    fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure> {
         let earlier = self.count_read(path);
         let row = self
             .reads
@@ -277,15 +314,15 @@ impl Kernel for FakeKernel<'_> {
             .max_by_key(|(_, from, _)| *from);
         match row {
             Some((_, _, Ok(bytes))) => Ok(bytes.clone()),
-            Some((_, _, Err(errno))) => Err(io::Error::from_raw_os_error(*errno)),
+            Some((_, _, Err((call, errno)))) => Err(call.failure(*errno)),
             None => self.real(&format!("read of {path}")).read(dir, path),
         }
     }
 
-    fn pids(&self, dir: &ProcDir) -> io::Result<Vec<u32>> {
+    fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure> {
         match &self.pids {
             Some(Ok(pids)) => Ok(pids.clone()),
-            Some(Err(errno)) => Err(io::Error::from_raw_os_error(*errno)),
+            Some(Err((call, errno))) => Err(call.failure(*errno)),
             None => self.real("pids").pids(dir),
         }
     }

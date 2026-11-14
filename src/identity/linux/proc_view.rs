@@ -63,6 +63,24 @@ impl ProcView {
     }
 }
 
+/// A failed [`ProcDir::read`] or [`ProcDir::pids`], by the call that failed: only an `openat2`'s errno
+/// can be a refusal ([`FailedCall::openat2`]), and only a file or directory that opened can fail
+/// reading it (`read(2)`, or the directory's setup and `getdents64`).
+#[derive(Debug)]
+pub(crate) enum ReadFailure {
+    Open(io::Error),
+    Read(io::Error),
+}
+
+impl ReadFailure {
+    /// The OS error, whichever call failed.
+    pub(crate) fn into_io(self) -> io::Error {
+        match self {
+            ReadFailure::Open(e) | ReadFailure::Read(e) => e,
+        }
+    }
+}
+
 /// Why a `/proc` view or pidfd cross-check could not be established.
 #[derive(Debug)]
 pub(crate) struct ViewUnreadable {
@@ -184,15 +202,13 @@ impl ProcDir {
     }
 
     /// Read the file at `path` under this `/proc`.
-    pub(crate) fn read(&self, path: &str) -> io::Result<Vec<u8>> {
+    pub(crate) fn read(&self, path: &str) -> Result<Vec<u8>, ReadFailure> {
+        let file = self.open_beneath(path, OFlags::RDONLY).map_err(ReadFailure::Open)?;
         let mut bytes = Vec::new();
-        std::fs::File::from(self.open_beneath(path, OFlags::RDONLY)?).read_to_end(&mut bytes)?;
+        std::fs::File::from(file)
+            .read_to_end(&mut bytes)
+            .map_err(ReadFailure::Read)?;
         Ok(bytes)
-    }
-
-    /// [`read`](Self::read) as UTF-8 text.
-    pub(crate) fn read_to_string(&self, path: &str) -> io::Result<String> {
-        utf8(self.read(path)?)
     }
 
     /// The target of the symlink at `path` under this `/proc`, without following it.
@@ -201,10 +217,14 @@ impl ProcDir {
         Ok(rustix::fs::readlinkat(&link, "", Vec::new())?.into_bytes())
     }
 
-    /// The pids listed under this `/proc`: its decimal-named entries.
-    pub(super) fn pids(&self) -> io::Result<Vec<u32>> {
-        let dir = rustix::fs::Dir::new(self.open_beneath(".", OFlags::RDONLY | OFlags::DIRECTORY)?)?;
-        collect_pids(dir.map(|entry| Ok(entry?.file_name().to_bytes().to_vec())))
+    /// The pids listed under this `/proc`: its decimal-named entries. The `openat2` of `.` is
+    /// [`ReadFailure::Open`]; the directory's setup and listing are [`ReadFailure::Read`].
+    pub(super) fn pids(&self) -> Result<Vec<u32>, ReadFailure> {
+        let fd = self
+            .open_beneath(".", OFlags::RDONLY | OFlags::DIRECTORY)
+            .map_err(ReadFailure::Open)?;
+        let dir = rustix::fs::Dir::new(fd).map_err(|e| ReadFailure::Read(e.into()))?;
+        collect_pids(dir.map(|entry| Ok(entry?.file_name().to_bytes().to_vec()))).map_err(ReadFailure::Read)
     }
 
     /// Whether the symlink at `path` under this `/proc` exists, without following it.
@@ -243,7 +263,11 @@ pub(crate) fn proc_view_with(kernel: &dyn Kernel) -> ProcView {
         Ok(dir) => dir,
         Err(why) => return ProcView::Unassessable(why),
     };
-    let status = match kernel.read(&dir, "self/status").and_then(utf8) {
+    let status = match kernel
+        .read(&dir, "self/status")
+        .map_err(ReadFailure::into_io)
+        .and_then(utf8)
+    {
         Ok(text) => text,
         Err(e) => {
             return ProcView::Unassessable(ViewUnreadable::of_read(UNREADABLE_STATUS_REASON, e));
@@ -366,6 +390,7 @@ pub(crate) fn pidfd_pid_in(
 ) -> Result<PidfdTarget, ViewUnreadable> {
     let fdinfo = kernel
         .read(dir, &format!("thread-self/fdinfo/{}", pidfd.as_raw_fd()))
+        .map_err(ReadFailure::into_io)
         .and_then(utf8)
         .map_err(|e| ViewUnreadable::of_read("the pidfd's fdinfo could not be read", e))?;
     parse_fdinfo_pid(&fdinfo).ok_or_else(|| ViewUnreadable::new("the pidfd's fdinfo has no parseable Pid line", None))

@@ -1,7 +1,6 @@
 //! `open_verified_with` against REAL namespace layouts, in re-exec'd children that own private
 //! mount or pid namespaces (see `test_child::namespaces` for the group's gating).
 
-use std::io;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +12,8 @@ use rustix::process::Pid;
 use super::open_tests::LiveNonLeaderTid;
 use crate::error::Error;
 use crate::identity::{
-    proc_view_with, FakeKernel, HostKernel, Kernel, ProcDir, ProcView, ViewUnreadable, UNREADABLE_STATUS_REASON,
+    proc_view_with, FakeKernel, HostKernel, Kernel, ProcDir, ProcView, ReadFailure, ViewUnreadable,
+    UNREADABLE_STATUS_REASON,
 };
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
@@ -195,7 +195,7 @@ impl Kernel for PauseKernel<'_> {
         self.inner.open_proc()
     }
 
-    fn read(&self, dir: &ProcDir, path: &str) -> io::Result<Vec<u8>> {
+    fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure> {
         if path == format!("{}/stat", self.pid) {
             let pause = self.pause.lock().expect("no panic holds the pause").take();
             if let Some(pause) = pause {
@@ -205,7 +205,7 @@ impl Kernel for PauseKernel<'_> {
         self.inner.read(dir, path)
     }
 
-    fn pids(&self, dir: &ProcDir) -> io::Result<Vec<u32>> {
+    fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure> {
         self.inner.pids(dir)
     }
 

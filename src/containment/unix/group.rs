@@ -175,24 +175,26 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
     // A listing error makes the whole scan unreliable; propagate it.
     let pids = kernel
         .pids(&proc_dir)
-        .map_err(|e| match crate::identity::pid_stat::refusal(&e) {
+        .map_err(|failure| match crate::identity::pid_file::open_refusal(&failure) {
             Some(refusal) => refused_listing(pgid, None, &refusal),
-            None => e,
+            None => failure.into_io(),
         })?;
     for pid in pids {
-        let stat = match crate::identity::pid_stat::read_in_scan(kernel, &proc_dir, pid) {
-            Ok(crate::identity::pid_stat::PidStat::Read(bytes)) => bytes,
+        let stat = match crate::identity::pid_file::read(kernel, &proc_dir, pid, "stat") {
+            Ok(crate::identity::pid_file::ReadOutcome::Read(bytes)) => bytes,
             // A pid outside a `pgid` listing carries no information about it; the residual (a
             // foreign-uid member of `pgid` itself, hidden by `hidepid`) is documented on
             // `Child::kill_tree`.
-            Ok(crate::identity::pid_stat::PidStat::Skipped(e)) => {
+            Ok(
+                crate::identity::pid_file::ReadOutcome::Exited(e) | crate::identity::pid_file::ReadOutcome::Hidden(e),
+            ) => {
                 log::debug!(
                     "containment::unix::group::members: /proc/{pid}/stat unreadable ({report}); excluding it",
                     report = crate::error::Report(&e)
                 );
                 continue;
             }
-            Ok(crate::identity::pid_stat::PidStat::Refused(refusal)) => {
+            Ok(crate::identity::pid_file::ReadOutcome::Refused(refusal)) => {
                 return Err(refused_listing(pgid, Some(pid), &refusal))
             }
             // Excluding it could clear a live group. `Unreadable` is a layer of the chain (see its doc),
