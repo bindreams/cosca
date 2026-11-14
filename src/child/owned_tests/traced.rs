@@ -289,13 +289,13 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
 
     let (tracee, stdin, unique) = tracee_with_unique();
     let pid = tracee.pid();
-    let (owned, mac) = super::macos::watch(pid, unique);
+    let owned = super::macos::watch(pid, unique);
     let pending = RefCell::new(Some(tracer::start(Mode::Auto)));
     let helper = Rc::new(RefCell::new(None));
     let stdin = RefCell::new(Some(stdin));
-    let _rounds = super::macos::on_rounds(&mac, {
+    let _rounds = super::macos::on_rounds({
         let helper = Rc::clone(&helper);
-        move |round, _| match round {
+        move |round| match round {
             0 => {
                 let mut attached = pending.borrow_mut().take().expect("the helper").attach_unheld(pid);
                 assert_eq!(attached.recv(), Report::Attached);
@@ -337,8 +337,8 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
     assert_eq!(outer.recv(), Report::Attached);
     let outer_pid = outer.helper_pid();
     let stdin = RefCell::new(Some(stdin));
-    let (owned, mac) = super::macos::watch(pid, unique);
-    let _rounds = super::macos::on_rounds(&mac, move |round, _| match round {
+    let owned = super::macos::watch(pid, unique);
+    let _rounds = super::macos::on_rounds(move |round| match round {
         0 => {
             test_hooks::send_signal(outer_pid, libc::SIGCONT);
             true

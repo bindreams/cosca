@@ -281,25 +281,6 @@ pub(crate) fn exit_record(status: i32) -> Record {
     }
 }
 
-/// The registration of an exit watch (`ExitWatch::proc_exit`): the exit of `pid` and nothing else.
-pub(crate) fn exit_watch(pid: u32) -> Subscription {
-    Subscription::Process {
-        pid,
-        signals: false,
-        reap: false,
-    }
-}
-
-/// The registration of a reap waiter (`await_reapable::register`): the exit, the signals and the
-/// reap of `pid`.
-pub(crate) fn reap_watch(pid: u32) -> Subscription {
-    Subscription::Process {
-        pid,
-        signals: true,
-        reap: true,
-    }
-}
-
 /// A short BSD-info record that states a parent and a state, and nothing else.
 pub(crate) fn short_info(ppid: u32, status: u32) -> libc::proc_bsdshortinfo {
     // SAFETY: all-zero is a valid `proc_bsdshortinfo`.

@@ -282,15 +282,19 @@ impl ExitWatch {
         self
     }
 
-    /// Arm `NOTE_EXIT` for `pid`. A pid that is already gone is a watch that reads as exited.
-    pub(crate) fn proc_exit(kernel: &dyn Kernel, pid: u32) -> Result<Self, Error> {
-        let kq = Kqueue::new()?;
-        let exit = Subscription::Process {
+    /// What [`ExitWatch::proc_exit`] registers: the exit of `pid` and nothing else.
+    pub(crate) fn registration(pid: u32) -> Subscription {
+        Subscription::Process {
             pid,
             signals: false,
             reap: false,
-        };
-        match kernel.subscribe(&kq, exit) {
+        }
+    }
+
+    /// Arm `NOTE_EXIT` for `pid`. A pid that is already gone is a watch that reads as exited.
+    pub(crate) fn proc_exit(kernel: &dyn Kernel, pid: u32) -> Result<Self, Error> {
+        let kq = Kqueue::new()?;
+        match kernel.subscribe(&kq, Self::registration(pid)) {
             Ok(()) => Ok(Self::new(kq)),
             Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => Ok(Self::new(kq).exited_now()),
             Err(e) => Err(Error::Io(e)),
