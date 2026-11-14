@@ -20,10 +20,12 @@ pub(crate) fn process_parents(kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid
             Some(refusal) => refused(&refusal),
             None => unassessable(&why.reason, why.source),
         })?;
-    let pids = kernel.pids(&dir).map_err(|e| match pid_file::refusal(&e) {
-        Some(refusal) => refused(&refusal),
-        None => unassessable("/proc could not be listed", Some(e)),
-    })?;
+    let pids = kernel
+        .pids(&dir)
+        .map_err(|failure| match pid_file::open_refusal(&failure) {
+            Some(refusal) => refused(&refusal),
+            None => unassessable("/proc could not be listed", Some(failure.into_io())),
+        })?;
     for pid in pids {
         let stat = match pid_file::read(kernel, &dir, pid, "stat") {
             Ok(ReadOutcome::Read(stat)) => stat,

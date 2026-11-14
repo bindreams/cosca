@@ -20,8 +20,8 @@ pub(crate) struct FakeKernel<'a> {
     reads: Vec<ReadRow>,
     /// How many times each path has been read.
     read_counts: Mutex<Vec<(String, usize)>>,
-    /// The listing of any `/proc`: the pids, or a raw errno.
-    pids: Option<Result<Vec<u32>, i32>>,
+    /// The listing of any `/proc`: the pids, or the call that failed and its raw errno.
+    pids: Option<Result<Vec<u32>, (ReadCall, i32)>>,
     signal_probes: Vec<(Pid, Result<(), Errno>)>,
     /// A pid, the flags the row answers (`None`: any), and the answer.
     pidfd_opens: Vec<(Pid, Option<PidfdFlags>, PidfdRow)>,
@@ -31,11 +31,21 @@ pub(crate) struct FakeKernel<'a> {
     opened: Mutex<Vec<Opened>>,
 }
 
-/// The call of a read that a row's errno answers for.
+/// The call of a read or listing that a row's errno answers for.
 #[derive(Clone, Copy)]
 enum ReadCall {
     Open,
     Read,
+}
+
+impl ReadCall {
+    fn failure(self, errno: i32) -> ReadFailure {
+        let error = io::Error::from_raw_os_error(errno);
+        match self {
+            ReadCall::Open => ReadFailure::Open(error),
+            ReadCall::Read => ReadFailure::Read(error),
+        }
+    }
 }
 
 /// A read row: the path, the number of earlier reads of it before the row answers, and the answer.
@@ -120,9 +130,16 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
-    /// Listing any `/proc` answers `answer`: the pids, or a raw errno.
+    /// Listing any `/proc` answers `answer`: the pids, or the raw errno of its `openat2`.
     pub(crate) fn on_pids(mut self, answer: Result<&[u32], i32>) -> Self {
-        self.pids = Some(answer.map(<[u32]>::to_vec));
+        self.pids = Some(answer.map(<[u32]>::to_vec).map_err(|errno| (ReadCall::Open, errno)));
+        self
+    }
+
+    /// Listing any `/proc` opens it, and the listing itself (the directory's setup, or `getdents64`)
+    /// fails with the raw `errno`.
+    pub(crate) fn on_pids_failing_after_open(mut self, errno: i32) -> Self {
+        self.pids = Some(Err((ReadCall::Read, errno)));
         self
     }
 
@@ -297,16 +314,15 @@ impl Kernel for FakeKernel<'_> {
             .max_by_key(|(_, from, _)| *from);
         match row {
             Some((_, _, Ok(bytes))) => Ok(bytes.clone()),
-            Some((_, _, Err((ReadCall::Open, errno)))) => Err(ReadFailure::Open(io::Error::from_raw_os_error(*errno))),
-            Some((_, _, Err((ReadCall::Read, errno)))) => Err(ReadFailure::Read(io::Error::from_raw_os_error(*errno))),
+            Some((_, _, Err((call, errno)))) => Err(call.failure(*errno)),
             None => self.real(&format!("read of {path}")).read(dir, path),
         }
     }
 
-    fn pids(&self, dir: &ProcDir) -> io::Result<Vec<u32>> {
+    fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure> {
         match &self.pids {
             Some(Ok(pids)) => Ok(pids.clone()),
-            Some(Err(errno)) => Err(io::Error::from_raw_os_error(*errno)),
+            Some(Err((call, errno))) => Err(call.failure(*errno)),
             None => self.real("pids").pids(dir),
         }
     }

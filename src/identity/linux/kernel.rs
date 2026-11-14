@@ -4,7 +4,6 @@
 //! The logic lives once, in functions that take `&dyn Kernel`; every production caller passes
 //! `&HostKernel`. Reads no test answers for stay raw until a test needs them.
 
-use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
 
 use rustix::fs::{fstat, fstatfs};
@@ -37,8 +36,9 @@ pub(crate) trait Kernel: Sync {
     /// or `thread-self/fdinfo/<fd>`. A failure says whether the `openat2` or `read(2)` failed.
     fn read(&self, dir: &ProcDir, path: &str) -> Result<Vec<u8>, ReadFailure>;
 
-    /// The numeric entries of `dir` (`ProcDir::pids`).
-    fn pids(&self, dir: &ProcDir) -> io::Result<Vec<u32>>;
+    /// The numeric entries of `dir` (`ProcDir::pids`). A failure says whether the `openat2` of `dir`
+    /// or its listing failed.
+    fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure>;
 
     /// `kill(target, 0)`. The caller decides what is a kill target (`probe::signal_target`); the
     /// kernel is asked only about one.
@@ -68,7 +68,7 @@ impl Kernel for HostKernel {
         dir.read(path)
     }
 
-    fn pids(&self, dir: &ProcDir) -> io::Result<Vec<u32>> {
+    fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure> {
         dir.pids()
     }
 

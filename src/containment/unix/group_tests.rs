@@ -948,6 +948,24 @@ fn members_is_unsupported_when_the_listing_or_the_view_read_is_refused() {
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
 }
 
+/// A listing that fails after `/proc` opened is no `openat2` refusal, whatever its errno: its own
+/// error, never one that says `openat2` is required. Mutant: "a listing failure is judged as an
+/// `openat2` failure".
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn members_is_not_unsupported_when_the_listing_fails_after_the_open() {
+    for errno in [libc::ENOSYS, libc::EPERM, libc::ENODEV] {
+        let kernel = FakeKernel::over(&HostKernel)
+            .same_view()
+            .on_pids_failing_after_open(errno);
+        let err = members(&kernel, i32::MAX).expect_err("an unlistable /proc lists nothing");
+        let text = crate::error::Report(&err).to_string();
+        // Not `err.kind()`: an `ENOSYS` of its own is `Unsupported` by std's mapping.
+        assert!(!text.contains("requires openat2"), "{errno}: {text}");
+        assert_eq!(crate::error::first_os_code(&err), Some(errno), "{errno}: {text}");
+    }
+}
+
 /// `PID` is in group 1234 by the scan's `stat`; the identity read that follows makes its own.
 /// `stat_fixture` puts the process in group 1234.
 #[cfg(target_os = "linux")]

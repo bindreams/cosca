@@ -231,7 +231,7 @@ pub(crate) fn proc_hidden_as() -> Option<i32> {
 }
 
 /// `kernel` with `pid`'s `<pid>/cgroup` read failing with [`proc_hidden_as`]'s errno (as the `openat2`'s
-/// answer), or `None` while neither hook is armed: the one place the hooks become a `FakeKernel` row.
+/// answer), or `None` while neither hook is armed.
 pub(crate) fn hidden_cgroup_of(
     kernel: &dyn crate::identity::Kernel,
     pid: u32,

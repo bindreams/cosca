@@ -73,13 +73,10 @@ pub(crate) fn pidfd_cgroup_id(pidfd: BorrowedFd<'_>) -> io::Result<Option<u64>> 
 /// (see [`names_leaf`]): `other_id` says the task's pidfd gave a cgroup id other than the leaf's,
 /// and `recorded` answers for the leaf's own path with ` (deleted)` after it.
 ///
-/// Reads through `kernel` (and, in a test build, the containment `fault` hooks), as
-/// [`pid_file::read`](crate::identity::pid_file::read) decides a failure. A read that is a
-/// [`Refusal`](crate::identity::Refusal) fails with an `Unsupported` error that says so, carried as
-/// the `io::Error` this returns; a pid that is not there for us (`ENOENT`, `ESRCH`, `hidepid`) fails
-/// with the read's own error; any other failure fails with a context, "reading pid N's cgroup", over
-/// the classified cause: the [`Unreadable`](crate::identity::pid_file::Unreadable) as the one layer
-/// below it, or a list of it and the failure that came with it.
+/// Reads `pid`'s cgroup through `kernel`. A refusal is an `Unsupported` error, carried as the
+/// `io::Error` this returns; a pid that is not there for us fails with the read's own error; any
+/// other failure is the [`Unreadable`](crate::identity::pid_file::Unreadable), which names the pid and
+/// its file (with the pid's `EPERM` beside a failed re-check).
 pub(crate) fn proc_names(
     kernel: &dyn crate::identity::Kernel,
     leaf_path: &str,
@@ -87,7 +84,7 @@ pub(crate) fn proc_names(
     recorded: impl FnOnce() -> Option<bool>,
     other_id: bool,
 ) -> io::Result<bool> {
-    use crate::identity::pid_file::{self, ReadOutcome};
+    use crate::identity::pid_file::ReadOutcome;
 
     let proc_dir = match crate::identity::proc_view_with(kernel) {
         crate::identity::ProcView::Same(dir) => dir,
@@ -99,30 +96,32 @@ pub(crate) fn proc_names(
         }
         crate::identity::ProcView::Unassessable(why) => return Err(view_unreadable(pid, why)),
     };
-    // A test hides the task as `hidepid` does: the `openat2` of its file answers the hook's errno.
-    #[cfg(test)]
-    let hiding = super::fault::hidden_cgroup_of(kernel, pid);
-    #[cfg(test)]
-    let kernel: &dyn crate::identity::Kernel = hiding
-        .as_ref()
-        .map_or(kernel, |hiding| hiding as &dyn crate::identity::Kernel);
-    let text = match pid_file::read(kernel, &proc_dir, pid, "cgroup") {
+    let text = match read_cgroup(kernel, &proc_dir, pid) {
         Ok(ReadOutcome::Read(bytes)) => crate::identity::utf8(bytes)?,
         Ok(ReadOutcome::Exited(e) | ReadOutcome::Hidden(e)) => return Err(e),
         Ok(ReadOutcome::Refused(refusal)) => {
             return Err(refusal.unsupported_io(format!("reading pid {pid}'s cgroup")));
         }
-        // The failure with the one that came with it, as layers of the chain.
-        Err(unreadable) => {
-            return Err(crate::error::io_context_over(
-                format!("reading pid {pid}'s cgroup"),
-                unreadable.into_cause(),
-            ))
-        }
+        Err(unreadable) => return Err(unreadable.into_io()),
     };
     let path = parse_v2_relative_path(&text)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cgroup v2 `0::` line"))?;
     names_leaf(path, leaf_path, other_id, recorded)
+}
+
+/// `pid`'s cgroup file through [`pid_file::read`](crate::identity::pid_file::read). A test build
+/// reads through the one kernel that [`fault::hidden_cgroup_of`](super::fault::hidden_cgroup_of) makes
+/// of an armed hook, which hides the file as `hidepid` does.
+fn read_cgroup(
+    kernel: &dyn crate::identity::Kernel,
+    dir: &crate::identity::ProcDir,
+    pid: u32,
+) -> Result<crate::identity::pid_file::ReadOutcome, crate::identity::pid_file::Unreadable> {
+    #[cfg(test)]
+    if let Some(hiding) = super::fault::hidden_cgroup_of(kernel, pid) {
+        return crate::identity::pid_file::read(&hiding, dir, pid, "cgroup");
+    }
+    crate::identity::pid_file::read(kernel, dir, pid, "cgroup")
 }
 
 /// The error of reading `pid`'s cgroup through a `/proc` view that could not be established, `why`:
@@ -990,27 +989,17 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
         Ok(2) if i32::from(ready[1]) != libc::SIGKILL => ProbeRead::Answer(Err(Unreadable::Probe(io::Error::other(
             "the probe's child could not ask to die with its parent",
         )))),
-        // The child is this process's own and unreaped, so its `/proc` entry exists: a read that
-        // is not shown it is `/proc` hiding it. The read is by the child's number, so it counts only
-        // if the child, which its pidfd names, had not exited when the read was made: an exited
-        // child may be reaped elsewhere and its number taken.
+        // The child is ours and unreaped, so a read that is not shown its entry is `/proc` hiding it
+        // (`ENOENT` under `hidepid=2`, `EPERM` under `hidepid=1`, measured on Linux 7.0); an exit is
+        // the probe's own failure. The read is by the child's number, so it counts only if its pidfd
+        // shows the child had not exited (else the number may be reused).
         Ok(2) => {
-            use crate::identity::pid_file::{self, ReadOutcome};
+            use crate::identity::pid_file::ReadOutcome;
 
             let child = u32::try_from(pid).expect("a forked child's pid is positive");
-            // A `/proc` that hides the child answers `ENOENT` under `hidepid=2`, `EPERM` under
-            // `hidepid=1` (measured on Linux 7.0); a test forces one as the `openat2`'s answer.
-            #[cfg(test)]
-            let hiding = super::fault::hidden_cgroup_of(kernel, child);
-            #[cfg(test)]
-            let kernel: &dyn crate::identity::Kernel = hiding
-                .as_ref()
-                .map_or(kernel, |hiding| hiding as &dyn crate::identity::Kernel);
-            let read = match pid_file::read(kernel, &proc_dir, child, "cgroup") {
+            let read = match read_cgroup(kernel, &proc_dir, child) {
                 Ok(ReadOutcome::Read(bytes)) => crate::identity::utf8(bytes).map(drop).map_err(Unreadable::Probe),
                 Ok(ReadOutcome::Hidden(e)) => Err(Unreadable::Hidden(e)),
-                // The child is unreaped, so an exit is no `hidepid`. The peek below answering `Running`
-                // contradicts the read, and the probe's own failure is then `Probe(ESRCH)`.
                 Ok(ReadOutcome::Exited(e)) => Err(Unreadable::Probe(e)),
                 Ok(ReadOutcome::Refused(refusal)) => Err(Unreadable::Refused(refusal)),
                 Err(unreadable) => Err(Unreadable::Read(unreadable)),

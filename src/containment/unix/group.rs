@@ -175,9 +175,9 @@ pub(crate) fn members(kernel: &dyn crate::identity::Kernel, pgid: i32) -> std::i
     // A listing error makes the whole scan unreliable; propagate it.
     let pids = kernel
         .pids(&proc_dir)
-        .map_err(|e| match crate::identity::pid_file::refusal(&e) {
+        .map_err(|failure| match crate::identity::pid_file::open_refusal(&failure) {
             Some(refusal) => refused_listing(pgid, None, &refusal),
-            None => e,
+            None => failure.into_io(),
         })?;
     for pid in pids {
         let stat = match crate::identity::pid_file::read(kernel, &proc_dir, pid, "stat") {

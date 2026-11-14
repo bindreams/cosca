@@ -259,6 +259,25 @@ fn an_unlistable_proc_is_unassessable_naming_the_errno() {
     }
 }
 
+/// A listing that fails after `/proc` opened is no `openat2` refusal, whatever its errno: it is
+/// `Unassessable` naming the errno, never `Unsupported`. Mutant: "a listing failure is judged as an
+/// `openat2` failure".
+#[skuld::test]
+fn a_listing_failing_after_the_open_is_unassessable_not_unsupported() {
+    for errno in [libc::ENOSYS, libc::EPERM, libc::ENODEV] {
+        let kernel = FakeKernel::over(&HostKernel)
+            .same_view()
+            .on_pids_failing_after_open(errno);
+        match process_parents(&kernel) {
+            Err(crate::error::Error::Unassessable { detail, source }) => {
+                assert!(detail.contains("/proc could not be listed"), "{errno}: {detail}");
+                assert_eq!(source.and_then(|e| crate::error::first_os_code(&*e)), Some(errno));
+            }
+            other => panic!("{errno}: expected Unassessable, got {other:?}"),
+        }
+    }
+}
+
 /// The kernel prints a parseable `stat` for every pid, so an unparsable one is a contract
 /// violation, not an absence: the snapshot names the pid instead of dropping it. Mutant: "an
 /// unparsable `stat` drops the pid".

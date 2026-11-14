@@ -129,8 +129,10 @@ enum StateUnknown {
     Skipped(std::io::Error),
     /// `<pid>/stat` could not be read: the `openat2` was refused. The error says what cosca requires.
     Refused(crate::error::Error),
-    /// `<pid>/stat` could not be read, for another reason.
-    Unreadable(crate::identity::pid_file::Unreadable),
+    /// `<pid>/stat` could not be read, for another reason: the failure as
+    /// [`Unreadable::into_cause`](crate::identity::pid_file::Unreadable::into_cause) makes it, with the
+    /// pid's own `EPERM` beside a failed re-check.
+    Unreadable(crate::error::Error),
     /// `<pid>/stat` has no state field.
     Unparsable(Vec<u8>),
 }
@@ -166,7 +168,7 @@ impl std::error::Error for StateUnknown {
 ///
 /// The only consumer, [`proc_state`], logs why at `debug` and drops no member: an unknown state only
 /// leaves a failed placement undiagnosed. So the failure of the `stat` read stays as
-/// [`pid_file::read`](crate::identity::pid_file::read) classed it, for the line that is logged.
+/// [`pid_file::read`](crate::identity::pid_file::read) classed it.
 #[cfg(target_os = "linux")]
 fn read_proc_state(kernel: &dyn crate::identity::Kernel, pid: u32) -> Result<char, StateUnknown> {
     use crate::identity::pid_file::{self, ReadOutcome};
@@ -180,7 +182,7 @@ fn read_proc_state(kernel: &dyn crate::identity::Kernel, pid: u32) -> Result<cha
         Ok(ReadOutcome::Refused(refusal)) => Err(StateUnknown::Refused(
             refusal.unsupported(format!("reading pid {pid}'s stat")),
         )),
-        Err(unreadable) => Err(StateUnknown::Unreadable(unreadable)),
+        Err(unreadable) => Err(StateUnknown::Unreadable(unreadable.into_cause())),
     }
 }
 

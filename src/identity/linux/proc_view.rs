@@ -63,13 +63,12 @@ impl ProcView {
     }
 }
 
-/// A failed [`ProcDir::read`], by the call that failed: only an `openat2`'s errno can be a refusal
-/// ([`FailedCall::openat2`]), and only a file that opened can fail `read(2)`.
+/// A failed [`ProcDir::read`] or [`ProcDir::pids`], by the call that failed: only an `openat2`'s errno
+/// can be a refusal ([`FailedCall::openat2`]), and only a file or directory that opened can fail
+/// reading it (`read(2)`, or the directory's setup and `getdents64`).
 #[derive(Debug)]
 pub(crate) enum ReadFailure {
-    /// The `openat2` of the file.
     Open(io::Error),
-    /// `read(2)` of the file that opened.
     Read(io::Error),
 }
 
@@ -218,10 +217,14 @@ impl ProcDir {
         Ok(rustix::fs::readlinkat(&link, "", Vec::new())?.into_bytes())
     }
 
-    /// The pids listed under this `/proc`: its decimal-named entries.
-    pub(super) fn pids(&self) -> io::Result<Vec<u32>> {
-        let dir = rustix::fs::Dir::new(self.open_beneath(".", OFlags::RDONLY | OFlags::DIRECTORY)?)?;
-        collect_pids(dir.map(|entry| Ok(entry?.file_name().to_bytes().to_vec())))
+    /// The pids listed under this `/proc`: its decimal-named entries. The `openat2` of `.` is
+    /// [`ReadFailure::Open`]; the directory's setup and listing are [`ReadFailure::Read`].
+    pub(super) fn pids(&self) -> Result<Vec<u32>, ReadFailure> {
+        let fd = self
+            .open_beneath(".", OFlags::RDONLY | OFlags::DIRECTORY)
+            .map_err(ReadFailure::Open)?;
+        let dir = rustix::fs::Dir::new(fd).map_err(|e| ReadFailure::Read(e.into()))?;
+        collect_pids(dir.map(|entry| Ok(entry?.file_name().to_bytes().to_vec()))).map_err(ReadFailure::Read)
     }
 
     /// Whether the symlink at `path` under this `/proc` exists, without following it.

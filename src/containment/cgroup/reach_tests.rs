@@ -1052,7 +1052,7 @@ impl Kernel for ChildExitsAfterCgroupRead {
         read
     }
 
-    fn pids(&self, dir: &ProcDir) -> std::io::Result<Vec<u32>> {
+    fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure> {
         HostKernel.pids(dir)
     }
 
@@ -1495,10 +1495,17 @@ fn proc_names_keeps_the_pids_eperm_beside_a_failed_recheck() {
     let members = crate::error::several_in(&err).unwrap_or_else(|| panic!("a list of both failures: {said}"));
     let codes: Vec<_> = members.iter().map(|m| crate::error::first_os_code(*m)).collect();
     assert_eq!(codes, [Some(libc::EIO), Some(libc::EPERM)], "{said}");
+    assert_eq!(
+        said.matches(&pid.to_string()).count(),
+        1,
+        "the pid is named once: {said}"
+    );
+    assert_eq!(said.matches("/cgroup").count(), 1, "the file is named once: {said}");
 }
 
-/// `proc_names` over an unreadable cgroup says the pid's file once, in one context over the failure:
-/// no layer of a cosca `Error` between them. Mutant: "the cause is wrapped as an `Error::Io` layer".
+/// `proc_names` over an unreadable cgroup says the pid and its file once, in the `Unreadable`'s words:
+/// no context of its own above them and no layer of a cosca `Error` between. Mutant: "the cause is
+/// wrapped in a context that names the pid again, or as an `Error::Io` layer".
 #[skuld::test]
 fn proc_names_says_an_unreadable_cgroup_once() {
     let pid = std::process::id();
@@ -1509,7 +1516,7 @@ fn proc_names_says_an_unreadable_cgroup_once() {
     let eio = std::io::Error::from_raw_os_error(libc::EIO);
     assert_eq!(
         crate::error::said(&err),
-        format!("reading pid {pid}'s cgroup: {pid}/cgroup could not be read: {eio}")
+        format!("{pid}/cgroup could not be read: {eio}")
     );
 }
 

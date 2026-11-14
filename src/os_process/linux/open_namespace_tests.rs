@@ -1,7 +1,6 @@
 //! `open_verified_with` against REAL namespace layouts, in re-exec'd children that own private
 //! mount or pid namespaces (see `test_child::namespaces` for the group's gating).
 
-use std::io;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -206,7 +205,7 @@ impl Kernel for PauseKernel<'_> {
         self.inner.read(dir, path)
     }
 
-    fn pids(&self, dir: &ProcDir) -> io::Result<Vec<u32>> {
+    fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure> {
         self.inner.pids(dir)
     }
 

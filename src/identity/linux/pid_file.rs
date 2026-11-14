@@ -1,7 +1,5 @@
 //! One pid's file (`<pid>/stat`, `<pid>/cgroup`) through the checked `/proc`: [`read`] is the one
-//! read of such a file in the crate, and the one place that decides what its failure means. Every
-//! whole-table scan (`containment::unix::group::members`, `containment::enumerate`), the by-pid
-//! read, the cgroup leaf's state read and the placement reads ask it.
+//! read of such a file in the crate, and the one place that decides what its failure means.
 //!
 //! A scan that skips a pid it could not read reports a table with a live process missing, and a
 //! tree walk over it misses that process and its subtree. So only the failures that mean "this pid
@@ -31,8 +29,8 @@ pub(crate) enum ReadOutcome {
     Refused(Refusal),
 }
 
-/// Why one pid's `stat` (or another of its files) could not be read and is not simply absent. Its
-/// words say what failed; the OS error behind them is the [`source`](std::error::Error::source).
+/// Why one pid's file could not be read and is not simply absent. Its words say what failed; the OS
+/// error behind them is the [`source`](std::error::Error::source).
 ///
 /// A layer of the error chain: a caller wraps it as the cause of its own error and never folds its
 /// words into a message of its own.
@@ -67,6 +65,16 @@ impl Unreadable {
                 std::sync::Arc::new(own),
                 [Error::io_cause(peer)],
             )),
+        }
+    }
+
+    /// [`into_cause`](Self::into_cause) as an `io::Error`, for a caller that returns one: this
+    /// failure alone, or both failures as the members of a list that a context ("two reads failed")
+    /// holds, which names neither the pid nor the file again.
+    pub(crate) fn into_io(self) -> io::Error {
+        match self.into_cause() {
+            crate::error::Error::Io(e) => e,
+            both => crate::error::io_context_over("two reads failed", both),
         }
     }
 }
@@ -107,11 +115,12 @@ impl std::error::Error for Unreadable {
     }
 }
 
-/// `pid`'s `file` (`stat`, or `cgroup`) through `dir`, and what a failure of the read means: a
-/// failure that says the pid is not there for us is [`ReadOutcome::Exited`] or
-/// [`ReadOutcome::Hidden`], a [`Refusal`] is [`ReadOutcome::Refused`], every other failure is
-/// [`Unreadable`]. The one policy of every read of a pid's file. Never asks `kill(pid, 0)`: a scan covers all of `/proc`, and a `hidepid` `/proc`
-/// answers a foreign-uid probe `EPERM` too, so the first foreign-uid process would abort every scan.
+/// `pid`'s `file` (`stat` or `cgroup`) through `dir`: a pid that is not there for us is
+/// [`ReadOutcome::Exited`] or [`ReadOutcome::Hidden`], a [`Refusal`] is [`ReadOutcome::Refused`], any
+/// other failure is [`Unreadable`].
+///
+/// Never asks `kill(pid, 0)`: under `hidepid` it answers a foreign uid `EPERM` too, so the first
+/// foreign process would abort every scan.
 pub(crate) fn read(
     kernel: &dyn Kernel,
     dir: &ProcDir,
@@ -169,10 +178,13 @@ fn failed_read(
             },
         },
         Some(libc::EXDEV | libc::ELOOP) => (Kind::BeyondMount, source, None),
-        _ => match refusal(&source) {
-            Some(refusal) => return Ok(ReadOutcome::Refused(refusal)),
-            None => (Kind::Other, source, None),
-        },
+        _ => {
+            let failure = ReadFailure::Open(source);
+            match open_refusal(&failure) {
+                Some(refusal) => return Ok(ReadOutcome::Refused(refusal)),
+                None => (Kind::Other, failure.into_io(), None),
+            }
+        }
     };
     Err(Unreadable {
         pid,
@@ -183,19 +195,14 @@ fn failed_read(
     })
 }
 
-/// The [`Refusal`] that `failure`, a failed read, is: only its `openat2` can be one.
-fn open_refusal(failure: &ReadFailure) -> Option<Refusal> {
+/// The [`Refusal`] an `openat2` failure of the checked `/proc` is, if any. A failure after the
+/// `openat2` (a `read(2)`, a listing) is none, whatever its errno. The one rule of every read and
+/// listing of `/proc`.
+pub(crate) fn open_refusal(failure: &ReadFailure) -> Option<Refusal> {
     match failure {
-        ReadFailure::Open(e) => refusal(e),
+        ReadFailure::Open(e) => FailedCall::openat2(Errno::from_io_error(e)?).refusal(),
         ReadFailure::Read(_) => None,
     }
-}
-
-/// The [`Refusal`] that `error`, the failure of an `openat2` of the checked `/proc`, is, by its errno.
-/// For the listing of `/proc`, which is no pid's file (`containment::enumerate`,
-/// `containment::unix::group::members`).
-pub(crate) fn refusal(error: &io::Error) -> Option<Refusal> {
-    FailedCall::openat2(Errno::from_io_error(error)?).refusal()
 }
 
 #[cfg(test)]

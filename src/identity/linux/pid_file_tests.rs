@@ -29,13 +29,17 @@ enum Want {
     Refused(i32),
     /// An `Unreadable` whose words contain this.
     Unreadable(&'static str),
+    /// An `Unreadable` of a failed re-check, whatever its errno: the re-check's error (this errno) is
+    /// its source and the pid's own `EPERM` its peer.
+    RecheckFailed(i32),
 }
 
 /// What a failed read of `4242/stat` is, by (call that failed, errno, re-check).
 ///
 /// Mutant: a `read(2)` errno is read as the `openat2`'s (`EPERM` asks the re-check, `ENOSYS` is a
 /// refusal, `EXDEV` is beyond a mount); `read(2)`'s `ESRCH` is no exit; an exit is read as `Hidden` or
-/// the reverse; a failed re-check is a skip or a refusal; a refusal is an `Unreadable`.
+/// the reverse; a failed re-check is a skip or a refusal, or its error is sent back through the same
+/// classification (an `ESRCH` or `ENOENT` of it skips a live pid); a skip's error is not the pid's own.
 #[skuld::test]
 fn a_failed_read_is_what_its_call_and_errno_say() {
     use Call::{Open, Read};
@@ -77,18 +81,44 @@ fn a_failed_read_is_what_its_call_and_errno_say() {
         // Nothing is known about the pid.
         (Open, libc::EIO, None, Want::Unreadable("could not be read")),
         (Open, libc::EMFILE, None, Want::Unreadable("could not be read")),
-        // A failed re-check is no evidence of `hidepid`, and a `read(2)` failure is no refusal.
+        // A failed re-check is no evidence of `hidepid`, and a `read(2)` failure is no refusal. The
+        // re-check's own errno does not matter: `ESRCH`, `ENOENT` and `EACCES` of it are no exit or
+        // hiding of the pid.
         (
             Open,
             libc::EPERM,
             Some(Fails(Open, libc::EMFILE)),
-            Want::Unreadable("re-check of self/stat failed"),
+            Want::RecheckFailed(libc::EMFILE),
+        ),
+        (
+            Open,
+            libc::EPERM,
+            Some(Fails(Open, libc::ESRCH)),
+            Want::RecheckFailed(libc::ESRCH),
+        ),
+        (
+            Open,
+            libc::EPERM,
+            Some(Fails(Open, libc::ENOENT)),
+            Want::RecheckFailed(libc::ENOENT),
+        ),
+        (
+            Open,
+            libc::EPERM,
+            Some(Fails(Open, libc::EACCES)),
+            Want::RecheckFailed(libc::EACCES),
         ),
         (
             Open,
             libc::EPERM,
             Some(Fails(Read, libc::ENOSYS)),
-            Want::Unreadable("re-check of self/stat failed"),
+            Want::RecheckFailed(libc::ENOSYS),
+        ),
+        (
+            Open,
+            libc::EPERM,
+            Some(Fails(Read, libc::ESRCH)),
+            Want::RecheckFailed(libc::ESRCH),
         ),
         (Read, libc::EPERM, None, Want::Unreadable("could not be read")),
         (Read, libc::ENOSYS, None, Want::Unreadable("could not be read")),
@@ -111,13 +141,24 @@ fn a_failed_read_is_what_its_call_and_errno_say() {
         };
         let name = format!("{call:?} {errno}, re-check {recheck:?}");
         match (read(&kernel, &dir, 4242, "stat"), want) {
-            (Ok(ReadOutcome::Exited(_)), Want::Exited) | (Ok(ReadOutcome::Hidden(_)), Want::Hidden) => {}
+            (Ok(ReadOutcome::Exited(why)), Want::Exited) | (Ok(ReadOutcome::Hidden(why)), Want::Hidden) => {
+                assert_eq!(why.raw_os_error(), Some(errno), "{name}: the pid's own error is why");
+            }
             (Ok(ReadOutcome::Refused(refusal)), Want::Refused(refusing)) => {
                 assert_eq!(crate::error::first_os_code(&refusal.cause()), Some(refusing), "{name}");
                 assert!(refusal.requirement().contains("requires openat2"), "{name}");
             }
             (Err(unreadable), Want::Unreadable(words)) => {
                 assert!(unreadable.to_string().contains(words), "{name}: {unreadable}");
+            }
+            (Err(mut unreadable), Want::RecheckFailed(recheck)) => {
+                assert!(
+                    unreadable.to_string().contains("re-check of self/stat failed"),
+                    "{name}: {unreadable}"
+                );
+                assert_eq!(crate::error::first_os_code(&unreadable), Some(recheck), "{name}");
+                let peer = unreadable.take_peer().and_then(|e| e.raw_os_error());
+                assert_eq!(peer, Some(libc::EPERM), "{name}: the pid's EPERM is the peer");
             }
             (got, want) => panic!("{name}: expected {want:?}, got {got:?}"),
         }

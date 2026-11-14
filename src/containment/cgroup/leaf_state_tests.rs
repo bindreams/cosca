@@ -136,16 +136,11 @@ fn an_unknown_state_has_what_it_wraps_as_its_source() {
     let unreadable = read_proc_state(&over().on_read(&stat, Err(libc::EIO)), me).expect_err("no state");
     assert!(matches!(unreadable, StateUnknown::Unreadable(_)), "{unreadable:?}");
     let source = std::error::Error::source(&unreadable).expect("an unreadable stat has a source");
-    let layer = source
-        .downcast_ref::<crate::identity::pid_file::Unreadable>()
-        .expect("the source is the read's layer");
-    let os_error = std::error::Error::source(layer).expect("the layer has the OS error below it");
-    assert_eq!(
-        os_error
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::raw_os_error),
-        Some(libc::EIO)
-    );
+    let cause = source
+        .downcast_ref::<crate::error::Error>()
+        .expect("the source is the read's failure as an error");
+    assert_eq!(crate::error::first_os_code(cause), Some(libc::EIO), "{cause}");
+    assert!(crate::error::said(cause).contains(&stat), "{cause}");
 
     let view = StateUnknown::View(crate::identity::ViewUnreadable::from_open_errno(rustix::io::Errno::IO));
     let source = std::error::Error::source(&view).expect("an unusable view has a source");
@@ -153,6 +148,25 @@ fn an_unknown_state_has_what_it_wraps_as_its_source() {
         source.downcast_ref::<crate::identity::ViewUnreadable>().is_some(),
         "{source}"
     );
+}
+
+/// An `EPERM` whose re-check of `self/stat` fails is an unknown state whose chain holds both failures,
+/// so the debug line `proc_state` logs has the pid's own `EPERM` beside the re-check's error. Mutant:
+/// "the unknown state keeps the re-check's failure and drops the pid's `EPERM`".
+#[skuld::test]
+fn an_unknown_state_after_a_failed_recheck_keeps_the_pids_eperm() {
+    let me = std::process::id();
+    let kernel = FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_read(&format!("{me}/stat"), Err(libc::EPERM))
+        .on_read("self/stat", Err(libc::EIO));
+
+    let why = read_proc_state(&kernel, me).expect_err("no state");
+
+    let said = crate::error::said(&why);
+    let members = crate::error::several_in(&why).unwrap_or_else(|| panic!("a list of both failures: {said}"));
+    let codes: Vec<_> = members.iter().map(|m| crate::error::first_os_code(*m)).collect();
+    assert_eq!(codes, [Some(libc::EIO), Some(libc::EPERM)], "{said}");
 }
 
 /// The debug line of an unknown state carries the OS error of the view that could not be used, once:
