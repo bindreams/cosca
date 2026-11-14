@@ -869,8 +869,8 @@ pub(crate) fn take_force_pump_failure(name: &std::ffi::OsStr) -> bool {
 }
 
 /// Send, for each batch the pump of the leaf named `name` takes in, whether it notifies. The pump
-/// sends before it notifies, so a wait a change batch wakes finds it sent. A failure's broadcast
-/// (`watcher::fail`) reports no batch.
+/// sends before it broadcasts, so a wait that a batch wakes has that batch already sent.
+/// `watcher::fail`'s broadcast sends none.
 pub(crate) fn set_pump_batch_notifier(name: &str, notify: std::sync::mpsc::Sender<bool>) {
     PUMP_SEAMS
         .lock()

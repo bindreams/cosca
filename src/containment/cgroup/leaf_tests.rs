@@ -245,7 +245,7 @@ fn wait_drained_terminates_under_a_frozen_clock() {
 /// Two real, simultaneously live processes placed directly in the same leaf via the crate's own
 /// `place_self_in_cgroup_pre_exec` — not a synthetic membership list — exercising `wait_drained`'s
 /// full mechanism: the real kernel `populated` 1→0 transition once both members are gone, and a
-/// real park at `wait_drained`'s `Block` arm — proven by counting real pump broadcasts
+/// real park at `wait_drained`'s `Block` arm — proven by counting the pump's changed batches
 /// (`fault::set_pump_batch_notifier`) against every park that woke, not just that the wait call
 /// returned.
 #[cfg(target_os = "linux")]
@@ -269,10 +269,6 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
         )
     });
 
-    // A park proves only that the wait call returned, not that a real broadcast woke it (a
-    // dropped listener returns too). Count real pump broadcasts independently: a mutant that
-    // fakes a park without ever really waiting cannot fake a matching broadcast, since the pump
-    // is a separate thread that only ever reports one for a real, observed leaf change.
     let leaf_name = leaf
         .leaf_path
         .file_name()
@@ -423,12 +419,9 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     );
     total_woken += parks.iter().filter(|p| p.woken).count();
 
-    // The structural proof that a park is real, not merely a wait call returning (a dropped
-    // listener returns too, as if woken, with no broadcast behind it): the pump is a thread of
-    // its own that only ever reports a batch as "changed" when it observed a real leaf change
-    // and is about to broadcast for it. Dropping the leaf stops and joins the pump, so every
-    // report it ever sent happens-before the read below, whatever the order of its statements.
-    // No more parks can have woken than the pump reported changed batches.
+    // A dropped listener also returns as if woken, so count the pump's changed batches: no more
+    // parks can have woken than that. Dropping the leaf stops and joins the pump, so every report
+    // happens-before the read.
     drop(leaf);
     let changed_batches = batches_rx.try_iter().filter(|&notified| notified).count();
     assert!(
