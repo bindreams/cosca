@@ -685,8 +685,18 @@ fn settle_answers_and_marks_by_what_ran_what_was_left_and_the_root_s_end() {
     type Answer = Result<SettleOutcome, (u32, Vec<u32>)>;
     let table: Vec<(TreeKillOutcome, bool, Answer, bool)> = vec![
         (TreeKillOutcome::Ran(Ok(())), false, Ok(SettleOutcome::Killed), true),
-        (skipped(Some(Ok(()))), true, Ok(SettleOutcome::Skipped), false),
-        (skipped(None), true, Ok(SettleOutcome::Skipped), false),
+        (
+            skipped(Some(Ok(()))),
+            true,
+            Ok(SettleOutcome::Skipped { over_killed: false }),
+            false,
+        ),
+        (
+            skipped(None),
+            true,
+            Ok(SettleOutcome::Skipped { over_killed: false }),
+            false,
+        ),
         (skipped(Some(Err(left(7)))), true, Err((7, vec![])), false),
         (
             TreeKillOutcome::Answered(Ok(())),
@@ -1037,7 +1047,7 @@ fn settle_answers_each_outcome_over_a_tree_never_settled_killed_or_left_an_unrea
                 (Err(vec!["pid 8".to_owned()]), Standing::Left(vec![8])),
                 (Err(gone()), Standing::Never),
                 (Err(gone()), Standing::Never),
-                (Ok(Skipped), Standing::Never),
+                (Ok(Skipped { over_killed: false }), Standing::Never),
             ]
         },
         || (TreeKilled::default(), 0, nothing()),
@@ -1050,7 +1060,7 @@ fn settle_answers_each_outcome_over_a_tree_never_settled_killed_or_left_an_unrea
                 (Err(vec!["pid 8".to_owned()]), Standing::Left(vec![8])),
                 (Ok(Killed), Standing::Killed),
                 (Err(gone()), Standing::Killed),
-                (Ok(Skipped), Standing::Killed),
+                (Ok(Skipped { over_killed: true }), Standing::Killed),
             ]
         },
         || {

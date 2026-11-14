@@ -298,7 +298,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         // built from.
         let more = match child.tree.settle(early, fate.not_running()).answer.map_err(Arc::new) {
             // A skip kills nothing: the notes of the first attempt stand.
-            Ok(SettleOutcome::Skipped) => None,
+            Ok(SettleOutcome::Skipped { .. }) => None,
             Ok(SettleOutcome::Killed) => {
                 tree_note.clear();
                 // The tree was killed after all: its first failure is not the error's.
@@ -472,7 +472,7 @@ pub(crate) fn report_tree_teardown(
                 Some(tree_teardown_warn(subject, &text)),
             )
         }
-        None | Some(Ok(SettleOutcome::Killed | SettleOutcome::Skipped)) => (String::new(), None),
+        None | Some(Ok(SettleOutcome::Killed | SettleOutcome::Skipped { .. })) => (String::new(), None),
     }
 }
 

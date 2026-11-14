@@ -1491,7 +1491,7 @@ fn a_tree_kill_is_left_to_try_unless_none_was_made_or_it_killed_or_unvouched_the
             })),
             false,
         ),
-        ("skipped", Some(Ok(SettleOutcome::Skipped)), true),
+        ("skipped", Some(Ok(SettleOutcome::Skipped { over_killed: false })), true),
         ("left members", Some(Err(unsettled())), true),
     ];
     for (label, tree, want) in table {
