@@ -1,4 +1,6 @@
-use super::{parse_pgrp, parse_ppid, parse_starttime_jiffies, parse_state, running_from_stat, stat_fixture};
+use super::{
+    parse_num_threads, parse_pgrp, parse_ppid, parse_starttime_jiffies, parse_state, running_from_stat, stat_fixture,
+};
 use crate::identity::Liveness;
 
 fn tok(v: u64) -> u64 {
@@ -107,6 +109,54 @@ fn running_from_stat_sleeping_state_matching_token() {
 fn running_from_stat_zombie_is_dead() {
     let stat = stat_fixture("Z", 8675309);
     assert_eq!(running_from_stat(&stat, tok(8675309)), Liveness::Dead);
+}
+
+/// A zombie `stat` whose process still has `threads` live threads: the fixture's `num_threads` (field
+/// 20, the `1` after `priority nice`) changed.
+fn zombie_with_threads(threads: u64) -> Vec<u8> {
+    let stat = String::from_utf8(stat_fixture("Z", 8675309)).expect("a utf-8 fixture");
+    stat.replacen(" 20 0 1 0 ", &format!(" 20 0 {threads} 0 "), 1)
+        .into_bytes()
+}
+
+/// A process whose leader thread exited while another still runs shows `Z` and the live threads: it
+/// has not exited. Mutant: any `Z` is dead.
+#[skuld::test]
+fn running_from_stat_zombie_leader_with_a_live_thread_is_alive() {
+    let stat = zombie_with_threads(2);
+    assert_eq!(parse_num_threads(&stat), Some(2));
+    assert_eq!(running_from_stat(&stat, tok(8675309)), Liveness::Alive);
+}
+
+#[skuld::test]
+fn running_from_stat_zombie_with_one_thread_is_dead() {
+    assert_eq!(parse_num_threads(&zombie_with_threads(1)), Some(1));
+    assert_eq!(running_from_stat(&zombie_with_threads(1), tok(8675309)), Liveness::Dead);
+}
+
+/// A `Z` whose thread count cannot be read could be a leader with live threads: not evidence of death.
+/// Mutant: an unreadable count is taken as a single thread.
+#[skuld::test]
+fn running_from_stat_zombie_with_an_unreadable_thread_count_is_unknown() {
+    let stat = String::from_utf8(stat_fixture("Z", 8675309))
+        .expect("a utf-8 fixture")
+        .replacen(" 20 0 1 0 ", " 20 0 many 0 ", 1)
+        .into_bytes();
+    assert_eq!(parse_num_threads(&stat), None);
+    assert_eq!(running_from_stat(&stat, tok(8675309)), Liveness::Unknown);
+}
+
+/// A record cut off before `starttime` is `Unknown`; one cut off before `num_threads` has none.
+#[skuld::test]
+fn a_truncated_record_parses_to_nothing_and_is_unknown() {
+    let stat = b"1234 (myproc) Z 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 2";
+    assert_eq!(parse_num_threads(stat), Some(2));
+    assert_eq!(parse_starttime_jiffies(stat), None);
+    assert_eq!(running_from_stat(stat, tok(8675309)), Liveness::Unknown);
+    assert_eq!(
+        parse_num_threads(b"1234 (myproc) Z 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0"),
+        None
+    );
 }
 
 #[skuld::test]

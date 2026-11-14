@@ -93,3 +93,43 @@ impl BlockedTree {
         );
     }
 }
+
+/// A std tree on one stdin pipe: a root that a `SIGTERM` ends, and below it a subshell and its `cat`
+/// that ignore `SIGTERM`. Its descendants exist once the readiness line is read. The `Process` is open
+/// on the root, and `members` are the descendants' identities.
+pub(crate) struct SurvivorTree {
+    pub(crate) child: Child,
+    _stdout: ChildStdout,
+    pub(crate) process: crate::Process,
+    pub(crate) members: Vec<crate::identity::ProcessId>,
+}
+
+pub(crate) fn survivor_tree() -> SurvivorTree {
+    tree_of(super::TERM_SURVIVOR_TREE_ARGV)
+}
+
+/// [`survivor_tree`] over `argv`, which prints `r\n` once its descendants exist.
+pub(crate) fn tree_of(argv: &[&str]) -> SurvivorTree {
+    let mut child = crate::test_spawn::spawn(
+        Command::new(argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped()),
+    )
+    .expect("spawn");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut ready = [0u8; 2];
+    stdout.read_exact(&mut ready).expect("the readiness line");
+    let process = crate::Process::open_pid(child.id()).expect("open").expect("running");
+    let members = process
+        .id()
+        .children(crate::Recursive::Yes)
+        .expect("the root's descendants");
+    assert!(!members.is_empty(), "the subshell is a descendant of the root");
+    SurvivorTree {
+        child,
+        _stdout: stdout,
+        process,
+        members,
+    }
+}

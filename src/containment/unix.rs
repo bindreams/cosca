@@ -56,6 +56,7 @@ use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
 use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
+use crate::containment::treewalk::Listing;
 use crate::containment::{check_number, Containment, Root, Skip, TerminateOutcome, TreeKill, Why};
 use crate::error::{Error, Failures};
 use std::sync::Arc;
@@ -86,8 +87,8 @@ impl Contains for Group {
         kill_group_tree(self.pgid, root)
     }
 
-    fn send_terminate(&self, _pid: u32, root: Option<&dyn Root>) -> TerminateOutcome {
-        term_group_tree(self.pgid, root)
+    fn send_terminate(&self, _pid: u32, root: Option<&dyn Root>) -> (TerminateOutcome, Option<Listing>) {
+        (term_group_tree(self.pgid, root), None)
     }
 
     /// No kernel object says "every member has exited".

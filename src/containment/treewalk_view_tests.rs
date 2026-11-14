@@ -92,7 +92,7 @@ fn id_walks() -> [(&'static str, Walk); 2] {
                 .map_err(Unkilled::into_error)
         }),
         ("terminate", |k, id| {
-            super::terminate(k, id, &super::ByIdentity::new(k, id))
+            super::terminate(k, id, &super::ByIdentity::new(k, id)).and_then(super::Terminated::into_result)
         }),
     ]
 }
@@ -135,7 +135,7 @@ fn a_walkers_terminate_over_an_untrusted_view_says_nothing_was_sent() {
     for view in VIEWS {
         let (child, id) = live_member();
         let kernel = view.fail(FakeKernel::over(&HostKernel), 0);
-        match super::terminate_tree(&kernel, id, None) {
+        match super::terminate_tree(&kernel, id, None).0 {
             crate::containment::TerminateOutcome::NotSent(Error::Unassessable { detail, .. })
                 if detail.contains(view.cause()) => {}
             other => panic!("expected NotSent(Unassessable) naming {}, got {other:?}", view.cause()),
@@ -197,9 +197,10 @@ fn an_anchor_read_that_fails_names_the_view_that_failed_it() {
 // The anchor guards the walk =====
 
 /// A root that no longer holds its pid has no descendants: its pid's new owner's children are not
-/// its own, and are never signalled. The signal-only walks are `Ok`; the kills killed nothing, and
-/// are `Unassessable` (`Process::kill_tree` included, which has no handle to settle it). Mutants:
-/// "walk without an anchor"; "a kill that found no root is `Ok`".
+/// its own, and are never signalled. Every walk is `Unassessable`: the kills killed nothing, and the
+/// signal-only walks sent nothing, for a root that has exited says nothing of its tree
+/// (`Process::kill_tree` included, which has no handle to settle it). Mutants: "walk without an
+/// anchor"; "a kill that found no root is `Ok`"; "a `SIGTERM` that found no root is `Ok`".
 #[skuld::test]
 fn every_walk_from_a_root_that_lost_its_pid_signals_nothing_and_a_kill_is_unassessable() {
     for (name, walk) in walks() {
@@ -211,13 +212,61 @@ fn every_walk_from_a_root_that_lost_its_pid_signals_nothing_and_a_kill_is_unasse
             .live_without_pidfs(pid, pidfd_of(pid))
             .on_read(&format!("{pid}/stat"), Ok(&stat_of_a_new_owner(pid)));
         let result = walk(&kernel, id);
-        if name.contains("kill") {
-            assert_unassessable_naming(result, &["no walk ran"]);
+        let said = if name.contains("kill") {
+            "no walk ran"
         } else {
-            assert!(result.is_ok(), "{name}: {result:?}");
-        }
+            "nothing was sent"
+        };
+        assert_unassessable_naming(result, &[said]);
         release(child);
     }
+}
+
+/// A root whose state cannot be read, whose walk finds no member, is `Unassessable` with nothing
+/// signalled: neither an exit nor a running root can be told, and a walk that found nothing says
+/// nothing of the tree either way. The root's `stat` is read by the snapshot, by the anchor, and then by
+/// the check that the walk's root has not exited, which finds a record it cannot parse. Mutant: an
+/// unreadable state is "not exited".
+#[skuld::test]
+fn every_id_walk_from_a_root_whose_state_cannot_be_read_is_unassessable_and_signals_nothing() {
+    for (name, walk) in id_walks() {
+        let (child, id) = live_member();
+        let id = ticks_id(id.pid());
+        let pid = id.pid();
+        let kernel = FakeKernel::over(&HostKernel)
+            .live_without_pidfs(pid, pidfd_of(pid))
+            .on_read_after(&format!("{pid}/stat"), 2, Ok(&b"not a stat record"[..]));
+        let result = walk(&kernel, id);
+        assert!(
+            matches!(&result, Err(Error::Unassessable { detail, .. }) if detail.contains("has exited could not be read")),
+            "{name}: {result:?}"
+        );
+        release(child);
+    }
+}
+
+/// `pid`'s `stat` as the kernel gives it now, except for the state: a zombie's.
+fn stat_as_a_zombie(pid: u32) -> Vec<u8> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("the live pid's stat");
+    let (head, tail) = stat.rsplit_once(')').expect("stat names its command in parentheses");
+    let mut fields: Vec<String> = tail.split_whitespace().map(str::to_owned).collect();
+    // `tail` starts at field 3, the state.
+    fields[0] = "Z".to_owned();
+    format!("{head}) {}\n", fields.join(" ")).into_bytes()
+}
+
+/// A root that has exited sends nothing, whether or not the walk could read every candidate: a signal
+/// to its zombie reaches no one, and `Ok` would say it reached the tree. Mutant: an exited root with an
+/// unread candidate is walked and signalled.
+#[skuld::test]
+fn terminate_over_an_exited_root_with_an_unreadable_candidate_sends_nothing() {
+    let (child, root, _, kernel) = root_with_an_unreadable_descendant();
+    let kernel = kernel.on_read(&format!("{}/stat", root.pid()), Ok(&stat_as_a_zombie(root.pid())));
+
+    let walked = super::terminate(&kernel, root, &super::ByIdentity::new(&kernel, root)).expect("the table reads");
+
+    assert!(matches!(walked, super::Terminated::RootExited(_)), "nothing is sent");
+    release(child);
 }
 
 /// A root whose pid cannot be queried is an error naming the pid and the view, with nothing
@@ -428,8 +477,9 @@ fn kill_by_identity_spares_a_pidfs_pid_the_kernel_cannot_open_or_shows_as_anothe
     release(child);
 }
 
-/// The root's `stat` is read three times: by the snapshot, by the anchor, and by the kill's
-/// re-verify, which finds another start time. Nothing is signalled. The root's own pidfd passes the
+/// The root's `stat` is read four times: by the snapshot, by the anchor, by the check that an empty
+/// walk's root has not exited, and by the kill's re-verify, which finds another start time. Nothing is
+/// signalled. The root's own pidfd passes the
 /// proof's fdinfo check, so the `stat` is what the row is about. Mutants: "the walk's kill
 /// re-verifies through `HostKernel`"; "the kill ignores a start time that differs".
 ///
@@ -444,7 +494,7 @@ fn every_walk_re_verifies_its_kill_through_its_kernel() {
         let id = ticks_id(id.pid());
         let kernel = FakeKernel::over(&HostKernel)
             .live_without_pidfs(id.pid(), pidfd_of(id.pid()))
-            .on_read_after(&format!("{}/stat", id.pid()), 2, Ok(&stat_of_a_new_owner(id.pid())));
+            .on_read_after(&format!("{}/stat", id.pid()), 3, Ok(&stat_of_a_new_owner(id.pid())));
         let result = walk(&kernel, id);
         assert!(result.is_ok(), "{name}: {result:?}");
         release(child);

@@ -253,7 +253,10 @@ fn a_send_on_a_released_tree_that_kept_its_mechanism_asserts() {
     tree.release().wait();
     let asserts = |send: &dyn Fn()| catch_unwind(AssertUnwindSafe(send)).is_err();
     assert!(asserts(&|| _ = tree.kill(None)), "kill did not assert");
-    assert!(asserts(&|| _ = tree.terminate(1, None)), "terminate did not assert");
+    assert!(
+        asserts(&|| _ = tree.terminate(1, None, None)),
+        "terminate did not assert"
+    );
     assert!(asserts(&|| _ = tree.would_reach(1, None)), "would_reach did not assert");
     assert!(asserts(&|| _ = tree.disarm()), "disarm did not assert");
 }

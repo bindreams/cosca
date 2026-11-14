@@ -839,7 +839,7 @@ use crate::containment::drain_edge::DrainEdge;
 use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::sweep_passes::run_passes;
-use crate::containment::treewalk::KillOutcome;
+use crate::containment::treewalk::{KillOutcome, Listing};
 use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill, Why};
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
@@ -948,8 +948,8 @@ impl Contains for Marker {
         self.kill_tree(root)
     }
 
-    fn send_terminate(&self, _pid: u32, root: Option<&dyn Root>) -> TerminateOutcome {
-        self.terminate_tree(root)
+    fn send_terminate(&self, _pid: u32, root: Option<&dyn Root>) -> (TerminateOutcome, Option<Listing>) {
+        (self.terminate_tree(root), None)
     }
 
     /// The marker pipe's EOF, advisory: see [`TreeDrain`](crate::containment::TreeDrain).

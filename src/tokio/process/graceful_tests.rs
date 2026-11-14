@@ -125,6 +125,67 @@ async fn async_foreign_graceful_shutdown_tree_graceful_path() {
     tree.assert_died_of_sigterm();
 }
 
+/// Async twin of `foreign_graceful_shutdown_tree_kills_a_member_that_ignores_the_sigterm_after_the_root_exits`
+/// in `process/graceful_tests.rs`: the root ends on the `SIGTERM`, and the sweep kills by identity the
+/// members the call's own walk found.
+///
+/// Mutant: the async call sweeps with no settlement (the walk from the exited root finds nothing).
+#[skuld::test]
+async fn async_foreign_graceful_shutdown_tree_kills_a_member_that_ignores_the_sigterm_after_the_root_exits() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let mut tree = foreign::survivor_tree();
+    let p = crate::tokio::Process::open_pid(tree.child.id())
+        .expect("open")
+        .expect("running");
+
+    p.graceful_shutdown_tree(Duration::from_secs(30))
+        .await
+        .expect("every member the walk found is killed");
+
+    for member in &tree.members {
+        assert_eq!(
+            member.is_alive(),
+            crate::identity::Liveness::Dead,
+            "{member:?} ignored the SIGTERM and is killed by identity"
+        );
+    }
+    let status = tree.child.wait().expect("reap the root");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
+}
+
+/// Async twin of `foreign_graceful_shutdown_tree_kills_a_member_reparented_while_the_root_outlives_the_grace`:
+/// the member is reparented before the sweep, and killed by identity.
+///
+/// Mutant: the async call sweeps with no settlement.
+#[skuld::test]
+async fn async_foreign_graceful_shutdown_tree_kills_a_member_reparented_while_the_root_outlives_the_grace() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let mut tree = foreign::tree_of(crate::test_child::ROOT_OUTLIVING_THE_GRACE_ARGV);
+    let p = crate::tokio::Process::open_pid(tree.child.id())
+        .expect("open")
+        .expect("running");
+    let reparented = crate::test_child::wait_for_the_middle_to_exit_after_the_term(tree.process.id());
+
+    p.graceful_shutdown_tree(Duration::ZERO)
+        .await
+        .expect("the member its walk reached is killed by identity");
+
+    reparented.assert_fired();
+    for member in &tree.members {
+        assert_eq!(
+            member.is_alive(),
+            crate::identity::Liveness::Dead,
+            "{member:?} is killed or ended by the SIGTERM"
+        );
+    }
+    let status = tree.child.wait().expect("reap the root");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the sweep killed the live root: {status:?}"
+    );
+}
+
 #[skuld::test]
 async fn async_foreign_graceful_shutdown_graceful_path() {
     crate::tokio::test_runtime::assert_current_thread();

@@ -216,7 +216,7 @@ impl<'a> KillWait<'a> {
     }
 
     /// The members the kill reached, for a row that states what a mechanism named.
-    #[cfg(all(test, any(windows, target_os = "linux")))]
+    #[cfg(test)]
     pub(crate) fn members_for_test(&self) -> &[ProcessId] {
         &self.members
     }
