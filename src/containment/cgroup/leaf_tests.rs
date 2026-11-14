@@ -426,14 +426,16 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     // The structural proof that a park is real, not merely a wait call returning (a dropped
     // listener returns too, as if woken, with no broadcast behind it): the pump is a thread of
     // its own that only ever reports a batch as "changed" when it observed a real leaf change
-    // and is about to broadcast for it. It reports before it broadcasts, so every park that woke
-    // has its batch counted, and no more parks can wake than the pump genuinely woke.
+    // and is about to broadcast for it. Dropping the leaf stops and joins the pump, so every
+    // report it ever sent happens-before the read below, whatever the order of its statements.
+    // No more parks can have woken than the pump reported changed batches.
+    drop(leaf);
     let changed_batches = batches_rx.try_iter().filter(|&notified| notified).count();
     assert!(
         total_woken <= changed_batches,
         "{total_woken} parks woke across this test, but the pump reported only \
-         {changed_batches} batches that actually broadcast — a woken park with no matching real \
-         broadcast behind it is not a real park"
+         {changed_batches} changed batches — a woken park with no matching changed batch behind \
+         it is not a real park"
     );
 }
 
@@ -2738,37 +2740,6 @@ fn a_siblings_removal_wakes_no_wait() {
     assert_eq!(
         waiter.join().expect("waiter").expect("wait"),
         TreeDrain::AllMembersExited
-    );
-}
-
-/// A wait the pump wakes finds the batch that woke it already reported to the batch notifier:
-/// `cgroup_wait_drained_tracks_two_real_members_through_exit` counts a park against the batches
-/// reported, so a report that trails the broadcast loses to a thread that returns from its wait.
-///
-/// Mutant: send the batch report after `shared.changed.notify` in `run_pump` -> the report is
-/// not there yet when the wake returns (the pump is held between the two to widen the window in
-/// a probe; unhooked it fails only when the scheduler holds the pump there).
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_woken_wait_finds_its_batch_reported() {
-    use crate::containment::cgroup::fault;
-    use crate::containment::cgroup::test_support::FakeLeaf;
-    use event_listener::Listener as _;
-
-    let fake = FakeLeaf::new("cosca-batch-before-wake", true);
-    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
-    let (batches, batches_rx) = std::sync::mpsc::channel();
-    fault::set_pump_batch_notifier("cosca-batch-before-wake", batches);
-
-    let DrainStep::Block { listener, .. } = leaf.drain_step(None).expect("a step on a populated leaf") else {
-        panic!("a populated leaf with no deadline must block");
-    };
-    FakeLeaf::set_populated(&fake.events, false);
-    listener.wait();
-    assert_eq!(
-        batches_rx.try_recv(),
-        Ok(true),
-        "the pump woke the listener before it reported the batch that woke it"
     );
 }
 
