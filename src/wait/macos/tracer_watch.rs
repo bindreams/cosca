@@ -231,18 +231,6 @@ pub(crate) mod seams {
     #[must_use = "the reads are real again as soon as the guard is dropped"]
     pub(crate) struct ForcedLinks(());
 
-    impl ForcedLinks {
-        /// How many of the queued answers no walk has taken yet.
-        pub(crate) fn left(&self) -> usize {
-            LINKS.with(|l| l.borrow().len())
-        }
-
-        /// Queues `links` after those not taken yet.
-        pub(crate) fn then(&self, links: impl IntoIterator<Item = Link>) {
-            LINKS.with(|l| l.borrow_mut().extend(links));
-        }
-    }
-
     impl Drop for ForcedLinks {
         fn drop(&mut self) {
             LINKS.with(|l| l.borrow_mut().clear());

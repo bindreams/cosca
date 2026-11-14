@@ -184,6 +184,22 @@ impl OwnedChild {
         crate::os_process::child::adopt_std(child, id).map(OwnedChild::new)
     }
 
+    /// [`adopt`](Self::adopt) on macOS with the kernel `kernel(pid, unique)` makes, for a test whose
+    /// rows name the child's pid and unique id; see
+    /// [`adopt_std_over`](crate::os_process::child::adopt_std_over).
+    #[cfg(all(test, target_os = "macos"))]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the child is handed back untouched for the caller to deal with"
+    )]
+    pub(crate) fn adopt_over<K: crate::identity::Kernel + Send + 'static>(
+        kernel: impl FnOnce(u32, u64) -> K,
+        child: std::process::Child,
+        id: crate::identity::ProcessId,
+    ) -> Result<OwnedChild, (Error, std::process::Child)> {
+        crate::os_process::child::adopt_std_over(kernel, child, id).map(OwnedChild::new)
+    }
+
     /// The child's pid, if its spawn learned it; see [`OsChild::pid`].
     pub(crate) fn pid(&self) -> Option<u32> {
         self.os.pid()

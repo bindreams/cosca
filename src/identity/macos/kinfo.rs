@@ -41,7 +41,8 @@ impl kinfo_proc {
     }
 }
 
-/// Read only by the tracer helper's tests (`test_support::tracer`), for their preconditions.
+/// `e_jobc` is read by the tracer helper's tests (`test_support::tracer_tests`) for their
+/// preconditions.
 #[cfg(test)]
 impl kinfo_proc {
     /// Byte offset of `eproc.e_jobc` within `kp_eproc`: after `e_ppid` and `e_pgid`
@@ -58,6 +59,17 @@ impl kinfo_proc {
     fn set_e_ppid(&mut self, ppid: libc::pid_t) {
         let at = kinfo_proc::E_PPID_OFFSET;
         self.kp_eproc[at..at + std::mem::size_of::<libc::pid_t>()].copy_from_slice(&ppid.to_ne_bytes());
+    }
+
+    /// The host's record of the live process `pid`, stating the parent it had when a tracer attached
+    /// (`oppid`) and the parent it has now (`ppid`).
+    pub(crate) fn of_host_held_by(pid: RawPid, oppid: libc::pid_t, ppid: libc::pid_t) -> kinfo_proc {
+        let (Resolved::Found(mut record), _) = super::kernel::HostKernel.kinfo(pid) else {
+            panic!("pid {pid} is live and has a kinfo_proc");
+        };
+        record.kp_proc.p_oppid = oppid;
+        record.set_e_ppid(ppid);
+        record
     }
 }
 
@@ -166,20 +178,6 @@ pub(crate) fn exit_begun(p_stat: libc::c_char, p_flag: libc::c_int) -> bool {
 /// EINTR retries, per the codebase convention.
 pub(crate) fn kinfo(kernel: &dyn Kernel, pid: RawPid) -> Resolved<kinfo_proc> {
     #[cfg(test)]
-    if fault::take_unreadable() {
-        return Resolved::Unknown;
-    }
-    #[cfg(test)]
-    if let Some(oppid) = fault::take_oppid() {
-        return match kernel.kinfo(pid).0 {
-            Resolved::Found(mut info) => {
-                info.kp_proc.p_oppid = oppid;
-                Resolved::Found(info)
-            }
-            other => other,
-        };
-    }
-    #[cfg(test)]
     if let Some((oppid, ppid)) = fault::forced_parents(pid) {
         return match kernel.kinfo(pid).0 {
             Resolved::Found(mut info) => {
@@ -193,41 +191,9 @@ pub(crate) fn kinfo(kernel: &dyn Kernel, pid: RawPid) -> Resolved<kinfo_proc> {
     kernel.kinfo(pid).0
 }
 
-/// [`Kernel::kinfo`] as the host kernel answers it: the `sysctl` itself, with the failure that left
-/// the read `Unknown`.
-pub(super) fn host_kinfo(pid: RawPid) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
-    read_record_explained(pid, libc::KERN_PROC_PID)
-}
-
-/// Forces a field of the next [`kinfo`] read.
+/// Forces the parents of a [`kinfo`] read.
 #[cfg(test)]
 pub(crate) mod fault {
-    use std::cell::Cell;
-
-    thread_local! {
-        static OPPID: Cell<Option<libc::pid_t>> = const { Cell::new(None) };
-        static UNREADABLE: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// The next [`kinfo`](super::kinfo) on this thread is refused (`Unknown`).
-    pub(crate) fn force_unreadable_once() {
-        UNREADABLE.with(|u| u.set(true));
-    }
-
-    pub(super) fn take_unreadable() -> bool {
-        UNREADABLE.with(Cell::take)
-    }
-
-    /// The next [`kinfo`](super::kinfo) on this thread that finds its process reports `oppid` as its
-    /// `p_oppid`, the parent it had when a tracer attached.
-    pub(crate) fn force_oppid_once(oppid: libc::pid_t) {
-        OPPID.with(|o| o.set(Some(oppid)));
-    }
-
-    pub(super) fn take_oppid() -> Option<libc::pid_t> {
-        OPPID.with(Cell::take)
-    }
-
     /// What [`force_parents`] answers: `(p_oppid, e_ppid)`.
     type Parents = Box<dyn FnMut() -> (libc::pid_t, libc::pid_t)>;
 
@@ -263,23 +229,10 @@ pub(crate) mod fault {
     }
 }
 
-/// [`kinfo`] without the seams that force a field, and with the failure that left the read `Unknown`: the
-/// errno of the `sysctl`, or the wrong size it wrote. Only the forced refusal of
-/// [`fault::force_unreadable_once`] is honoured here, as an `EPERM` (the other seams force fields of a
-/// record).
-pub(crate) fn kinfo_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
-    #[cfg(test)]
-    if fault::take_unreadable() {
-        return (Resolved::Unknown, Some(std::io::Error::from_raw_os_error(libc::EPERM)));
-    }
-    kernel.kinfo(pid)
-}
-
-/// The selector-parameterized core. The `selector` parameter is a TEST SEAM (production
-/// always passes `KERN_PROC_PID` via `kinfo()`) — it lets a unit test drive the
-/// contract-violation arm with an invalid selector.
-fn read_record_explained(pid: RawPid, selector: libc::c_int) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, selector, pid as libc::c_int];
+/// [`Kernel::kinfo`] as the host kernel answers it: the `sysctl` itself, with the failure that left
+/// the read `Unknown`.
+pub(super) fn host_kinfo(pid: RawPid) -> (Resolved<kinfo_proc>, Option<std::io::Error>) {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as libc::c_int];
     loop {
         let mut info: kinfo_proc = unsafe { std::mem::zeroed() };
         let mut size = std::mem::size_of::<kinfo_proc>();
@@ -294,48 +247,79 @@ fn read_record_explained(pid: RawPid, selector: libc::c_int) -> (Resolved<kinfo_
                 0,
             )
         };
-        if rc != 0 {
-            let e = std::io::Error::last_os_error();
-            return match e.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                // The OS positively says there is no such process.
-                Some(libc::ESRCH) => (Resolved::Gone, None),
-                // A sandbox or hardened runtime refusing the query is the DESIGNED Unknown,
-                // not a contract violation - `debug`, like every other per-pid probe.
-                Some(libc::EPERM) | Some(libc::EACCES) => {
-                    log::debug!(
-                        "sysctl(KERN_PROC selector {selector}, {pid}) refused: {report}",
-                        report = crate::error::Report(&e)
-                    );
-                    (Resolved::Unknown, Some(e))
-                }
-                // ENOMEM/EINVAL are neither race- nor permission-reachable. ENOMEM in
-                // particular is the ONLY runtime detector for a kernel `kinfo_proc` that has
-                // grown past our 648-byte definition: it fails before the size check below
-                // is ever reached, and the compile-time size assert cannot fire because the
-                // Rust definition is what stayed still. Keep it loud.
-                _ => {
-                    super::contract_violation(format_args!(
-                        "sysctl(KERN_PROC selector {selector}, {pid}) failed: {report}",
-                        report = crate::error::Report(&e)
-                    ));
-                    (Resolved::Unknown, Some(e))
-                }
-            };
-        }
-        if size == 0 {
-            return (Resolved::Gone, None);
-        }
-        if size != std::mem::size_of::<kinfo_proc>() {
-            // Layout drift — never trust a partial/foreign-sized record.
-            let drift = format!(
-                "sysctl(KERN_PROC selector {selector}, {pid}) wrote {size} bytes, expected {}",
+        let called = if rc == 0 {
+            Ok(size)
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
+        return match classify(pid, called) {
+            SysctlOutcome::Retry => continue,
+            SysctlOutcome::Gone => (Resolved::Gone, None),
+            SysctlOutcome::Refused(e) => {
+                log::debug!(
+                    "sysctl(KERN_PROC_PID, {pid}) refused: {report}",
+                    report = crate::error::Report(&e)
+                );
+                (Resolved::Unknown, Some(e))
+            }
+            SysctlOutcome::Violation { message, error } => {
+                super::contract_violation(format_args!("{message}"));
+                (Resolved::Unknown, Some(error))
+            }
+            SysctlOutcome::Record => (Resolved::Found(info), None),
+        };
+    }
+}
+
+/// What one `sysctl(KERN_PROC_PID)` call's result means.
+#[derive(Debug)]
+enum SysctlOutcome {
+    /// `EINTR`: ask again.
+    Retry,
+    /// The OS positively says there is no such process: `ESRCH`, or an empty reply.
+    Gone,
+    /// A sandbox or hardened runtime refused the query: the DESIGNED `Unknown`, not a contract
+    /// violation.
+    Refused(std::io::Error),
+    /// The kernel broke the contract: what to trace, and the error the read answers, which keeps a
+    /// failure's own errno.
+    Violation { message: String, error: std::io::Error },
+    /// A record of exactly our `kinfo_proc`'s size.
+    Record,
+}
+
+/// What `called`, the bytes the sysctl wrote or the error it failed with, means for `pid`.
+///
+/// `ENOMEM` and `EINVAL` are neither race- nor permission-reachable. `ENOMEM` in particular is the ONLY
+/// runtime detector for a kernel `kinfo_proc` that has grown past our 648-byte definition: it fails
+/// before the size check is ever reached, and the compile-time size assert cannot fire because the Rust
+/// definition is what stayed still. A record of another size is layout drift: never trusted.
+fn classify(pid: RawPid, called: std::io::Result<usize>) -> SysctlOutcome {
+    match called {
+        Err(e) => match e.raw_os_error() {
+            Some(libc::EINTR) => SysctlOutcome::Retry,
+            Some(libc::ESRCH) => SysctlOutcome::Gone,
+            Some(libc::EPERM | libc::EACCES) => SysctlOutcome::Refused(e),
+            _ => SysctlOutcome::Violation {
+                message: format!(
+                    "sysctl(KERN_PROC_PID, {pid}) failed: {report}",
+                    report = crate::error::Report(&e)
+                ),
+                error: e,
+            },
+        },
+        Ok(0) => SysctlOutcome::Gone,
+        Ok(size) if size == std::mem::size_of::<kinfo_proc>() => SysctlOutcome::Record,
+        Ok(size) => {
+            let message = format!(
+                "sysctl(KERN_PROC_PID, {pid}) wrote {size} bytes, expected {}",
                 std::mem::size_of::<kinfo_proc>()
             );
-            super::contract_violation(format_args!("{drift}"));
-            return (Resolved::Unknown, Some(std::io::Error::other(drift)));
+            SysctlOutcome::Violation {
+                error: std::io::Error::other(message.clone()),
+                message,
+            }
         }
-        return (Resolved::Found(info), None);
     }
 }
 

@@ -212,34 +212,41 @@ fn snapshot_is_an_empty_blind_pass_when_the_edge_allocation_fails() {
 /// an error. Mutant: "transient counted as denied".
 #[skuld::test]
 fn a_fork_in_progress_resolves_and_is_not_counted_as_denied() {
-    use crate::identity::{macos_fault, Key, PpidRead};
+    use crate::identity::{FakeKernel, Kernel};
     let me = std::process::id() as libc::c_int;
-    let _forced = macos_fault::force_ppid_reads(
-        me as u32,
-        &[
-            PpidRead::Forking,
-            PpidRead::Forking,
-            PpidRead::Found(1, Key::for_test(1)),
-        ],
-    );
-    let (edges, denied, _) = join_edges(&HostKernel, &[me]).expect("edge buffer");
+    let Ok(record) = HostKernel.bsd_info(me as u32) else {
+        panic!("this process has a record");
+    };
+    let with_parent = |ppid| {
+        let mut record = record;
+        record.pbi_ppid = ppid;
+        Ok(record)
+    };
+    // The record states parent `0` twice, then `1`, and the kernel has no other row: a fourth read
+    // would panic.
+    let kernel = FakeKernel::new()
+        .on_bsd_info(me as u32, with_parent(0))
+        .on_bsd_info(me as u32, with_parent(0))
+        .on_bsd_info(me as u32, with_parent(1));
+    let (edges, denied, _) = join_edges(&kernel, &[me]).expect("edge buffer");
     assert_eq!(denied, 0);
     assert_eq!(edges, [(me as u32, 1)]);
-    assert_eq!(macos_fault::ppid_read_attempts(me as u32), 3);
 }
 
 /// A persistent refusal is a denial, read once. Mutant: "a persistent refusal is retried" (a second
 /// read reaches the real one, which resolves it).
 #[skuld::test]
 fn a_persistent_refusal_is_a_denial_after_one_read() {
-    use crate::identity::{macos_fault, PpidRead};
+    use crate::identity::{FakeKernel, ReadErr};
     let me = std::process::id() as libc::c_int;
-    let _forced = macos_fault::force_ppid_reads(me as u32, &[PpidRead::Refused]);
-    match process_parents(&HostKernel) {
+    // libproc misses (`EPERM`, as for a cross-user process) and the sysctl fallback is refused.
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_bsd_info(me as u32, Err(ReadErr::Refused(libc::EPERM)))
+        .on_kinfo_refused(me as u32, libc::EPERM);
+    match process_parents(&kernel) {
         Err(crate::error::Error::Unassessable { detail, .. }) => {
             assert!(detail.contains(&format!("sample: [{me}]")), "{detail}")
         }
         other => panic!("expected Unassessable, got {other:?}"),
     }
-    assert_eq!(macos_fault::ppid_read_attempts(me as u32), 1);
 }

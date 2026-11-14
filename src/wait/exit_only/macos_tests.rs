@@ -4,7 +4,7 @@
 
 use crate::child::spawn::identity_macos_tests::reap_by_pid;
 use crate::identity::{
-    ppid_fault, uniq_fault, uniq_info, HostKernel, ReadErr, ReadPurpose, UniqInfo, UniqRead, LAUNCHD,
+    short_info, uniq_fault, uniq_info, FakeKernel, HostKernel, ReadErr, ReadPurpose, UniqInfo, UniqRead, LAUNCHD,
 };
 use crate::os_process::child::{adopted_blocker, Foreign, OsChild, PeekOutcome};
 use crate::test_child::wait_until_zombie;
@@ -33,20 +33,18 @@ pub(crate) fn echild_yet_resolvable() -> (u32, u64) {
     (pid, unique_of(pid))
 }
 
-/// The parent read of a live process another process holds, as a tracer holds a child: not
-/// launchd.
-pub(crate) fn held_by_a_tracer() -> ppid_fault::Forced {
-    ppid_fault::force_ppid_once(Ok(held_by_a_tracer_pid()))
+/// A kernel that reads `pid`'s parent as `ppid` for its next `reads` parent reads and is the host's
+/// otherwise: `pid` is held by `ppid`, as a tracer holds a child (not launchd), or launchd holds a
+/// zombie whose tracer died (XNU reparented it).
+pub(crate) fn parent_reads(pid: u32, ppid: u32, reads: usize) -> FakeKernel<'static> {
+    (0..reads).fold(FakeKernel::over(&HostKernel), |kernel, _| {
+        kernel.on_short_bsd(pid, Ok(short_info(ppid, libc::SRUN)))
+    })
 }
 
-/// The tracer's pid in the parent read [`held_by_a_tracer`] forces.
+/// The tracer's pid in the parent reads of a process [`parent_reads`] states as held by a tracer.
 pub(crate) fn held_by_a_tracer_pid() -> u32 {
     4242
-}
-
-/// The parent read of a zombie whose tracer died: XNU reparented it to launchd.
-fn orphaned_to_launchd() -> ppid_fault::Forced {
-    ppid_fault::force_ppid_once(Ok(LAUNCHD))
 }
 
 /// A blocker that has exited and is not yet reaped, adopted (so a `MacosChild` holds it), and its pid.
@@ -65,10 +63,9 @@ fn exited_unreaped_blocker() -> (Box<dyn OsChild>, u32) {
 #[skuld::test]
 fn an_identity_read_gone_takes_the_echild_path() {
     let (_os, pid) = exited_unreaped_blocker();
-    let target = Target::pid(&HostKernel, pid, Some(unique_of(pid)));
-    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, UniqRead::Gone);
+    let kernel = FakeKernel::over(&HostKernel).on_unique_info(pid, UniqRead::Gone);
+    let target = Target::pid(&kernel, pid, Some(unique_of(pid)));
     let peeked = exit_only::peek(&target).expect("peek");
-    drop(forced);
     assert_eq!(peeked, PeekOutcome::Foreign(Foreign::Gone));
     reap_by_pid(pid);
 }
@@ -90,10 +87,9 @@ fn assert_refused_read(err: &std::io::Error, words: &str) {
 #[skuld::test]
 fn a_refused_identity_read_of_an_exited_child_is_an_error_with_the_refusals_code() {
     let (_os, pid) = exited_unreaped_blocker();
-    let target = Target::pid(&HostKernel, pid, Some(unique_of(pid)));
-    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Peek, UniqRead::Refused(libc::EPERM));
+    let kernel = FakeKernel::over(&HostKernel).on_unique_info(pid, UniqRead::Refused(libc::EPERM));
+    let target = Target::pid(&kernel, pid, Some(unique_of(pid)));
     let err = exit_only::peek(&target).expect_err("an exit that cannot be tied to the child is not consumed");
-    drop(forced);
     assert_refused_read(&err, "its exit was not consumed");
     reap_by_pid(pid);
 }
@@ -105,10 +101,9 @@ fn a_refused_identity_read_of_an_exited_child_is_an_error_with_the_refusals_code
 #[skuld::test]
 fn a_refused_identity_read_of_a_running_child_is_an_error_to_a_verified_peek() {
     let (_os, id, _stdin) = adopted_blocker();
-    let target = Target::pid(&HostKernel, id.pid(), Some(unique_of(id.pid())));
-    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::Running, UniqRead::Refused(libc::EPERM));
+    let kernel = FakeKernel::over(&HostKernel).on_unique_info(id.pid(), UniqRead::Refused(libc::EPERM));
+    let target = Target::pid(&kernel, id.pid(), Some(unique_of(id.pid())));
     let err = exit_only::peek_verified(&target).expect_err("a running child cannot be shown to be ours");
-    drop(forced);
     assert_refused_read(&err, "it cannot be shown to be ours");
 }
 
@@ -118,9 +113,8 @@ fn a_refused_identity_read_of_a_running_child_is_an_error_to_a_verified_peek() {
 /// left for the caller.
 fn second_reap_with_unique(read: UniqRead) -> (Box<dyn OsChild>, u32) {
     let (os, pid) = exited_unreaped_blocker();
-    let forced = uniq_fault::force_uniq_read_once(ReadPurpose::SecondPeek, read);
-    exit_only::second_reap(&HostKernel, pid, Some(7));
-    drop(forced);
+    let kernel = FakeKernel::over(&HostKernel).on_unique_info(pid, read);
+    exit_only::second_reap(&kernel, pid, Some(7));
     (os, pid)
 }
 
@@ -193,11 +187,10 @@ fn a_second_reap_that_finds_nothing_is_skipped() {
     let (_os, pid) = exited_unreaped_blocker();
     let marker = format!("second reap of pid {pid}");
     let mark = crate::log_capture::mark();
-    let same = uniq_fault::force_uniq_read_once(ReadPurpose::SecondPeek, found(7));
+    let kernel = FakeKernel::over(&HostKernel).on_unique_info(pid, found(7));
     let none = exit_seams::force_empty_reap_once();
-    exit_only::second_reap(&HostKernel, pid, Some(7));
+    exit_only::second_reap(&kernel, pid, Some(7));
     drop(none);
-    drop(same);
     let levels = crate::log_capture::levels_since(mark, &marker);
     assert!(
         !levels.contains(&log::Level::Warn),
@@ -240,11 +233,10 @@ fn force_uniq_read_once_hits_only_its_purpose() {
 #[skuld::test]
 fn an_echild_for_a_pid_held_by_a_tracer_is_running() {
     let (pid, unique) = echild_yet_resolvable();
-    let target = Target::pid(&HostKernel, pid, Some(unique));
-    let forced = held_by_a_tracer();
+    // The peek reads the parent, and so does the `try_reap`'s.
+    let kernel = parent_reads(pid, held_by_a_tracer_pid(), 2);
+    let target = Target::pid(&kernel, pid, Some(unique));
     assert_eq!(exit_only::peek(&target).expect("peek"), PeekOutcome::Running);
-    drop(forced);
-    let _forced = held_by_a_tracer();
     assert_eq!(
         exit_only::try_reap(&target).expect("try_reap"),
         exit_only::Reap::Running
@@ -273,14 +265,12 @@ fn an_echild_for_another_users_process_that_launchd_does_not_own_is_running() {
 #[skuld::test]
 fn an_echild_for_a_pid_orphaned_to_launchd_is_orphaned() {
     let (pid, unique) = echild_yet_resolvable();
-    let target = Target::pid(&HostKernel, pid, Some(unique));
-    let forced = orphaned_to_launchd();
+    let kernel = parent_reads(pid, LAUNCHD, 2);
+    let target = Target::pid(&kernel, pid, Some(unique));
     assert_eq!(
         exit_only::peek(&target).expect("peek"),
         PeekOutcome::Foreign(Foreign::Orphaned)
     );
-    drop(forced);
-    let _forced = orphaned_to_launchd();
     assert_eq!(
         exit_only::try_reap(&target).expect("try_reap"),
         exit_only::Reap::Foreign(Foreign::Orphaned)
@@ -295,16 +285,15 @@ fn an_echild_for_a_pid_orphaned_to_launchd_is_orphaned() {
 #[skuld::test]
 fn an_echild_whose_parent_read_fails_is_foreign() {
     let (pid, unique) = echild_yet_resolvable();
-    let target = Target::pid(&HostKernel, pid, Some(unique));
-    let forced = ppid_fault::force_ppid_once(Err(ReadErr::Refused(libc::EPERM)));
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_short_bsd(pid, Err(ReadErr::Refused(libc::EPERM)))
+        .on_short_bsd(pid, Err(ReadErr::Gone));
+    let target = Target::pid(&kernel, pid, Some(unique));
     assert_eq!(
         exit_only::peek(&target).expect("peek"),
         PeekOutcome::Foreign(Foreign::Gone)
     );
-    drop(forced);
-    let forced = ppid_fault::force_ppid_once(Err(ReadErr::Gone));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exit_only::peek(&target)));
-    drop(forced);
     if cfg!(debug_assertions) {
         assert!(outcome.is_err(), "a debug build asserts the contract");
     } else {
@@ -322,7 +311,6 @@ fn an_echild_whose_parent_read_fails_is_foreign() {
 #[skuld::test]
 fn an_echild_for_a_pid_that_no_longer_names_the_child_is_foreign() {
     let (pid, unique) = echild_yet_resolvable();
-    let target = Target::pid(&HostKernel, pid, Some(unique));
     let other = found(unique ^ 1);
     for (reads, want) in [
         (vec![other], Foreign::Other),
@@ -332,16 +320,15 @@ fn an_echild_for_a_pid_that_no_longer_names_the_child_is_foreign() {
         (vec![UniqRead::Gone], Foreign::Gone),
         (vec![found(unique), UniqRead::Gone], Foreign::Gone),
     ] {
-        let forced: Vec<_> = reads
-            .iter()
-            .map(|read| uniq_fault::force_uniq_read_once(ReadPurpose::Echild, *read))
-            .collect();
+        let kernel = reads.iter().fold(FakeKernel::over(&HostKernel), |kernel, read| {
+            kernel.on_unique_info(pid, *read)
+        });
+        let target = Target::pid(&kernel, pid, Some(unique));
         assert_eq!(
             exit_only::peek(&target).expect("peek"),
             PeekOutcome::Foreign(want),
             "{reads:?}"
         );
-        drop(forced);
     }
 }
 
@@ -364,8 +351,8 @@ fn an_echild_with_no_id_stays_foreign() {
 #[skuld::test]
 fn a_refused_echild_read_is_an_error_to_a_verified_peek() {
     let (pid, unique) = echild_yet_resolvable();
-    let target = Target::pid(&HostKernel, pid, Some(unique));
-    let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::Echild, UniqRead::Refused(libc::EPERM));
+    let kernel = FakeKernel::over(&HostKernel).on_unique_info(pid, UniqRead::Refused(libc::EPERM));
+    let target = Target::pid(&kernel, pid, Some(unique));
     let err = exit_only::peek_verified(&target).expect_err("a denied read cannot show a reap");
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err}");

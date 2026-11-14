@@ -176,21 +176,15 @@ pub(crate) fn adopt_std(
     id: crate::identity::ProcessId,
 ) -> Result<Box<dyn OsChild>, (Error, std::process::Child)> {
     debug_assert_eq!(child.id(), id.pid(), "the identity must be the child's");
-    #[cfg(target_os = "macos")]
-    let gone = || Error::Io(std::io::Error::from_raw_os_error(libc::ECHILD));
     #[cfg(target_os = "linux")]
     let os = match adopt_pidfd(&crate::identity::HostKernel, id) {
         Ok(os) => os,
         Err(e) => return Err((e, child)),
     };
     #[cfg(target_os = "macos")]
-    let os: Box<dyn OsChild> = match crate::signal::read_identity(&crate::identity::HostKernel, id.pid()) {
-        Ok(Some(unique)) => match super::macos::child::MacosChild::new(crate::identity::HostKernel, id.pid(), unique) {
-            Ok(os) => Box::new(os),
-            Err(e) => return Err((e, child)),
-        },
-        Ok(None) => return Err((gone(), child)),
-        Err(errno) => return Err((crate::signal::identity_unreadable(id.pid(), errno), child)),
+    let os = match adopt_macos(|_, _| crate::identity::HostKernel, id) {
+        Ok(os) => os,
+        Err(e) => return Err((e, child)),
     };
     #[cfg(windows)]
     let os: Box<dyn OsChild> = Box::new(super::windows::WindowsProcess::for_child(
@@ -201,6 +195,49 @@ pub(crate) fn adopt_std(
     #[cfg(unix)]
     drop(child);
     Ok(os)
+}
+
+/// [`adopt_std`]'s macOS half: a [`MacosChild`](super::macos::child::MacosChild) of `id`'s pid that
+/// asks the kernel `kernel(pid, unique)` makes, where `unique` is the host's own read of the pid's
+/// unique id. The kernel is made once the child's id is known, for a test whose rows name it. `ECHILD`
+/// if the pid has no process, and the unreadable-identity error if the read is refused.
+#[cfg(all(test, target_os = "macos"))]
+fn adopt_macos<K: crate::identity::Kernel + Send + 'static>(
+    kernel: impl FnOnce(u32, u64) -> K,
+    id: crate::identity::ProcessId,
+) -> Result<Box<dyn OsChild>, Error> {
+    let pid = id.pid();
+    match crate::signal::read_identity(&crate::identity::HostKernel, pid) {
+        Ok(Some(unique)) => Ok(Box::new(super::macos::child::MacosChild::new(
+            kernel(pid, unique),
+            pid,
+            unique,
+        )?)),
+        Ok(None) => Err(Error::Io(std::io::Error::from_raw_os_error(libc::ECHILD))),
+        Err(errno) => Err(crate::signal::identity_unreadable(pid, errno)),
+    }
+}
+
+/// [`adopt_std`] with a kernel the test states: see [`adopt_macos`].
+#[cfg(all(test, target_os = "macos"))]
+#[allow(
+    clippy::result_large_err,
+    reason = "the child is handed back untouched for the caller to deal with"
+)]
+pub(crate) fn adopt_std_over<K: crate::identity::Kernel + Send + 'static>(
+    kernel: impl FnOnce(u32, u64) -> K,
+    child: std::process::Child,
+    id: crate::identity::ProcessId,
+) -> Result<Box<dyn OsChild>, (Error, std::process::Child)> {
+    debug_assert_eq!(child.id(), id.pid(), "the identity must be the child's");
+    match adopt_macos(kernel, id) {
+        Ok(os) => {
+            // std's `Child` holds nothing else the tests use: dropping it neither kills nor reaps.
+            drop(child);
+            Ok(os)
+        }
+        Err(e) => Err((e, child)),
+    }
 }
 
 /// [`adopt_std`]'s Linux half: the pidfd of `id`'s pid, confirmed to name a child of this process.

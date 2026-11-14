@@ -1229,7 +1229,7 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
     );
 }
 
-/// A pass whose root's identity cannot be read (`identity::unreadable` refuses its by-pid read, as
+/// A pass whose root's identity cannot be read (`identity::force_unknown` refuses its by-pid read, as
 /// the OS can) skips the walk channel and is `incomplete`: not observed is not observed absent. The
 /// root is already in `seen`, so the pass signals no one, and the walk is the only source of
 /// `incomplete`, and no walk is recorded. The warn names the marker handle. Mutants: the unreadable
@@ -1244,7 +1244,7 @@ fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
     drop(cmd);
     let root = inert_root();
     let marker = super::Marker::new(prepared, root, None);
-    let (_kernel, _unreadable) = crate::identity::unreadable(root.pid());
+    let _unreadable = crate::identity::force_unknown(root.pid());
 
     let mut reached = Vec::new();
     let mut state = super::SweepState::new(&mut reached);
@@ -1275,7 +1275,7 @@ fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
     assert_eq!(warned.len(), 1, "{warned:?}");
 }
 
-/// A pass whose walk cannot read a live child of its live root (`identity::unreadable` refuses the
+/// A pass whose walk cannot read a live child of its live root (`identity::force_unknown` refuses the
 /// child's by-pid read, as the OS can) does not signal it and is `incomplete`: not observed is not
 /// observed absent. The root is already in `seen`, so the child is the only candidate and nothing
 /// is signalled. Mutant: the sweep takes the walk's members and ignores `unassessed`: the pass
@@ -1313,7 +1313,7 @@ fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete(
         panic!("the root has exactly one child, got {children:?}");
     };
     let marker = super::Marker::new(prepared, root, None);
-    let (_kernel, _unreadable) = crate::identity::unreadable(child.pid());
+    let _unreadable = crate::identity::force_unknown(child.pid());
 
     let mut reached = Vec::new();
     let mut state = super::SweepState::new(&mut reached);
@@ -1443,7 +1443,7 @@ fn a_terminate_that_sent_nothing_keeps_the_members_it_could_not_reach() {
     let _serialize = test_spawn_lock();
     let root_id = inert_root();
     let marker = marker_without_holders(root_id, Some(0));
-    let (_kernel, _unreadable) = crate::identity::unreadable(root_id.pid());
+    let _unreadable = crate::identity::force_unknown(root_id.pid());
     let root = crate::test_support::stated_root::StatedRoot::unreaped();
     match marker.terminate_tree(Some(&root)) {
         crate::containment::TerminateOutcome::NotSent(crate::error::Error::Unassessable {

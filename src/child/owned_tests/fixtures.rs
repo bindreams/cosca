@@ -60,6 +60,23 @@ impl Blocker {
         }
     }
 
+    /// [`Blocker::spawn`] with a `MacosChild` that asks `kernel(pid, unique)`, which owns it. The
+    /// kernel is built once the child exists, as its rows are about the child's pid and unique id.
+    /// A row the test leaves unused answers the teardown's reads.
+    #[cfg(target_os = "macos")]
+    pub(super) fn spawn_over<K: crate::identity::Kernel + Send + 'static>(
+        kernel: impl FnOnce(u32, u64) -> K,
+    ) -> Blocker {
+        let (child, stdin) = spawn_std_blocker();
+        let id = identity_of(&child);
+        let owned = OwnedChild::adopt_over(kernel, child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+        Blocker {
+            owned: Arc::new(owned),
+            pid: id.pid(),
+            stdin: Some(stdin),
+        }
+    }
+
     /// End the child: close its stdin, so it reads EOF and exits.
     pub(super) fn end_child(&mut self) {
         drop(self.stdin.take());

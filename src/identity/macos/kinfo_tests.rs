@@ -1,7 +1,7 @@
 //! Layout/value oracles for the local kinfo_proc definition. macOS-only at runtime.
 
 use super::*;
-use crate::identity::HostKernel;
+use crate::identity::{FakeKernel, HostKernel};
 
 // The kernel must agree with our struct size exactly: for a real one-record fetch, XNU
 // sets the written size to sizeof(struct kinfo_proc). (A NULL-buffer probe is NOT usable
@@ -34,22 +34,6 @@ fn kernel_writes_exactly_our_kinfo_proc_size() {
         std::mem::size_of::<kinfo_proc>(),
         "kernel kinfo_proc record size disagrees with our layout"
     );
-}
-
-// The rc!=0 contract-violation arm, driven through the selector test seam (a SYNTHETIC
-// invalid selector — the arm's real triggers are unconstructible with a correct mib). In
-// debug builds the tripwire panics AFTER the warn executed (this test expects the panic);
-// in the release lane the same straight-line code minus the compiled-out assert runs to
-// `None`, which the assert below pins.
-// SCOPE: the EPERM arm - a sandboxed sysctl refusal - is a DIFFERENT arm, reached by no
-// test on any available machine.
-#[cfg_attr(debug_assertions, should_panic(expected = "sysctl(KERN_PROC"))]
-#[skuld::test]
-fn an_undiagnosable_sysctl_failure_trips_the_tripwire_and_reports_unknown() {
-    let (r, _) = super::read_record_explained(std::process::id() as super::super::RawPid, -1);
-    // `assert_eq!` is impossible here: `Resolved`-s derives are T-bounded and `kinfo_proc`
-    // embeds a union, so it can never be `PartialEq`/`Debug`.
-    assert!(r.is_unknown(), "a failed sysctl must never yield a record - or a Gone");
 }
 
 // Verifies contract_violation's warn is actually captured, not just that debug panics —
@@ -377,9 +361,49 @@ fn the_exit_read_of_an_identity_is_gone_for_another_token_and_unknown_when_refus
         "the pid holds another process than the token's"
     );
 
-    fault::force_unreadable_once();
-    let (read, cause) = super::super::exit_begun(&HostKernel, me.pid(), me.key);
+    let refused = FakeKernel::over(&HostKernel).on_kinfo_refused(me.pid(), libc::EPERM);
+    let (read, cause) = super::super::exit_begun(&refused, me.pid(), me.key);
     assert_eq!(read, crate::identity::Resolved::Unknown);
     let error = cause.into_error("pid 1").expect("the refusal is the cause");
     assert!(error.to_string().contains("kinfo_proc could not be read"), "{error}");
+}
+
+// What one sysctl call's result means. Mutants: `EINTR` is not retried; a refusal is a contract
+// violation (a sandbox then trips the debug tripwire), or an `ENOMEM` / `EINVAL` is quiet; a record of
+// another size is trusted; an empty reply is a violation.
+#[skuld::test]
+fn a_sysctl_result_is_classified_by_its_errno_and_size() {
+    let failed = |errno| std::io::Error::from_raw_os_error(errno);
+    let size = std::mem::size_of::<kinfo_proc>();
+    assert!(matches!(classify(7, Err(failed(libc::EINTR))), SysctlOutcome::Retry));
+    assert!(matches!(classify(7, Err(failed(libc::ESRCH))), SysctlOutcome::Gone));
+    assert!(matches!(classify(7, Ok(0)), SysctlOutcome::Gone));
+    assert!(matches!(classify(7, Ok(size)), SysctlOutcome::Record));
+    for errno in [libc::EPERM, libc::EACCES] {
+        match classify(7, Err(failed(errno))) {
+            SysctlOutcome::Refused(e) => assert_eq!(e.raw_os_error(), Some(errno)),
+            other => panic!("errno {errno} is a refusal, got {other:?}"),
+        }
+    }
+    for errno in [libc::ENOMEM, libc::EINVAL] {
+        match classify(7, Err(failed(errno))) {
+            SysctlOutcome::Violation { message, error } => {
+                assert!(message.contains("sysctl(KERN_PROC_PID, 7) failed"), "{message}");
+                assert_eq!(error.raw_os_error(), Some(errno), "the errno stays the read's cause");
+            }
+            other => panic!("errno {errno} is a contract violation, got {other:?}"),
+        }
+    }
+    for wrote in [size - 1, size + 1] {
+        match classify(7, Ok(wrote)) {
+            SysctlOutcome::Violation { message, error } => {
+                assert_eq!(
+                    message,
+                    format!("sysctl(KERN_PROC_PID, 7) wrote {wrote} bytes, expected {size}")
+                );
+                assert_eq!(error.to_string(), message);
+            }
+            other => panic!("{wrote} bytes is layout drift, got {other:?}"),
+        }
+    }
 }

@@ -3,8 +3,8 @@
 //! read under a parent; and the pids whose parent number is `0` and not a fork in progress. The rows
 //! for a candidate and its parent that run on every platform are in `identity::tree_tests`.
 
-use super::{fault, read_ppid_once, resolve_ppid, trusted_ppid, PpidRead};
-use crate::identity::{HostKernel, Key, ProcessId, Resolved};
+use super::{read_ppid_once, resolve_ppid, trusted_ppid, PpidRead};
+use crate::identity::{FakeKernel, HostKernel, Kernel, Key, ProcessId, ReadErr, Resolved};
 use crate::test_child::{live_exiting_member, release_unsignalled};
 
 /// The start key of the record the ppid was read from, as a stated value.
@@ -75,9 +75,12 @@ fn a_refused_sysctl_is_unknown_after_one_read() {
 #[skuld::test]
 fn a_candidate_whose_parent_read_is_refused_is_unknown() {
     let (child, kid) = live_exiting_member();
-    let _forced = fault::force_ppid_reads(kid.pid(), &[PpidRead::Refused]);
+    // libproc misses (`EPERM`, as for a cross-user process) and the sysctl fallback is refused.
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_bsd_info(kid.pid(), Err(ReadErr::Refused(libc::EPERM)))
+        .on_kinfo_refused(kid.pid(), libc::EPERM);
     let parent = Some(ProcessId::current());
-    let (read, cause) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), parent, None, None);
+    let (read, cause) = ProcessId::of_ordered_with(&kernel, kid.pid(), parent, None, None);
     release_unsignalled(child);
     assert_eq!(read, Resolved::Unknown);
     assert_eq!(cause.blamed_parent(), None);
@@ -117,21 +120,38 @@ fn one_parent_read_of_launchd_finds_its_parent_zero() {
 }
 
 /// An ordered read waits out a fork-in-progress parent number only when it asks for the parent: one
-/// that names none reads the record once and never reads the parent number.
+/// that names none reads the record once, whatever its parent number says, and one that names a parent
+/// reads again. The record states parent number `0`, which is a fork in progress for a pid other than
+/// 0 and 1. Neither kernel has a host behind it: a read no row states panics.
 ///
-/// Mutant: every ordered read goes through the parent read.
+/// Mutants: every ordered read goes through the parent read (the first kernel, with its one row,
+/// would read again and panic); the read under a parent trusts the `0` (the candidate is then
+/// `Gone`, its parent number not being the parent's).
 #[skuld::test]
 fn an_ordered_read_reads_the_parent_number_only_when_asked() {
     let (child, kid) = live_exiting_member();
-    let _forced = fault::force_ppid_reads(kid.pid(), &[]);
-    let (alone, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), None, None, None);
+    let me = std::process::id();
+    let record = |pid| match HostKernel.bsd_info(pid) {
+        Ok(record) => record,
+        Err(e) => panic!("the live process {pid} has a record: {e:?}"),
+    };
+    let forking = || {
+        let mut record = record(kid.pid());
+        record.pbi_ppid = 0;
+        Ok(record)
+    };
+    let alone_kernel = FakeKernel::new().on_bsd_info(kid.pid(), forking());
+    let (alone, _) = ProcessId::of_ordered_with(&alone_kernel, kid.pid(), None, None, None);
     assert!(matches!(alone, Resolved::Found(_)), "{alone:?}");
-    assert_eq!(fault::ppid_read_attempts(kid.pid()), 0);
+    // The candidate's two reads (parent number `0`, then the real one), then the proof of the parent.
+    let under_kernel = FakeKernel::new()
+        .on_bsd_info(kid.pid(), forking())
+        .on_bsd_info(kid.pid(), Ok(record(kid.pid())))
+        .on_bsd_info(me, Ok(record(me)));
     let parent = Some(ProcessId::current());
-    let (under, _) = ProcessId::of_ordered_with(&crate::identity::HostKernel, kid.pid(), parent, None, None);
+    let (under, _) = ProcessId::of_ordered_with(&under_kernel, kid.pid(), parent, None, None);
     release_unsignalled(child);
     assert!(matches!(under, Resolved::Found(_)), "{under:?}");
-    assert_eq!(fault::ppid_read_attempts(kid.pid()), 1);
 }
 
 /// A record whose key is not the `expected` one is another process's: `Gone`, with or without a
