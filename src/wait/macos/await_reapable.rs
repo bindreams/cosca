@@ -230,20 +230,17 @@ pub(crate) fn await_reapable_on(
     let mut round: u32 = 0;
     #[cfg(test)]
     let mut check = crate::wait::test_clock::RoundCheck::new("await_reapable_on");
+    #[cfg(test)]
     let mut repeek = false;
     loop {
         #[cfg(test)]
-        check.round();
-        if repeek {
-            #[cfg(test)]
-            {
-                test_hooks::fire_before_repeek();
-                if backoff {
-                    test_hooks::fire_esrch_repeek();
-                }
+        {
+            check.round();
+            if repeek && backoff {
+                test_hooks::fire_esrch_repeek();
             }
+            repeek = true;
         }
-        repeek = true;
         // Peeks until the wait may block: once more at once after a tracer's watch is registered.
         let mut tracer_wait = None;
         loop {
@@ -251,6 +248,11 @@ pub(crate) fn await_reapable_on(
             // peek again by a pid that may since name another child.
             if drain_for_reap(kq, &mut events, pid, &mut tracer)? {
                 return Ok(Waited::Gone);
+            }
+            // The final peek is the only one at or after the deadline: it answers what this
+            // round's peek would.
+            if expired(deadline) {
+                return final_peek(kernel, pid, unique);
             }
             let (peeked, holder) = peek(kernel, pid, unique)?;
             if let Some(verdict) = settle(peeked) {
@@ -309,8 +311,6 @@ fn expired(deadline: Option<Instant>) -> bool {
 
 /// The one non-blocking look at expiry.
 fn final_peek(kernel: &dyn Kernel, pid: u32, unique: Option<u64>) -> io::Result<Waited> {
-    #[cfg(test)]
-    exit_only::seams::step(exit_only::seams::HolderStep::FinalPeek);
     Ok(settle(peek(kernel, pid, unique)?.0).unwrap_or(Waited::DeadlinePassed))
 }
 

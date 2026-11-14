@@ -50,10 +50,7 @@ pub(crate) mod macos_tests;
 #[cfg(test)]
 #[cfg_attr(
     windows,
-    allow(
-        dead_code,
-        reason = "the Unix holder steps and record rewrites have no Windows caller"
-    )
+    allow(dead_code, reason = "the forced peeks and record rewrites have only Unix callers")
 )]
 #[path = "exit_only/seams.rs"]
 pub(crate) mod seams;

@@ -12,7 +12,6 @@ thread_local! {
     static AWAIT_TIMEOUTS: RefCell<Vec<Option<Duration>>> = const { RefCell::new(Vec::new()) };
     static AWAIT_EVENTS: RefCell<Vec<(i16, u32)>> = const { RefCell::new(Vec::new()) };
     static FORCED_REGISTRATION: Cell<Option<Registration>> = const { Cell::new(None) };
-    static ON_BEFORE_REPEEK: RefCell<Option<OnceHook>> = const { RefCell::new(None) };
     static ON_ESRCH_REPEEK: RefCell<Option<OnceHook>> = const { RefCell::new(None) };
     static ON_KEVENT_ROUND: RefCell<Option<RoundHookOnce>> = const { RefCell::new(None) };
     static ON_EVERY_KEVENT_ROUND: RefCell<Option<EveryRoundHook>> = const { RefCell::new(None) };
@@ -30,6 +29,9 @@ pub(crate) fn await_requested_timeouts() -> Vec<Option<Duration>> {
 }
 
 /// Record one event the `await_reapable` loop got back: its `filter` and `fflags`.
+///
+/// The events are the OS's answer to a registration, not a `Kernel` row, and no outcome shows them
+/// (a knote with and one without `EV_CLEAR` end the same wait `Reapable`).
 pub(crate) fn record_event(filter: i16, fflags: u32) {
     AWAIT_EVENTS.with(|e| e.borrow_mut().push((filter, fflags)));
 }
@@ -70,19 +72,6 @@ pub(crate) fn take_forced_registration(which: Registration) -> bool {
         }
         forced
     })
-}
-
-/// Run `hook` on the waiting thread just before the wait's next re-peek. The guard drops an
-/// unfired hook.
-pub(crate) fn on_before_repeek(hook: impl FnOnce() + 'static) -> ForcedOnce {
-    ON_BEFORE_REPEEK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-    ForcedOnce(|| ON_BEFORE_REPEEK.with(|h| *h.borrow_mut() = None))
-}
-
-pub(crate) fn fire_before_repeek() {
-    if let Some(hook) = ON_BEFORE_REPEEK.with(|h| h.borrow_mut().take()) {
-        hook();
-    }
 }
 
 /// Run `hook` on the waiting thread just before the next re-peek that follows an `ESRCH`
