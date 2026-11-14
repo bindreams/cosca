@@ -345,63 +345,70 @@ pub(crate) struct TreeKilled {
     state: std::sync::Mutex<TreeState>,
 }
 
-/// The settlement of a tree ([`TreeKilled`]): each state is a fact the handle knows, and [`next`]
-/// moves them by one rule. Only a walk that leaves nothing vouches for the tree; only a member seen
-/// running un-vouches it. A settlement, from any state:
+/// The settlement of a tree ([`TreeKilled`]): two facts the handle knows, the [`Vouching`] and the
+/// members it holds, and [`next`] moves them by one rule. Only a walk that leaves nothing vouches for
+/// the tree; only a member seen running un-vouches it. A settlement, from any state:
 ///
-/// - leaves members with identities (held ones still left, or new ones): `Left`;
+/// - leaves members with identities (held ones still left, or new ones): holds them, and keeps an
+///   `Unvouched` tree's kind; a `Killed` tree is `Never`, since it was seen running on;
 /// - is a walk (`Ran`) that leaves nothing, held members included: `Killed`;
 /// - leaves something running that holds no identity (a member of a handle that is not a `TreeWalk`,
 ///   or a walk that left the root, whatever then ended it): `Unvouched`, from any state;
 /// - otherwise (a gone root, a walk not made, or a skipped kill whose sweep left nothing: none saw a
-///   member running) keeps the state, except that `Left` whose held members all dropped out is
-///   `Unvouched`. A held member is held because its kill was refused: it ran on and may have forked,
-///   and killing it again by identity does not reach its children.
+///   member running) keeps the vouching, except that held members that all dropped out leave a `Never`
+///   tree `Unvouched`. A held member is held because its kill was refused: it ran on and may have
+///   forked, and killing it again by identity does not reach its children.
 ///
 /// The kind of an `Unvouched` state is the latest fact:
 ///
 /// - a walk that saw the root running names [`RootSeenRunning`](UnvouchedKind::RootSeenRunning),
 ///   whether or not the root had ended;
-/// - held members that all dropped out name [`HeldMembersGone`](UnvouchedKind::HeldMembersGone);
+/// - held members that all dropped out of a `Never` tree name
+///   [`HeldMembersGone`](UnvouchedKind::HeldMembersGone);
 /// - something else left running with no identity names [`Earlier`](UnvouchedKind::Earlier), from
 ///   any previous state.
 ///
-/// A settlement with no new fact keeps the stored kind.
+/// A settlement with no new fact keeps the stored kind, held members included.
+///
+/// A `Killed` tree holds no members: a `SIGTERM` walk that finds live ones on it has seen it run on,
+/// and only the call's own complete walk can vouch for it again.
 #[derive(Debug, Default)]
-enum TreeState {
+struct TreeState {
+    vouching: Vouching,
+    /// What a kill left, or a `SIGTERM` walk reached, never none, so every later kill and drop answers
+    /// them first: the root's death reparents them out of a later walk, so the handle kills the ones
+    /// whose identity was read again and reports the others again. The two kinds are told apart by the
+    /// entry ([`Left`](crate::containment::treewalk::Left)): `Resolved` and `Unread` are leftovers of a
+    /// kill that did not kill them, `Termed` members of a `SIGTERM` walk, which nothing has refused. A
+    /// kill that finds only `Termed` members gone leaves the tree unvouched all the same, unless the
+    /// call is the one whose own complete walk reached them ([`settle`](TreeKilled::settle)). Held
+    /// over an `Unvouched` tree, they are killed by identity and the kind stays, so no walk makes a
+    /// tree an earlier kill left unvouched `Ok`.
+    held: Vec<crate::containment::treewalk::Left>,
+}
+
+/// Whether a walk has vouched for a tree.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Vouching {
     /// Nothing has settled the tree: no kill left anything running, and no walk left nothing.
     #[default]
     Never,
     /// A walk left nothing: vouched for.
     Killed,
-    /// A walk left these members, or a `SIGTERM` walk reached them, never none, so every later kill and
-    /// drop answers them first: the root's death reparents them out of a later walk, so the handle
-    /// kills the ones whose identity was read again and reports the others again. The two kinds are
-    /// told apart by the entry ([`Left`](crate::containment::treewalk::Left)): `Resolved` and `Unread`
-    /// are leftovers of a kill that did not kill them, `Termed` members of a `SIGTERM` walk, which
-    /// nothing has refused. A kill that finds only `Termed` members gone leaves the tree unvouched all
-    /// the same, unless the call is the one whose own complete walk reached them
-    /// ([`settle`](TreeKilled::settle)). `Beneath` is the state the members were held on top of: a
-    /// `SIGTERM` walk on a tree already killed or unvouched holds its members to be killed by identity,
-    /// and the vouching stays as it was (a kill that ends them leaves `Killed` killed and an unvouched
-    /// tree unvouched, with its kind), so no walk makes a tree an earlier kill left unvouched `Ok`.
-    Left(Vec<crate::containment::treewalk::Left>, Beneath),
-    /// A kill ran, and no member it left is held now (each is gone, or the handle never held an
-    /// identity for it), but no walk since has vouched for the tree: a member seen running may have
-    /// forked, and its children were never looked for. The kind says what was found where the tree
-    /// became unvouched: every text over this state is chosen by it.
+    /// A kill ran, and no walk since has vouched for the tree: a member seen running may have forked,
+    /// and its children were never looked for. The kind says what was found where the tree became
+    /// unvouched: every text over this state is chosen by it.
     Unvouched(UnvouchedKind),
 }
 
-/// What a [`TreeState::Left`] was held on top of: the vouching it keeps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Beneath {
-    /// A tree never settled, or one whose members a kill left: nothing is kept.
-    Open,
-    /// A killed tree: vouched for.
-    Killed,
-    /// A tree an earlier kill left unvouched, with the kind it found.
-    Unvouched(UnvouchedKind),
+impl TreeState {
+    fn new(vouching: Vouching, held: Vec<crate::containment::treewalk::Left>) -> TreeState {
+        debug_assert!(
+            vouching != Vouching::Killed || held.is_empty(),
+            "a killed tree holds no member"
+        );
+        TreeState { vouching, held }
+    }
 }
 
 /// The state after a settlement, by the rule on [`TreeState`]. The facts: `walked`, the outcome was a
@@ -421,11 +428,15 @@ fn next(
         "a root seen running is something left running"
     );
     if !left_now.is_empty() {
-        return TreeState::Left(left_now, Beneath::Open);
+        let vouching = match prev.vouching {
+            Vouching::Unvouched(kept) => Vouching::Unvouched(kept),
+            Vouching::Never | Vouching::Killed => Vouching::Never,
+        };
+        return TreeState::new(vouching, left_now);
     }
     // The kind the facts name, for a state they leave unvouched. Something running with no identity
     // and no root seen is `Earlier` from any state; with nothing running, the only way to be
-    // unvouched is `Left` whose held members all dropped out.
+    // unvouched is held members that all dropped out of a `Never` tree.
     let named = if root_seen_running {
         UnvouchedKind::RootSeenRunning
     } else if running {
@@ -433,18 +444,14 @@ fn next(
     } else {
         UnvouchedKind::HeldMembersGone
     };
-    match prev {
-        _ if walked && !running => TreeState::Killed,
-        TreeState::Never if !running => TreeState::Never,
-        TreeState::Killed if !running => TreeState::Killed,
-        TreeState::Unvouched(kept) if !running => TreeState::Unvouched(*kept),
-        // Members a walk held on a vouched or unvouched tree, now gone: the vouching is as it was.
-        TreeState::Left(_, Beneath::Killed) if !running => TreeState::Killed,
-        TreeState::Left(_, Beneath::Unvouched(kept)) if !running => TreeState::Unvouched(*kept),
-        TreeState::Never | TreeState::Killed | TreeState::Left(..) | TreeState::Unvouched(_) => {
-            TreeState::Unvouched(named)
-        }
-    }
+    let vouching = match prev.vouching {
+        _ if walked && !running => Vouching::Killed,
+        Vouching::Never if !running && prev.held.is_empty() => Vouching::Never,
+        Vouching::Killed if !running => Vouching::Killed,
+        Vouching::Unvouched(kept) if !running => Vouching::Unvouched(kept),
+        Vouching::Never | Vouching::Killed | Vouching::Unvouched(_) => Vouching::Unvouched(named),
+    };
+    TreeState::new(vouching, Vec::new())
 }
 
 impl TreeKilled {
@@ -455,26 +462,27 @@ impl TreeKilled {
     /// Whether the tree is killed. Only a Unix drop reads it (`DropView`), and the tests.
     #[cfg(any(unix, test))]
     pub(crate) fn is_set(&self) -> bool {
-        matches!(*self.lock(), TreeState::Killed)
+        self.lock().vouching == Vouching::Killed
     }
 
     /// A tree an earlier kill left unvouched with `kind`, for a test that cannot make the kill that
     /// does it without a refusing member.
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn leave_unvouched_for_test(&self, kind: UnvouchedKind) {
-        *self.lock() = TreeState::Unvouched(kind);
+        *self.lock() = TreeState::new(Vouching::Unvouched(kind), Vec::new());
     }
 
     /// Holds `members`, which a `SIGTERM` walk found and reached, as members a later kill answers first
-    /// ([`Left`](TreeState::Left), as `Termed` entries, not as leftovers of a refused kill): the root's
+    /// ([`held`](TreeState::held), as `Termed` entries, not as leftovers of a refused kill): the root's
     /// exit reparents them out of every later walk, so only their identities reach them. `complete`:
     /// the walk read every candidate, so `members` list the tree whole as it saw it. `call` is the call
     /// that walked, if it will sweep: the returned token is the one its sweep may vouch with, `Some`
     /// only for a complete walk, and tags the members it reached. A member held already (the same
     /// process, by pid and start identity, in either kind) is held once, and is tagged by the call
-    /// that reached it now. A tree already killed or left unvouched keeps its vouching and the kind
-    /// ([`Beneath`]): its members are held all the same, to be killed by identity, but a walk cannot
-    /// vouch for what an earlier kill did not.
+    /// that reached it now. A tree left unvouched keeps its kind: its members are held all the same,
+    /// to be killed by identity, but a walk cannot vouch for what an earlier kill did not. A killed
+    /// tree that a walk finds live members on has been seen to run on: it is `Never` again, with them
+    /// held, and only the call's own complete walk can vouch for it again.
     pub(crate) fn hold(
         &self,
         members: Vec<crate::identity::ProcessId>,
@@ -485,12 +493,7 @@ impl TreeKilled {
 
         let walk = call.filter(|_| complete).cloned();
         let mut state = self.lock();
-        let (mut held, beneath) = match &*state {
-            TreeState::Left(held, beneath) => (held.clone(), *beneath),
-            TreeState::Never => (Vec::new(), Beneath::Open),
-            TreeState::Killed => (Vec::new(), Beneath::Killed),
-            TreeState::Unvouched(kind) => (Vec::new(), Beneath::Unvouched(*kind)),
-        };
+        let mut held = state.held.clone();
         for id in members {
             match held.iter_mut().find(|member| match member {
                 Left::Resolved(held_id) | Left::Termed { id: held_id, .. } => *held_id == id,
@@ -506,7 +509,11 @@ impl TreeKilled {
             }
         }
         if !held.is_empty() {
-            *state = TreeState::Left(held, beneath);
+            let vouching = match state.vouching {
+                Vouching::Killed => Vouching::Never,
+                kept @ (Vouching::Never | Vouching::Unvouched(_)) => kept,
+            };
+            *state = TreeState::new(vouching, held);
         }
         walk
     }
@@ -611,8 +618,8 @@ pub(crate) enum SettleOutcome {
     /// The kill was skipped (and the sweep by identity of a macOS fd marker left nothing): it killed
     /// nothing, and the state left is not unvouched.
     Skipped,
-    /// The state left is [`Unvouched`](TreeState::Unvouched), whatever the call did: a skipped kill
-    /// over a tree a skip moved there from [`Left`](TreeState::Left), or a walk that left only the
+    /// The state left is [`Unvouched`](Vouching::Unvouched), whatever the call did: a skipped kill
+    /// over a tree a skip moved there from held members that were refused, or a walk that left only the
     /// root, whose own end then made the answer `Ok`. `kind` says what was found.
     Unvouched { kind: UnvouchedKind },
 }
@@ -1058,12 +1065,9 @@ impl TreeKilled {
     ) -> Settled {
         let outcome = outcome.into();
         let mut state = self.lock();
-        let was_killed = matches!(*state, TreeState::Killed | TreeState::Left(_, Beneath::Killed));
+        let was_killed = state.vouching == Vouching::Killed;
         // Copied, not taken: the state is written once, at the end, so an unwind between leaves it as it was.
-        let held = match &*state {
-            TreeState::Left(held, _) => held.clone(),
-            TreeState::Never | TreeState::Killed | TreeState::Unvouched(_) => Vec::new(),
-        };
+        let held = state.held.clone();
         let (gone_root_pid, call) = match &outcome {
             TreeKillOutcome::NoRoot(pid, call) => (Some(*pid), call.as_ref()),
             _ => (None, None),
@@ -1071,19 +1075,16 @@ impl TreeKilled {
         let gone_root = gone_root_pid.is_some();
         // The call's own walk stands for the walk the gone root cannot make.
         let listing_stands = call.is_some_and(|call| {
-            match &*state {
-            TreeState::Never | TreeState::Killed => true,
-            TreeState::Left(_, Beneath::Unvouched(_)) | TreeState::Unvouched(_) => false,
-            TreeState::Left(held, _) => held.iter().all(|member| {
-                matches!(member, crate::containment::treewalk::Left::Termed { walk: Some(walk), .. } if walk == call)
-            }),
-        }
+            !matches!(state.vouching, Vouching::Unvouched(_))
+                && state.held.iter().all(|member| {
+                    matches!(member, crate::containment::treewalk::Left::Termed { walk: Some(walk), .. } if walk == call)
+                })
         });
         let ran = matches!(outcome, TreeKillOutcome::Ran(_) | TreeKillOutcome::Answered(_));
         // What a walk not made or a gone root leaves is its error, not a member seen running.
         let looked_for_no_member = matches!(outcome, TreeKillOutcome::NoRoot(..) | TreeKillOutcome::Unwalked(_));
         // A walk already covered the tree unless it was never settled: a gone root adds no error of its own.
-        let covered = gone_root && (listing_stands || !matches!(*state, TreeState::Never));
+        let covered = gone_root && (listing_stands || state.vouching != Vouching::Never || !state.held.is_empty());
         let result = if covered { Ok(()) } else { outcome.into_result() };
         let crate::containment::mechanism::KillLeftOutcome {
             mut result,
@@ -1100,12 +1101,16 @@ impl TreeKilled {
         let after = next(&state, ran, left_now, running, root_seen_running);
         // Every member the listing named is gone or was killed and waited for: the listing is clear.
         let listing_clear = listing_stands && result.is_ok();
-        let after = if listing_clear { TreeState::Killed } else { after };
+        let after = if listing_clear {
+            TreeState::new(Vouching::Killed, Vec::new())
+        } else {
+            after
+        };
         if gone_root && result.is_ok() && !was_killed && !listing_clear {
             // What an earlier walk left is gone or unknown, but nothing walked the tree for what it forked.
-            let error = match after {
-                TreeState::Unvouched(kind) => TreeKillOutcome::no_root_after_kills_error(kind),
-                TreeState::Never | TreeState::Killed | TreeState::Left(..) => {
+            let error = match after.vouching {
+                Vouching::Unvouched(kind) => TreeKillOutcome::no_root_after_kills_error(kind),
+                Vouching::Never | Vouching::Killed => {
                     debug_assert!(
                         false,
                         "a gone root over held or unvouched members leaves the tree unvouched"
@@ -1122,10 +1127,10 @@ impl TreeKilled {
         };
         // The answer follows the state left: `Killed` only over a vouched tree. A gone root answers
         // `Ok` only over a killed tree.
-        let answer = unsettled.map(|()| match &after {
-            TreeState::Unvouched(kind) => SettleOutcome::Unvouched { kind: *kind },
+        let answer = unsettled.map(|()| match after.vouching {
+            Vouching::Unvouched(kind) => SettleOutcome::Unvouched { kind },
             _ if ran || gone_root => {
-                debug_assert!(matches!(after, TreeState::Killed), "`Killed` answers a killed tree");
+                debug_assert!(after.vouching == Vouching::Killed, "`Killed` answers a killed tree");
                 SettleOutcome::Killed
             }
             _ => SettleOutcome::Skipped,

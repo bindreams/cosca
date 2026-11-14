@@ -467,6 +467,12 @@ impl Tree {
             _ => None,
         }
     }
+
+    /// Leaves the tree as an earlier kill that found `kind` would ([`TreeKilled::leave_unvouched_for_test`]).
+    #[cfg(test)]
+    pub(crate) fn leave_unvouched_for_test(&self, kind: crate::containment::dispatch::UnvouchedKind) {
+        self.killed.leave_unvouched_for_test(kind);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -480,11 +486,6 @@ impl Tree {
             Holder::Contained(Mechanism::Marker(m)) => m.pgid().is_some(),
             _ => false,
         }
-    }
-
-    /// Leaves the tree as an earlier kill that found `kind` would ([`TreeKilled::leave_unvouched_for_test`]).
-    pub(crate) fn leave_unvouched_for_test(&self, kind: crate::containment::dispatch::UnvouchedKind) {
-        self.killed.leave_unvouched_for_test(kind);
     }
 
     /// The root a tree walk walks from; `None` for any other tree.
