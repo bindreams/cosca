@@ -319,7 +319,7 @@ pub(super) fn on_rounds(mut hook: impl FnMut(u32) -> bool + 'static) -> crate::w
 /// holding the child, ends the wait: `Orphaned`. This process's own pid stands in for the child, and
 /// a blocker for the tracer; the parent read is forced: this process until the attach, then the
 /// stand-in, then launchd once that has exited. A `SIGCONT` to this process stands in for the
-/// attach's `SIGSTOP`. Nothing but that signal wakes the wait, so it ends only if the signal did.
+/// attach's `SIGSTOP`. Nothing but that signal wakes the wait.
 ///
 /// Mutant: the wait registers no `NOTE_SIGNAL` on the child: it never ends (the suite's `slow-timeout`
 /// fails it).
@@ -368,8 +368,7 @@ fn started_by_us_traced_by(tracer: u32) -> (libc::pid_t, libc::pid_t) {
 /// that `SIGCHLD` wakes it, and the look after it finds launchd holding the child: `Orphaned`. This
 /// process's own pid stands in for the child, held by one blocker; a second blocker stands in for
 /// that one's tracer, by its forced parents. A `SIGCHLD` to the second stands in for the first one's
-/// exit, and the child's parent read then answers launchd. Nothing but that `SIGCHLD` wakes the
-/// wait, so it ends only if the signal did.
+/// exit, and the child's parent read then answers launchd. Nothing but that `SIGCHLD` wakes the wait.
 ///
 /// Mutant: the walk stops at the child's tracer: the wait never ends (the suite's `slow-timeout`
 /// fails it).
@@ -787,7 +786,7 @@ fn a_refused_confirmation_is_dead_when_the_peek_shows_the_exit_record() {
 /// Mutant: `OwnedChild::liveness` answers `Alive` for a child the peek reads running.
 #[skuld::test]
 fn a_refused_confirmation_is_the_refusal_when_the_peek_reads_the_child_running() {
-    let (b, _) = Blocker::spawn_over(|pid, _| {
+    let (b, kernel) = Blocker::spawn_over(|pid, _| {
         FakeKernel::over(&HostKernel)
             .on_subscribe_refused(ExitWatch::registration(pid), libc::ESRCH)
             .on_unique_info(pid, UniqRead::Refused(libc::EPERM))
@@ -795,4 +794,8 @@ fn a_refused_confirmation_is_the_refusal_when_the_peek_reads_the_child_running()
     let err = b.owned.liveness().expect_err("a running peek does not answer");
     assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
+    assert!(
+        kernel.all_rows_taken(),
+        "the adoption's registration was refused, and the confirming read was refused"
+    );
 }

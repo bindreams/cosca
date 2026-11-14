@@ -186,8 +186,7 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
-    /// The next registration `what` is refused with `errno`, as a pid past `P_REF_DEAD` refuses it
-    /// (`ESRCH`).
+    /// The next registration `what` is refused with `errno` (a pid past `P_REF_DEAD` answers `ESRCH`).
     pub(crate) fn on_subscribe_refused(mut self, what: Subscription, errno: i32) -> Self {
         self.subscribes.push(what, Err(errno));
         self

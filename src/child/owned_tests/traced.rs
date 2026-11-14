@@ -278,7 +278,7 @@ fn tracee_with_unique() -> (crate::Child, crate::PipeWriter, u64) {
 /// A real tracer that attaches while the wait is blocked: the attach's `SIGSTOP` wakes the wait
 /// through the child's `NOTE_SIGNAL`, before anything else happens to the child. The wait then
 /// watches the tracer; the child's exit and the tracer's hand-back end it with the child's status.
-/// The attach's `SIGSTOP` is the only wake of the wait's first block, so the wait ends only if it did.
+/// The attach's `SIGSTOP` is the only wake of the wait's first block.
 ///
 /// Mutant: the wait registers no `NOTE_SIGNAL` on the child: it never ends (the suite's `slow-timeout`
 /// fails it).
@@ -321,7 +321,7 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
 /// registers the second tracer too, whose signals then wake it. A `SIGCONT` to the second tracer,
 /// which leaves a running process running, shows the registration. The child's exit and its
 /// tracer's hand-back end the wait with the child's status. The `SIGCONT` is the only wake of the
-/// wait's first block, so the wait ends only if the registration saw it.
+/// wait's first block.
 ///
 /// Mutant: the walk stops at the child's tracer: the wait never ends (the suite's `slow-timeout`
 /// fails it).

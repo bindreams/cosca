@@ -53,8 +53,7 @@ fn blocker() -> (std::process::Child, ProcessId) {
 }
 
 /// The host's kernel, except that the registration of `pid`'s exit watch is refused with `ESRCH`:
-/// the watch reads fired while the process runs, as XNU posts the exit edge (and refuses a pid past
-/// `P_REF_DEAD`) before `p_stat = SZOMB`.
+/// the watch reads fired while the process runs, as XNU posts the exit edge before `p_stat = SZOMB`.
 fn a_kernel_that_fires_the_exit_watch(pid: u32) -> FakeKernel<'static> {
     FakeKernel::over(&HostKernel).on_subscribe_refused(ExitWatch::registration(pid), libc::ESRCH)
 }
@@ -281,12 +280,17 @@ fn an_open_and_a_send_arm_no_watch_and_the_first_look_arms_it() {
 #[skuld::test]
 fn a_fired_watch_on_a_process_is_exited_only_once_it_is_a_zombie() {
     let (mut child, id) = blocker();
-    let p = MacosProcess::open(a_kernel_that_fires_the_exit_watch(id.pid()), id)
+    let kernel = std::sync::Arc::new(a_kernel_that_fires_the_exit_watch(id.pid()));
+    let p = MacosProcess::open(std::sync::Arc::clone(&kernel), id)
         .unwrap()
         .expect("a live process opens");
     assert!(
         matches!(p.exited(), Ok(Exit::Recheck)),
         "the watch fired, the process is not a zombie"
+    );
+    assert!(
+        kernel.all_rows_taken(),
+        "the first look's registration consumed the refusal"
     );
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Delivered);
     wait_until_zombie(id.pid());
@@ -294,17 +298,17 @@ fn a_fired_watch_on_a_process_is_exited_only_once_it_is_a_zombie() {
     child.wait().unwrap();
 }
 
-/// A spawned blocker child, its stdin, its identity, and a [`MacosChild`] over it that asks the
-/// kernel `kernel` makes (from the child's identity, over [`a_kernel_that_fires_the_exit_watch`]'s
-/// rows), and whose exit watch has fired while it runs (the registration refusal stands in for the
-/// edge, as for `MacosProcess` above).
+/// A spawned blocker child, its stdin, its identity, a [`MacosChild`] over the kernel `kernel` builds
+/// from the child's identity, whose exit watch has fired while it runs (see
+/// [`a_kernel_that_fires_the_exit_watch`]), and a handle to that kernel.
 fn a_child_with_a_fired_watch(
     kernel: impl FnOnce(FakeKernel<'static>, ProcessId) -> FakeKernel<'static>,
 ) -> (
     std::process::Child,
     std::process::ChildStdin,
     ProcessId,
-    crate::os_process::macos::child::MacosChild<FakeKernel<'static>>,
+    crate::os_process::macos::child::MacosChild<std::sync::Arc<FakeKernel<'static>>>,
+    std::sync::Arc<FakeKernel<'static>>,
 ) {
     use crate::os_process::macos::child::MacosChild;
 
@@ -313,9 +317,9 @@ fn a_child_with_a_fired_watch(
     let stdin = child.stdin.take().expect("piped stdin");
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     let unique = unique_of(id.pid());
-    let kernel = kernel(a_kernel_that_fires_the_exit_watch(id.pid()), id);
-    let mac = MacosChild::new(kernel, id.pid(), unique).expect("watch the child");
-    (child, stdin, id, mac)
+    let kernel = std::sync::Arc::new(kernel(a_kernel_that_fires_the_exit_watch(id.pid()), id));
+    let mac = MacosChild::new(std::sync::Arc::clone(&kernel), id.pid(), unique).expect("watch the child");
+    (child, stdin, id, mac, kernel)
 }
 
 /// [`a_fired_watch_on_a_process_is_exited_only_once_it_is_a_zombie`] for the owned child.
@@ -323,10 +327,14 @@ fn a_child_with_a_fired_watch(
 /// Mutant: `MacosChild::exited` answers `Exited` on the watch alone, so the first look is `Exited`.
 #[skuld::test]
 fn a_fired_watch_on_a_child_is_exited_only_once_it_is_a_zombie() {
-    let (mut child, stdin, id, mac) = a_child_with_a_fired_watch(|kernel, _| kernel);
+    let (mut child, stdin, id, mac, kernel) = a_child_with_a_fired_watch(|kernel, _| kernel);
     assert!(
         matches!(mac.exited(), Ok(Exit::Recheck)),
         "the watch fired, the child is not a zombie"
+    );
+    assert!(
+        kernel.all_rows_taken(),
+        "the adoption's registration consumed the refusal"
     );
     drop(stdin);
     wait_until_zombie(id.pid());
@@ -449,12 +457,20 @@ fn a_refused_confirmation_of_a_process_is_unassessable_with_the_errno() {
     let (mut child, id) = blocker();
     // The open's read, the arming's, then the confirming one, which is refused.
     let own = UniqRead::Found(own_unique_info(id));
-    let kernel = a_kernel_that_fires_the_exit_watch(id.pid())
-        .on_unique_info(id.pid(), own)
-        .on_unique_info(id.pid(), own)
-        .on_unique_info(id.pid(), UniqRead::Refused(libc::EPERM));
-    let p = open_with(kernel, id).unwrap().expect("a live process opens");
+    let kernel = std::sync::Arc::new(
+        a_kernel_that_fires_the_exit_watch(id.pid())
+            .on_unique_info(id.pid(), own)
+            .on_unique_info(id.pid(), own)
+            .on_unique_info(id.pid(), UniqRead::Refused(libc::EPERM)),
+    );
+    let p = open_with(std::sync::Arc::clone(&kernel), id)
+        .unwrap()
+        .expect("a live process opens");
     assert_a_refused_confirmation_is_unassessable_with_the_errno(&*p);
+    assert!(
+        kernel.all_rows_taken(),
+        "the open, the arming and the confirming read each read"
+    );
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -465,9 +481,13 @@ fn a_refused_confirmation_of_a_process_is_unassessable_with_the_errno() {
 #[skuld::test]
 fn a_refused_confirmation_of_a_child_is_unassessable_with_the_errno() {
     // The child's first read is the confirming one.
-    let (mut child, stdin, _id, mac) =
+    let (mut child, stdin, _id, mac, kernel) =
         a_child_with_a_fired_watch(|kernel, id| kernel.on_unique_info(id.pid(), UniqRead::Refused(libc::EPERM)));
     assert_a_refused_confirmation_is_unassessable_with_the_errno(&mac);
+    assert!(
+        kernel.all_rows_taken(),
+        "the adoption's registration was refused, and the confirming read was refused"
+    );
     drop(stdin);
     child.wait().unwrap();
 }
@@ -689,19 +709,23 @@ fn a_confirmed_exit_is_remembered_and_later_looks_read_nothing() {
 
     let (mut child, id) = blocker();
     let own = UniqRead::Found(own_unique_info(id));
-    let kernel = a_kernel_that_fires_the_exit_watch(id.pid())
-        // The open's read, and the arming's.
-        .on_unique_info(id.pid(), own)
-        .on_unique_info(id.pid(), own)
-        // The first confirming look: the process runs.
-        .on_unique_info(id.pid(), own)
-        .on_short_bsd(id.pid(), Ok(short_info(LAUNCHD, libc::SRUN)))
-        .on_unique_info(id.pid(), own)
-        // The second: a zombie.
-        .on_unique_info(id.pid(), own)
-        .on_short_bsd(id.pid(), Ok(short_info(LAUNCHD, libc::SZOMB)))
-        .on_unique_info(id.pid(), own);
-    let p = open_with(kernel, id).unwrap().expect("a live process opens");
+    let kernel = std::sync::Arc::new(
+        a_kernel_that_fires_the_exit_watch(id.pid())
+            // The open's read, and the arming's.
+            .on_unique_info(id.pid(), own)
+            .on_unique_info(id.pid(), own)
+            // The first confirming look: the process runs.
+            .on_unique_info(id.pid(), own)
+            .on_short_bsd(id.pid(), Ok(short_info(LAUNCHD, libc::SRUN)))
+            .on_unique_info(id.pid(), own)
+            // The second: a zombie.
+            .on_unique_info(id.pid(), own)
+            .on_short_bsd(id.pid(), Ok(short_info(LAUNCHD, libc::SZOMB)))
+            .on_unique_info(id.pid(), own),
+    );
+    let p = open_with(std::sync::Arc::clone(&kernel), id)
+        .unwrap()
+        .expect("a live process opens");
     assert!(
         matches!(p.exited(), Ok(Exit::Recheck)),
         "the watch fired and the first confirming read finds it running"
@@ -710,6 +734,7 @@ fn a_confirmed_exit_is_remembered_and_later_looks_read_nothing() {
         matches!(p.exited(), Ok(Exit::Exited)),
         "the second confirming read finds a zombie"
     );
+    assert!(kernel.all_rows_taken(), "the two confirming looks took every row");
     assert!(matches!(p.exited(), Ok(Exit::Exited)));
     assert!(matches!(p.exited(), Ok(Exit::Exited)));
     child.kill().unwrap();
@@ -807,8 +832,7 @@ fn esrch_at_registration_reads_as_exited_and_rechecks() {
     drop(child.stdin.take());
     let id = ProcessId::of(child.id()).found().expect("identity");
     wait_until_zombie(id.pid());
-    // The zombie is not yet visible to the look's peek. The test keeps a handle to the kernel the
-    // child owns, to ask whether its rows were taken.
+    // The zombie is not yet visible to the look's peek.
     let kernel = std::sync::Arc::new(a_kernel_that_fires_the_exit_watch(id.pid()).on_peek(id.pid(), Ok(None)));
     let os = adopt_std_over(
         {
@@ -830,7 +854,7 @@ fn esrch_at_registration_reads_as_exited_and_rechecks() {
 
 /// A running child, a [`MacosChild`] over the kernel `kernel` makes from the child's pid, and the
 /// identity. The rows' registrations are taken in order, the adoption's first, so a later row is
-/// the exit wait's. The test keeps a handle to the kernel, to ask whether its rows were taken.
+/// the exit wait's.
 fn a_running_child_with_a_watch(
     kernel: impl FnOnce(u32) -> FakeKernel<'static>,
 ) -> (
@@ -939,7 +963,7 @@ fn an_exit_wait_whose_drain_read_the_reap_is_done_because_the_pid_is_gone() {
 
 /// A pid past registration at the reap registration (`ESRCH`, a refusal row) is not a failure either,
 /// and it is no news about the exit: the exit watch registered on its own and the running child reads
-/// `Running`. The row is the reap's (the exit watch's registration is another subscription).
+/// `Running`.
 ///
 /// Mutant: `ESRCH` at the reap registration fails the adoption, or reads the child as exited (marks
 /// the exit watch fired).
