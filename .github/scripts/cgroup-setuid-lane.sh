@@ -30,4 +30,4 @@ trap leave EXIT
 sudo chown "$(id -u):$(id -g)" "$CG" "$CG/cgroup.procs" "$CG/cgroup.subtree_control" "$CG/cgroup.threads" || exit 1
 echo $$ | sudo tee "$CG/cgroup.procs" > /dev/null || exit 1
 export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1 COSCA_TEST_SETUID=1 COSCA_TEST_SETUID_CONSENT=1 COSCA_TESTCFG_SETUID_HELPER="$3" SKULD_LABELS="cgroup & setuid"
-"$1" nextest run --archive-file "$2" --workspace-remap "$PWD" --profile "${NEXTEST_PROFILE:-ci-cgroup-setuid}" --no-tests=fail -E "binary(cosca)"
+"$1" nextest run --archive-file "$2" --workspace-remap "$PWD" --profile ci-cgroup-setuid --no-tests=fail -E "binary(cosca)"

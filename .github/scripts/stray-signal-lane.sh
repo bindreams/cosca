@@ -12,6 +12,6 @@ set -euo pipefail
 target="${1:?usage: stray-signal-lane.sh <target> [release]}"
 export COSCA_TEST_STRAY_SIGNAL=1 COSCA_TEST_STRAY_SIGNAL_CONSENT=1 SKULD_LABELS=stray_signal
 if [[ "${2:-}" == release ]]; then
-    exec cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target "$target" --profile "${NEXTEST_PROFILE:-ci-stray-signal-release}"
+    exec cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target "$target" --profile ci-stray-signal-release
 fi
-exec cargo nextest run --locked --no-tests=fail --features tokio --target "$target" --profile "${NEXTEST_PROFILE:-ci-stray-signal}" -E 'binary(cosca) | binary(=process)'
+exec cargo nextest run --locked --no-tests=fail --features tokio --target "$target" --profile ci-stray-signal -E 'binary(cosca) | binary(=process)'

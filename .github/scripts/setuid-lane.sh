@@ -11,4 +11,4 @@ set -euo pipefail
 
 target="${1:?usage: setuid-lane.sh <target> <helper>}"
 export COSCA_TEST_SETUID=1 COSCA_TEST_SETUID_CONSENT=1 COSCA_TESTCFG_SETUID_HELPER="${2:?usage: setuid-lane.sh <target> <helper>}" SKULD_LABELS=setuid
-exec cargo nextest run --locked --no-tests=fail --features tokio --target "$target" --profile "${NEXTEST_PROFILE:-ci-setuid}" -E 'binary(cosca) | binary(group_teardown_setuid)'
+exec cargo nextest run --locked --no-tests=fail --features tokio --target "$target" --profile ci-setuid -E 'binary(cosca) | binary(group_teardown_setuid)'

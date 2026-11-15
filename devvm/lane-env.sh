@@ -3,8 +3,9 @@
 # The groups that are off by default are off here as in CI: `.github/test-group-defaults.env`, which the CI jobs apply
 # to their environment; a lane turns on its own. Then the groups whose kernel feature this guest's kernel lacks are
 # turned off too, and the script says which. The floors are those of `src/test_groups.rs`; at or above one the
-# variable stays unset and the group runs. Only `sudo --preserve-env` carries these into a root shell: it takes
-# `COSCA_LANE_FLOOR_VARS`, the comma-separated names of the variables this script may turn off.
+# variable stays unset and the group runs. `COSCA_LANE_FLOOR_VARS` lists, comma-separated, the kernel-floor
+# variables this script turned off or may turn off, for `sudo --preserve-env`. A root lane's `sudo` drops the
+# default-off groups as CI's does; the lane script sets the groups it runs.
 # The caller's shell keeps its allexport setting and gains no variables besides the exports.
 cosca_lane_env() {
     local allexport=off kernel release pair floor group vars=

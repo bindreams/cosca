@@ -2,7 +2,7 @@
 
 The guest is Ubuntu 24.04 with the toolchain of `.github/ci-toolchain`, `cargo-nextest`, and the git-tracked tree at
 `~/cosca` ([`cosca-linux.devvm.yaml`](cosca-linux.devvm.yaml)). Each lane below runs the CI lane's scripts from
-`.github/scripts/`, so a lane that passes here runs the text CI runs. It does not reproduce CI's runner or kernel: the
+`.github/scripts/`, the scripts CI's steps call. It does not reproduce CI's runner or kernel: the
 guest's is 6.8, and `lane-env.sh` turns off the groups that need a newer one and says which.
 
 Every lane runs as the guest's `user`, which may `sudo` without a password; the lanes that need root call `sudo`
@@ -24,8 +24,8 @@ After an edit to a tracked file, rerun from a fresh instance: `devvm rm cosca-la
 last step (`copy`) runs again, about 45 seconds; the layers above it are reused. `devvm rm cosca-lane` when done.
 
 Each block sources `lane-env.sh`: the groups that are off by default (`.github/test-group-defaults.env`) are off, and
-the lane's script turns on its own with their `_CONSENT` variable. All tests of the lane pass. The skipped ones are
-those of the groups `lane-env.sh` printed as off, those the lane's filterset leaves out, and ignored tests.
+the lane's script turns on its own with their `_CONSENT` variable. All tests of the lane pass. Skipped are the tests
+the lane does not select (its labels and filterset), ignored tests, and those of the groups `lane-env.sh` printed as off.
 
 | Lane (CI group)                           | Consent variables set by                    |
 | ----------------------------------------- | ------------------------------------------- |

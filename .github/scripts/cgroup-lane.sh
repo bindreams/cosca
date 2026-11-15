@@ -3,8 +3,9 @@
 #
 # Usage: cgroup-lane.sh <cargo-nextest> <archive> <uid:gid>
 # Run it from the checkout, as root (CI runs `sudo python3 forward.py bash -ux cgroup-lane.sh ...` under
-# `run-nextest.py cgroup`) or as an ordinary user that may `sudo` (it runs itself again under `sudo`, keeping the kernel-floor switches of
-# `devvm/lane-env.sh`). `sudo`'s `secure_path` drops `~/.cargo/bin`, so the unprivileged user passes in
+# `run-nextest.py cgroup`) or, after sourcing `devvm/lane-env.sh`, as an ordinary user that may `sudo`: it runs
+# itself again under `sudo`, keeping that script's kernel-floor switches. `sudo`'s `secure_path` drops
+# `~/.cargo/bin`, so the unprivileged user passes in
 # `cargo-nextest`'s resolved path, the archive it built (`cgroup-archive.sh`) and its own `uid:gid`, which gets
 # `target/` back.
 #
@@ -66,7 +67,7 @@ export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
 # For the namespace tests that also attach a foreign tracer; no other test here takes it.
 export COSCA_TEST_TRACER=1 COSCA_TEST_TRACER_CONSENT=1
 status=0
-SKULD_LABELS="(cgroup | namespaces) & !setuid" "$1" nextest run --archive-file "$2" --workspace-remap "$PWD" --profile "${NEXTEST_PROFILE:-ci-cgroup}" --no-capture --no-tests=fail -E "binary(cosca) | binary(spawn_io) | binary(tokio_io)" || status=1
+SKULD_LABELS="(cgroup | namespaces) & !setuid" "$1" nextest run --archive-file "$2" --workspace-remap "$PWD" --profile ci-cgroup --no-capture --no-tests=fail -E "binary(cosca) | binary(spawn_io) | binary(tokio_io)" || status=1
 # Hand the target dir back so later steps can write to it.
 chown -R "$3" "$PWD/target" || status=1
 exit "$status"
