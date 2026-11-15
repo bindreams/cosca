@@ -50,6 +50,35 @@ system-affecting group also fails without `COSCA_TEST_<GROUP>_CONSENT=1`. To kee
 on your machine without exporting variables each time, set the `=0` switches in the `[env]`
 table of `~/.cargo/config.toml`.
 
+Every switch, with `COSCA_TEST_` left off. Each is on unless set to `0`; "CI default" is what
+`.github/test-group-defaults.env` gives the CI jobs, whose lanes turn a group on by setting it. A group
+with a consent column of "yes" fails without `<GROUP>_CONSENT=1`.
+
+| Switch               | Gates                                                                                     | Consent | CI default |
+| -------------------- | ----------------------------------------------------------------------------------------- | ------- | ---------- |
+| `ROOT`               | library tests that need a DAC bypass (run as root)                                        | yes     | off        |
+| `UID_SWITCH`         | tests that run as real root and spawn and signal processes under other real uids          | yes     | off        |
+| `NAMESPACES`         | tests that unshare namespaces and mount (Linux)                                           | yes     | off        |
+| `TRACER`             | tests that attach a tracer to their own children, as a debugger would                     | yes     | off        |
+| `SETUID`             | tests that run a setuid-root copy of the test helper                                      | yes     | off        |
+| `CGROUP`             | tests that create, kill and remove cgroup v2 leaves, and fail on a leaf left behind       | yes     | off        |
+| `ELEVATION`          | tests that elevate with `sudo`, `doas`, `pkexec`, `osascript` or `ShellExecuteEx`         | yes     | off        |
+| `STRAY_SIGNAL`       | tests whose failure may signal an unrelated process                                       | yes     | off        |
+| `DRIVE_MAPPING`      | the Windows test that maps a drive letter for the whole logon session                     | yes     | off        |
+| `PATH_PROBES`        | Windows path-resolution canaries and surveys, which execute helper copies and make links  | yes     | off        |
+| `SHELL_EXECUTE`      | Windows probes that elevate through `ShellExecuteEx` and register volatile App Paths keys | yes     | off        |
+| `SHELL_PROBES`       | Windows probes that execute batch files through `ShellExecuteEx`                          | yes     | off        |
+| `ELEVATION_ROUTES`   | Windows token and logon probes: derived tokens, scratch accounts, a scheduled task        | yes     | off        |
+| `PIDFD_GROUP_SIGNAL` | tests that need Linux 6.9+ (`pidfd_send_signal` on a process group)                       | no      | on         |
+| `PIDFD_GET_INFO`     | tests that need Linux 6.13+ (`PIDFD_GET_INFO` answers a cgroup id)                        | no      | on         |
+| `CLONE3`             | tests that need a host that allows `clone3`; Docker's default seccomp profile does not    | no      | on         |
+| `UNPRIVILEGED`       | tests that mean something only without privilege (`RLIMIT_NPROC` does not bind root)      | no      | on         |
+| `NON_ROOT`           | `cosca-path` tests of permission denial, which root bypasses                              | no      | on         |
+
+A group with no consent variable asks for no consent. Where the host lacks what its tests need (a
+kernel floor, `clone3`, a non-root user), they fail naming the switch, and `=0` turns the group off
+there.
+
 `ELEVATION` is an ordinary group of this kind: tests that really elevate with `sudo`, `doas`, `pkexec`,
 `osascript` or `ShellExecuteEx(runas)`. `COSCA_TEST_ELEVATION=0` turns it off, and it needs
 `COSCA_TEST_ELEVATION_CONSENT=1`. Run it only in a sandbox, set up as the elevation lanes in `.github/workflows/ci.yaml` do (passwords,
