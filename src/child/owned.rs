@@ -169,6 +169,13 @@ impl OwnedChild {
         }
     }
 
+    /// Take over the child `pidfd` names, whose pid is `pid` if known. **Makes no call to it**, as
+    /// [`new`](Self::new). The one constructor of a Linux box over a pidfd.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn over_pidfd(pid: Option<u32>, pidfd: std::os::fd::OwnedFd) -> OwnedChild {
+        OwnedChild::new(Box::new(crate::os_process::linux::LinuxProcess::new(pid, pidfd)))
+    }
+
     /// Take over the std `child`, whose identity `id` the caller has just read, through
     /// [`adopt_std`](crate::os_process::child::adopt_std). **Never reaps**: an already-exited child
     /// is still a zombie afterwards. Tests only: a spawn adopts through the handle it holds.

@@ -387,7 +387,7 @@ pub(crate) enum Past {
     Unexecuted,
 }
 
-/// What a teardown's kill of the root came to, as [`OwnedChild::tear_down_between`] tells its hook.
+/// What the root's own kill came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RootKill {
     /// The root's kill was sent: its reap is pending, and the root may be a zombie still.

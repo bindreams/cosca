@@ -61,6 +61,12 @@ pub enum ElevationErrorKind {
     /// The elevated child launched, but the parent could not resolve its identity to
     /// manage it. Whether it was terminated is reported in the error `detail`. A spawn returns it
     /// inside [`Error::MayHaveStarted`].
+    ///
+    /// The spawn terminates the child and waits for it. A UAC handle may be granted no right to
+    /// terminate: the refused kill hands the child back in the error's `unreaped`
+    /// ([`Unreaped`](crate::Unreaped)), and dropping the error from a sync spawn then blocks until
+    /// the elevated program exits (a tokio spawn's lets it go). [`wait`](crate::Unreaped::wait) or
+    /// [`leak`](crate::Unreaped::leak) settles it first.
     #[error("elevated child launched but could not be tracked")]
     Untracked,
     /// The composed elevation command exceeded this host's exec argument budget
@@ -433,7 +439,9 @@ pub enum Error {
     /// that proves the program never ran hands nothing back: it is not this variant), on every Unix,
     /// when the elevation backend's password write fails, and on Windows, when a
     /// `kill_on_drop(false)` child's job refuses the disarm and the kill that follows is refused
-    /// too. The other failed spawns leave a child they could not end running and warn.
+    /// too, or when a UAC child that could not be tracked ([`ElevationErrorKind::Untracked`]) is
+    /// refused its kill. Dropping such an error blocks until the child exits (see
+    /// [`Unreaped`](crate::Unreaped)). The other failed spawns leave a child they could not end running and warn.
     ///
     /// On Windows, a failed `ShellExecuteEx` launch is classified by its error (see `runas_failure`).
     MayHaveStarted {

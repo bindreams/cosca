@@ -47,11 +47,7 @@ use crate::identity::Kernel;
 #[path = "exit_only/macos_tests.rs"]
 pub(crate) mod macos_tests;
 
-#[cfg(test)]
-#[cfg_attr(
-    windows,
-    allow(dead_code, reason = "the forced peeks and record rewrites have only Unix callers")
-)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 #[path = "exit_only/seams.rs"]
 pub(crate) mod seams;
 
@@ -112,7 +108,7 @@ impl<'a> Target<'a> {
 /// Look at `target` without consuming anything. The handle `target` holds answers; macOS has no
 /// handle, so its target carries the kernel that does.
 pub(crate) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     if let Some(forced) = seams::take_forced_peek() {
         return forced;
     }

@@ -384,6 +384,35 @@ enum Threshold {
     Frozen(std::time::Duration),
 }
 
+#[cfg(feature = "tokio")]
+thread_local! {
+    static BLOCKS_IGNORED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While it lives, [`hold_teardown`]'s watch on this thread ignores blocks. The flag clears when the
+/// guard drops, also on unwind.
+#[cfg(feature = "tokio")]
+#[must_use = "the watch hears blocks again as soon as the guard is dropped"]
+pub(crate) struct BlocksIgnored(());
+
+#[cfg(feature = "tokio")]
+impl Drop for BlocksIgnored {
+    fn drop(&mut self) {
+        BLOCKS_IGNORED.with(|i| i.set(false));
+    }
+}
+
+/// Makes [`hold_teardown`]'s watch on this thread ignore blocks until the returned guard drops.
+/// Only a front's spawn tests arm it (`slow_teardown_tests`), inside the `teardown` closure: a front's
+/// spawn runs the cgroup placement probe first, and the probe's reap is the same kind of wait
+/// (`OwnedChild::wait`) as the teardown's, so its block would be taken for the teardown's first.
+/// Drop the guard at the spawn point where the teardown's window starts.
+#[cfg(feature = "tokio")]
+pub(crate) fn ignore_blocks_until() -> BlocksIgnored {
+    BLOCKS_IGNORED.with(|i| i.set(true));
+    BlocksIgnored(())
+}
+
 /// What [`hold_teardown`] found, before any assertion on it.
 #[cfg(feature = "tokio")]
 struct Held<R> {
@@ -438,7 +467,7 @@ fn hold_teardown<R: Send>(
             let at_block = report(look_tx.clone());
             let at_pause = report(look_tx);
             let _block = on_each_block(move |block| {
-                if !is_drain_wait(block) {
+                if !is_drain_wait(block) && !BLOCKS_IGNORED.with(std::cell::Cell::get) {
                     at_block();
                 }
             });

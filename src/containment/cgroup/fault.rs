@@ -42,8 +42,7 @@ thread_local! {
     static PROBE_DUMPABLE: Cell<bool> = const { Cell::new(false) };
     static PROBE_CLOSE_RANGE_ALLOWED: Cell<Option<u32>> = const { Cell::new(None) };
     static PROBE_FD_DIR_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
-    static BEFORE_PROBE_KILL: crate::oneshot_hook::OneShotHook<libc::pid_t, Option<i32>> = const { crate::oneshot_hook::OneShotHook::new() };
-    static PROBE_STEPS: std::cell::RefCell<Vec<ProbeStep>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PROBE_ENDS: std::cell::RefCell<Vec<super::reach::ProbeEnd>> = const { std::cell::RefCell::new(Vec::new()) };
     static CGROUP_ID_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static LIVENESS_READ_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static SUBTREE_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
@@ -340,37 +339,14 @@ pub(crate) fn probe_fd_dir_fails() -> Option<i32> {
     PROBE_FD_DIR_FAILS.with(Cell::get)
 }
 
-/// A hook given the probe child's pid; `Some(errno)` makes the guarded syscall fail with it.
-pub(crate) type ProbeHook = crate::oneshot_hook::Armed<libc::pid_t, Option<i32>>;
-
-/// Run `hook` once, in the next placement probe forked from this thread, right before its child is
-/// killed through its pidfd. `Some(errno)`: the kill fails with it and is not made.
-pub(crate) fn set_before_probe_kill(hook: impl FnOnce(libc::pid_t) -> Option<i32> + 'static) -> ProbeHook {
-    crate::oneshot_hook::arm_with(&BEFORE_PROBE_KILL, hook)
+/// Notes how a placement probe's child ended, once it was reaped, on this thread.
+pub(crate) fn record_probe_end(end: super::reach::ProbeEnd) {
+    PROBE_ENDS.with(|s| s.borrow_mut().push(end));
 }
 
-/// A step of a placement probe's end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProbeStep {
-    /// A kill of the child (signal number), recorded once the syscall or its seam answered.
-    Kill(i32),
-    /// The child's reap and how it ended.
-    Reap(super::reach::ProbeEnd),
-}
-
-/// Notes a step of a placement probe's end on this thread.
-pub(crate) fn record_probe_step(step: ProbeStep) {
-    PROBE_STEPS.with(|s| s.borrow_mut().push(step));
-}
-
-/// The steps of the placement probes' ends on this thread since the last call.
-pub(crate) fn take_probe_steps() -> Vec<ProbeStep> {
-    PROBE_STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()))
-}
-
-/// Runs the [`set_before_probe_kill`] hook, if armed: the errno the kill fails with.
-pub(crate) fn run_before_probe_kill(pid: libc::pid_t) -> Option<i32> {
-    crate::oneshot_hook::fire_with(&BEFORE_PROBE_KILL, pid).flatten()
+/// How the placement probes' children ended on this thread since the last call.
+pub(crate) fn take_probe_ends() -> Vec<super::reach::ProbeEnd> {
+    PROBE_ENDS.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
 /// Run `hook` once, right before the next `cgroup.kill` write on this thread; the guard clears it.

@@ -133,20 +133,18 @@ fn signal_failure_carries_the_win32_code() {
 }
 
 /// A UAC handle whose access cannot be read is taken to hold `SYNCHRONIZE` and no more, so a
-/// refused kill of its live child is a refusal of permission: an error, never an exit.
+/// refused kill of its live child is a refusal of permission ([`KillRefusal::Permission`], which
+/// `each_windows_handle_kind_states_what_its_kill_may_be_refused_for` states for a handle without
+/// `PROCESS_TERMINATE`): an error, never an exit.
 ///
 /// Mutant: the unreadable access is taken for every right (`PROCESS_ALL_ACCESS`), so a refused kill
 /// breaks the contract instead of reporting it.
 #[skuld::test]
-fn a_uac_handle_whose_access_cannot_be_read_is_refused_for_permission() {
-    use crate::os_process::child::{KillRefusal, OsChild as _};
+fn a_uac_handle_whose_access_cannot_be_read_is_taken_to_hold_synchronize_only() {
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
 
     let granted = super::access_of_uac_read(Err::<u32, _>(std::io::Error::other("unreadable")));
     assert_eq!(granted, PROCESS_SYNCHRONIZE);
-    let event = super::test_event::new_test_event().expect("create an event handle");
-    let p = super::WindowsProcess::for_uac(event, std::process::id(), granted);
-    assert_eq!(p.kill_refusal(), KillRefusal::Permission);
 }
 
 /// A UAC handle that was read as not granted `SYNCHRONIZE` cannot be waited on, which its owner's

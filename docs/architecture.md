@@ -82,9 +82,16 @@ In order:
    `DrainEdge::wait`.
    [#839](https://github.com/bindreams/cosca/issues/839) records the owner decisions and the PR
    plan. What is still the old shape, and which step takes it:
-   - Spawn (the spawn-time slice, Linux and Windows part): `exit_only::Target`, which the
-     Linux and Windows spawn identity checks and `unique_report` still take by handle or
-     number; the `exit_only::seams` the spawn-time tests use. `OwnedChild::tear_down`
+   - Spawn: each spawn builds one `OwnedChild` where its handle first exists, and every later
+     read, kill and reap of the child goes through it, the identity check
+     (`resolve_identity`) and the cgroup placement probe's child included. Linux: in the
+     handshake's `conclude`, over the pidfd the child sent, for every arm that has it. macOS:
+     right after the child's unique id is adopted; a child whose id came late gets a box of its
+     own, its tree swept around the root's kill (`late_child.rs`). Windows: right after the
+     process is created, a UAC launch right after `ShellExecuteEx` returns. Two reads are by
+     number, through `exit_only::Target`: macOS's `unique_report`, before a unique id exists, and
+     the Linux handshake's pre-report watch (a pidfd opened by number until
+     [#383](https://github.com/bindreams/cosca/issues/383) S2). `OwnedChild::tear_down`
      is the one kill-then-settle policy, split at its one wait (`begin_tear_down` returns the
      teardown's end or a pending wait, which `settle` blocks on and `settle_async` awaits), and
      `Child::drop` uses it. The async spawn is the sync spawn, run whole on tokio's blocking pool,
@@ -93,17 +100,15 @@ In order:
      Linux the teardown also ends every spawn failure (the handshake's `conclude`, and the
      identity and attach arms, `held_teardown.rs`), while a cgroup leaf a failed spawn drops
      ends its own exchange with the child (`CgroupLeaf::abandon_without_child`: killed through if
-     the child entered it, then removed, the child sent nothing). The spawn builds the
-     `OwnedChild` once when the handshake succeeds. On macOS it builds the `MacosChild` right
-     after the child's unique id is adopted, and the identity and attach arms tear down through
-     `held_teardown` as Linux's do (a refused kill, or a front still running, comes back as an
-     `Unreaped`); a child whose id came late gets a box of its own and the same teardown, with its
-     tree swept around the root's kill (`late_child.rs`). On Windows it
-     ends every failure of the std and raw spawns (`held_teardown::tear_down_failed_spawn`); a
-     refused kill comes back in the spawn's failure as an `Unreaped`. The `OwnedChild` is built
-     once, right after the process is created. An identity read the OS refuses fails no spawn: the child is kept with no identity, and only
-     a containment that needs one fails the attach. A teardown through a pidfd
-     (`held_teardown::tear_down_pidfd`) is told once what its caller knows became of the pidfd
+     the child entered it, then removed, the child sent nothing). On macOS the identity and
+     attach arms tear down through `held_teardown` as Linux's do (a refused kill, or a front
+     still running, comes back as an `Unreaped`). On Windows `held_teardown::tear_down_failed_spawn`
+     ends every failure of the std and raw spawns; a refused kill comes back in the spawn's
+     failure as an `Unreaped`, and so does a UAC child whose pid or identity cannot be read (ended
+     by the same teardown and waited for). An identity read the OS refuses fails no spawn: the
+     child is kept with no identity, and only a containment that needs one fails the attach. A
+     teardown over a handle
+     (`held_teardown::tear_down_expecting`) is told once what its caller knows became of the handle
      (`Past`, in `child::owned::teardown`); what the handle allows is its constructor's
      (`OsChild::kill_refusal`: a pidfd is refused for permission alone, a `CreateProcess` handle
      never, a UAC handle by the access it was granted), and the two make the `Expect` that
@@ -121,8 +126,7 @@ In order:
      `Command::{status, output, read}` do through `Child::tear_down_or_hand_back` (awaited, for
      the async ones), and so does the Windows `kill_on_drop(false)` disarm refusal
      (`Child::commit_kill_on_drop`). `SuspendedChild::resume` runs it too; `# Errors` there has the
-     split by arm. Windows still tears down by itself for its other spawn failures (the UAC
-     path's untracked kill).
+     split by arm.
    - macOS children with no box are stated limits: one whose id was never read is left; one whose
      kqueue the kernel refused is killed through its unique id, its marker's holders swept, warned
      of and never waited on.
@@ -133,12 +137,16 @@ In order:
      `ppid_fault`, `force_parents`, `force_links`, `by_pid_reads`). `HostKernel`'s own `sysctl`
      read states no row, so what a sysctl result means (`ESRCH`, `EPERM`/`EACCES` quiet; any other
      errno or a record of another size a `contract_violation`) is the pure `kinfo::classify`,
-     tested directly. `exit_only::{peek, peek_verified, peek_traced}` still consult the
-     `exit_only::seams` hooks `force_peek_once` and `force_peeks`. The spawn-time macOS tests
-     need them, because the code they run holds `HostKernel`. Three Linux spawn tests need the peek hooks too: the Linux
-     peek is a `waitid` on a pidfd, which no `Kernel` row answers. A registration (an exit watch's, a reap
-     waiter's) is a `subscribe` row: refused with `ESRCH`, or made and never firing. `LinuxProcess`
-     peeks through `exit_only::linux::peek`, which consults no hook.
+     tested directly. The one peek seam, `exit_only::seams` (`force_peek_once`, `force_peeks`),
+     answers a box's peek in the OS's place under `cfg(test)`: on macOS in
+     `exit_only::{peek, peek_verified, peek_traced}`, on Linux in `LinuxProcess::peek`. The tests
+     that need it run a whole spawn, whose box a test cannot reach, and the macOS spawn-time code
+     also holds `HostKernel`. The Linux peek is a `waitid(P_PIDFD, WNOHANG)` on our own child's
+     pidfd, which the kernel (`kernel/exit.c`, `kernel_waitid`, `__do_wait`) answers only with
+     `ECHILD` (a foreign reap, `Foreign::Gone`) or, for a closed or non-pidfd descriptor,
+     `EBADF`/`EINVAL` (debug-asserted); the seam states what a sandbox policy may answer. No
+     Windows test forces a peek. A registration (an exit watch's, a reap waiter's) is a `subscribe`
+     row: refused with `ESRCH`, or made and never firing.
 2. **Elevation backends:** a black box that says what the tracked process is (the program, or a
    wrapper that outlives it) and what may be signalled. `Child` asks it; it stops knowing sudo,
    doas or osascript.

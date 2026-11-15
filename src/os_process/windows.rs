@@ -34,7 +34,8 @@ pub(crate) const CREATE_PROCESS_ACCESS: PROCESS_ACCESS_RIGHTS = PROCESS_ALL_ACCE
 
 #[derive(Debug)]
 pub(crate) struct WindowsProcess {
-    pid: u32,
+    /// `None`: a UAC launch whose `GetProcessId` failed.
+    pid: Option<u32>,
     handle: OwnedHandle,
     /// The access the handle was granted: `SYNCHRONIZE` decides how a look reads the exit, and
     /// `PROCESS_TERMINATE` what a refused kill means.
@@ -50,7 +51,7 @@ impl WindowsProcess {
         #[cfg(test)]
         crate::wait::read_probe::mark("identity verified");
         Ok(Some(Self {
-            pid: id.pid(),
+            pid: Some(id.pid()),
             // SAFETY: `open_verified` hands over a freshly opened handle that nothing else owns.
             handle: unsafe { OwnedHandle::from_raw_handle(handle.0 as _) },
             granted,
@@ -61,15 +62,17 @@ impl WindowsProcess {
     /// [`CREATE_PROCESS_ACCESS`]: its kill is never refused.
     pub(crate) fn for_child(handle: OwnedHandle, pid: u32) -> Self {
         Self {
-            pid,
+            pid: Some(pid),
             handle,
             granted: CREATE_PROCESS_ACCESS,
         }
     }
 
-    /// The child `pid` that a UAC elevation (`ShellExecuteEx`) created, by the handle it returned,
-    /// with the access that handle was granted (read once, by [`uac_access`]).
-    pub(crate) fn for_uac(handle: OwnedHandle, pid: u32, granted: PROCESS_ACCESS_RIGHTS) -> Self {
+    /// The child that a UAC elevation (`ShellExecuteEx`) created, by the handle it returned, whose
+    /// pid is `pid` (`None`: it could not be read), with the access that handle was granted, read
+    /// from it here ([`uac_access`]).
+    pub(crate) fn for_uac(handle: OwnedHandle, pid: Option<u32>) -> Self {
+        let granted = uac_access(HANDLE(handle.as_raw_handle()));
         Self { pid, handle, granted }
     }
 
@@ -84,7 +87,7 @@ impl WindowsProcess {
 
 /// The access the process handle `ShellExecuteEx` returned was granted, read from the handle once,
 /// where it is handed over: the kill, the wait and the spawn all take it from there.
-pub(crate) fn uac_access(handle: HANDLE) -> PROCESS_ACCESS_RIGHTS {
+fn uac_access(handle: HANDLE) -> PROCESS_ACCESS_RIGHTS {
     access_of_uac_read(windows_granted_access(handle))
 }
 
@@ -176,8 +179,8 @@ impl OsProcess for WindowsProcess {
                 // The caller that goes on to report the refusal warns of it: a refusal warns once.
                 Termination::Failed(e) => {
                     log::debug!(
-                        "wait: TerminateProcess(pid {}) failed ({report})",
-                        self.pid,
+                        "wait: TerminateProcess({}) failed ({report})",
+                        super::child_named(self.pid),
                         report = crate::error::Report(&e)
                     );
                     Err(Error::Io(win32_io_error(e)))
@@ -202,7 +205,7 @@ impl OsProcess for WindowsProcess {
 
 impl OsChild for WindowsProcess {
     fn pid(&self) -> Option<u32> {
-        Some(self.pid)
+        self.pid
     }
 
     fn kill_refusal(&self) -> KillRefusal {

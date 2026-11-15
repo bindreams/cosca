@@ -102,6 +102,14 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(fail: FailAt, front
                 }
             };
             let _at = fault::set_at(fail.point, move || seizing(fault::spawn_pid()));
+            // A front's spawn runs the cgroup placement probe first, whose reap is the same kind of
+            // wait (`OwnedChild::wait`) as the teardown's. The teardown's window starts where the
+            // spawn reads the child's identity, which every failure point here follows: the probe's
+            // wait is not its first block. (No other spawn here blocks before it.)
+            let _window = front.then(|| {
+                let ignored = foreign_tracer::ignore_blocks_until();
+                fault::set_at(SpawnPoint::BeforeIdentity, move || drop(ignored))
+            });
             (fail.arm)();
             let mut cmd = foreign_tracer::tokio_tracee_command();
             if front {
