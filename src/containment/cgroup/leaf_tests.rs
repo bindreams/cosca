@@ -3832,6 +3832,11 @@ fn terminate_reports_a_member_it_could_not_signal(how: Unsignalled) {
     use crate::containment::cgroup::fault::{fail_terminate, take_member_terms, TerminateStep};
     crate::log_capture::install();
     let (leaf, mut member, stdin) = entered_real_leaf();
+    let kernel = std::sync::Arc::new(crate::identity::FakeKernel::over(&crate::identity::HostKernel));
+    let leaf = match how {
+        Unsignalled::Unplaced => leaf.asking_for_test(crate::identity::spawn_kernel(std::sync::Arc::clone(&kernel))),
+        Unsignalled::Unpinned | Unsignalled::SendFailed => leaf,
+    };
     let pid = member.id();
     let leaf_name = leaf
         .path()
@@ -3843,14 +3848,14 @@ fn terminate_reports_a_member_it_could_not_signal(how: Unsignalled) {
     let mark = crate::log_capture::mark();
     let guard: Box<dyn std::any::Any> = match how {
         Unsignalled::Unpinned => Box::new(fail_terminate(TerminateStep::Pin, libc::EMFILE)),
-        // Neither route can place the member: `/proc` hides it, and no pidfd gives its cgroup.
-        Unsignalled::Unplaced => Box::new((
-            crate::containment::cgroup::fault::miss_pidfd_info(),
-            crate::containment::cgroup::fault::hide_proc(),
-        )),
+        Unsignalled::Unplaced => Box::new(crate::containment::cgroup::fault::miss_pidfd_info()),
         Unsignalled::SendFailed => Box::new(fail_terminate(TerminateStep::Send, libc::EIO)),
     };
+    // Neither route can place the member: `/proc` hides it, and no pidfd gives its cgroup. The row
+    // covers the `terminate` call alone, not the leaf's drop.
+    let hidden = matches!(how, Unsignalled::Unplaced).then(|| kernel.hide_every_pid_cgroup());
     let result = leaf.terminate().expect("cgroup.procs is readable");
+    drop(hidden);
     drop(guard);
     // No send was made, so none is noted, a refused one included.
     assert_eq!(take_member_terms(), []);
@@ -3871,19 +3876,14 @@ fn terminate_reports_a_member_it_could_not_signal(how: Unsignalled) {
     }
     // The one member's cause is the error's source, with its OS code, and not in its text.
     let code = match how {
-        Unsignalled::Unpinned => Some(libc::EMFILE),
-        Unsignalled::SendFailed => Some(libc::EIO),
-        // Which errno a hidden `/proc` answers is the kernel's.
-        Unsignalled::Unplaced => None,
+        Unsignalled::Unpinned => libc::EMFILE,
+        Unsignalled::SendFailed => libc::EIO,
+        // The stated row's.
+        Unsignalled::Unplaced => libc::ENOENT,
     };
-    match code {
-        Some(code) => {
-            assert_eq!(crate::error::first_os_code(&err), Some(code), "{err:?}");
-            let os_error = std::io::Error::from_raw_os_error(code).to_string();
-            assert!(!detail.contains(&os_error), "{detail}");
-        }
-        None => assert!(crate::error::first_os_code(&err).is_some(), "{err:?}"),
-    }
+    assert_eq!(crate::error::first_os_code(&err), Some(code), "{err:?}");
+    let os_error = std::io::Error::from_raw_os_error(code).to_string();
+    assert!(!detail.contains(&os_error), "{detail}");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains(&format!("pid {pid}")), "{warns:?}");
 }
@@ -4257,14 +4257,18 @@ fn cgroup_terminate_reports_a_member_whose_place_and_exit_cannot_be_read(#[fixtu
 
     use crate::containment::cgroup::fault::{fail_terminate, take_member_terms, TerminateStep};
     let (leaf, mut member, stdin) = entered_real_leaf();
+    // Neither route can place the member (`/proc` hides it, and no pidfd gives its cgroup), and its
+    // exit cannot be read either.
+    let kernel = std::sync::Arc::new(crate::identity::FakeKernel::over(&crate::identity::HostKernel));
+    let leaf = leaf.asking_for_test(crate::identity::spawn_kernel(std::sync::Arc::clone(&kernel)));
     take_member_terms();
     let guard = (
-        // Neither route can place the member, and its exit cannot be read either.
         crate::containment::cgroup::fault::miss_pidfd_info(),
-        crate::containment::cgroup::fault::hide_proc(),
         fail_terminate(TerminateStep::Exited, libc::EIO),
     );
+    let hidden = kernel.hide_every_pid_cgroup();
     let result = leaf.terminate().expect("cgroup.procs is readable");
+    drop(hidden);
     drop(guard);
     let noted = take_member_terms();
     drop(stdin);
@@ -4286,7 +4290,7 @@ fn cgroup_terminate_reports_a_member_whose_place_and_exit_cannot_be_read(#[fixtu
         rendered.contains("its exit could not be read") && rendered.contains("(os error 5)"),
         "the failed exit read is in the report too: {rendered}"
     );
-    // The code the walk finds is the placement's (`hide_proc` answers `ENOENT`), not the exit read's.
+    // The code the walk finds is the placement's (the stated row answers `ENOENT`), not the exit read's.
     assert_eq!(crate::error::first_os_code(&err), Some(libc::ENOENT), "{err:?}");
 }
 
@@ -4354,10 +4358,10 @@ fn a_failed_placement_whose_exit_read_fails_too_keeps_its_os_code_as_the_source(
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_refused_placement_of_a_live_member_is_returned_as_unsupported() {
-    use crate::containment::cgroup::fault::hide_proc_as;
     use crate::containment::cgroup::test_support::kill_record;
+    use crate::identity::{FakeKernel, HostKernel};
 
-    // No leaf id: the task is placed through `/proc`, which the fault refuses.
+    // No leaf id: the task is placed through `/proc`, which the stated row refuses.
     let subtree = crate::containment::cgroup::Subtree::new(
         None,
         None,
@@ -4368,11 +4372,11 @@ fn a_refused_placement_of_a_live_member_is_returned_as_unsupported() {
     );
     let pidfd = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty())
         .expect("pidfd_open");
-    let _refused = hide_proc_as(libc::ENOSYS);
+    let refusing = FakeKernel::over(&HostKernel).on_every_pid_read("cgroup", Err(libc::ENOSYS));
 
     let result = super::placed_or_exited(
         pidfd.as_fd(),
-        subtree.holds(&crate::identity::HostKernel, std::process::id(), Some(pidfd.as_fd())),
+        subtree.holds(&refusing, std::process::id(), Some(pidfd.as_fd())),
     );
 
     let err = match result {

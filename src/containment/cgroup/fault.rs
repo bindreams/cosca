@@ -29,7 +29,6 @@ thread_local! {
     static REFUSED_KILL_WRITES: Cell<u32> = const { Cell::new(0) };
     static FAIL_NEXT_KILL_WRITE: Cell<bool> = const { Cell::new(false) };
     static PIDFD_INFO_MISSING: Cell<bool> = const { Cell::new(false) };
-    static PROC_HIDDEN: Cell<bool> = const { Cell::new(false) };
     static BEFORE_KILL_WRITE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static AFTER_KILL_WRITE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static FORCED_PIDFD_CGROUP_ID: Cell<Option<u64>> = const { Cell::new(None) };
@@ -37,7 +36,6 @@ thread_local! {
     static BEFORE_SWEEP_REMOVE: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
     static AFTER_DRAIN_WARN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static WALK_FAILURE: std::cell::RefCell<Option<WalkFailure>> = const { std::cell::RefCell::new(None) };
-    static PROC_HIDDEN_AS: Cell<Option<i32>> = const { Cell::new(None) };
     static PIDFD_INFO_FAILS: Cell<Option<i32>> = const { Cell::new(None) };
     static PROBE_DUMPABLE: Cell<bool> = const { Cell::new(false) };
     static PROBE_CLOSE_RANGE_ALLOWED: Cell<Option<u32>> = const { Cell::new(None) };
@@ -184,57 +182,6 @@ impl Drop for MissPidfdInfo {
 
 pub(crate) fn pidfd_info_missing() -> bool {
     PIDFD_INFO_MISSING.with(Cell::get)
-}
-
-/// While the guard lives, this thread finds no `/proc/<pid>/cgroup` for another task, as a
-/// `hidepid` `/proc` hides a task of another user.
-pub(crate) fn hide_proc() -> HideProc {
-    PROC_HIDDEN.with(|f| f.set(true));
-    HideProc(())
-}
-
-#[must_use = "/proc is visible again as soon as the guard is dropped"]
-pub(crate) struct HideProc(());
-
-impl Drop for HideProc {
-    fn drop(&mut self) {
-        PROC_HIDDEN.with(|f| f.set(false));
-    }
-}
-
-/// While the guard lives, this thread's reads of another task's `/proc/<pid>/cgroup` fail with
-/// `errno`: any errno the open can answer, such as `hidepid`'s (`EPERM` under `hidepid=1`, `ENOENT`
-/// under `hidepid=2`) or an exit's `ESRCH`. It does not make the task hidden, only its reads fail.
-pub(crate) fn hide_proc_as(errno: i32) -> HideProcAs {
-    PROC_HIDDEN_AS.with(|f| f.set(Some(errno)));
-    HideProcAs(())
-}
-
-#[must_use = "the reads succeed again as soon as the guard is dropped"]
-pub(crate) struct HideProcAs(());
-
-impl Drop for HideProcAs {
-    fn drop(&mut self) {
-        PROC_HIDDEN_AS.with(|f| f.set(None));
-    }
-}
-
-/// The errno this thread's `<pid>/cgroup` reads fail with: [`hide_proc_as`]'s, `ENOENT` under
-/// [`hide_proc`], or `None` while neither is armed.
-pub(crate) fn proc_hidden_as() -> Option<i32> {
-    PROC_HIDDEN_AS
-        .with(Cell::get)
-        .or_else(|| PROC_HIDDEN.with(Cell::get).then_some(libc::ENOENT))
-}
-
-/// `kernel` with `pid`'s `<pid>/cgroup` read failing with [`proc_hidden_as`]'s errno (as the `openat2`'s
-/// answer), or `None` while neither hook is armed.
-pub(crate) fn hidden_cgroup_of(
-    kernel: &dyn crate::identity::Kernel,
-    pid: u32,
-) -> Option<crate::identity::FakeKernel<'_>> {
-    proc_hidden_as()
-        .map(|errno| crate::identity::FakeKernel::over(kernel).on_read(&format!("{pid}/cgroup"), Err(errno)))
 }
 
 /// While the guard lives, `PIDFD_GET_INFO` fails on this thread with `EIO`, as a kernel that has

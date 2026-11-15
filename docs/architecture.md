@@ -190,14 +190,7 @@ In order:
    `FakeKernel`: the root's read moves into `OwnedChild`, which borrows the kernel its OS box owns
    (`OsChild::kernel()`, which `OwnedChild::kernel()` lends) for that one identity
    read, and those tests state `FakeKernel` rows (owner, 2026-11-05: kept until then; needs
-   [#877](https://github.com/bindreams/cosca/issues/877) on macOS). Beside them goes
-   `containment::cgroup::fault::hide_proc` and `hide_proc_as`, a thread-local hook that makes the
-   `<pid>/cgroup` reads of `proc_names` and of the placement probe fail through a `FakeKernel` of their own: the
-   `Kernel` is carried through spawn, the leaf and `Subtree`, and those tests state `FakeKernel` rows
-   (tech-debt deputy, 2026-11-14). The probe's tests need a read row for its child's `<pid>/cgroup`,
-   a pid unknown before the fork: a row that matches the child's `cgroup` by its pid once forked,
-   not a fixed path. Windows tests of an exiting-process refusal state a `terminate` row of the Windows `FakeKernel`,
-   one per call in call order (owner, 2026-11-06).
+   [#877](https://github.com/bindreams/cosca/issues/877) on macOS).
 5. **Spawn:** produces an `OsChild`, its pipes, its containment and its elevation, for both halves.
    On Linux the one fork that execs is `child::spawn::fork_exec` ([#383](https://github.com/bindreams/cosca/issues/383)
    S2): a clone kind (vfork without `CLONE_VM`, or plain), the env block built in the parent, the

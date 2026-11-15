@@ -2,10 +2,12 @@
 //! with no row panics, except under [`FakeKernel::over`], which passes it to the real kernel.
 //!
 //! Rows are plain data: a path or pid is looked up by `==`, and a later row replaces an earlier one.
+//! The one exception is the any-pid row, which matches a path of exactly two components: a decimal
+//! pid, then the file (`4242/cgroup`). `self/<file>` and `<pid>/task/<tid>/<file>` are not matched.
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use rustix::io::Errno;
@@ -19,6 +21,12 @@ pub(crate) struct FakeKernel<'a> {
     real: Option<&'a dyn Kernel>,
     open_proc: Option<Errno>,
     reads: Vec<ReadRow>,
+    /// The any-pid rows: a file name and what every read of `<pid>/<file>` answers when no row of
+    /// `reads` does. Behind a `Mutex` so a test can state one through `&self` after the kernel is
+    /// shared.
+    any_pid_reads: Mutex<Vec<AnyPidRow>>,
+    /// The generation of the latest any-pid row stated.
+    any_pid_generation: AtomicU64,
     /// How many times each path has been read.
     read_counts: Mutex<Vec<(String, usize)>>,
     /// The listing of any `/proc`: the pids, or the call that failed and its raw errno.
@@ -53,9 +61,37 @@ impl ReadCall {
     }
 }
 
+/// What a read row answers: the bytes, or the call that failed and its raw errno.
+type ReadAnswer = Result<Vec<u8>, (ReadCall, i32)>;
+
+/// What `hidepid` does to another user's task: its `cgroup` open fails with `ENOENT`.
+const HIDEPID_ROW: (&str, Result<&[u8], i32>) = ("cgroup", Err(libc::ENOENT));
+
+/// An any-pid row: the file, the generation that stated it, and the answer.
+type AnyPidRow = (String, u64, ReadAnswer);
+
+/// An any-pid row stated through [`FakeKernel::state_every_pid_read`]. Dropping it restores the
+/// file's earlier row (none, a builder's, or an outer guard's). Guards drop innermost first.
+#[must_use = "the row is replaced by the one before it when this is dropped"]
+pub(crate) struct StatedRow<'k, 'a> {
+    kernel: &'k FakeKernel<'a>,
+    file: String,
+    generation: u64,
+    before: Option<(u64, ReadAnswer)>,
+}
+
+impl Drop for StatedRow<'_, '_> {
+    fn drop(&mut self) {
+        let current = self.kernel.replace_any_pid_row(&self.file, self.before.take());
+        debug_assert!(
+            current.is_some_and(|(generation, _)| generation == self.generation),
+            "a stated any-pid row is dropped while it is still the file's row: guards drop innermost first"
+        );
+    }
+}
+
 /// A read row: the path, the number of earlier reads of it before the row answers, and the answer.
-/// `Err` is the call that failed and its raw errno.
-type ReadRow = (String, usize, Result<Vec<u8>, (ReadCall, i32)>);
+type ReadRow = (String, usize, ReadAnswer);
 
 /// A thread listing row: the pid, the number of earlier listings of its threads before the row answers,
 /// and the answer (`Err` as for a read row).
@@ -89,6 +125,8 @@ impl<'a> FakeKernel<'a> {
             real: None,
             open_proc: None,
             reads: Vec::new(),
+            any_pid_reads: Mutex::new(Vec::new()),
+            any_pid_generation: AtomicU64::new(0),
             read_counts: Mutex::new(Vec::new()),
             pids: None,
             tids: Vec::new(),
@@ -127,6 +165,65 @@ impl<'a> FakeKernel<'a> {
     /// `openat2`. For a symlink the bytes are its target.
     pub(crate) fn on_read(self, path: &str, answer: Result<&[u8], i32>) -> Self {
         self.on_read_after(path, 0, answer)
+    }
+
+    /// A kernel over `real` whose `/proc` refuses every task's `cgroup` as `hidepid` does a task of
+    /// another user: `ENOENT`.
+    pub(crate) fn hidepid(real: &'a dyn Kernel) -> Self {
+        let (file, answer) = HIDEPID_ROW;
+        Self::over(real).on_every_pid_read(file, answer)
+    }
+
+    /// [`hidepid`](Self::hidepid)'s row, after the kernel is shared; see
+    /// [`state_every_pid_read`](Self::state_every_pid_read).
+    pub(crate) fn hide_every_pid_cgroup(&self) -> StatedRow<'_, 'a> {
+        let (file, answer) = HIDEPID_ROW;
+        self.state_every_pid_read(file, answer)
+    }
+
+    /// Reading `file` of any pid under any `/proc` answers `answer`: the bytes, or the raw errno of
+    /// its `openat2`. A row for one path ([`on_read`](Self::on_read)) answers before it. A test that
+    /// cannot name a pid beforehand (a forked probe's) states this row.
+    pub(crate) fn on_every_pid_read(self, file: &str, answer: Result<&[u8], i32>) -> Self {
+        self.state_any_pid_row(file, answer);
+        self
+    }
+
+    /// [`on_every_pid_read`](Self::on_every_pid_read) after the kernel is shared; the row is
+    /// restored when the returned guard is dropped.
+    pub(crate) fn state_every_pid_read(&self, file: &str, answer: Result<&[u8], i32>) -> StatedRow<'_, 'a> {
+        let (generation, before) = self.state_any_pid_row(file, answer);
+        StatedRow {
+            kernel: self,
+            file: file.to_owned(),
+            generation,
+            before,
+        }
+    }
+
+    /// Makes `answer` the file's any-pid row. Returns its generation and the row replaced.
+    fn state_any_pid_row(&self, file: &str, answer: Result<&[u8], i32>) -> (u64, Option<(u64, ReadAnswer)>) {
+        let generation = self.any_pid_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let answer = answer.map(<[u8]>::to_vec).map_err(|errno| (ReadCall::Open, errno));
+        (generation, self.replace_any_pid_row(file, Some((generation, answer))))
+    }
+
+    /// `None` removes the row. Returns the row replaced.
+    fn replace_any_pid_row(&self, file: &str, row: Option<(u64, ReadAnswer)>) -> Option<(u64, ReadAnswer)> {
+        debug_assert!(
+            !file.is_empty() && !file.contains('/'),
+            "an any-pid row names a file, not a path"
+        );
+        let mut rows = self.any_pid_reads.lock().expect("no panic holds the rows");
+        let before = rows
+            .iter()
+            .position(|(f, ..)| f == file)
+            .map(|at| rows.remove(at))
+            .map(|(_, generation, answer)| (generation, answer));
+        if let Some((generation, answer)) = row {
+            rows.push((file.to_owned(), generation, answer));
+        }
+        before
     }
 
     /// Reading `path` under any `/proc` opens it, and its `read(2)` (a symlink's `readlinkat`) fails
@@ -301,10 +398,21 @@ impl<'a> FakeKernel<'a> {
             .iter()
             .filter(|(p, from, _)| p == path && *from <= earlier)
             .max_by_key(|(_, from, _)| *from);
-        row.map(|(_, _, answer)| match answer {
+        let answered = |answer: &ReadAnswer| match answer {
             Ok(bytes) => Ok(bytes.clone()),
             Err((call, errno)) => Err(call.failure(*errno)),
-        })
+        };
+        if let Some((_, _, answer)) = row {
+            return Some(answered(answer));
+        }
+        let (pid, file) = path.split_once('/')?;
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let rows = self.any_pid_reads.lock().expect("no panic holds the rows");
+        rows.iter()
+            .find(|(f, ..)| f == file)
+            .map(|(_, _, answer)| answered(answer))
     }
 
     fn real(&self, call: &str) -> &'a dyn Kernel {
