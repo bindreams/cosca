@@ -30,6 +30,10 @@ pub(crate) trait OsChild: OsProcess {
     /// A teardown's contract with its caller reads it.
     fn kill_refusal(&self) -> KillRefusal;
 
+    /// The kernel this child was built with, which every read of it asks: the one place a read by the
+    /// child's number (a reap and reuse of it, a cgroup read) asks too.
+    fn kernel(&self) -> &dyn crate::identity::Kernel;
+
     /// Look at the exit record without consuming it, and without touching anything a waiter waits
     /// on. A stop, or a zombie only its tracer sees, is [`PeekOutcome::Running`]. Any thread, any
     /// time.
@@ -180,7 +184,7 @@ pub(crate) fn adopt_std(
 ) -> Result<Box<dyn OsChild>, (Error, std::process::Child)> {
     debug_assert_eq!(child.id(), id.pid(), "the identity must be the child's");
     #[cfg(target_os = "linux")]
-    let os = match adopt_pidfd(&crate::identity::HostKernel, id) {
+    let os = match adopt_pidfd(crate::identity::HostKernel, id) {
         Ok(os) => os,
         Err(e) => return Err((e, child)),
     };
@@ -191,6 +195,7 @@ pub(crate) fn adopt_std(
     };
     #[cfg(windows)]
     let os: Box<dyn OsChild> = Box::new(super::windows::WindowsProcess::for_child(
+        crate::identity::HostKernel,
         std::os::windows::io::OwnedHandle::from(child),
         id.pid(),
     ));
@@ -243,10 +248,11 @@ pub(crate) fn adopt_std_over<K: crate::identity::Kernel + Send + 'static>(
     }
 }
 
-/// [`adopt_std`]'s Linux half: the pidfd of `id`'s pid, confirmed to name a child of this process.
+/// [`adopt_std`]'s Linux half: the pidfd of `id`'s pid, opened through `kernel`, which the child then
+/// owns, confirmed to name a child of this process.
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) fn adopt_pidfd(
-    kernel: &dyn crate::identity::Kernel,
+pub(crate) fn adopt_pidfd<K: crate::identity::Kernel + Send + 'static>(
+    kernel: K,
     id: crate::identity::ProcessId,
 ) -> Result<Box<dyn OsChild>, Error> {
     use std::os::fd::AsFd as _;
@@ -263,7 +269,7 @@ pub(crate) fn adopt_pidfd(
     match peek(&Target::PidFd(pidfd.as_fd())).map_err(Error::Io)? {
         PeekOutcome::Foreign(_) => Err(Error::Io(std::io::Error::from_raw_os_error(libc::ECHILD))),
         PeekOutcome::Exit(_) | PeekOutcome::Running => {
-            Ok(Box::new(super::linux::LinuxProcess::new(Some(id.pid()), pidfd)))
+            Ok(Box::new(super::linux::LinuxProcess::new(kernel, Some(id.pid()), pidfd)))
         }
     }
 }

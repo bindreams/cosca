@@ -856,7 +856,15 @@ fn abandon(
         ..SpawnPolicy::SYNC
     };
     let error = crate::error::Error::Io(std::io::Error::other("the late child was not adopted"));
-    let failure = super::late_child::abandon_late_child(child, unique, error, None, prepared, policy);
+    let failure = super::late_child::abandon_late_child(
+        child,
+        unique,
+        error,
+        None,
+        prepared,
+        policy,
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+    );
     let SpawnFailure::MayHaveStarted {
         fate,
         unreaped,

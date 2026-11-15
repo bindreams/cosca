@@ -183,8 +183,9 @@ pub(crate) struct FirstRead {
 impl FirstRead {
     /// The report: the first read's, or, for a spawn that returned `Ok` with the pipe still empty,
     /// what [`await_report`] waits for. An id from a spawn whose std error pipe was exposed is
-    /// [`Report::Late`]. May block without a bound, so `spawn_lock` must be released first.
-    pub(crate) fn finish(self) -> Report {
+    /// [`Report::Late`]. May block without a bound, so `spawn_lock` must be released first. The wait's
+    /// reads of the child's place and tracer ask `kernel`, the spawn's.
+    pub(crate) fn finish(self, kernel: &dyn crate::identity::Kernel) -> Report {
         #[cfg(any(test, debug_assertions))]
         debug_assert!(
             !super::spawn_lock_held_by_this_thread(),
@@ -197,7 +198,7 @@ impl FirstRead {
             exposed,
         } = self;
         match (report, pid) {
-            (Report::Unwritten, Some(pid)) => await_report(&read_end, pid),
+            (Report::Unwritten, Some(pid)) => await_report(kernel, &read_end, pid),
             (Report::Id(id), Some(_)) if exposed => Report::Late(id),
             // A failed spawn leaves no child to wait on: std collected it, or tokio dropped it and
             // its pid with it. Its report came already or never comes, so the read stands.
@@ -254,12 +255,12 @@ const SAY_WAITING_AFTER: std::time::Duration = std::time::Duration::from_secs(1)
 /// registration; the wait then lasts as long as that process, unless the pipe hits EOF first.
 ///
 /// Past one second it warns, once, naming what it waits for.
-fn await_report(read_end: &OwnedFd, pid: u32) -> Report {
+fn await_report(kernel: &dyn crate::identity::Kernel, read_end: &OwnedFd, pid: u32) -> Report {
     #[cfg(test)]
     if seams::wait_is_refused() {
         return Report::WaitFailed(io::Error::other("test seam: the wait for a report was entered"));
     }
-    match watch(read_end, pid) {
+    match watch(kernel, read_end, pid) {
         Ok(Watch::Pipe(report)) => {
             #[cfg(test)]
             seams::woke(seams::Wake::Pipe);
@@ -288,7 +289,7 @@ enum Watch {
 }
 
 /// The kqueue wait of [`await_report`].
-fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
+fn watch(kernel: &dyn crate::identity::Kernel, read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
     use crate::os_process::macos::kqueue::{Event, Kqueue, Subscription};
     use crate::wait::macos::{OnTracer, TracerWatch};
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
@@ -330,10 +331,10 @@ fn watch(read_end: &OwnedFd, pid: u32) -> io::Result<Watch> {
             Report::Id(id) => return Ok(Watch::Pipe(Report::Late(id))),
             report => return Ok(Watch::Pipe(report)),
         }
-        let recheck = match check(pid)? {
+        let recheck = match check(kernel, pid)? {
             Check::Gone => return Ok(Watch::ChildGone),
             Check::Running => None,
-            Check::Traced(by) => match tracer.held_by(&crate::identity::HostKernel, &kq, by)? {
+            Check::Traced(by) => match tracer.held_by(kernel, &kq, by)? {
                 OnTracer::Block => None,
                 OnTracer::Recheck(after) if after.is_zero() => continue,
                 OnTracer::Recheck(after) => Some(after),
@@ -395,14 +396,14 @@ enum Check {
 /// process this one forked is [`Check::Traced`] by the process that holds it, unless that is
 /// launchd: XNU gives launchd a child whose tracer exited while the child was exiting, so it is
 /// gone. Any other answer means the child is gone. A read that is refused is an error.
-fn check(pid: u32) -> io::Result<Check> {
-    use crate::identity::{origin, HostKernel, Origin, LAUNCHD};
+fn check(kernel: &dyn crate::identity::Kernel, pid: u32) -> io::Result<Check> {
+    use crate::identity::{origin, Origin, LAUNCHD};
     use crate::os_process::child::PeekOutcome;
     use crate::wait::exit_only::{peek, Target};
-    Ok(match peek(&Target::pid(&HostKernel, pid, None))? {
+    Ok(match peek(&Target::pid(kernel, pid, None))? {
         PeekOutcome::Running => Check::Running,
         PeekOutcome::Exit(_) => Check::Gone,
-        PeekOutcome::Foreign(_) => match origin(&HostKernel, pid) {
+        PeekOutcome::Foreign(_) => match origin(kernel, pid) {
             Origin::Ours { parent } if parent == LAUNCHD => Check::Gone,
             // A tracer detached between the two reads: the child is ours again, and its own
             // `NOTE_EXIT` reaches this process.

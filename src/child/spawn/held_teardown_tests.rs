@@ -334,7 +334,11 @@ fn a_front_with_no_pid_is_named_as_such() {
     let blocker = ReapsBlocker::new(&owned, stdin);
     // The same child, named by its pidfd alone: the copy is the pid-less handle's own.
     let pidfd = owned.pidfd().expect("a Linux child has its pidfd");
-    let pidless = OwnedChild::over_pidfd(None, pidfd.try_clone_to_owned().expect("dup the pidfd"));
+    let pidless = OwnedChild::over_pidfd(
+        crate::identity::HostKernel,
+        None,
+        pidfd.try_clone_to_owned().expect("dup the pidfd"),
+    );
     let mark = crate::log_capture::mark();
 
     let (detail, _, unreaped) = tear_down_leaving(pidless, Some(Front::Sudo), &mut Diagnosis::default());

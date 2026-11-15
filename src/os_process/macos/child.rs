@@ -203,6 +203,10 @@ impl<K: Kernel + Send> OsChild for MacosChild<K> {
         Some(self.pid)
     }
 
+    fn kernel(&self) -> &dyn Kernel {
+        &self.kernel
+    }
+
     /// The signal is refused with `EPERM` alone, but the identity read it is checked by is refused
     /// with whatever errno the kernel answers.
     fn kill_refusal(&self) -> KillRefusal {

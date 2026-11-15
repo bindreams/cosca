@@ -29,7 +29,7 @@ use crate::child::owned::OwnedChild;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::error::{Error, Failures};
-use crate::identity::{HostKernel, ProcessId, Resolved};
+use crate::identity::{ProcessId, Resolved};
 use crate::os_process::child::PeekOutcome;
 use crate::os_process::macos::child::MacosChild;
 
@@ -56,16 +56,28 @@ pub(super) fn abandon_late_child(
     front: Option<crate::elevation::front::Front>,
     prepared: crate::containment::Prepared,
     policy: SpawnPolicy,
+    kernel: crate::identity::SpawnKernel,
 ) -> SpawnFailure {
     let pid = child.id();
     #[cfg(test)]
     super::fault::capture(ProcessId::of(pid));
-    let owned = match MacosChild::new(HostKernel, pid, unique) {
+    let owned = match MacosChild::new(std::sync::Arc::clone(&kernel), pid, unique) {
         Ok(os) => {
             drop(child);
             OwnedChild::new(Box::new(os))
         }
-        Err(refusal) => return super::leave_unwatched_child(child, pid, unique, front, prepared, refusal, Some(error)),
+        Err(refusal) => {
+            return super::leave_unwatched_child(
+                &*kernel,
+                super::UnwatchedChild { child, pid, unique },
+                super::UnwatchedReport {
+                    front,
+                    prepared,
+                    refusal,
+                    late: Some(error),
+                },
+            )
+        }
     };
     abandon_boxed_late_child(owned, pid, error, front, prepared, policy)
 }
@@ -287,7 +299,7 @@ impl LateSweeps {
         if prepared.mode.is_none() || !prepared.is_root {
             return late;
         }
-        let (resolved, _, mut why) = resolve_identity(&HostKernel, pid, owned);
+        let (resolved, _, mut why) = resolve_identity(owned.kernel(), pid, owned);
         let unshown = match resolved {
             Resolved::Found(id) => {
                 late.id = Some(id);

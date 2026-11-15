@@ -9,7 +9,7 @@ use super::{dying_in, front_placement, proc_names, Subtree};
 use crate::containment::cgroup::fault;
 use crate::containment::cgroup::test_support::{alone, kill_record};
 use crate::identity::{
-    FakeKernel, HostKernel, Kernel, ProcDir, ProcOpenFailure, ReadFailure, UNREADABLE_STATUS_REASON,
+    spawn_kernel, FakeKernel, HostKernel, Kernel, ProcDir, ProcOpenFailure, ReadFailure, UNREADABLE_STATUS_REASON,
 };
 use crate::log_capture::warns_since;
 use crate::test_groups::{cgroup, Group};
@@ -69,7 +69,7 @@ fn holds_hidden(leaf: &Subtree, id: u64) -> Result<bool, crate::error::Error> {
     let _id = fault::force_pidfd_cgroup_id(id);
     let _hidden = fault::hide_proc();
     let pidfd = own_pidfd();
-    leaf.holds(std::process::id(), Some(pidfd.as_fd()))
+    leaf.holds(&HostKernel, std::process::id(), Some(pidfd.as_fd()))
 }
 
 /// A task is in the leaf only when all 64 bits of its cgroup id are the leaf's: an id equal in
@@ -81,18 +81,18 @@ fn a_subtree_compares_all_64_bits_of_a_cgroup_id() {
     let leaf = subtree(HIGH, false);
     {
         let _id = fault::force_pidfd_cgroup_id(HIGH);
-        assert!(leaf.holds(pid, Some(pidfd.as_fd())).expect("a forced id"));
+        assert!(leaf.holds(&HostKernel, pid, Some(pidfd.as_fd())).expect("a forced id"));
     }
     {
         let _id = fault::force_pidfd_cgroup_id(HIGH & u64::from(u32::MAX));
         assert!(
-            !leaf.holds(pid, Some(pidfd.as_fd())).expect("a forced id"),
+            !leaf.holds(&HostKernel, pid, Some(pidfd.as_fd())).expect("a forced id"),
             "an id equal only in its low 32 bits is another cgroup"
         );
     }
     let low = subtree(HIGH & u64::from(u32::MAX), false);
     let _id = fault::force_pidfd_cgroup_id(HIGH);
-    assert!(!low.holds(pid, Some(pidfd.as_fd())).expect("a forced id"));
+    assert!(!low.holds(&HostKernel, pid, Some(pidfd.as_fd())).expect("a forced id"));
 }
 
 /// A kill reached a task only if the leaf's own kill landed: a task in the leaf whose kill failed
@@ -103,13 +103,13 @@ fn a_subtree_reached_a_task_only_once_its_kill_landed() {
     let pid = std::process::id();
     let _id = fault::force_pidfd_cgroup_id(HIGH);
     assert!(subtree(HIGH, false)
-        .holds(pid, Some(pidfd.as_fd()))
+        .holds(&HostKernel, pid, Some(pidfd.as_fd()))
         .expect("a forced id"));
     assert!(!subtree(HIGH, false)
-        .reached_by(pid, Some(pidfd.as_fd()), None)
+        .reached_by(&HostKernel, pid, Some(pidfd.as_fd()), None)
         .expect("a forced id"));
     assert!(subtree(HIGH, true)
-        .reached_by(pid, Some(pidfd.as_fd()), None)
+        .reached_by(&HostKernel, pid, Some(pidfd.as_fd()), None)
         .expect("a forced id"));
 }
 
@@ -118,7 +118,7 @@ fn a_subtree_reached_a_task_only_once_its_kill_landed() {
 fn with_pidfd_info_a_front_is_placeable_whatever_proc_hides() {
     let _id = fault::force_pidfd_cgroup_id(HIGH);
     let _hidden = fault::hide_proc();
-    front_placement(&HostKernel, || Ok(HIGH)).expect("placeable by a pidfd's cgroup id");
+    front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)).expect("placeable by a pidfd's cgroup id");
 }
 
 /// Without `PIDFD_GET_INFO`, a `/proc` that shows a process this one may not trace makes fronts
@@ -130,7 +130,7 @@ fn with_pidfd_info_a_front_is_placeable_whatever_proc_hides() {
 #[skuld::test]
 fn cgroup_without_pidfd_info_a_proc_that_shows_untraceable_processes_places_fronts(#[fixture(cgroup)] _group: &Group) {
     let _missing = fault::miss_pidfd_info();
-    front_placement(&HostKernel, || Ok(HIGH)).expect("the lane's /proc shows its root every process");
+    front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)).expect("the lane's /proc shows its root every process");
 }
 
 /// Without `PIDFD_GET_INFO`, a `/proc` that hides a process this one may not trace refuses an
@@ -139,7 +139,7 @@ fn cgroup_without_pidfd_info_a_proc_that_shows_untraceable_processes_places_fron
 fn without_pidfd_info_a_hidepid_proc_refuses_naming_hidepid() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
-    match front_placement(&HostKernel, || Ok(HIGH)) {
+    match front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)) {
         Err(err @ crate::error::Error::Unsupported { .. }) => {
             let crate::error::Error::Unsupported { detail, .. } = &err else {
                 unreachable!()
@@ -160,7 +160,7 @@ fn without_pidfd_info_a_hidepid_proc_refuses_naming_hidepid() {
 fn without_pidfd_info_a_diverged_proc_view_refuses_naming_the_view() {
     let _missing = fault::miss_pidfd_info();
     let kernel = FakeKernel::over(&HostKernel).diverged_view();
-    match front_placement(&kernel, || Ok(HIGH)) {
+    match front_placement(&spawn_kernel(kernel), || Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => {
             assert!(detail.contains("an outer pid namespace's"), "{detail}");
             assert!(!detail.contains("hidepid"), "{detail}");
@@ -174,7 +174,7 @@ fn without_pidfd_info_a_diverged_proc_view_refuses_naming_the_view() {
 fn without_pidfd_info_an_unassessable_proc_view_refuses_naming_the_view() {
     let _missing = fault::miss_pidfd_info();
     let kernel = FakeKernel::over(&HostKernel).unreadable_view();
-    match front_placement(&kernel, || Ok(HIGH)) {
+    match front_placement(&spawn_kernel(kernel), || Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => {
             assert!(
                 detail.contains(&format!("could not be established ({UNREADABLE_STATUS_REASON})")),
@@ -203,10 +203,10 @@ fn cgroup_the_placement_probe_answers_with_fds_0_and_1_closed(#[fixture(cgroup)]
     };
     let _missing = fault::miss_pidfd_info();
     let restore = RestoreStdio::close(&done, &[0, 1]);
-    let shown = front_placement(&HostKernel, || Ok(HIGH));
+    let shown = front_placement(&spawn_kernel(HostKernel), || Ok(HIGH));
     let hidden = {
         let _hidden = fault::hide_proc();
-        front_placement(&HostKernel, || Ok(HIGH))
+        front_placement(&spawn_kernel(HostKernel), || Ok(HIGH))
     };
     drop(restore);
     shown.expect("this test's /proc hides nothing");
@@ -338,7 +338,7 @@ fn a_task_still_in_the_cgroup_it_was_seen_in_is_placed_without_a_walk() {
     let pid = std::process::id();
 
     let (inside, by) = leaf
-        .holds_seen(pid, Some(pidfd.as_fd()), Some(HIGH + 1))
+        .holds_seen(&HostKernel, pid, Some(pidfd.as_fd()), Some(HIGH + 1))
         .expect("no walk and no /proc read");
     assert!(inside);
     assert_eq!(
@@ -347,11 +347,11 @@ fn a_task_still_in_the_cgroup_it_was_seen_in_is_placed_without_a_walk() {
         "the cgroup id that placed it is named, for a listing to keep"
     );
     assert!(leaf
-        .reached_by(pid, Some(pidfd.as_fd()), Some(HIGH + 1))
+        .reached_by(&HostKernel, pid, Some(pidfd.as_fd()), Some(HIGH + 1))
         .expect("no walk and no /proc read"));
-    leaf.holds_seen(pid, Some(pidfd.as_fd()), Some(HIGH + 2))
+    leaf.holds_seen(&HostKernel, pid, Some(pidfd.as_fd()), Some(HIGH + 2))
         .expect_err("a task that moved is placed by the walk, which cannot tell here");
-    leaf.holds_seen(pid, Some(pidfd.as_fd()), None)
+    leaf.holds_seen(&HostKernel, pid, Some(pidfd.as_fd()), None)
         .expect_err("a task not seen before is placed by the walk");
 }
 
@@ -376,14 +376,14 @@ fn a_task_still_in_the_cgroup_it_was_seen_in_is_placed_without_the_leafs_id() {
     let pid = std::process::id();
 
     let (inside, by) = leaf
-        .holds_seen(pid, Some(pidfd.as_fd()), Some(HIGH + 1))
+        .holds_seen(&HostKernel, pid, Some(pidfd.as_fd()), Some(HIGH + 1))
         .expect("no walk and no /proc read");
     assert!(inside);
     assert_eq!(by, Some(HIGH + 1), "the id that placed it is named");
     assert!(leaf
-        .reached_by(pid, Some(pidfd.as_fd()), Some(HIGH + 1))
+        .reached_by(&HostKernel, pid, Some(pidfd.as_fd()), Some(HIGH + 1))
         .expect("no walk and no /proc read"));
-    leaf.holds_seen(pid, Some(pidfd.as_fd()), Some(HIGH + 2))
+    leaf.holds_seen(&HostKernel, pid, Some(pidfd.as_fd()), Some(HIGH + 2))
         .expect_err("a task that moved is placed through the hidden /proc");
 }
 
@@ -415,13 +415,13 @@ fn cgroup_a_task_in_a_known_cgroup_is_placed_without_the_leafs_id(#[fixture(cgro
     {
         let _id = fault::force_pidfd_cgroup_id(known_id);
         let (inside, by) = leaf
-            .holds_seen(pid, Some(pidfd.as_fd()), None)
+            .holds_seen(&HostKernel, pid, Some(pidfd.as_fd()), None)
             .expect("no walk and no /proc read");
         assert!(inside);
         assert_eq!(by, Some(known_id), "the known cgroup's id placed it");
     }
     let _id = fault::force_pidfd_cgroup_id(known_id + 1);
-    leaf.holds_seen(pid, Some(pidfd.as_fd()), None)
+    leaf.holds_seen(&HostKernel, pid, Some(pidfd.as_fd()), None)
         .expect_err("a task in no known cgroup is placed through the hidden /proc");
 }
 
@@ -462,7 +462,7 @@ fn an_unreadable_pidfd_id_places_a_seen_task_through_proc_without_the_leafs_id()
     let pidfd = own_pidfd();
 
     let e = leaf
-        .holds_seen(std::process::id(), Some(pidfd.as_fd()), Some(HIGH))
+        .holds_seen(&HostKernel, std::process::id(), Some(pidfd.as_fd()), Some(HIGH))
         .expect_err("the hidden /proc places nothing");
     assert_eq!(
         crate::error::first_os_code(&e),
@@ -491,7 +491,7 @@ fn an_exited_task_has_no_pidfd_id_and_is_not_placed_through_proc_without_the_lea
     let pidfd = own_pidfd();
 
     let e = leaf
-        .holds_seen(std::process::id(), Some(pidfd.as_fd()), Some(HIGH))
+        .holds_seen(&HostKernel, std::process::id(), Some(pidfd.as_fd()), Some(HIGH))
         .expect_err("the task's exit is the answer");
     assert_eq!(
         crate::error::first_os_code(&e),
@@ -507,7 +507,7 @@ fn a_placement_by_the_leafs_own_id_names_it() {
     let pidfd = own_pidfd();
 
     let (inside, by) = subtree(HIGH, true)
-        .holds_seen(std::process::id(), Some(pidfd.as_fd()), None)
+        .holds_seen(&HostKernel, std::process::id(), Some(pidfd.as_fd()), None)
         .expect("the leaf's own id");
     assert!(inside);
     assert_eq!(by, Some(HIGH), "the leaf's own id placed it");
@@ -557,7 +557,7 @@ fn a_recorded_place_answers_for_its_own_task_alone() {
 fn without_pidfd_info_a_hidepid_1_proc_refuses_naming_hidepid() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc_as(libc::EPERM);
-    match front_placement(&HostKernel, || Ok(HIGH)) {
+    match front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => assert!(detail.contains("hidepid"), "{detail}"),
         other => panic!("expected Unsupported, got {other:?}"),
     }
@@ -568,7 +568,7 @@ fn without_pidfd_info_a_hidepid_1_proc_refuses_naming_hidepid() {
 fn a_probe_child_that_stays_dumpable_fails_the_probe() {
     let _missing = fault::miss_pidfd_info();
     let _dumpable = fault::keep_probe_dumpable();
-    match front_placement(&HostKernel, || Ok(HIGH)) {
+    match front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)) {
         Err(e @ crate::error::Error::Io(_)) => {
             assert!(crate::error::said(&e).contains("non-dumpable"), "{e:?}");
         }
@@ -581,7 +581,7 @@ fn a_probe_child_that_stays_dumpable_fails_the_probe() {
 #[skuld::test]
 fn a_refused_pidfd_info_refuses_naming_it() {
     let _failing = fault::fail_pidfd_info();
-    match front_placement(&HostKernel, || Ok(HIGH)) {
+    match front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)) {
         Err(err @ crate::error::Error::Unsupported { .. }) => {
             let crate::error::Error::Unsupported { detail, .. } = &err else {
                 unreachable!()
@@ -601,7 +601,9 @@ fn a_refused_pidfd_info_refuses_naming_it() {
 #[skuld::test]
 fn a_host_that_gives_no_cgroup_id_refuses_naming_the_errno() {
     for errno in [libc::ENOSYS, libc::EOPNOTSUPP, libc::EPERM] {
-        match front_placement(&HostKernel, || Err(std::io::Error::from_raw_os_error(errno))) {
+        match front_placement(&spawn_kernel(HostKernel), || {
+            Err(std::io::Error::from_raw_os_error(errno))
+        }) {
             Err(err @ crate::error::Error::Unsupported { .. }) => {
                 let crate::error::Error::Unsupported { detail, .. } = &err else {
                     unreachable!()
@@ -619,7 +621,9 @@ fn a_host_that_gives_no_cgroup_id_refuses_naming_the_errno() {
 /// Any other failure to read the leaf's id is the spawn's I/O error, not a claim about the host.
 #[skuld::test]
 fn any_other_failure_to_read_the_leaf_id_is_an_io_error() {
-    match front_placement(&HostKernel, || Err(std::io::Error::from_raw_os_error(libc::ENOMEM))) {
+    match front_placement(&spawn_kernel(HostKernel), || {
+        Err(std::io::Error::from_raw_os_error(libc::ENOMEM))
+    }) {
         Err(crate::error::Error::Io(e)) => assert!(e.to_string().contains("leaf"), "{e}"),
         other => panic!("expected Io, got {other:?}"),
     }
@@ -673,7 +677,7 @@ fn a_refused_views_errors_carry_the_refusals_chain() {
     };
     said_all(crate::error::said(&super::view_unreadable(7, why)));
 
-    let Err(unreadable) = super::untraceable_cgroup_readable(&kernel) else {
+    let Err(unreadable) = super::untraceable_cgroup_readable(&spawn_kernel(kernel)) else {
         panic!("a refused view reads no cgroup");
     };
     said_all(crate::error::said(&super::refusal(unreadable)));
@@ -694,7 +698,7 @@ fn a_refused_view_is_a_refusal_where_it_is_read() {
         crate::error::said(&err)
     );
 
-    match super::untraceable_cgroup_readable(&kernel) {
+    match super::untraceable_cgroup_readable(&spawn_kernel(kernel)) {
         Err(super::Unreadable::Refused(refusal)) => {
             assert!(refusal.requirement().contains("requires openat2"), "{refusal:?}");
         }
@@ -753,7 +757,8 @@ fn the_probe_child_dies_with_the_thread_that_forked_it() {
     std::thread::scope(move |scope| {
         scope.spawn(move || {
             let parent = rustix::process::getpid().as_raw_nonzero().get();
-            let probe = super::fork_probe(&proc_dir(), parent, false).expect("fork the probe");
+            let probe =
+                super::fork_probe(&proc_dir(), parent, false, spawn_kernel(HostKernel)).expect("fork the probe");
             let mut report = [0u8; 2];
             probe.channel().read_exact(&mut report).expect("the probe reports");
             // Kept past this thread's end: the child must die of its parent-death signal, which the
@@ -788,7 +793,8 @@ fn a_probe_whose_parent_is_gone_exits_without_reporting() {
 
     // Not this process's pid, so the child's `getppid` differs from it, as after a reparenting.
     let not_the_parent = rustix::process::getpid().as_raw_nonzero().get() + 1;
-    let probe = super::fork_probe(&proc_dir(), not_the_parent, false).expect("fork the probe");
+    let probe =
+        super::fork_probe(&proc_dir(), not_the_parent, false, spawn_kernel(HostKernel)).expect("fork the probe");
     let pidfd = ProbeGuard::of(probe.pid);
     // The child's end of the socket closes with the child: end of file, with nothing reported. One
     // read, so a probe that reports instead fails the assertion, and does not leave the read
@@ -835,8 +841,8 @@ fn assert_two_probes_hold_only_their_own() {
 
     let proc = proc_dir();
     let parent = rustix::process::getpid().as_raw_nonzero().get();
-    let first = super::fork_probe(&proc, parent, true).expect("fork the first probe");
-    let second = super::fork_probe(&proc, parent, true).expect("fork the second probe");
+    let first = super::fork_probe(&proc, parent, true, spawn_kernel(HostKernel)).expect("fork the first probe");
+    let second = super::fork_probe(&proc, parent, true, spawn_kernel(HostKernel)).expect("fork the second probe");
     // Each child closes what it inherited before it reports.
     let mut report = [0u8; 2];
     first
@@ -902,7 +908,7 @@ fn the_probe_child_is_killed_through_its_pidfd() {
     let _hidden = fault::hide_proc();
     fault::take_probe_ends();
     let sends = crate::send_log::Capture::start();
-    front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
+    front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)).expect_err("a hidden /proc refuses");
     assert_eq!(fault::take_probe_ends(), [ProbeEnd::Signal(libc::SIGKILL)]);
     let sent = sends.by_identity();
     assert!(
@@ -938,7 +944,7 @@ fn a_probe_child_whose_pidfd_kill_fails_is_released_and_reaped_through_its_pidfd
     fault::take_probe_ends();
     let sends = crate::send_log::Capture::start();
     let mark = crate::log_capture::mark();
-    front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
+    front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)).expect_err("a hidden /proc refuses");
     let sent = sends.by_identity();
     let [(pid, libc::SIGKILL)] = sent[..] else {
         panic!("the probe's child was sent one kill: {sent:?}")
@@ -963,24 +969,28 @@ fn a_failed_kill_of_one_probe_is_not_stalled_by_another_probes_child() {
 
     let _missing = fault::miss_pidfd_info();
     let refused = crate::signal::seams::refuse_kills();
-    let second = std::sync::Mutex::new(None);
+    let second = std::sync::Arc::new(std::sync::Mutex::new(None));
     // Forked once the first probe's child has reported and its cgroup is read, so the first's parent
     // end is open in this process.
     let kernel = AfterCgroupRead {
-        after: |_| {
-            let parent = rustix::process::getpid().as_raw_nonzero().get();
-            let probe = super::fork_probe(&proc_dir(), parent, false).expect("fork the second probe");
-            let mut report = [0u8; 2];
-            probe
-                .channel()
-                .read_exact(&mut report)
-                .expect("the second probe reports");
-            *second.lock().expect("lock") = Some(probe);
+        after: {
+            let second = std::sync::Arc::clone(&second);
+            move |_| {
+                let parent = rustix::process::getpid().as_raw_nonzero().get();
+                let probe = super::fork_probe(&proc_dir(), parent, false, spawn_kernel(HostKernel))
+                    .expect("fork the second probe");
+                let mut report = [0u8; 2];
+                probe
+                    .channel()
+                    .read_exact(&mut report)
+                    .expect("the second probe reports");
+                *second.lock().expect("lock") = Some(probe);
+            }
         },
     };
     fault::take_probe_ends();
     // Its verdict is not the point.
-    drop(front_placement(&kernel, || Ok(HIGH)));
+    drop(front_placement(&spawn_kernel(kernel), || Ok(HIGH)));
     assert_eq!(fault::take_probe_ends(), [ProbeEnd::Exit(super::RELEASED)]);
     drop(refused);
     let second = second.lock().expect("lock").take().expect("the second probe forked");
@@ -1025,7 +1035,7 @@ fn a_probe_child_reaped_by_an_ignored_sigchld_keeps_the_verdict() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
     fault::take_probe_ends();
-    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
+    let err = front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)).expect_err("a hidden /proc refuses");
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{err:?}");
     assert_eq!(fault::take_probe_ends(), [ProbeEnd::Elsewhere]);
 }
@@ -1045,7 +1055,7 @@ fn a_probe_child_that_dies_early_with_sigchld_ignored_says_so() {
     let _no_dir = fault::fail_probe_fd_dir(libc::EMFILE);
     fault::take_probe_ends();
     let mark = crate::log_capture::mark();
-    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe's child is gone");
+    let err = front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)).expect_err("the probe's child is gone");
     assert_eq!(fault::take_probe_ends().last(), Some(&ProbeEnd::Elsewhere));
     assert!(
         crate::error::said(&err).contains("SIGCHLD"),
@@ -1114,22 +1124,25 @@ impl<F: Fn(libc::pid_t) + Sync> Kernel for AfterCgroupRead<F> {
 #[skuld::test]
 fn a_probe_child_that_exits_before_the_read_is_confirmed_is_reported_gone() {
     let _missing = fault::miss_pidfd_info();
-    let killed = std::sync::atomic::AtomicBool::new(false);
+    let killed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let kernel = AfterCgroupRead {
-        after: |pid| {
-            // SAFETY: `pid` is this test's own unreaped child.
-            assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill the probe's child");
-            // Waits for the exit itself, and leaves the zombie for the probe's reap.
-            rustix::process::waitid(
-                rustix::process::WaitId::Pid(rustix::process::Pid::from_raw(pid).expect("a positive pid")),
-                rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
-            )
-            .expect("wait for the probe's child to exit");
-            killed.store(true, std::sync::atomic::Ordering::SeqCst);
+        after: {
+            let killed = std::sync::Arc::clone(&killed);
+            move |pid| {
+                // SAFETY: `pid` is this test's own unreaped child.
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill the probe's child");
+                // Waits for the exit itself, and leaves the zombie for the probe's reap.
+                rustix::process::waitid(
+                    rustix::process::WaitId::Pid(rustix::process::Pid::from_raw(pid).expect("a positive pid")),
+                    rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+                )
+                .expect("wait for the probe's child to exit");
+                killed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         },
     };
     fault::take_probe_ends();
-    let err = front_placement(&kernel, || Ok(HIGH)).expect_err("the probe's child is gone");
+    let err = front_placement(&spawn_kernel(kernel), || Ok(HIGH)).expect_err("the probe's child is gone");
     assert!(
         killed.load(std::sync::atomic::Ordering::SeqCst),
         "the kernel read the child's cgroup and killed the child"
@@ -1148,7 +1161,7 @@ fn a_probe_child_that_exits_before_the_read_is_confirmed_is_reported_gone() {
 fn a_probe_child_reaped_by_another_waiter_ends_as_elsewhere() {
     fault::take_probe_ends();
     let parent = rustix::process::getpid().as_raw_nonzero().get();
-    let probe = super::fork_probe(&proc_dir(), parent, false).expect("fork the probe");
+    let probe = super::fork_probe(&proc_dir(), parent, false, spawn_kernel(HostKernel)).expect("fork the probe");
     let pid = probe.pid;
     // SAFETY: `pid` is this test's own unreaped child.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill the probe's child");
@@ -1213,7 +1226,7 @@ fn assert_probe_answers_with_spare_descriptors(spare: usize) {
     let _limit = limit_nofile(spare);
     fault::take_probe_ends();
     let mark = crate::log_capture::mark();
-    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("a hidden /proc refuses");
+    let err = front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)).expect_err("a hidden /proc refuses");
     assert!(
         matches!(&err, crate::error::Error::Unsupported { detail, .. } if detail.contains("hides the cgroup")),
         "the refusal is the hidden /proc's: {err:?}"
@@ -1252,7 +1265,7 @@ fn a_probe_with_no_descriptor_for_its_childs_pidfd_fails_with_the_clones_errno()
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc();
     let _limit = limit_nofile(3);
-    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe cannot fork");
+    let err = front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)).expect_err("the probe cannot fork");
     assert!(matches!(err, crate::error::Error::Io(_)), "{err:?}");
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EMFILE), "{err:?}");
 }
@@ -1327,7 +1340,7 @@ fn a_probe_dropped_unended_is_killed_and_reaped() {
     fault::take_probe_ends();
     let parent = rustix::process::getpid().as_raw_nonzero().get();
     let pid = {
-        let probe = super::fork_probe(&proc_dir(), parent, false).expect("fork the probe");
+        let probe = super::fork_probe(&proc_dir(), parent, false, spawn_kernel(HostKernel)).expect("fork the probe");
         probe.pid
     };
     assert_eq!(fault::take_probe_ends(), [ProbeEnd::Signal(libc::SIGKILL)]);
@@ -1347,7 +1360,7 @@ fn a_probe_child_whose_fd_directory_open_fails_is_reported_with_its_errno_and_it
     let _no_dir = fault::fail_probe_fd_dir(libc::EMFILE);
     fault::take_probe_ends();
     let mark = crate::log_capture::mark();
-    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe fails");
+    let err = front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)).expect_err("the probe fails");
     // The child's own exit and the probe's kill race to end it; either is the end.
     let ends = fault::take_probe_ends();
     let end = match ends[..] {
@@ -1409,7 +1422,7 @@ fn a_probe_childs_refused_openat2_refuses_the_spawn_naming_it() {
     let _missing = fault::miss_pidfd_info();
     for errno in [libc::ENOSYS, libc::EPERM, libc::ENODEV] {
         let _no_dir = fault::fail_probe_fd_dir(errno);
-        let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("the probe's child cannot set up");
+        let err = front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)).expect_err("the probe's child cannot set up");
         assert_refused_openat2(&err, errno);
     }
 }
@@ -1421,7 +1434,7 @@ fn a_refused_cgroup_read_of_the_probes_child_refuses_the_spawn_naming_openat2() 
     let _missing = fault::miss_pidfd_info();
     for errno in [libc::ENOSYS, libc::ENODEV] {
         let _refused = fault::hide_proc_as(errno);
-        let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("a refused read refuses");
+        let err = front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)).expect_err("a refused read refuses");
         assert_refused_openat2(&err, errno);
     }
 }
@@ -1432,7 +1445,7 @@ fn an_eperm_cgroup_read_beside_a_proc_directory_that_answers_is_hidepid() {
     let _missing = fault::miss_pidfd_info();
     let _hidden = fault::hide_proc_as(libc::EPERM);
     let kernel = FakeKernel::over(&HostKernel).same_view();
-    match front_placement(&kernel, || Ok(HIGH)) {
+    match front_placement(&spawn_kernel(kernel), || Ok(HIGH)) {
         Err(crate::error::Error::Unsupported { detail, .. }) => assert!(detail.contains("hidepid"), "{detail}"),
         other => panic!("expected Unsupported, got {other:?}"),
     }
@@ -1449,7 +1462,7 @@ fn an_eperm_cgroup_read_whose_recheck_fails_is_an_unknown_not_hidepid() {
     let kernel = FakeKernel::over(&HostKernel)
         .same_view()
         .on_read("self/stat", Err(libc::EIO));
-    match front_placement(&kernel, || Ok(HIGH)) {
+    match front_placement(&spawn_kernel(kernel), || Ok(HIGH)) {
         Err(err @ crate::error::Error::Io(_)) => {
             let said = crate::error::Report(&err).to_string();
             assert!(
@@ -1471,7 +1484,7 @@ fn an_eperm_cgroup_read_whose_recheck_fails_is_an_unknown_not_hidepid() {
 fn an_exited_answer_to_the_probes_cgroup_read_is_no_hidepid() {
     let _missing = fault::miss_pidfd_info();
     let _exited = fault::hide_proc_as(libc::ESRCH);
-    match front_placement(&HostKernel, || Ok(HIGH)) {
+    match front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)) {
         Err(err @ crate::error::Error::Io(_)) => {
             let said = crate::error::Report(&err).to_string();
             assert!(said.contains("probing whether /proc shows"), "{said}");
@@ -1531,7 +1544,8 @@ fn proc_names_says_an_unreadable_cgroup_once() {
 fn a_probe_whose_cgroup_read_fails_says_the_file_once() {
     let _missing = fault::miss_pidfd_info();
     let _failing = fault::hide_proc_as(libc::EIO);
-    let err = front_placement(&HostKernel, || Ok(HIGH)).expect_err("an unreadable cgroup fails the probe");
+    let err =
+        front_placement(&spawn_kernel(HostKernel), || Ok(HIGH)).expect_err("an unreadable cgroup fails the probe");
     let said = crate::error::said(&err);
     assert_eq!(said.matches("an I/O operation failed").count(), 1, "{said}");
     assert_eq!(said.matches("/cgroup").count(), 1, "{said}");
@@ -1546,7 +1560,9 @@ fn a_refused_cgroup_read_of_a_task_says_what_cosca_requires() {
     let (leaf, _dir) = stand_in_subtree(None);
     for errno in [libc::ENOSYS, libc::ENODEV] {
         let _refused = fault::hide_proc_as(errno);
-        let err = leaf.holds(std::process::id(), None).expect_err("a refused read");
+        let err = leaf
+            .holds(&HostKernel, std::process::id(), None)
+            .expect_err("a refused read");
         assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{errno}: {err}");
         assert_eq!(crate::error::first_os_code(&err), Some(errno), "{err:?}");
         let said = crate::error::Report(&err).to_string();
@@ -1564,7 +1580,7 @@ fn a_refused_cgroup_read_after_the_pidfd_placed_the_task_elsewhere_is_still_a_re
     let _refused = fault::hide_proc_as(libc::ENOSYS);
     let pidfd = own_pidfd();
     let err = leaf
-        .holds(std::process::id(), Some(pidfd.as_fd()))
+        .holds(&HostKernel, std::process::id(), Some(pidfd.as_fd()))
         .expect_err("a refused read");
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{err:?}");
     assert!(crate::error::said(&err).contains("requires openat2"), "{err:?}");
@@ -1578,7 +1594,9 @@ fn a_cgroup_read_of_a_task_that_is_no_refusal_is_no_refusal_in_the_error() {
     let (leaf, _dir) = stand_in_subtree(None);
     for errno in [libc::EIO, libc::ENOENT, libc::EPERM] {
         let _failing = fault::hide_proc_as(errno);
-        let err = leaf.holds(std::process::id(), None).expect_err("a failed read");
+        let err = leaf
+            .holds(&HostKernel, std::process::id(), None)
+            .expect_err("a failed read");
         assert!(
             !matches!(err, crate::error::Error::Unsupported { .. }),
             "{errno}: {err:?}"
@@ -1614,7 +1632,7 @@ fn the_walk_closes_the_lowest_descriptors_with_fds_0_and_1_closed() {
     let restore = RestoreStdio::close(&done, &[0, 1]);
     let proc = proc_dir();
     let parent = rustix::process::getpid().as_raw_nonzero().get();
-    let probe = super::fork_probe(&proc, parent, true).expect("fork the probe");
+    let probe = super::fork_probe(&proc, parent, true, spawn_kernel(HostKernel)).expect("fork the probe");
     let mut report = [0u8; 2];
     probe.channel().read_exact(&mut report).expect("the probe reports");
     let held: Vec<_> = descriptors_of(probe.pid).into_values().collect();
@@ -1644,7 +1662,7 @@ fn the_walk_closes_a_listing_longer_than_one_batch() {
     drop(files.drain(10..12));
     let _refused = fault::refuse_probe_close_range();
     let parent = rustix::process::getpid().as_raw_nonzero().get();
-    let probe = super::fork_probe(&proc_dir(), parent, true).expect("fork the probe");
+    let probe = super::fork_probe(&proc_dir(), parent, true, spawn_kernel(HostKernel)).expect("fork the probe");
     let mut report = [0u8; 2];
     probe.channel().read_exact(&mut report).expect("the probe reports");
     let held: Vec<_> = descriptors_of(probe.pid).into_values().collect();

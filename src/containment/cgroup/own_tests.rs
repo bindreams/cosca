@@ -80,7 +80,11 @@ fn an_own_cgroup_the_filesystem_does_not_show_is_a_process_group_for_strongest()
     let root = tempfile::tempdir().expect("tempdir");
     let offered = offered_in(Ok("0::/not/here\n".to_owned()), root.path());
 
-    let leaf = leaf_if_offered(offered, None);
+    let leaf = leaf_if_offered(
+        offered,
+        &crate::identity::spawn_kernel(crate::identity::HostKernel),
+        None,
+    );
 
     assert!(matches!(leaf, Ok(None)), "{leaf:?}");
 }
@@ -93,7 +97,11 @@ fn an_own_cgroup_without_a_cgroup_procs_is_a_process_group_for_strongest() {
     std::fs::create_dir(root.path().join("own")).expect("create the own cgroup");
     let offered = offered_in(Ok("0::/own\n".to_owned()), root.path());
 
-    let leaf = leaf_if_offered(offered, None);
+    let leaf = leaf_if_offered(
+        offered,
+        &crate::identity::spawn_kernel(crate::identity::HostKernel),
+        None,
+    );
 
     assert!(matches!(leaf, Ok(None)), "{leaf:?}");
     assert!(left_in(&root.path().join("own")).is_empty());
@@ -109,7 +117,11 @@ fn a_leaf_whose_cgroup_procs_is_missing_fails_strongest_and_leaves_no_leaf() {
     let offered = offered_under(root.path());
     crate::containment::cgroup::fault::set_force_kill_supported(true);
 
-    let leaf = leaf_if_offered(offered, None);
+    let leaf = leaf_if_offered(
+        offered,
+        &crate::identity::spawn_kernel(crate::identity::HostKernel),
+        None,
+    );
 
     let Err(error) = leaf else {
         panic!("a leaf with no cgroup.procs must fail the spawn: {leaf:?}");
@@ -152,7 +164,11 @@ fn a_cgroup_this_process_may_not_use_is_a_process_group_for_strongest(#[fixture(
         std::fs::set_permissions(&own, PermissionsExt::from_mode(dir_mode)).expect("chmod dir");
         crate::containment::cgroup::fault::set_force_kill_supported(true);
 
-        let leaf = leaf_if_offered(offered_in(Ok("0::/own\n".to_owned()), root.path()), None);
+        let leaf = leaf_if_offered(
+            offered_in(Ok("0::/own\n".to_owned()), root.path()),
+            &crate::identity::spawn_kernel(crate::identity::HostKernel),
+            None,
+        );
 
         // Restored, so the temp directory can be removed.
         std::fs::set_permissions(&own, PermissionsExt::from_mode(0o700)).expect("restore dir");
@@ -177,7 +193,11 @@ fn a_leaf_without_cgroup_kill_is_a_process_group_for_strongest_and_leaves_no_lea
     let root = tempfile::tempdir().expect("tempdir");
     let offered = offered_under(root.path());
 
-    let leaf = leaf_if_offered(offered, None);
+    let leaf = leaf_if_offered(
+        offered,
+        &crate::identity::spawn_kernel(crate::identity::HostKernel),
+        None,
+    );
 
     assert!(matches!(leaf, Ok(None)), "a process group, not an error and not a leaf");
     let left = left_in(&root.path().join("own"));
@@ -192,7 +212,11 @@ fn a_failed_leaf_step_other_than_a_missing_cgroup_kill_fails_strongest() {
     let offered = offered_under(root.path());
     crate::containment::cgroup::fault::set_force_kill_check_errno(libc::EACCES);
 
-    let leaf = leaf_if_offered(offered, None);
+    let leaf = leaf_if_offered(
+        offered,
+        &crate::identity::spawn_kernel(crate::identity::HostKernel),
+        None,
+    );
 
     let Err(error) = leaf else {
         panic!("a failed cgroup.kill lookup must fail the spawn");
@@ -212,7 +236,11 @@ fn a_leaf_that_cannot_be_held_fails_strongest_and_leaves_no_leaf() {
     let offered = offered_under(root.path());
     crate::containment::cgroup::fault::set_force_leaf_open_failure(true);
 
-    let leaf = leaf_if_offered(offered, None);
+    let leaf = leaf_if_offered(
+        offered,
+        &crate::identity::spawn_kernel(crate::identity::HostKernel),
+        None,
+    );
 
     let Err(error) = leaf else {
         panic!("a leaf that cannot be held must fail the spawn: {leaf:?}");

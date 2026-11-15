@@ -36,7 +36,12 @@ fn assert_failed_spawn_warns_once(outcome: fn(OwnedFd) -> Outcome) {
         let blocker = release_between_kill_and_wait(stdin);
         let warn_after = crate::tokio::slow_teardown_after();
         let spawned = Err::<std::process::Child, _>(std::io::Error::other("spawn failed"));
-        let failed = conclude(spawned, outcome(pidfd), warn_after);
+        let failed = conclude(
+            spawned,
+            outcome(pidfd),
+            crate::identity::spawn_kernel(crate::identity::HostKernel),
+            warn_after,
+        );
         assert!(failed.is_err(), "the failed spawn fails");
         blocker.recorded()
     });
@@ -94,7 +99,12 @@ fn unexecuted_child(
             pid_tx.send(pid).expect("report the pid");
             seized_rx.recv().expect("the tracer seized the child");
             let warn_after = crate::tokio::slow_teardown_after();
-            let failed = conclude(Ok(child), outcome(pidfd), warn_after);
+            let failed = conclude(
+                Ok(child),
+                outcome(pidfd),
+                crate::identity::spawn_kernel(crate::identity::HostKernel),
+                warn_after,
+            );
             assert!(failed.is_err(), "the failed spawn fails");
             (pid, blocker.recorded())
         },

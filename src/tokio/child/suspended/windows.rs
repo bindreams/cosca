@@ -40,7 +40,7 @@ pub(super) async fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
     let (child, wanted_kill_on_drop) = on_pool(
         cmd.as_sync_mut(),
         "cosca::tokio::Command::spawn_suspended",
-        move |cmd| spawn_frozen(cmd, |cmd| spawn_uncommitted(cmd, policy)),
+        move |cmd| spawn_frozen(cmd, |cmd| spawn_uncommitted(cmd, policy, crate::identity::HostKernel)),
     )
     .await
     .map_err(spawn_failure)??;

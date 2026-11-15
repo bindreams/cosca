@@ -17,7 +17,7 @@ use super::wait::{Hop, Unjoined};
 pub(crate) async fn spawn(cmd: &mut Command) -> Result<Child, SpawnFailure> {
     let policy = async_policy();
     on_pool(cmd, "cosca::tokio::Command::spawn", move |cmd| {
-        crate::child::spawn::spawn_uncommitted(cmd, policy)?.commit_kill_on_drop()
+        crate::child::spawn::spawn_uncommitted(cmd, policy, crate::identity::HostKernel)?.commit_kill_on_drop()
     })
     .await
     .map_err(spawn_failure)?

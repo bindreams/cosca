@@ -89,7 +89,9 @@ pub(super) fn spawn(cmd: &mut Command) -> Result<SuspendedChild, Error> {
     if let Some(refusal) = refusal(cmd) {
         return Err(refusal);
     }
-    let (child, wanted_kill_on_drop) = spawn_frozen(cmd, |cmd| spawn_uncommitted(cmd, SpawnPolicy::SYNC))?;
+    let (child, wanted_kill_on_drop) = spawn_frozen(cmd, |cmd| {
+        spawn_uncommitted(cmd, SpawnPolicy::SYNC, crate::identity::HostKernel)
+    })?;
     Ok(SuspendedChild {
         child,
         wanted_kill_on_drop,

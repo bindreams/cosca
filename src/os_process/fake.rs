@@ -60,6 +60,8 @@ struct Shared {
     source: Source,
     /// What answers a call the tables have nothing for. `None`: such a call panics.
     real: Option<Box<dyn OsChild>>,
+    /// What [`OsChild::kernel`] answers, once [`with_kernel`](FakeProcess::with_kernel) states it.
+    kernel: std::sync::OnceLock<crate::identity::SpawnKernel>,
 }
 
 /// What calls consume and record, behind one lock so a `&FakeProcess` is `Sync`.
@@ -118,7 +120,19 @@ impl FakeProcess {
             }),
             source: Source::new(),
             real,
+            kernel: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Answer `kernel` to [`OsChild::kernel`]. Without it, a fake over a real child answers that
+    /// child's, and any other panics.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_kernel(self, kernel: crate::identity::SpawnKernel) -> Self {
+        assert!(
+            self.0.kernel.set(kernel).is_ok(),
+            "FakeProcess: the kernel is stated once"
+        );
+        self
     }
 
     /// Answer `pid` to [`OsChild::pid`]. Without it, a fake over a real child answers that child's,
@@ -311,6 +325,14 @@ impl OsChild for FakeProcess {
     fn pid(&self) -> Option<u32> {
         let stated = self.script().pid;
         stated.or_else(|| self.0.real.as_ref().and_then(|real| real.pid()))
+    }
+
+    fn kernel(&self) -> &dyn crate::identity::Kernel {
+        match (self.0.kernel.get(), &self.0.real) {
+            (Some(stated), _) => &**stated,
+            (None, Some(real)) => real.kernel(),
+            (None, None) => panic!("FakeProcess: the kernel was asked past the stated facts"),
+        }
     }
 
     fn kill_refusal(&self) -> KillRefusal {

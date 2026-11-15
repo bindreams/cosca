@@ -1535,7 +1535,7 @@ fn assert_the_failed_root_is_the_one_error(done: &crate::test_own_process::Compl
     let member = crate::identity::windows_fixture::spawn_query_only_without_console(done);
     let id = crate::identity::windows_identity_from_handle_result(member.handle(), member.pid())
         .expect("the restricted member's identity");
-    let root = crate::os_process::windows::WindowsProcess::open(id)
+    let root = crate::os_process::windows::WindowsProcess::open(crate::identity::HostKernel, id)
         .expect("open the restricted member")
         .expect("a live process opens with QUERY alone");
     let job = super::JobHandle::create_empty_for_test();

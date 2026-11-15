@@ -67,6 +67,19 @@ fn a_second_peek_runs_after_every_first_reap() {
     assert_zombie_consumed(b.pid, "the second reap");
 }
 
+// The box's kernel =====
+
+/// The `OwnedChild` lends the kernel its box was built with: the row stated for it answers a read made
+/// through the lent kernel.
+///
+/// Mutant: `kernel()` lends a host kernel.
+#[skuld::test]
+fn an_owned_child_lends_the_kernel_its_box_was_built_with() {
+    let (b, kernel) = Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_peek(pid, Ok(None)));
+    assert_eq!(b.owned.kernel().peek(b.pid).expect("the stated row"), None);
+    assert!(kernel.all_rows_taken(), "the lent kernel answered from the row");
+}
+
 // Task 2b: the `SIG_IGN` hang =====
 
 const MARKER: &str = "COSCA_TESTCFG_SHARED_SIGIGN";

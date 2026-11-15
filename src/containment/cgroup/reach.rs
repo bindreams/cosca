@@ -235,8 +235,16 @@ impl Subtree {
     /// outside if the walk finds it nowhere (see [`walk_places`](Self::walk_places)). Otherwise,
     /// before 6.13 or when the walk cannot tell, by `/proc/<pid>/cgroup`'s path. A subtree with no
     /// unified-hierarchy path (a test leaf) holds nothing that read would place.
-    pub(crate) fn holds(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> Result<bool, Error> {
-        self.holds_seen(pid, pidfd, None).map(|(inside, _)| inside)
+    ///
+    /// Reads `/proc` through `kernel`, the spawn's, which the caller lends: a subtree outlives the leaf
+    /// it was taken from and holds none.
+    pub(crate) fn holds(
+        &self,
+        kernel: &dyn crate::identity::Kernel,
+        pid: u32,
+        pidfd: Option<BorrowedFd<'_>>,
+    ) -> Result<bool, Error> {
+        self.holds_seen(kernel, pid, pidfd, None).map(|(inside, _)| inside)
     }
 
     /// [`holds`](Self::holds), also giving the cgroup id that placed the task (the leaf's, a known
@@ -249,6 +257,7 @@ impl Subtree {
     /// ([`Error::Unsupported`]): the read of a cgroup that is not the leaf's adds no context to it.
     pub(crate) fn holds_seen(
         &self,
+        kernel: &dyn crate::identity::Kernel,
         pid: u32,
         pidfd: Option<BorrowedFd<'_>>,
         seen: Option<u64>,
@@ -287,24 +296,18 @@ impl Subtree {
         let Some(path) = &self.path else {
             return Ok((false, None));
         };
-        proc_names(
-            &crate::identity::HostKernel,
-            path,
-            pid,
-            || self.placed.of(pid),
-            elsewhere,
-        )
-        .map(|inside| (inside, None))
-        .map_err(|e| match e {
-            Error::Io(e) if elsewhere => Error::Io(crate::error::io_context(
-                format!(
-                    "pid {pid} is in another cgroup than its leaf, maybe one under it, and that cgroup's path \
+        proc_names(kernel, path, pid, || self.placed.of(pid), elsewhere)
+            .map(|inside| (inside, None))
+            .map_err(|e| match e {
+                Error::Io(e) if elsewhere => Error::Io(crate::error::io_context(
+                    format!(
+                        "pid {pid} is in another cgroup than its leaf, maybe one under it, and that cgroup's path \
                          cannot be read"
-                ),
-                e,
-            )),
-            other => other,
-        })
+                    ),
+                    e,
+                )),
+                other => other,
+            })
     }
 
     /// Whether the cgroup `id`, not the leaf's own, is under the leaf, by a walk of the leaf's
@@ -368,20 +371,27 @@ impl Subtree {
     /// only then does the task's exit follow, so only then may it be waited for. `seen` is as in
     /// [`holds_seen`](Self::holds_seen): the pidfd route answers from it when the leaf's id is
     /// unknown. This is the one check that a kill reached a task.
-    pub(crate) fn reached_by(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>, seen: Option<u64>) -> Result<bool, Error> {
+    pub(crate) fn reached_by(
+        &self,
+        kernel: &dyn crate::identity::Kernel,
+        pid: u32,
+        pidfd: Option<BorrowedFd<'_>>,
+        seen: Option<u64>,
+    ) -> Result<bool, Error> {
         if !self.killed.landed() {
             return Ok(false);
         }
-        self.holds_seen(pid, pidfd, seen).map(|(inside, _)| inside)
+        self.holds_seen(kernel, pid, pidfd, seen).map(|(inside, _)| inside)
     }
 }
 
 impl Reach for Subtree {
-    /// [`Subtree::reached_by`], asked with the child's pid and pidfd. A child with no pid cannot be placed: it
-    /// has no number to ask `/proc` with, so whether the kill reached it is not known.
+    /// [`Subtree::reached_by`], asked with the child's pid and pidfd, through the child's kernel. A
+    /// child with no pid cannot be placed: it has no number to ask `/proc` with, so whether the kill
+    /// reached it is not known.
     fn reached(&self, child: &crate::child::owned::OwnedChild) -> Result<bool, Error> {
         match child.pid() {
-            Some(pid) => self.reached_by(pid, child.pidfd(), None),
+            Some(pid) => self.reached_by(child.kernel(), pid, child.pidfd(), None),
             None => Err(Error::Io(io::Error::other(
                 "the child's pid is not known, so it cannot be placed",
             ))),
@@ -407,7 +417,7 @@ fn dying_in(text: &str) -> Option<u64> {
 ///
 /// `Err` is the spawn's refusal.
 pub(crate) fn front_placement(
-    kernel: &dyn crate::identity::Kernel,
+    kernel: &crate::identity::SpawnKernel,
     leaf_id: impl FnOnce() -> io::Result<u64>,
 ) -> Result<(), crate::error::Error> {
     use std::os::fd::AsFd;
@@ -576,8 +586,13 @@ impl Drop for Probe {
 /// that died before that took effect is no longer `parent`, so the child exits instead. `proc` is
 /// this process's `/proc`, through which the child lists its descriptors where `close_range` is
 /// refused. The child's pidfd comes from the fork ([`fork_with_pidfd`]), so it names the probe for
-/// good; a fork that cannot make one is the fork's errno.
-fn fork_probe(proc: &crate::identity::ProcDir, parent: libc::pid_t, dumpable: bool) -> io::Result<Probe> {
+/// good; a fork that cannot make one is the fork's errno. The child's box owns `kernel`.
+fn fork_probe(
+    proc: &crate::identity::ProcDir,
+    parent: libc::pid_t,
+    dumpable: bool,
+    kernel: crate::identity::SpawnKernel,
+) -> io::Result<Probe> {
     use std::os::fd::AsRawFd;
 
     // Under the spawn lock, so no other fork of cosca's copies the child's end; a later probe child
@@ -607,6 +622,7 @@ fn fork_probe(proc: &crate::identity::ProcDir, parent: libc::pid_t, dumpable: bo
     Ok(Probe {
         pid: new.pid,
         child: OwnedChild::over_pidfd(
+            kernel,
             Some(u32::try_from(new.pid).expect("a forked child's pid is positive")),
             new.pidfd,
         ),
@@ -962,8 +978,8 @@ fn confirmed(read: Result<(), Unreadable>, peeked: Result<PeekOutcome, Error>) -
 }
 
 /// Reads the cgroup of a non-dumpable child of this process (see [`front_placement`]).
-fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(), Unreadable> {
-    let proc_dir = match crate::identity::proc_view_with(kernel) {
+fn untraceable_cgroup_readable(kernel: &crate::identity::SpawnKernel) -> Result<(), Unreadable> {
+    let proc_dir = match crate::identity::proc_view_with(&**kernel) {
         crate::identity::ProcView::Same(dir) => dir,
         crate::identity::ProcView::Diverged => {
             return Err(Unreadable::View(
@@ -988,8 +1004,13 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
     let dumpable = super::fault::probe_kept_dumpable();
     #[cfg(not(test))]
     let dumpable = false;
-    let probe =
-        fork_probe(&proc_dir, rustix::process::getpid().as_raw_nonzero().get(), dumpable).map_err(Unreadable::Probe)?;
+    let probe = fork_probe(
+        &proc_dir,
+        rustix::process::getpid().as_raw_nonzero().get(),
+        dumpable,
+        std::sync::Arc::clone(kernel),
+    )
+    .map_err(Unreadable::Probe)?;
     let pid = probe.pid;
     let mut ready = [0u8; SETUP_FAILED_LEN];
     let readied = loop {
@@ -1016,7 +1037,7 @@ fn untraceable_cgroup_readable(kernel: &dyn crate::identity::Kernel) -> Result<(
             use crate::identity::pid_file::ReadOutcome;
 
             let child = u32::try_from(pid).expect("a forked child's pid is positive");
-            let read = match read_cgroup(kernel, &proc_dir, child) {
+            let read = match read_cgroup(&**kernel, &proc_dir, child) {
                 Ok(ReadOutcome::Read(bytes)) => crate::identity::utf8(bytes).map(drop).map_err(Unreadable::Probe),
                 Ok(ReadOutcome::Hidden(e)) => Err(Unreadable::Hidden(e)),
                 Ok(ReadOutcome::Exited(e)) => Err(Unreadable::Probe(e)),

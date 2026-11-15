@@ -38,13 +38,37 @@ use crate::child::owned::teardown::Reach;
 pub(crate) use windows_child_end::ChildEnd;
 
 pub(crate) fn spawn(cmd: &mut Command) -> Result<Child, SpawnFailure> {
-    spawn_uncommitted(cmd, SpawnPolicy::SYNC)?.commit_kill_on_drop()
+    spawn_with(cmd, crate::identity::HostKernel)
 }
 
-/// [`spawn`] up to the handle it returns, whose containment resource still tears the tree down
+/// [`spawn`] asking `kernel`: the one body of the spawn, whatever the kernel. `kernel` is erased
+/// once, here, into a [`SpawnKernel`](crate::identity::SpawnKernel); every OS box the spawn builds
+/// (the child's, the cgroup leaf's, the placement probe's) owns it or a clone of it, and the spawn's
+/// own reads ask it.
+pub(crate) fn spawn_with<K: crate::identity::Kernel + Send + 'static>(
+    cmd: &mut Command,
+    kernel: K,
+) -> Result<Child, SpawnFailure> {
+    spawn_uncommitted(cmd, SpawnPolicy::SYNC, kernel)?.commit_kill_on_drop()
+}
+
+/// [`spawn_with`] up to the handle it returns, whose containment resource still tears the tree down
 /// on drop whatever `kill_on_drop` says. `policy` is every teardown's of the child it makes: a
 /// failed spawn's, the handle's own, its cgroup leaf's drain, and the `Unreaped` they hand back.
-pub(crate) fn spawn_uncommitted(cmd: &mut Command, policy: SpawnPolicy) -> Result<Child, SpawnFailure> {
+pub(crate) fn spawn_uncommitted<K: crate::identity::Kernel + Send + 'static>(
+    cmd: &mut Command,
+    policy: SpawnPolicy,
+    kernel: K,
+) -> Result<Child, SpawnFailure> {
+    spawn_over(cmd, policy, crate::identity::spawn_kernel(kernel))
+}
+
+/// [`spawn_uncommitted`] over the erased kernel.
+fn spawn_over(
+    cmd: &mut Command,
+    policy: SpawnPolicy,
+    kernel: crate::identity::SpawnKernel,
+) -> Result<Child, SpawnFailure> {
     let kill_on_drop = cmd.kill_on_drop_flag();
     // Elevation runs BEFORE spawn_unelevated's std::mem::take(cmd.fds_mut()), so the
     // effect layers see/modify cmd.fds() while it is still populated (the honest Windows
@@ -52,7 +76,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command, policy: SpawnPolicy) -> Resul
     if cmd.elevation_request().enabled {
         #[cfg(windows)]
         {
-            return crate::elevation::windows::spawn_elevated(cmd, kill_on_drop, policy);
+            return crate::elevation::windows::spawn_elevated(cmd, kill_on_drop, policy, kernel);
         }
         #[cfg(unix)]
         {
@@ -67,7 +91,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command, policy: SpawnPolicy) -> Resul
             // BackendUnavailable ONLY when the backend path is the culprit (a bad cwd
             // yields the same kind and stays a plain Io). An already-elevated derived
             // (sanitized original) has no backend path, so it is never remapped.
-            let r = spawn_unelevated(&mut derived, kill_on_drop, policy);
+            let r = spawn_unelevated(&mut derived, kill_on_drop, policy, kernel);
             let child = match backend_path.as_deref() {
                 Some(bp) => r.map_err(|f| f.map(|e| crate::elevation::remap_derived_spawn_error(e, bp)))?,
                 None => r?,
@@ -87,7 +111,7 @@ pub(crate) fn spawn_uncommitted(cmd: &mut Command, policy: SpawnPolicy) -> Resul
             }));
         }
     }
-    spawn_unelevated(cmd, kill_on_drop, policy)
+    spawn_unelevated(cmd, kill_on_drop, policy, kernel)
 }
 
 /// Finish a POSIX elevated spawn whose deferred password write returned `written`.
@@ -527,11 +551,12 @@ pub(crate) fn spawn_unelevated(
     cmd: &mut Command,
     kill_on_drop: bool,
     policy: SpawnPolicy,
+    kernel: crate::identity::SpawnKernel,
 ) -> Result<Child, SpawnFailure> {
     // Read now: a failed spawn's teardown needs the front before a `Child` exists.
     let elevation = cmd.elevation_report().cloned();
     let front = elevation.as_ref().and_then(crate::elevation::ElevationReport::front);
-    spawn_reported(cmd, kill_on_drop, policy, elevation, front).map_err(|failure| {
+    spawn_reported(cmd, kill_on_drop, policy, elevation, front, kernel).map_err(|failure| {
         if front.is_some() {
             failure.behind_front()
         } else {
@@ -547,10 +572,11 @@ fn spawn_reported(
     policy: SpawnPolicy,
     elevation: Option<crate::elevation::ElevationReport>,
     front: Option<crate::elevation::front::Front>,
+    kernel: crate::identity::SpawnKernel,
 ) -> Result<Child, SpawnFailure> {
     // Before anything is made or forked: a pidfd that is refused means no child, and no leaf.
     #[cfg(target_os = "linux")]
-    crate::os_process::linux::open::probe_pidfd_support_with(&crate::identity::HostKernel).not_started()?;
+    crate::os_process::linux::open::probe_pidfd_support_with(&*kernel).not_started()?;
     // Read the routing rule BEFORE the take, which empties the map the rule reads. Evaluated
     // after, it would collapse to "does it have an executable()", and a high-descriptor-only
     // command would take the std path — whose fd >= 3 collection is unix-only, so the
@@ -565,7 +591,7 @@ fn spawn_reported(
     // CONTAINED children (Job Object / TreeWalk).
     #[cfg(windows)]
     if to_raw_backend {
-        return windows_raw::spawn_raw(cmd, fds, kill_on_drop, policy);
+        return windows_raw::spawn_raw(cmd, fds, kill_on_drop, policy, kernel);
     }
     #[cfg(unix)]
     let mut steps = in_child::InChild::default();
@@ -607,6 +633,7 @@ fn spawn_reported(
                 cmd.fd_marker_suppressed(),
                 cmd.env_ops(),
                 policy.teardown_warn_after,
+                &kernel,
             )
             .not_started()?;
             let report = report.open(&_guard).not_started()?;
@@ -622,7 +649,7 @@ fn spawn_reported(
         };
         // Outside the lock, which covers only the window before the ends are close-on-exec: the wait
         // for a report the first read missed has no bound.
-        let unique = first.finish();
+        let unique = first.finish(&*kernel);
         // std collected the child of a spawn it failed, which never ran the program.
         let c = spawned
             .map_err(|e| unique_report::failed_spawn_error(e, &unique))
@@ -644,11 +671,12 @@ fn spawn_reported(
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
             policy.teardown_warn_after,
+            &kernel,
         )
         .not_started()?;
         // A front this host could not place after a cgroup kill is refused before it is spawned.
         if let Some(leaf) = prepared.cgroup_leaf.as_ref().filter(|_| front.is_some()) {
-            crate::containment::cgroup::front_placement(&crate::identity::HostKernel, || leaf.id()).not_started()?;
+            crate::containment::cgroup::front_placement(&kernel, || leaf.id()).not_started()?;
         }
 
         let _guard = spawn_lock();
@@ -664,7 +692,7 @@ fn spawn_reported(
         // Classified at the SYSCALL, not around the whole spawn: an access-denied from stdio
         // resolution or the post-spawn attach has nothing to do with a breakaway request.
         #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
-        let held = handshake.run(|| std_cmd.spawn())?;
+        let held = handshake.run(kernel, || std_cmd.spawn())?;
         (prepared, held.child, held.owned, parent_ends)
     };
     #[cfg(windows)]
@@ -679,6 +707,7 @@ fn spawn_reported(
             cmd.fd_marker_suppressed(),
             cmd.env_ops(),
             policy.teardown_warn_after,
+            &kernel,
         )
         .not_started()?;
 
@@ -714,6 +743,7 @@ fn spawn_reported(
         (
             pid,
             OwnedChild::new(Box::new(crate::os_process::windows::WindowsProcess::for_child(
+                kernel,
                 std::os::windows::io::OwnedHandle::from(child),
                 pid,
             ))),
@@ -734,17 +764,24 @@ fn spawn_reported(
         fault::run_at(fault::SpawnPoint::BeforeAdopt, pid);
         let unique = match unique_report::adopted_id(unique, pid) {
             Ok(unique) => unique,
-            Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, front, prepared, policy)),
+            Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, front, prepared, policy, kernel)),
         };
         // A refused kqueue is the one way to fail, and no box exists then ([`leave_unwatched_child`]).
-        match crate::os_process::macos::child::MacosChild::new(crate::identity::HostKernel, pid, unique) {
+        match crate::os_process::macos::child::MacosChild::new(std::sync::Arc::clone(&kernel), pid, unique) {
             Ok(os) => {
                 drop(child);
                 (pid, OwnedChild::new(Box::new(os)))
             }
             Err(refusal) => {
                 return Err(leave_unwatched_child(
-                    child, pid, unique, front, prepared, refusal, None,
+                    &*kernel,
+                    UnwatchedChild { child, pid, unique },
+                    UnwatchedReport {
+                        front,
+                        prepared,
+                        refusal,
+                        late: None,
+                    },
                 ))
             }
         }
@@ -770,7 +807,7 @@ fn spawn_reported(
         pidfd: owned.os_handle(),
     };
     let (resolved, cause, mut why) = resolve_identity(
-        &crate::identity::HostKernel,
+        owned.kernel(),
         pid,
         #[cfg(unix)]
         &owned,
@@ -982,6 +1019,7 @@ fn abandon_unadopted(
     front: Option<crate::elevation::front::Front>,
     prepared: crate::containment::Prepared,
     policy: SpawnPolicy,
+    kernel: crate::identity::SpawnKernel,
 ) -> SpawnFailure {
     use unique_report::Unadoptable;
 
@@ -995,7 +1033,9 @@ fn abandon_unadopted(
             drop(child);
             SpawnFailure::NotStarted(error)
         }
-        Unadoptable::Late(unique) => late_child::abandon_late_child(child, unique, error, front, prepared, policy),
+        Unadoptable::Late(unique) => {
+            late_child::abandon_late_child(child, unique, error, front, prepared, policy, kernel)
+        }
         Unadoptable::Unverified => {
             let fate = leave_unverified_child(child);
             SpawnFailure::started(error, fate, None).with_detail(FrontFate::LeftUnreaped.detail(front, Some(pid)))
@@ -1020,22 +1060,43 @@ fn leave_unverified_child(child: std::process::Child) -> ChildFate {
     ChildFate::Running { id: None }
 }
 
-/// macOS: abandon a child `MacosChild::new` refused (its kqueue, `EMFILE` and the like). It is a
-/// stated limit: the child is sent `SIGKILL` through its unique id (an elevation front is sent
-/// nothing), its marker's holders are swept, and it is never waited on, so it stays a zombie until this
-/// process exits. `refusal` is the spawn's error unless the id came `late`, when it goes in the
-/// failure's `cleanup`.
+/// macOS: the child [`leave_unwatched_child`] leaves: the `std` handle, its pid and the unique id it
+/// reported.
 #[cfg(target_os = "macos")]
-fn leave_unwatched_child(
+struct UnwatchedChild {
     child: std::process::Child,
     pid: u32,
     unique: u64,
+}
+
+/// macOS: what [`leave_unwatched_child`]'s failure reports of the child's tree and of both refusals.
+/// `refusal` is the spawn's error unless the id came `late`, when it goes in the failure's `cleanup`.
+#[cfg(target_os = "macos")]
+struct UnwatchedReport {
     front: Option<crate::elevation::front::Front>,
     prepared: crate::containment::Prepared,
     refusal: Error,
     late: Option<Error>,
+}
+
+/// macOS: abandon a child `MacosChild::new` refused (its kqueue, `EMFILE` and the like). It is a
+/// stated limit: the child is sent `SIGKILL` through its unique id (an elevation front is sent
+/// nothing), its marker's holders are swept, and it is never waited on, so it stays a zombie until this
+/// process exits.
+#[cfg(target_os = "macos")]
+fn leave_unwatched_child(
+    kernel: &dyn crate::identity::Kernel,
+    unwatched: UnwatchedChild,
+    report: UnwatchedReport,
 ) -> SpawnFailure {
-    let (fate, said, killing) = unwatched_child_fate(pid, unique, front.is_some());
+    let UnwatchedChild { child, pid, unique } = unwatched;
+    let UnwatchedReport {
+        front,
+        prepared,
+        refusal,
+        late,
+    } = report;
+    let (fate, said, killing) = unwatched_child_fate(kernel, pid, unique, front.is_some());
     // The containment is no front's to kill: its marker closes with it.
     let holders = if front.is_some() {
         None
@@ -1079,7 +1140,12 @@ fn leave_unwatched_child(
 /// What [`leave_unwatched_child`] does to the child `pid`, whose unique id is `unique`: the fate it
 /// answers, the clause that says it, and what failed (a refused kill). Nothing is sent to a `front`.
 #[cfg(target_os = "macos")]
-fn unwatched_child_fate(pid: u32, unique: u64, front: bool) -> (ChildFate, String, Option<Failures>) {
+fn unwatched_child_fate(
+    kernel: &dyn crate::identity::Kernel,
+    pid: u32,
+    unique: u64,
+    front: bool,
+) -> (ChildFate, String, Option<Failures>) {
     use crate::signal::{via_audit_token, Sent, Sig};
 
     if front {
@@ -1089,8 +1155,8 @@ fn unwatched_child_fate(pid: u32, unique: u64, front: bool) -> (ChildFate, Strin
             None,
         );
     }
-    match via_audit_token(&crate::identity::HostKernel, pid, Some(unique), Sig::Kill) {
-        // `Delivered` also covers a child whose exit had begun at the send, so the clause says both.
+    match via_audit_token(kernel, pid, Some(unique), Sig::Kill) {
+        // `Delivered` includes a send refused because the exit had begun.
         Ok(Sent::Delivered) => (
             ChildFate::Killed,
             "it was sent SIGKILL, or its exit had begun when the send was made".to_owned(),

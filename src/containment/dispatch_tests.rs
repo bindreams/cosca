@@ -2799,6 +2799,7 @@ fn prepare_creates_the_leaf_with_its_spawns_warn_threshold(#[fixture(cgroup)] _g
         false,
         &[],
         Some(threshold),
+        &crate::identity::spawn_kernel(crate::identity::HostKernel),
     )
     .expect("prepare is infallible off Windows");
 
@@ -2830,6 +2831,7 @@ fn prepare_places_the_marker_above_the_callers_reserved_fds() {
         false,
         &[],
         None,
+        &crate::identity::spawn_kernel(crate::identity::HostKernel),
     )
     .expect("prepare is infallible off Windows");
     let marker = prepared.marker.as_ref().expect("a contained macOS root gets a marker");
@@ -2861,6 +2863,7 @@ fn prepare_with_a_failing_marker_install(
         false,
         &[],
         None,
+        &crate::identity::spawn_kernel(crate::identity::HostKernel),
     )
 }
 
@@ -2925,6 +2928,7 @@ fn prepare_installs_no_marker_for_an_elevation_derived_spawn() {
         true,
         &[],
         None,
+        &crate::identity::spawn_kernel(crate::identity::HostKernel),
     )
     .expect("prepare is infallible off Windows");
     assert!(
