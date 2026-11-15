@@ -14,4 +14,10 @@ impl OwnedChild {
         self.os = Box::new(fake.clone());
         fake
     }
+
+    /// Every read of this child's number answers `read`, as the number of a reaped root reads.
+    #[cfg(unix)]
+    pub(crate) fn number_reads_always(&mut self, read: crate::identity::Resolved<crate::identity::ProcessId>) {
+        self.script_over(|fake| fake.number_reads_always(read));
+    }
 }

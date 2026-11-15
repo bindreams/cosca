@@ -177,7 +177,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
         crate::containment::dispatch::TeardownCaller::FinishElevated,
         child.pid(),
         child.id,
-        || child.proc.state(),
+        &child.proc,
         &child.tree,
     );
     let mut report = crate::child::drop_report::DropReport::new(&view);

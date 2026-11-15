@@ -34,6 +34,15 @@ pub(crate) trait OsChild: OsProcess {
     /// child's number (a reap and reuse of it, a cgroup read) asks too.
     fn kernel(&self) -> &dyn crate::identity::Kernel;
 
+    /// The identity `pid`, the child's number as its caller holds it, holds now, and why it could not
+    /// be read when the read knows: a read by number through [`kernel`](Self::kernel), never through
+    /// the child's handle, which after a reap names the dead child and not the number's holder. It
+    /// needs no [`pid`](Self::pid) of the box, so a box without one answers it too.
+    #[cfg(unix)]
+    fn number_holder(&self, pid: u32) -> crate::identity::NumberRead {
+        crate::identity::ProcessId::of_with(self.kernel(), pid)
+    }
+
     /// Look at the exit record without consuming it, and without touching anything a waiter waits
     /// on. A stop, or a zombie only its tracer sees, is [`PeekOutcome::Running`]. Any thread, any
     /// time.

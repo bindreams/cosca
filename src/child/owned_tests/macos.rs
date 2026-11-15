@@ -889,3 +889,22 @@ fn a_refused_confirmation_is_the_refusal_when_the_peek_reads_the_child_running()
         "the adoption's registration was refused, and the confirming read was refused"
     );
 }
+
+// A hold's number read =====
+
+/// A hold reads the number it was taken for, through the kernel its box owns, whatever pid the box
+/// learned: the kernel refuses every record read of the held pid, which the host does not have and
+/// would answer `Gone`, and the box's own pid, which the host reads as `Found`, is not the number
+/// held.
+///
+/// Mutant: `ReapHold::number_holder` reads the box's pid, or a host kernel.
+#[skuld::test]
+fn a_hold_reads_its_own_number_through_the_kernel_its_box_owns() {
+    use crate::containment::Root;
+    use crate::identity::{unreadable, Resolved};
+
+    const HELD: u32 = 2_000_000_000;
+    let (b, _) = Blocker::spawn_over(|_, _| unreadable(HELD));
+    let (read, _) = b.owned.hold(HELD).number_holder();
+    assert!(matches!(read, Resolved::Unknown), "{read:?}");
+}

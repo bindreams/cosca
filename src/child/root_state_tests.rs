@@ -65,7 +65,7 @@ mod linux {
     /// `proc.state()`).
     fn drop_after_foreign_reap_and_same_tick_reuse_body() {
         let recorder = record_kill_group();
-        let (child, writer) = session_blocker();
+        let (mut child, writer) = session_blocker();
         assert!(
             child.tree.signals_a_group_for_test(),
             "the test needs a group named by the root's pid, which ContainMode::Session makes"
@@ -73,7 +73,7 @@ mod linux {
         let root = child.id().expect(crate::test_child::IDENTITY_READ);
         drop(writer);
         let reuser = reap_behind_and_reuse(root.pid());
-        let _read = crate::child::fault::force_root_reads(crate::identity::Resolved::Found(root));
+        child.proc.number_reads_always(crate::identity::Resolved::Found(root));
 
         drop(child);
 
@@ -157,15 +157,19 @@ mod linux {
         let blocker = crate::child::spawn::fault::release_between_kill_and_wait(writer);
         let mark = crate::log_capture::mark();
         // The number is unreadable too, so the read says so in a `debug` line of its own.
-        let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
-        let fake = child
-            .proc
-            .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
+        let fake = child.proc.script_over(|f| {
+            f.peeks([Err(std::io::Error::other("forced peek failure"))])
+                .number_reads([(
+                    crate::identity::Resolved::Unknown,
+                    crate::identity::UnknownCause::default(),
+                )])
+        });
 
         let err = crate::child::spawn::finish_elevated(child, Err(crate::error::Error::Io(std::io::Error::other("w"))))
             .expect_err("the spawn fails");
 
         fake.assert_peeks_exhausted();
+        fake.assert_number_reads_exhausted();
         blocker.assert_killed();
         // The cleanup's error and the Unknown warn report it; the handle it drops afterwards is
         // disarmed and says nothing more.
@@ -223,14 +227,18 @@ mod linux {
         let (mut child, writer) = session_blocker();
         let blocker = crate::child::spawn::fault::release_at_drop_kill(writer);
         let mark = crate::log_capture::mark();
-        let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
-        let fake = child
-            .proc
-            .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
+        let fake = child.proc.script_over(|f| {
+            f.peeks([Err(std::io::Error::other("forced peek failure"))])
+                .number_reads([(
+                    crate::identity::Resolved::Unknown,
+                    crate::identity::UnknownCause::default(),
+                )])
+        });
 
         drop(child);
 
         fake.assert_peeks_exhausted();
+        fake.assert_number_reads_exhausted();
         blocker.assert_killed();
         assert!(
             !crate::log_capture::contains_since(mark, "treating the root as not reaped"),
@@ -259,7 +267,7 @@ mod linux {
             crate::containment::dispatch::TeardownCaller::Drop,
             child.pid(),
             child.id,
-            || child.proc.state(),
+            &child.proc,
             &child.tree,
         );
         fake.assert_peeks_exhausted();

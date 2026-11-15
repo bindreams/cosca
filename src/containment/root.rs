@@ -33,6 +33,20 @@ pub(crate) trait Root {
         self.state()
     }
 
+    /// Who holds the root's number now, and why it could not be read when the read knows. Asked only
+    /// when the state is `Reaped { own: true }`; the default is a debug-asserted breach.
+    #[cfg(unix)]
+    fn number_holder(&self) -> crate::identity::NumberRead {
+        debug_assert!(
+            false,
+            "the number of a root that never answers `Reaped {{ own: true }}` was read"
+        );
+        (
+            crate::identity::Resolved::Unknown,
+            crate::identity::UnknownCause::default(),
+        )
+    }
+
     /// Linux: the root's pidfd, if it has one. A send through it with `PIDFD_SIGNAL_PROCESS_GROUP`
     /// names the group exactly: the kernel resolves it from the pidfd's process, never from a number.
     #[cfg(target_os = "linux")]
@@ -73,6 +87,10 @@ impl Root for Seen<'_> {
         self.look.clone()
     }
 
+    fn number_holder(&self) -> crate::identity::NumberRead {
+        self.root.number_holder()
+    }
+
     #[cfg(target_os = "linux")]
     fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         self.root.pidfd()
@@ -110,7 +128,7 @@ pub(crate) fn check_number(root: Option<&dyn Root>) -> Result<(), NotItsGroup> {
         None => {}
     }
     match root {
-        Some(root) => number_holds(root.pid(), root.state()).map_err(|refusal| NotItsGroup::unproven(refusal, probe)),
+        Some(root) => number_holds(root, root.state()).map_err(|refusal| NotItsGroup::unproven(refusal, probe)),
         None => {
             debug_assert!(false, "a send by the root's number was given no root to check");
             Err(NotItsGroup::NoRoot)
@@ -232,15 +250,16 @@ impl Refusal {
     }
 }
 
-/// Whether the root's pid, `pid`, still names its process group, from `state`, the root's own
-/// handle's answer, and for a root this handle reaped, the pid's own read. `Ok` only while the root
-/// is unreaped.
+/// Whether `root`'s pid still names its process group, from `state`, the root's own handle's answer,
+/// and for a root this handle reaped, the pid's own read ([`Root::number_holder`]). `Ok` only while
+/// the root is unreaped.
 #[cfg(unix)]
-pub(crate) fn number_holds(pid: RawPid, state: RootState) -> Result<(), Refusal> {
+pub(crate) fn number_holds(root: &dyn Root, state: RootState) -> Result<(), Refusal> {
     use crate::identity::Resolved;
+    let pid = root.pid();
     match state {
         RootState::Unreaped => Ok(()),
-        RootState::Reaped { own: true } => Err(match crate::child::root_identity_now(pid) {
+        RootState::Reaped { own: true } => Err(match root.number_holder() {
             (Resolved::Gone, _) => Refusal::ReapedPidGone(pid),
             (Resolved::Found(_), _) => Refusal::ReapedPidTaken(pid),
             (Resolved::Unknown, cause) => {
@@ -295,7 +314,7 @@ pub(crate) fn look(root: &dyn Root, has_group: bool) -> NumberLook {
         return NumberLook::Untrusted(state);
     }
     let handle_unsure = matches!(state, RootState::Unknown(_));
-    match number_holds(root.pid(), state) {
+    match number_holds(root, state) {
         Ok(()) => NumberLook::Trusted,
         Err(Refusal::ReapedPidTaken(_)) => NumberLook::Empty,
         Err(Refusal::ReapedPidGone(_)) if !has_group => NumberLook::Empty,

@@ -261,10 +261,12 @@ impl Reap {
         let _ = (self, script);
     }
 
-    /// Arms what makes the root's number read as this reap, until the guard drops.
-    fn force_reads(self, id: ProcessId) -> Option<Box<dyn std::any::Any>> {
-        self.read(id)
-            .map(|read| Box::new(crate::child::fault::force_root_reads(read)) as Box<dyn std::any::Any>)
+    /// States what makes the root's number read as this reap, through the kernel the child owns.
+    fn state_reads(self, child: &mut crate::Child) {
+        let id = child.id().expect(crate::test_child::IDENTITY_READ);
+        if let Some(read) = self.read(id) {
+            child.proc.number_reads_always(read);
+        }
     }
 
     /// Puts the real root's answers back in place of [`script`](Self::script)'s, for the cell's
@@ -291,8 +293,8 @@ impl Reap {
         false
     }
 
-    /// Whether the force must be lifted before the cell's cleanup kills and reaps the root: a macOS
-    /// root forced untrusted would refuse both.
+    /// Whether the scripted answers must be lifted before the cell's cleanup kills and reaps the
+    /// root: a macOS root scripted untrusted would refuse both.
     fn lift_before_cleanup(self) -> bool {
         cfg!(target_os = "macos") && self.untrusted()
     }
@@ -661,7 +663,7 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         }
     }
     let scripted = reap.script(&mut child);
-    let mut forced = reap.force_reads(child.id().expect(crate::test_child::IDENTITY_READ));
+    reap.state_reads(&mut child);
 
     let _released = release_when_the_drain_blocks(mechanism, &stdin);
     #[cfg(target_os = "linux")]
@@ -674,17 +676,16 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         Op::GracefulShutdown => child.graceful_shutdown_tree(Duration::ZERO).map(drop),
         Op::Drop => {
             drop(child);
-            return finish_teardown(reap, scripted, forced, recorders, root, cat, stdin, stderr);
+            return finish_teardown(reap, scripted, recorders, root, cat, stdin, stderr);
         }
         Op::FinishElevated => {
             _ = crate::child::spawn::finish_elevated(child, failed_write());
-            return finish_teardown(reap, scripted, forced, recorders, root, cat, stdin, stderr);
+            return finish_teardown(reap, scripted, recorders, root, cat, stdin, stderr);
         }
     };
     reap.assert_script_used(scripted.as_ref());
     let mut sent = recorders.sent(root, cat);
     if reap.lift_before_cleanup() {
-        drop(forced.take());
         // The root's kill and reap below are the real ones.
         Reap::lift(scripted.as_ref());
     }
@@ -705,7 +706,6 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
         child.wait_tree().expect("the leaf drains");
     }
     drop(child);
-    drop(forced);
     drop(recorders);
     sent
 }
@@ -742,7 +742,6 @@ fn release_when_the_drain_blocks<T>(_: Mechanism, _: &std::rc::Rc<std::cell::Cel
 fn finish_teardown(
     reap: Reap,
     scripted: Option<crate::os_process::fake::FakeProcess>,
-    forced: Option<Box<dyn std::any::Any>>,
     recorders: Recorders,
     root: u32,
     cat: u32,
@@ -752,7 +751,6 @@ fn finish_teardown(
     use std::io::Read as _;
     reap.assert_script_used(scripted.as_ref());
     let mut sent = recorders.sent(root, cat);
-    drop(forced);
     drop(stdin.take());
     let mut rest = Vec::new();
     stderr
@@ -794,7 +792,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap) -> Sent {
         }
     }
     let scripted = reap.script(&mut child.inner);
-    let mut forced = reap.force_reads(child.id().expect(crate::test_child::IDENTITY_READ));
+    reap.state_reads(&mut child.inner);
 
     let _released = release_when_the_drain_blocks(mechanism, &stdin);
     #[cfg(target_os = "linux")]
@@ -805,7 +803,6 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap) -> Sent {
     reap.assert_script_used(scripted.as_ref());
     let mut sent = recorders.sent(root, cat);
     if reap.lift_before_cleanup() {
-        drop(forced.take());
         // The root's kill and reap below are the real ones.
         Reap::lift(scripted.as_ref());
     }
@@ -826,7 +823,6 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap) -> Sent {
         child.wait_tree().await.expect("the leaf drains");
     }
     drop(child);
-    drop(forced);
     drop(recorders);
     sent
 }

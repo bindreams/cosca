@@ -184,13 +184,16 @@ In order:
    `graceful_shutdown` and `graceful_shutdown_tree` are each one `async fn` (`shutdown_lone` and
    `shutdown_tree`, in `child/graceful/shutdown.rs`) over a `Waits` trait of their waits: the sync
    `Child` runs them with blocking waits through `run_ready` (one poll, a panic on `Pending`), and
-   the async `Child` awaits them. What is
-   left is to remove `child::fault::force_root_reads` and `force_next_root_read`, a
-   thread-local hook that answers the root's identity read (`root_identity_now`) beside
-   `FakeKernel`: the root's read moves into `OwnedChild`, which borrows the kernel its OS box owns
-   (`OsChild::kernel()`, which `OwnedChild::kernel()` lends) for that one identity
-   read, and those tests state `FakeKernel` rows (owner, 2026-11-05: kept until then; needs
-   [#877](https://github.com/bindreams/cosca/issues/877) on macOS).
+   the async `Child` awaits them. The root's identity read by number, after our own reap, is
+   `OsChild::number_holder`. The OS box reads the number through the kernel it owns
+   (`OsChild::kernel()`). `OwnedChild` asks the box, and a policy that holds a `Root` asks the root
+   (`Root::number_holder`, which `ReapHold` answers through its child). A test states the read on
+   the fake of the layer it holds, as it states peeks. For a spawned child that is its
+   `FakeProcess`: `number_reads` answers one read each, and `number_reads_always` answers every
+   later one. For a stated root it is `StatedRoot::holding`. Only the identity read's own tests
+   state `FakeKernel` rows for it, and the one helper that gives a policy test a real read's
+   cause: `test_support::emfile_number_read` runs `ProcessId::of_with` over a refused
+   `pidfd_open` row.
 5. **Spawn:** produces an `OsChild`, its pipes, its containment and its elevation, for both halves.
    On Linux the one fork that execs is `child::spawn::fork_exec` ([#383](https://github.com/bindreams/cosca/issues/383)
    S2): a clone kind (vfork without `CLONE_VM`, or plain), the env block built in the parent, the

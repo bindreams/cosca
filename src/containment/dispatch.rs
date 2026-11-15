@@ -244,18 +244,20 @@ impl DropView {
     /// be compared with, so only a number that names no process shows it reaped, and the handle
     /// decides alone otherwise.
     ///
+    /// The number read is `root_pid`'s, whatever pid `proc`'s box has learned.
+    ///
     /// Reading emits no `warn`: the caller reports once, with a
     /// [`DropReport`](crate::child::drop_report::DropReport). `caller` names itself in log lines.
     pub(crate) fn read(
         caller: TeardownCaller,
         root_pid: u32,
         id: Option<crate::identity::ProcessId>,
-        root: impl FnOnce() -> RootState,
+        proc: &crate::child::owned::OwnedChild,
         tree: &Tree,
     ) -> DropView {
         let label = caller.label();
-        let (now, unread) = crate::child::root_identity_now(root_pid);
-        let state = root();
+        let (now, unread) = proc.number_holder(root_pid);
+        let state = proc.state();
         let handle_reaped = matches!(state, RootState::Reaped { .. });
         let root = if crate::child::root_reaped(handle_reaped, id, now) {
             // The number shows the reap where the handle could not say; say so in the log.

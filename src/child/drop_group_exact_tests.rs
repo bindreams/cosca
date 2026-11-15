@@ -214,12 +214,13 @@ fn a_drop_of_a_root_its_handle_cannot_read_with_no_member_left_still_skips_the_g
     reap_root(&child, Reap::Foreign);
     let mark = crate::log_capture::mark();
     let capture = Capture::start();
-    let _as_root = crate::child::fault::force_next_root_read(Resolved::Found(id));
-    let fake = child
-        .proc
-        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
+    let fake = child.proc.script_over(|f| {
+        f.peeks([Err(std::io::Error::other("forced peek failure"))])
+            .number_reads([(Resolved::Found(id), crate::identity::UnknownCause::default())])
+    });
     drop(child);
     fake.assert_peeks_exhausted();
+    fake.assert_number_reads_exhausted();
     let steps = capture.group_steps();
     assert_eq!(steps, [], "nothing was sent to the group");
     let skips = crate::log_capture::records_since_on_current_thread(mark, "so it does not kill its process group");
@@ -238,10 +239,10 @@ fn an_unreadable_handle_with_a_gone_number_and_an_empty_group_is_reaped(teardown
     reap_root(&child, Reap::Foreign);
     let mark = crate::log_capture::mark();
     let capture = Capture::start();
-    let _as_gone = crate::child::fault::force_next_root_read(Resolved::Gone);
-    let fake = child
-        .proc
-        .script_over(|f| f.peeks([Err(std::io::Error::other("forced peek failure"))]));
+    let fake = child.proc.script_over(|f| {
+        f.peeks([Err(std::io::Error::other("forced peek failure"))])
+            .number_reads([(Resolved::Gone, crate::identity::UnknownCause::default())])
+    });
     let detail = match teardown {
         Teardown::Drop => {
             let torn = child.tear_down(
@@ -255,6 +256,7 @@ fn an_unreadable_handle_with_a_gone_number_and_an_empty_group_is_reaped(teardown
         Teardown::FinishElevated => tear_down(child, teardown),
     };
     fake.assert_peeks_exhausted();
+    fake.assert_number_reads_exhausted();
     assert_eq!(capture.group_steps(), [], "nothing was sent to the group");
     if let Some(detail) = detail {
         assert!(!detail.contains("tree was not killed"), "{detail}");

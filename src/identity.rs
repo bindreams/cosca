@@ -354,6 +354,10 @@ pub struct ProcessId {
     key: Key,
 }
 
+/// What a read of a pid's identity answers: who holds it, and why it could not be read when the read
+/// knows ([`UnknownCause`], set only for [`Resolved::Unknown`]).
+pub(crate) type NumberRead = (Resolved<ProcessId>, UnknownCause);
+
 impl ProcessId {
     /// The raw OS process id. NOTE: a bare PID is not unique across time — use
     /// the whole `ProcessId` for identity, comparison, and map keys.
@@ -386,13 +390,13 @@ impl ProcessId {
     }
 
     /// [`of`](Self::of), and why it was [`Resolved::Unknown`] when the read itself knows.
-    pub(crate) fn of_explained(pid: RawPid) -> (Resolved<ProcessId>, UnknownCause) {
+    pub(crate) fn of_explained(pid: RawPid) -> NumberRead {
         Self::of_with(&HostKernel, pid)
     }
 
     /// [`of_explained`](Self::of_explained) through `kernel`: the one entry to a by-pid identity
     /// read, on every platform.
-    pub(crate) fn of_with(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<ProcessId>, UnknownCause) {
+    pub(crate) fn of_with(kernel: &dyn Kernel, pid: RawPid) -> NumberRead {
         #[cfg(all(test, target_os = "macos"))]
         seams::note_by_pid_read();
         #[cfg(target_os = "linux")]
@@ -1004,11 +1008,7 @@ impl ProcessId {
     /// key is read from `held` and the pid is not opened again. Before Linux 6.9, where `held` has
     /// no inode of its own, it is the `/proc` read by `pid`. The caller checks through `held` that
     /// `pid` still names the child.
-    pub(crate) fn of_held_with(
-        kernel: &dyn Kernel,
-        pid: RawPid,
-        held: std::os::fd::BorrowedFd<'_>,
-    ) -> (Resolved<ProcessId>, UnknownCause) {
+    pub(crate) fn of_held_with(kernel: &dyn Kernel, pid: RawPid, held: std::os::fd::BorrowedFd<'_>) -> NumberRead {
         let (read, cause) = backend::of_held(kernel, pid, held);
         (read.map(|key| ProcessId { pid, key }), cause)
     }
@@ -1089,7 +1089,7 @@ pub(crate) fn ticks_id(pid: RawPid) -> ProcessId {
 /// [`unreadable`] on macOS: the record read `EPERM`s on both paths, as a sandbox refuses it (a
 /// cross-user read is refused by `proc_pidinfo` only).
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) fn unreadable(pid: RawPid) -> impl Kernel {
+pub(crate) fn unreadable(pid: RawPid) -> FakeKernel<'static> {
     FakeKernel::over(&HostKernel)
         .on_every_bsd_info_failing(pid, ReadErr::Refused(libc::EPERM))
         .on_every_kinfo_refused(pid, libc::EPERM)

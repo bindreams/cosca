@@ -896,18 +896,45 @@ fn a_hold_checks_the_roots_group_by_its_own_state() {
     let refused = check().expect_err("reaped elsewhere");
     assert!(refused.contains("reaped elsewhere"), "{refused}");
 
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Reaped(exit())]);
-    let child = OwnedChild::new(Box::new(fake));
-    status(child.wait(None));
+    let reaped_reading = |read| {
+        let fake = FakeProcess::new([])
+            .reaps([ReapAnswer::Reaped(exit())])
+            .number_reads_always(read);
+        let child = OwnedChild::new(Box::new(fake));
+        status(child.wait(None));
+        child
+    };
+    let child = reaped_reading(Resolved::Gone);
     let check = || check_number(Some(&child.hold(UNREAD_PID))).map_err(|why| why.to_string());
-    {
-        let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
-        let refused = check().expect_err("the pid names no process");
-        assert!(refused.contains("names no process"), "{refused}");
-    }
-    let _unknown = crate::child::fault::force_root_reads(Resolved::Unknown);
+    let refused = check().expect_err("the pid names no process");
+    assert!(refused.contains("names no process"), "{refused}");
+    let child = reaped_reading(Resolved::Unknown);
+    let check = || check_number(Some(&child.hold(UNREAD_PID))).map_err(|why| why.to_string());
     let refused = check().expect_err("the pid could not be read");
     assert!(refused.contains("this handle reaped the root"), "{refused}");
+}
+
+/// A hold reads the number it was taken for, through the kernel its box owns, whatever pid the box
+/// learned: the row refuses the held pid, which the host does not have and would answer `Gone`, and
+/// the box's own pid has no row.
+///
+/// Mutant: `ReapHold::number_holder` reads the box's pid, or a host kernel.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_hold_reads_its_own_number_through_the_kernel_its_box_owns() {
+    use crate::containment::Root;
+    use crate::identity::{spawn_kernel, FakeKernel, HostKernel, Resolved};
+
+    const HELD: u32 = 2_000_000_000;
+    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(HELD, Err(rustix::io::Errno::MFILE));
+    let fake = FakeProcess::new([])
+        .with_pid(HELD + 1)
+        .with_kernel(spawn_kernel(kernel));
+    let child = OwnedChild::new(Box::new(fake));
+    let (read, cause) = child.hold(HELD).number_holder();
+    assert!(matches!(read, Resolved::Unknown), "{read:?}");
+    let why = cause.into_error("the held pid").expect("the refused open is the cause");
+    assert_eq!(crate::error::first_os_code(&why), Some(libc::EMFILE), "{why:?}");
 }
 
 /// A waiter parked on its wait is a holder (`W`), not a reap.

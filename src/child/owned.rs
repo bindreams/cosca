@@ -325,6 +325,12 @@ impl OwnedChild {
         RootState::of_peek(self.os.peek().map_err(Error::into_io))
     }
 
+    /// See [`OsChild::number_holder`].
+    #[cfg(unix)]
+    pub(crate) fn number_holder(&self, pid: u32) -> crate::identity::NumberRead {
+        self.os.number_holder(pid)
+    }
+
     /// Whether this thread holds the lock. Tests only.
     #[cfg(all(unix, test))]
     pub(crate) fn is_held_by_current_thread(&self) -> bool {
@@ -521,6 +527,10 @@ impl crate::containment::Root for ReapHold<'_> {
 
     fn state(&self) -> crate::signal::RootState {
         ReapHold::state(self)
+    }
+
+    fn number_holder(&self) -> crate::identity::NumberRead {
+        self.child.number_holder(self.pid)
     }
 
     #[cfg(target_os = "linux")]

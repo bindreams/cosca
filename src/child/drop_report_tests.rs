@@ -1062,20 +1062,24 @@ fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
     crate::log_capture::install();
     let (mut child, _writer) = contained_blocker(ContainMode::Session);
     let mark = crate::log_capture::mark();
-    let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Gone);
-    let fake = child
-        .proc
-        .script_over(|f| f.peeks([Err(std::io::Error::other("handle doubt 6e2"))]));
+    let fake = child.proc.script_over(|f| {
+        f.peeks([Err(std::io::Error::other("handle doubt 6e2"))])
+            .number_reads([(
+                crate::identity::Resolved::Gone,
+                crate::identity::UnknownCause::default(),
+            )])
+    });
 
     let view = crate::containment::DropView::read(
         crate::containment::dispatch::TeardownCaller::FailedRun,
         child.pid(),
         child.id,
-        || child.proc.state(),
+        &child.proc,
         &child.tree,
     );
 
     fake.assert_peeks_exhausted();
+    fake.assert_number_reads_exhausted();
     assert!(
         matches!(view.root, crate::signal::RootState::Reaped { .. }),
         "{:?}",
@@ -1099,22 +1103,22 @@ fn an_unreadable_number_is_logged_with_why() {
     crate::log_capture::install();
     let (mut child, _writer) = contained_blocker(ContainMode::Session);
     let mark = crate::log_capture::mark();
-    let _number = crate::child::fault::force_root_reads_failing(crate::identity::FailedCall::pidfd_open(
-        rustix::io::Errno::MFILE,
-    ));
-    let fake = child
-        .proc
-        .script_over(|f| f.peeks([Err(std::io::Error::other("handle doubt 8c3"))]));
+    let unread = crate::test_support::emfile_number_read(child.pid());
+    let fake = child.proc.script_over(|f| {
+        f.peeks([Err(std::io::Error::other("handle doubt 8c3"))])
+            .number_reads([unread])
+    });
 
     let _view = crate::containment::DropView::read(
         crate::containment::dispatch::TeardownCaller::Drop,
         child.pid(),
         child.id,
-        || child.proc.state(),
+        &child.proc,
         &child.tree,
     );
 
     fake.assert_peeks_exhausted();
+    fake.assert_number_reads_exhausted();
     let records = crate::log_capture::records_since_on_current_thread(mark, "could not be read either");
     assert_eq!(records.len(), 1, "{records:?}");
     let emfile = std::io::Error::from_raw_os_error(libc::EMFILE).to_string();
@@ -1128,20 +1132,24 @@ fn an_unreadable_number_is_logged_with_why() {
 #[skuld::test]
 fn the_look_a_kill_decides_on_is_the_one_the_report_is_worded_from() {
     let (mut child, _writer) = contained_blocker(ContainMode::Session);
-    let _number = crate::child::fault::force_next_root_read(crate::identity::Resolved::Gone);
-    let fake = child
-        .proc
-        .script_over(|f| f.peeks([Err(std::io::Error::other("handle doubt 7a1"))]));
+    let fake = child.proc.script_over(|f| {
+        f.peeks([Err(std::io::Error::other("handle doubt 7a1"))])
+            .number_reads([(
+                crate::identity::Resolved::Gone,
+                crate::identity::UnknownCause::default(),
+            )])
+    });
 
     let view = crate::containment::DropView::read(
         crate::containment::dispatch::TeardownCaller::Drop,
         child.pid(),
         child.id,
-        || child.proc.state(),
+        &child.proc,
         &child.tree,
     );
 
     fake.assert_peeks_exhausted();
+    fake.assert_number_reads_exhausted();
     assert!(view.leaves_root_alone());
     assert!(
         matches!(view.look(), crate::signal::RootState::Reaped { .. }),
