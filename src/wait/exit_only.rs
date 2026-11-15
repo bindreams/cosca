@@ -17,7 +17,9 @@ use std::io;
 #[cfg(unix)]
 use std::process::ExitStatus;
 
-use crate::os_process::child::{ExitRecord, Foreign, PeekOutcome};
+#[cfg(not(target_os = "linux"))]
+use crate::os_process::child::PeekOutcome;
+use crate::os_process::child::{ExitRecord, Foreign};
 
 #[cfg(target_os = "linux")]
 #[path = "exit_only/linux.rs"]
@@ -106,7 +108,9 @@ impl<'a> Target<'a> {
 }
 
 /// Look at `target` without consuming anything. The handle `target` holds answers; macOS has no
-/// handle, so its target carries the kernel that does.
+/// handle, so its target carries the kernel that does. Linux looks through its pidfd by
+/// [`linux::peek`].
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
     #[cfg(all(test, target_os = "macos"))]
     if let Some(forced) = seams::take_forced_peek() {

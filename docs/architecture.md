@@ -89,20 +89,18 @@ In order:
    plan. What is still the old shape, and which step takes it:
    - Spawn: each spawn builds one `OwnedChild` where its handle first exists, and every later
      read, kill and reap of the child goes through it, the identity check
-     (`resolve_identity`) and the cgroup placement probe's child included. Linux: in the
-     handshake's `conclude`, over the pidfd the child sent, for every arm that has it. macOS:
+     (`resolve_identity`) and the cgroup placement probe's child included. Linux: in
+     `fork_spawn`, over the pidfd the clone gave it, for every arm. macOS:
      right after the child's unique id is adopted; a child whose id came late gets a box of its
      own, its tree swept around the root's kill (`late_child.rs`). Windows: right after the
-     process is created, a UAC launch right after `ShellExecuteEx` returns. Two reads are by
-     number, through `exit_only::Target`: macOS's `unique_report`, before a unique id exists, and
-     the Linux handshake's pre-report watch (a pidfd opened by number until
-     [#383](https://github.com/bindreams/cosca/issues/383) S2). `OwnedChild::tear_down`
+     process is created, a UAC launch right after `ShellExecuteEx` returns. One read is by
+     number, through `exit_only::Target`: macOS's `unique_report`, before a unique id exists. `OwnedChild::tear_down`
      is the one kill-then-settle policy, split at its one wait (`begin_tear_down` returns the
      teardown's end or a pending wait, which `settle` blocks on and `settle_async` awaits), and
      `Child::drop` uses it. The async spawn is the sync spawn, run whole on tokio's blocking pool,
      told the async `SpawnPolicy` (the warn threshold of its waits, and what an `Unreaped` it
      hands back does when dropped). On
-     Linux the teardown also ends every spawn failure (the handshake's `conclude`, and the
+     Linux the teardown also ends every spawn failure (`fork_spawn`'s `conclude`, and the
      identity and attach arms, `held_teardown.rs`), while a cgroup leaf a failed spawn drops
      ends its own exchange with the child (`CgroupLeaf::abandon_without_child`: killed through if
      the child entered it, then removed, the child sent nothing). On macOS the identity and
@@ -198,5 +196,7 @@ In order:
    On Linux the one fork that execs is `child::spawn::fork_exec` ([#383](https://github.com/bindreams/cosca/issues/383)
    S2): a clone kind (vfork without `CLONE_VM`, or plain), the env block built in the parent, the
    caller's async-signal-safe steps, and a status channel of errno and ready records read without
-   blocking. The elevation shim uses it. The ordinary spawn is std's `Command` and the handshake;
-   both go when it moves onto the core.
+   blocking. The elevation shim uses it, and so does the ordinary spawn (`child::spawn::fork_spawn`,
+   the vfork kind): its outcome is the core's records alone. The ordinary spawn searches for the
+   program as `std::process::Command` does (libc's `execvp` in the child, which the core's
+   `Program::searching` asks for), and the shim by its own `program_path`; the lookup slice unifies them.

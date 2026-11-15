@@ -3,14 +3,21 @@
 //! (`read_fd`).
 
 use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+#[cfg(not(target_os = "linux"))]
 use std::os::unix::process::CommandExt;
+#[cfg(not(target_os = "linux"))]
 use std::process::{Command, Stdio};
 
 use super::{install, FdMapping};
+#[cfg(not(target_os = "linux"))]
 use crate::child::spawn::in_child::register_alone;
+use crate::child::spawn::in_child::InChild;
 use crate::test_own_process::{own_process, test_path};
+#[cfg(not(target_os = "linux"))]
 use crate::test_spawn::spawn;
 use crate::test_stdio::RestoreStdio;
 
@@ -24,12 +31,14 @@ fn file_with(content: &str) -> File {
 }
 
 /// `install` on `cmd`, as the only step of its hook.
+#[cfg(not(target_os = "linux"))]
 fn install_on(cmd: &mut Command, mappings: Vec<FdMapping>) -> std::io::Result<()> {
     register_alone(cmd, |steps| install(steps, mappings))
 }
 
 /// Spawn `/bin/sh -c script` with `mappings` installed exactly as a real `Command::fd()` caller
 /// would, and return its captured stdout as a `String`.
+#[cfg(not(target_os = "linux"))]
 fn run_sh(script: &str, mappings: Vec<FdMapping>) -> String {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(script).stdout(Stdio::piped());
@@ -37,6 +46,37 @@ fn run_sh(script: &str, mappings: Vec<FdMapping>) -> String {
     let out = crate::test_spawn::output_captured(&mut cmd).expect("spawn /bin/sh");
     assert!(out.status.success(), "child failed: {out:?}");
     String::from_utf8(out.stdout).expect("utf8 stdout")
+}
+
+/// Spawn `/bin/sh -c script` through the ordinary spawn's entry with `mappings` installed exactly as a real
+/// `Command::fd()` caller would, and return its captured stdout as a `String`.
+#[cfg(target_os = "linux")]
+fn run_sh(script: &str, mappings: Vec<FdMapping>) -> String {
+    let (mut stdout_read, mut steps) = sh_steps(mappings);
+    let started = crate::child::spawn::in_child::spawn_sh(script, &mut steps).expect("spawn /bin/sh");
+    // The parent's copy of the stdout pipe's write end: it reads EOF once the child is done with its own.
+    drop(steps);
+    let mut stdout = String::new();
+    stdout_read.read_to_string(&mut stdout).expect("read the stdout");
+    assert_eq!(
+        crate::child::spawn::in_child::exit_code(&started),
+        Some(0),
+        "child failed"
+    );
+    stdout
+}
+
+/// The steps of a child whose stdout is a pipe (its read end is returned) and whose fds are `mappings`.
+#[cfg(target_os = "linux")]
+fn sh_steps(mappings: Vec<FdMapping>) -> (std::io::PipeReader, InChild) {
+    let (stdout_read, stdout_write) = std::io::pipe().expect("pipe");
+    let mut steps = InChild::default();
+    steps.map_stdio(super::Plan::stdio(vec![FdMapping {
+        parent_fd: OwnedFd::from(stdout_write),
+        child_fd: 1,
+    }]));
+    install(&mut steps, mappings).expect("install");
+    (stdout_read, steps)
 }
 
 /// A shell snippet that reads `fd` via `/dev/fd/N`, never via `<&N` (see the module docs).
@@ -164,10 +204,8 @@ fn a_three_way_rotation_of_colliding_mappings_resolves_correctly() {
 fn install_rejects_a_duplicate_child_fd_in_every_build_profile() {
     let a = file_with("A");
     let b = file_with("B");
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg("true");
-    let err = install_on(
-        &mut cmd,
+    let err = install(
+        &mut InChild::default(),
         vec![
             FdMapping {
                 parent_fd: a.into(),
@@ -231,22 +269,50 @@ fn without_preserve_the_fd_is_closed_at_exec() {
 #[skuld::test]
 fn an_i32_max_child_fd_fails_at_spawn_not_at_install() {
     let f = file_with("x");
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg("true").stdout(Stdio::piped());
-    install_on(
-        &mut cmd,
-        vec![FdMapping {
-            parent_fd: f.into(),
-            child_fd: i32::MAX,
-        }],
-    )
-    .expect("i32::MAX must be accepted by install");
-    let err = crate::test_spawn::spawn(&mut cmd)
-        .and_then(|c| c.wait_with_output())
-        .expect_err("dup2 onto i32::MAX must fail the spawn with an Err, not abort the child");
+    let mapping = vec![FdMapping {
+        parent_fd: f.into(),
+        child_fd: i32::MAX,
+    }];
+    #[cfg(not(target_os = "linux"))]
+    let err = {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("true").stdout(Stdio::piped());
+        install_on(&mut cmd, mapping).expect("i32::MAX must be accepted by install");
+        crate::test_spawn::spawn(&mut cmd)
+            .and_then(|c| c.wait_with_output())
+            .expect_err("dup2 onto i32::MAX must fail the spawn with an Err, not abort the child")
+    };
+    #[cfg(target_os = "linux")]
+    let err = failed_spawn_of_true(mapping);
     // EBADF (or whatever the target OS reports for an out-of-range dup2 target) — not a crash,
     // not a hang, just a normal io::Error.
     assert!(err.raw_os_error().is_some(), "expected an OS error, got {err:?}");
+}
+
+/// The error of the spawn of `true` with `mappings` installed, which must fail.
+#[cfg(target_os = "linux")]
+fn failed_spawn_of_true(mappings: Vec<FdMapping>) -> std::io::Error {
+    let (_stdout, mut steps) = sh_steps(mappings);
+    match crate::child::spawn::in_child::spawn_sh("true", &mut steps) {
+        Err(err) => err,
+        Ok(started) => panic!("the spawn succeeded (child {})", started.pid),
+    }
+}
+
+/// Lowers this process's soft `RLIMIT_NOFILE` to 256, which its children inherit: the limit the tests below
+/// need for the child's `dup2`s. For a process of the test's own, which the `Completion` witnesses.
+#[cfg(target_os = "linux")]
+fn lower_the_limit_to_256(_own_process: &crate::test_own_process::Completion) {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: reads and lowers this process's own limit, which only this process's own test uses.
+    unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+        limit.rlim_cur = 256;
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0, "lower the limit");
+    }
 }
 
 /// An out-of-range but representable child fd (e.g. one far beyond any real process' open-file
@@ -255,47 +321,66 @@ fn an_i32_max_child_fd_fails_at_spawn_not_at_install() {
 /// than an abort. This is the process-level regression test; `cosca::Command::fd`-level coverage
 /// lives in `tests/spawn_io.rs`.
 ///
-/// Lowers the CHILD's own `RLIMIT_NOFILE` to 256 via a `pre_exec` hook registered BEFORE
-/// `install`'s (the same technique `a_distant_high_target_...` above already uses), so
-/// `1_000_000` is guaranteed out of range for THIS spawn regardless of the host's own ambient
-/// `ulimit -n`. Without it, this would depend on the runner: on Linux, a soft limit raised past
-/// `1_000_000` is entirely ordinary (see `tests/common::RestoreRlimitNofile`'s doc), so the same
-/// `dup2` this test expects to fail could instead succeed.
+/// Lowers the `RLIMIT_NOFILE` of the CHILD to 256, so `1_000_000` is guaranteed out of range for THIS
+/// spawn regardless of the host's own ambient `ulimit -n`. Without it, this would depend on the
+/// runner: on Linux, a soft limit raised past `1_000_000` is entirely ordinary (see
+/// `tests/common::RestoreRlimitNofile`'s doc), so the same `dup2` this test expects to fail could
+/// instead succeed. On macOS a `pre_exec` hook registered BEFORE `install`'s does it; on Linux, which
+/// has no hook, the test's own process does (the child inherits the limit).
 #[skuld::test]
 fn an_out_of_range_but_representable_child_fd_fails_at_spawn_not_at_install() {
-    let f = file_with("x");
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg("true").stdout(Stdio::piped());
-
-    // SAFETY: `pre_exec` runs post-fork, pre-exec, in the child only; `setrlimit` is a checked,
-    // non-allocating raw syscall. Registered first so it runs before the fd map's hook.
-    unsafe {
-        cmd.pre_exec(|| {
-            let lim = libc::rlimit {
-                rlim_cur: 256,
-                rlim_max: 256,
-            };
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    install_on(
-        &mut cmd,
-        vec![FdMapping {
-            parent_fd: f.into(),
+    #[cfg(target_os = "linux")]
+    {
+        let Some(done) = own_process(
+            test_path!(an_out_of_range_but_representable_child_fd_fails_at_spawn_not_at_install),
+            crate::test_spawn::spawn,
+        ) else {
+            return;
+        };
+        lower_the_limit_to_256(&done);
+        let mapping = vec![FdMapping {
+            parent_fd: file_with("x").into(),
             child_fd: 1_000_000,
-        }],
-    )
-    .expect("1_000_000 must be accepted by install (representable, just not achievable)");
-    let err = crate::test_spawn::spawn(&mut cmd)
-        .and_then(|c| c.wait_with_output())
-        .expect_err("dup2 onto an unachievable fd number must fail the spawn with an Err, not abort the child");
-    // EBADF (or whatever the target OS reports for an out-of-range dup2 target) — not a crash,
-    // not a hang, just a normal io::Error.
-    assert!(err.raw_os_error().is_some(), "expected an OS error, got {err:?}");
+        }];
+        let err = failed_spawn_of_true(mapping);
+        assert!(err.raw_os_error().is_some(), "expected an OS error, got {err:?}");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let f = file_with("x");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("true").stdout(Stdio::piped());
+
+        // SAFETY: `pre_exec` runs post-fork, pre-exec, in the child only; `setrlimit` is a checked,
+        // non-allocating raw syscall. Registered first so it runs before the fd map's hook.
+        unsafe {
+            cmd.pre_exec(|| {
+                let lim = libc::rlimit {
+                    rlim_cur: 256,
+                    rlim_max: 256,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        install_on(
+            &mut cmd,
+            vec![FdMapping {
+                parent_fd: f.into(),
+                child_fd: 1_000_000,
+            }],
+        )
+        .expect("1_000_000 must be accepted by install (representable, just not achievable)");
+        let err = crate::test_spawn::spawn(&mut cmd)
+            .and_then(|c| c.wait_with_output())
+            .expect_err("dup2 onto an unachievable fd number must fail the spawn with an Err, not abort the child");
+        // EBADF (or whatever the target OS reports for an out-of-range dup2 target) — not a crash,
+        // not a hang, just a normal io::Error.
+        assert!(err.raw_os_error().is_some(), "expected an OS error, got {err:?}");
+    }
 }
 
 // One distant child_fd must not inflate every temporary past a tight RLIMIT_NOFILE =====
@@ -308,6 +393,15 @@ fn an_out_of_range_but_representable_child_fd_fails_at_spawn_not_at_install() {
 /// 255 target.
 #[skuld::test]
 fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rlimit() {
+    // On Linux, which has no hook for the child's limit, the test's own process lowers it: the child
+    // inherits it.
+    #[cfg(target_os = "linux")]
+    let Some(done) = own_process(
+        test_path!(a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rlimit),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     let a = file_with("AAA");
     let b = file_with("BBB");
     let c = file_with("CCC");
@@ -316,53 +410,56 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
     let c_owned: OwnedFd = c.into();
     let a_raw = a_owned.as_raw_fd();
     let b_raw = b_owned.as_raw_fd();
+    let script = format!("{}; {}", read_fd(b_raw), read_fd(a_raw));
+    let mappings = vec![
+        FdMapping {
+            parent_fd: a_owned,
+            child_fd: b_raw,
+        },
+        FdMapping {
+            parent_fd: b_owned,
+            child_fd: a_raw,
+        },
+        // Numerically distant but still a valid fd under the 256 rlimit (0..255) — must not push
+        // the swap's temporary search past the rlimit ceiling.
+        FdMapping {
+            parent_fd: c_owned,
+            child_fd: 255,
+        },
+    ];
 
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg(format!("{}; {}", read_fd(b_raw), read_fd(a_raw)))
-        .stdout(Stdio::piped());
+    #[cfg(target_os = "linux")]
+    let stdout = {
+        lower_the_limit_to_256(&done);
+        run_sh(&script, mappings).into_bytes()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let stdout = {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(script).stdout(Stdio::piped());
 
-    // Lower the CHILD's RLIMIT_NOFILE to 256 before the fd map's hook runs. `pre_exec` hooks run
-    // in registration order, and the fd map's step runs last — so registering this one first
-    // mirrors the order containment steps rely on in production.
-    unsafe {
-        cmd.pre_exec(|| {
-            let lim = libc::rlimit {
-                rlim_cur: 256,
-                rlim_max: 256,
-            };
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    install_on(
-        &mut cmd,
-        vec![
-            FdMapping {
-                parent_fd: a_owned,
-                child_fd: b_raw,
-            },
-            FdMapping {
-                parent_fd: b_owned,
-                child_fd: a_raw,
-            },
-            // Numerically distant but still a valid fd under the 256 rlimit (0..255) — must not push
-            // the swap's temporary search past the rlimit ceiling.
-            FdMapping {
-                parent_fd: c_owned,
-                child_fd: 255,
-            },
-        ],
-    )
-    .expect("install");
-
-    let out = crate::test_spawn::output_captured(&mut cmd).expect("spawn /bin/sh");
-    assert!(out.status.success(), "child failed: {out:?}");
+        // Lower the CHILD's RLIMIT_NOFILE to 256 before the fd map's hook runs. `pre_exec` hooks run
+        // in registration order, and the fd map's step runs last — so registering this one first
+        // mirrors the order containment steps rely on in production.
+        unsafe {
+            cmd.pre_exec(|| {
+                let lim = libc::rlimit {
+                    rlim_cur: 256,
+                    rlim_max: 256,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        install_on(&mut cmd, mappings).expect("install");
+        let out = crate::test_spawn::output_captured(&mut cmd).expect("spawn /bin/sh");
+        assert!(out.status.success(), "child failed: {out:?}");
+        out.stdout
+    };
     assert_eq!(
-        out.stdout, b"AAABBB",
+        stdout, b"AAABBB",
         "the swap must still resolve correctly even with a numerically distant child_fd \
          elsewhere in the mapping set"
     );
@@ -378,6 +475,7 @@ fn a_distant_high_target_does_not_inflate_every_other_temporary_past_a_tight_rli
 /// pipe (now sitting at fd 2) instead of the mapping's actual source. Reproduces the bug measured
 /// on tokio: `close(2)`, `stderr(pipe())` + `fd(3, null)` delivered the stderr pipe's bytes
 /// through fd 3 instead of the mapping's real source.
+#[cfg(not(target_os = "linux"))]
 #[skuld::test]
 fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
     let Some(done) = own_process(
@@ -432,18 +530,92 @@ fn a_source_starting_below_fd_3_is_moved_before_stdio_dup2_can_clobber_it() {
     );
 }
 
-/// A relocated low `parent_fd`'s ORIGINAL number must stay open (busy) in the parent for as long
-/// as `std_cmd` holds the `pre_exec` closure — not just until `install` returns. Freeing it any
-/// earlier hands that exact number back to the OS right before `std_cmd.spawn()` does its own
-/// internal fd allocation (e.g. its child-to-parent error-reporting pipe, or any piped stdio),
-/// which can then claim that same number in the parent and collide with a dup2 std performs in
-/// the child before any `pre_exec` hook runs — so the freed number ends up serving two different
-/// purposes across the fork, corrupting whichever one loses.
+/// The same hazard on Linux, where the child's own steps `dup2` its stdio onto 0 to 2 (a plan of their
+/// own) before the fd map's: a source that starts out at fd 2 must not be repointed to the stderr
+/// pipe the stdio plan puts there.
+#[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops() {
+fn a_source_starting_below_fd_3_is_moved_before_the_stdio_plan_can_clobber_it() {
     let Some(done) = own_process(
-        test_path!(a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops),
-        spawn,
+        test_path!(a_source_starting_below_fd_3_is_moved_before_the_stdio_plan_can_clobber_it),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let _restore = RestoreStdio::close(&done, &[2]);
+    // The next fd opened lands at 2 (just closed above by `RestoreStdio::close`) — this IS the
+    // mapping's source, at the exact number the bug needs to reproduce.
+    let owned: OwnedFd = file_with("fd3-token").into();
+    assert_eq!(
+        owned.as_raw_fd(),
+        2,
+        "test setup invariant: the source must land exactly at fd 2 to reproduce the bug"
+    );
+    let (mut stdout_read, stdout_write) = std::io::pipe().expect("pipe");
+    let (mut stderr_read, stderr_write) = std::io::pipe().expect("pipe");
+    let mut steps = InChild::default();
+    steps.map_stdio(super::Plan::stdio(vec![
+        FdMapping {
+            parent_fd: OwnedFd::from(stdout_write),
+            child_fd: 1,
+        },
+        FdMapping {
+            parent_fd: OwnedFd::from(stderr_write),
+            child_fd: 2,
+        },
+    ]));
+    install(
+        &mut steps,
+        vec![FdMapping {
+            parent_fd: owned,
+            child_fd: 3,
+        }],
+    )
+    .expect("install");
+
+    let script = format!(
+        // Without the relocation fd 3 is the stderr pipe, and `cat` on it would block on its own writer.
+        "if test -f /dev/fd/3; then {} >&1; else printf %s fd3-is-not-a-regular-file; fi; echo unrelated-stderr >&2",
+        read_fd(3)
+    );
+    let started = crate::child::spawn::in_child::spawn_sh(&script, &mut steps).expect("spawn /bin/sh");
+    drop(steps);
+    let (mut stdout, mut stderr) = (String::new(), String::new());
+    stdout_read.read_to_string(&mut stdout).expect("read the stdout");
+    stderr_read.read_to_string(&mut stderr).expect("read the stderr");
+    assert_eq!(
+        crate::child::spawn::in_child::exit_code(&started),
+        Some(0),
+        "child failed"
+    );
+    assert_ne!(
+        stdout, "fd3-is-not-a-regular-file",
+        "fd 3 in the child is not a regular file: the relocation is missing and fd 3 is the stderr pipe"
+    );
+    assert_eq!(
+        stdout, "fd3-token",
+        "fd 3 in the child must deliver the mapping's OWN source, not whatever the stdio plan later put \
+         at the parent-side fd 2 number"
+    );
+    assert_eq!(
+        stderr.trim(),
+        "unrelated-stderr",
+        "the stderr pipe must carry only the child's own stderr writes, not fd 3's bytes"
+    );
+}
+
+/// A relocated low `parent_fd`'s ORIGINAL number must stay open (busy) in the parent for as long
+/// as the steps that hold it (`std_cmd`'s `pre_exec` closure on macOS) exist — not just until
+/// `install` returns. Freeing it any earlier hands that exact number back to the OS right before
+/// the spawn does its own internal fd allocation (e.g. its child-to-parent error-reporting pipe, or
+/// any piped stdio), which can then claim that same number in the parent and collide with a dup2
+/// the child makes before the fd map's step runs — so the freed number ends up serving two
+/// different purposes across the fork, corrupting whichever one loses.
+#[skuld::test]
+fn a_relocated_low_parent_fd_stays_open_in_the_parent_until_its_steps_drop() {
+    let Some(done) = own_process(
+        test_path!(a_relocated_low_parent_fd_stays_open_in_the_parent_until_its_steps_drop),
+        crate::test_spawn::spawn,
     ) else {
         return;
     };
@@ -456,10 +628,9 @@ fn a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops() {
         "test setup invariant: the source must land exactly at fd 2 to reproduce the bug"
     );
 
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg("true");
-    install_on(
-        &mut cmd,
+    let mut steps = InChild::default();
+    install(
+        &mut steps,
         vec![FdMapping {
             parent_fd: owned,
             child_fd: 5,
@@ -468,22 +639,22 @@ fn a_relocated_low_parent_fd_stays_open_in_the_parent_until_std_cmd_drops() {
     .expect("install");
 
     // fd 2, in THIS process, must still be a live descriptor right after `install` returns —
-    // freeing it earlier is exactly the bug: it must stay open until `cmd` itself (and the
-    // closure/Plan it owns) drops.
+    // freeing it earlier is exactly the bug: it must stay open until `steps` itself (and the
+    // Plan it owns) drops.
     let still_open = unsafe { libc::fcntl(2, libc::F_GETFD) } != -1;
     assert!(
         still_open,
         "the original low fd (2) must remain open across install() — it must not be freed \
-         back to the OS before std_cmd's own spawn() internals have run"
+         back to the OS before the spawn's own fd allocations have run"
     );
 
-    drop(cmd); // only now may the retired original actually close
+    drop(steps); // only now may the retired original actually close
 
-    // Once `cmd` (and the `Plan`/`retired` it owned) has dropped, fd 2 must actually be freed —
+    // Once `steps` (and the `Plan`/`retired` it owned) has dropped, fd 2 must actually be freed —
     // proving `_retired` isn't just leaked open for the life of the process.
     let closed_after_drop = unsafe { libc::fcntl(2, libc::F_GETFD) } == -1;
     assert!(
         closed_after_drop,
-        "the retired original fd (2) must be closed once std_cmd drops, not leaked open"
+        "the retired original fd (2) must be closed once its steps drop, not leaked open"
     );
 }

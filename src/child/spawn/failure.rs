@@ -309,10 +309,7 @@ impl SpawnFailure {
     /// The error of a failure that answered that the program did not start; panics otherwise.
     #[cfg_attr(
         not(target_os = "linux"),
-        allow(
-            dead_code,
-            reason = "only the Linux handshake's tests take a not-started failure apart"
-        )
+        allow(dead_code, reason = "only the Linux spawn's tests take a not-started failure apart")
     )]
     #[track_caller]
     pub(crate) fn expect_not_started(self) -> Error {

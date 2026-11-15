@@ -1,7 +1,10 @@
-//! std-only spawn: resolve the crate's `Stdio` model onto `std::process::Command`,
-//! wire the program/args via the `quote` module, and adopt the child into an `OwnedChild`.
+//! The spawn: resolve the crate's `Stdio` model, wire the program and arguments, and adopt the child into
+//! an `OwnedChild`. On Linux the child is made by the fork-exec core (`child::spawn::fork_exec`, through
+//! `fork_spawn`); on macOS it is a `std::process::Command`, and on Windows the raw backend
+//! (`windows_raw`) makes it.
 
 use std::collections::BTreeMap;
+#[cfg(not(target_os = "linux"))]
 use std::process::Stdio as StdStdio;
 #[cfg(unix)]
 use std::sync::Arc;
@@ -19,7 +22,9 @@ pub(crate) use crate::child::spawn::failure::failed_after_the_spawn;
 pub(crate) use crate::child::spawn::failure::{after_the_spawn, failed_after_teardown, Classify, SpawnFailure};
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::Child;
-use crate::command::{Command, CommandInput, EnvOp};
+#[cfg(not(target_os = "linux"))]
+use crate::command::EnvOp;
+use crate::command::{Command, CommandInput};
 #[cfg(unix)]
 use crate::error::ChildFate;
 use crate::error::Error;
@@ -574,9 +579,6 @@ fn spawn_reported(
     front: Option<crate::elevation::front::Front>,
     kernel: crate::identity::SpawnKernel,
 ) -> Result<Child, SpawnFailure> {
-    // Before anything is made or forked: a pidfd that is refused means no child, and no leaf.
-    #[cfg(target_os = "linux")]
-    crate::os_process::linux::open::probe_pidfd_support_with(&*kernel).not_started()?;
     // Read the routing rule BEFORE the take, which empties the map the rule reads. Evaluated
     // after, it would collapse to "does it have an executable()", and a high-descriptor-only
     // command would take the std path — whose fd >= 3 collection is unix-only, so the
@@ -596,7 +598,13 @@ fn spawn_reported(
     #[cfg(unix)]
     let mut steps = in_child::InChild::default();
     #[cfg(target_os = "linux")]
-    let (mut std_cmd, handshake) = build_std_command_with(cmd, &mut steps, pidfd_handshake::register).not_started()?;
+    let invocation = {
+        let invocation = invocation(cmd).not_started()?;
+        if let Some(dir) = &invocation.cwd {
+            enter_in_child(&mut steps, dir).not_started()?;
+        }
+        invocation
+    };
     #[cfg(target_os = "macos")]
     let (mut std_cmd, report) = build_std_command_with(cmd, &mut steps, unique_report::register).not_started()?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -656,16 +664,16 @@ fn spawn_reported(
             .not_started()?;
         (prepared, c, unique, parent_ends)
     };
-    // Linux holds the child before `exec` until the parent has its pidfd; see `pidfd_handshake`.
-    // Everything from the channel's creation to the helper's join is under `spawn_lock`.
+    // Linux clones the child with its pidfd and reads its status channel; see `fork_spawn`. The clone
+    // and the reads are under `spawn_lock`.
     #[cfg(target_os = "linux")]
-    let (mut prepared, child, owned, parent_ends) = {
+    let (mut prepared, pid, owned, parent_ends) = {
         // Before `prepare`, so a refused stdio fails before containment makes a cgroup leaf.
-        let parent_ends = resolve_into_std(&mut std_cmd, &mut steps, &fds).not_started()?;
-        let prepared = crate::containment::prepare(
-            &mut std_cmd,
+        let parent_ends = resolve_into_fork(&mut steps, &fds).not_started()?;
+        let contain = cmd.contain_request();
+        let mut prepared = crate::containment::prepare(
             &mut steps,
-            &cmd.contain_request(),
+            &contain,
             cmd.flags_request(),
             &reserved,
             cmd.fd_marker_suppressed(),
@@ -678,22 +686,24 @@ fn spawn_reported(
         if let Some(leaf) = prepared.cgroup_leaf.as_ref().filter(|_| front.is_some()) {
             crate::containment::cgroup::front_placement(&kernel, || leaf.id()).not_started()?;
         }
+        let program =
+            fork_spawn::program(&invocation, cmd.env_ops(), prepared.marks_environment(&contain)).not_started()?;
 
-        let _guard = spawn_lock();
-        // The handshake's hook was registered first of all (see `build_std_command_with`), so the fd
-        // map, which may `dup2` a mapping onto any number including the channel's, runs after the
-        // handshake is done.
-        let handshake = handshake
-            .open(&_guard)
-            .not_started()?
-            .warning_past(policy.teardown_warn_after);
-        steps.register(&mut std_cmd);
-
-        // Classified at the SYSCALL, not around the whole spawn: an access-denied from stdio
-        // resolution or the post-spawn attach has nothing to do with a breakaway request.
-        #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
-        let held = handshake.run(kernel, || std_cmd.spawn())?;
-        (prepared, held.child, held.owned, parent_ends)
+        let guard = spawn_lock();
+        let refusing_placement = prepared.refuses_failed_placement();
+        let on_failure = fork_spawn::OnFailure {
+            policy,
+            front,
+            placement: prepared.placement_channel(),
+            refusing_placement,
+        };
+        let started = fork_spawn::start(&program, &mut steps, kernel, on_failure, &guard);
+        // The child's ends of its pipes and its fd map's sources close here, under the lock, as std's
+        // spawn closed them, whether or not the spawn started: a fork that does not exec, made by
+        // another thread, holds a copy of an end until it ends.
+        drop(steps);
+        let started = started?;
+        (prepared, started.pid, started.owned, parent_ends)
     };
     #[cfg(windows)]
     let (mut prepared, child, parent_ends) = {
@@ -728,14 +738,8 @@ fn spawn_reported(
     };
     // Phase 2 (after spawn, before adopt): attach the mechanism (job/cgroup/...).
     // `prepared` is consumed here: Linux cgroup leaf ownership moves to the tree's cgroup mechanism.
-    // Linux holds the child through the box the handshake built over its pidfd; std's `Child`
-    // neither kills nor reaps on drop. Every arm below tears down or adopts this one handle.
-    #[cfg(target_os = "linux")]
-    let pid = {
-        let pid = child.id();
-        drop(child);
-        pid
-    };
+    // Linux holds the child through the box over the pidfd its clone gave it. Every arm below tears
+    // down or adopts this one handle.
     // Windows holds it through std's process handle, which becomes the `OwnedChild`'s own.
     #[cfg(windows)]
     let (pid, owned) = {
@@ -1251,7 +1255,7 @@ pub(crate) fn spawn_lock_held_by_this_thread() -> bool {
     SPAWN_LOCK_HELD_BY_THIS_THREAD.with(|f| f.get())
 }
 
-#[cfg(any(not(any(target_os = "linux", target_os = "macos")), test))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, Error> {
     #[cfg(unix)]
     {
@@ -1267,47 +1271,15 @@ pub(crate) fn build_std_command(cmd: &Command) -> Result<std::process::Command, 
 /// [`build_std_command`], running `first` on the command before anything else is set on it, so a
 /// hook `first` registers runs first in the child. Returns what `first` returned. On Unix this
 /// registers no hook: the child's own steps go into `steps`, for the caller to register last.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn build_std_command_with<R>(
     cmd: &Command,
     #[cfg(unix)] steps: &mut in_child::InChild,
     first: impl FnOnce(&mut std::process::Command) -> R,
 ) -> Result<(std::process::Command, R), Error> {
-    // Program + args via the `quote` model.
-    let StdLaunch {
-        program,
-        mut std_cmd,
-        cwd,
-        enter,
-    } = match cmd.input() {
-        CommandInput::Empty => return Err(Error::Io(std::io::Error::other("no program specified"))),
-        CommandInput::Argv(argv) => {
-            let (Resolved { program, cwd, enter }, rest) = resolve_program_argv(cmd, argv)?;
-            let mut c = std::process::Command::new(&program);
-            c.args(rest);
-            // POSIX: when executable() overrides the loaded file, preserve the
-            // user's argv[0] via arg0() — the executable as written when argv is
-            // empty. Without this, std would set argv[0] to the (possibly completed)
-            // program path, silently dropping the user's intended name.
-            #[cfg(unix)]
-            if let Some(exe) = cmd.executable_path() {
-                use std::os::unix::process::CommandExt;
-                c.arg0(argv.first().map_or(exe.as_os_str(), std::ffi::OsString::as_os_str));
-            }
-            StdLaunch {
-                program,
-                std_cmd: c,
-                cwd,
-                enter,
-            }
-        }
-        CommandInput::CommandLine(line) => build_from_commandline(cmd, line)?,
-    };
-    // Reject .bat/.cmd (BatBadBut) on Windows, and an interior NUL everywhere — this is the std
-    // backend's only NUL check, and the default Windows path. Judged on the token WE resolved,
-    // not on `std_cmd.get_program()`: std's Unix constructor swaps a NUL-bearing program for a
-    // `<string-with-nul>` sentinel, so reading it back would hide the exact token the gate exists
-    // to judge (and would make this verdict differ by platform for reasons unrelated to Windows).
-    reject_batch_path(std::path::Path::new(&program))?;
+    let invocation = invocation(cmd)?;
+    let mut std_cmd = invocation.std_command();
+    let Invocation { cwd, enter, .. } = invocation;
     apply_env(&mut std_cmd, cmd.env_ops());
     let first = first(&mut std_cmd);
     match cwd {
@@ -1398,47 +1370,110 @@ fn resolve_program_argv<'a>(
     Ok((program, rest))
 }
 
-/// The resolved program token alongside the `std::process::Command` built from it and the
-/// directory to run it in.
-struct StdLaunch {
-    program: std::ffi::OsString,
-    std_cmd: std::process::Command,
-    cwd: Option<std::path::PathBuf>,
-    enter: bool,
+/// What a command runs, resolved the way every spawn through the platform's own launcher needs it: the
+/// program to load, the directory to run it in, and the arguments.
+pub(crate) struct Invocation {
+    pub(crate) program: std::ffi::OsString,
+    /// POSIX: `argv[0]`, when `executable()` overrides the loaded file: the user's own name for the
+    /// program, which the loaded path would otherwise replace. `None`: `argv[0]` is `program`.
+    #[cfg(unix)]
+    pub(crate) arg0: Option<std::ffi::OsString>,
+    /// The arguments after `argv[0]`.
+    pub(crate) args: Vec<std::ffi::OsString>,
+    /// Windows: the command line after its first token, which std appends as it is.
+    #[cfg(windows)]
+    raw_args: Option<std::ffi::OsString>,
+    pub(crate) cwd: Option<std::path::PathBuf>,
+    /// The child enters `cwd` itself; see `crate::resolve::exact::Anchored::enter`.
+    #[cfg_attr(
+        target_os = "linux",
+        allow(dead_code, reason = "the Linux child enters every directory itself, asked or not")
+    )]
+    pub(crate) enter: bool,
+}
+
+impl Invocation {
+    /// The `std::process::Command` of this invocation, with no environment, directory or stdio set.
+    #[cfg(not(target_os = "linux"))]
+    fn std_command(&self) -> std::process::Command {
+        let mut c = std::process::Command::new(&self.program);
+        // POSIX: when executable() overrides the loaded file, preserve the user's argv[0] via arg0() —
+        // the executable as written when argv is empty. Without this, std would set argv[0] to the
+        // (possibly completed) program path, silently dropping the user's intended name.
+        #[cfg(unix)]
+        if let Some(arg0) = &self.arg0 {
+            use std::os::unix::process::CommandExt;
+            c.arg0(arg0);
+        }
+        c.args(&self.args);
+        #[cfg(windows)]
+        if let Some(raw) = &self.raw_args {
+            use std::os::windows::process::CommandExt;
+            c.raw_arg(raw); // args only — program is prepended by std
+        }
+        c
+    }
+}
+
+/// What `cmd` runs. Rejects .bat/.cmd (BatBadBut) on Windows, and an interior NUL everywhere: this is the
+/// std backend's only NUL check, and the default Windows path. Judged on the token WE resolved, not on
+/// `std_cmd.get_program()`: std's Unix constructor swaps a NUL-bearing program for a
+/// `<string-with-nul>` sentinel, so reading it back would hide the exact token the gate exists to judge
+/// (and would make this verdict differ by platform for reasons unrelated to Windows).
+pub(crate) fn invocation(cmd: &Command) -> Result<Invocation, Error> {
+    let invocation = match cmd.input() {
+        CommandInput::Empty => return Err(Error::Io(std::io::Error::other("no program specified"))),
+        CommandInput::Argv(argv) => {
+            let (Resolved { program, cwd, enter }, rest) = resolve_program_argv(cmd, argv)?;
+            Invocation {
+                program,
+                #[cfg(unix)]
+                arg0: cmd.executable_path().map(|exe| {
+                    argv.first()
+                        .map_or(exe.as_os_str(), std::ffi::OsString::as_os_str)
+                        .to_owned()
+                }),
+                args: rest.to_vec(),
+                #[cfg(windows)]
+                raw_args: None,
+                cwd,
+                enter,
+            }
+        }
+        CommandInput::CommandLine(line) => invocation_of_commandline(cmd, line)?,
+    };
+    reject_batch_path(std::path::Path::new(&invocation.program))?;
+    Ok(invocation)
 }
 
 #[cfg(unix)]
-fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<StdLaunch, Error> {
+fn invocation_of_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<Invocation, Error> {
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     let words = crate::quote::posix::split(line.as_bytes())?;
     // `OsStringExt::from_vec` already yields an OsString; do NOT wrap it in
     // `OsString::from(..)` (that is redundant and fails type inference).
-    let argv: Vec<OsString> = words.into_iter().map(OsString::from_vec).collect();
+    let mut argv: Vec<OsString> = words.into_iter().map(OsString::from_vec).collect();
     if argv.is_empty() {
         return Err(Error::Io(std::io::Error::other("empty command line")));
     }
     let Resolved { program, cwd, enter } = resolve_program(cmd, argv[0].clone())?;
-    let mut c = std::process::Command::new(&program);
     // When executable() overrides the loaded file, argv[0] from the command
-    // line is the user's intended name — preserve it via arg0().
-    if cmd.executable_path().is_some() {
-        use std::os::unix::process::CommandExt;
-        c.arg0(&argv[0]);
-    }
-    c.args(&argv[1..]);
-    Ok(StdLaunch {
+    // line is the user's intended name.
+    let arg0 = cmd.executable_path().map(|_| argv[0].clone());
+    let args = argv.split_off(1);
+    Ok(Invocation {
         program,
-        std_cmd: c,
+        arg0,
+        args,
         cwd,
         enter,
     })
 }
 
 #[cfg(windows)]
-fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<StdLaunch, Error> {
+fn invocation_of_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<Invocation, Error> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use std::os::windows::process::CommandExt;
     // Windows is command-line-native. CRITICAL: std::process always PREPENDS a
     // quoted form of the program to lpCommandLine and then appends raw_arg. So
     // raw_arg must be the ARGS portion only (the line MINUS its first token);
@@ -1452,17 +1487,16 @@ fn build_from_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result<St
     let wide: Vec<u16> = line.encode_wide().collect();
     let (first, rest) = crate::quote::windows::first_token_and_rest_wide(&wide)
         .ok_or_else(|| Error::Io(std::io::Error::other("empty command line")))?;
-    let program = std::ffi::OsString::from_wide(&first);
-    let mut c = std::process::Command::new(&program);
-    c.raw_arg(std::ffi::OsString::from_wide(&rest)); // args only — program is prepended by std
-    Ok(StdLaunch {
-        program,
-        std_cmd: c,
+    Ok(Invocation {
+        program: std::ffi::OsString::from_wide(&first),
+        args: Vec::new(),
+        raw_args: Some(std::ffi::OsString::from_wide(&rest)),
         cwd: cmd.cwd().map(std::path::Path::to_path_buf),
         enter: false,
     })
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn apply_env(std_cmd: &mut std::process::Command, ops: &[EnvOp]) {
     for op in ops {
         match op {
@@ -1550,10 +1584,46 @@ pub(crate) fn resolve_stdio(
     Ok((child_ends, parent_ends))
 }
 
+/// The fd map's mappings of the child ends above stdio: each `dup2`ed onto its number in the child.
+#[cfg(unix)]
+fn fd_mappings(child_ends: BTreeMap<Fd, ChildEnd>) -> Vec<fd_map::FdMapping> {
+    child_ends
+        .into_iter()
+        .map(|(fd, owned)| fd_map::FdMapping {
+            parent_fd: owned,
+            child_fd: fd.raw(),
+        })
+        .collect()
+}
+
+/// [`resolve_stdio`] for the Linux spawn ([`fork_spawn`]): the child's own steps `dup2` each end onto its
+/// number, 0/1/2 in a plan of their own that runs first, and each fd >= 3 end in the fd map, which runs last. Returns every parent end. The caller's `prepare` adds its
+/// steps after.
+#[cfg(target_os = "linux")]
+fn resolve_into_fork(
+    steps: &mut in_child::InChild,
+    fds: &BTreeMap<Fd, ResolvedStdio>,
+) -> Result<BTreeMap<Fd, ParentEnd>, Error> {
+    let (mut child_ends, parent_ends) = resolve_stdio(fds, ParentStd::read())?;
+    let stdio = [Fd::STDIN, Fd::STDOUT, Fd::STDERR]
+        .into_iter()
+        .map(|slot| fd_map::FdMapping {
+            parent_fd: child_ends
+                .remove(&slot)
+                .unwrap_or_else(|| unreachable!("resolve_stdio resolves 0/1/2 always")),
+            child_fd: slot.raw(),
+        })
+        .collect();
+    steps.map_stdio(fd_map::Plan::stdio(stdio));
+    fd_map::install(steps, fd_mappings(child_ends)).map_err(Error::Io)?;
+    Ok(parent_ends)
+}
+
 /// [`resolve_stdio`] for a spawn through `std::process::Command`: 0/1/2 go to `cmd` (std closes its
 /// copies at spawn), and on Unix each fd >= 3 child end goes to the fd map in `steps`, whose step
 /// `dup2`s it to its number after the fork. Returns every parent end. The caller registers the hook
 /// after `prepare` has added its steps.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn resolve_into_std(
     cmd: &mut std::process::Command,
     #[cfg(unix)] steps: &mut in_child::InChild,
@@ -1579,16 +1649,7 @@ pub(crate) fn resolve_into_std(
     // The step runs after every other, so it cannot replace a descriptor one still needs, and std
     // `dup2`s 0/1/2 before any `pre_exec` hook runs, so a mapping never clobbers stdio.
     #[cfg(unix)]
-    {
-        let mappings: Vec<fd_map::FdMapping> = child_ends
-            .into_iter()
-            .map(|(fd, owned)| fd_map::FdMapping {
-                parent_fd: owned,
-                child_fd: fd.raw(),
-            })
-            .collect();
-        fd_map::install(steps, mappings).map_err(Error::Io)?;
-    }
+    fd_map::install(steps, fd_mappings(child_ends)).map_err(Error::Io)?;
     #[cfg(not(unix))]
     debug_assert!(child_ends.is_empty(), "the std path on Windows has no fd >= 3 end");
     Ok(parent_ends)
@@ -2738,13 +2799,13 @@ pub(crate) use batch_gate::reject_batch_path;
 #[path = "spawn/fd_map.rs"]
 pub(crate) mod fd_map;
 
-// The one `pre_exec` hook that runs every in-child step of a spawn.
+// Every in-child step of a spawn: one `pre_exec` hook on macOS, the steps of the fork-exec core on Linux.
 #[cfg(unix)]
 #[path = "spawn/in_child.rs"]
 pub(crate) mod in_child;
 
-// The `pre_exec` fd-channel primitive of `pidfd_handshake` and, on macOS, `unique_report`.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+// macOS: the `pre_exec` fd-channel primitive of `unique_report`.
+#[cfg(target_os = "macos")]
 #[path = "spawn/fd_channel.rs"]
 pub(crate) mod fd_channel;
 
@@ -2753,14 +2814,14 @@ pub(crate) mod fd_channel;
 #[path = "spawn/fork_exec.rs"]
 pub(crate) mod fork_exec;
 
+// Linux: the ordinary spawn, on the fork-exec core.
+#[cfg(target_os = "linux")]
+#[path = "spawn/fork_spawn.rs"]
+mod fork_spawn;
+
 // A failed spawn's answer to whether the program could have started.
 #[path = "spawn/failure.rs"]
 pub(crate) mod failure;
-
-// Linux: holds a forked child before `exec` until the parent has its pidfd.
-#[cfg(target_os = "linux")]
-#[path = "spawn/pidfd_handshake.rs"]
-pub(crate) mod pidfd_handshake;
 
 // What a spawn is told about the teardowns of the child it makes.
 #[path = "spawn/policy.rs"]

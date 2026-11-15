@@ -5,7 +5,9 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::event::{PollFd, PollFlags};
 use rustix::process::{pidfd_send_signal, waitid, Signal, WaitId, WaitIdOptions};
 
-use super::{channel, spawn, Failure, Program, Progress, Record, SpawnError, Spawned, Status, StepFailure};
+use super::{
+    channel, spawn, Failure, Program, Progress, Record, RefusalKind, SpawnError, Spawned, Status, StepFailure,
+};
 use crate::child::spawn::spawn_lock;
 use crate::os_process::linux::fork::{
     clone_with_pidfd, fails_with, fallback, fork_with_pidfd, CloneKind, Fork, ForkFn, NewChild,
@@ -32,7 +34,7 @@ fn start(kind: CloneKind, fork: ForkFn, program: &Program, steps: Steps<'_>) -> 
     let _lock = spawn_lock();
     // SAFETY: this thread holds `spawn_lock`, and every `steps` of these tests makes raw system calls
     // only.
-    unsafe { spawn(kind, fork, program, steps, STEP_EXIT) }
+    unsafe { spawn(kind, fork, program, &[], &mut || steps(), STEP_EXIT) }
 }
 
 fn started(kind: CloneKind, program: &Program, steps: Steps<'_>) -> Spawned {
@@ -101,7 +103,7 @@ fn assert_nonblocking(status: &Status) {
 /// the ready record; the read end blocks.
 #[skuld::test]
 fn the_status_reads_records_in_order_and_a_failure_sticks() {
-    let (mut status, writer) = channel(CloneKind::Plain).expect("a channel");
+    let (mut status, writer) = channel(CloneKind::Plain, &[]).expect("a channel");
     assert_nonblocking(&status);
     assert_eq!(status.progress().unwrap(), Progress::Pending);
     write_record(&writer, Record::Ready);
@@ -112,7 +114,7 @@ fn the_status_reads_records_in_order_and_a_failure_sticks() {
     assert_eq!(status.progress().unwrap(), failed);
     assert_eq!(status.progress().unwrap(), failed, "a failure is the answer for good");
 
-    let (mut status, writer) = channel(CloneKind::Plain).expect("a channel");
+    let (mut status, writer) = channel(CloneKind::Plain, &[]).expect("a channel");
     write_record(&writer, Record::Ready);
     write_record(
         &writer,
@@ -130,10 +132,10 @@ fn the_status_reads_records_in_order_and_a_failure_sticks() {
         "both records are in the pipe: the failure is the answer"
     );
 
-    let (mut status, writer) = channel(CloneKind::Plain).expect("a channel");
+    let (mut status, writer) = channel(CloneKind::Plain, &[]).expect("a channel");
     drop(writer);
     assert_eq!(status.progress().unwrap(), Progress::Ended { ready: false });
-    let (mut status, writer) = channel(CloneKind::Plain).expect("a channel");
+    let (mut status, writer) = channel(CloneKind::Plain, &[]).expect("a channel");
     write_record(&writer, Record::Ready);
     drop(writer);
     assert_eq!(status.progress().unwrap(), Progress::Ended { ready: true });
@@ -142,7 +144,7 @@ fn the_status_reads_records_in_order_and_a_failure_sticks() {
 /// `garbage` written to a channel is a bug in debug builds and an error without them, and the channel
 /// is unusable for good: a whole record written after it is not decoded.
 fn assert_garbage_ends_the_channel(garbage: &[u8]) {
-    let (mut status, writer) = channel(CloneKind::Plain).expect("a channel");
+    let (mut status, writer) = channel(CloneKind::Plain, &[]).expect("a channel");
     rustix::io::write(&writer, garbage).unwrap();
     let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| status.progress()));
     if cfg!(debug_assertions) {
@@ -417,7 +419,7 @@ fn a_clone_refused_on_both_paths_is_unsupported() {
     for kind in [CloneKind::Vfork, CloneKind::Plain] {
         let refused = start(kind, both_refused, &program, &|| Ok(())).err();
         assert!(
-            matches!(refused, Some(SpawnError::Unsupported(libc::EPERM))),
+            matches!(refused, Some(SpawnError::Unsupported(RefusalKind::Eperm))),
             "{kind:?}: {refused:?}"
         );
         let other = start(kind, eagain, &program, &|| Ok(())).err();
@@ -661,8 +663,20 @@ fn a_ready_record_that_cannot_be_written_stops_the_child_before_its_exec() {
         &[],
     );
     let mut spawned = started(CloneKind::Plain, &ran, &|| {
-        // SAFETY: a raw `close_range` of every descriptor above stdio.
-        unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) };
+        // SAFETY: a raw `close_range` of every descriptor above stdio; where the kernel has none (it is
+        // Linux 5.9, above the floor), a `close` of every number below the descriptor limit.
+        unsafe {
+            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) == -1 {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+                for fd in 3..limit.rlim_cur.min(libc::c_int::MAX as u64) as libc::c_int {
+                    libc::close(fd);
+                }
+            }
+        }
         Ok(())
     });
     assert_eq!(exit_status(&spawned.child), STEP_EXIT);

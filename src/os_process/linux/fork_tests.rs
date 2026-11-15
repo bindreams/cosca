@@ -136,3 +136,13 @@ fn another_errno_of_the_first_clone_does_not_fall_back() {
     let answer = fork_exiting(eagain_then_clone, CloneKind::Plain, 12);
     assert_eq!(answer.err(), Some(libc::EAGAIN));
 }
+
+/// A kernel before 5.2 runs `clone` with `CLONE_PIDFD` ignored: the call returns the child's pid and
+/// stores no descriptor. That is a refusal (`ENOSYS`), not a panic, and nothing is closed.
+///
+/// Mutant: the missing descriptor is wrapped as an `OwnedFd` (a panic, or a close of `-1`).
+#[skuld::test]
+fn a_clone_that_stored_no_pidfd_is_a_refusal() {
+    let answer = super::after_clone(4_000_000, -1, Path::Clone);
+    assert_eq!(answer.err(), Some(libc::ENOSYS));
+}

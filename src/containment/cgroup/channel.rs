@@ -27,8 +27,8 @@ const PROCEED: u8 = b'P';
 /// The channel of the placement exchange (see the module's contract): a `SOCK_SEQPACKET` socket
 /// pair. The child sends two messages of two native-endian `i32`s — its *intent* (with its pid),
 /// then its *report* (the write's errno or [`REPORT_PLACED`]). The parent may send one byte back:
-/// *proceed*. The child names itself to the parent's teardown by pid alone: the spawn handshake's
-/// pidfd, which the parent holds before the child sends anything, is the handle.
+/// *proceed*. The child names itself to the parent's teardown by pid alone: the pidfd the spawn's
+/// clone gave the parent, which it holds before the child sends anything, is the handle.
 ///
 /// `pre_exec` runs after `fork`, where async-signal-safety forbids allocating, formatting or
 /// locking, and nothing the child computes survives its `exec`. A `sendmsg(2)` from a buffer on
@@ -36,15 +36,12 @@ const PROCEED: u8 = b'P';
 /// listening makes it fail with `EPIPE` instead of killing the child with `SIGPIPE`.
 ///
 /// # When the report is final
-/// Not when `spawn` returns. `std`'s Unix spawn returns once its own close-on-exec error channel
-/// reads EOF, normally at the child's `exec`. But that channel takes the lowest free fds: with two
-/// of this process's 0, 1 and 2 closed, its child end is one of them. When `std` `dup2`s the
-/// child's stdio for that slot into place, before any `pre_exec` runs, it closes that end, and
-/// `spawn` returns before the child has placed itself.
+/// The spawn's clone suspends the parent until the child's `exec` or exit, so the report is queued
+/// by the time `spawn` returns.
 ///
-/// [`ReportChannel::wait`] therefore waits for the child itself: for the report, or for the
-/// child's exit, watched through the child's own pidfd, which it handed over at the spawn handshake
-/// from before `exec`. That pidfd names the child whoever reaps it and whoever takes its number: a
+/// [`ReportChannel::wait`] waits for the child itself: for the report, or for the child's exit,
+/// watched through the child's own pidfd, which the clone gave the parent from the child's first
+/// instant. That pidfd names the child whoever reaps it and whoever takes its number: a
 /// reaped child's pidfd is readable, so the wait ends. The report is always sent before `exec`, so
 /// a child that exits without one never exec'd, so nothing of its is in the leaf, and
 /// `NotReported` says so. The channel's EOF is no substitute for the pidfd: every process this one
@@ -55,8 +52,8 @@ const PROCEED: u8 = b'P';
 /// later `dup2` is fd_map's mapping of fds 3 and up, whose hook the spawn registers after the
 /// placement hook: it can replace the child's end only once the report is sent.
 ///
-/// The wait is no longer than the one `std` intends: the child reaches its report on `std`'s own
-/// path from `fork` to `exec`, all of which `spawn` normally waits out.
+/// The wait is no longer than the spawn's: the child reaches its report on its way from the clone
+/// to `exec`, all of which the clone's parent waits out.
 ///
 /// **One child per channel.** A caller that routes several children through one channel reads
 /// the last intent and the first report sent, whoever sent them.
@@ -176,6 +173,13 @@ impl ReportChannel {
                 return self.received.placement();
             }
         }
+    }
+
+    /// The child's report, from what is queued, without waiting: `None` while it has sent none. Final only
+    /// once the child has ended or exec'd, which the spawn's clone has waited for.
+    pub(crate) fn reported(&mut self) -> Option<PlacementReport> {
+        self.drain();
+        self.received.report
     }
 
     /// Read every message queued, without blocking, into what was received. `true` once the

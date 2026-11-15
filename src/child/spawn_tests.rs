@@ -263,7 +263,7 @@ fn attach_failure_reaps_the_spawned_child() {
 }
 
 /// A failed spawn whose teardown kill is refused (as a setuid-root child refuses it) hands the child
-/// back in the error, running, at both arms after the handshake: the identity read (which read none)
+/// back in the error, running, at both arms after the spawn: the identity read (which read none)
 /// and the attach (which read one). The warn says the child is handed back.
 ///
 /// The child is a setuid-root helper that is fully root once it has written its ready byte, which
@@ -446,30 +446,6 @@ fn a_spawn_hands_its_kernel_to_the_boxes_it_makes_and_keeps_nothing_after() {
             "no box or leaf of the spawn outlives its child (raw backend: {raw})"
         );
     }
-}
-
-/// The spawn's pre-fork probe of `pidfd_open` asks the kernel the spawn was started with: a refusal
-/// stated for this process's own pid fails the spawn before a child is made, which the host, that
-/// answers the probe, would not.
-///
-/// Mutant: the spawn probes through a host kernel, so the spawn succeeds.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_spawn_probes_pidfd_support_through_the_kernel_it_was_given() {
-    use crate::identity::{FakeKernel, HostKernel};
-
-    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(std::process::id(), Err(rustix::io::Errno::MFILE));
-    let mut c = crate::test_child::command(Console::Hidden);
-    c.args(["true"]);
-    let failure = match super::spawn_with(&mut c, kernel) {
-        Ok(child) => {
-            child.wait().expect("reap the child");
-            panic!("a refused probe fails the spawn");
-        }
-        Err(failure) => failure,
-    };
-    let err = failure.expect_not_started();
-    assert_eq!(crate::error::first_os_code(&err), Some(libc::EMFILE), "{err:?}");
 }
 
 #[skuld::test]
@@ -1676,22 +1652,6 @@ fn an_elevation_refused_for_its_shape_did_not_start() {
     cmd.fd(3, crate::stdio::Stdio::null()).expect("fd 3");
     let err = expect_not_started(cmd.spawn().expect_err("fd >= 3 is refused under elevation"));
     assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
-}
-
-/// Linux: a pidfd handshake whose channel cannot be made fails before the fork.
-///
-/// Mutant: the handshake's `open` answers that the program may have started.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_handshake_that_cannot_open_did_not_start() {
-    let _armed = super::pidfd_handshake::fault::fail_done_fd(rustix::io::Errno::MFILE);
-    let mut cmd = crate::test_child::command(Console::Hidden);
-    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    let err = expect_not_started(cmd.spawn().expect_err("a failed open fails the spawn"));
-    assert_eq!(
-        crate::error::said(&err),
-        crate::error::io_said(format!("eventfd: {}", std::io::Error::from_raw_os_error(libc::EMFILE)))
-    );
 }
 
 // One OS situation, one fate =====

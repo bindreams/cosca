@@ -50,8 +50,8 @@ something it killed warn once past 1 s, as the drop's does, each naming what it 
   (`abandon_late_child` in [`late_child.rs`](../src/child/spawn/late_child.rs), which waits for the
   root to exit before the second sweep of its tree, then settles the reap as every failed spawn's
   teardown does);
-- on Linux, the waits for a child it killed in the pidfd handshake
-  ([`conclude`](../src/child/spawn/pidfd_handshake.rs) and `await_unexecuted_exit`);
+- on Linux, the wait for a child it killed that its status channel showed never ran the program
+  ([`conclude`](../src/child/spawn/fork_spawn.rs));
 - on Linux, the wait for an elevation front its leaf's kill ended, in the teardown after the handle
   exists (`tear_down_held` in [`held_teardown.rs`](../src/child/spawn/held_teardown.rs));
 - on Linux, the wait for a cgroup leaf's drain, in the leaf's `Drop`, in `finish_elevated`'s
@@ -199,11 +199,13 @@ process:
   only a process-group kill stays inexact;
 - on Windows, a process handle or Job Object.
 
-On Linux cosca requires a pidfd for every child it spawns. When `pidfd_open` is refused (a kernel
-before 5.3, or a seccomp profile that blocks it), spawn fails with `Error::Unsupported`, and cosca
-itself never reaps by pid on Linux. The Linux spawn core (`child::spawn::fork_exec`) takes the pidfd
-from the clone itself, and answers `Unsupported` when both `clone3` and `clone(CLONE_PIDFD)` are
-refused. macOS has no pidfd, so it reaps by pid, only while the process is an unreaped child. A
+On Linux cosca requires a pidfd for every child it spawns, and itself never reaps by pid. Every
+Linux spawn goes through the spawn core (`child::spawn::fork_exec`), which takes the pidfd from the
+clone itself, and answers `Error::Unsupported` when both `clone3` and `clone(CLONE_PIDFD)` are
+refused (`ENOSYS` or `EPERM`, a kernel before 5.3 or a seccomp profile that blocks them). On a
+kernel before 5.2 the legacy `clone` ignores `CLONE_PIDFD` and makes a child with no pidfd: the spawn
+is the same `Unsupported`, and the child is left, because cosca never reaps by pid; such kernels are
+below the 5.6 floor. macOS has no pidfd, so it reaps by pid, only while the process is an unreaped child. A
 macOS `Drop` that cannot confirm its child is ours leaks the child with a
 `warn` naming the pid; it never reaps on a guess.
 

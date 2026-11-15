@@ -731,7 +731,7 @@ fn a_posix_host_runs_its_own_executable_named_bat() {
 
 /// The std backend is the DEFAULT Windows path: `args([..])` with no `executable()` and no
 /// fd >= 3 is false for `routes_to_raw_backend`, so it reaches the gate through
-/// [`crate::child::spawn::build_std_command`] with no NUL check of its own.
+/// [`crate::child::spawn::invocation`] (which `build_std_command` asks) with no NUL check of its own.
 ///
 /// Host-independent on purpose: what it pins is that the gate judges the token the CALLER named.
 ///
@@ -743,7 +743,7 @@ fn the_std_backend_judges_the_program_token_the_caller_named() {
     let mut c = crate::test_child::command(Console::Hidden);
     c.args([with_interior_nul(r"C:\tools\setup.bat", "junk")]);
     // An `Ok`, or the `Unsupported` batch refusal, panics in the helper.
-    let msg = invalid_input_message(crate::child::spawn::build_std_command(&c));
+    let msg = invalid_input_message(crate::child::spawn::invocation(&c).map(|_| ()));
     assert!(
         !msg.contains('\0'),
         "the refusal must not carry a raw NUL into logs: {msg:?}"
@@ -762,7 +762,7 @@ fn the_std_backend_judges_the_program_token_the_caller_named() {
 fn the_std_backend_does_not_blame_the_batch_vector_for_a_truncated_prefix() {
     let mut c = crate::test_child::command(Console::Hidden);
     c.args([with_interior_nul(r"C:\tools\setup", ".bat")]);
-    invalid_input_message(crate::child::spawn::build_std_command(&c));
+    invalid_input_message(crate::child::spawn::invocation(&c).map(|_| ()));
 }
 
 /// THE PLATFORM WIRING, on the spellings only the Win32 branch reaches.

@@ -259,7 +259,7 @@ fn a_linux_child_owns_and_lends_the_kernel_it_was_built_with() {
     assert_eq!(Arc::strong_count(&kernel), 1, "dropping the box releases the kernel");
 }
 
-/// A child whose pid is unknown (its spawn failed after the handshake opened its pidfd) is signalled
+/// A child whose pid is unknown (a box built over its pidfd alone) is signalled
 /// and reaped through the pidfd alone.
 ///
 /// Mutant: a pid is required to signal or to settle the child.

@@ -289,8 +289,8 @@ impl Child {
     /// The pid the child had at spawn. A number only: it does not say the process still holds it
     /// (an identity is [`id`](Self::id)).
     ///
-    /// The handle's pid is an `Option` because a handle exists pid-less before the spawn handshake;
-    /// a `Child` always has one, asserted in `from_parts`.
+    /// The handle's pid is an `Option` because a handle may exist pid-less (a box built over a
+    /// pidfd alone); a `Child` always has one, asserted in `from_parts`.
     pub fn pid(&self) -> u32 {
         self.proc
             .pid()
@@ -1233,6 +1233,12 @@ fn take_reader(pipes: &mut BTreeMap<Fd, ParentEnd>, fd: Fd) -> Option<PipeReader
 
 impl Command {
     /// Spawn the configured command.
+    ///
+    /// # Linux
+    ///
+    /// The child starts with `SIGPIPE` at its default, as std's does. A binary built with nightly
+    /// `-Zon-broken-pipe=error` or `=inherit` still gets that here, where std would pass the parent's
+    /// disposition.
     ///
     /// # Errors
     ///

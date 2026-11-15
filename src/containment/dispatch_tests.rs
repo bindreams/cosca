@@ -2788,9 +2788,7 @@ fn prepare_creates_the_leaf_with_its_spawns_warn_threshold(#[fixture(cgroup)] _g
     use crate::containment::{ContainMode, ContainRequest, Nesting};
 
     let threshold = std::time::Duration::from_millis(1234);
-    let mut cmd = std::process::Command::new("true");
     let prepared = super::prepare(
-        &mut cmd,
         &mut crate::child::spawn::in_child::InChild::default(),
         &ContainRequest {
             mode: Some(ContainMode::Strongest),

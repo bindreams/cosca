@@ -23,7 +23,7 @@ pub(crate) type OsHandle<'a> = BorrowedHandle<'a>;
 /// says now.
 pub(crate) trait OsChild: OsProcess {
     /// The child's pid, for messages. `None`: the spawn never learned it (a Linux child whose spawn
-    /// failed after the handshake opened its pidfd); acts go by the handle either way.
+    /// failed after its clone gave the pidfd); acts go by the handle either way.
     fn pid(&self) -> Option<u32>;
 
     /// What a kill through this handle may be refused for, as whatever built the handle knows it.
@@ -279,7 +279,8 @@ pub(crate) fn adopt_pidfd<K: crate::identity::Kernel + Send + 'static>(
 ) -> Result<Box<dyn OsChild>, Error> {
     use std::os::fd::AsFd as _;
 
-    use crate::wait::exit_only::{peek, Target};
+    use crate::wait::exit_only::linux::peek;
+    use crate::wait::exit_only::Target;
 
     let target = rustix::process::Pid::from_raw(id.pid() as i32).expect("a spawned child's pid is never 0");
     let pidfd = kernel

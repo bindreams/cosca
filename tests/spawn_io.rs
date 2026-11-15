@@ -1771,16 +1771,15 @@ fn unified_cgroup(proc_cgroup: &str) -> &str {
 /// stdio onto 0/1/2 before any `pre_exec` runs. So with slots closed at spawn time:
 /// - a `cgroup.procs` fd opened in a gap would be replaced by the child's stdio, and the placement
 ///   write would land in the user's file and report a placement that never happened;
-/// - with two or more closed, `std`'s own error channel lands its child end on one of them, the
-///   child's stdio closes it, and `spawn` returns before the child has placed itself. Reading the
-///   report then would miss the placement, degrade to a process group, and leave the child in a
-///   leaf nothing kills through.
+/// - with two or more closed, a status channel at the lowest free numbers would land on one of them
+///   and the child's stdio would close it. The spawn's channel and pidfd are moved above stdio
+///   (`above_stdio`), and the clone suspends the parent until the child has placed itself, so the
+///   report is read after the placement.
 ///
 /// A `Stdio::from_file` end is a dup numbered 3 or above, so it does not fill a gap first.
 ///
-/// Every case also runs with `pidfd_open` denied by a seccomp filter. Linux needs a pidfd for
-/// every child, so the spawn must fail with `Unsupported`, naming the adoption, and leave no leaf
-/// behind.
+/// Every case also runs with the clone that gives the pidfd denied by a seccomp filter. Linux needs a
+/// pidfd for every child, so the spawn must fail with `Unsupported` and leave no leaf behind.
 ///
 /// Each case runs in a fresh copy of this test binary running only this test
 /// (`test_own_process::run`): a closed 0, 1 or 2 is process-wide, so in a binary with other tests
@@ -1823,16 +1822,16 @@ fn linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child(#[f
 #[cfg(target_os = "linux")]
 const CLOSED_SLOTS_ENV: &str = "COSCA_TESTCFG_CLOSED_SLOTS";
 
-/// Set to deny `pidfd_open` in one case of
+/// Set to deny the pidfd's clone in one case of
 /// [`linux_cgroup_v2_closed_stdio_slots_cannot_misplace_or_misreport_the_child`].
 #[cfg(target_os = "linux")]
 const DENY_PIDFD_ENV: &str = "COSCA_TESTCFG_DENY_PIDFD";
 
-/// Make `pidfd_open` fail with `EPERM` on the calling thread and every process it forks, as a
-/// seccomp-filtered container does.
+/// Make a clone that asks for a pidfd fail with `EPERM` on the calling thread and every process it
+/// forks, as a seccomp-filtered container does.
 #[cfg(target_os = "linux")]
-fn deny_pidfd_open_on_this_thread() {
-    common::seccomp::deny_pidfd_open_on_this_thread(libc::EPERM);
+fn deny_pidfd_clones_on_this_thread() {
+    common::seccomp::deny_pidfd_clones_on_this_thread(libc::ENOSYS, Some(libc::EPERM));
 }
 
 #[cfg(target_os = "linux")]
@@ -1916,12 +1915,12 @@ fn spawn_with_slots_closed(done: &common::test_own_process::Completion, slots: &
     cmd.contain();
 
     // The spawn runs on a thread of its own: a seccomp filter is per thread, so this one keeps
-    // the `pidfd_open` it needs to watch the child below.
+    // the clone it needs to start the helpers below.
     let spawned = std::thread::scope(|scope| {
         scope
             .spawn(|| {
                 if deny_pidfd {
-                    deny_pidfd_open_on_this_thread();
+                    deny_pidfd_clones_on_this_thread();
                 }
                 spawn_with_std_slots_closed(done, &mut cmd, slots)
             })

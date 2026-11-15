@@ -104,13 +104,13 @@ fn deny_syscall_on_this_thread(nr: libc::c_long, errno: i32) {
     }
 }
 
-/// [`deny_pidfd_open_on_this_thread`], and also make every fork of a new process fail with
-/// `EAGAIN` on the calling thread: `fork`/`vfork` where they exist, `clone` without
-/// `CLONE_THREAD`, and `clone3` with `ENOSYS` so libc falls back to `clone` (threads still start).
-/// A spawn that reaches the fork under this filter fails with `Io`, not `Unsupported`, so it
-/// proves a refusal was found BEFORE the fork.
-pub fn deny_pidfd_open_and_forks_on_this_thread(errno: i32) {
-    const CLONE_THREAD: u32 = 0x0001_0000;
+/// Make `clone3` fail with `clone3_errno`, and every `clone` that asks for a pidfd (`CLONE_PIDFD`)
+/// fail with `clone_errno` (`None`: such a `clone` is allowed), on the calling thread and every
+/// process it forks. With `clone3_errno` `ENOSYS`, libc falls back to `clone` and threads still
+/// start. A spawn on this thread then finds `clone3` and `clone` answering as a seccomp-filtered
+/// container does.
+pub fn deny_pidfd_clones_on_this_thread(clone3_errno: i32, clone_errno: Option<i32>) {
+    const CLONE_PIDFD: u32 = 0x0000_1000;
     // `seccomp_data`: `nr` at offset 0, `args[0]` at offset 16.
     let load = |offset: u32| libc::sock_filter {
         code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
@@ -142,21 +142,11 @@ pub fn deny_pidfd_open_and_forks_on_this_thread(errno: i32) {
         &mut filter,
         &mut jumps,
         libc::BPF_JEQ,
-        libc::SYS_pidfd_open as u32,
-        "errno",
-    );
-    cond(
-        &mut filter,
-        &mut jumps,
-        libc::BPF_JEQ,
         libc::SYS_clone3 as u32,
-        "enosys",
+        "clone3",
     );
-    cond(&mut filter, &mut jumps, libc::BPF_JEQ, libc::SYS_clone as u32, "clone");
-    #[cfg(target_arch = "x86_64")]
-    {
-        cond(&mut filter, &mut jumps, libc::BPF_JEQ, libc::SYS_fork as u32, "eagain");
-        cond(&mut filter, &mut jumps, libc::BPF_JEQ, libc::SYS_vfork as u32, "eagain");
+    if clone_errno.is_some() {
+        cond(&mut filter, &mut jumps, libc::BPF_JEQ, libc::SYS_clone as u32, "clone");
     }
     // Nothing matched: allow.
     jumps.push((filter.len(), libc::BPF_JA, 0, "allow"));
@@ -166,20 +156,21 @@ pub fn deny_pidfd_open_and_forks_on_this_thread(errno: i32) {
         jf: 0,
         k: 0,
     });
-    targets.insert("errno", filter.len());
-    filter.push(ret(libc::SECCOMP_RET_ERRNO | errno as u32));
-    targets.insert("enosys", filter.len());
-    filter.push(ret(libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32));
-    targets.insert("eagain", filter.len());
-    filter.push(ret(libc::SECCOMP_RET_ERRNO | libc::EAGAIN as u32));
-    // `clone` is allowed only as a thread.
-    targets.insert("clone", filter.len());
-    filter.push(load(16));
-    cond(&mut filter, &mut jumps, libc::BPF_JSET, CLONE_THREAD, "allow");
-    filter.push(ret(libc::SECCOMP_RET_ERRNO | libc::EAGAIN as u32));
-    // Jumps only go forward, so the allow is last.
-    targets.insert("allow", filter.len());
-    filter.push(ret(libc::SECCOMP_RET_ALLOW));
+    targets.insert("clone3", filter.len());
+    filter.push(ret(libc::SECCOMP_RET_ERRNO | clone3_errno as u32));
+    if let Some(errno) = clone_errno {
+        // `clone` is refused only when it asks for a pidfd; the allow follows, for the jumps that need it.
+        targets.insert("clone", filter.len());
+        filter.push(load(16));
+        cond(&mut filter, &mut jumps, libc::BPF_JSET, CLONE_PIDFD, "errno");
+        targets.insert("allow", filter.len());
+        filter.push(ret(libc::SECCOMP_RET_ALLOW));
+        targets.insert("errno", filter.len());
+        filter.push(ret(libc::SECCOMP_RET_ERRNO | errno as u32));
+    } else {
+        targets.insert("allow", filter.len());
+        filter.push(ret(libc::SECCOMP_RET_ALLOW));
+    }
     for (at, op, k, on_true) in jumps {
         let distance = targets[on_true] - at - 1;
         filter[at] = if op == libc::BPF_JA {

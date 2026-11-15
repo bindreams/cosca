@@ -2,7 +2,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 use super::{drain_control, drained, Drained};
-use crate::child::spawn::fork_exec::{Failure, Progress, SpawnError, StepFailure};
+use crate::child::spawn::fork_exec::{Failure, Progress, RefusalKind, SpawnError, StepFailure};
 use crate::elevation::shim::protocol::{Errno, NotExecuted, Signal};
 use crate::elevation::shim::run::child::{died_before_exec, not_spawned};
 use crate::elevation::shim::run::log::Log;
@@ -121,7 +121,7 @@ fn a_child_that_died_before_exec_is_reported_by_how_it_died() {
 /// Mutants: `Unsupported` is reported as `ForkFailed`; `Pipe` as `ForkFailed`.
 #[skuld::test]
 fn a_spawn_that_made_no_child_reports_its_own_cause() {
-    let (unsupported, what, errno) = not_spawned(SpawnError::Unsupported(libc::EPERM));
+    let (unsupported, what, errno) = not_spawned(SpawnError::Unsupported(RefusalKind::Eperm));
     assert_eq!(unsupported, NotExecuted::Unsupported(Errno(libc::EPERM)));
     assert_eq!(
         (what, errno),
