@@ -5,7 +5,7 @@
 //! whose answers the stub states. The anchor row reads this live process; the `cfg(windows)` rows
 //! below run only on Windows, with their own short-lived children.
 
-use super::{descendants_with, Resolution, Walk};
+use super::{descendants_with, AnchorReads, Resolution, Walk};
 use crate::error::Error;
 use crate::identity::{Key, OrderKey, ProcessId, RawPid, UnknownCause};
 #[cfg(unix)]
@@ -155,7 +155,7 @@ fn recurses_into_deep_tree() {
         (300u32, ROOT_TOKEN + 2),
         (400u32, ROOT_TOKEN + 3),
     ]);
-    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens));
+    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens), &no_reads());
     assert_eq!(pids(got), [200, 300, 400]);
 }
 
@@ -167,7 +167,7 @@ fn reparented_orphan_is_missed() {
     // pid 1; its ppid no longer chains to the root, so the walk cannot reach it.
     let parents = [(300, 1)];
     let tokens = HashMap::from([(300u32, ROOT_TOKEN + 9)]);
-    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens));
+    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens), &no_reads());
     assert!(
         got.members.is_empty(),
         "reparented orphan is honestly missed (documented)"
@@ -182,7 +182,7 @@ fn root_is_never_included() {
     // root pid never appears in the descendant set even if such an edge exists.
     let parents = [(ROOT_PID, ROOT_PID), (200, ROOT_PID)];
     let tokens = HashMap::from([(ROOT_PID, ROOT_TOKEN), (200u32, ROOT_TOKEN + 1)]);
-    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens));
+    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens), &no_reads());
     assert_eq!(pids(got), [200], "root excluded; genuine child kept");
 }
 
@@ -194,7 +194,7 @@ fn duplicate_edge_yields_pid_once() {
     // (or later double-kill) the same process twice.
     let parents = [(200, ROOT_PID), (200, ROOT_PID)];
     let tokens = HashMap::from([(200u32, ROOT_TOKEN + 1)]);
-    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens));
+    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens), &no_reads());
     assert_eq!(pids(got), [200], "duplicate edge collapses to a single result");
 }
 
@@ -206,7 +206,7 @@ fn unresolvable_candidate_is_skipped() {
     // snapshot and resolve); it is dropped along with anything under it.
     let parents = [(200, ROOT_PID), (300, 200)];
     let tokens = HashMap::from([(300u32, ROOT_TOKEN + 5)]); // 200 missing
-    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens));
+    let got = descendants_with(root(), root_bound(), &parents, resolver(&tokens), &no_reads());
     assert!(got.members.is_empty(), "gone candidate and its subtree are skipped");
     assert!(got.unassessed.is_empty(), "a gone candidate is not unassessed");
 }
@@ -219,13 +219,19 @@ fn an_unreadable_candidate_and_its_subtree_are_out_of_the_walk_and_it_is_unasses
     let parents = [(200, ROOT_PID), (300, 200), (400, ROOT_PID)];
     let tokens = HashMap::from([(300u32, ROOT_TOKEN + 5), (400u32, ROOT_TOKEN + 6)]);
     let read = resolver(&tokens);
-    let got = descendants_with(root(), root_bound(), &parents, |pid, parent, bound| {
-        if pid == 200 {
-            Err(unreadable(200))
-        } else {
-            read(pid, parent, bound)
-        }
-    });
+    let got = descendants_with(
+        root(),
+        root_bound(),
+        &parents,
+        |pid, parent, bound| {
+            if pid == 200 {
+                Err(unreadable(200))
+            } else {
+                read(pid, parent, bound)
+            }
+        },
+        &no_reads(),
+    );
     assert_eq!(unassessed(&got), [200]);
     assert!(matches!(&got.unassessed[0].1, Error::Unassessable { detail, .. } if detail.contains("pid 200")));
     assert_eq!(pids(got), [400]);
@@ -246,12 +252,18 @@ fn complete_members_keeps_every_unassessed_candidate_as_a_cause_in_order() {
         300 => 3,
         _ => 5,
     };
-    let got = descendants_with(root(), root_bound(), &parents, |pid, _, _| {
-        Err(Error::Unassessable {
-            detail: format!("cause of {pid}"),
-            source: Some(Error::io_cause(std::io::Error::from_raw_os_error(os_code(pid)))),
-        })
-    });
+    let got = descendants_with(
+        root(),
+        root_bound(),
+        &parents,
+        |pid, _, _| {
+            Err(Error::Unassessable {
+                detail: format!("cause of {pid}"),
+                source: Some(Error::io_cause(std::io::Error::from_raw_os_error(os_code(pid)))),
+            })
+        },
+        &no_reads(),
+    );
     let order: Vec<RawPid> = got.unassessed.iter().map(|(pid, _)| *pid).collect();
     let error = got.complete_members().expect_err("three candidates were not assessed");
 
@@ -290,17 +302,23 @@ fn complete_members_keeps_every_unassessed_candidate_as_a_cause_in_order() {
 #[skuld::test]
 fn complete_members_keeps_every_candidate_below_an_unassessable_when_the_first_is_an_io_error() {
     let parents = [(200, ROOT_PID), (300, ROOT_PID)];
-    let got = descendants_with(root(), root_bound(), &parents, |pid, _, _| {
-        let code = if pid == 200 { 2 } else { 3 };
-        Err(if pid == 200 {
-            Error::Io(std::io::Error::from_raw_os_error(code))
-        } else {
-            Error::Unassessable {
-                detail: "the second".to_owned(),
-                source: Some(Error::io_cause(std::io::Error::from_raw_os_error(code))),
-            }
-        })
-    });
+    let got = descendants_with(
+        root(),
+        root_bound(),
+        &parents,
+        |pid, _, _| {
+            let code = if pid == 200 { 2 } else { 3 };
+            Err(if pid == 200 {
+                Error::Io(std::io::Error::from_raw_os_error(code))
+            } else {
+                Error::Unassessable {
+                    detail: "the second".to_owned(),
+                    source: Some(Error::io_cause(std::io::Error::from_raw_os_error(code))),
+                }
+            })
+        },
+        &no_reads(),
+    );
     let order: Vec<RawPid> = got.unassessed.iter().map(|(pid, _)| *pid).collect();
     assert_eq!(order, [200, 300]);
 
@@ -326,7 +344,13 @@ fn complete_members_keeps_every_candidate_below_an_unassessable_when_the_first_i
 #[skuld::test]
 fn a_duplicate_edge_to_an_unreadable_candidate_is_one_unassessed_entry() {
     let parents = [(200, ROOT_PID), (200, ROOT_PID)];
-    let got = descendants_with(root(), root_bound(), &parents, |pid, _, _| Err(unreadable(pid)));
+    let got = descendants_with(
+        root(),
+        root_bound(),
+        &parents,
+        |pid, _, _| Err(unreadable(pid)),
+        &no_reads(),
+    );
     assert_eq!(unassessed(&got), [200]);
     assert!(got.members.is_empty());
 }
@@ -349,8 +373,8 @@ fn only_a_gone_candidate_is_logged_as_gone_or_an_impostor() {
         }
     };
     let mark = crate::log_capture::mark();
-    descendants_with(root(), root_bound(), &parents, resolve);
-    children_of_with(root(), root_bound(), &parents, resolve);
+    descendants_with(root(), root_bound(), &parents, resolve, &no_reads());
+    children_of_with(root(), root_bound(), &parents, resolve, &no_reads());
     assert!(crate::log_capture::contains_since(
         mark,
         &format!("pid {GONE} gone, or an impostor")
@@ -367,13 +391,19 @@ fn an_unreadable_direct_child_is_unassessed_in_the_one_level_filter_too() {
     let parents = [(200, ROOT_PID), (200, ROOT_PID), (300, ROOT_PID), (400, 200)];
     let tokens = HashMap::from([(300u32, ROOT_TOKEN + 5)]);
     let read = resolver(&tokens);
-    let got = children_of_with(root(), root_bound(), &parents, |pid, parent, bound| {
-        if pid == 200 {
-            Err(unreadable(200))
-        } else {
-            read(pid, parent, bound)
-        }
-    });
+    let got = children_of_with(
+        root(),
+        root_bound(),
+        &parents,
+        |pid, parent, bound| {
+            if pid == 200 {
+                Err(unreadable(200))
+            } else {
+                read(pid, parent, bound)
+            }
+        },
+        &no_reads(),
+    );
     assert_eq!(unassessed(&got), [200]);
     assert_eq!(pids(got), [300]);
 }
@@ -396,11 +426,11 @@ fn a_duplicate_edge_is_resolved_once_in_both_filters() {
             Err(unreadable(pid))
         }
     };
-    let got = children_of_with(root(), root_bound(), &parents, first_reads_second_does_not);
+    let got = children_of_with(root(), root_bound(), &parents, first_reads_second_does_not, &no_reads());
     assert_eq!((pids(got), reads.get()), (vec![200], 1), "one level");
 
     reads.set(0);
-    let got = descendants_with(root(), root_bound(), &parents, first_reads_second_does_not);
+    let got = descendants_with(root(), root_bound(), &parents, first_reads_second_does_not, &no_reads());
     assert!(got.unassessed.is_empty(), "{:?}", got.unassessed);
     assert_eq!((pids(got), reads.get()), (vec![200], 1), "whole subtree");
 }
@@ -415,7 +445,7 @@ fn children_of_keeps_one_level_genuine_children_only() {
     let root = id(100, 50);
     let parents = [(101, 100), (102, 101), (103, 100)];
     let tokens = HashMap::from([(101u32, 60), (102u32, 70)]);
-    let got = children_of_with(root, bound_of(50), &parents, resolver(&tokens));
+    let got = children_of_with(root, bound_of(50), &parents, resolver(&tokens), &no_reads());
     assert!(got.unassessed.is_empty());
     assert_eq!(pids(got), [101]);
 }
@@ -431,7 +461,13 @@ fn children_of_duplicate_edge_yields_pid_once() {
     let parents = [(101, 100), (101, 100)];
     let tokens = HashMap::from([(101u32, ROOT_TOKEN + 1)]);
     assert_eq!(
-        pids(children_of_with(root, root_bound(), &parents, resolver(&tokens))),
+        pids(children_of_with(
+            root,
+            root_bound(),
+            &parents,
+            resolver(&tokens),
+            &no_reads()
+        )),
         [101],
         "duplicate edge collapses to a single child"
     );
@@ -454,7 +490,7 @@ fn the_resolver_is_asked_for_each_candidates_accepted_parent() {
         Ok(Some(resolved(pid, ROOT_TOKEN + 1)))
     };
     let parents = [(200, ROOT_PID), (300, 200)];
-    descendants_with(root(), root_bound(), &parents, resolve);
+    descendants_with(root(), root_bound(), &parents, resolve, &no_reads());
     assert_eq!(
         asked.take(),
         [
@@ -463,7 +499,7 @@ fn the_resolver_is_asked_for_each_candidates_accepted_parent() {
         ]
     );
 
-    children_of_with(root(), root_bound(), &parents, resolve);
+    children_of_with(root(), root_bound(), &parents, resolve, &no_reads());
     assert_eq!(asked.take(), [(200, root(), root_bound())]);
 }
 
@@ -483,10 +519,371 @@ fn the_bound_is_the_roots_bound_not_its_id_token() {
         Ok(None)
     };
     for bound in [bound_of(ROOT_TOKEN - 500), None] {
-        descendants_with(root(), bound, &parents, resolve);
+        descendants_with(root(), bound, &parents, resolve, &no_reads());
         assert_eq!(asked.take(), [(200, bound)], "descendants_with");
-        children_of_with(root(), bound, &parents, resolve);
+        children_of_with(root(), bound, &parents, resolve, &no_reads());
         assert_eq!(asked.take(), [(200, bound)], "children_of_with");
+    }
+}
+
+// The anchor-row rule for a candidate that cannot be read =====
+
+/// The walk's only unreadable candidate in the rows below, and a pid that is no member's child.
+const UNREADABLE_PID: RawPid = 200;
+const OUTSIDER_PID: RawPid = 4;
+
+/// Run `body` with the anchor reads of stated tables: `keys` the key of each pid that can be opened
+/// (a pid absent from it cannot be), `creators` the `(parent pid, creator pid)` its handle names (a
+/// parent absent from it cannot be read).
+fn with_reads<R>(keys: &[(RawPid, u64)], creators: &[(RawPid, RawPid)], body: impl FnOnce(&AnchorReads<'_>) -> R) -> R {
+    with_counted_reads(keys, creators, body).0
+}
+
+/// [`with_reads`], and how many reads `body` made.
+fn with_counted_reads<R>(
+    keys: &[(RawPid, u64)],
+    creators: &[(RawPid, RawPid)],
+    body: impl FnOnce(&AnchorReads<'_>) -> R,
+) -> (R, usize) {
+    let keys: HashMap<RawPid, u64> = keys.iter().copied().collect();
+    let creators: HashMap<RawPid, RawPid> = creators.iter().copied().collect();
+    let reads = std::cell::Cell::new(0);
+    let key_of = |pid: RawPid| {
+        reads.set(reads.get() + 1);
+        keys.get(&pid).map(|&key| OrderKey::for_test(key))
+    };
+    let creator_of = |parent: ProcessId| {
+        reads.set(reads.get() + 1);
+        creators.get(&parent.pid()).copied()
+    };
+    let got = body(&AnchorReads {
+        key_of: &key_of,
+        creator_of: &creator_of,
+    });
+    (got, reads.get())
+}
+
+/// A resolver that cannot read [`UNREADABLE_PID`] and finds every other pid created just after the root.
+fn unreadable_200(pid: RawPid, _parent: ProcessId, _bound: Option<OrderKey>) -> Resolution {
+    if pid == UNREADABLE_PID {
+        Err(unreadable(pid))
+    } else {
+        Ok(Some(resolved(pid, ROOT_TOKEN + 1)))
+    }
+}
+
+/// The unreadable candidate's fate in both filters, given a root of key `root_key`, `rows` as the
+/// listing's order, the keys of the pids that can be opened and the root's creator, when its handle
+/// reads one: `(members, unassessed)` of each.
+fn walk_unreadable(
+    root_key: u64,
+    rows: &[(RawPid, RawPid)],
+    keys: &[(RawPid, u64)],
+    root_creator: Option<RawPid>,
+) -> [(Vec<RawPid>, Vec<RawPid>); 2] {
+    let root = id(ROOT_PID, root_key);
+    let creators: Vec<(RawPid, RawPid)> = root_creator.map(|creator| (ROOT_PID, creator)).into_iter().collect();
+    let fates = |walk: Walk| (pids_unsorted(&walk), unassessed(&walk));
+    with_reads(keys, &creators, |reads| {
+        [
+            fates(descendants_with(root, bound_of(root_key), rows, unreadable_200, reads)),
+            fates(super::children_of_with(
+                root,
+                bound_of(root_key),
+                rows,
+                unreadable_200,
+                reads,
+            )),
+        ]
+    })
+}
+
+/// Both filters' fate for the unreadable candidate must be `expected`.
+#[track_caller]
+fn assert_fate(fates: [(Vec<RawPid>, Vec<RawPid>); 2], expected: (Vec<RawPid>, Vec<RawPid>), what: &str) {
+    for (fate, filter) in fates.into_iter().zip(["descendants", "children"]) {
+        assert_eq!(fate, expected, "{filter}: {what}");
+    }
+}
+
+/// What a walk shows for an unreadable candidate the listing places before an anchor: not a member
+/// and not unassessed.
+fn dropped() -> (Vec<RawPid>, Vec<RawPid>) {
+    (vec![], vec![])
+}
+
+/// What it shows for one nothing places: an error.
+fn reported() -> (Vec<RawPid>, Vec<RawPid>) {
+    (vec![], vec![UNREADABLE_PID])
+}
+
+fn pids_unsorted(walk: &Walk) -> Vec<RawPid> {
+    walk.members.iter().map(ProcessId::pid).collect()
+}
+
+/// An unreadable candidate placed before the row of its parent's pid was created before whoever holds
+/// that pid, so it is not the parent's child: dropped as gone, not unassessed. Placed after the row,
+/// it stays an error. Only the row's pid (not its key) can drop the candidate.
+///
+/// Mutants: the row naming the parent's pid is not a stop; the direction is inverted (an error
+/// before the parent's row, dropped after it).
+#[skuld::test]
+fn an_unreadable_candidate_before_its_parents_row_is_not_a_member_and_one_after_it_is_unassessed() {
+    let parents_row = (ROOT_PID, OUTSIDER_PID);
+    let candidate_row = (UNREADABLE_PID, ROOT_PID);
+    let keys = [(ROOT_PID, ROOT_TOKEN)];
+
+    let before = walk_unreadable(ROOT_TOKEN, &[candidate_row, parents_row], &keys, None);
+    assert_fate(before, dropped(), "before the parent's row");
+    let after = walk_unreadable(ROOT_TOKEN, &[parents_row, candidate_row], &keys, None);
+    assert_fate(after, reported(), "after the parent's row");
+}
+
+/// A later row with a key older than the parent's, and nothing more, places nothing: the candidate
+/// stays an error. So it does when the creator's row, which would be an anchor, is listed before the
+/// candidate, not after.
+///
+/// Mutant: a later row whose key precedes the parent's drops the candidate (the key branch).
+#[skuld::test]
+fn an_unrelated_later_row_with_an_older_key_does_not_drop_an_unreadable_candidate() {
+    const PARENT_KEY: u64 = 20;
+    let candidate_row = (UNREADABLE_PID, ROOT_PID);
+
+    let rows = [candidate_row, (400, OUTSIDER_PID)];
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &[(400, 15)], None),
+        reported(),
+        "a later row, older than the parent and the creator of nothing",
+    );
+    // Its creator (key 5) is verified, but is listed before the candidate: no anchor after it.
+    let rows = [(OUTSIDER_PID, 0), candidate_row, (400, OUTSIDER_PID)];
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &[(OUTSIDER_PID, 5), (400, 15)], None),
+        reported(),
+        "a verified creator row before the candidate",
+    );
+}
+
+/// A row listed after the candidate that is shown to be a creator is an anchor: its process was in
+/// the list before the parent could create anything, so the candidate, listed before it, is not the
+/// parent's child. The row (pid 4) is named as the creator of a row (pid 400) whose key is no later
+/// than the parent's (20), and its own key precedes that row's.
+///
+/// Mutants: the creator's key is not compared with its created row's; the created row's key is not
+/// compared with the parent's (or compared strictly); a creator that cannot be opened, or a created row
+/// that cannot, is read as verified; the creator's pid is not matched against the row's ppid.
+#[skuld::test]
+fn an_unreadable_candidate_before_a_verified_creator_row_is_not_a_member() {
+    const PARENT_KEY: u64 = 20;
+    let candidate_row = (UNREADABLE_PID, ROOT_PID);
+    let rows = [candidate_row, (OUTSIDER_PID, 0), (400, OUTSIDER_PID)];
+
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &[(OUTSIDER_PID, 5), (400, 15)], None),
+        dropped(),
+        "the creator precedes what it created, which precedes the parent",
+    );
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &[(OUTSIDER_PID, 5), (400, PARENT_KEY)], None),
+        dropped(),
+        "what it created is the parent's own age",
+    );
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &[(OUTSIDER_PID, 30), (400, 15)], None),
+        reported(),
+        "the pid's holder now is newer than what it created: another process",
+    );
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &[(OUTSIDER_PID, 5), (400, 25)], None),
+        reported(),
+        "what it created is newer than the parent",
+    );
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &[(400, 15)], None),
+        reported(),
+        "the creator cannot be opened",
+    );
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &[(OUTSIDER_PID, 5)], None),
+        reported(),
+        "what it created cannot be opened",
+    );
+    let no_creator_row = [candidate_row, (5, 0), (400, OUTSIDER_PID)];
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &no_creator_row, &[(OUTSIDER_PID, 5), (400, 15)], None),
+        reported(),
+        "the creator has no row after the candidate",
+    );
+}
+
+/// The parent's own creator, read on the parent's handle (a process that has exited but is held has
+/// no row, and its creator pid is the one thing that names its creator), is an anchor when its key
+/// precedes the parent's. A creator the handle cannot name, or whose holder is newer than the parent,
+/// places nothing.
+///
+/// Mutants: the parent's creator is not an anchor; its key is not compared with the parent's.
+#[skuld::test]
+fn an_unreadable_candidate_before_its_parents_creator_row_is_not_a_member() {
+    const PARENT_KEY: u64 = 20;
+    let candidate_row = (UNREADABLE_PID, ROOT_PID);
+    let rows = [candidate_row, (300, OUTSIDER_PID)];
+
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &[(300, 10)], Some(300)),
+        dropped(),
+        "the creator row follows the candidate",
+    );
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &[(300, 30)], Some(300)),
+        reported(),
+        "the creator's pid is held by a newer process",
+    );
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &[(300, PARENT_KEY)], Some(300)),
+        reported(),
+        "the creator's pid is held by a process of the parent's own age",
+    );
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &[(300, 10)], None),
+        reported(),
+        "the parent's creator cannot be read",
+    );
+    assert_fate(
+        walk_unreadable(
+            PARENT_KEY,
+            &[(300, OUTSIDER_PID), candidate_row],
+            &[(300, 10)],
+            Some(300),
+        ),
+        reported(),
+        "the creator row precedes the candidate",
+    );
+}
+
+/// A pid's anchor row is its first: a later row of a pid the listing names twice is no anchor, and
+/// a row naming itself as its creator makes no creator of its pid. The candidate sits between the
+/// first and the second row of a verified creator (pid 4), so nothing is listed after it that anchors.
+///
+/// Mutants: a duplicate pid's last row is the anchor row; a row naming itself counts as a creator
+/// (not distinguishable from the strict key comparison, which refuses it as well).
+#[skuld::test]
+fn only_a_pids_first_row_anchors_and_a_row_naming_itself_creates_nothing() {
+    const PARENT_KEY: u64 = 20;
+    let candidate_row = (UNREADABLE_PID, ROOT_PID);
+    let keys = [(OUTSIDER_PID, 5), (400, 15)];
+
+    let rows = [(OUTSIDER_PID, 0), candidate_row, (400, OUTSIDER_PID), (OUTSIDER_PID, 0)];
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &keys, None),
+        reported(),
+        "the creator's second row is no anchor",
+    );
+    let rows = [candidate_row, (OUTSIDER_PID, 0), (400, OUTSIDER_PID), (OUTSIDER_PID, 0)];
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &keys, None),
+        dropped(),
+        "the creator's first row is, after the candidate",
+    );
+    let rows = [candidate_row, (400, 400)];
+    assert_fate(
+        walk_unreadable(PARENT_KEY, &rows, &[(400, 15)], None),
+        reported(),
+        "a row naming itself as its creator",
+    );
+}
+
+/// The parent is a member: its bound is its own order key, not the root's, so a created row older
+/// than the member but newer than the root proves its creator an anchor only against the member's key.
+/// Mutant: the root's bound is used for a deeper candidate.
+#[skuld::test]
+fn an_unreadable_candidate_is_ordered_against_the_member_that_is_its_parent() {
+    // root (key 1000) -> member 300 (key 1100, resolved just after the root) -> unreadable 200.
+    // Row 500 (key 1080: after the root, before the member) was created by row 400 (key 1050).
+    let rows = [(300, ROOT_PID), (UNREADABLE_PID, 300), (400, OUTSIDER_PID), (500, 400)];
+    let walk = |keys: &[(RawPid, u64)]| {
+        with_reads(keys, &[], |reads| {
+            descendants_with(root(), root_bound(), &rows, unreadable_200_under_300, reads)
+        })
+    };
+    let got = walk(&[(400, 1_050), (500, 1_080)]);
+    assert_eq!(pids_unsorted(&got), [300]);
+    assert!(got.unassessed.is_empty(), "created before its parent: not a member");
+    let got = walk(&[(400, 1_050), (500, 1_150)]);
+    assert_eq!(unassessed(&got), [UNREADABLE_PID], "row 500 follows the member");
+}
+
+/// A resolver that finds 300 created at key 1100 and cannot read [`UNREADABLE_PID`].
+fn unreadable_200_under_300(pid: RawPid, _parent: ProcessId, _bound: Option<OrderKey>) -> Resolution {
+    match pid {
+        UNREADABLE_PID => Err(unreadable(pid)),
+        _ => Ok(Some(resolved(pid, 1_100))),
+    }
+}
+
+/// Where the platform gives no bound (anywhere but Windows) the order of rows is no proof of anything:
+/// an unreadable candidate stays an error whatever the rows say. Mutant: the rule applies without a bound.
+#[skuld::test]
+fn an_unreadable_candidate_is_not_dropped_by_row_order_where_there_is_no_bound() {
+    let rows = [(UNREADABLE_PID, ROOT_PID), (ROOT_PID, OUTSIDER_PID)];
+    let got = with_reads(&[(ROOT_PID, ROOT_TOKEN)], &[(ROOT_PID, 3)], |reads| {
+        descendants_with(root(), None, &rows, unreadable_200, reads)
+    });
+    assert_eq!(unassessed(&got), [UNREADABLE_PID]);
+}
+
+/// A candidate the resolver reads costs no read of a row or of the parent's creator, in either
+/// filter. Mutant: every candidate's anchors are looked up.
+#[skuld::test]
+fn a_candidate_the_resolver_reads_costs_no_anchor_reads() {
+    let rows = [(300, ROOT_PID), (400, OUTSIDER_PID)];
+    let (got, reads) = with_counted_reads(&[], &[], |reads| {
+        descendants_with(root(), root_bound(), &rows, unreadable_200, reads)
+    });
+    assert_eq!((pids_unsorted(&got), reads), (vec![300], 0), "descendants");
+    let (got, reads) = with_counted_reads(&[], &[], |reads| {
+        super::children_of_with(root(), root_bound(), &rows, unreadable_200, reads)
+    });
+    assert_eq!((pids_unsorted(&got), reads), (vec![300], 0), "children");
+}
+
+/// A resolver that cannot read two pids under the root.
+fn unreadable_two(pid: RawPid, _parent: ProcessId, _bound: Option<OrderKey>) -> Resolution {
+    if pid == UNREADABLE_PID || pid == UNREADABLE_PID + 1 {
+        Err(unreadable(pid))
+    } else {
+        Ok(Some(resolved(pid, ROOT_TOKEN + 1)))
+    }
+}
+
+/// A parent's anchors are looked up once, however many of its candidates cannot be read: the reads
+/// of a second candidate under the same parent add none. Both are placed before the anchor.
+///
+/// Mutant: each unreadable candidate looks the anchors up again.
+#[skuld::test]
+fn a_parents_anchors_are_looked_up_once_for_all_its_unreadable_candidates() {
+    const PARENT_KEY: u64 = 20;
+    let keys = [(OUTSIDER_PID, 5), (400, 15)];
+    let reads_of = |rows: &[(RawPid, RawPid)], filter: &str| {
+        let (walk, reads) = with_counted_reads(&keys, &[], |reads| {
+            let (root, bound) = (id(ROOT_PID, PARENT_KEY), bound_of(PARENT_KEY));
+            match filter {
+                "descendants" => descendants_with(root, bound, rows, unreadable_two, reads),
+                _ => super::children_of_with(root, bound, rows, unreadable_two, reads),
+            }
+        });
+        assert_eq!(unassessed(&walk), Vec::<RawPid>::new(), "{filter}: both are placed");
+        reads
+    };
+    let tail = [(OUTSIDER_PID, 0), (400, OUTSIDER_PID)];
+    let one = [(UNREADABLE_PID, ROOT_PID), tail[0], tail[1]];
+    let two = [
+        (UNREADABLE_PID, ROOT_PID),
+        (UNREADABLE_PID + 1, ROOT_PID),
+        tail[0],
+        tail[1],
+    ];
+    for filter in ["descendants", "children"] {
+        assert_eq!(reads_of(&one, filter), reads_of(&two, filter), "{filter}");
     }
 }
 
@@ -596,6 +993,77 @@ fn a_real_candidate_is_dropped_under_a_parent_that_is_not_its_creator_on_windows
     assert!(dropped.unassessed.is_empty() && kept.unassessed.is_empty());
     assert_eq!(dropped.members, vec![x]);
     assert_eq!(kept.members, vec![x, y]);
+}
+
+/// The Windows wiring of the anchor rows to the live reads, through `walk_from` with real
+/// processes. The root `r` is a live child of this process `t`, whose creator is `o` (this test runs
+/// in a process of its own, a child of the process that started it). The candidate `u` is a real
+/// process this one cannot open, named by a stated row as `r`'s child. Both reads are live and
+/// openable here: `r`'s creator is `t`, read on `r`'s handle, and the keys of `t` and `o` are read by
+/// pid; both are older than `r`.
+///
+/// - With only `t`'s row after `u`, the anchor is `r`'s creator: `u`, listed before it, is dropped;
+///   listed after it, `u` stays unassessed.
+/// - With `t` listed before `u`, and `o`'s row, which names no creator of `r`'s, after it, the anchor
+///   is `o`: named as the creator of `t`, older than `t`, which is no later than `r`. `u` is dropped.
+///   With `o`'s row before `u` too, nothing follows `u` and `u` stays unassessed.
+///
+/// Mutants: the creator read of `r` finds nothing (the first case fails); the key read finds nothing
+/// (the first and second cases fail).
+#[cfg(windows)]
+#[skuld::test]
+fn an_unreadable_candidate_is_placed_by_the_live_creator_and_key_reads_on_windows() {
+    use crate::identity::{HostKernel, Resolved};
+    use crate::test_child::{live_findstr_blocker, release_findstr_unterminated};
+    use crate::Recursive;
+
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(
+            an_unreadable_candidate_is_placed_by_the_live_creator_and_key_reads_on_windows
+        ),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let (r_child, r) = live_findstr_blocker();
+    let u = crate::identity::windows_fixture::spawn_unkillable(&done);
+    assert_eq!(
+        ProcessId::of(u.pid()),
+        Resolved::Unknown,
+        "precondition: the candidate cannot be opened"
+    );
+    let t = ProcessId::current().pid();
+    let o = ProcessId::current()
+        .parent()
+        .expect("this process's parent reads")
+        .expect("this process has a parent")
+        .pid();
+    let candidate = (u.pid(), r.pid());
+    let fate = |rows: &[(RawPid, RawPid)]| {
+        [Recursive::No, Recursive::Yes].map(|depth| {
+            let walk = super::walk_from(&HostKernel, r, rows, depth)
+                .expect("the root reads")
+                .expect("the root is live");
+            assert!(walk.members.is_empty(), "the candidate is no member");
+            unassessed(&walk)
+        })
+    };
+    let dropped = [Vec::<RawPid>::new(), vec![]];
+    let reported = [vec![u.pid()], vec![u.pid()]];
+
+    let creator_row_after = fate(&[candidate, (t, 4)]);
+    let creator_row_before = fate(&[(t, 4), candidate]);
+    let key_proves_creator = fate(&[(t, o), candidate, (o, 4)]);
+    let nothing_after = fate(&[(o, 4), (t, o), candidate]);
+    release_findstr_unterminated(r_child);
+
+    assert_eq!(creator_row_after, dropped, "the creator's row follows the candidate");
+    assert_eq!(creator_row_before, reported, "the creator's row precedes the candidate");
+    assert_eq!(
+        key_proves_creator, dropped,
+        "a creator shown by a key read follows the candidate"
+    );
+    assert_eq!(nothing_after, reported, "no anchor follows the candidate");
 }
 
 /// A root that exits while its handle is held is walked, and its running child is killed. Windows
@@ -1316,4 +1784,12 @@ fn a_member_never_read_is_reported_again_as_the_variant_it_was() {
             if op == "process open" && detail == "pidfd_open was refused"),
         "{source:?}"
     );
+}
+
+/// Reads that find nothing: no row can be shown to be an anchor but the parent's own.
+fn no_reads() -> AnchorReads<'static> {
+    AnchorReads {
+        key_of: &|_| None,
+        creator_of: &|_| None,
+    }
 }

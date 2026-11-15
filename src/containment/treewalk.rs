@@ -107,11 +107,15 @@
 //! is an error ([`Walk::complete_members`]). The walk logs nothing: its caller reports, once. A
 //! caller with no error to return for them says each ([`warn_unassessed`]).
 //!
-//! A process the walk cannot read is never taken for one that is not the root's. On Windows that
-//! includes a process it cannot open (one the caller may not query), whose creator pid is never
-//! updated: if it names the root's pid, because an earlier holder of that pid created it, the walk
-//! cannot tell it from a genuine child, so every walk from that root is incomplete for as long as it
-//! lives. Only a walk is affected: a Job Object holds its members by membership and never walks.
+//! A process the walk cannot read is not a member only when the listing's order shows it. On Windows
+//! that includes a process it cannot open (one the caller may not query), whose creator pid is never
+//! updated and whose parent number and key cannot be read. The listing ([`process_parents`]) is in
+//! process-list insertion order, so a candidate listed before an anchor row (a process already listed
+//! before the parent could create anything; see [`Anchors`]) is not the parent's child. A candidate
+//! with no anchor row after it stays an error: every walk from that root is incomplete for as long as
+//! it lives. Only a walk is affected: a Job Object holds its members by membership and never walks.
+//!
+//! [`process_parents`]: crate::containment::enumerate::process_parents
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
@@ -123,7 +127,6 @@ use crate::containment::mechanism::{Contains, KillLeftOutcome};
 use crate::containment::Why;
 use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill};
 use crate::error::Error;
-#[cfg(unix)]
 use crate::identity::Resolved;
 use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution};
 use crate::os_process::OsProcess;
@@ -359,7 +362,9 @@ use nix::sys::signal::Signal;
 /// each resolution carries for the rest). The resolver answers `Ok(None)` for a candidate that does
 /// not follow it. `resolve` is injected so the filter is pure: live code passes [`resolve_or_drop`],
 /// tests pass a stub. A candidate the resolver errs on is dropped with its subtree and listed once in
-/// [`Walk::unassessed`].
+/// [`Walk::unassessed`], unless the listing's order shows it was created before its parent
+/// ([`Anchors::list_before`]; `reads` are its reads, injected like `resolve`):
+/// then it is not a member, and dropped as gone.
 ///
 /// The root itself is never included (callers kill the root explicitly first).
 pub(crate) fn descendants_with(
@@ -367,6 +372,7 @@ pub(crate) fn descendants_with(
     root_bound: Option<OrderKey>,
     parents: &[(RawPid, RawPid)],
     resolve: impl Fn(RawPid, ProcessId, Option<OrderKey>) -> Resolution,
+    reads: &AnchorReads<'_>,
 ) -> Walk {
     // BFS over the ppid forest. `frontier` holds the accepted pids whose children we still
     // need to visit, each with the bound its children follow; it starts as just the root. A pid joins
@@ -375,8 +381,8 @@ pub(crate) fn descendants_with(
     // strictly shrinking set of not-yet-visited edges.
     let mut walk = Walk::default();
     let mut frontier: Vec<(ProcessId, Option<OrderKey>)> = vec![(root, root_bound)];
-    // Remaining (pid, ppid) edges not yet attached to the tree.
-    let mut pending: Vec<(RawPid, RawPid)> = parents.to_vec();
+    // The rows of the remaining (pid, ppid) edges not yet attached to the tree.
+    let mut pending: Vec<usize> = (0..parents.len()).collect();
     // Pids already accepted, so a duplicate edge (e.g. a snapshot that lists a
     // pid twice) never enumerates/kills the same process twice.
     let mut accepted: std::collections::HashSet<RawPid> = std::collections::HashSet::new();
@@ -385,14 +391,17 @@ pub(crate) fn descendants_with(
     // appears in multiple edges; identity is stable for the duration of the walk.
     let mut resolved: std::collections::HashMap<RawPid, Option<(ProcessId, Option<OrderKey>)>> =
         std::collections::HashMap::new();
+    // Each parent's anchor rows, looked up at the first of its candidates that cannot be read.
+    let mut anchors: std::collections::HashMap<RawPid, Anchors<'_>> = std::collections::HashMap::new();
 
     while !frontier.is_empty() {
         let mut next: Vec<(ProcessId, Option<OrderKey>)> = Vec::new();
         // Partition: edges whose ppid is in the current frontier are candidates.
-        let mut still_pending: Vec<(RawPid, RawPid)> = Vec::with_capacity(pending.len());
-        for (pid, ppid) in pending.drain(..) {
+        let mut still_pending: Vec<usize> = Vec::with_capacity(pending.len());
+        for row in pending.drain(..) {
+            let (pid, ppid) = parents[row];
             let Some(&(parent, bound)) = frontier.iter().find(|(p, _)| p.pid() == ppid) else {
-                still_pending.push((pid, ppid));
+                still_pending.push(row);
                 continue;
             };
             // A process is never its own parent; guard against a degenerate
@@ -410,9 +419,18 @@ pub(crate) fn descendants_with(
                         None
                     }
                     Ok(read) => read,
-                    // Reported by the walk's caller, from the list.
                     Err(why) => {
-                        walk.unassessed.push((pid, why));
+                        let anchors = anchors
+                            .entry(parent.pid())
+                            .or_insert_with(|| Anchors::new(parents, parent, bound, reads));
+                        if anchors.list_before(row) {
+                            log::debug!(
+                                "treewalk: pid {pid} unreadable, and listed before an anchor row - not its child"
+                            );
+                        } else {
+                            // Reported by the walk's caller, from the list.
+                            walk.unassessed.push((pid, why));
+                        }
                         None
                     }
                 });
@@ -460,17 +478,20 @@ struct AnchorProof {
 /// Pure one-level child filter (host-testable): keep each pid whose ppid == the parent's
 /// pid and which the resolver finds ordered after `parent_bound`: `resolve(pid, parent, bound)` is
 /// injected for purity, with `parent_bound` as the bound. The parent itself is never included. A pid
-/// the resolver errs on is listed once in [`Walk::unassessed`].
+/// the resolver errs on is listed once in [`Walk::unassessed`], unless [`Anchors::list_before`] (by
+/// `reads`) shows it is not the parent's child.
 pub(crate) fn children_of_with(
     parent: ProcessId,
     parent_bound: Option<OrderKey>,
     parents: &[(RawPid, RawPid)],
     resolve: impl Fn(RawPid, ProcessId, Option<OrderKey>) -> Resolution,
+    reads: &AnchorReads<'_>,
 ) -> Walk {
     let mut walk = Walk::default();
+    let anchors = Anchors::new(parents, parent, parent_bound, reads);
     // Each pid is resolved once, so a duplicate edge cannot list a pid twice or be read differently.
     let mut resolved = std::collections::HashSet::new();
-    for &(pid, ppid) in parents {
+    for (row, &(pid, ppid)) in parents.iter().enumerate() {
         if ppid != parent.pid() || pid == ppid || !resolved.insert(pid) {
             continue;
         }
@@ -481,10 +502,115 @@ pub(crate) fn children_of_with(
                     "treewalk: pid {pid} gone, or an impostor (recycled pid / stale ppid) - dropped from children"
                 );
             }
+            Err(_) if anchors.list_before(row) => {
+                log::debug!("treewalk: pid {pid} unreadable, and listed before an anchor row - not its child");
+            }
             Err(why) => walk.unassessed.push((pid, why)),
         }
     }
     walk
+}
+
+/// The two live reads [`Anchors`] makes: `key_of` the order key of the process that holds a pid now
+/// (`None`: it cannot be opened, or is gone), `creator_of` the creator pid on a parent's own handle.
+/// Injected like `resolve`, so the filters stay pure.
+pub(crate) struct AnchorReads<'a> {
+    pub(crate) key_of: &'a dyn Fn(RawPid) -> Option<OrderKey>,
+    pub(crate) creator_of: &'a dyn Fn(ProcessId) -> Option<RawPid>,
+}
+
+/// The rows of the listing `parents` that stand for processes in the list before `parent` could
+/// create anything, and so tell where a candidate it could not read was listed: a candidate listed
+/// before such a row entered the list before the parent existed, so it is not the parent's child.
+/// This rests on the listing being in process-list insertion order, between unrelated processes too
+/// (the candidate is unrelated to the anchor): measured as no inversion in millions of row pairs on
+/// Windows 11 and both CI images, and pinned by `windows_tests`. Windows only, where `bound` is the
+/// parent's key: elsewhere no row is an anchor.
+///
+/// An anchor row is one of:
+///
+/// - the row of the parent's pid (the parent, or an earlier holder of its pid);
+/// - the row of a creator `X` shown to be one: some `Y` whose key, read now, is no later than the
+///   parent's names `X` as its creator (`Y`'s ppid in the listing; for the parent itself, `creator_of`,
+///   its handle's creator pid), and `X`'s key, read now, precedes `Y`'s. `X` held its pid from before
+///   `Y` was created until now, so it was in the list before `Y` was allocated, hence before the
+///   parent. A pid that changed hands since then reads a newer key, so it only keeps the error.
+///
+/// A candidate with no anchor row after it stays an error, for the parent may have been created
+/// between it and the rows after it (the parent has no row of its own once it exited and its handle
+/// is held).
+struct Anchors<'a> {
+    parents: &'a [(RawPid, RawPid)],
+    parent: ProcessId,
+    bound: Option<OrderKey>,
+    reads: &'a AnchorReads<'a>,
+    /// The last anchor row, found at the first use: one pass for all of the parent's candidates.
+    last: std::cell::OnceCell<Option<usize>>,
+}
+
+impl<'a> Anchors<'a> {
+    fn new(
+        parents: &'a [(RawPid, RawPid)],
+        parent: ProcessId,
+        bound: Option<OrderKey>,
+        reads: &'a AnchorReads<'a>,
+    ) -> Anchors<'a> {
+        Anchors {
+            parents,
+            parent,
+            bound,
+            reads,
+            last: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Whether the candidate listed at `parents[row]` is listed before an anchor row.
+    fn list_before(&self, row: usize) -> bool {
+        self.last.get_or_init(|| self.last_row()).is_some_and(|last| row < last)
+    }
+
+    /// The row of the last anchor.
+    fn last_row(&self) -> Option<usize> {
+        use std::collections::HashMap;
+
+        let bound = self.bound?;
+        // A pid's anchor row is its first, so a pid the listing names twice is not read twice.
+        let mut first_row: HashMap<RawPid, usize> = HashMap::new();
+        let mut made_by: HashMap<RawPid, Vec<RawPid>> = HashMap::new();
+        for (row, &(pid, creator)) in self.parents.iter().enumerate() {
+            first_row.entry(pid).or_insert(row);
+            if pid != creator {
+                made_by.entry(creator).or_default().push(pid);
+            }
+        }
+        let parents_creator = (self.reads.creator_of)(self.parent);
+        let mut keys: HashMap<RawPid, Option<OrderKey>> = HashMap::new();
+        let mut key = |pid| *keys.entry(pid).or_insert_with(|| (self.reads.key_of)(pid));
+
+        for (row, &(pid, _)) in self.parents.iter().enumerate().rev() {
+            if first_row[&pid] != row {
+                continue;
+            }
+            if pid == self.parent.pid() {
+                return Some(row);
+            }
+            let made = made_by.get(&pid).map(Vec::as_slice).unwrap_or_default();
+            if parents_creator != Some(pid) && made.is_empty() {
+                continue;
+            }
+            let Some(creator_key) = key(pid) else {
+                continue;
+            };
+            let names_it = (parents_creator == Some(pid) && creator_key < bound)
+                || made
+                    .iter()
+                    .any(|&made| key(made).is_some_and(|made| creator_key < made && made <= bound));
+            if names_it {
+                return Some(row);
+            }
+        }
+        None
+    }
 }
 
 /// The walk from `root` over `parents`, a snapshot taken BEFORE this call: the one entry to the
@@ -502,7 +628,9 @@ pub(crate) fn children_of_with(
 /// `root` needs no row in `parents`: the walk reads only the rows that name it as their parent, and
 /// a missing row of `root` says nothing about those. Toolhelp, for one, drops the row of an exited
 /// process whose handle is held (at once, or a moment after its exit), though its children, which
-/// Windows does not reparent, run on.
+/// Windows does not reparent, run on. The candidates of such a root that cannot be read are placed
+/// by the anchor rows instead, one of which is its creator's row, named by the root's handle
+/// ([`Anchors`]).
 pub(crate) fn walk_from(
     kernel: &dyn Kernel,
     root: ProcessId,
@@ -513,9 +641,22 @@ pub(crate) fn walk_from(
         return Ok(None);
     };
     let resolve = |pid, parent, bound| resolve_or_drop(kernel, pid, parent, bound);
+    let key_of = |pid| match ProcessId::of_ordered_with(kernel, pid, None, None, None).0 {
+        Resolved::Found((_, order)) => order,
+        Resolved::Gone | Resolved::Unknown => None,
+    };
+    // The creator pid on the parent's own handle (the one read that names it where its row is gone).
+    let creator_of = |parent: ProcessId| match parent.parent_number_and_order_with(kernel).0 {
+        Resolved::Found((creator, _)) => Some(creator),
+        Resolved::Gone | Resolved::Unknown => None,
+    };
+    let reads = AnchorReads {
+        key_of: &key_of,
+        creator_of: &creator_of,
+    };
     Ok(Some(match depth {
-        Recursive::No => children_of_with(root, root_bound, parents, resolve),
-        Recursive::Yes => descendants_with(root, root_bound, parents, resolve),
+        Recursive::No => children_of_with(root, root_bound, parents, resolve, &reads),
+        Recursive::Yes => descendants_with(root, root_bound, parents, resolve, &reads),
     }))
 }
 

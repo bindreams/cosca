@@ -13,6 +13,12 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use crate::error::Error;
 use crate::identity::{Kernel, RawPid};
 
+/// Rows come in process-list insertion order, between unrelated processes too: a creator's row
+/// precedes the rows of what it created, and a row listed before another is of a process that entered
+/// the list first. `treewalk::descendants_with` relies on both to place a candidate it cannot open
+/// (`treewalk::Anchors`). Keys of overlapping creations may be out of this order. Undocumented by
+/// Windows; pinned by `windows_tests`.
+///
 /// A failed or interrupted snapshot is [`Error::Unassessable`] naming the Win32 call and its
 /// code: a partial list would read as "no descendants" to the tree walk.
 pub(crate) fn process_parents(_kernel: &dyn Kernel) -> Result<Vec<(RawPid, RawPid)>, Error> {
@@ -72,6 +78,10 @@ fn snapshot_failed(call: &str, e: windows::core::Error) -> Error {
         source: Some(Error::io_cause(crate::error::win32_io_error(e))),
     }
 }
+
+#[cfg(test)]
+#[path = "windows_tests.rs"]
+mod windows_tests;
 
 /// Test-only seam: make the ToolHelp snapshot fail.
 #[cfg(test)]
