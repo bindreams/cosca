@@ -371,29 +371,8 @@ jobs:
         shell: bash
         run: prek run --hook-stage pre-push cargo-clippy --all-files
 
-      # Live cgroup v2 containment tests belong to the CGROUP group: on unless
-      # COSCA_TEST_CGROUP=0 (this workflow's default), and, enabled, they need
-      # COSCA_TEST_CGROUP_CONSENT=1 and fail without it. They need a cgroup the supervisor may
-      # create child cgroups under. We make a fresh leaf directly under the unified root cgroup:
-      # its `cgroup.subtree_control` is empty, so the v2 "no internal processes"
-      # rule does not apply and a cgroup may hold BOTH the test process and a child
-      # leaf. We move our shell into it and run the labelled tests there (as root, in
-      # parallel) — across the `--lib` unit-test binary (which carries the white-box
-      # CgroupLeaf::wait_drained coverage in src/containment/cgroup/leaf_tests.rs, and with `tokio` the
-      # async spawn's post-fork failure path), `spawn_io` and `tokio_io`. `CGROUP` means this lane: a
-      # delegated cgroup, with the `unshare` that container seccomp profiles refuse permitted. The
-      # tests assert CgroupV2/build a real leaf and FAIL LOUDLY if it is unusable — never a silent skip.
-      #
-      # The labels: `cgroup` (the CGROUP group, every test of `containment::cgroup`, and the tests
-      # labelled `cgroup` explicitly, which keep in this lane what the old `test(/cgroup/)` name filter selected;
-      # most use fake leaves and also run in the main lanes) and `namespaces` (the NAMESPACES group, which also gets its own consent here: root, on a
-      # CI runner). `-E binary(...)`: libtest binaries ignore `SKULD_LABELS` and would run whole.
-      # A test that is also in the `setuid` group needs a caller that is not root, so this root run leaves
-      # it out (`!setuid`); "Run cgroup tests that also need the setuid group" runs it.
-      #
-      # The unprivileged runner user builds the archive; only running it needs root. `sudo`'s
-      # `secure_path` drops `~/.cargo/bin`, so `cargo-nextest`'s resolved path and the archive are
-      # passed in as positional arguments rather than looked up again inside the root shell.
+      # The CGROUP and NAMESPACES groups, as root in a fresh cgroup leaf: `.github/scripts/cgroup-lane.sh` has the
+      # explanation. The unprivileged runner user builds the archive; only running it needs root.
       - name: Build cgroup v2 containment tests (Linux)
         if: matrix.os == 'linux'
         run: |
@@ -405,70 +384,20 @@ jobs:
         timeout-minutes: 10
         shell: bash
         run: |
-          # shellcheck disable=SC2016 # the root shell expands its own positional arguments
-          exec python3 .github/scripts/run-nextest.py cgroup sudo "$(command -v python3)" .github/scripts/forward.py bash -uxc '
-            CG=/sys/fs/cgroup/cosca-ci
-            PRIOR="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"
-            mkdir "$CG" || exit 1
-            # Back out of the lane cgroup and remove it on every exit. If a test left processes or cgroups in it, report
-            # them, kill the subtree, wait for the kernel to report it empty, remove the leaves, and still fail.
-            leave() {
-              echo $$ > "$PRIOR/cgroup.procs" || { echo "could not leave $CG" >&2; exit 1; }
-              rmdir "$CG" && return
-              echo "could not remove $CG; left in it:" >&2
-              find "$CG" -type d | while read -r d; do echo "$d: $(tr "\n" " " < "$d/cgroup.procs")"; done >&2
-              echo 1 > "$CG/cgroup.kill" || echo "could not kill $CG" >&2
-              # `cgroup.events` signals a change to `populated`, so poll it rather than wait a time.
-              python3 - "$CG/cgroup.events" <<\PY || echo "could not wait for $CG to empty" >&2
-          import select, sys
-          events = open(sys.argv[1])
-          poller = select.poll()
-          poller.register(events, select.POLLPRI | select.POLLERR)
-          while True:
-              events.seek(0)
-              if "populated 0" in events.read().split("\n"):
-                  break
-              poller.poll()
-          PY
-              find "$CG" -depth -type d -exec rmdir {} \; || echo "could not remove the leaves of $CG" >&2
-              exit 1
-            }
-            trap leave EXIT
-            echo $$ > "$CG/cgroup.procs"
-            # A delegated cgroup and root on a CI runner, which is the sandbox, so consent is given.
-            # The profile is passed explicitly: sudo-rs (Ubuntu 26.04) ignores -E, so no variable survives.
-            export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
-            export COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
-            # For the namespace tests that also attach a foreign tracer; no other test here takes it.
-            export COSCA_TEST_TRACER=1 COSCA_TEST_TRACER_CONSENT=1
-            status=0
-            SKULD_LABELS="(cgroup | namespaces) & !setuid" "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci-cgroup --no-capture --no-tests=fail -E "binary(cosca) | binary(spawn_io) | binary(tokio_io)" || status=1
-            # Hand the target dir back so later steps can write to it.
-            chown -R "$2" "$PWD/target"
-            exit "$status"
-          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(id -u):$(id -g)"
+          exec python3 .github/scripts/run-nextest.py cgroup sudo "$(command -v python3)" .github/scripts/forward.py bash -ux .github/scripts/cgroup-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(id -u):$(id -g)"
 
-      # The setuid group (`COSCA_TEST_SETUID`, off workflow-wide). It needs a COPY of cosca_testbin
-      # that is genuinely setuid-root (owned by root, mode u+s), so a helper process can become
-      # truly unsignalable by this job's ordinary unprivileged user, giving a REAL mixed process
-      # group. Only preparing the helper copy needs root; the tests run as the normal runner user,
-      # no sudo. The lane check fails the lane unless the helper really reaches uid 0 and may
-      # create a user namespace. The group is selected by its label (`SKULD_LABELS=setuid`), in the
-      # two binaries that carry it (see principle 10).
+      # The setuid group (`COSCA_TEST_SETUID`, off workflow-wide). It needs a setuid-root COPY of cosca_testbin
+      # (`.github/scripts/setuid-helper.sh`). The lane check fails the lane unless the helper really reaches uid 0 and
+      # may create a user namespace. The group is selected by its label (`SKULD_LABELS=setuid`), in the two binaries
+      # that carry it (see principle 10).
       - name: Set up setuid-root helper (Linux)
         id: lin_helper
         if: matrix.os == 'linux'
         run: |
           set -euxo pipefail
-          BIN=$(cargo build --locked --target ${{ matrix.target }} --bin cosca_testbin --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "cosca_testbin") | .executable' \
-            | grep -v '^null$' | grep . | head -n1)
-          test -x "$BIN"
           HELPER="${RUNNER_TEMP}/cosca_testbin_setuid"
           echo "helper=$HELPER" >> "$GITHUB_OUTPUT"
-          cp "$BIN" "$HELPER"
-          sudo chown root:root "$HELPER"
-          sudo chmod 4755 "$HELPER"
+          bash .github/scripts/setuid-helper.sh ${{ matrix.target }} "$HELPER"
 
       - name: Check the setuid lane (Linux)
         if: matrix.os == 'linux'
@@ -491,11 +420,8 @@ jobs:
           SKULD_LABELS: setuid
         run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca) | binary(group_teardown_setuid)'
 
-      # The tests that are in both the `cgroup` and the `setuid` group: they need a delegated cgroup, and a
-      # caller that is not root (the helper is only unsignalable by one). The cgroup lane above runs as root and
-      # leaves them out; this one runs the same archive as the runner user, in a cgroup the user owns. Root
-      # makes that cgroup, hands it over and moves this shell into it: the user cannot move itself out of
-      # the cgroup the runner started it in.
+      # The tests that are in both the `cgroup` and the `setuid` group, as the runner user in a cgroup it owns, over
+      # the archive of the cgroup lane: `.github/scripts/cgroup-setuid-lane.sh` has the explanation.
       - name: Run cgroup tests that also need the setuid group (Linux)
         if: matrix.os == 'linux'
         timeout-minutes: 10
@@ -507,48 +433,15 @@ jobs:
           COSCA_TEST_SETUID_CONSENT: "1"
           COSCA_TESTCFG_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
           SKULD_LABELS: cgroup & setuid
-        run: |
-          # shellcheck disable=SC2016 # the inner shell expands its own variables
-          exec python3 .github/scripts/run-nextest.py cgroup-setuid bash -uxc '
-            CG=/sys/fs/cgroup/cosca-ci-user
-            PRIOR="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"
-            sudo mkdir "$CG" || exit 1
-            # Back out of the lane cgroup and remove it on every exit. If a test left processes or cgroups in it,
-            # report them, kill the subtree and still fail; the runner is thrown away after the job.
-            leave() {
-              echo $$ | sudo tee "$PRIOR/cgroup.procs" > /dev/null || { echo "could not leave $CG" >&2; exit 1; }
-              sudo find "$CG" -depth -type d -exec rmdir {} \; && return
-              echo "could not remove $CG; left in it:" >&2
-              sudo grep -r "" "$CG" --include=cgroup.procs >&2 || true
-              echo 1 | sudo tee "$CG/cgroup.kill" > /dev/null || echo "could not kill $CG" >&2
-              exit 1
-            }
-            trap leave EXIT
-            sudo chown "$(id -u):$(id -g)" "$CG" "$CG/cgroup.procs" "$CG/cgroup.subtree_control" "$CG/cgroup.threads"
-            echo $$ | sudo tee "$CG/cgroup.procs" > /dev/null
-            "$0" nextest run --archive-file "$1" --workspace-remap "$PWD" --profile ci-cgroup-setuid --no-tests=fail -E "binary(cosca)"
-          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst"
+        run: exec python3 .github/scripts/run-nextest.py cgroup-setuid bash -ux .github/scripts/cgroup-setuid-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst"
 
-      # The same test started as root re-executes itself as uid 65534 (see the test file's "Running
-      # as root" docs), so the test binary, the `cosca_testbin` path compiled into it, and the
-      # helper must all be reachable by that uid: every directory above the checkout and the
-      # extraction directory is made traversable and `target` readable. `--extract-to` is what lets
-      # nextest run an archive there: its default extraction directory is root-only. `sudo --preserve-env` keeps
-      # COSCA_TESTCFG_SETUID_HELPER and the group's variables (Ubuntu 26.04's sudo-rs ignores `-E`).
+      # The same test started as root, over its own archive: `.github/scripts/setuid-root-archive.sh` and
+      # `setuid-root-lane.sh` have the explanation. `sudo --preserve-env` keeps COSCA_TESTCFG_SETUID_HELPER and the
+      # group's variables (Ubuntu 26.04's sudo-rs ignores `-E`).
       - name: Archive the setuid-root process-group teardown test (Linux)
         id: lin_setuid_archive
         if: matrix.os == 'linux'
-        run: |
-          set -euxo pipefail
-          cargo nextest archive --locked --target ${{ matrix.target }} --test group_teardown_setuid --archive-file "$RUNNER_TEMP/setuid-root.tar.zst"
-          mkdir -m 0755 "$RUNNER_TEMP/setuid-root-extract"
-          # Build output of this checkout, not system policy.
-          chmod -R a+rX "$PWD/target"
-          modes=("$RUNNER_TEMP")
-          d="$PWD"
-          while [ "$d" != / ]; do modes+=("$d"); d=$(dirname "$d"); done
-          bash .github/scripts/dir-modes.sh record "$RUNNER_TEMP/dir-modes" "${modes[@]}"
-          for d in "${modes[@]}"; do sudo chmod a+x "$d"; done
+        run: bash .github/scripts/setuid-root-archive.sh ${{ matrix.target }}
 
       - name: Run setuid-root process-group teardown test as root (Linux)
         if: matrix.os == 'linux'
@@ -559,11 +452,7 @@ jobs:
           COSCA_TEST_SETUID_CONSENT: "1"
           COSCA_TESTCFG_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
           SKULD_LABELS: setuid_root
-        run: |
-          # shellcheck disable=SC2016 # the root shell expands its own positional arguments
-          exec python3 .github/scripts/run-nextest.py setuid-root sudo --preserve-env=COSCA_TEST_SETUID,COSCA_TEST_SETUID_CONSENT,COSCA_TESTCFG_SETUID_HELPER,SKULD_LABELS "$(command -v python3)" .github/scripts/forward.py bash -euxc '
-            "$0" nextest run --archive-file "$1" --extract-to "$2" --workspace-remap "$PWD" --profile ci-setuid-root --no-tests=fail -E "binary(group_teardown_setuid)"
-          ' "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract"
+        run: exec python3 .github/scripts/run-nextest.py setuid-root sudo --preserve-env=COSCA_TEST_SETUID,COSCA_TEST_SETUID_CONSENT,COSCA_TESTCFG_SETUID_HELPER,SKULD_LABELS "$(command -v python3)" .github/scripts/forward.py bash -eux .github/scripts/setuid-root-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract"
 
       - name: Remove the setuid-root helper (Linux)
         if: ${{ always() && steps.lin_helper.outcome != 'skipped' && steps.lin_helper.outcome != '' }}
@@ -877,11 +766,7 @@ jobs:
         id: lin_elev_doas
         if: ${{ !cancelled() && steps.lin_elev_policy.outcome == 'success' }}
         shell: bash
-        run: |
-          set -euxo pipefail
-          printf 'permit nopass %s as root\n' "$USER" | sudo tee /etc/doas.conf >/dev/null
-          doas -C /etc/doas.conf
-          test "$(doas -n id -u)" = 0
+        run: bash .github/scripts/elevation-lane-doas.sh "$USER"
 
       # Rules and password: see elevation-lane-sudoers.sh. The password goes to the run step as an output, not
       # through `GITHUB_ENV`.
