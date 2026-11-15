@@ -226,7 +226,7 @@ jobs:
         run: ${{ matrix.nextest }} tokio cargo nextest run --locked --features tokio --target ${{ matrix.target }}
 
       # The `TRACER` group attaches a tracer to the tests' own children, as a debugger would; a CI
-      # runner is the sandbox, so this step consents. Windows has no tracer tests.
+      # runner is the sandbox, so `tracer-lane.sh` consents. Windows has no tracer tests.
       - name: Run the tracer tests (Unix)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
         timeout-minutes: 10

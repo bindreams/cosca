@@ -24,8 +24,8 @@ After an edit to a tracked file, rerun from a fresh instance: `devvm rm cosca-la
 last step (`copy`) runs again, about 45 seconds; the layers above it are reused. `devvm rm cosca-lane` when done.
 
 Each block sources `lane-env.sh`: the groups that are off by default (`.github/test-group-defaults.env`) are off, and
-the lane's script turns on its own with their `_CONSENT` variable. All tests of the lane pass; skips are the groups
-`lane-env.sh` printed as off.
+the lane's script turns on its own with their `_CONSENT` variable. All tests of the lane pass. The skipped ones are
+those of the groups `lane-env.sh` printed as off, those the lane's filterset leaves out, and ignored tests.
 
 | Lane (CI group)                           | Consent variables set by                    |
 | ----------------------------------------- | ------------------------------------------- |
@@ -114,7 +114,7 @@ trap restore EXIT
 bash .github/scripts/setuid-helper.sh "$target" "$helper"
 bash .github/scripts/setuid-lane-check.sh "$helper"
 bash .github/scripts/setuid-root-archive.sh "$target"
-bash .github/scripts/setuid-root-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract" "$helper"
+python3 .github/scripts/run-nextest.py setuid-root bash .github/scripts/setuid-root-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract" "$helper"
 ```
 
 ## Root and uid switch
@@ -140,7 +140,7 @@ variant() {
   echo "== lane $1"
   # The mounts give root-lane.sh the container's /repo/target/nextest, /junit-out and /artifacts, in a mount
   # namespace that ends with the lane.
-  sudo --preserve-env=COSCA_TEST_PIDFD_GROUP_SIGNAL,COSCA_TEST_PIDFD_GET_INFO env \
+  sudo --preserve-env="$COSCA_LANE_FLOOR_VARS" env \
     LANE="$lane" ARTIFACTS="$RUNNER_TEMP/artifacts" CAPS="-all,$docker_caps$3" \
     COSCA_TEST_ROOT=1 COSCA_TEST_ROOT_CONSENT=1 COSCA_TEST_UID_SWITCH="$2" COSCA_TEST_UID_SWITCH_CONSENT=1 \
     PRIVILEGE_TESTS='binary(cosca) | binary(process_root)' PREFIX="$4" \

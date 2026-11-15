@@ -418,7 +418,9 @@ Windows groups: `COSCA_TEST_PATH_PROBES` (the `windows_path_resolution` canaries
 (`windows_shell_resolution`) and `COSCA_TEST_ELEVATION_ROUTES` (`windows_elevation_routes`), which
 are `test_group!` rows like `namespaces`. The `Test (windows/...)` jobs of `ci.yaml` select them by label, as does `windows-probes.yaml` (weekly, on dispatch).
 CI's test jobs turn each off through `.github/test-group-defaults.env` (a step appends it to `$GITHUB_ENV`) and opt in
-only in the step or job that runs it; `devvm/lane-env.sh` applies the same file in a Linux guest.
+only in the step or job that runs it; `devvm/lane-env.sh` applies the same file in a Linux guest. `windows-probes.yaml`
+does not read the file: its workflow `env` block turns the four probe groups off itself, and its `executing` job's
+`env` opts in.
 
 **Why:** a test that can end in a destructive outcome, or does a visible operation on shared
 resources, harms or disturbs whatever machine it runs on when it goes wrong, so the sandbox, not the

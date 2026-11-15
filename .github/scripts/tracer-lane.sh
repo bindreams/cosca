@@ -12,6 +12,6 @@ set -euo pipefail
 target="${1:?usage: tracer-lane.sh <target> [release]}"
 export COSCA_TEST_TRACER=1 COSCA_TEST_TRACER_CONSENT=1 SKULD_LABELS=tracer
 if [[ "${2:-}" == release ]]; then
-    exec cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target "$target" --profile ci-tracer-release
+    exec cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target "$target" --profile "${NEXTEST_PROFILE:-ci-tracer-release}"
 fi
-exec cargo nextest run --locked --no-tests=fail --features tokio --target "$target" --profile ci-tracer -E 'binary(cosca)'
+exec cargo nextest run --locked --no-tests=fail --features tokio --target "$target" --profile "${NEXTEST_PROFILE:-ci-tracer}" -E 'binary(cosca)'
