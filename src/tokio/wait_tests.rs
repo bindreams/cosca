@@ -309,8 +309,9 @@ async fn exited_by_id_resolves_immediately_on_an_identity_mismatch() {
 }
 
 /// The async cgroup drain wait wakes when the leaf is removed, even with no event on
-/// `cgroup.events` — the removal can cancel the one notification a drain sends. A missed wake
-/// hangs this test: #985 row A1.
+/// `cgroup.events` — the removal can cancel the one notification a drain sends. A pump that never
+/// broadcasts hangs this test; `a_changed_batch_notifies_a_listener_that_was_there_before_it` fails
+/// it by assertion.
 #[cfg(target_os = "linux")]
 #[skuld::test(labels = [crate::test_harness::CGROUP])]
 async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_populated_event() {
