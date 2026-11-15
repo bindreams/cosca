@@ -258,7 +258,7 @@ fn tear_down_leaving(
     let how = HeldTeardown {
         front,
         id: None,
-        subtree: None,
+        reach: None,
         disposition: Disposition::Leave,
         policy: SpawnPolicy::SYNC,
     };
@@ -533,7 +533,7 @@ fn tear_down_front_under(
     let how = HeldTeardown {
         front: Some(Front::Sudo),
         id: None,
-        subtree,
+        reach: subtree.map(|subtree| subtree as &dyn crate::child::owned::teardown::Reach),
         disposition: Disposition::HandBack,
         policy,
     };

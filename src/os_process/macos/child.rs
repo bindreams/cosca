@@ -14,7 +14,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 use super::{ExitWatch, Kqueue};
 use crate::error::Error;
 use crate::identity::{has_exited, held_by, Held, Kernel, ReadPurpose};
-use crate::os_process::child::{Foreign, OsChild, PeekOutcome, TryReapOutcome};
+use crate::os_process::child::{Foreign, KillRefusal, OsChild, PeekOutcome, TryReapOutcome};
 use crate::os_process::drive::{Step, Waitable};
 use crate::os_process::{Exit, ExitWait, OsProcess, WaitFor};
 use crate::signal::{via_audit_token, Sent, Sig};
@@ -201,6 +201,12 @@ impl<K: Kernel + Send> MacosChild<K> {
 impl<K: Kernel + Send> OsChild for MacosChild<K> {
     fn pid(&self) -> Option<u32> {
         Some(self.pid)
+    }
+
+    /// The signal is refused with `EPERM` alone, but the identity read it is checked by is refused
+    /// with whatever errno the kernel answers.
+    fn kill_refusal(&self) -> KillRefusal {
+        KillRefusal::Any
     }
 
     /// `waitid(WNOWAIT)` by pid, checked against the unique id; a running child whose id cannot be

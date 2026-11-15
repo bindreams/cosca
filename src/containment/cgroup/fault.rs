@@ -451,7 +451,6 @@ impl Drop for ObserveRmdirs {
 pub(crate) fn take_rmdir_hook() {
     RMDIR_HOOK.with(|h| h.borrow_mut().take());
 }
-/// Run the rmdir hook, if one is set and answers.
 pub(crate) fn run_rmdir_hook(path: &std::path::Path) -> Option<std::io::Result<()>> {
     let mut hook = RMDIR_HOOK.with(|h| h.borrow_mut().take())?;
     let result = hook(path);

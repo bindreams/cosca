@@ -46,18 +46,16 @@ dropping thread. Exactly these of the failed spawn's blocking waits for
 something it killed warn once past 1 s, as the drop's does, each naming what it waits for:
 
 - the wait for the root, once the spawn has a child handle;
-- on macOS, the wait for the root of a child whose unique id arrived only after the spawn returned,
-  where the spawn holds a std `Child` but no cosca handle (`kill_and_reap_unreported` in
-  [`spawn.rs`](../src/child/spawn.rs), through `await_exit_warning`);
+- on macOS, the wait for the root of a child whose unique id arrived only after the spawn returned
+  (`abandon_late_child` in [`late_child.rs`](../src/child/spawn/late_child.rs), which waits for the
+  root to exit before the second sweep of its tree, then settles the reap as every failed spawn's
+  teardown does);
 - on Linux, the waits for a child it killed in the pidfd handshake
-  ([`conclude`](../src/child/spawn/pidfd_handshake.rs) and `await_unexecuted_exit`), and in a cgroup
-  leaf's abandonment, which tears the child down through the pidfd the handshake left it
-  (`abandon_before_verdict` in [`leaf.rs`](../src/containment/cgroup/leaf.rs));
+  ([`conclude`](../src/child/spawn/pidfd_handshake.rs) and `await_unexecuted_exit`);
 - on Linux, the wait for an elevation front its leaf's kill ended, in the teardown after the handle
-  exists and in the leaf's abandonment (`abandon_before_verdict` in
-  [`leaf.rs`](../src/containment/cgroup/leaf.rs));
+  exists (`tear_down_held` in [`held_teardown.rs`](../src/child/spawn/held_teardown.rs));
 - on Linux, the wait for a cgroup leaf's drain, in the leaf's `Drop`, in `finish_elevated`'s
-  cleanup, and in the leaf's abandonment (`abandon_before_verdict` in
+  cleanup, and in the leaf's abandonment (`abandon_without_child` in
   [`leaf.rs`](../src/containment/cgroup/leaf.rs)).
 
 Each runs through [`wait_warning`](../src/wait/teardown_warn.rs), as the armed drop's reap and

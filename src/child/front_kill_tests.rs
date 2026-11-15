@@ -923,8 +923,9 @@ impl Drop for AttachFails {
     }
 }
 
-/// `err` is a failed attach whose `detail` says it left the front `pid` running and unreaped, and the
-/// log says the attach failed, not that its identity could not be read: it was verified.
+/// `err` is a failed attach whose `detail` says it handed the front `pid` back, running and
+/// unreaped, and the log says the attach failed, not that its identity could not be read: it was
+/// verified.
 #[cfg(target_os = "macos")]
 #[track_caller]
 pub(crate) fn assert_attach_failure_left_the_front(err: &Error, text: &str, pid: u32, mark: usize) {
@@ -933,7 +934,7 @@ pub(crate) fn assert_attach_failure_left_the_front(err: &Error, text: &str, pid:
         "the cause is a Containment: {err:?}"
     );
     assert!(text.contains(&format!("pid {pid} is what sudo left")), "{text}");
-    assert!(text.contains("; left unreaped"), "{text}");
+    assert!(text.contains("handed back to the caller in the error"), "{text}");
     assert!(
         crate::log_capture::contains_since(mark, "attach failed"),
         "the warning says the attach failed"
@@ -944,13 +945,14 @@ pub(crate) fn assert_attach_failure_left_the_front(err: &Error, text: &str, pid:
     );
 }
 
-/// macOS: a front whose attach fails (which only a seam makes it do) is sent nothing and left
-/// running and unreaped, not killed like another child; the error keeps its variant and says so.
+/// macOS: a front whose attach fails (which only a seam makes it do) is sent nothing and, still
+/// running, handed back in the error, not killed like another child; the error keeps its variant and
+/// says so.
 ///
 /// Mutant: the arm kills and reaps it as any child.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn macos_a_front_whose_attach_fails_is_left_unreaped_and_noted() {
+fn macos_a_front_whose_attach_fails_is_handed_back_and_noted() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let (err, detail, id, fate) = fail_a_front_spawn(|_| {}, fail_the_attach, |cmd| cmd.spawn().map(drop));
@@ -963,18 +965,21 @@ fn macos_a_front_whose_attach_fails_is_left_unreaped_and_noted() {
     assert_attach_failure_left_the_front(&err, &detail, id.pid(), mark);
 }
 
-/// macOS: an identity check that found the front gone, reaped by someone else, says it could not be
-/// waited on, not that it is left unreaped.
+/// macOS: what became of a front is what the teardown's own look at it finds, not what the identity
+/// check said: a check forced to find the front gone, while it still runs, leaves a front that is
+/// looked at, found running, and handed back.
+///
+/// Mutant: the check's verdict is the front's fate (`Gone`), and the running front is dropped.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn macos_an_identity_check_that_found_the_front_gone_does_not_claim_it_unreaped() {
+fn macos_a_front_the_identity_check_called_gone_is_looked_at_and_handed_back() {
     let (_, detail, _id, fate) = fail_a_front_spawn(|_| {}, identity_finds_the_front_gone, |cmd| cmd.spawn().map(drop));
     assert_eq!(
         fate,
-        crate::error::ChildFate::Gone,
-        "the check found it reaped by someone else"
+        crate::error::ChildFate::Running { id: None },
+        "the front still runs"
     );
-    assert_noted_unaccounted(&detail);
+    assert!(detail.contains("handed back to the caller in the error"), "{detail}");
 }
 
 /// While it lives, this thread's identity checks find the spawned child gone.
@@ -996,26 +1001,6 @@ impl Drop for IdentityFindsGone {
     }
 }
 
-/// `text`, the `detail` of a failed spawn, notes a front that could not be waited on, and never says
-/// it is left unreaped.
-#[cfg(target_os = "macos")]
-#[track_caller]
-pub(crate) fn assert_noted_unaccounted(text: &str) {
-    assert!(text.contains("what sudo left"), "{text}");
-    assert!(text.contains("could not be waited on"), "{text}");
-    assert!(!text.contains("left unreaped"), "{text}");
-}
-
-/// A child left unverified because someone else reaped it is unaccounted for, never "left
-/// unreaped"; one whose identity was refused is left unreaped.
-#[skuld::test]
-fn an_unverified_childs_fate_follows_its_identity() {
-    use crate::child::spawn::FrontFate;
-    use crate::containment::RootIdentity;
-    assert_eq!(FrontFate::of_unverified(RootIdentity::Gone), FrontFate::Unaccounted);
-    assert_eq!(FrontFate::of_unverified(RootIdentity::Unknown), FrontFate::LeftUnreaped);
-}
-
 /// macOS: a spawn whose own read of the front's unique-id report fails cannot adopt it, and leaves
 /// it as any unadopted child: sent nothing, and unreaped. The error, its variant kept, says so. The
 /// `cat`'s stdin is a pipe this test owns, so the front is shown unsignalled by its exit.
@@ -1033,24 +1018,32 @@ fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
 }
 
 /// macOS: a contained spawn whose check of the front's identity is refused (`Unknown`) cannot attach
-/// its marker, which needs the identity, so it fails the attach with the read's error and leaves the
-/// front unverified: sent nothing, and unreaped. The error says so, as for a report it could not
-/// read. (An uncontained front is kept, with no identity.)
+/// its marker, which needs the identity, so it fails the attach with the read's error and tears the
+/// front down as every front is: sent nothing, and looked at. The refusal is forced to last into that
+/// look too (it is the one forced peek left), which cannot say whether the front exited, so the front
+/// is handed back, its fate unknown, and the error says so. (An uncontained front is kept, with no
+/// identity.)
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn macos_a_contained_front_whose_identity_is_refused_is_left_and_noted() {
+fn macos_a_contained_front_whose_identity_is_refused_is_handed_back_and_noted() {
     let (err, detail, id, fate) = fail_a_front_spawn(
         |cmd| _ = cmd.contain(),
         refuse_the_identity,
         |cmd| cmd.spawn().map(drop),
     );
-    // Its identity is what could not be read.
-    assert_eq!(
-        fate,
-        crate::error::ChildFate::Running { id: None },
-        "the front is left running"
+    assert!(
+        matches!(err, Error::Unassessable { .. }),
+        "the cause is the identity's Unassessable: {err:?}"
     );
-    assert_unadopted_front_noted(&err, &detail, id.pid());
+    assert_eq!(fate, crate::error::ChildFate::Unknown, "the look at the front failed");
+    assert!(
+        detail.contains(&format!("pid {} is what sudo left", id.pid())),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("could not be waited on") && detail.contains("handed back to the caller in the error"),
+        "{detail}"
+    );
 }
 
 /// While it lives, this thread's reads of a spawned child's own unique-id report fail.
@@ -1107,12 +1100,18 @@ pub(crate) fn fail_a_front_spawn<G>(
     };
     // Every failure this forces comes after the front ran.
     let detail = crate::test_child::detail_of(&err);
-    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    // A front still running is handed back in the error, with `writer` to release it by; one the spawn
+    // could not adopt is left, and reaped here.
+    let (err, fate, handed_back) = crate::test_child::expect_may_have_started_parts(err, writer);
     let crate::identity::Resolved::Found(id) = fault::take_captured().expect("the spawn captured the child") else {
         panic!("the spawn must capture a resolved identity");
     };
-    drop(writer);
-    let status = reap(id.pid()).expect("the front was left unreaped");
+    let status = if handed_back.is_none() {
+        drop(handed_back);
+        reap(id.pid()).expect("the front was left unreaped")
+    } else {
+        handed_back.wait()
+    };
     assert!(status.success(), "the front was signalled: {status:?}");
     (err, detail, id, fate)
 }

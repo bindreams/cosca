@@ -10,7 +10,6 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-#[cfg(any(target_os = "linux", windows))]
 use super::child::KillRefusal;
 use super::child::{ExitRecord, Foreign, OsChild, PeekOutcome, TryReapOutcome};
 use super::{Exit, OsProcess, WaitFor};
@@ -69,7 +68,6 @@ struct Script {
     pid: Option<u32>,
     /// What [`OsChild::kill_refusal`] answers. `None`: the real child's, if there is one; a fake
     /// with none states it or panics.
-    #[cfg(any(target_os = "linux", windows))]
     kill_refusal: Option<KillRefusal>,
     exits: VecDeque<Answer>,
     peeks: VecDeque<PeekAnswer>,
@@ -105,7 +103,6 @@ impl FakeProcess {
         Self(Arc::new(Shared {
             script: Mutex::new(Script {
                 pid: None,
-                #[cfg(any(target_os = "linux", windows))]
                 kill_refusal: None,
                 exits: exits.into_iter().collect(),
                 peeks: VecDeque::new(),
@@ -133,7 +130,7 @@ impl FakeProcess {
 
     /// Answer `refusal` to [`OsChild::kill_refusal`]. Without it, a fake over a real child answers
     /// that child's, and any other panics.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub(crate) fn with_kill_refusal(self, refusal: KillRefusal) -> Self {
         self.script().kill_refusal = Some(refusal);
         self
@@ -316,7 +313,6 @@ impl OsChild for FakeProcess {
         stated.or_else(|| self.0.real.as_ref().and_then(|real| real.pid()))
     }
 
-    #[cfg(any(target_os = "linux", windows))]
     fn kill_refusal(&self) -> KillRefusal {
         let stated = self.script().kill_refusal;
         match (stated, &self.0.real) {

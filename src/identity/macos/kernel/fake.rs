@@ -114,16 +114,6 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
-    /// Every peek of `pid` that no once row answers answers `answer()`.
-    pub(crate) fn on_every_peek(
-        mut self,
-        pid: u32,
-        answer: impl Fn() -> io::Result<Option<Record>> + Send + Sync + 'static,
-    ) -> Self {
-        self.peeks.push_every(pid, answer);
-        self
-    }
-
     /// The next unique-id read of `pid` answers `answer`.
     pub(crate) fn on_unique_info(mut self, pid: RawPid, answer: UniqRead) -> Self {
         self.unique_infos.push(pid, answer);

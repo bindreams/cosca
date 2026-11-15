@@ -6,8 +6,6 @@
 //! (`HostKernel`) and every Linux peek (a `waitid` on a pidfd). Code over a macOS `Kernel` states
 //! `FakeKernel` peek and consume rows instead.
 
-#[cfg(target_os = "macos")]
-use std::cell::Cell;
 use std::cell::RefCell;
 use std::io;
 
@@ -15,8 +13,6 @@ use crate::os_process::child::PeekOutcome;
 
 thread_local! {
     static FORCED_PEEK: RefCell<std::collections::VecDeque<io::Result<PeekOutcome>>> = const { RefCell::new(std::collections::VecDeque::new()) };
-    #[cfg(target_os = "macos")]
-    static FORCED_SI_CODE: Cell<Option<i32>> = const { Cell::new(None) };
 }
 
 /// Disarms an unconsumed force on drop.
@@ -50,16 +46,4 @@ pub(crate) fn assert_peeks_exhausted() {
 
 pub(crate) fn take_forced_peek() -> Option<io::Result<PeekOutcome>> {
     FORCED_PEEK.with(|f| f.borrow_mut().pop_front())
-}
-
-/// The next consuming `waitid` on this thread hands back a record with this `si_code`.
-#[cfg(target_os = "macos")]
-pub(crate) fn force_consuming_record_once(si_code: i32) -> Forced {
-    FORCED_SI_CODE.with(|f| f.set(Some(si_code)));
-    Forced(|| FORCED_SI_CODE.with(|f| f.set(None)))
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn take_forced_si_code() -> Option<i32> {
-    FORCED_SI_CODE.with(Cell::take)
 }

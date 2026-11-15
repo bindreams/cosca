@@ -378,7 +378,7 @@ pub(crate) use dispatch::DropView;
     unused_imports,
     reason = "not every re-exported name here is consumed on every target/feature combination; re-exporting uniformly beats per-item cfg_attr gating"
 )]
-pub(crate) use dispatch::{attach, prepare, Attachment, Prepared, RootIdentity, TreeKilled};
+pub(crate) use dispatch::{attach, prepare, Attachment, Prepared, TreeKilled};
 #[allow(
     unused_imports,
     reason = "a mechanism is named outside containment/ only by tests and the macOS late spawn"

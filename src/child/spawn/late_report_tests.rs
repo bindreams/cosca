@@ -10,36 +10,33 @@ use crate::test_child::Console;
 use std::rc::Rc;
 
 use super::identity_macos_tests::{
-    end_unsignalled_and_reap, has_not_exited, is_reaped, other_unique_id, reap_by_pid, refuse_the_kill,
-    std_blocker_with_unique, sync_blocker,
+    end_unsignalled_and_reap, has_not_exited, is_reaped, reap_by_pid, refuse_the_kill, std_blocker_with_unique,
+    sync_blocker,
 };
 use super::unique_report;
-use super::{LateTree, Sweep};
 use crate::error::ChildFate;
-use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
 use crate::os_process::child::PeekOutcome;
 use crate::test_groups::{stray_signal, tracer_group, Group};
-use crate::wait::exit_only::seams::{force_peek_once, force_peeks};
+use crate::wait::exit_only::seams::force_peeks;
 
 // What the one warn says =====
 
-/// The sentence for a kill that was sent, and a child that was reaped.
-pub(crate) const SAID_REAPED: &str = "was sent SIGKILL; it was reaped";
-/// ... for a kill that was sent, and a status that was not collected.
-pub(crate) const SAID_KILLED: &str = "was sent SIGKILL; its status was not collected";
+/// The clause for a kill that was sent, and a child that was reaped.
+pub(crate) const SAID_REAPED: &str = "reaped it after the kill";
+/// ... for a child whose exit someone else collected (after a kill that was sent, or none).
+pub(crate) const SAID_REAPED_ELSEWHERE: &str = "reaped by someone else";
 /// ... for a kill that failed, and a child still running.
-pub(crate) const SAID_REFUSED_RUNNING: &str = "could not be killed (";
-pub(crate) const SAID_STILL_RUNNING: &str = "it is still running";
-/// ... for a kill that sent nothing.
-pub(crate) const SAID_NOT_SENT: &str = "its pid names another process, so nothing was sent";
-pub(crate) const ZOMBIE: &str = "stays a zombie once it exits";
+pub(crate) const SAID_REFUSED_RUNNING: &str = "could not be terminated (";
+/// ... where a child the teardown could not end goes.
+pub(crate) const HANDED_BACK: &str = "handed back to the caller in the error";
 
-/// The `warn`s since `mark` that name `pid` as `child {pid} `, on this thread, with their text.
+/// The `warn`s since `mark` of a failed spawn's teardown that name `pid` as `child {pid} `, on this
+/// thread, with their text.
 pub(crate) fn warns_of(pid: u32, mark: usize) -> Vec<String> {
-    let prefix = format!("child {pid} ");
-    crate::log_capture::records_since_on_current_thread(mark, &prefix)
+    let named = format!("child {pid} ");
+    crate::log_capture::records_since_on_current_thread(mark, &named)
         .into_iter()
-        .filter(|(level, text)| *level == log::Level::Warn && text.starts_with(&prefix))
+        .filter(|(level, text)| *level == log::Level::Warn && text.starts_with("teardown after a failed spawn: "))
         .map(|(_, text)| text)
         .collect()
 }
@@ -118,7 +115,12 @@ fn macos_sync_spawn_of_a_late_reporting_child_kills_and_reaps_it_through_its_id(
     assert!(is_reaped(pid), "nothing is left to wait for");
     let said = crate::error::said(&err);
     assert!(said.contains("exec cannot be confirmed"), "{said}");
-    assert_one_warn(pid, mark, &[SAID_REAPED], &[SAID_REFUSED_RUNNING, SAID_NOT_SENT]);
+    assert_one_warn(
+        pid,
+        mark,
+        &[SAID_REAPED],
+        &[SAID_REFUSED_RUNNING, SAID_REAPED_ELSEWHERE],
+    );
 }
 
 /// Closes this process's fds 0 and 1, and asserts they are the lowest free numbers, so that std's
@@ -290,12 +292,13 @@ fn macos_a_spawn_waiting_for_a_late_report_lets_another_spawn_complete() {
     drop(writer);
 }
 
-/// An elevation front whose report came late is sent nothing and left unreaped, as every front is.
-/// The one `warn` says so, and says nothing of a kill.
+/// An elevation front whose report came late is sent nothing and, still running, handed back to the
+/// caller in the error, as every front is. The one `warn` says so, and says nothing of a kill.
 ///
-/// Mutants: the front is killed; the front's note is dropped; the warn is the torn-down sentence.
+/// Mutants: the front is killed; the front's note is dropped; the front is left, not handed back; the
+/// warn is the torn-down sentence.
 #[skuld::test]
-fn macos_sync_spawn_of_a_late_front_leaves_it_running_and_says_so() {
+fn macos_sync_spawn_of_a_late_front_hands_it_back_and_says_so() {
     use crate::elevation::ElevatedVia;
     crate::log_capture::install();
     let (mut cmd, writer) = sync_blocker();
@@ -309,7 +312,7 @@ fn macos_sync_spawn_of_a_late_front_leaves_it_running_and_says_so() {
         cmd.spawn().expect_err("a late front is not adopted")
     };
     let said = crate::test_child::detail_of(&err);
-    let (_, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
+    let (_, fate, handed_back) = crate::test_child::expect_handed_back(err, writer);
     assert_eq!(fate, ChildFate::Running { id: None }, "a front is left running");
     let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
         panic!("the spawn captured the child");
@@ -320,13 +323,13 @@ fn macos_sync_spawn_of_a_late_front_leaves_it_running_and_says_so() {
     assert_one_warn(
         pid,
         mark,
-        &["elevation front", "left unreaped", ZOMBIE],
-        &["was sent SIGKILL", SAID_REFUSED_RUNNING, SAID_NOT_SENT],
+        &["elevation front", HANDED_BACK],
+        &["was sent SIGKILL", SAID_REFUSED_RUNNING, SAID_REAPED_ELSEWHERE],
     );
-    assert!(said.contains("; left unreaped"), "{said}");
-    // The writer stays open until the reap: closing it would let the child exit by itself.
-    end_unsignalled_and_reap(pid);
-    drop(writer);
+    assert!(said.contains(HANDED_BACK), "{said}");
+    // The handed-back front exits once its stdin closes, by itself: nothing signalled it.
+    let status = handed_back.wait();
+    assert!(status.success(), "the front was signalled: {status:?}");
 }
 
 /// The ends of a [`TREE_ARGV`] spawn the test keeps.
@@ -560,36 +563,6 @@ fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_was_not_fully_killed(
     );
 }
 
-/// A later sweep that succeeded does not show it reached what the first one missed: the note says the
-/// tree may not be fully killed, where a first failure that nothing followed says it was not.
-///
-/// Mutant: the later success erases the first failure, or the note does not tell the two apart.
-#[skuld::test]
-fn macos_late_tree_note_hedges_a_failed_sweep_a_later_sweep_followed() {
-    use crate::containment::dispatch::Unkilled;
-    let left = || {
-        Err(Unkilled {
-            members: vec![crate::error::Error::MemberNotKilled {
-                pid: 4242,
-                source: std::sync::Arc::new(crate::error::Error::Containment {
-                    detail: "refused".into(),
-                    source: None,
-                }),
-            }],
-            root: None,
-            resolved: Vec::new(),
-        })
-    };
-    let mut followed = late_root(4242, None);
-    followed.sweeps = vec![left(), Ok(())];
-    let note = followed.failure_note(true).expect("the first sweep failed");
-    assert!(note.contains("its tree may not be fully killed"), "{note}");
-    let mut alone = late_root(4242, None);
-    alone.sweeps = vec![left()];
-    let note = alone.failure_note(true).expect("the sweep failed");
-    assert!(note.contains("its tree was not fully killed"), "{note}");
-}
-
 /// A walk that left only the root is settled by the root's kill, which follows it: the grandchild is
 /// dead, and the warn says nothing of the tree, as no walk from the zombie root runs to judge it.
 ///
@@ -611,125 +584,6 @@ fn macos_late_tree_walk_that_leaves_only_the_root_is_settled_by_the_root_kill() 
         &[SAID_REAPED],
         &["tree was not", "fully killed", "was not killed"],
     );
-}
-
-/// A walk that left only the root is settled by the root's kill only when that kill ended the root.
-/// A root whose kill was refused or could not be verified is still running, so the note names it.
-///
-/// Mutant: `failure_note` treats the root as ended whatever its kill did.
-#[skuld::test]
-fn macos_late_tree_names_a_root_the_walk_left_unless_the_root_kill_ended_it() {
-    use crate::containment::dispatch::Unkilled;
-    let root_left = || LateTree {
-        tree: None,
-        sweep: Sweep::RootAlive,
-        pid: 4242,
-        unique: 1,
-        id: None,
-        sweeps: vec![Err(Unkilled {
-            members: Vec::new(),
-            root: Some(Box::new(crate::error::Error::MemberNotKilled {
-                pid: 4242,
-                source: std::sync::Arc::new(crate::error::Error::Containment {
-                    detail: "refused".into(),
-                    source: None,
-                }),
-            })),
-            resolved: Vec::new(),
-        })],
-        notes: Vec::new(),
-        failures: Vec::new(),
-    };
-
-    let mut ended = root_left();
-    assert_eq!(ended.failure_note(true), None, "the root's kill ended it");
-    assert!(ended.failures.is_empty(), "{:?}", ended.failures);
-    let mut running = root_left();
-    let named = running.failure_note(false).expect("the root is still running");
-    assert!(named.contains("pid 4242 was not killed"), "{named}");
-    assert_eq!(running.failures.len(), 1, "{:?}", running.failures);
-    // The held error says its own layer (a member left); the member is below it, with its cause.
-    let held = crate::error::said(&*running.failures[0]);
-    assert!(
-        held.contains("pid 4242 was not killed") && held.contains("refused"),
-        "the failure is held as an error: {held}"
-    );
-}
-
-/// A late child's root with `id`, for [`Root::signal`](crate::containment::Root::signal).
-fn late_root(pid: u32, id: Option<crate::identity::ProcessId>) -> LateTree {
-    LateTree {
-        tree: None,
-        sweep: Sweep::RootAlive,
-        pid,
-        unique: 1,
-        id,
-        sweeps: Vec::new(),
-        notes: Vec::new(),
-        failures: Vec::new(),
-    }
-}
-
-/// A late child whose attach read no identity has nothing to open, so its root's send is
-/// `Unassessable` and nothing is sent. Mutant: the send is `Gone` or goes by the pid.
-#[skuld::test]
-fn a_late_roots_send_without_an_identity_is_unassessable_and_sends_nothing() {
-    use crate::containment::Root as _;
-    let sends = crate::send_log::Capture::start();
-    let err = late_root(4242, None)
-        .signal(crate::signal::Sig::Kill)
-        .expect_err("no identity, no send");
-    let crate::error::Error::Unassessable { detail, .. } = &err else {
-        panic!("expected Unassessable, got {err:?}");
-    };
-    assert!(detail.contains("no identity to open it by"), "{detail}");
-    assert_eq!(sends.by_identity(), vec![], "nothing was sent");
-}
-
-/// A late child whose identity cannot be opened is the open's error, with the errno kept, and
-/// nothing is sent. Mutant: the open's failure reads as `Gone`.
-#[skuld::test]
-fn a_late_roots_send_whose_open_is_refused_is_the_opens_error() {
-    use crate::containment::Root as _;
-    let (mut child, _stdin, _) = std_blocker_with_unique();
-    let id = crate::identity::ProcessId::of(child.id())
-        .found()
-        .expect("a live child");
-    let sends = crate::send_log::Capture::start();
-    let _refused = uniq_fault::force_uniq_read_once(ReadPurpose::Open, UniqRead::Refused(libc::EPERM));
-    let err = late_root(child.id(), Some(id))
-        .signal(crate::signal::Sig::Kill)
-        .expect_err("a refused open is an error");
-    let crate::error::Error::Unassessable {
-        source: Some(source), ..
-    } = &err
-    else {
-        panic!("expected Unassessable with its cause, got {err:?}");
-    };
-    assert_eq!(crate::error::first_os_code(source), Some(libc::EPERM), "{err:?}");
-    assert_eq!(sends.by_identity(), vec![], "nothing was sent");
-    _ = child.kill();
-    _ = child.wait();
-}
-
-/// A late child whose pid names another process now is `Gone`: nothing is sent to the stranger.
-/// Mutant: the root is signalled by its pid.
-#[skuld::test]
-fn a_late_roots_send_to_a_recycled_pid_is_gone_and_sends_nothing() {
-    use crate::containment::Root as _;
-    let (mut child, _stdin, _) = std_blocker_with_unique();
-    let id = crate::identity::ProcessId::of(child.id())
-        .found()
-        .expect("a live child");
-    let sends = crate::send_log::Capture::start();
-    let sent = late_root(child.id(), Some(id.with_other_value()))
-        .signal(crate::signal::Sig::Kill)
-        .expect("a recycled pid is no error");
-    assert_eq!(sent, crate::signal::Sent::Gone);
-    assert_eq!(sends.by_identity(), vec![], "nothing was sent to the stranger");
-    assert!(child.try_wait().expect("try_wait").is_none(), "the stranger still runs");
-    _ = child.kill();
-    _ = child.wait();
 }
 
 /// A Session child without a marker, held between its report and its `setsid`, is torn down with
@@ -865,7 +719,7 @@ fn macos_sync_spawn_of_a_late_child_reaped_before_its_teardown_kills_its_marked_
     assert_one_warn(
         id.pid(),
         mark,
-        &[SAID_NOT_SENT, "reached only through its marker's holders"],
+        &[SAID_REAPED_ELSEWHERE, "reached only through its marker's holders"],
         &["was sent SIGKILL", "fully killed", "tree was not killed"],
     );
 }
@@ -977,12 +831,45 @@ fn tear_down_warning_after(
         move || drop(stdin.take())
     });
     let mark = crate::log_capture::mark();
+    // The forced answers are still armed when they are counted: a look the teardown stopped making
+    // fails here, and not as an answer that was never given.
     let _armed = arm(pid);
-    let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, prepared, warn_after);
-    let tail = done.zombie_tail();
-    let (fate, _failures) = done.warn(pid, tail);
-    drop(child);
+    let (fate, _cleanup) = abandon(prepared, warn_after, child, unique);
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     (fate, warns_of(pid, mark), sent.entries())
+}
+
+/// The teardown of a late child (a real blocker with the id `unique`) as the spawn makes it: its
+/// fate, and what failed in it. A child the teardown hands back is given up unreaped, still running
+/// if its kill was refused, for the test to end.
+fn abandon(
+    prepared: crate::containment::Prepared,
+    warn_after: Option<std::time::Duration>,
+    child: std::process::Child,
+    unique: u64,
+) -> (ChildFate, Option<crate::error::Failures>) {
+    use crate::child::spawn::failure::SpawnFailure;
+    use crate::child::spawn::policy::SpawnPolicy;
+
+    let policy = SpawnPolicy {
+        teardown_warn_after: warn_after,
+        ..SpawnPolicy::SYNC
+    };
+    let error = crate::error::Error::Io(std::io::Error::other("the late child was not adopted"));
+    let failure = super::late_child::abandon_late_child(child, unique, error, None, prepared, policy);
+    let SpawnFailure::MayHaveStarted {
+        fate,
+        unreaped,
+        cleanup,
+        ..
+    } = failure
+    else {
+        panic!("a late child's failure says the program may have started: {failure:?}");
+    };
+    if let Some(unreaped) = unreaped {
+        unreaped.leak();
+    }
+    (fate, cleanup)
 }
 
 /// A refused kill of a late child is returned for the spawn's `cleanup` as the error the OS gave, beside
@@ -1001,17 +888,13 @@ fn macos_late_teardown_returns_a_refused_kill_for_the_cleanup() {
     };
     let _refused = refuse_the_kill();
 
-    let done = crate::child::spawn::kill_and_reap_unreported(pid, unique, uncontained, None);
-    let (fate, failures) = done.warn(pid, None);
+    let (fate, failures) = abandon(uncontained, None, child, unique);
 
     assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
     let failures = failures.expect("the kill was refused");
     assert_eq!(failures.iter().len(), 1, "{failures:?}");
-    assert!(
-        matches!(&**failures.first(), crate::error::Error::Io(_)),
-        "{failures:?}"
-    );
-    drop(child);
+    let said = crate::error::said(&**failures.first());
+    assert!(said.contains("killing the child"), "{said}");
     end_unsignalled_and_reap(pid);
 }
 
@@ -1032,56 +915,15 @@ fn macos_late_teardown_of_a_live_child_is_reaped() {
     assert_eq!(fate, ChildFate::Reaped);
     let warn = only(&warns);
     assert_kill_sent(pid, &sent);
-    assert!(warn.contains(SAID_REAPED) && !warn.contains(ZOMBIE), "{warn}");
+    assert!(warn.contains(SAID_REAPED) && !warn.contains(HANDED_BACK), "{warn}");
 }
 
-/// A wait for the killed child that passes its threshold says so once, naming the child, and keeps
-/// waiting: the child is still reaped, and the event's own `warn` follows. The first two looks at the
-/// child are forced to find it running, so the threshold (zero here) expires before it is seen dead.
+/// A refused kill leaves the child running: the sentence says the kill failed and where the child
+/// goes (handed back in the error), never that a kill was sent or did not end it.
 ///
-/// Mutants: no slow-wait `warn`; the `warn` repeats; the wait gives up at the threshold.
+/// Mutants: a refused kill is worded as a sent one; the hand-back is not said.
 #[skuld::test]
-fn macos_late_teardown_whose_wait_passes_its_threshold_warns_once_and_still_reaps() {
-    let (child, stdin, unique) = std_blocker_with_unique();
-    let stdin = Rc::new(Cell::new(Some(stdin)));
-    let pid = child.id();
-    let uncontained = crate::containment::Prepared {
-        mode: None,
-        is_root: true,
-        marker: None,
-    };
-    let (fate, warns, sent) = tear_down_warning_after(
-        uncontained,
-        Some(std::time::Duration::ZERO),
-        child,
-        &stdin,
-        unique,
-        |_| {
-            vec![Box::new(force_peeks([
-                Ok(PeekOutcome::Running),
-                Ok(PeekOutcome::Running),
-            ]))]
-        },
-    );
-    crate::wait::exit_only::seams::assert_peeks_exhausted();
-    assert_eq!(fate, ChildFate::Reaped, "the wait goes on past the threshold");
-    assert_kill_sent(pid, &sent);
-    assert_eq!(warns.len(), 2, "the slow wait, then the event: {warns:?}");
-    assert!(
-        warns[0].contains("not reapable")
-            && warns[0].contains("a tracer holds its exit")
-            && warns[0].contains("still waiting for it to exit"),
-        "{warns:?}"
-    );
-    assert!(warns[1].contains(SAID_REAPED), "{warns:?}");
-}
-
-/// A refused kill leaves the child running: the sentence says the kill failed and the child runs,
-/// never that a kill was sent or did not end it, and a sync child is left a zombie, which it says.
-///
-/// Mutants: a refused kill is worded as a sent one; the zombie is not said.
-#[skuld::test]
-fn macos_late_teardown_with_a_refused_kill_leaves_it_running_and_says_so() {
+fn macos_late_teardown_with_a_refused_kill_hands_it_back_and_says_so() {
     let (child, stdin, unique) = std_blocker_with_unique();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
@@ -1090,7 +932,7 @@ fn macos_late_teardown_with_a_refused_kill_leaves_it_running_and_says_so() {
     let warn = only(&warns);
     assert_eq!(sent, [], "a refused kill sends nothing");
     assert!(
-        warn.contains(SAID_REFUSED_RUNNING) && warn.contains(SAID_STILL_RUNNING) && warn.contains(ZOMBIE),
+        warn.contains(SAID_REFUSED_RUNNING) && warn.contains(HANDED_BACK),
         "{warn}"
     );
     assert!(
@@ -1101,7 +943,8 @@ fn macos_late_teardown_with_a_refused_kill_leaves_it_running_and_says_so() {
 }
 
 /// A refused kill of a child whose tree attach read its identity: the child is left running, and its
-/// fate names it by that identity. The tree walk is forced blind, so it kills nothing.
+/// fate names it by that identity. Both of the tree's walks (before the root's kill, and after it,
+/// the root still alive and ours) are forced blind, so they kill nothing.
 ///
 /// Mutant: the teardown drops the attach's identity (`Running { id: None }`).
 #[skuld::test]
@@ -1115,69 +958,74 @@ fn macos_late_teardown_of_a_contained_child_with_a_refused_kill_names_it_running
         marker: None,
     };
     let (fate, _warns, sent) = tear_down_with(walked, child, &stdin, unique, |_| {
-        crate::containment::enumerate::force_blind_snapshots(1);
+        crate::containment::enumerate::force_blind_snapshots(2);
         vec![Box::new(refuse_the_kill())]
     });
+    crate::containment::enumerate::assert_blind_snapshots_consumed();
     assert!(
         matches!(fate, ChildFate::Running { id: Some(id) } if id.pid() == pid),
         "{fate:?}"
     );
-    assert_eq!(sent, [], "a refused kill and a blind walk send nothing");
+    assert_eq!(sent, [], "a refused kill and blind walks send nothing");
     end_unsignalled_and_reap(pid);
 }
 
-/// An id read that shows the pid gone or another process's sends nothing: `Gone`, and the sentence
-/// says nothing was sent, never that a kill was.
+/// A child someone else reaped before its teardown sends nothing: the kill finds the pid gone, and
+/// the teardown says it was reaped by someone else, never that a kill was sent. The fate is `Gone`:
+/// cosca delivered nothing.
 ///
 /// Mutant: the no-send is worded as a sent kill.
 #[skuld::test]
-fn macos_late_teardown_of_a_pid_that_is_not_the_child_sends_nothing_and_is_gone() {
+fn macos_late_teardown_of_a_child_reaped_before_the_teardown_sends_nothing_and_is_gone() {
     let (child, stdin, unique) = std_blocker_with_unique();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
-    let other = other_unique_id(pid);
-    let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
-        vec![Box::new(uniq_fault::force_uniq_read_once(ReadPurpose::Kill, other))]
+    let (fate, warns, sent) = tear_down(child, &stdin, unique, |pid| {
+        // SAFETY: `pid` is this test's own child.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        reap_by_pid(pid);
+        vec![]
     });
     assert_eq!(fate, ChildFate::Gone);
     let warn = only(&warns);
     assert_eq!(sent, [], "nothing is sent to a pid that is not the child");
-    assert!(warn.contains(SAID_NOT_SENT) && warn.contains("it is gone"), "{warn}");
+    assert!(warn.contains(SAID_REAPED_ELSEWHERE), "{warn}");
     assert!(
-        !warn.contains("was sent SIGKILL") && !warn.contains("signalled"),
+        !warn.contains("was sent SIGKILL") && !warn.contains("signalled") && !warn.contains(&format!("{pid} was sent")),
         "{warn}"
     );
-    end_unsignalled_and_reap(pid);
 }
 
-/// A refused kill and a refused id read: nothing shows what became of the child, `Unknown`.
+/// A refused kill and a peek of the child that fails: nothing shows what became of it, `Unknown`.
+/// The box's wait reads the child unverified, so a refused id read alone leaves it `Running`; the
+/// peek is forced to fail, as the OS's refusal of it does when the child is not ours to see.
 ///
 /// Mutant: the arm answers `Running` or `Reaped`.
 #[skuld::test]
-fn macos_late_teardown_with_a_refused_kill_and_a_refused_read_is_unknown() {
+fn macos_late_teardown_with_a_refused_kill_and_a_failed_peek_is_unknown() {
     let (child, stdin, unique) = std_blocker_with_unique();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
         vec![
             Box::new(refuse_the_kill()),
-            Box::new(uniq_fault::force_uniq_read_once(
-                ReadPurpose::Running,
-                UniqRead::Refused(libc::EPERM),
-            )),
+            Box::new(force_peeks([Err(std::io::Error::from_raw_os_error(libc::EPERM))])),
         ]
     });
     assert_eq!(fate, ChildFate::Unknown);
     let warn = only(&warns);
     assert_eq!(sent, [], "a refused kill sends nothing");
     assert!(
-        warn.contains(SAID_REFUSED_RUNNING) && warn.contains("what became of it is unknown"),
+        warn.contains(SAID_REFUSED_RUNNING) && warn.contains("the wait failed"),
         "{warn}"
     );
     end_unsignalled_and_reap(pid);
 }
 
-/// A delivered kill, then a wait that shows someone else reaped the child (`Waited::Gone`): `Killed`.
+/// A delivered kill, then a wait that shows someone else reaped the child: `Killed`.
+///
+/// The first forced answer is the teardown's look at whether the root is a zombie of ours; the second
+/// is the wait's.
 ///
 /// Mutant: the arm says the child was reaped, or `Gone`.
 #[skuld::test]
@@ -1187,15 +1035,18 @@ fn macos_late_teardown_of_a_child_reaped_elsewhere_after_the_kill_is_killed() {
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
-        vec![Box::new(force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Gone))))]
+        vec![Box::new(force_peeks([
+            Ok(PeekOutcome::Foreign(Foreign::Gone)),
+            Ok(PeekOutcome::Foreign(Foreign::Gone)),
+        ]))]
     });
     assert_eq!(fate, ChildFate::Killed);
     assert_kill_sent(pid, &sent);
-    assert!(only(&warns).contains(SAID_KILLED), "{warns:?}");
+    assert!(only(&warns).contains(SAID_REAPED_ELSEWHERE), "{warns:?}");
     reap_by_pid(pid);
 }
 
-/// A delivered kill, then a zombie launchd holds (`Waited::Orphaned`): `Killed`, and the warn says why.
+/// A delivered kill, then a zombie launchd holds: `Killed`, and the warn says why.
 ///
 /// Mutant: the arm says the child was reaped.
 #[skuld::test]
@@ -1205,19 +1056,20 @@ fn macos_late_teardown_of_an_orphaned_zombie_after_the_kill_is_killed_and_says_s
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
-        vec![Box::new(force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Orphaned))))]
+        vec![Box::new(force_peeks([
+            Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
+            Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
+        ]))]
     });
     assert_eq!(fate, ChildFate::Killed);
     assert_kill_sent(pid, &sent);
     let warn = only(&warns);
-    assert!(
-        warn.contains(SAID_KILLED) && warn.contains("launchd holds its zombie"),
-        "{warn}"
-    );
+    assert!(warn.contains("launchd holds its zombie"), "{warn}");
     reap_by_pid(pid);
 }
 
-/// A delivered kill, then a failed wait: `Killed`, with the failure in the warn.
+/// A delivered kill, then a failed wait: `Killed`, with the failure in the warn. The first forced
+/// answer is the teardown's look at whether the root is a zombie of ours.
 ///
 /// Mutant: the arm says the child was reaped.
 #[skuld::test]
@@ -1226,41 +1078,16 @@ fn macos_late_teardown_with_a_failed_wait_is_killed() {
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
-        vec![Box::new(force_peek_once(Err(std::io::Error::other(
-            "forced wait failure",
-        ))))]
+        vec![Box::new(force_peeks([
+            Ok(PeekOutcome::Running),
+            Err(std::io::Error::other("forced wait failure")),
+        ]))]
     });
     assert_eq!(fate, ChildFate::Killed);
     assert_kill_sent(pid, &sent);
     let warn = only(&warns);
     assert!(
-        warn.contains(SAID_KILLED) && warn.contains("forced wait failure"),
-        "{warn}"
-    );
-    reap_by_pid(pid);
-}
-
-/// A delivered kill, a wait that sees the exit, then a reap whose peek is refused: the child is
-/// dead and its status is not shown ours to take, `Unknown`.
-///
-/// Mutant: the arm says the child was reaped.
-#[skuld::test]
-fn macos_late_teardown_whose_reap_peek_fails_after_the_kill_is_unknown() {
-    use crate::os_process::child::ExitRecord;
-    let (child, stdin, unique) = std_blocker_with_unique();
-    let stdin = Rc::new(Cell::new(Some(stdin)));
-    let pid = child.id();
-    let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
-        vec![Box::new(force_peeks([
-            Ok(PeekOutcome::Exit(ExitRecord::Unreadable { si_code: 0 })),
-            Err(std::io::Error::other("forced reap-peek failure")),
-        ]))]
-    });
-    assert_eq!(fate, ChildFate::Unknown);
-    assert_kill_sent(pid, &sent);
-    let warn = only(&warns);
-    assert!(
-        warn.contains("was sent SIGKILL") && warn.contains("what became of it is unknown"),
+        warn.contains("the wait failed") && warn.contains("forced wait failure"),
         "{warn}"
     );
     reap_by_pid(pid);
@@ -1315,7 +1142,13 @@ fn late_tree_not_zombie(
         move || {
             let holders = crate::containment::fdmarker::fault::holder_kills_so_far();
             marks.set((walks.walked().len(), holders.len()));
-            *forced.borrow_mut() = Some(force_peek_once(Ok(PeekOutcome::Foreign(waited))));
+            // The teardown's look at whether the root is a zombie of ours, the box's look at the
+            // second sweep's send, then the wait's.
+            *forced.borrow_mut() = Some(force_peeks([
+                Ok(PeekOutcome::Foreign(waited)),
+                Ok(PeekOutcome::Foreign(waited)),
+                Ok(PeekOutcome::Foreign(waited)),
+            ]));
         }
     });
     let mark = crate::log_capture::mark();
@@ -1323,6 +1156,7 @@ fn late_tree_not_zombie(
         let _late = unique_report::seams::find_the_report_unwritten();
         cmd.spawn().expect_err("a late child is not adopted")
     };
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
     drop(forced.borrow_mut().take());
     let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
     let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
@@ -1375,8 +1209,10 @@ fn macos_late_marked_tree_whose_root_is_not_shown_a_zombie_still_sweeps_its_hold
         "the root's pid is not walked again"
     );
     assert_eq!(seen.fate, ChildFate::Killed);
+    // A root reaped elsewhere is no reason a kill makes moot, so the skip is a failure of the tree's
+    // kill, not the note that the root's pid was not used again.
     assert!(
-        seen.warn.contains(NOT_SWEPT_AGAIN) && seen.warn.contains("its tree was not fully killed"),
+        seen.warn.contains("its tree was not fully killed") && !seen.warn.contains(NOT_SWEPT_AGAIN),
         "{}",
         seen.warn
     );
@@ -1406,12 +1242,13 @@ fn macos_late_walked_tree_whose_root_is_not_shown_a_zombie_is_not_walked_again()
     assert!(seen.warn.contains(NOT_SWEPT_AGAIN), "{}", seen.warn);
 }
 
-/// A Session tree whose root is shown gone after its kill: the warn says its group was not killed
-/// again.
+/// A Session tree whose root was reaped elsewhere after its kill: the root's number may name another
+/// process, which a kill does not make moot, so the warn says the tree was not fully killed because
+/// its group was not killed again.
 ///
-/// Mutant: the note is dropped.
+/// Mutant: the skip is taken for a moot one, and only the note that the pid was not used again is said.
 #[skuld::test]
-fn macos_late_session_tree_whose_root_is_not_shown_a_zombie_says_so() {
+fn macos_late_session_tree_whose_root_was_reaped_elsewhere_after_its_kill_says_its_group_was_not_killed() {
     use crate::containment::ContainMode;
     let seen = late_tree_not_zombie(
         |cmd| {
@@ -1422,7 +1259,13 @@ fn macos_late_session_tree_whose_root_is_not_shown_a_zombie_says_so() {
     );
     assert!(!seen.survived, "the first sweep kills the grandchild");
     assert_eq!(seen.fate, ChildFate::Killed);
-    assert!(seen.warn.contains(NOT_SWEPT_AGAIN), "{}", seen.warn);
+    assert!(
+        seen.warn.contains("its tree was not fully killed")
+            && seen.warn.contains("so its tree did not kill its process group")
+            && !seen.warn.contains(NOT_SWEPT_AGAIN),
+        "{}",
+        seen.warn
+    );
 }
 
 /// Resets a spawn fault flag when dropped.
@@ -1534,19 +1377,6 @@ fn macos_late_teardown_whose_tree_attach_fails_says_its_tree_was_not_killed() {
         warn.contains("its tree was not killed: ") && warn.contains("forced attach failure"),
         "{warn}"
     );
-}
-
-/// A child that could not be verified is said to be unsignalled for that reason, never gone.
-///
-/// Mutant: the outcome is worded as the no-send of a pid that names another process.
-#[skuld::test]
-fn macos_an_unverified_child_is_said_to_be_unsignalled_because_it_could_not_be_verified() {
-    let said = super::said(&super::KillOutcome::Unverified, ChildFate::Running { id: None });
-    assert!(
-        said.contains("could not be verified, so it was not signalled"),
-        "{said}"
-    );
-    assert!(!said.contains("was gone"), "{said}");
 }
 
 /// A root reaped by another reaper after the look that decides the sweep after its kill, and before

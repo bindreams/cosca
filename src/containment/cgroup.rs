@@ -27,7 +27,7 @@
 //!
 //! # Placement reports: when one is final, and what cosca may kill
 //! Every decision about a leaf rests on these rules. `take_placement`,
-//! `abandon_before_verdict` and `Drop` each apply them; none has a rule of its own.
+//! `abandon_without_child` and `Drop` each apply them; none has a rule of its own.
 //!
 //! **Messages.** In its `pre_exec` the child sends, in order: an *intent*, carrying its pid,
 //! before it touches the leaf; then, after its `cgroup.procs` write, its *report* — `Placed` or
@@ -62,7 +62,7 @@
 //! itself, through its pidfd, whatever the leaf's kill returned — it may have left the leaf, or
 //! never entered it — and, when it exec'd outside the leaf, as the process group it leads. An
 //! elevation front is sent nothing: an exited one is reaped, and one its leaf's kill reached is
-//! waited for (see `abandon_before_verdict`).
+//! waited for (see `tear_down_held`, which looks at it through the leaf's `Subtree`).
 //!
 //! **Ownership.** The child is this process's own, but another reaper in the process may reap it
 //! (see `Command::contain`), so cosca looks at it through its handle before anything it sends by

@@ -1021,7 +1021,7 @@ jobs:
           dir="$RUNNER_TEMP/old-kernel-$KERNEL"
           mkdir -p "$dir"
           rm -f "$dir/result"
-          vng --run "$KERNEL" --verbose --append psi=0 --user root --cpus 2 --memory 2G --rwdir "$dir" \
+          vng --run "$KERNEL" --verbose --append psi=0 --user root --cpus 2 --memory 4G --rwdir "$dir" \
             --exec "env PATH='$PATH' HOME='$HOME' CARGO_HOME='${CARGO_HOME:-$HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$HOME/.rustup}' bash '$PWD/.github/scripts/shim-old-kernel-guest.sh' '$KERNEL' '$dir/result' '$(id -u)' '$(id -g)' '$COSCA_TESTBIN'" \
             2>&1 | tee "$dir/log"
 
@@ -1063,7 +1063,7 @@ jobs:
           dir="$RUNNER_TEMP/old-kernel-$KERNEL"
           mkdir -p "$dir"
           rm -f "$dir/result"
-          vng --run "$KERNEL" --verbose --append psi=0 --user root --cpus 2 --memory 2G --rwdir "$dir" \
+          vng --run "$KERNEL" --verbose --append psi=0 --user root --cpus 2 --memory 4G --rwdir "$dir" \
             --exec "env PATH='$PATH' HOME='$HOME' CARGO_HOME='${CARGO_HOME:-$HOME/.cargo}' RUSTUP_HOME='${RUSTUP_HOME:-$HOME/.rustup}' bash '$PWD/.github/scripts/shim-old-kernel-guest.sh' '$KERNEL' '$dir/result' '$(id -u)' '$(id -g)' '$COSCA_TESTBIN'" \
             2>&1 | tee "$dir/log"
 

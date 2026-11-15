@@ -32,6 +32,8 @@ use crate::stdio::{Direction, Fd, ResolvedStdio};
 // A child-side descriptor handed to std via `Stdio::from`.
 #[cfg(unix)]
 pub(crate) type ChildEnd = std::os::unix::io::OwnedFd;
+#[cfg(target_os = "linux")]
+use crate::child::owned::teardown::Reach;
 #[cfg(windows)]
 pub(crate) use windows_child_end::ChildEnd;
 
@@ -726,22 +728,29 @@ fn spawn_reported(
         use std::os::windows::io::AsRawHandle;
         owned.os_handle().as_raw_handle()
     };
+    // macOS has no handle: the unique id the child reported before `exec` is what the `OwnedChild`
+    // names it by, and the identity is checked against. The report decides first: a child that died
+    // before `exec` is that, whatever an attach would find of its pid.
     #[cfg(target_os = "macos")]
-    let pid = child.id();
-    // macOS has no handle: the unique id the child reported before `exec` is what the identity is
-    // checked against and the shared child is adopted with. The report decides first: a child that
-    // died before `exec` is that, whatever an attach would find of its pid.
-    #[cfg(target_os = "macos")]
-    let unique = match unique_report::adopted_id(unique, pid) {
-        Ok(unique) => unique,
-        Err(not_adopted) => {
-            return Err(abandon_unadopted(
-                child,
-                not_adopted,
-                front,
-                prepared,
-                policy.teardown_warn_after,
-            ))
+    let (pid, owned) = {
+        let pid = child.id();
+        #[cfg(test)]
+        fault::run_at(fault::SpawnPoint::BeforeAdopt, pid);
+        let unique = match unique_report::adopted_id(unique, pid) {
+            Ok(unique) => unique,
+            Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, front, prepared, policy)),
+        };
+        // A refused kqueue is the one way to fail, and no box exists then ([`leave_unwatched_child`]).
+        match crate::os_process::macos::child::MacosChild::new(crate::identity::HostKernel, pid, unique) {
+            Ok(os) => {
+                drop(child);
+                (pid, OwnedChild::new(Box::new(os)))
+            }
+            Err(refusal) => {
+                return Err(leave_unwatched_child(
+                    child, pid, unique, front, prepared, refusal, None,
+                ))
+            }
         }
     };
     // A front's leaf subtree, captured while it exists: a failure arm drops the leaf, killing it.
@@ -761,8 +770,6 @@ fn spawn_reported(
     fault::run_at(fault::SpawnPoint::BeforeIdentity, pid);
     #[cfg(target_os = "linux")]
     let through = crate::wait::exit_only::Target::PidFd(owned.os_handle());
-    #[cfg(target_os = "macos")]
-    let through = crate::wait::exit_only::Target::pid(&crate::identity::HostKernel, pid, Some(unique));
     #[cfg(windows)]
     let through = crate::wait::exit_only::Target::Handle(owned.os_handle());
     #[cfg(target_os = "linux")]
@@ -771,10 +778,12 @@ fn spawn_reported(
         pidfd: owned.os_handle(),
     };
     let (resolved, cause, mut why) = resolve_identity(
-        #[cfg(not(target_os = "macos"))]
         &crate::identity::HostKernel,
         pid,
+        #[cfg(not(target_os = "macos"))]
         &through,
+        #[cfg(target_os = "macos")]
+        &owned,
     );
     let id = match resolved {
         crate::identity::Resolved::Found(id) => Ok(id),
@@ -823,15 +832,9 @@ fn spawn_reported(
             if front.is_none() {
                 note_group_left_running(&prepared, pid, &mut why);
             }
-            #[cfg(target_os = "macos")]
-            let (fate, child_fate) = {
-                let identity = crate::containment::RootIdentity::Gone;
-                let child_fate = leave_unverified_child(child, identity, None, &mut why);
-                (front.map(|_| FrontFate::of_unverified(identity)), child_fate)
-            };
             let error = spawn_identity_error(other, cause);
             // A child the teardown could not end comes back in the error.
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             let (
                 detail,
                 Torn {
@@ -844,7 +847,10 @@ fn spawn_reported(
                 held_teardown::HeldTeardown {
                     front,
                     id: None,
-                    subtree: subtree.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    reach: subtree.as_ref().map(|subtree| subtree as &dyn Reach),
+                    #[cfg(target_os = "macos")]
+                    reach: None,
                     disposition: crate::child::owned::teardown::Disposition::HandBack,
                     policy,
                 },
@@ -863,12 +869,6 @@ fn spawn_reported(
                 crate::child::owned::teardown::Disposition::HandBack,
                 policy,
                 &mut why,
-            );
-            #[cfg(target_os = "macos")]
-            let (detail, unreaped, cleanup) = (
-                front_detail(fate, front, Some(pid)),
-                None,
-                None::<crate::error::Failures>,
             );
             let failure = SpawnFailure::started(error, child_fate, unreaped);
             #[cfg(unix)]
@@ -897,15 +897,23 @@ fn spawn_reported(
         Ok(v) => v,
         Err(failure) => {
             log::debug!("attach failed: {report}", report = crate::error::Report(&failure.cause));
-            // Off macOS: kill + reap, since a dropped handle neither kills nor reaps. A Linux front
-            // is the exception: a failed attach has dropped the containment, a cgroup leaf's drop
-            // kills it, and the front is waited for (`tear_down_held`).
-            #[cfg(target_os = "linux")]
+            // Kill + reap, since a dropped handle neither kills nor reaps. A front is the exception:
+            // it is sent nothing (on Linux a failed attach has dropped the containment, a cgroup
+            // leaf's drop kills it, and the front is waited for): `tear_down_held`.
+            #[cfg(target_os = "macos")]
+            if id_read.is_some() {
+                assert_attach_cannot_fail(&failure.cause);
+            }
+            #[cfg(unix)]
             return Err(held_teardown::tear_down_after_failed_attach(
                 owned,
                 id_read,
                 failure,
+                #[cfg(target_os = "linux")]
                 held_teardown::unexecuted_past(id_read),
+                // A macOS attach proves nothing of the program: it is never an unexecuted one.
+                #[cfg(target_os = "macos")]
+                crate::child::owned::teardown::Past::WaitMayFail,
                 policy,
                 &mut why,
                 |owned, why| {
@@ -914,7 +922,10 @@ fn spawn_reported(
                         held_teardown::HeldTeardown {
                             front,
                             id: id_read,
-                            subtree: subtree.as_ref(),
+                            #[cfg(target_os = "linux")]
+                            reach: subtree.as_ref().map(|subtree| subtree as &dyn Reach),
+                            #[cfg(target_os = "macos")]
+                            reach: None,
                             disposition: crate::child::owned::teardown::Disposition::HandBack,
                             policy,
                         },
@@ -926,62 +937,6 @@ fn spawn_reported(
             return Err(held_teardown::tear_down_after_failed_windows_attach(
                 owned, id_read, failure, policy, &mut why,
             ));
-            // macOS: a front is left running and unreaped, sent nothing; any other child is killed
-            // and reaped through its verified unique id.
-            #[cfg(target_os = "macos")]
-            let crate::containment::dispatch::AttachFailure {
-                cause: error,
-                cleanup: attach_cleanup,
-                ..
-            } = failure;
-            #[cfg(target_os = "macos")]
-            let (fate, child_fate, teardown_cleanup) = {
-                if id_read.is_some() {
-                    assert_attach_cannot_fail(&error);
-                }
-                if front.is_some() {
-                    (
-                        Some(leave_front_after_attach_failure(child)),
-                        ChildFate::Running { id: id_read },
-                        None,
-                    )
-                } else {
-                    let (child_fate, failures) =
-                        teardown_after_attach_failure(child, unique, id_read, policy.teardown_warn_after);
-                    (None, child_fate, failures)
-                }
-            };
-            #[cfg(target_os = "macos")]
-            return Err(SpawnFailure::started(error, child_fate, None)
-                .with_detail(front_detail(fate, front, Some(pid)))
-                .with_cleanup(attach_cleanup)
-                .with_cleanup(teardown_cleanup));
-        }
-    };
-    // A refused kqueue is the one way to fail, and the child is then reachable by its unique id alone.
-    #[cfg(target_os = "macos")]
-    let owned = match crate::os_process::macos::child::MacosChild::new(crate::identity::HostKernel, pid, unique) {
-        Ok(os) => {
-            drop(child);
-            OwnedChild::new(Box::new(os))
-        }
-        Err(error) => {
-            // A front is sent nothing and left; any other child is killed and reaped through its
-            // verified unique id, as for a failed attach.
-            let (fate, child_fate, cleanup) = if front.is_some() {
-                (
-                    Some(leave_front_after_attach_failure(child)),
-                    ChildFate::Running { id: id_read },
-                    None,
-                )
-            } else {
-                let (child_fate, failures) =
-                    teardown_after_attach_failure(child, unique, id_read, policy.teardown_warn_after);
-                (None, child_fate, failures)
-            };
-            return Err(SpawnFailure::started(error, child_fate, None)
-                .with_detail(front_detail(fate, front, Some(pid)))
-                .with_cleanup(cleanup));
         }
     };
     Ok(Child::from_parts(
@@ -1009,543 +964,6 @@ pub(crate) fn assert_attach_cannot_fail(error: &Error) {
     let _ = error;
 }
 
-/// macOS: a front whose attach failed is sent nothing and left running and unreaped, with a warning:
-/// a kill would orphan the elevated program. Dropping the `std` `Child` closes our pipe ends only.
-#[cfg(target_os = "macos")]
-fn leave_front_after_attach_failure(child: std::process::Child) -> FrontFate {
-    log::warn!(
-        "{} is left running and unreaped, with nothing signalled or waited on by pid: its attach failed, and a \
-         kill would orphan the elevated program",
-        crate::elevation::front::front_named(Some(child.id()))
-    );
-    drop(child);
-    FrontFate::LeftUnreaped
-}
-
-/// macOS: a child whose attach failed is killed through its verified unique id and reaped only
-/// after that id shows the zombie is ours.
-/// - A kill that was delivered: wait for the exit, then reap once.
-/// - A child already gone: nothing to do.
-/// - A kill that failed: one verified, non-blocking reap, and the child is left.
-///
-/// The checks are not pins: macOS has no handle. The kill is exact, by audit token (the kernel
-/// checks the pid's `p_idversion`), but the reap has `try_reap`'s window between its id check and
-/// the consuming `waitid`. A child that cannot be shown ours (a refused id read) is left with a `warn`;
-/// a zombie launchd holds is not ours to reap, and is `Gone`.
-///
-/// Dropping the `std` `Child` closes our pipe ends only.
-#[cfg(target_os = "macos")]
-fn teardown_after_attach_failure(
-    child: std::process::Child,
-    unique: u64,
-    id: Option<ProcessId>,
-    warn_after: Option<std::time::Duration>,
-) -> (ChildFate, Option<Failures>) {
-    let torn = kill_and_reap_verified(child.id(), unique, id, ZOMBIE_NOTE, warn_after);
-    drop(child);
-    torn
-}
-
-/// The kill and reap of [`teardown_after_attach_failure`], for a child by its pid, whoever holds its
-/// handle. `id` is its identity, if one was read. What it cannot do is one event, so one `warn`
-/// carries every note (a verified foreign reap is a `debug`). `left_running` is the caller's note of
-/// what becomes of a child this leaves running. `warn_after`: see [`kill_and_reap_unreported`]. Answers
-/// the fate, and what failed in the teardown (a refused kill, a failed wait or reap), for the
-/// spawn's `cleanup`.
-#[cfg(target_os = "macos")]
-pub(crate) fn kill_and_reap_verified(
-    pid: u32,
-    unique: u64,
-    id: Option<ProcessId>,
-    left_running: &str,
-    warn_after: Option<std::time::Duration>,
-) -> (ChildFate, Option<Failures>) {
-    let mut found = Findings::default();
-    let (fate, kill) = kill_and_reap_noting(pid, unique, id, warn_after, &mut found, |_| {});
-    let Findings {
-        mut notes,
-        breach,
-        failures,
-    } = found;
-    match kill {
-        KillOutcome::Refused(why) => notes.insert(0, format!("could not be killed: {why}")),
-        KillOutcome::Unverified => notes.insert(0, UNVERIFIED.to_owned()),
-        KillOutcome::Delivered | KillOutcome::NotSent => {}
-    }
-    if matches!(fate, ChildFate::Running { .. }) {
-        notes.push(left_running.to_owned());
-    }
-    if !notes.is_empty() {
-        log::warn!("spawn teardown: pid {pid} {}", notes.join("; "));
-    }
-    // After the log: an assertion that fires first would take the warn with it.
-    debug_assert!(breach.is_none(), "{}", breach.unwrap_or_default());
-    (fate, Failures::collect(failures))
-}
-
-/// What a by-pid teardown found, in the order it did: the notes for the event's one `warn`, a breach
-/// of the teardown's contract to assert after it, and the failures the spawn's `cleanup` holds.
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct Findings {
-    notes: Vec<String>,
-    breach: Option<String>,
-    failures: Vec<Arc<Error>>,
-}
-
-/// What a teardown that leaves its child running leaves behind, when nothing holds the child's handle.
-#[cfg(target_os = "macos")]
-const ZOMBIE_NOTE: &str = "is left unreaped: it stays a zombie once it exits";
-
-/// What became of the kill of a teardown.
-#[cfg(target_os = "macos")]
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum KillOutcome {
-    /// `SIGKILL` was sent.
-    Delivered,
-    /// The id check found the child gone or its pid another process's: nothing was sent.
-    NotSent,
-    /// The child could not be verified, so nothing was sent.
-    Unverified,
-    /// The kill failed with this error; the child was not signalled.
-    Refused(String),
-}
-
-/// What [`kill_and_reap_unreported`] did, before the event's one `warn`.
-#[cfg(target_os = "macos")]
-pub(crate) struct Unreported {
-    pub(crate) fate: ChildFate,
-    kill: KillOutcome,
-    notes: Vec<String>,
-    breach: Option<String>,
-    /// What failed in the teardown, for the spawn's `cleanup`.
-    failures: Vec<Arc<Error>>,
-}
-
-/// Kills and reaps `pid`, a child whose unique id `unique` arrived only after its spawn returned. Its
-/// exec cannot be confirmed, so it is torn down through the id, as the other post-spawn failures are,
-/// with its tree through `prepared`, its containment:
-/// 1. the tree, while the root is alive, so a walk from it still finds its descendants (the walk's
-///    own kill reaches the root first);
-/// 2. the root, so it can add no member after its kill lands (a `setsid`, an `exec`, a fork);
-/// 3. once the root is an unreaped zombie, whose pid still names its group, the tree again, for what
-///    it added before it died: a child held between its report and a `setsid` escapes the first
-///    `killpg`. A `TreeWalk` tree skips this step: the root's kill reparented its children, so a walk
-///    from the zombie finds none and answers
-///    [`NoRoot`](crate::containment::dispatch::TreeKillOutcome::NoRoot), which judges nothing;
-/// 4. the root's reap.
-///
-/// The root's wait is unbounded. With `warn_after`, it logs one `warn` naming `pid` once the wait
-/// passes that long, and goes on waiting: the threshold is a message, never a decision. Otherwise it
-/// warns nothing: [`Unreported::warn`] does, once.
-#[cfg(target_os = "macos")]
-pub(crate) fn kill_and_reap_unreported(
-    pid: u32,
-    unique: u64,
-    prepared: crate::containment::Prepared,
-    warn_after: Option<std::time::Duration>,
-) -> Unreported {
-    #[cfg(test)]
-    fault::run_at(fault::SpawnPoint::BeforeLateTeardown, pid);
-    let mut tree = LateTree::attach(pid, unique, prepared);
-    tree.kill(Sweep::RootAlive);
-    #[cfg(test)]
-    fault::run_at(fault::SpawnPoint::BeforeLateRootKill, pid);
-    let mut found = Findings::default();
-    let (fate, kill) = kill_and_reap_noting(pid, unique, tree.id, warn_after, &mut found, |zombie| {
-        // A walk from the zombie root finds nothing: the kill reparented its children (see step 3).
-        if !(zombie && tree.is_walk()) {
-            tree.kill(Sweep::RootKilled { zombie });
-        }
-    });
-    let Findings {
-        mut notes,
-        breach,
-        failures,
-    } = found;
-    let mut owed = std::mem::take(&mut tree.notes);
-    // The root is ended when its kill was sent, or it was already gone; not when it could not be
-    // verified or the kill was refused.
-    owed.extend(tree.failure_note(matches!(kill, KillOutcome::Delivered | KillOutcome::NotSent)));
-    notes.splice(0..0, owed);
-    // The tree's sweeps ran around the root's kill, and their failures come first, as the tree kill's
-    // does everywhere.
-    let failures = std::mem::take(&mut tree.failures).into_iter().chain(failures).collect();
-    Unreported {
-        fate,
-        kill,
-        notes,
-        breach,
-        failures,
-    }
-}
-
-/// Which sweep of a late child's tree [`LateTree::kill`] runs.
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy)]
-enum Sweep {
-    /// Before the root's kill, while its identity is fresh from [`LateTree::attach`].
-    RootAlive,
-    /// After the root's kill. `zombie`: the root is shown an unreaped zombie of ours, so its pid
-    /// still names it and its group.
-    RootKilled { zombie: bool },
-}
-
-/// The late child's root, for a send by its pid: the state is a verified peek, read afresh right
-/// before each send, until the root's kill has been made and it is not shown an unreaped zombie of
-/// ours ([`Sweep::RootKilled`] with `zombie: false`): then it is not pinned, and a marker kills its
-/// holders alone, the root excepted. There is no pidfd on macOS.
-#[cfg(target_os = "macos")]
-impl crate::containment::Root for LateTree {
-    fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    /// The late child holds no handle on its root: it is opened by its identity for the one send.
-    fn signal(&self, sig: crate::signal::Sig) -> Result<crate::signal::Sent, crate::error::Error> {
-        let Some(id) = self.id else {
-            return Err(crate::error::Error::Unassessable {
-                detail: format!("the late child (pid {}) has no identity to open it by", self.pid),
-                source: None,
-            });
-        };
-        match crate::os_process::open_with(crate::identity::HostKernel, id)
-            .map_err(crate::os_process::OpenFailure::into_open_error)?
-        {
-            Some(os) => os.signal(sig),
-            None => Ok(crate::signal::Sent::Gone),
-        }
-    }
-
-    fn state(&self) -> crate::signal::RootState {
-        if matches!(self.sweep, Sweep::RootKilled { zombie: false }) {
-            return crate::signal::RootState::Unpinned;
-        }
-        let target = crate::wait::exit_only::Target::pid(&crate::identity::HostKernel, self.pid, Some(self.unique));
-        crate::signal::RootState::of_peek(crate::wait::exit_only::peek_verified(&target))
-    }
-}
-
-/// The tree of a child whose report came late, and the notes its sweeps owe the teardown's `warn`.
-#[cfg(target_os = "macos")]
-struct LateTree {
-    /// The containment, attached to the root, whose identity was read and shown ours; or, when the
-    /// root is not shown ours, only its marker without the root, whose holders the kernel names by
-    /// the marker pipe. `None`: no tree of its own (uncontained, or a nested member of another
-    /// root's).
-    tree: Option<crate::containment::Tree>,
-    /// The sweep being run: what the root reports.
-    sweep: Sweep,
-    /// The root's pid and the unique id it must still have for a send by its number.
-    pid: u32,
-    unique: u64,
-    /// The root's identity, when the attach read it.
-    id: Option<ProcessId>,
-    /// What each sweep left, in the order they ran. Judged together once the root's kill is known
-    /// ([`failure_note`](Self::failure_note)).
-    sweeps: Vec<Result<(), crate::containment::dispatch::Unkilled>>,
-    /// What the sweeps could not do.
-    notes: Vec<String>,
-    /// The failures behind `notes` that are errors, for the spawn's `cleanup`: the sweep that failed
-    /// first, and the holders of a marker that were not all killed.
-    failures: Vec<Arc<Error>>,
-}
-
-#[cfg(target_os = "macos")]
-impl LateTree {
-    /// Reads the identity of `pid` and checks it against `unique`, then attaches `prepared` to it.
-    /// A root that is gone or not shown ours keeps only its marker's holders, when it has a marker.
-    /// A foreign reap after the check is the gap `Child::drop`'s tree kill accepts too.
-    fn attach(pid: u32, unique: u64, prepared: crate::containment::Prepared) -> LateTree {
-        use crate::identity::Resolved;
-        let mut tree = LateTree {
-            tree: None,
-            sweep: Sweep::RootAlive,
-            pid,
-            unique,
-            id: None,
-            sweeps: Vec::new(),
-            notes: Vec::new(),
-            failures: Vec::new(),
-        };
-        if prepared.mode.is_none() || !prepared.is_root {
-            return tree;
-        }
-        let (resolved, _, mut why) = resolve_identity(
-            pid,
-            &crate::wait::exit_only::Target::pid(&crate::identity::HostKernel, pid, Some(unique)),
-        );
-        let unshown = match resolved {
-            Resolved::Found(id) => {
-                tree.id = Some(id);
-                match attach_or_fault(pid, Ok(id), prepared) {
-                    Ok(attachment) => tree.tree = Some(attachment.tree),
-                    Err(failure) => {
-                        assert_attach_cannot_fail(&failure.cause);
-                        tree.notes.push(format!(
-                            "its tree was not killed: {}",
-                            crate::error::Report(&failure.cause)
-                        ));
-                    }
-                }
-                return tree;
-            }
-            Resolved::Gone => "the child is gone, or is not ours",
-            Resolved::Unknown => "the child's identity could not be read",
-        };
-        match prepared.marker {
-            Some(marker) => {
-                tree.notes.push(why.fold(format!(
-                    "{unshown}, so its tree is reached only through its marker's holders, not its process group \
-                     or the processes its pid parents"
-                )));
-                tree.tree = Some(crate::containment::Tree::contained(
-                    crate::containment::Mechanism::Marker(crate::containment::fdmarker::Marker::without_root(marker)),
-                ));
-            }
-            None => tree.notes.push(why.fold(format!("its tree was not killed: {unshown}"))),
-        }
-        tree
-    }
-
-    /// Whether the tree is a `TreeWalk`'s, found by a walk from its root.
-    fn is_walk(&self) -> bool {
-        matches!(&self.tree, Some(tree) if tree.containment() == crate::containment::Containment::TreeWalk)
-    }
-
-    /// Runs `sweep`.
-    fn kill(&mut self, sweep: Sweep) {
-        use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
-        self.sweep = sweep;
-        let Some(tree) = &self.tree else {
-            return;
-        };
-        // The mechanism looks at the root, which reports this sweep ([`Root::state`]): a root this
-        // process's unreaped child is shown by a verified peek right before each send by its pid; one
-        // not shown ours any more is skipped, its marker's holders alone swept, and never the root.
-        // A late child's tree is swept alone: it waits for nothing the sweep killed.
-        match tree.send_kill(Some(&*self)) {
-            TreeKillOutcome::Skipped(skip) if matches!(sweep, Sweep::RootKilled { zombie: false }) => {
-                if let Some(Err(e)) = skip.holders {
-                    self.notes.push(format!(
-                        "its marker's holders were not all killed after its kill: {}",
-                        crate::error::Report(&e)
-                    ));
-                    self.failures.push(Arc::new(e));
-                }
-                self.notes.push(NOT_SWEPT_AGAIN.to_owned());
-            }
-            // The root stopped being shown ours between the sweeps: nothing by its pid was sent.
-            TreeKillOutcome::Skipped(skip) => self.sweeps.push(Err(Unkilled::from(skip.sweep_error()))),
-            other => self.sweeps.push(other.into_result()),
-        }
-    }
-
-    /// The `warn`'s note for the sweeps that failed, once the root's kill is known: `root_ended` says
-    /// whether it ended the root, which settles a walk that left only the root
-    /// ([`Unkilled::unsettled`](crate::containment::dispatch::Unkilled::unsettled), as
-    /// [`Tree::settle`](crate::containment::Tree::settle) does). The first failure stands: a
-    /// later sweep is not shown to reach what it missed. That failure is also kept, as the error it is,
-    /// in `failures`.
-    fn failure_note(&mut self, root_ended: bool) -> Option<String> {
-        let mut failed = None;
-        let mut succeeded_after = false;
-        for sweep in self.sweeps.drain(..) {
-            match (sweep.or_else(|left| left.unsettled(root_ended)), &failed) {
-                (Err(left), None) => {
-                    failed = Some(crate::error::Report(&left).to_string());
-                    self.failures.insert(0, Arc::new(left));
-                }
-                (Err(_), Some(_)) => succeeded_after = false,
-                (Ok(()), failed) => succeeded_after = failed.is_some(),
-            }
-        }
-        let failed = failed?;
-        Some(if succeeded_after {
-            format!(
-                "its tree may not be fully killed: a kill of it failed ({failed}), and the later one that succeeded \
-                 cannot be shown to reach what that one missed"
-            )
-        } else {
-            format!("its tree was not fully killed: {failed}")
-        })
-    }
-}
-
-/// The note of a tree whose root was not shown an unreaped zombie once its kill was tried.
-#[cfg(target_os = "macos")]
-const NOT_SWEPT_AGAIN: &str = "it was not shown an unreaped zombie, so its tree was not killed again by its pid: what \
-                               it started after the first kill of its tree may be left running";
-
-/// What a teardown says of a child it could not verify.
-#[cfg(target_os = "macos")]
-const UNVERIFIED: &str = "could not be verified, so it was not signalled";
-
-/// The one `warn` of a spawn whose child's report came late (see [`Report::Late`]).
-#[cfg(target_os = "macos")]
-const LATE: &str = "was spawned while at least two of this process's descriptors 0 to 2 were closed, so its exec \
-                    cannot be confirmed and the program may have started; it was not adopted";
-
-/// The sentence for what a teardown did, built from the kill and the fate, so that each is said only
-/// when it happened.
-#[cfg(target_os = "macos")]
-fn said(kill: &KillOutcome, fate: ChildFate) -> String {
-    let sent = match kill {
-        KillOutcome::Delivered => "was sent SIGKILL".to_owned(),
-        KillOutcome::NotSent => "was gone, or its pid names another process, so nothing was sent".to_owned(),
-        KillOutcome::Unverified => UNVERIFIED.to_owned(),
-        KillOutcome::Refused(why) => format!("could not be killed ({why})"),
-    };
-    let state = match fate {
-        ChildFate::Reaped => "it was reaped",
-        ChildFate::Killed => "its status was not collected",
-        ChildFate::Running { .. } => "it is still running",
-        ChildFate::Gone => "it is gone, or was reaped by someone else",
-        ChildFate::Unknown => "what became of it is unknown",
-    };
-    format!("{sent}; {state}")
-}
-
-#[cfg(target_os = "macos")]
-impl Unreported {
-    /// The event's one `warn`: what happened to child `pid`. `tail` is what the caller did with the
-    /// handle it holds, if that is worth saying (a forget's leak, a child left unreaped). Answers the
-    /// fate, and what failed in the teardown, for the spawn's `cleanup`.
-    pub(crate) fn warn(self, pid: u32, tail: Option<&str>) -> (ChildFate, Option<Failures>) {
-        let mut line = format!("child {pid} {LATE}, and {}", said(&self.kill, self.fate));
-        // `said` already says so, from the fate.
-        for note in self.notes.iter().filter(|note| *note != "is still running") {
-            line.push_str("; ");
-            line.push_str(note);
-        }
-        if let Some(tail) = tail {
-            line.push_str("; ");
-            line.push_str(tail);
-        }
-        log::warn!("{line}");
-        // After the log: an assertion that fires first would take the warn with it.
-        debug_assert!(self.breach.is_none(), "{}", self.breach.unwrap_or_default());
-        (self.fate, Failures::collect(self.failures))
-    }
-
-    /// What the sync spawn says of a child it leaves behind, when it is still running.
-    pub(crate) fn zombie_tail(&self) -> Option<&'static str> {
-        matches!(self.fate, ChildFate::Running { .. }).then_some(ZOMBIE_NOTE)
-    }
-}
-
-/// The one `warn` for an elevation front whose report came late: it is sent nothing and left unreaped
-/// (it stays a zombie once it exits), whatever the id says.
-#[cfg(target_os = "macos")]
-pub(crate) fn warn_late_front(pid: u32, tail: Option<&str>) {
-    let tail = tail.map_or_else(String::new, |tail| format!("; {tail}"));
-    log::warn!(
-        "child {pid} {LATE}; it is an elevation front, so nothing was sent to it and it is left unreaped: it stays a \
-         zombie once it exits{tail}"
-    );
-}
-
-/// `warn_after`: see [`kill_and_reap_unreported`].
-#[cfg(target_os = "macos")]
-fn kill_and_reap_noting(
-    pid: u32,
-    unique: u64,
-    id: Option<ProcessId>,
-    warn_after: Option<std::time::Duration>,
-    found: &mut Findings,
-    after_kill: impl FnOnce(bool),
-) -> (ChildFate, KillOutcome) {
-    use crate::os_process::child::Foreign;
-    use crate::signal::{via_audit_token, Sent, Sig};
-    use crate::wait::macos::Waited;
-
-    let target = crate::wait::exit_only::Target::pid(&crate::identity::HostKernel, pid, Some(unique));
-    match via_audit_token(&crate::identity::HostKernel, pid, Some(unique), Sig::Kill) {
-        Ok(Sent::Delivered) => {
-            // A fixture that only the kill would end is released here when no kill was sent.
-            #[cfg(test)]
-            fault::run_between_kill_and_wait();
-            let waited = await_exit_warning(pid, unique, warn_after);
-            after_kill(matches!(waited, Ok(Waited::Reapable)));
-            let fate = match waited {
-                Ok(Waited::Reapable) => reap_verified(pid, &target, id, true, found),
-                Ok(Waited::Gone) => {
-                    log::debug!("spawn teardown: pid {pid} was reaped by someone else");
-                    Foreign::Gone.fate(true)
-                }
-                Ok(Waited::Orphaned) => {
-                    found.notes.push(unverifiable(&crate::signal::UNPINNED_WHY));
-                    Foreign::Orphaned.fate(true)
-                }
-                Ok(Waited::DeadlinePassed) => {
-                    debug_assert!(false, "an unbounded wait reported a passed deadline");
-                    found.notes.push("is still running after its kill".to_owned());
-                    ChildFate::Running { id }
-                }
-                // Nothing reaps it after this: the std `Child` reaps nothing.
-                Err(e) => {
-                    found.notes.push(format!(
-                        "could not be waited for ({}), so it is left unreaped: it stays a zombie once it exits",
-                        crate::error::Report(&e)
-                    ));
-                    found.failures.push(Error::io_cause(crate::error::io_context(
-                        "waiting for the killed child",
-                        e,
-                    )));
-                    ChildFate::Killed
-                }
-            };
-            (fate, KillOutcome::Delivered)
-        }
-        Ok(Sent::Gone) => {
-            log::debug!("spawn teardown: pid {pid} is already gone");
-            after_kill(false);
-            (Foreign::Gone.fate(false), KillOutcome::NotSent)
-        }
-        Ok(Sent::Unverified) => {
-            debug_assert!(false, "`via_audit_token` was given `Some(unique)`, so it verifies");
-            after_kill(false);
-            (ChildFate::Running { id }, KillOutcome::Unverified)
-        }
-        Err(kill) => {
-            after_kill(false);
-            let refused = KillOutcome::Refused(crate::error::Report(&kill).to_string());
-            found
-                .failures
-                .push(Error::io_cause(crate::error::io_context("killing the child", kill)));
-            let fate = reap_verified(pid, &target, id, false, found);
-            (fate, refused)
-        }
-    }
-}
-
-/// Waits for the killed `pid` to become reapable. With `warn_after`, the wait that passes it logs one
-/// `warn` and then goes on, unbounded ([`wait_warning`](crate::wait::teardown_warn::wait_warning)).
-#[cfg(target_os = "macos")]
-fn await_exit_warning(
-    pid: u32,
-    unique: u64,
-    warn_after: Option<std::time::Duration>,
-) -> std::io::Result<crate::wait::macos::Waited> {
-    use crate::identity::HostKernel;
-    use crate::wait::macos::{await_reapable, Waited};
-
-    // What the bounded look found, when it found the end: the unbounded wait answers it.
-    crate::wait::teardown_warn::wait_warning(
-        None,
-        crate::wait::teardown_warn::Due::in_(warn_after),
-        |found, until| match await_reapable(&HostKernel, pid, Some(unique), Some(until)) {
-            Ok(Waited::DeadlinePassed) => false,
-            done => {
-                *found = Some(done);
-                true
-            }
-        },
-        |after| warn_still_waiting(Some(pid), after),
-        |found| found.unwrap_or_else(|| await_reapable(&HostKernel, pid, Some(unique), None)),
-    )
-}
-
 /// The one `warn` of a spawn teardown whose wait for the child it killed has passed `after`; the
 /// wait goes on.
 pub(crate) fn warn_still_waiting(pid: Option<u32>, after: std::time::Duration) {
@@ -1561,91 +979,19 @@ pub(crate) fn warn_still_waiting(pid: Option<u32>, after: std::time::Duration) {
     log::warn!("{who} has not exited {after:?} after its kill was requested; still waiting for it to exit");
 }
 
-/// The note for a child that cannot be shown to be ours or reaped.
-#[cfg(target_os = "macos")]
-fn unverifiable(why: &dyn std::fmt::Display) -> String {
-    format!("cannot be shown to be ours or reaped ({why})")
-}
-
-/// [`teardown_after_attach_failure`]'s reap: consume `target`'s exit record only when a verified
-/// peek shows the zombie is ours. Only a verified foreign reap is a `debug`; a child that cannot be
-/// shown ours or reaped is noted for the teardown's one `warn`.
-#[cfg(target_os = "macos")]
-///
-/// `killed`: whether cosca's kill was delivered, which decides the fate of a foreign verdict.
-fn reap_verified(
-    pid: u32,
-    target: &crate::wait::exit_only::Target<'_>,
-    id: Option<ProcessId>,
-    killed: bool,
-    found: &mut Findings,
-) -> ChildFate {
-    use crate::os_process::child::{ExitRecord, Foreign, PeekOutcome};
-    use crate::wait::exit_only::{peek_verified, try_reap, Reap};
-
-    let foreign = |why: Foreign, found: &mut Findings| {
-        match why {
-            Foreign::Orphaned => found.notes.push(unverifiable(&crate::signal::UNPINNED_WHY)),
-            Foreign::Gone | Foreign::Other => log::debug!("spawn teardown: pid {pid} was reaped by someone else"),
-        }
-        why.fate(killed)
-    };
-    match peek_verified(target) {
-        Err(e) => {
-            found.notes.push(unverifiable(&crate::error::Report(&e)));
-            found.failures.push(Error::io_cause(crate::error::io_context(
-                "looking at the child's exit",
-                e,
-            )));
-            return ChildFate::Unknown;
-        }
-        Ok(PeekOutcome::Foreign(why)) => return foreign(why, found),
-        Ok(PeekOutcome::Running) => {
-            found.notes.push("is still running".to_owned());
-            return ChildFate::Running { id };
-        }
-        Ok(PeekOutcome::Exit(_)) => {}
-    }
-    match try_reap(target) {
-        Ok(Reap::Reaped(ExitRecord::Status(_))) => ChildFate::Reaped,
-        // The consuming `waitid` collected the zombie, whatever it reported.
-        Ok(Reap::Reaped(ExitRecord::Unreadable { si_code })) => {
-            found.notes.push(format!(
-                "a consuming waitid returned si_code {si_code}, not an exit record"
-            ));
-            found.breach = Some(format!("a consuming waitid on a zombie returned si_code {si_code}"));
-            ChildFate::Reaped
-        }
-        Ok(Reap::Running) => {
-            found.notes.push("is still running".to_owned());
-            ChildFate::Running { id }
-        }
-        Ok(Reap::Foreign(why)) => foreign(why, found),
-        Err(e) => {
-            found
-                .notes
-                .push(format!("could not be reaped: {}", crate::error::Report(&e)));
-            found
-                .failures
-                .push(Error::io_cause(crate::error::io_context("reaping the child", e)));
-            ChildFate::Unknown
-        }
-    }
-}
-
 /// macOS: `child` could not be adopted, and the spawn fails with `not_adopted.error`. A child that
 /// died before `exec` is only a corpse nothing collects, and the program did not start. A child
-/// whose id came late may have started the program: it is killed and reaped by pid, each act checked
-/// against that id, and its tree is killed through `prepared` (see [`kill_and_reap_unreported`]). A
-/// `front` is sent nothing and left running and unreaped instead, and the error notes it. Any other
-/// is never signalled or waited on by pid, and is left as `leave_unverified_child` leaves it.
+/// whose id came late may have started the program: it is torn down through a box of its own, with
+/// its tree through `prepared` ([`late_child::abandon_late_child`]). A child with no id at all
+/// cannot have a box (`MacosChild` is built from the id), so it is left as
+/// [`leave_unverified_child`] leaves it.
 #[cfg(target_os = "macos")]
 fn abandon_unadopted(
     child: std::process::Child,
     not_adopted: unique_report::NotAdopted,
     front: Option<crate::elevation::front::Front>,
     prepared: crate::containment::Prepared,
-    warn_after: Option<std::time::Duration>,
+    policy: SpawnPolicy,
 ) -> SpawnFailure {
     use unique_report::Unadoptable;
 
@@ -1659,94 +1005,121 @@ fn abandon_unadopted(
             drop(child);
             SpawnFailure::NotStarted(error)
         }
-        Unadoptable::Late(unique) => {
-            #[cfg(test)]
-            fault::capture(ProcessId::of(pid));
-            // A front is sent nothing: it is left running and unreaped, with its note.
-            if front.is_some() {
-                warn_late_front(pid, None);
-                drop(child);
-                return SpawnFailure::started(
-                    error,
-                    // The id was reported, but no `ProcessId` was read from it.
-                    ChildFate::Running { id: None },
-                    None,
-                )
-                .with_detail(FrontFate::LeftUnreaped.detail(front, Some(pid)));
-            }
-            // Torn down through its unique id, exactly as every other post-spawn failure is. The `std`
-            // `Child` is dropped after: it reaps nothing, so a child still running stays a zombie.
-            let done = kill_and_reap_unreported(pid, unique, prepared, warn_after);
-            let tail = done.zombie_tail();
-            let (fate, cleanup) = done.warn(pid, tail);
-            drop(child);
-            SpawnFailure::started(error, fate, None).with_cleanup(cleanup)
-        }
+        Unadoptable::Late(unique) => late_child::abandon_late_child(child, unique, error, front, prepared, policy),
         Unadoptable::Unverified => {
-            // No unique id was read, so there is no identity to give.
-            let (error, fate) = teardown_after_failed_adoption(child, error, None);
-            SpawnFailure::started(error, fate, None).with_detail(
-                FrontFate::of_unverified(crate::containment::RootIdentity::Unknown).detail(front, Some(pid)),
-            )
+            let fate = leave_unverified_child(child);
+            SpawnFailure::started(error, fate, None).with_detail(FrontFate::LeftUnreaped.detail(front, Some(pid)))
         }
     }
 }
 
-/// macOS: abandon `child` without signalling or waiting on it by pid, since nothing shows its pid
-/// still names it. `RootIdentity::Gone` means someone else reaped it, so it is forgotten; otherwise
-/// it is left unreaped. Dropping the `std` `Child` closes our pipe ends only. Either way
-/// a warning names the pid, and the spawn still fails: the caller must not assume the program did
-/// not start.
-#[cfg(target_os = "macos")]
-fn leave_unverified_child(
-    child: std::process::Child,
-    identity: crate::containment::RootIdentity,
-    id: Option<ProcessId>,
-    why: &mut Diagnosis,
-) -> ChildFate {
-    let pid = child.id();
-    let fate = if identity == crate::containment::RootIdentity::Gone {
-        log::warn!(
-            "{}",
-            why.fold(format!(
-                "child {pid} was reaped by someone else; its pid may be reused, so nothing is signalled or waited on by pid"
-            ))
-        );
-        ChildFate::Gone
-    } else {
-        log::warn!(
-            "{}",
-            why.fold(format!(
-                "child {pid} cannot be shown to be ours (its identity could not be read); leaving it unreaped, with \
-                 nothing signalled or waited on by pid, and it may still be running"
-            ))
-        );
-        ChildFate::Running { id }
-    };
-    drop(child);
-    fate
-}
-
-/// The spawned `child` could not be adopted: its unique-id report is not an id (unreadable or
-/// malformed), so it is left alone (see `leave_unverified_child`). Answers `error`.
+/// macOS: abandon `child`, whose unique-id report is not an id (unreadable or malformed), so nothing
+/// shows its pid still names it and no `MacosChild` can be built. It is not signalled or waited on
+/// by pid and is left unreaped, and a warning names the pid; the spawn still fails, and the caller
+/// must not assume the program did not start. Dropping the `std` `Child` closes our pipe ends only.
 ///
 /// Only macOS adopts by a reported id. Linux opens the pidfd before `exec` (see `pidfd_handshake`)
 /// and Windows takes std's process handle, so on both adoption cannot fail.
 #[cfg(target_os = "macos")]
-fn teardown_after_failed_adoption(
-    child: std::process::Child,
-    error: Error,
-    id: Option<ProcessId>,
-) -> (Error, ChildFate) {
+fn leave_unverified_child(child: std::process::Child) -> ChildFate {
+    let pid = child.id();
     #[cfg(test)]
-    fault::capture(ProcessId::of(child.id()));
-    let fate = leave_unverified_child(
-        child,
-        crate::containment::RootIdentity::Unknown,
-        id,
-        &mut Diagnosis::default(),
+    fault::capture(ProcessId::of(pid));
+    log::warn!(
+        "child {pid} cannot be shown to be ours (its identity could not be read); leaving it unreaped, with \
+         nothing signalled or waited on by pid, and it may still be running"
     );
-    (error, fate)
+    drop(child);
+    // No unique id was read, so there is no identity to give.
+    ChildFate::Running { id: None }
+}
+
+/// macOS: abandon a child `MacosChild::new` refused (its kqueue, `EMFILE` and the like). It is a
+/// stated limit: the child is sent `SIGKILL` through its unique id (an elevation front is sent
+/// nothing), its marker's holders are swept, and it is never waited on, so it stays a zombie until this
+/// process exits. `refusal` is the spawn's error unless the id came `late`, when it goes in the
+/// failure's `cleanup`.
+#[cfg(target_os = "macos")]
+fn leave_unwatched_child(
+    child: std::process::Child,
+    pid: u32,
+    unique: u64,
+    front: Option<crate::elevation::front::Front>,
+    prepared: crate::containment::Prepared,
+    refusal: Error,
+    late: Option<Error>,
+) -> SpawnFailure {
+    let (fate, said, killing) = unwatched_child_fate(pid, unique, front.is_some());
+    // The containment is no front's to kill: its marker closes with it.
+    let holders = if front.is_some() {
+        None
+    } else {
+        late_child::marker_holders(prepared)
+    };
+    let swept = holders.map(|tree| tree.send_kill(None).into_result().or_else(|left| left.unsettled(true)));
+    let tree = match &swept {
+        None => "its tree was not killed".to_owned(),
+        Some(Ok(())) => "its marker's holders were killed, and the rest of its tree (its process group, the \
+                         processes its pid parents) was not"
+            .to_owned(),
+        Some(Err(left)) => format!(
+            "its marker's holders were not all killed ({}), and the rest of its tree was not",
+            crate::error::Report(left)
+        ),
+    };
+    let lead = if late.is_some() {
+        format!("child {pid} {}, and its exit could not be watched", late_child::LATE)
+    } else {
+        format!("child {pid}'s exit could not be watched")
+    };
+    log::warn!(
+        "{lead} ({}), so it has no handle and {tree}: {said}; it is not waited for or reaped, so \
+         it stays a zombie once it exits",
+        crate::error::Report(&refusal)
+    );
+    drop(child);
+    let (cause, refused) = match late {
+        Some(late) => (late, Failures::collect([Arc::new(refusal)])),
+        None => (refusal, None),
+    };
+    let left = Failures::collect(swept.and_then(Result::err).map(Arc::new));
+    SpawnFailure::started(cause, fate, None)
+        .with_detail(FrontFate::LeftUnreaped.detail(front, Some(pid)))
+        .with_cleanup(refused)
+        .with_cleanup(killing)
+        .with_cleanup(left)
+}
+
+/// What [`leave_unwatched_child`] does to the child `pid`, whose unique id is `unique`: the fate it
+/// answers, the clause that says it, and what failed (a refused kill). Nothing is sent to a `front`.
+#[cfg(target_os = "macos")]
+fn unwatched_child_fate(pid: u32, unique: u64, front: bool) -> (ChildFate, String, Option<Failures>) {
+    use crate::signal::{via_audit_token, Sent, Sig};
+
+    if front {
+        return (
+            ChildFate::Running { id: None },
+            "it is an elevation front, so nothing was sent to it".to_owned(),
+            None,
+        );
+    }
+    match via_audit_token(&crate::identity::HostKernel, pid, Some(unique), Sig::Kill) {
+        Ok(Sent::Delivered) => (ChildFate::Killed, "it was sent SIGKILL".to_owned(), None),
+        Ok(Sent::Gone) => (
+            ChildFate::Gone,
+            "it was gone, or its pid names another process, so nothing was sent".to_owned(),
+            None,
+        ),
+        Ok(Sent::Unverified) => {
+            debug_assert!(false, "`via_audit_token` was given `Some(unique)`, so it verifies");
+            (ChildFate::Running { id: None }, "it was not signalled".to_owned(), None)
+        }
+        Err(kill) => (
+            ChildFate::Running { id: None },
+            format!("it could not be killed ({})", crate::error::Report(&kill)),
+            Failures::collect([Error::io_cause(crate::error::io_context("killing the child", kill))]),
+        ),
+    }
 }
 
 /// Serializes spawns against the process-global inheritable-handle window: on Windows both the std
@@ -2393,17 +1766,18 @@ pub(crate) fn spawn_identity_error(
 ///   (held by launchd after its tracer died) is `Gone`, as every foreign verdict is.
 /// - **Windows:** the process handle pins the pid, so the read stands.
 ///
-/// On macOS the `through` id is the one the child reported before `exec`.
+/// On macOS `through` is the box, which names the child by the unique id it reported before `exec`.
 ///
 /// What the check found out, when it could not show the read named our child, comes back as a
 /// [`Diagnosis`]: the failed spawn's teardown carries it in its one `warn`, unless the child is kept
 /// (see the `Diagnosis` keep rule). The
 /// [`UnknownCause`](crate::identity::UnknownCause) is the read's own, for [`spawn_identity_error`].
 pub(crate) fn resolve_identity(
-    // On macOS `through` carries the kernel.
-    #[cfg(not(target_os = "macos"))] kernel: &dyn crate::identity::Kernel,
+    kernel: &dyn crate::identity::Kernel,
     pid: u32,
-    through: &crate::wait::exit_only::Target<'_>,
+    // On macOS the handle is the box: its peek checks the read against its own unique id.
+    #[cfg(not(target_os = "macos"))] through: &crate::wait::exit_only::Target<'_>,
+    #[cfg(target_os = "macos")] through: &OwnedChild,
 ) -> (
     crate::identity::Resolved<ProcessId>,
     crate::identity::UnknownCause,
@@ -2417,10 +1791,7 @@ pub(crate) fn resolve_identity(
         resolve_identity_unchecked(kernel, pid, held)
     };
     #[cfg(target_os = "macos")]
-    let (read, cause) = {
-        let crate::wait::exit_only::Target::Pid { kernel, .. } = *through;
-        resolve_identity_unchecked(kernel, pid)
-    };
+    let (read, cause) = resolve_identity_unchecked(kernel, pid);
     #[cfg(windows)]
     let (read, cause) = resolve_identity_unchecked(kernel, pid);
     let Resolved::Found(_) = read else {
@@ -2434,7 +1805,7 @@ pub(crate) fn resolve_identity(
         #[cfg(target_os = "linux")]
         let peeked = crate::wait::exit_only::peek(through);
         #[cfg(target_os = "macos")]
-        let peeked = crate::wait::exit_only::peek_verified(through);
+        let peeked = through.peek().map_err(Error::into_io);
         match peeked {
             Ok(PeekOutcome::Running | PeekOutcome::Exit(_)) => (read, cause, Diagnosis::default()),
             // Orphaned: `Gone`, warned.
@@ -2517,7 +1888,6 @@ impl Diagnosis {
 
     /// Whether the diagnosis is still owed, so a warn that folds it is the event's one warn. The
     /// kept check counts: a teardown only runs for a failed spawn, which it is then part of.
-    #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn is_owed(&self) -> bool {
         self.owed.is_some() || self.kept_check.is_some()
     }
@@ -2666,13 +2036,6 @@ pub(crate) fn named(pid: Option<u32>) -> String {
 /// What a failed spawn's teardown did with its child, when that child is an elevation front (see
 /// [`crate::elevation::front`]), which it never signals: a kill of it would orphan the program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    target_os = "macos",
-    allow(
-        dead_code,
-        reason = "macOS leaves an unverified child without tearing it down, so it is never reaped here"
-    )
-)]
 pub(crate) enum FrontFate {
     /// It had exited, or a cgroup leaf's kill ended it, and was reaped.
     Reaped,
@@ -2690,23 +2053,10 @@ pub(crate) enum FrontFate {
 }
 
 impl FrontFate {
-    /// The fate of a child left unverified (macOS: `leave_unverified_child`): one reaped by someone
-    /// else is unaccounted for, and any other is left unreaped.
-    #[cfg_attr(
-        not(target_os = "macos"),
-        allow(dead_code, reason = "only macOS leaves a child unverified")
-    )]
-    pub(crate) fn of_unverified(identity: crate::containment::RootIdentity) -> FrontFate {
-        match identity {
-            crate::containment::RootIdentity::Gone => FrontFate::Unaccounted,
-            crate::containment::RootIdentity::Unknown => FrontFate::LeftUnreaped,
-        }
-    }
-
     /// The fate of the front a look ([`OwnedChild::look_at_front`](crate::child::owned::OwnedChild::look_at_front))
     /// found: one that is running, or whose place or subtree could not be read, is left (or handed
     /// back) with the elevated program possibly running.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(crate) fn of_look(look: &crate::child::owned::teardown::LookOutcome) -> FrontFate {
         use crate::child::owned::teardown::LookOutcome;
         match look {
@@ -2724,7 +2074,7 @@ impl FrontFate {
 
     /// [`detail`](Self::detail) for a front the failed spawn hands back to the caller, in the error,
     /// where `detail` says it is left unreaped.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(crate) fn detail_handed_back(
         self,
         front: Option<crate::elevation::front::Front>,
@@ -2770,16 +2120,6 @@ impl FrontFate {
         };
         Some(format!("{what}; {fate}"))
     }
-}
-
-/// [`FrontFate::detail`] for a `fate` that may be unknown (`None`).
-#[cfg(target_os = "macos")]
-fn front_detail(
-    fate: Option<FrontFate>,
-    front: Option<crate::elevation::front::Front>,
-    pid: Option<u32>,
-) -> Option<String> {
-    fate.and_then(|fate| fate.detail(front, pid))
 }
 
 /// Settle `prepared`'s placement verdict in a failure arm after the fork, before the child is torn
@@ -2893,6 +2233,8 @@ pub(crate) mod fault {
         static BEFORE_ATTACH: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         static AFTER_IDENTITY_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         #[cfg(target_os = "macos")]
+        static BEFORE_ADOPT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
+        #[cfg(target_os = "macos")]
         static BEFORE_LATE_TEARDOWN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
         #[cfg(target_os = "macos")]
         static BEFORE_LATE_ROOT_KILL: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
@@ -3001,6 +2343,11 @@ pub(crate) mod fault {
         /// Right after the spawn read the child's identity, before it checks the read against the
         /// child's handle.
         AfterIdentityRead,
+        /// macOS: right before the spawn adopts the unique id its child reported (builds its
+        /// `MacosChild`, or abandons a child it cannot adopt, as a late one), after every descriptor
+        /// the spawn held for the report is closed.
+        #[cfg(target_os = "macos")]
+        BeforeAdopt,
         /// macOS: right before the teardown of a child whose unique id came late.
         #[cfg(target_os = "macos")]
         BeforeLateTeardown,
@@ -3014,6 +2361,8 @@ pub(crate) mod fault {
             SpawnPoint::BeforeIdentity => &BEFORE_IDENTITY,
             SpawnPoint::BeforeAttach => &BEFORE_ATTACH,
             SpawnPoint::AfterIdentityRead => &AFTER_IDENTITY_READ,
+            #[cfg(target_os = "macos")]
+            SpawnPoint::BeforeAdopt => &BEFORE_ADOPT,
             #[cfg(target_os = "macos")]
             SpawnPoint::BeforeLateTeardown => &BEFORE_LATE_TEARDOWN,
             #[cfg(target_os = "macos")]
@@ -3369,10 +2718,12 @@ pub(crate) mod pidfd_handshake;
 #[path = "spawn/policy.rs"]
 pub(crate) mod policy;
 
-// Linux and Windows: a failed spawn's teardown of the child it holds.
-#[cfg(any(target_os = "linux", windows))]
 #[path = "spawn/held_teardown.rs"]
 pub(crate) mod held_teardown;
+
+#[cfg(target_os = "macos")]
+#[path = "spawn/late_child.rs"]
+mod late_child;
 
 // Windows raw `CreateProcessW` spawn backend.
 #[cfg(windows)]

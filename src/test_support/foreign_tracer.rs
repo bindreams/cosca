@@ -474,16 +474,10 @@ fn assert_killed(pid: u32, status: i32) {
     );
 }
 
-/// [`hold_teardown`] at threshold zero, which makes the warn due before the teardown's first block
-/// or pause, with no clock involved. Asserts that the teardown did not return before the tracer let
-/// go, that its first block or pause came after the warn, that exactly one warn, naming the child as
-/// `names` says, said it was still waiting, and that the tracee died of a `SIGKILL`. Answers what
-/// `teardown` returned.
-///
-/// A teardown that never warns, or whose kill sends nothing, fails an assertion here instead of
-/// hanging: the tracer lets go at the first block or pause whatever the warn. The threshold is
-/// zero for `teardown` and anything it reads on its thread; a caller that reads it earlier, on its
-/// own thread, sets zero itself ([`crate::tokio::warn_slow_teardowns_after`]).
+/// [`hold_teardown`] at threshold zero: asserts exactly one warn naming the child (as `names` says)
+/// before the teardown's first block or pause, and that the tracee died of `SIGKILL`. Returns what
+/// `teardown` returned. The threshold is zero on `teardown`'s thread only; a caller that reads it
+/// earlier sets zero itself ([`crate::tokio::warn_slow_teardowns_after`]).
 #[cfg(feature = "tokio")]
 pub(crate) fn assert_warns_once_before_blocking<R: Send>(
     names: Names,

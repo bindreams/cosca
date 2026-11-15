@@ -359,7 +359,7 @@ impl Kqueue {
         }
     }
 
-    /// The underlying nix queue, for the loops that read it directly (`await_reapable`,
+    /// The underlying nix queue, for the loops that read it directly (the exit-event drain,
     /// `unique_report`, the test tracer).
     pub(crate) fn native(&self) -> &NixKqueue {
         &self.0

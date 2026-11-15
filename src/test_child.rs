@@ -110,8 +110,6 @@ pub(crate) fn testbin(name: &str) -> std::path::PathBuf {
 /// child on its own and let a mutant that skips the kill under test pass for the wrong reason.
 /// Stdin is what decides the child's fate, so the writer's lifetime is the fixture's lifetime:
 ///
-/// - [`leaked_writer_stdin`]: the write end is never closed, so only a kill by the code under
-///   test ends the child (teardown tests that own no handle on it).
 /// - [`held_std_blocker`], [`held_contained_blocker`] and [`held_contained_blocker_async`]: the
 ///   caller holds the write end and must keep it for exactly as long as the child must stay
 ///   alive. Dropping it (or `std::process::Child::wait()`, which closes the piped stdin before
@@ -139,20 +137,6 @@ pub(crate) static BLOCKER_ARGV: std::sync::LazyLock<&'static [&'static str]> = s
     #[cfg(not(windows))]
     &["cat"]
 });
-
-/// A [`Stdio`](crate::stdio::Stdio) reading from a pipe whose write end is leaked (see
-/// [`BLOCKER_ARGV`]). For a child the test leaves alone: any test that expects a kill holds the
-/// writer instead ([`held_writer_stdin`]) and releases it after the kill.
-#[cfg(target_os = "macos")]
-pub(crate) fn leaked_writer_stdin() -> crate::stdio::Stdio {
-    let (reader, writer) = std::io::pipe().expect("pipe");
-    #[cfg(unix)]
-    let file = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
-    #[cfg(windows)]
-    let file = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
-    std::mem::forget(writer);
-    crate::stdio::Stdio::from_file(file)
-}
 
 /// This process's stdio, closed with copies kept at 10 or above, put back when dropped. For a
 /// re-exec'd fixture that needs the lowest free numbers to be stdio slots: drop every descriptor
@@ -233,7 +217,7 @@ impl Drop for ClosedStdio {
     }
 }
 
-/// Like [`leaked_writer_stdin`], but the caller keeps the write end: dropping it is the only way
+/// A stdin the caller keeps the write end of: dropping it is the only way
 /// to make the [`BLOCKER_ARGV`] child exit by itself (status 0), so a test that must see a kill
 /// end it drops the writer only after the kill.
 pub(crate) fn held_writer_stdin() -> (crate::stdio::Stdio, crate::PipeWriter) {
@@ -582,7 +566,7 @@ pub(crate) fn tear_down_held_holding<R>(
     let how = crate::child::spawn::held_teardown::HeldTeardown {
         front,
         id,
-        subtree,
+        reach: subtree.map(|subtree| subtree as &dyn crate::child::owned::teardown::Reach),
         disposition: crate::child::owned::teardown::Disposition::HandBack,
         policy: crate::child::spawn::policy::SpawnPolicy::SYNC,
     };
@@ -1564,6 +1548,48 @@ pub(crate) fn set_signal_ignored(signo: libc::c_int, ignore: bool) {
         "signal({signo}): {}",
         std::io::Error::last_os_error()
     );
+}
+
+/// While it lives, the next descriptor this process asks for is refused (`EMFILE`): the descriptor
+/// limit is its lowest free descriptor. Restores the limit on drop. Only a fixture re-exec (see
+/// [`run_fixture_case`]) may hold one: the limit is process-wide.
+#[cfg(target_os = "macos")]
+#[must_use = "the limit is restored as soon as the guard drops"]
+pub(crate) struct RefusedDescriptors {
+    saved: libc::rlimit,
+    pub(crate) limit: libc::c_int,
+}
+
+/// Lowers this process's descriptor limit to its lowest free descriptor, so the next one is refused.
+#[cfg(target_os = "macos")]
+pub(crate) fn refuse_new_descriptors() -> RefusedDescriptors {
+    // SAFETY: `probe` is a descriptor this call opens and closes, and `lowered` is a valid `rlimit`.
+    unsafe {
+        let probe = libc::dup(0);
+        assert!(probe > 0, "dup: {}", std::io::Error::last_os_error());
+        let mut saved = std::mem::zeroed::<libc::rlimit>();
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved), 0);
+        let lowered = libc::rlimit {
+            rlim_cur: probe as libc::rlim_t,
+            rlim_max: saved.rlim_max,
+        };
+        assert_eq!(libc::close(probe), 0);
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &lowered), 0);
+        RefusedDescriptors { saved, limit: probe }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for RefusedDescriptors {
+    fn drop(&mut self) {
+        // SAFETY: restores the limit saved when the guard was made.
+        let restored = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
+        assert!(
+            restored == 0 || std::thread::panicking(),
+            "setrlimit: {}",
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 /// The directory [`run_fixture_with_cwd`]'s caller prepared, read from `marker_env`; `None` when it

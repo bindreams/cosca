@@ -236,7 +236,6 @@ pub(crate) fn failed_after_teardown(cause: Error, behind_front: bool, torn_down:
 /// said in the spawn's warn, which that variant has no place for.
 ///
 /// [`NotStartedWithChild`]: SpawnFailure::NotStartedWithChild
-#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn failed_attach(
     not_started: bool,
     cause: Error,
