@@ -12,22 +12,26 @@
 //!
 //! Each requirement comes from a different syscall:
 //!
-//! - `pidfd_open` needs 5.3, and cosca requires a pidfd for every child it spawns, and to read the
-//!   identity of any process by its pid, [`ProcessId::current`](identity::ProcessId::current) and
+//! - `pidfd_open` needs 5.3, and cosca requires it to read the identity of any process by its pid,
+//!   [`ProcessId::current`](identity::ProcessId::current) and
 //!   [`to_record`](identity::ProcessId::to_record) / `restore` included. A refusal is
 //!   [`Error::Unsupported`](error::Error::Unsupported); a transient failure such as `EMFILE` is
 //!   [`Error::Io`](error::Error::Io) naming the syscall (an identity read that meets one is
 //!   unknown, and a member of a process group whose pidfd cannot be opened is not signalled).
-//!   `ProcessId::current` panics on either. A spawn probes `pidfd_open` before it forks, and the
-//!   child then opens a pidfd on itself and hands it to the parent before it runs the program, so
-//!   no child exists without one.
+//!   `ProcessId::current` panics on either.
+//! - `clone3` (5.3), or `clone` with `CLONE_PIDFD` (5.2) where `clone3` is refused, makes every child
+//!   cosca spawns, and gives its pidfd as the child is made, so no child exists without one. A spawn
+//!   whose `clone3` and `clone` are both refused with `ENOSYS` or `EPERM` is
+//!   [`Error::Unsupported`](error::Error::Unsupported) naming `spawn` and the running kernel, and makes
+//!   no child. The one exception is a kernel before 5.2, whose `clone` ignores `CLONE_PIDFD`: the
+//!   spawn is the same `Unsupported`, but a child was made, and it is left (cosca never reaps by
+//!   pid). Such kernels are below the 5.6 floor.
 //! - On Linux 6.9 and newer pidfds have an inode of their own, one per process and never reused,
 //!   which is a process's identity: `pidfd_open` by pid, then `fstat`, with no `/proc`. Before 6.9
 //!   the identity is the `starttime` in `/proc/<pid>/stat`. cosca finds out which by asking the
 //!   pidfd's filesystem, and never parses a kernel version.
 //! - `waitid(P_PIDFD)` needs 5.4, and is how an owned child is waited for and reaped, by its
-//!   pidfd and not its pid. The one by-pid wait is std's own, inside a spawn that fails after the
-//!   fork.
+//!   pidfd and not its pid.
 //! - `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` needs 5.6. The
 //!   checked `/proc` view uses it to read a process's start time and to list processes.
 //!   Before Linux 6.9 a refusal (what counts as one is under

@@ -230,15 +230,25 @@ fn an_empty_cwd_fails_an_exact_program_as_it_fails_a_search_one() {
     assert_eq!(kind(&mut exact), std::io::ErrorKind::NotFound);
 }
 
+/// The std command a macOS spawn would build for `c`.
+#[cfg(target_os = "macos")]
+fn std_command_of(c: &Command) -> std::process::Command {
+    let mut steps = crate::child::spawn::in_child::InChild::default();
+    let (std_cmd, ()) = crate::child::spawn::build_std_command_with(c, &mut steps, |_| ()).expect("build");
+    std_cmd
+}
+
 /// The directory is entered by cosca's hook, not std: std leaves a relative program with a
 /// `current_dir` "platform specific and unstable". Its hook cannot be inspected, so this pins that
-/// std is handed no directory to apply; the unreachable-cwd tests pin that the hook enters it.
+/// std is handed no directory to apply; the unreachable-cwd tests pin that the hook enters it. Only
+/// macOS hands std a command: the Linux spawn runs no std command at all.
+#[cfg(target_os = "macos")]
 #[skuld::test]
 fn a_relative_exact_program_hands_std_no_current_dir() {
     for dir in ["sub", "/work"] {
         let mut c = crate::test_child::command(Console::Hidden);
         c.raw_executable("tool").args(["tool"]).current_dir(dir);
-        let std_cmd = crate::child::spawn::build_std_command(&c).expect("build");
+        let std_cmd = std_command_of(&c);
         assert_eq!(std_cmd.get_current_dir(), None, "{dir}");
         assert_eq!(std_cmd.get_program(), "./tool", "{dir}");
     }
@@ -246,11 +256,12 @@ fn a_relative_exact_program_hands_std_no_current_dir() {
 
 /// Negative control: a `Search` program is not completed by cosca, so a relative `current_dir`
 /// is left for the child to read at the fork.
+#[cfg(target_os = "macos")]
 #[skuld::test]
 fn a_search_programs_relative_cwd_is_passed_through() {
     let mut c = crate::test_child::command(Console::Hidden);
     c.executable("tool").args(["tool"]).current_dir("sub");
-    let std_cmd = crate::child::spawn::build_std_command(&c).expect("build");
+    let std_cmd = std_command_of(&c);
     assert_eq!(std_cmd.get_current_dir(), Some(std::path::Path::new("sub")));
 }
 

@@ -355,8 +355,6 @@ pub(crate) async fn spawn_tokio_tracee() -> (crate::tokio::Child, crate::tokio::
 pub(crate) enum Names {
     /// `child <pid>`, the pid `seized` answers.
     Pid,
-    /// The spawned child whose pid the teardown does not know.
-    Unknown,
 }
 
 /// The end of the one warn of a teardown's wait for the child it killed. At threshold zero a cgroup
@@ -531,7 +529,6 @@ pub(crate) fn assert_warns_once_before_blocking<R: Send>(
     assert_killed(pid, status);
     let who = match names {
         Names::Pid => format!("child {pid}"),
-        Names::Unknown => "pid unknown".to_owned(),
     };
     let named: Vec<_> = warns.iter().filter(|text| text.contains(&who)).collect();
     assert_eq!(named.len(), 1, "one warn before the blocking wait: {warns:?}");
@@ -545,7 +542,7 @@ pub(crate) fn assert_warns_once_before_blocking<R: Send>(
 /// with none out, and that the tracee died of a `SIGKILL`. Answers what `teardown` returned.
 ///
 /// A teardown that warns at once fails an assertion here. The frozen clock is the thread's: a
-/// `teardown` that reads its threshold on its own thread, as the handshake's does, sees `after`.
+/// `teardown` that reads its threshold on its own thread sees `after`.
 #[cfg(feature = "tokio")]
 pub(crate) fn assert_no_warn_before_the_threshold<R: Send>(
     after: std::time::Duration,
@@ -566,29 +563,6 @@ pub(crate) fn assert_no_warn_before_the_threshold<R: Send>(
     assert_killed(pid, status);
     assert!(warns.is_empty(), "no warn before the threshold passed: {warns:?}");
     done
-}
-
-/// [`assert_warns_once_before_blocking`] for a tracee `pid` that exists already: the teardown starts
-/// only once the tracer has seized it.
-#[cfg(feature = "tokio")]
-pub(crate) fn assert_warns_once_after_seizing<R: Send>(
-    names: Names,
-    pid: u32,
-    teardown: impl FnOnce() -> R + Send,
-) -> R {
-    let (seized_tx, seized_rx) = std::sync::mpsc::channel();
-    assert_warns_once_before_blocking(
-        names,
-        move || {
-            seized_rx.recv().expect("the tracer seized the child");
-            teardown()
-        },
-        move || {
-            let tracer = spawn_helper(pid);
-            seized_tx.send(()).expect("let the teardown go on");
-            (pid, tracer)
-        },
-    )
 }
 
 /// At least one child was reaped by a teardown, and each died of `SIGKILL`: the teardown's kill was

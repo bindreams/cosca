@@ -336,123 +336,190 @@ fn a_refused_pidfd_open_fails_the_async_graceful_shutdown_trees_group_sweep_nami
     }
 }
 
-/// `spawn` adopts its child through a pidfd; a refused `pidfd_open` fails the spawn with
-/// `Unsupported` naming `spawn`, with no fallback.
+/// `spawn` gets its child's pidfd from the clone, so it needs no `pidfd_open`: with it refused by a
+/// seccomp filter the spawn still succeeds, and the child is ended through its own handle.
 ///
-/// Mutants: the op is another; an errno missing from the refusals.
+/// Mutant: the spawn calls `pidfd_open`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_seccomp_refused_pidfd_open_fails_the_spawn_naming_spawn() {
+fn a_seccomp_refused_pidfd_open_does_not_fail_a_spawn() {
     for (code, name) in REFUSALS {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap().to_string();
         let mut cmd = common::command(common::Console::Hidden);
         cmd.executable(common::testbin())
             .args(["cosca_testbin", "control-block", addr.as_str(), "R"]);
-        let result = std::thread::scope(|scope| {
+        std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     common::seccomp::deny_pidfd_open_on_this_thread(code);
-                    cmd.spawn()
+                    let child = cmd
+                        .spawn()
+                        .unwrap_or_else(|e| panic!("{name}: a spawn needs no pidfd_open: {e:?}"));
+                    child.kill().expect("kill through the handle the clone gave");
+                    child.wait().expect("reap");
+                })
+                .join()
+                .expect("the filtered thread");
+        });
+    }
+}
+
+/// A row of [`assert_clone_refused`]: `clone3`'s errno, then `clone`'s (`None`: allowed), the name of the
+/// errno the spawn ends on, and whether it is a refusal.
+#[cfg(target_os = "linux")]
+type CloneRow = (i32, Option<i32>, &'static str, bool);
+
+/// The rows where `clone3` answers `ENOSYS`, so libc falls back to `clone` and threads still start: the
+/// async spawn's runtime can run on a filtered thread.
+#[cfg(target_os = "linux")]
+const FALLBACK_ROWS: [CloneRow; 3] = [
+    (libc::ENOSYS, Some(libc::EPERM), "EPERM", true),
+    (libc::ENOSYS, Some(libc::ENOSYS), "ENOSYS", true),
+    (libc::ENOSYS, Some(libc::EAGAIN), "EAGAIN", false),
+];
+
+/// A `clone3` answering `EAGAIN` is the kernel's own failure: no fallback to the `clone` that would have
+/// worked. Sync only: libc does not fall back on `EAGAIN` for a thread either, so a runtime could not start
+/// its pool thread under it.
+#[cfg(target_os = "linux")]
+const CLONE3_FAILS_ROW: CloneRow = (libc::EAGAIN, None, "EAGAIN", false);
+
+/// A spawn whose clone is refused on both paths (`clone3`, then `clone(CLONE_PIDFD)`) is
+/// `Unsupported` naming `spawn`, for the two errnos that are refusals (`ENOSYS`, `EPERM`), and makes
+/// no child: this thread has none, live or zombie, and the program never ran. Any other errno is
+/// the clone's own failure, `Io`. `build` makes the command that writes `ran` to the file; `spawn`
+/// spawns it, on the filtered thread.
+///
+/// Mutants: the refusal is mapped to `Io`; an errno other than the two is a refusal; a `clone3` failing
+/// with `EAGAIN` falls back to `clone`.
+#[cfg(target_os = "linux")]
+fn assert_clone_refused<C: Send, T: std::fmt::Debug + Send>(
+    rows: &[CloneRow],
+    build: impl Fn(std::fs::File) -> C,
+    spawn: impl Fn(&mut C) -> Result<T, Error> + Send + Sync,
+) {
+    use std::io::Read;
+
+    for &(clone3, clone, name, refusal) in rows {
+        let code = clone.unwrap_or(clone3);
+        let (mut reader, writer) = std::io::pipe().expect("pipe");
+        let mut cmd = build(std::fs::File::from(std::os::fd::OwnedFd::from(writer)));
+        let (result, waitid) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    common::seccomp::deny_pidfd_clones_on_this_thread(clone3, clone);
+                    let result = spawn(&mut cmd);
+                    // `__WNOTHREAD`: only this thread's children. ECHILD: it has none.
+                    // SAFETY: a `waitid` with no output buffer, `WNOWAIT`: it consumes nothing.
+                    let rc = unsafe {
+                        libc::waitid(
+                            libc::P_ALL,
+                            0,
+                            std::ptr::null_mut(),
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WNOTHREAD,
+                        )
+                    };
+                    (result, (rc, std::io::Error::last_os_error().raw_os_error()))
                 })
                 .join()
                 .expect("the filtered thread")
         });
-        assert_refused(result, "spawn", (code, name));
+        match result {
+            Err(e @ Error::Unsupported { .. }) if refusal => {
+                let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").expect("the kernel release");
+                assert_eq!(
+                    e.to_string(),
+                    format!(
+                        "spawn is not supported on linux: cosca requires a clone that returns the child's \
+                         pidfd (clone3, or clone with CLONE_PIDFD; Linux \u{2265} 5.3), refused here: \
+                         clone answered {name} (kernel {})",
+                        release.trim_end()
+                    )
+                );
+                assert_eq!(common::os_code(&e), Some(code), "{name}: the errno is the source");
+            }
+            Err(Error::Io(e)) if !refusal => assert_eq!(e.raw_os_error(), Some(code), "{name}: {e:?}"),
+            other => panic!("a clone answering {name}: unexpected {other:?}"),
+        }
+        assert_eq!(waitid, (-1, Some(libc::ECHILD)), "{name}: no child, not even a zombie");
+        drop(cmd);
+        let mut out = String::new();
+        reader.read_to_string(&mut out).expect("read to EOF");
+        assert_eq!(out, "", "{name}: the program must not have run");
     }
 }
 
-/// The refusal is found BEFORE the fork, whichever `Command` spawns. The filter also makes any fork
-/// fail, so a spawn that got as far as forking would fail `Io`, not `Unsupported`; and this thread
-/// ends with no child, live or zombie, and the program never ran. `build` makes the command that
-/// writes `ran` to the file; `spawn` spawns it, on the filtered thread.
 #[cfg(target_os = "linux")]
-fn assert_refusal_found_before_any_fork<C: Send, T: std::fmt::Debug + Send>(
-    code: i32,
-    name: &str,
-    build: impl FnOnce(std::fs::File) -> C,
-    spawn: impl FnOnce(&mut C) -> Result<T, Error> + Send,
-) {
+#[skuld::test]
+fn a_refused_clone_fails_the_spawn_unsupported_with_no_child() {
+    assert_clone_refused(
+        &[FALLBACK_ROWS.as_slice(), &[CLONE3_FAILS_ROW]].concat(),
+        |stdout| {
+            let mut cmd = common::command(common::Console::Hidden);
+            cmd.args(["sh", "-c", "echo ran"]);
+            cmd.stdout(cosca::Stdio::from_file(stdout)).expect("set stdout");
+            cmd
+        },
+        |cmd| cmd.spawn(),
+    );
+}
+
+/// A `clone3` refused with `EPERM` (a profile whose default action is `EPERM`) falls back to
+/// `clone(CLONE_PIDFD)`, which the filter allows: the spawn succeeds and the program runs.
+///
+/// Mutant: `EPERM` from `clone3` is not a refusal the fallback reads.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_clone3_refused_with_eperm_falls_back_to_clone_and_spawns() {
     use std::io::Read;
 
     let (mut reader, writer) = std::io::pipe().expect("pipe");
-    let mut cmd = build(std::fs::File::from(std::os::fd::OwnedFd::from(writer)));
-    let (result, waitid) = std::thread::scope(|scope| {
+    let mut cmd = common::command(common::Console::Hidden);
+    cmd.args(["sh", "-c", "echo ran"]);
+    cmd.stdout(cosca::Stdio::from_file(std::fs::File::from(
+        std::os::fd::OwnedFd::from(writer),
+    )))
+    .expect("set stdout");
+    std::thread::scope(|scope| {
         scope
             .spawn(|| {
-                common::seccomp::deny_pidfd_open_and_forks_on_this_thread(code);
-                let result = spawn(&mut cmd);
-                // `__WNOTHREAD`: only this thread's children. ECHILD: it has none.
-                // SAFETY: a `waitid` with no output buffer, `WNOWAIT`: it consumes nothing.
-                let rc = unsafe {
-                    libc::waitid(
-                        libc::P_ALL,
-                        0,
-                        std::ptr::null_mut(),
-                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WNOTHREAD,
-                    )
-                };
-                (result, (rc, std::io::Error::last_os_error().raw_os_error()))
+                common::seccomp::deny_pidfd_clones_on_this_thread(libc::EPERM, None);
+                let child = cmd.spawn().unwrap_or_else(|e| panic!("the fallback must spawn: {e:?}"));
+                child.wait().expect("reap");
             })
             .join()
-            .expect("the filtered thread")
+            .expect("the filtered thread");
     });
-    assert_refused(result, "spawn", (code, name));
-    assert_eq!(waitid, (-1, Some(libc::ECHILD)), "{name}: no child, not even a zombie");
     drop(cmd);
     let mut out = String::new();
     reader.read_to_string(&mut out).expect("read to EOF");
-    assert_eq!(out, "", "{name}: the program must not have run");
+    assert_eq!(out, "ran\n");
 }
 
-/// Mutant: the pre-fork probe is skipped.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_seccomp_refused_pidfd_open_is_found_before_any_fork() {
-    for (code, name) in REFUSALS {
-        assert_refusal_found_before_any_fork(
-            code,
-            name,
-            |stdout| {
-                let mut cmd = common::command(common::Console::Hidden);
-                cmd.args(["sh", "-c", "echo ran"]);
-                cmd.stdout(cosca::Stdio::from_file(stdout)).expect("set stdout");
-                cmd
-            },
-            |cmd| cmd.spawn(),
-        );
-    }
-}
-
-/// [`a_seccomp_refused_pidfd_open_is_found_before_any_fork`] for the async spawn, which makes its
-/// own probe call. `tokio::Command::spawn` refuses outside a runtime, so the filtered thread enters
-/// one.
-///
-/// Mutant: the async spawn skips the pre-fork probe.
+/// [`a_refused_clone_fails_the_spawn_unsupported_with_no_child`] for the async spawn. `tokio::Command::spawn`
+/// refuses outside a runtime, so the filtered thread enters one.
 #[cfg(target_os = "linux")]
 #[cfg(feature = "tokio")]
 #[skuld::test]
-fn a_seccomp_refused_pidfd_open_is_found_before_any_async_fork() {
-    for (code, name) in REFUSALS {
-        assert_refusal_found_before_any_fork(
-            code,
-            name,
-            |stdout| {
-                let mut cmd = common::tokio_command(common::Console::Hidden);
-                cmd.args(["sh", "-c", "echo ran"]);
-                cmd.stdout(cosca::Stdio::from_file(stdout)).expect("set stdout");
-                cmd
-            },
-            |cmd| {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("a current-thread runtime");
-                // The pool thread the spawn runs on is made by this thread, so it has the filter too.
-                runtime.block_on(cmd.spawn())
-            },
-        );
-    }
+fn a_refused_clone_fails_the_async_spawn_unsupported_with_no_child() {
+    assert_clone_refused(
+        &FALLBACK_ROWS,
+        |stdout| {
+            let mut cmd = common::tokio_command(common::Console::Hidden);
+            cmd.args(["sh", "-c", "echo ran"]);
+            cmd.stdout(cosca::Stdio::from_file(stdout)).expect("set stdout");
+            cmd
+        },
+        |cmd| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a current-thread runtime");
+            // The pool thread the spawn runs on is made by this thread, so it has the filter too.
+            runtime.block_on(cmd.spawn())
+        },
+    );
 }
 
 #[path = "../src/test_harness.rs"]

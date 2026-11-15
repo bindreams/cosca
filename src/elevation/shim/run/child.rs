@@ -110,7 +110,8 @@ pub(in crate::elevation::shim) fn spawn(
             CloneKind::Plain,
             fork,
             program,
-            &|| steps(prepared),
+            &[],
+            &mut || steps(prepared),
             crate::elevation::shim::codes::NOT_EXECUTED,
         )
     }
@@ -120,10 +121,10 @@ pub(in crate::elevation::shim) fn spawn(
 pub(in crate::elevation::shim) fn not_spawned(error: SpawnError) -> (NotExecuted, &'static str, i32) {
     match error {
         SpawnError::Pipe(errno) => (NotExecuted::SetupFailed(Errno(errno)), "cannot create a pipe", errno),
-        SpawnError::Unsupported(errno) => (
-            NotExecuted::Unsupported(Errno(errno)),
+        SpawnError::Unsupported(refusal) => (
+            NotExecuted::Unsupported(Errno(refusal.errno())),
             "the kernel cannot make a child with a pidfd",
-            errno,
+            refusal.errno(),
         ),
         SpawnError::Fork(errno) => (NotExecuted::ForkFailed(Errno(errno)), "fork", errno),
     }

@@ -33,8 +33,8 @@ pub(crate) struct Prepared {
     pub frozen: bool,
 }
 
-/// A child the spawn has just forked, as the spawn holds it: its pid, and the pidfd the handshake
-/// gave it from before `exec`. The pidfd names the child whoever reaps it and whoever takes its
+/// A child the spawn has just forked, as the spawn holds it: its pid, and the pidfd its clone
+/// gave it from its first instant. The pidfd names the child whoever reaps it and whoever takes its
 /// number, so everything about the child's exit asks it, and the pid only labels.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
@@ -71,6 +71,28 @@ impl Prepared {
         return self.graceful;
         #[cfg(not(windows))]
         return crate::graceful::GracefulMechanism::Process;
+    }
+
+    /// Linux: whether the child's environment carries the nesting marker, which the spawn sets itself.
+    /// `req` is the request this was prepared for.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn marks_environment(&self, req: &ContainRequest) -> bool {
+        marks_environment(req, self.is_root)
+    }
+
+    /// Linux: the placement channel of the cgroup leaf this spawn made, if it made one.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn placement_channel(&mut self) -> Option<&mut crate::containment::cgroup::ReportChannel> {
+        self.cgroup_leaf
+            .as_mut()
+            .map(crate::containment::cgroup::CgroupLeaf::placement_channel)
+    }
+
+    /// Linux: whether the leaf's slot refuses a failed placement (`Strongest`): the child of this spawn
+    /// must not run outside the leaf, so one that reports a failed write has ended.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn refuses_failed_placement(&self) -> bool {
+        self.cgroup_leaf.is_some() && self.mode.is_some_and(ContainMode::is_strict)
     }
 
     /// End the placement exchange of a spawn that failed while the caller still holds its child:
@@ -184,7 +206,7 @@ pub(crate) enum TeardownCaller {
     /// `SuspendedChild::resume`).
     FailedRun,
     /// A spawn's teardown of the child it holds, when its identity read or its attach fails, and the
-    /// cleanup of a child the handshake abandons.
+    /// cleanup of a child the status channel shows never ran.
     #[cfg_attr(
         not(any(target_os = "linux", windows)),
         allow(dead_code, reason = "only the Linux and Windows spawns tear a child down")
@@ -1410,8 +1432,14 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
     };
     WindowsContain {
         creation_flags,
-        marker_env: is_root && req.nesting == Nesting::Mark,
+        marker_env: marks_environment(req, is_root),
     }
+}
+
+/// Whether the child's environment carries the nesting marker: it is the root of a tree, and the request
+/// marks. A nested spawn inherits the marker it found.
+fn marks_environment(req: &ContainRequest, is_root: bool) -> bool {
+    is_root && req.nesting == Nesting::Mark
 }
 
 /// Phase 1 (before spawn): env-marker root detection + pre-spawn OS setup. On Unix, what the child
@@ -1434,7 +1462,7 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
     reason = "each Unix platform reads its own subset of the arguments"
 )]
 pub(crate) fn prepare(
-    std_cmd: &mut std::process::Command,
+    #[cfg(not(target_os = "linux"))] std_cmd: &mut std::process::Command,
     #[cfg(unix)] steps: &mut crate::child::spawn::in_child::InChild,
     req: &ContainRequest,
     #[cfg_attr(
@@ -1519,7 +1547,9 @@ pub(crate) fn prepare(
             frozen: flags.suspended,
         });
     }
-    let marker_env = is_root && req.nesting == Nesting::Mark;
+    // Linux sets the marker in the environment it builds itself (see [`Prepared::marks_environment`]).
+    #[cfg(not(target_os = "linux"))]
+    let marker_env = marks_environment(req, is_root);
     // Windows: hand std the whole environment, rebuilt from the snapshot the marker was read from,
     // so std does not read this process's environment again at `CreateProcessW`. The marker is an
     // op after the user's, named as std names it; it survives a user `env_clear`.
@@ -1530,9 +1560,9 @@ pub(crate) fn prepare(
         std_cmd.env_clear();
         std_cmd.envs(env.captured_vars().expect("a capture is never inherited"));
     }
-    // Elsewhere: set AFTER any user env ops (env_clear) have been applied to std_cmd by the spawn
+    // macOS: set AFTER any user env ops (env_clear) have been applied to std_cmd by the spawn
     // engine, so the marker survives env_clear. `env` appends.
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     if marker_env {
         std_cmd.env(crate::containment::NESTED_ENV, "1");
     }
@@ -1564,7 +1594,7 @@ pub(crate) fn prepare(
                 }
                 UnixSetup::ProcessGroup => {
                     // Strongest: set a new process group + try cgroup.
-                    crate::containment::unix::set_process_group(std_cmd);
+                    steps.process_group();
                 }
             }
 

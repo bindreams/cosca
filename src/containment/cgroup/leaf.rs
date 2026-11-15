@@ -365,6 +365,12 @@ impl CgroupLeaf {
         self.report.as_ref().expect(RELEASED).slot()
     }
 
+    /// The placement-report channel, for a spawn that reads what a child that ended before its `exec`
+    /// reported. Only before the placement verdict is taken.
+    pub(crate) fn placement_channel(&mut self) -> &mut ReportChannel {
+        self.report.as_mut().expect(RELEASED)
+    }
+
     /// Whether `child` entered this leaf: `Ok` when its own write into it succeeded.
     ///
     /// Used once, post-spawn (parent side). Blocks until the report is final — `spawn` returning
@@ -1266,8 +1272,9 @@ impl CgroupLeaf {
             match self.abandon_without_child(warn) {
                 // Nothing named itself: there is no child to answer for.
                 WithoutChild::Unnamed => {}
-                // A child that named itself is one `std` collected (a sync spawn): it is not ours
-                // to reap, and the leaf's own part is done.
+                // A child that named itself is one the spawn already tore down through its pidfd
+                // (or a failed spawn reaped after the clone): it is not ours to reap, and the
+                // leaf's own part is done.
                 WithoutChild::Named => {}
                 // The report was still here, so the exchange was not yet ended.
                 WithoutChild::AlreadyAbandoned => {
@@ -1356,11 +1363,11 @@ pub(crate) enum WithoutChild {
     /// The child never named itself: it may not have been forked, and one that was exits at its
     /// first send, with nothing here to reap it.
     Unnamed,
-    /// The child named a pid. A child that named itself always has its pidfd in the parent (the
-    /// handshake's go-ahead comes only once the parent holds it), so a spawn with no handle for it
-    /// is one where `std` collected the child. Its one consumer is `CgroupLeaf`'s `Drop`
-    /// ([`tear_down`](CgroupLeaf::tear_down)), after a sync spawn; the tokio path asserts against
-    /// it.
+    /// The child named a pid. A child that named itself was cloned, and the spawn that cloned it
+    /// holds its pidfd (the clone gives it before the child runs): the spawn tore the child down
+    /// through that pidfd, or a failed spawn reaped it after the clone, so there is no handle
+    /// left for the leaf to be given. Its one consumer is `CgroupLeaf`'s `Drop`
+    /// ([`tear_down`](CgroupLeaf::tear_down)); the tokio path asserts against it.
     Named,
     /// The exchange was already ended: a breach of the call-once contract.
     AlreadyAbandoned,
@@ -1369,8 +1376,8 @@ pub(crate) enum WithoutChild {
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
     /// End the exchange of a spawn that has no child to give the leaf (a spawn failed before its
-    /// verdict, and `std` collected the child, or none was forked): kill through the leaf if the
-    /// child entered it, and remove the leaf. Nothing is sent to the child, which nothing here
+    /// verdict, and the spawn already tore the child down through its pidfd, or none was cloned): kill
+    /// through the leaf if the child entered it, and remove the leaf. Nothing is sent to the child, which nothing here
     /// holds. Answers whether the child named itself ([`WithoutChild`]).
     ///
     /// Called once per leaf: the channel is taken once, and a repeat is a breach, which debug

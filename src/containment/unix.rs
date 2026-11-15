@@ -132,8 +132,10 @@ impl Contains for Group {
     }
 }
 
-/// Apply pre-spawn group setup to `std_cmd` (root spawns only).
+/// Apply pre-spawn group setup to `std_cmd` (root spawns only). Linux asks its own steps for the same
+/// (`InChild::process_group`).
 /// Must not be combined with `set_session` on the same command.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn set_process_group(std_cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
     std_cmd.process_group(0); // leader: pgid == pid

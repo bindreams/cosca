@@ -1,4 +1,4 @@
-//! The sync spawn's teardown of the child it holds after the handshake (`tear_down_held`), over a
+//! The sync spawn's teardown of the child it holds after the clone (`tear_down_held`), over a
 //! real child with scripted answers (`script_over`). Unprivileged: the leaf's subtree is stated, not
 //! read from a cgroup.
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs inside the virtme-ng guest of the "Shim on Linux" steps in ci.yaml. Checks which kernel booted, then runs the
-# elevation shim's tests on it: first as the unprivileged user that built them, with a setuid-root copy
+# elevation shim's tests and the fork-exec core's (`child::spawn::fork_exec`, `child::spawn::fork_spawn`: the vfork
+# release and the spawn's records) on it: first as the unprivileged user that built them, with a setuid-root copy
 # of the test binary for the test that refuses one, then as root for the tests that need root. It
 # writes <result file> only on full success ("ok <tag> <uname -r>"); the host step reads that file,
 # so a guest that failed, or never ran, cannot pass the job.
@@ -34,7 +35,7 @@ groups_root=(COSCA_TEST_ROOT=0 COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CON
     COSCA_TEST_TRACER=1 COSCA_TEST_TRACER_CONSENT=1 COSCA_TEST_UID_SWITCH=1 COSCA_TEST_UID_SWITCH_CONSENT=1
     COSCA_TEST_SETUID=0 COSCA_TEST_CGROUP=0 COSCA_TEST_ELEVATION=0 COSCA_TEST_STRAY_SIGNAL=0
     "SKULD_LABELS=namespaces | tracer | uid_switch")
-filter='test(elevation::shim::)'
+filter='test(elevation::shim::) | test(child::spawn::fork_exec) | test(child::spawn::fork_spawn)'
 nextest=(cargo nextest run --locked --lib --no-fail-fast --no-tests=fail -E "$filter")
 
 passed() { # <log> <test name>: the log says the test passed
@@ -64,7 +65,11 @@ for name in foreign_writer_of_a_is_refused owner_exit_before_answer_is_123 owner
     owner_pidfd_emfile_is_116_not_123 owner_exit_kills_the_program_despite_fd_copies \
     owner_exit_between_the_recheck_and_the_clone_never_starts_the_program \
     a_signal_after_the_answer_and_before_the_start_is_not_started \
-    the_kernel_refuses_credentials_that_are_not_the_senders setuid_shim_is_refused_before_anything; do
+    the_kernel_refuses_credentials_that_are_not_the_senders setuid_shim_is_refused_before_anything \
+    the_vfork_kind_returns_only_after_the_child_ran_its_steps \
+    a_fork_without_exec_holding_the_channel_does_not_hold_the_return \
+    a_child_fd_on_the_status_channels_number_does_not_hide_a_failed_exec \
+    a_failed_exec_is_an_error_with_two_of_fds_0_to_2_closed; do
     passed "$unpriv_log" "$name"
 done
 

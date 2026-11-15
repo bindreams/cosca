@@ -22,10 +22,7 @@ pub(crate) fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
 /// [`above_stdio`], handing `fd` back if it could not be moved.
 #[cfg_attr(
     not(target_os = "linux"),
-    allow(
-        dead_code,
-        reason = "only the Linux pidfd handshake keeps a descriptor it could not move"
-    )
+    allow(dead_code, reason = "only the Linux spawn keeps a pidfd it could not move")
 )]
 pub(crate) fn above_stdio_keeping(fd: OwnedFd) -> Result<OwnedFd, (io::Error, OwnedFd)> {
     if fd.as_raw_fd() >= 3 {

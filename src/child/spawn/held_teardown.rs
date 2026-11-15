@@ -1,6 +1,7 @@
 //! A failed spawn's teardown of the child it holds after the spawn: on Linux, through its pidfd when
-//! the identity read or the attach that follows fails (sync and async) and of the child the
-//! handshake itself abandons; on Windows, the std and raw spawns' child over its process handle; on
+//! the identity read or the attach that follows fails (sync and async) and of the child the status
+//! channel shows never ran the program (`fork_spawn`); on Windows, the std and raw
+//! spawns' child over its process handle; on
 //! macOS, over the `MacosChild` the spawn builds right after the child's unique id is adopted.
 //! The teardown over a handle with what its caller expects of it ([`tear_down_expecting`]) and the
 //! look at a front (`look_at_failed_spawn_front`) are also what a cgroup leaf's abandonment
@@ -74,8 +75,8 @@ pub(crate) fn tear_down_held(child: OwnedChild, how: HeldTeardown<'_>, why: &mut
     (detail, torn)
 }
 
-/// Tears `child` down after a failed attach that proved it never ran the program (on Linux its hook
-/// ended it before `exec`, as the handshake ends a child it never told to go; on Windows it is still
+/// Tears `child` down after a failed spawn or attach that proved it never ran the program (on Linux
+/// it ended before `exec`, as its status channel or its placement report shows; on Windows it is still
 /// suspended): killed and reaped, whether or not it is an elevation front, which never ran its
 /// `sudo`. Nothing but its being gone refuses its kill ([`Past::Unexecuted`]): on Linux it has this
 /// process's credentials; on Windows the handle is `CreateProcess`'s own and holds

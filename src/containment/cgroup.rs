@@ -32,9 +32,9 @@
 //! **Messages.** In its `pre_exec` the child sends, in order: an *intent*, carrying its pid,
 //! before it touches the leaf; then, after its `cgroup.procs` write, its *report* — `Placed` or
 //! the write's errno. It sends nothing else, and nothing after `exec`. The child's handle is the
-//! pidfd the spawn handshake holds for it, which the abandonment is given: unlike a pid, it
+//! pidfd the spawn's clone gave the parent, which the abandonment is given: unlike a pid, it
 //! cannot come to name another process, whoever reaps the child. A child that sent an intent has
-//! its pidfd in the parent, because the handshake's go-ahead comes only once the parent holds it.
+//! its pidfd in the parent, because the clone gives it before the child runs.
 //!
 //! **One verdict.** The parent ends the exchange exactly once, by one of two acts:
 //! - *Decide.* `take_placement` reads the report — waiting for it, or for the child's exit; then it

@@ -27,9 +27,11 @@
 //!    retry is bounded by the number of `child_fd`s: `F_DUPFD_CLOEXEC` always returns a
 //!    genuinely free number, so at most one collision can occur per `child_fd`;
 //!  - relocates, in the parent before any fork, any mapping whose `parent_fd` sits below fd 3
-//!    (see [`install`]) — std's OWN stdio setup (`.stdin()`/`.stdout()`/`.stderr()`) runs its
-//!    `dup2`s in the child BEFORE any `pre_exec` hook, so a mapping source left at fd 0/1/2
-//!    would otherwise be silently clobbered before the [`InChild`] hook ever ran;
+//!    (see [`install`]) — on Linux the stdio plan runs first among the child's steps, and its
+//!    `dup2`s onto 0 to 2 would clobber a source left there; on macOS std's OWN stdio setup
+//!    (`.stdin()`/`.stdout()`/`.stderr()`) runs its `dup2`s in the child BEFORE any `pre_exec`
+//!    hook. Either way a mapping source left at fd 0/1/2 would be silently clobbered before the
+//!    [`InChild`] steps got to it;
 //!  - checks every post-fork syscall (raw `libc` or rustix) and turns a failure into an
 //!    `io::Error` — except the one `close` of a temporary this module exclusively owns (see
 //!    [`dup_avoiding`]), whose result is intentionally ignored: on Linux a same-process `close`
@@ -44,16 +46,18 @@
 //! deliberately NOT rejected here: it is a normal spawn-time condition (bounded by the child's
 //! own `RLIMIT_NOFILE`) and is left to fail exactly the way any other post-fork syscall failure
 //! does — `dup2` returns `EBADF`, the checked closure returns that as an `io::Error`, and
-//! std's own child-to-parent error pipe turns that into an ordinary `Err` from `Command::spawn`.
+//! the spawn's child-to-parent error channel turns that into an ordinary `Err` from the spawn.
 //!
-//! That last step has one known exception: std allocates its error pipe itself, inside
-//! `spawn()`, AFTER this module's own dup2 plan has already been built from the caller's
-//! `child_fd`s. Nothing here steers a `child_fd` away from whatever number that pipe's write end
-//! lands on. If a caller's `child_fd` equals that number, this module's own pass 2 dup2s the
-//! caller's mapping onto it — closing std's error channel before the child ever calls `exec`. A
-//! dup2 or exec failure after that point (including the out-of-range case above) writes std's
-//! errno bytes into the caller's mapped fd instead of reaching the parent, and `spawn()` wrongly
-//! returns `Ok`. Not fixed here: a cosca-owned error channel would fix it.
+//! On Linux that channel is the spawn core's (`child::spawn::fork_exec`), whose write end
+//! is kept off every `child_fd` (`InChild::mapped_fds`), so no mapping can replace it. On macOS
+//! it is std's own error pipe, with one known exception: std allocates it itself, inside `spawn()`,
+//! AFTER this module's own dup2 plan has already been built from the caller's `child_fd`s. Nothing
+//! here steers a `child_fd` away from whatever number that pipe's write end lands on. If a caller's
+//! `child_fd` equals that number, this module's own pass 2 dup2s the caller's mapping onto it —
+//! closing std's error channel before the child ever calls `exec`. A dup2 or exec failure after
+//! that point (including the out-of-range case above) writes std's errno bytes into the caller's
+//! mapped fd instead of reaching the parent, and `spawn()` wrongly returns `Ok`. Not fixed there: a
+//! cosca-owned fork and error channel would fix it.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -83,19 +87,22 @@ pub(crate) struct FdMapping {
 /// failure rather than a parent-side refusal.
 ///
 /// Before building the plan, relocates (in the parent, before any fork) any mapping whose
-/// `parent_fd` sits below fd 3, via `F_DUPFD_CLOEXEC(fd, 3)` — see the module docs for why a
-/// low-numbered source would otherwise be clobbered by std's own stdio setup. That relocation is
-/// the only parent-side failure mode left: an ordinary `Err` (e.g. `EMFILE`) if the duplicate
-/// itself cannot be made.
+/// `parent_fd` sits below fd 3, via `F_DUPFD_CLOEXEC(fd, 3)`. The reason differs by platform: on
+/// Linux the stdio plan ([`Plan::stdio`]) is the first step of the child, and its `dup2`s onto 0 to
+/// 2 would clobber a source left there before this plan ran; on macOS std's own stdio `dup2`s run
+/// before any `pre_exec` hook. That relocation is the only parent-side failure mode left: an
+/// ordinary `Err` (e.g. `EMFILE`) if the duplicate itself cannot be made.
 ///
 /// The vacated original number is deliberately NOT freed at this point: it stays open, owned by
-/// the `Plan` (see `Plan::_retired`), until the command holding `steps`' hook drops. Freeing it any
-/// earlier would let `Command::spawn`'s own internal fd allocation — most importantly its
-/// child-to-parent CLOEXEC error-reporting pipe, which `spawn()` opens at the lowest free number —
-/// claim that exact number in the parent. Std's OWN child-side stdio dup2 runs before any
-/// `pre_exec` hook (including this module's own), so if that pipe's write end landed on a freed
-/// 0/1/2 slot, std's own dup2 would close it before this module's `pre_exec` ever got a chance to
-/// run, and a post-fork failure would then have nowhere left to report to.
+/// the `Plan` (see `Plan::_retired`), until the command holding `steps`' hook drops. On macOS,
+/// freeing it any earlier would let `Command::spawn`'s own internal fd allocation — most
+/// importantly its child-to-parent CLOEXEC error-reporting pipe, which `spawn()` opens at the
+/// lowest free number — claim that exact number in the parent. Std's OWN child-side stdio dup2
+/// runs before any `pre_exec` hook (including this module's own), so if that pipe's write end
+/// landed on a freed 0/1/2 slot, std's own dup2 would close it before this module's `pre_exec`
+/// ever got a chance to run, and a post-fork failure would then have nowhere left to report to.
+/// On Linux the spawn core's channel and the clone's pidfd are moved above stdio, so the
+/// retention is not needed for them; it is the same on both platforms.
 pub(crate) fn install(steps: &mut InChild, mut mappings: Vec<FdMapping>) -> io::Result<()> {
     if mappings.is_empty() {
         return Ok(());
@@ -159,6 +166,13 @@ pub(super) struct Plan {
 }
 
 impl Plan {
+    /// The plan of the child's stdio: `mappings` put onto 0 to 2. Its sources may sit on any number,
+    /// 0 to 2 included: pass 1 moves a source that sits on another mapping's number out of the way.
+    #[cfg(target_os = "linux")]
+    pub(super) fn stdio(mappings: Vec<FdMapping>) -> Plan {
+        Plan::build(mappings, Vec::new())
+    }
+
     fn build(mappings: Vec<FdMapping>, retired: Vec<OwnedFd>) -> Plan {
         let mut child_fds: Vec<RawFd> = mappings.iter().map(|m| m.child_fd).collect();
         child_fds.sort_unstable();
@@ -169,6 +183,12 @@ impl Plan {
             child_fds,
             _retired: retired,
         }
+    }
+
+    /// Every child fd number the plan maps onto, ascending.
+    #[cfg(target_os = "linux")]
+    pub(super) fn child_fds(&self) -> &[RawFd] {
+        &self.child_fds
     }
 
     /// Async-signal-safe: no allocation, every syscall's return value is checked (module docs:
@@ -245,7 +265,7 @@ fn dup_fd_cloexec_at_or_above(fd: RawFd, min: RawFd) -> io::Result<RawFd> {
 /// OS failure (e.g. `EMFILE` — too many open files) as-is. Separately, `min`'s `checked_add` can
 /// overflow, but only if `forbidden` contains `i32::MAX` AND the process has enough open-file
 /// headroom for `F_DUPFD_CLOEXEC` to actually hand back `i32::MAX` — not reachable in practice.
-fn dup_avoiding(fd: RawFd, forbidden: &[RawFd]) -> io::Result<RawFd> {
+pub(super) fn dup_avoiding(fd: RawFd, forbidden: &[RawFd]) -> io::Result<RawFd> {
     let mut min: RawFd = 3;
     loop {
         let tmp = dup_fd_cloexec_at_or_above(fd, min)?;

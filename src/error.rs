@@ -435,7 +435,7 @@ pub enum Error {
     /// arm is in `resume`'s `# Errors`.
     ///
     /// A failed spawn, sync or tokio, hands back the child when the spawn or run could not end it:
-    /// on Linux, when the identity read or the attach fails after the handshake (an attach failure
+    /// on Linux, when the identity read or the attach fails after the clone (an attach failure
     /// that proves the program never ran hands nothing back: it is not this variant), on every Unix,
     /// when the elevation backend's password write fails, and on Windows, when a
     /// `kill_on_drop(false)` child's job refuses the disarm and the kill that follows is refused

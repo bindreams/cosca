@@ -563,7 +563,7 @@ pub(crate) fn expect_handed_back<R>(
     (cause, fate, handed_back)
 }
 
-/// `tear_down_held` (the sync spawn's teardown of the child it holds after the handshake) with the
+/// `tear_down_held` (the sync spawn's teardown of the child it holds after the clone) with the
 /// diagnosis `why`, its handed-back child in a [`HandedBack`] with `release`. The child has a pid.
 /// The first answer is what the teardown did with a front, the `detail` of the spawn's error.
 #[cfg(target_os = "linux")]

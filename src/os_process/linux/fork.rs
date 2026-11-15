@@ -51,13 +51,6 @@ pub(crate) enum CloneKind {
     /// The parent is suspended until the child's `execve` or exit, as `vfork` does, but the child has
     /// an address space of its own (no `CLONE_VM`). The child must never wait on the parent: the
     /// parent is not running, so it would wait for ever.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the kind of a spawn that waits for the exec; the shim spawns Plain"
-        )
-    )]
     Vfork,
     /// The parent runs on. The child may wait on the parent.
     Plain,
@@ -100,8 +93,9 @@ const CLONE_VFORK: u64 = 0x4000;
 
 /// Forks this process, as `fork` does, and hands the parent a pidfd for the child. `kind` says whether
 /// the parent is suspended until the child's `execve` or exit. `Err` is the errno, and no child was
-/// made. Allocates and logs nothing, in either process: [`NewChild::path`] says which clone ran, for
-/// the parent to log.
+/// made, except on a kernel before 5.2, whose `clone` ignores `CLONE_PIDFD`: there the child is made, `Err`
+/// is `ENOSYS`, and the child is left (see `after_clone`). Allocates and logs nothing, in either process:
+/// [`NewChild::path`] says which clone ran, for the parent to log.
 ///
 /// `clone3` is tried first, and `clone(CLONE_PIDFD)` replaces it where its errno is a refusal: `ENOSYS`
 /// (the kernel lacks `clone3`, or Docker's default seccomp profile refuses it) or `EPERM` (a seccomp
@@ -189,7 +183,12 @@ fn debug_assert_locked() {
     );
 }
 
-/// The result of a clone that returned `pid`: right after the call, so that `errno` is its own.
+/// The result of a clone that returned `pid`: right after the call, so that `errno` is its own. `pidfd` is
+/// what the caller initialised to `-1` and the clone stored the descriptor in.
+///
+/// A kernel before 5.2 runs the legacy `clone` with `CLONE_PIDFD` ignored: it returns the child's pid and
+/// stores no descriptor. That is a refusal (`ENOSYS`) with a child made: nothing here can name it, and cosca
+/// never reaps by pid, so it is left (a zombie once it ends). Such kernels are below the 5.6 floor.
 fn after_clone(pid: libc::c_long, pidfd: libc::c_int, path: Path) -> Result<Fork, i32> {
     if pid == 0 {
         return Ok(Fork::Child);
@@ -197,7 +196,9 @@ fn after_clone(pid: libc::c_long, pidfd: libc::c_int, path: Path) -> Result<Fork
     if pid < 0 {
         return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
     }
-    debug_assert!(pidfd >= 0, "CLONE_PIDFD stores the descriptor");
+    if pidfd < 0 {
+        return Err(libc::ENOSYS);
+    }
     // SAFETY: the kernel made `pidfd` for this call and nothing else owns it.
     let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
     Ok(Fork::Parent(NewChild {

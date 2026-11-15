@@ -11,8 +11,8 @@
 //! the checked `/proc` view cannot be built, and `open_verified_with` of an id told by its
 //! `starttime` (a host before Linux 6.9) is `Unsupported` naming `openat2`; an id told by its pidfd's
 //! inode needs no `/proc` view.
-//! `spawn` probes `pidfd_open` on this process's own pid before it forks ([`probe_pidfd_support_with`]),
-//! so a refusal fails the spawn with no child; see `child::spawn::pidfd_handshake` for the rest.
+//! `spawn` calls no `pidfd_open`: the clone that makes the child gives its pidfd (see
+//! `child::spawn::fork_exec`).
 
 use std::os::fd::AsFd as _;
 
@@ -114,26 +114,6 @@ fn io_or_unsupported(op: &str, call: FailedCall) -> Error {
             std::io::Error::from(call.errno()),
         ))
     })
-}
-
-/// A `pidfd_open` failure while spawning: a refusal is [`Error::Unsupported`], anything else `Io`.
-pub(crate) fn spawn_open_error(errno: rustix::io::Errno) -> Error {
-    io_or_unsupported("spawn", FailedCall::pidfd_open(errno))
-}
-
-/// The pre-fork probe: `pidfd_open` through `kernel` on this process's own pid, closed at once. Spawning forks
-/// through std, which cannot hand back a pidfd, so a kernel or filter that refuses `pidfd_open`
-/// has to be found out BEFORE the fork, or the child would exist with no pidfd. A refusal is
-/// [`Error::Unsupported`] naming `spawn`; any other failure (`EMFILE`, `ENFILE`, `ENOMEM`) is `Io`
-/// naming `pidfd_open`. Either way no child exists.
-///
-/// Two syscalls per spawn, and no cached verdict: a cache is process-global state, and a filter
-/// can be installed after the first spawn.
-pub(crate) fn probe_pidfd_support_with(kernel: &dyn Kernel) -> Result<(), Error> {
-    kernel
-        .pidfd_open(rustix::process::getpid(), PidfdFlags::empty())
-        .map(drop)
-        .map_err(spawn_open_error)
 }
 
 /// `pidfd_open` refused `id`'s pid with `errno`. `Ok(None)` when the process is provably gone;
