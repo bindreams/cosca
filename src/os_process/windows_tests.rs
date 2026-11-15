@@ -4,9 +4,9 @@ use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, HAND
 use windows::Win32::System::Threading::CreateEventW;
 
 use crate::error::Error;
-use crate::identity::ProcessId;
+use crate::identity::{refusing_the_next_terminate, FakeKernel, ProcessId};
 use crate::os_process::drive::exited_held;
-use crate::os_process::{kill, open, terminate, Exit, OsProcess as _, WaitFor};
+use crate::os_process::{kill, open, open_with, terminate, Exit, OpenFailure, OsProcess as _, WaitFor};
 use crate::signal::{Sent, Sig};
 use crate::test_child::live_blocker as blocker;
 
@@ -144,11 +144,7 @@ fn a_windows_child_owns_the_kernel_it_was_built_with() {
     use crate::identity::Kernel;
     use crate::os_process::child::OsChild as _;
 
-    /// A kernel with something to count: Windows's `Kernel` has no methods.
-    struct Counted;
-    impl Kernel for Counted {}
-
-    let kernel = Arc::new(Counted);
+    let kernel = Arc::new(FakeKernel::new());
     let p = super::WindowsProcess::for_child(
         Arc::clone(&kernel),
         super::test_event::new_test_event().expect("create an event handle"),
@@ -195,20 +191,27 @@ fn a_uac_handle_keeps_the_access_it_was_read_as() {
     assert_eq!(super::access_of_uac_read(Ok::<_, std::io::Error>(read)).0, read);
 }
 
-/// A kill of a process that is exiting but not yet signalled is `Ok`; the seam refuses and the
-/// process stays alive.
+/// A kill of a process that is exiting but not yet signalled is `Ok`; the `FakeKernel`'s terminate
+/// row refuses and the process stays alive.
 ///
 /// Mutant: a refusal is success only once the process reads signalled, so this one is `Err(Io)`.
 #[skuld::test]
 fn kill_of_a_process_that_is_exiting_but_not_signalled_is_ok() {
     let (child, _stdin, id) = blocker();
-    let p = open(id).unwrap().expect("a live process opens");
-    let _refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let kernel = std::sync::Arc::new(refusing_the_next_terminate());
+    let p = open_with(std::sync::Arc::clone(&kernel), id)
+        .map_err(OpenFailure::into_open_error)
+        .unwrap()
+        .expect("a live process opens");
     let result = kill(&*p);
-    // The seam sent no terminate: end the fixture before asserting.
+    // The row sent no terminate: end the fixture before asserting.
     child.kill().expect("end the fixture");
     child.wait().expect("reap the fixture");
 
+    assert!(
+        kernel.all_rows_taken(),
+        "the kill reached TerminateProcess to be refused"
+    );
     result.expect("a refusal on an exiting process is not a failed kill");
 }
 

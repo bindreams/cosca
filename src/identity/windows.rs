@@ -25,13 +25,17 @@ use windows::Win32::Foundation::{
     WAIT_TIMEOUT,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
-    PROCESS_ACCESS_RIGHTS, PROCESS_BASIC_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    PROCESS_TERMINATE,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS,
+    PROCESS_BASIC_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 use windows::Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION;
 
 use super::{Key, Liveness, OrderKey, OrderedRead, ParentRead, RawPid, Resolved, UnknownCause};
+
+#[path = "windows/kernel.rs"]
+pub(crate) mod kernel;
+
+use self::kernel::Kernel;
 
 /// 100 ns intervals between 1601-01-01 (FILETIME epoch) and 1970-01-01 (Unix).
 const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
@@ -128,9 +132,9 @@ pub(crate) fn is_access_denied(e: &windows::core::Error) -> bool {
     e.code() == windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0)
 }
 
-/// `TerminateProcess` on `handle`, a live process handle the caller closes afterwards. Never
-/// blocks. `granted` is the access the handle holds, which its opener knows (it asked for it, or
-/// read it from the handle once: [`granted_access`]).
+/// `TerminateProcess`, asked of `kernel`, on `handle`, a live process handle the caller closes
+/// afterwards. Never blocks. `granted` is the access the handle holds, which its opener knows (it
+/// asked for it, or read it from the handle once: [`granted_access`]).
 ///
 /// `TerminateProcess` refuses with `ERROR_ACCESS_DENIED` both a handle that lacks
 /// `PROCESS_TERMINATE` and a process that has terminated (Microsoft's `TerminateProcess` page), so
@@ -141,8 +145,8 @@ pub(crate) fn is_access_denied(e: &windows::core::Error) -> bool {
 /// - It lacks the right: only an [`exit_look`] that finds the process exited proves an exit. The
 ///   exit code is read to prove an exit, never to prove liveness, because 259 cannot be told from a
 ///   live process. Anything else is [`Termination::Failed`] with the refusal.
-pub(crate) fn terminate_held(handle: HANDLE, granted: PROCESS_ACCESS_RIGHTS) -> Termination {
-    let refusal = match terminate_process(handle) {
+pub(crate) fn terminate_held(kernel: &dyn Kernel, handle: HANDLE, granted: PROCESS_ACCESS_RIGHTS) -> Termination {
+    let refusal = match kernel.terminate(handle, TERMINATE_EXIT_CODE) {
         Ok(()) => return Termination::Terminated,
         Err(e) if !is_access_denied(&e) => return Termination::Failed(e),
         Err(e) => e,
@@ -226,39 +230,6 @@ pub(crate) fn granted_access(handle: HANDLE) -> std::io::Result<u32> {
 
 /// The exit code `terminate_held` ends a process with.
 pub(crate) const TERMINATE_EXIT_CODE: u32 = 1;
-
-fn terminate_process(handle: HANDLE) -> windows::core::Result<()> {
-    #[cfg(test)]
-    if fault::fire_exiting_refusal() {
-        return Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
-            windows::Win32::Foundation::ERROR_ACCESS_DENIED.0,
-        )));
-    }
-    // SAFETY: the caller's live process handle.
-    unsafe { TerminateProcess(handle, TERMINATE_EXIT_CODE) }
-}
-
-/// Test seam for the window Windows leaves open while a process exits.
-#[cfg(test)]
-pub(crate) mod fault {
-    use crate::oneshot_hook::{self, Armed, OneShotHook};
-
-    thread_local! {
-        static EXITING: OneShotHook = const { OneShotHook::new() };
-    }
-
-    /// Make the next `terminate_held` on this thread refuse with `ERROR_ACCESS_DENIED` without
-    /// calling `TerminateProcess`; the process stays alive. The guard clears the refusal on drop,
-    /// used or not, so one that no kill reached cannot refuse the next test's kill on this thread.
-    pub(crate) fn refuse_next_terminate_as_exiting() -> Armed {
-        oneshot_hook::arm(&EXITING, || {})
-    }
-
-    /// Whether an armed refusal was waiting, which this answers.
-    pub(super) fn fire_exiting_refusal() -> bool {
-        oneshot_hook::fire_with(&EXITING, ()).is_some()
-    }
-}
 
 /// Read the creation FILETIME of an open process handle as a raw token, preserving the
 /// failure. `creation_token` is this with the error dropped.

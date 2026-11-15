@@ -5,7 +5,7 @@ use windows::Win32::System::Threading::{
 
 use super::{creation_token, current_token, exit_look, is_running, open_dropping_refused, start_token, Look, Opened};
 use crate::identity::windows_fixture::{spawn_restricted, spawn_restricted_shell};
-use crate::identity::{Key, Liveness, Resolved};
+use crate::identity::{refusing_the_next_terminate, HostKernel, Key, Liveness, Resolved};
 use crate::os_process::windows::CREATE_PROCESS_ACCESS;
 
 /// One look at whether `id`'s process has exited, through the open: gone or recycled
@@ -415,7 +415,7 @@ impl Limited {
 
     /// `terminate_held` on the handle, as the one that opened it with the rights it asked for.
     fn terminate(&self) -> super::Termination {
-        super::terminate_held(self.0, self.1)
+        super::terminate_held(&HostKernel, self.0, self.1)
     }
 }
 
@@ -425,22 +425,26 @@ impl Drop for Limited {
     }
 }
 
-/// The seam refuses a process that stays alive and unsignalled.
+/// The `FakeKernel`'s terminate row refuses a process that stays alive and unsignalled.
 ///
 /// Mutant: a refusal is `Exited` only for a signalled process, so this one is `Failed`.
 #[skuld::test]
 fn a_refusal_on_a_handle_holding_terminate_is_the_exit() {
     let child = spawn_blocked_child();
-    let _refusal = super::fault::refuse_next_terminate_as_exiting();
-    let outcome = super::terminate_held(handle_of(&child), CREATE_PROCESS_ACCESS);
+    let kernel = refusing_the_next_terminate();
+    let outcome = super::terminate_held(&kernel, handle_of(&child), CREATE_PROCESS_ACCESS);
     end(child);
+    assert!(
+        kernel.all_rows_taken(),
+        "the kill reached TerminateProcess to be refused"
+    );
     assert!(
         matches!(outcome, super::Termination::Exited),
         "got a failure or a terminate"
     );
 }
 
-/// The same for a process that has exited and was signalled: the real refusal, no seam.
+/// The same for a process that has exited and was signalled: the real refusal, no row.
 ///
 /// Mutant: a refusal is `Exited` only while the process is unsignalled.
 #[skuld::test]
@@ -448,7 +452,7 @@ fn a_real_refusal_on_a_handle_holding_terminate_of_an_exited_process_is_the_exit
     let mut child = spawn_blocked_child();
     child.kill().expect("end the fixture");
     child.wait().expect("reap the fixture");
-    let outcome = super::terminate_held(handle_of(&child), CREATE_PROCESS_ACCESS);
+    let outcome = super::terminate_held(&HostKernel, handle_of(&child), CREATE_PROCESS_ACCESS);
     assert!(
         matches!(outcome, super::Termination::Exited),
         "got a failure or a terminate"
@@ -472,18 +476,22 @@ fn a_refusal_on_a_handle_without_terminate_is_failed_while_the_process_runs() {
     assert!(super::is_access_denied(&e), "{e:?}");
 }
 
-/// As above with the seam's refusal, the process being exiting but unsignalled: a handle without
-/// the right cannot show the exit.
+/// As above with the `FakeKernel`'s terminate row refusing, the process being exiting but
+/// unsignalled: a handle without the right cannot show the exit.
 ///
-/// Mutant: the granted access is not consulted, so the seam's refusal reads as the exit.
+/// Mutant: the granted access is not consulted, so the row's refusal reads as the exit.
 #[skuld::test]
 fn an_exiting_refusal_on_a_handle_without_terminate_is_failed_while_unsignalled() {
     let child = spawn_blocked_child();
     let limited = Limited::of(&child, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION);
-    let _refusal = super::fault::refuse_next_terminate_as_exiting();
-    let outcome = limited.terminate();
+    let kernel = refusing_the_next_terminate();
+    let outcome = super::terminate_held(&kernel, limited.0, limited.1);
     drop(limited);
     end(child);
+    assert!(
+        kernel.all_rows_taken(),
+        "the kill reached TerminateProcess to be refused"
+    );
     let super::Termination::Failed(e) = outcome else {
         panic!("an unsignalled process is not shown to have exited");
     };

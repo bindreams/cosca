@@ -607,8 +607,8 @@ pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signa
 /// Terminate `id` through a handle opened by identity ([`open_by_identity`]). Already gone
 /// (unresolvable, or exiting when the call came) is success. Best-effort.
 #[cfg(windows)]
-pub(crate) fn kill_by_identity(id: ProcessId) -> KillOutcome {
-    kill_opened(id, open_by_identity(&crate::identity::HostKernel, id), Sig::Kill)
+pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId) -> KillOutcome {
+    kill_opened(id, open_by_identity(kernel, id), Sig::Kill)
 }
 
 /// Whether `root`'s exit has begun, as the kernel's exit flag shows (see the module doc), read through
@@ -796,10 +796,7 @@ fn kill_one(kernel: &dyn Kernel, id: ProcessId) -> KillOutcome {
     #[cfg(unix)]
     return kill_by_identity(kernel, id, Signal::SIGKILL);
     #[cfg(windows)]
-    {
-        let _ = kernel;
-        kill_by_identity(id)
-    }
+    kill_by_identity(kernel, id)
 }
 
 /// A member of a `TreeWalk` tree that a walk left, as the handle holds it for the next kill

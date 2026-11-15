@@ -194,11 +194,7 @@ pub(crate) fn adopt_std(
         Err(e) => return Err((e, child)),
     };
     #[cfg(windows)]
-    let os: Box<dyn OsChild> = Box::new(super::windows::WindowsProcess::for_child(
-        crate::identity::HostKernel,
-        std::os::windows::io::OwnedHandle::from(child),
-        id.pid(),
-    ));
+    let os = adopt_std_over(crate::identity::HostKernel, child, id);
     // std's `Child` holds nothing else the tests use: dropping it neither kills nor reaps.
     #[cfg(unix)]
     drop(child);
@@ -248,6 +244,23 @@ pub(crate) fn adopt_std_over<K: crate::identity::Kernel + Send + 'static>(
     }
 }
 
+/// [`adopt_std`]'s Windows half over a kernel the test states: a
+/// [`WindowsProcess`](super::windows::WindowsProcess) of the child's own handle, which owns `kernel`.
+/// It cannot fail: the handle pins the process.
+#[cfg(all(test, windows))]
+pub(crate) fn adopt_std_over<K: crate::identity::Kernel + Send + 'static>(
+    kernel: K,
+    child: std::process::Child,
+    id: crate::identity::ProcessId,
+) -> Box<dyn OsChild> {
+    debug_assert_eq!(child.id(), id.pid(), "the identity must be the child's");
+    Box::new(super::windows::WindowsProcess::for_child(
+        kernel,
+        std::os::windows::io::OwnedHandle::from(child),
+        id.pid(),
+    ))
+}
+
 /// [`adopt_std`]'s Linux half: the pidfd of `id`'s pid, opened through `kernel`, which the child then
 /// owns, confirmed to name a child of this process.
 #[cfg(all(test, target_os = "linux"))]
@@ -274,16 +287,27 @@ pub(crate) fn adopt_pidfd<K: crate::identity::Kernel + Send + 'static>(
     }
 }
 
-/// A running blocker child (see [`crate::test_child::held_std_blocker`]) adopted by
-/// [`adopt_std`], its identity, and the write end of its stdin: closing it ends the child.
+/// A running blocker child (see [`crate::test_child::held_std_blocker`]), its identity, and the
+/// write end of its stdin: closing it ends the child.
 #[cfg(test)]
-pub(crate) fn adopted_blocker() -> (Box<dyn OsChild>, crate::identity::ProcessId, std::process::ChildStdin) {
+pub(crate) fn spawned_blocker() -> (
+    std::process::Child,
+    crate::identity::ProcessId,
+    std::process::ChildStdin,
+) {
     let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let stdin = child.stdin.take().expect("piped stdin");
     let id = crate::identity::ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");
+    (child, id, stdin)
+}
+
+/// [`spawned_blocker`]'s child adopted by [`adopt_std`], its identity, and the write end of its stdin.
+#[cfg(test)]
+pub(crate) fn adopted_blocker() -> (Box<dyn OsChild>, crate::identity::ProcessId, std::process::ChildStdin) {
+    let (child, id, stdin) = spawned_blocker();
     let os = adopt_std(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {}", crate::error::Report(&e)));
     (os, id, stdin)
 }

@@ -712,14 +712,11 @@ pub(crate) use backend::{
 pub(crate) use backend::{close as windows_close, open_classified as windows_open_classified};
 
 #[cfg(all(windows, test))]
-pub(crate) use backend::fault as windows_fault;
-#[cfg(all(windows, test))]
 pub(crate) use backend::TERMINATE_EXIT_CODE as WINDOWS_TERMINATE_EXIT_CODE;
 
 #[cfg(target_os = "linux")]
 pub(crate) use backend::pid_file;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use backend::kernel::{HostKernel, Kernel};
 
 /// One `waitid` record: the `si_code` and `si_status` of the `siginfo_t`. What `waitid` answers on
@@ -743,9 +740,6 @@ pub(crate) use backend::refusal::{warn_refused, FailedCall, Refusal};
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::kernel::PIDFD_THREAD;
 
-#[cfg(windows)]
-pub(crate) use no_reads::{HostKernel, Kernel};
-
 /// The one kernel a spawn starts with, erased, so the spawn is written once whatever kernel it is
 /// given. Its boxes (the child's, the cgroup leaf's, the placement probe's) each own a clone of the
 /// `Arc`, which answers as the original. `Kernel` is `Sync`, so the `Arc` is `Send`.
@@ -756,23 +750,11 @@ pub(crate) fn spawn_kernel(kernel: impl Kernel + Send + 'static) -> SpawnKernel 
     std::sync::Arc::new(kernel)
 }
 
-/// The [`Kernel`] of the platform whose reads no test answers yet.
-#[cfg(windows)]
-mod no_reads {
-    /// What cosca asks the kernel about processes, so shared code takes one `&dyn Kernel` on every
-    /// platform.
-    pub(crate) trait Kernel: Sync {}
-
-    /// The real kernel.
-    pub(crate) struct HostKernel;
-
-    impl Kernel for HostKernel {}
-
-    forward_kernel!();
-}
-
-#[cfg(all(any(target_os = "linux", target_os = "macos"), test))]
+#[cfg(test)]
 pub(crate) use backend::kernel::fake::FakeKernel;
+
+#[cfg(all(windows, test))]
+pub(crate) use backend::kernel::fake::refusing_the_next_terminate;
 
 #[cfg(all(target_os = "macos", test))]
 pub(crate) use backend::kernel::fake::{exit_record, short_info};

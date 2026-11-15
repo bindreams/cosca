@@ -193,7 +193,7 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<(HANDLE, PROCESS_ACC
 impl<K: Kernel + Send> OsProcess for WindowsProcess<K> {
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         match sig {
-            Sig::Kill => match windows_terminate_held(self.raw(), self.granted) {
+            Sig::Kill => match windows_terminate_held(&self.kernel, self.raw(), self.granted) {
                 Termination::Terminated => Ok(Sent::Delivered),
                 Termination::Exited => Ok(Sent::Gone),
                 // The caller that goes on to report the refusal warns of it: a refusal warns once.

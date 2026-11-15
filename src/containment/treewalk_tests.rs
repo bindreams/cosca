@@ -691,6 +691,55 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
     );
 }
 
+/// A walk sends each descendant's kill through the kernel it was given: one `terminate` row per
+/// descendant, taken by its kill. The root's kill is the host's (a `ByIdentity` over the host
+/// kernel) and ends the root.
+///
+/// Mutant: `kill_one` asks the host kernel instead of the walk's.
+#[cfg(windows)]
+#[skuld::test]
+fn a_walk_kills_each_descendant_through_its_kernel_on_windows() {
+    use std::process::Stdio;
+
+    use crate::identity::{FakeKernel, HostKernel};
+    use crate::Recursive;
+
+    let more = crate::test_child::windows_more();
+    let mut shell = crate::test_spawn::spawn(
+        std::process::Command::new("cmd.exe")
+            .arg("/c")
+            .arg(&more)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped()),
+    )
+    .expect("spawn the root");
+    let root = ProcessId::of(shell.id()).found().expect("the live root resolves");
+    // The first byte read back says `more` exists; both pipes stay open so it keeps running.
+    let mut stdin = shell.stdin.take().expect("piped stdin");
+    std::io::Write::write_all(&mut stdin, b"x\r\n").expect("feed the child a line");
+    let mut first = [0u8; 1];
+    let read = std::io::Read::read(shell.stdout.as_mut().expect("piped stdout"), &mut first).expect("read the echo");
+    assert_eq!(read, 1, "the root closed its output before its child echoed");
+    let descendants = root.children(Recursive::Yes).expect("the root's descendants");
+    assert!(!descendants.is_empty(), "precondition: the root has descendants");
+    let kernel = descendants
+        .iter()
+        .fold(FakeKernel::new(), |kernel, _| kernel.on_terminate(Ok(())));
+
+    let outcome = super::hard_kill(&kernel, root, &super::ByIdentity::new(&HostKernel, root))
+        .outcome()
+        .into_result();
+    // The rows sent nothing: end the fixture before asserting.
+    drop(stdin);
+    shell.wait().expect("the root's exit is recorded");
+
+    outcome.expect("every descendant's kill was answered");
+    assert!(
+        kernel.all_rows_taken(),
+        "a descendant's kill did not ask the walk's kernel"
+    );
+}
+
 /// The handle a walk sends a member's kill through is open for the member's exit: it can be waited
 /// on once the kill is sent. A handle opened for `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`
 /// alone cannot (`WaitForSingleObject` answers `ERROR_ACCESS_DENIED`).
@@ -731,7 +780,7 @@ fn kill_by_identity_reports_not_attempted_when_the_open_is_denied() {
     let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
         .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
-    let outcome = super::kill_by_identity(id);
+    let outcome = super::kill_by_identity(&crate::identity::HostKernel, id);
     assert!(matches!(outcome, super::KillOutcome::NotAttempted(_)), "{outcome:?}");
     assert!(child.is_running(), "a denied open must leave the process running");
 }
@@ -973,7 +1022,7 @@ fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
         .expect("the owned handle always yields an identity");
     let stale = real.with_other_value();
 
-    let outcome = super::kill_by_identity(stale);
+    let outcome = super::kill_by_identity(&crate::identity::HostKernel, stale);
     assert!(
         matches!(outcome, super::KillOutcome::AlreadyGone),
         "a stale identity names a process that is gone - nothing to terminate: {outcome:?}"
@@ -983,7 +1032,7 @@ fn kill_by_identity_spares_a_stale_identity_and_kills_a_matching_one() {
         "a stale identity must never terminate the pid-s occupant"
     );
 
-    let outcome = super::kill_by_identity(real);
+    let outcome = super::kill_by_identity(&crate::identity::HostKernel, real);
     assert!(
         matches!(outcome, super::KillOutcome::Terminated),
         "a matching identity must reach TerminateProcess: {outcome:?}"
@@ -1021,7 +1070,7 @@ fn kill_by_identity_reports_a_member_that_exits_before_the_terminate_as_gone() {
     let exiter = std::rc::Rc::clone(&child);
     super::fault::set_before_terminate(move || exiter.terminate());
 
-    let outcome = super::kill_by_identity(id);
+    let outcome = super::kill_by_identity(&crate::identity::HostKernel, id);
     assert!(
         matches!(outcome, super::KillOutcome::AlreadyGone),
         "a member that exited before the terminate has nothing left to kill: {outcome:?}"
@@ -1051,12 +1100,16 @@ fn kill_by_identity_reports_a_member_that_is_exiting_but_not_signalled_as_gone()
         child.id(),
     )
     .expect("the owned handle always yields an identity");
-    let _refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
-    let outcome = super::kill_by_identity(id);
-    // The seam sent no terminate: end the fixture before asserting.
+    let kernel = crate::identity::refusing_the_next_terminate();
+    let outcome = super::kill_by_identity(&kernel, id);
+    // The row sent no terminate: end the fixture before asserting.
     child.kill().expect("end the fixture");
     child.wait().expect("reap the fixture");
 
+    assert!(
+        kernel.all_rows_taken(),
+        "the kill reached TerminateProcess to be refused"
+    );
     assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
 }
 

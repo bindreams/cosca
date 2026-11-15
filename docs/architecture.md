@@ -38,9 +38,9 @@ A question about a _pid_ and a question about a _process you hold_ go to differe
 
 The identity module asks the kernel through one interface, `Kernel` (`HostKernel` makes the calls;
 tests pass a `FakeKernel` of stated answers). The trait exists on every platform, so shared code
-takes `&dyn Kernel` with no `#[cfg]`; Linux's and macOS's have the methods, and Windows's has none
-yet. A method enters with its first caller. A read that a test answers takes `&dyn Kernel`; code
-that runs between fork and exec never does, and stays raw.
+takes `&dyn Kernel` with no `#[cfg]`; Linux's and macOS's have the methods, and Windows's has
+`terminate` (`TerminateProcess`). A method enters with its first caller. A read that a test answers
+takes `&dyn Kernel`; code that runs between fork and exec never does, and stays raw.
 
 The OS layer owns the kernel it asks, on every platform. `os_process::open_with(kernel, id)` checks
 `id` through `&kernel` and moves the same kernel into the process it returns (`LinuxProcess<K>`,
@@ -196,10 +196,8 @@ In order:
    `Kernel` is carried through spawn, the leaf and `Subtree`, and those tests state `FakeKernel` rows
    (tech-debt deputy, 2026-11-14). The probe's tests need a read row for its child's `<pid>/cgroup`,
    a pid unknown before the fork: a row that matches the child's `cgroup` by its pid once forked,
-   not a fixed path. Beside them goes the Windows
-   exiting-refusal hook (`identity::windows_fault::refuse_next_terminate_as_exiting`), which answers
-   in the OS's place (`TerminateProcess` refusing as an exit under way); the Windows `Kernel` methods
-   enter with their first caller, and those tests state rows (owner, 2026-11-06).
+   not a fixed path. Windows tests of an exiting-process refusal state a `terminate` row of the Windows `FakeKernel`,
+   one per call in call order (owner, 2026-11-06).
 5. **Spawn:** produces an `OsChild`, its pipes, its containment and its elevation, for both halves.
    On Linux the one fork that execs is `child::spawn::fork_exec` ([#383](https://github.com/bindreams/cosca/issues/383)
    S2): a clone kind (vfork without `CLONE_VM`, or plain), the env block built in the parent, the
