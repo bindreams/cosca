@@ -563,11 +563,10 @@ pub(crate) mod block_probe {
     /// The hook [`on_each_block`] arms.
     type Hook = Box<dyn FnMut(&Block<'_>)>;
 
-    /// One hook [`on_each_block`] armed. `hook` is out of the slot while it runs, so it may itself
-    /// arm or drop a hook, or block.
+    /// `hook` is out of the slot while it runs, so it may itself arm or drop a hook, or block.
     struct Armament {
         id: u64,
-        /// The blocks of a wait this hook has seen: a `Condvar` block is not one.
+        /// The rounds of a wait this hook has seen ([`Block::is_round`]).
         blocks: u32,
         hook: Option<Hook>,
     }
@@ -580,10 +579,10 @@ pub(crate) mod block_probe {
         static ON_PAUSE: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     }
 
-    /// What one wait is about to block on.
+    /// What one wait waits on.
     #[allow(
         dead_code,
-        reason = "`Fd` is read only by `Block::ready`, which only macOS tests call; `Listener` is built on Linux only"
+        reason = "`Fd` is read only by `Block::ready`, which only macOS tests call; `Drain` and `DrainAwait` are built on Linux only"
     )]
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum WaitObject<'a> {
@@ -596,8 +595,11 @@ pub(crate) mod block_probe {
         /// Keeps `'a` used on Windows, where there is no `Fd`. Never built.
         #[cfg(windows)]
         Unbuilt(std::convert::Infallible, std::marker::PhantomData<&'a ()>),
-        /// The cgroup pump's broadcast: nothing to look at.
-        Listener,
+        /// A thread blocking on a cgroup leaf's drain, on the pump's broadcast or on the leaf's own
+        /// watch: the drain is in the leaf, so there is nothing to look at.
+        Drain,
+        /// A task awaiting a cgroup leaf's drain: nothing blocks, and there is nothing to look at.
+        DrainAwait,
         /// Another waiter's reap: nothing to look at.
         Condvar,
     }
@@ -605,7 +607,9 @@ pub(crate) mod block_probe {
     /// One block, as the hook of [`on_each_block`] sees it.
     #[derive(Debug)]
     pub(crate) struct Block<'a> {
-        /// `Some(1)` for the first block of a wait this hook sees; `None` at a `Condvar` block.
+        /// `Some(1)` for the first block of a wait this hook sees. `None` at a block that is no
+        /// round of a thread's wait: a `Condvar` block (another waiter's reap) and a
+        /// [`WaitObject::DrainAwait`] (a task's await blocks no thread).
         #[cfg_attr(not(target_os = "macos"), allow(dead_code, reason = "only macOS tests read it"))]
         pub(crate) n: Option<u32>,
         /// What the call is armed for; `None` is unbounded.
@@ -614,7 +618,8 @@ pub(crate) mod block_probe {
     }
 
     impl Block<'_> {
-        /// Whether this is a round of the wait itself, not another waiter's `Condvar` block.
+        /// Whether this is a round of a thread's wait: not another waiter's `Condvar` block, and not
+        /// a task's [`WaitObject::DrainAwait`].
         pub(crate) fn is_round(&self) -> bool {
             self.n.is_some()
         }
@@ -640,9 +645,14 @@ pub(crate) mod block_probe {
 
     /// The one call a block site makes, just before the blocking call: records what the block is
     /// armed for (`None`: no timeout) and runs the hooks [`on_each_block`] armed. Every lock the
-    /// wait took is released, except a `Condvar` block's: it holds the child's lock.
+    /// wait took is released, except a `Condvar` block's: it holds the child's lock. A
+    /// [`WaitObject::DrainAwait`] blocks no thread: the hooks run at it, but it is not recorded
+    /// for [`take`] and is not counted as a block by any hook.
     pub(crate) fn blocking(armed: Option<Duration>, on: WaitObject<'_>) {
-        record(armed);
+        if !matches!(on, WaitObject::DrainAwait) {
+            record(armed);
+        }
+        let is_round = !matches!(on, WaitObject::Condvar | WaitObject::DrainAwait);
         // The hooks armed now, in arming order: one armed by a hook first sees the next block, and
         // one a hook disarmed does not run.
         let ids: Vec<u64> = ON_BLOCK.with(|hooks| hooks.borrow().iter().map(|a| a.id).collect());
@@ -651,7 +661,7 @@ pub(crate) mod block_probe {
                 let mut hooks = hooks.borrow_mut();
                 let armament = hooks.iter_mut().find(|a| a.id == id)?;
                 let hook = armament.hook.take()?;
-                let n = (!matches!(on, WaitObject::Condvar)).then(|| {
+                let n = is_round.then(|| {
                     armament.blocks += 1;
                     armament.blocks
                 });
@@ -741,17 +751,23 @@ pub(crate) mod block_probe {
         Armed(Disarm::Block(id), PhantomData)
     }
 
-    /// Run `hook` once, at this thread's next block that is not a `Condvar`'s: the thread has
-    /// released every lock it took for the wait it is about to make.
-    pub(crate) fn on_blocking(hook: impl FnOnce() + 'static) -> Armed {
+    /// Run `hook` once, at the next block of this thread that `keep` accepts.
+    fn once_at(keep: fn(&Block<'_>) -> bool, hook: impl FnOnce(&Block<'_>) + 'static) -> Armed {
         let mut hook = Some(hook);
         on_each_block(move |block| {
-            if block.is_round() {
+            if keep(block) {
                 if let Some(hook) = hook.take() {
-                    hook();
+                    hook(block);
                 }
             }
         })
+    }
+
+    /// Run `hook` once, at this thread's next round of a wait ([`Block::is_round`]): the thread has
+    /// released every lock it took for the wait it is about to make. A `Condvar` block and a task's
+    /// await ([`WaitObject::DrainAwait`]) are no round here.
+    pub(crate) fn on_blocking(hook: impl FnOnce() + 'static) -> Armed {
+        once_at(|block| block.is_round(), move |_| hook())
     }
 
     /// Run `hook` on this thread just before its next recheck pause sleeps. A hook that takes the
@@ -760,6 +776,30 @@ pub(crate) mod block_probe {
     pub(crate) fn on_pause(hook: impl FnOnce() + 'static) -> Armed {
         let _hook = crate::oneshot_hook::arm(&ON_PAUSE, hook);
         Armed(Disarm::Pause { _hook }, PhantomData)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_drain_wait(block: &Block<'_>) -> bool {
+        matches!(block.on, WaitObject::Drain | WaitObject::DrainAwait)
+    }
+
+    /// Run `hook` once, at the next wait of this thread for a cgroup leaf's drain: a block on it
+    /// ([`WaitObject::Drain`]) or a task's await of it ([`WaitObject::DrainAwait`]). A user that
+    /// must tell the two apart filters on the kind itself, through [`on_each_block`].
+    #[cfg(target_os = "linux")]
+    pub(crate) fn on_drain_block(hook: impl FnOnce() + 'static) -> Armed {
+        once_at(is_drain_wait, move |_| hook())
+    }
+
+    /// Run `act` at every wait of this thread for a cgroup leaf's drain ([`on_drain_block`]'s two
+    /// kinds), until the guard drops.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn on_each_drain_block(mut act: impl FnMut() + 'static) -> Armed {
+        on_each_block(move |block| {
+            if is_drain_wait(block) {
+                act();
+            }
+        })
     }
 
     /// Run `hook`, under the `OwnedChild`'s lock, just before this thread's next block on that
@@ -771,14 +811,10 @@ pub(crate) mod block_probe {
 
     /// [`on_condvar_block`], with the armed timeout (`None`: no timeout).
     pub(crate) fn on_condvar_block_with(hook: impl FnOnce(Option<Duration>) + 'static) -> Armed {
-        let mut hook = Some(hook);
-        on_each_block(move |block| {
-            if !block.is_round() {
-                if let Some(hook) = hook.take() {
-                    hook(block.armed);
-                }
-            }
-        })
+        once_at(
+            |block| matches!(block.on, WaitObject::Condvar),
+            move |block| hook(block.armed),
+        )
     }
 
     /// Every timeout armed on this thread since the last call, in order.

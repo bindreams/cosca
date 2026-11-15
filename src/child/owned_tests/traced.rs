@@ -89,7 +89,7 @@ fn blocked_in<'s, G, R: Send + 's>(
 /// panics, ending its wait, instead of blocking the scope's join for ever.
 ///
 /// A look that finds nothing is ended by the test's hand-back, whose `NOTE_EXIT` XNU re-fires on the
-/// watch's kqueue (`kern_exit.c:2856-2912`), and the assertion on the look fails.
+/// watch's kqueue, and the assertion on the look fails.
 fn look_after_staging() -> (
     impl FnOnce(&crate::wait::block_probe::Block<'_>) + Send + 'static,
     std::sync::mpsc::Sender<()>,
@@ -187,7 +187,7 @@ fn a_zombie_a_tracer_holds_is_running_until_the_hand_back(#[fixture(tracer_group
 ///
 /// The unbounded watch runs on a thread of its own and must not block: a block is the mutant's. The
 /// test thread then ends it with the hand-back, whose `NOTE_EXIT` XNU re-fires on the exit watch's
-/// kqueue (`kern_exit.c:2856-2912`); the knote stays pending whether the watch's poll has begun or
+/// kqueue; the knote stays pending whether the watch's poll has begun or
 /// not, so no ordering is needed. The assertion that the watch made no block fails after that.
 ///
 /// Mutant: `exited_by` waits on the exit watch alone, which fires only at the hand-back: the
@@ -280,7 +280,7 @@ fn a_zombie_launchd_holds_has_exited_for_the_grace_watch_at_once(#[fixture(trace
 ///
 /// The watch's block is looked at once the attach is staged (`blocked_in` with `look_after_staging`). The ordering edge
 /// is the helper's `attached`: it follows `PT_ATTACH`, which sends the `SIGSTOP`, and XNU posts
-/// `NOTE_SIGNAL` before any disposition check (`kern_sig.c:2126`).
+/// `NOTE_SIGNAL` before any disposition check.
 ///
 /// Mutant: the exit wait registers no `NOTE_SIGNAL`, or blocks on the shared exit kqueue, whose
 /// `NOTE_EXIT` is withheld: the look finds nothing.
@@ -321,7 +321,7 @@ fn a_tracer_that_attaches_during_the_grace_watch_wakes_it(#[fixture(tracer_group
 /// The watch's block is looked at once the attach is staged and `is_alive` has run after it
 /// (`blocked_in` with `look_after_staging`), so a wake `is_alive` took is a look that finds nothing. The ordering edge
 /// is the helper's `attached`: it follows `PT_ATTACH`, which sends the `SIGSTOP`, and XNU posts
-/// `NOTE_SIGNAL` before any disposition check (`kern_sig.c:2126`).
+/// `NOTE_SIGNAL` before any disposition check.
 ///
 /// Mutant: the watch blocks on a kqueue that `is_alive` reads, which takes the attach's event.
 #[skuld::test]
@@ -376,8 +376,8 @@ fn tracee_with_unique() -> (crate::Child, crate::PipeWriter, u64) {
 ///
 /// Each staged wake is looked at, at its block (`on_rounds`). Round 0's ordering edge is the helper's
 /// `attached`: it follows `PT_ATTACH`, which sends the `SIGSTOP`, and XNU posts `NOTE_SIGNAL` before any
-/// disposition check (`kern_sig.c:2126`). Round 1's is the helper's `reaped`: it follows the helper's
-/// `wait4`, which hands the zombie back and re-fires `NOTE_EXIT` to this process (`kern_exit.c:2856-2912`).
+/// disposition check. Round 1's is the helper's `reaped`: it follows the helper's `wait4`, which
+/// hands the zombie back and re-fires `NOTE_EXIT` to this process.
 ///
 /// Mutant: the wait registers no `NOTE_SIGNAL` on the child: round 0's look finds nothing.
 #[skuld::test]
@@ -429,10 +429,9 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
 ///
 /// Each staged wake is looked at, at its block (`on_rounds`). Round 0's ordering edge is the
 /// `kill(2)`: XNU's `psignal_internal` posts `NOTE_SIGNAL` to the target's knotes before it returns,
-/// ahead of any disposition check (`kern_sig.c:2126`); the signal goes to the outer helper, so no
-/// other event is on the wait's kqueue. Round 1's is the inner helper's `reaped`: it follows the inner
-/// helper's `wait4`, which hands the zombie back and re-fires `NOTE_EXIT` to this process
-/// (`kern_exit.c:2856-2912`).
+/// ahead of any disposition check; the signal goes to the outer helper, so no other event is on the
+/// wait's kqueue. Round 1's is the inner helper's `reaped`: it follows the inner helper's `wait4`,
+/// which hands the zombie back and re-fires `NOTE_EXIT` to this process.
 ///
 /// Mutant: the walk stops at the child's tracer: round 0's look finds nothing.
 #[skuld::test]

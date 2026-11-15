@@ -96,7 +96,7 @@ fn report_channel_wait_returns_a_report_written_after_it_was_called() {
     let pidfd = pidfd_of(pid);
     let (polling_tx, polling_rx) = std::sync::mpsc::channel();
     let waiter = std::thread::spawn(move || {
-        crate::containment::cgroup::fault::set_wait_polling_notifier(polling_tx);
+        let _polling = crate::wait::block_probe::on_blocking(move || _ = polling_tx.send(()));
         channel.wait(pidfd.as_fd())
     });
     polling_rx.recv().expect("the wait reaches its poll with nothing sent");
@@ -109,7 +109,12 @@ fn report_channel_wait_returns_a_report_written_after_it_was_called() {
 /// still holds the child's end: any process forked while the channel is open inherits it, and
 /// one that never execs would otherwise hold off the channel's EOF for as long as it runs.
 ///
-/// A regression hangs this test rather than failing it: the wait has no timeout by design.
+/// The child's exit is visible (`waitid` with `WNOWAIT`) before the wait starts, so a wait that
+/// follows the pidfd blocks once, on a pidfd that is already readable. The hook sends a message
+/// that is no report, as the block begins: a wait that leaves the pidfd out of its poll set, or
+/// ignores what it says, wakes on that message, finds nothing final, and blocks a second time,
+/// where the hook fails the test instead of the wait hanging. The correct wait returns on the pidfd
+/// and reads the message with the rest.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn report_channel_wait_ends_at_the_childs_exit_while_another_process_holds_the_childs_end() {
@@ -121,12 +126,33 @@ fn report_channel_wait_ends_at_the_childs_exit_while_another_process_holds_the_c
     let gate = gate_read.as_raw_fd();
     // Inherits the child's end, and keeps it until released through the gate.
     let holder = fork_running(&[gate, channel.slot().fd], move || block_on(gate));
+    let (_end, slot) = childs_copy(&channel);
     let child = fork_running(&[], || {});
+    let pidfd = pidfd_of(child.pid());
+    rustix::process::waitid(
+        rustix::process::WaitId::PidFd(pidfd.as_fd()),
+        rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+    )
+    .expect("waitid(WNOWAIT): the child's exit, not consumed");
 
-    assert_eq!(
-        channel.wait(pidfd_of(child.pid()).as_fd()),
-        PlacementReport::NotReported
-    );
+    let hook = crate::wait::block_probe::on_each_block(move |block| {
+        assert_eq!(
+            block.n,
+            Some(1),
+            "the wait blocked a second time, on a channel with no report and no EOF: it did not return at the child's exit"
+        );
+        assert_eq!(
+            block.ready(),
+            Some(true),
+            "the child's exit is already visible on its pidfd"
+        );
+        // SAFETY: the copy of the child's end is open until the test ends.
+        unsafe { slot.send_intent() }.expect("send an intent, which is no report");
+    });
+    let report = channel.wait(pidfd.as_fd());
+    drop(hook);
+
+    assert_eq!(report, PlacementReport::NotReported);
     reap(child.defuse());
     gate_write.write_all(b"x").expect("release the holder");
     reap(holder.defuse());

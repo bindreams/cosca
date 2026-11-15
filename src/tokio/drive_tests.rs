@@ -622,9 +622,7 @@ mod windows {
     /// Both clocks are frozen (tokio's paused, the OS-wait clock held), so the deadline is exactly
     /// 50 ms off however long the setup took. The one member is the GUI-subsystem testbin, which
     /// starts nothing, so a round registers one arm per handle and `[left, left]` means one member;
-    /// a `cmd /C more` member would add `more.com` and `conhost.exe`. The clock is then moved to
-    /// 10 ms short of the deadline, so the wait that times out must register again for the time
-    /// left, and the hook on the second arm moves the clock the rest of the way.
+    /// a `cmd /C more` member would add `more.com` and `conhost.exe`.
     ///
     /// Mutants: the timer is not armed, or armed for more than the deadline (an arm check fails);
     /// the round answers before it has waited (the first poll is ready); it answers `MembersRemain`

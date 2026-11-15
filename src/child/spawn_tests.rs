@@ -779,15 +779,8 @@ fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
     let fake = FakeLeaf::new(name, true);
     let (path, events) = (fake.leaf.clone(), fake.events.clone());
     leaf_fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&path, &events));
-    let (blocking, wait_reached) = std::sync::mpsc::channel();
-    leaf_fault::set_drain_blocking_notifier(blocking);
     let members = fake.events.clone();
-    let exiting = std::thread::spawn(move || {
-        // A closed channel means the wait never blocked: nothing to release.
-        if wait_reached.recv().is_ok() {
-            FakeLeaf::set_populated(&members, false);
-        }
-    });
+    let _exits = crate::wait::block_probe::on_drain_block(move || FakeLeaf::set_populated(&members, false));
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
     let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
@@ -801,8 +794,6 @@ fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
         .expect_may_have_started_with();
     assert_eq!(fate, ChildFate::Reaped);
     teardown.assert_killed();
-    leaf_fault::take_drain_blocking_notifier();
-    exiting.join().expect("the exiting thread");
     leaf_fault::take_rmdir_hook();
 
     assert!(matches!(err, Error::Elevation { .. }), "got {err:?}");

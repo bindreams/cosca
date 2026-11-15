@@ -309,7 +309,8 @@ only as a failure bound, whose expiry fails the test or reports an error, like a
 work cosca controls. A timeout a caller passes to cosca is the caller's policy: cosca honours it,
 re-reads state at expiry and reports what it finds (`wait_timeout` returns `Ok(None)` (`Ok(false)`
 on `Process`), `wait_tree_timeout` returns `MembersRemain`, and `graceful_shutdown`'s grace
-escalates to a kill). A backoff that re-checks a deterministic condition, with no cap, is fine. No
+escalates to a kill). A test fails its stated mutant by an assertion; the suite's `slow-timeout` is a
+fire alarm, never the failure bound. A backoff that re-checks a deterministic condition, with no cap, is fine. No
 arbitrary retry or loop caps. A test child kept alive is a held child, never a `sleep` or `ping`: use
 `BLOCKER_ARGV` for a held child, the `held_*` constructors and `member_command` in
 [`src/test_child.rs`](../src/test_child.rs), `ROOT_LEAVING_A_MEMBER` in

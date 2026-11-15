@@ -545,18 +545,27 @@ impl Drop for Member {
     }
 }
 
-/// Installs the drain-wait seams (`set_wait_site_park_notifier`, `set_drain_blocking_notifier`,
-/// `set_drain_zero_remaining_notifier`), uninstalling all three on drop — panic-safe, so a panic
-/// in the closure passed to [`WaitObserver::run`]/[`WaitObserver::run_with_block_sender`] still
-/// leaves this thread's seams clean for whatever runs next.
+/// Send on `tx` at each drain wait of a cgroup leaf on this thread, just before it blocks or its
+/// task awaits, until the guard drops: the watch is armed and `populated` last read 1. A send with
+/// no live receiver is a contract violation by the test, which keeps the receiver until the guard
+/// drops: a wait can legally re-block (`populated` is re-read before the pump's own broadcast lands).
 #[cfg(target_os = "linux")]
-struct WaitObserverGuard;
+pub(crate) fn signal_when_drain_blocks(tx: std::sync::mpsc::Sender<()>) -> crate::wait::block_probe::Armed {
+    crate::wait::block_probe::on_each_drain_block(move || {
+        tx.send(()).expect("the receiver outlives the armed hook");
+    })
+}
+
+/// Uninstalls the drain-wait seams on drop, also on panic.
+#[cfg(target_os = "linux")]
+struct WaitObserverGuard {
+    _signal: crate::wait::block_probe::Armed,
+}
 
 #[cfg(target_os = "linux")]
 impl Drop for WaitObserverGuard {
     fn drop(&mut self) {
         crate::containment::cgroup::fault::take_wait_site_park_notifier();
-        crate::containment::cgroup::fault::take_drain_blocking_notifier();
         crate::containment::cgroup::fault::take_drain_zero_remaining_notifier();
     }
 }
@@ -578,7 +587,7 @@ impl WaitObserver {
         (result, parks, block_rx.try_iter().count(), zero_remainings)
     }
 
-    /// Like `run`, but the caller supplies the `drain_blocking` sender itself — so it (or a
+    /// Like `run`, but the caller supplies the [`signal_when_drain_blocks`] sender itself — so it (or a
     /// receiver on another thread, paired with this same sender) can react to the signal while
     /// the wait is still in progress, before this call returns. The caller owns the count of
     /// whatever it receives on the matching receiver; this returns only the parks and the
@@ -591,9 +600,10 @@ impl WaitObserver {
         let (park_tx, park_rx) = std::sync::mpsc::channel();
         let (zero_tx, zero_rx) = std::sync::mpsc::channel();
         fault::set_wait_site_park_notifier(park_tx);
-        fault::set_drain_blocking_notifier(block_tx);
         fault::set_drain_zero_remaining_notifier(zero_tx);
-        let _guard = WaitObserverGuard;
+        let _guard = WaitObserverGuard {
+            _signal: signal_when_drain_blocks(block_tx),
+        };
         let result = f();
         (result, park_rx.try_iter().collect(), zero_rx.try_iter().count())
     }

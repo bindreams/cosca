@@ -1,10 +1,8 @@
 //! Tests for [`OwnedChild`](super::OwnedChild): one deterministic test per row of the state
 //! table, each with the mutant it turns RED against named in its doc.
 //!
-//! A test here fails its mutant by an assertion, never by the suite's `slow-timeout`
-//! (`.config/nextest.toml`), which is a fire alarm and no failure bound. The macOS tests that wait on a
-//! kqueue look at the wait's block from a [`block_probe`](crate::wait::block_probe) hook and assert
-//! there.
+//! The macOS tests that wait on a kqueue look at the wait's block from a
+//! [`block_probe`](crate::wait::block_probe) hook and assert there.
 
 #[path = "owned_tests/fixtures.rs"]
 mod fixtures;

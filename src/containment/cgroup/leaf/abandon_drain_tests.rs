@@ -28,7 +28,7 @@ fn drain_warns_at_release(fake: &FakeLeaf, end: impl FnOnce()) -> (Option<usize>
             FakeLeaf::set_populated(&events, false);
         }
     });
-    let _backstop = fault::set_before_drain_block({
+    let _backstop = crate::wait::block_probe::on_drain_block({
         let (events, warns_at_release) = (fake.events.clone(), Rc::clone(&warns_at_release));
         move || {
             if warns_at_release.get().is_none() {

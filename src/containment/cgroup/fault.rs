@@ -10,7 +10,6 @@ thread_local! {
     static AFTER_TERMINATE_PIN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static MEMBER_TERMS: std::cell::RefCell<Vec<MemberTerm>> = const { std::cell::RefCell::new(Vec::new()) };
     static AFTER_SHUT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
-    static WAIT_POLLING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static ON_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_STATE_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static WAITED_PIDFD: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
@@ -18,7 +17,6 @@ thread_local! {
     static FORCE_REPORT_CHANNEL_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<ForcedWrite>> = const { Cell::new(None) };
     static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
-    static DRAIN_BLOCKING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static DRAIN_ZERO_REMAINING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     static WAIT_SITE_PARK: std::cell::RefCell<Option<std::sync::mpsc::Sender<WaitSitePark>>> = const { std::cell::RefCell::new(None) };
     static WAIT_DEADLINE_ARG: std::cell::RefCell<Option<std::sync::mpsc::Sender<std::time::Instant>>> = const { std::cell::RefCell::new(None) };
@@ -37,7 +35,6 @@ thread_local! {
     static FORCED_PIDFD_CGROUP_ID: Cell<Option<u64>> = const { Cell::new(None) };
     static BEFORE_WALK_OPEN: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
     static BEFORE_SWEEP_REMOVE: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
-    static BEFORE_DRAIN_BLOCK: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static AFTER_DRAIN_WARN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static WALK_FAILURE: std::cell::RefCell<Option<WalkFailure>> = const { std::cell::RefCell::new(None) };
     static PROC_HIDDEN_AS: Cell<Option<i32>> = const { Cell::new(None) };
@@ -59,8 +56,9 @@ thread_local! {
     static FORK_RUNNING_LOCK_HELD_REPORT_FD: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
 }
 
-/// Replaces a leaf's `rmdir`, given the leaf's path.
-type RmdirHook = Box<dyn FnMut(&std::path::Path) -> std::io::Result<()>>;
+/// Given the leaf's path, answers a leaf's `rmdir` in the production removal's place, or `None`
+/// to let the production removal run.
+type RmdirHook = Box<dyn FnMut(&std::path::Path) -> Option<std::io::Result<()>>>;
 
 /// While the guard lives, every `cgroup.kill` write on this thread fails with `EIO`, and kills
 /// nothing: a failed kill whose members may all still run. A teardown after a failed kill must not
@@ -98,7 +96,7 @@ fn arm_fail_kill_writes(release: Option<(Box<dyn FnOnce()>, ReleaseAt)>) -> Fail
     FAIL_KILL_WRITES.with(|f| f.set(true));
     REFUSED_KILL_WRITES.with(|n| n.set(0));
     FailKillWrites {
-        _no_drain_wait: set_before_drain_block(|| {
+        _no_drain_wait: crate::wait::block_probe::on_drain_block(|| {
             fail_once_unwinding(
                 "a teardown whose cgroup.kill failed waited for the leaf's drain, which its members may never end",
             );
@@ -129,7 +127,7 @@ fn fail_once_unwinding(message: &str) {
 
 #[must_use = "the writes succeed again as soon as the guard is dropped"]
 pub(crate) struct FailKillWrites {
-    _no_drain_wait: crate::oneshot_hook::Armed,
+    _no_drain_wait: crate::wait::block_probe::Armed,
     _no_unwritten_kill: crate::oneshot_hook::Armed,
 }
 
@@ -427,33 +425,38 @@ pub(crate) fn take_force_inotify_failure() -> bool {
 
 /// Replace every leaf `rmdir` on this thread with `hook`, until [`take_rmdir_hook`]. A temp
 /// directory gives none of cgroupfs's `rmdir` answers, so a test supplies them.
-pub(crate) fn set_rmdir_hook(hook: impl FnMut(&std::path::Path) -> std::io::Result<()> + 'static) {
-    RMDIR_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+pub(crate) fn set_rmdir_hook(mut hook: impl FnMut(&std::path::Path) -> std::io::Result<()> + 'static) {
+    RMDIR_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(move |path| Some(hook(path)))));
+}
+/// While the guard lives, run `observe` with the leaf's path at every leaf `rmdir` on this
+/// thread, then the production removal: for a test on a real cgroupfs.
+pub(crate) fn observe_rmdirs(mut observe: impl FnMut(&std::path::Path) + 'static) -> ObserveRmdirs {
+    RMDIR_HOOK.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move |path| {
+            observe(path);
+            None
+        }))
+    });
+    ObserveRmdirs(())
+}
+
+#[must_use = "the observer is removed as soon as the guard is dropped"]
+pub(crate) struct ObserveRmdirs(());
+
+impl Drop for ObserveRmdirs {
+    fn drop(&mut self) {
+        take_rmdir_hook();
+    }
 }
 pub(crate) fn take_rmdir_hook() {
     RMDIR_HOOK.with(|h| h.borrow_mut().take());
 }
-/// Run the rmdir hook, if one is set.
+/// Run the rmdir hook, if one is set and answers.
 pub(crate) fn run_rmdir_hook(path: &std::path::Path) -> Option<std::io::Result<()>> {
     let mut hook = RMDIR_HOOK.with(|h| h.borrow_mut().take())?;
     let result = hook(path);
     RMDIR_HOOK.with(|h| *h.borrow_mut() = Some(hook));
-    Some(result)
-}
-
-/// Send on `notify` each time a leaf's drain wait on this thread is about to block: the watch is
-/// armed and `populated` last read 1. Kept until [`take_drain_blocking_notifier`].
-pub(crate) fn set_drain_blocking_notifier(notify: std::sync::mpsc::Sender<()>) {
-    DRAIN_BLOCKING.with(|d| *d.borrow_mut() = Some(notify));
-}
-pub(crate) fn take_drain_blocking_notifier() {
-    DRAIN_BLOCKING.with(|d| d.borrow_mut().take());
-}
-/// Run `hook` once when the next drain wait on this thread is about to block, before it does: a
-/// fixture that only the thing awaited would release can be checked, or released, here, so a
-/// mutant that never made it happen fails an assertion instead of hanging the wait.
-pub(crate) fn set_before_drain_block(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
-    crate::oneshot_hook::arm(&BEFORE_DRAIN_BLOCK, hook)
+    result
 }
 
 /// Run `hook` once right after the next slow-drain warn on this thread, before the wait goes on:
@@ -468,20 +471,6 @@ pub(crate) fn run_after_drain_warn() {
     crate::oneshot_hook::fire(&AFTER_DRAIN_WARN);
 }
 
-pub(crate) fn notify_drain_blocking() {
-    crate::oneshot_hook::fire(&BEFORE_DRAIN_BLOCK);
-    DRAIN_BLOCKING.with(|d| {
-        if let Some(notify) = d.borrow().as_ref() {
-            // The send must always run — `debug_assert!` does not evaluate its condition in a
-            // release build, so it cannot gate the call itself, only check its result. A send
-            // failure while a notifier is installed means its receiver was dropped early — a
-            // contract violation by the test that installed it, not something to swallow.
-            let sent = notify.send(());
-            debug_assert!(sent.is_ok(), "drain-blocking notifier's receiver was dropped");
-        }
-    });
-}
-
 /// Send on `notify` each time a leaf's drain step on this thread takes its zero-remaining
 /// shortcut — answers `MembersRemain` from a step that arms no listener. Kept until
 /// [`take_drain_zero_remaining_notifier`].
@@ -494,8 +483,7 @@ pub(crate) fn take_drain_zero_remaining_notifier() {
 pub(crate) fn notify_drain_zero_remaining() {
     DRAIN_ZERO_REMAINING.with(|d| {
         if let Some(notify) = d.borrow().as_ref() {
-            // The send must always run — see `notify_drain_blocking`'s own comment on why the
-            // result, not the call, is what `debug_assert!` gates.
+            // The send runs in release too; only its check is debug-only.
             let sent = notify.send(());
             debug_assert!(sent.is_ok(), "zero-remaining notifier's receiver was dropped");
         }
@@ -526,8 +514,6 @@ pub(crate) fn take_wait_site_park_notifier() {
 pub(crate) fn notify_wait_site_park(park: WaitSitePark) {
     WAIT_SITE_PARK.with(|p| {
         if let Some(notify) = p.borrow().as_ref() {
-            // The send must always run — see `notify_drain_blocking`'s own comment on why the
-            // result, not the call, is what `debug_assert!` gates.
             let sent = notify.send(park);
             debug_assert!(sent.is_ok(), "wait-site-park notifier's receiver was dropped");
         }
@@ -550,8 +536,6 @@ pub(crate) fn take_wait_deadline_arg_notifier() {
 pub(crate) fn notify_wait_deadline_arg(at: std::time::Instant) {
     WAIT_DEADLINE_ARG.with(|p| {
         if let Some(notify) = p.borrow().as_ref() {
-            // The send must always run — see `notify_drain_blocking`'s own comment on why the
-            // result, not the call, is what `debug_assert!` gates.
             let sent = notify.send(at);
             debug_assert!(sent.is_ok(), "wait-deadline-arg notifier's receiver was dropped");
         }
@@ -644,17 +628,6 @@ pub(crate) fn take_force_occupy_before_unwind() -> bool {
 }
 pub(crate) fn occupy_before_unwind_armed() -> bool {
     FORCE_OCCUPY_BEFORE_UNWIND.with(|f| f.get())
-}
-
-/// Have the NEXT report wait on this thread signal `notify` just before it blocks — the one
-/// point a test can know the wait began before the report existed.
-pub(crate) fn set_wait_polling_notifier(notify: std::sync::mpsc::Sender<()>) {
-    WAIT_POLLING.with(|w| *w.borrow_mut() = Some(notify));
-}
-pub(crate) fn notify_wait_polling() {
-    if let Some(notify) = WAIT_POLLING.with(|w| w.borrow_mut().take()) {
-        _ = notify.send(());
-    }
 }
 
 /// Run `hook` at the start of the NEXT report wait on this thread, before it reads anything. The

@@ -92,9 +92,7 @@ fn assert_ends_closed(ends: Option<fault::Ends>, what: &str) -> fault::Ends {
 
 /// Mutants, each failing an assertion: the handshake aborts the child (`success`, `program_ran`);
 /// it forks more than once (`spawns`); the spawning thread keeps its copy of the child's end, or the
-/// helper does not read EOF (`assert_ends_closed`). The helper shuts the parent's end on every exit,
-/// so a handshake that holds the child for good is
-/// `an_undelivered_go_ahead_fails_the_spawn_and_ends_the_childs_wait`'s mutant.
+/// helper does not read EOF (`assert_ends_closed`). The helper shuts the parent's end on every exit.
 #[skuld::test]
 fn a_normal_spawn_runs_the_program_and_forks_once() {
     let (mut cmd, reader) = marker_command();

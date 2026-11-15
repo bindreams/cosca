@@ -165,7 +165,7 @@ impl ReportChannel {
                 PollFd::new(&pidfd, PollFlags::IN),
             ];
             #[cfg(test)]
-            fault::notify_wait_polling();
+            crate::wait::block_probe::blocking(None, crate::wait::block_probe::WaitObject::Fd(pidfd));
             // No timeout: the child reports or exits on its way to `exec`, like `std`'s own wait.
             if let Err(e) = crate::wait::poll_ready(&mut fds) {
                 panic!("poll on the placement report channel failed: {e}");
