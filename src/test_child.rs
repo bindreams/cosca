@@ -103,6 +103,18 @@ pub(crate) fn testbin(name: &str) -> std::path::PathBuf {
 
 // Blocker fixtures =====
 
+mod std_child;
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(unused_imports, reason = "only Linux tests name the guard's type")
+)]
+pub(crate) use std_child::StdChild;
+#[cfg_attr(
+    windows,
+    allow(unused_imports, reason = "its held-child callers are not converted yet")
+)]
+pub(crate) use std_child::{blocker, blocker_with};
+
 /// The argv of a child that does nothing until its stdin reaches EOF or it is killed: `cat`, or
 /// `more.com` by its `System32` path on Windows. It exits 0 on EOF, and a kill never gives it 0, so
 /// [`assert_killed`] tells the two apart. Every fixture that needs a child "still alive at some

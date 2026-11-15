@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use crate::graceful_hooks::{at, release_at, HookPoint};
 use crate::send_log::Capture;
+use crate::test_child::blocker;
 use crate::test_child::foreign::{self, survivor_tree, tree_of};
 use crate::wait::fault;
 
@@ -136,7 +137,7 @@ fn foreign_graceful_shutdown_tree_graceful_path() {
 // Mutants: `os_process::terminate` sends nothing; `graceful_shutdown` skips it.
 #[skuld::test]
 fn foreign_graceful_shutdown_graceful_path() {
-    let mut child = foreign::blocker();
+    let mut child = blocker();
     let p = crate::Process::open_pid(child.id()).expect("open").expect("running");
     let stdin = child.stdin.take().expect("piped stdin");
     let _release = release_at(HookPoint::AfterTerminate, stdin);
@@ -307,7 +308,7 @@ fn foreign_kill_tree_over_an_exited_unreaped_root_is_unassessable() {
 // Mutant: the empty walk is `Ok`.
 #[skuld::test]
 fn foreign_terminate_tree_over_an_exited_root_with_an_empty_walk_is_unassessable_and_sends_nothing() {
-    let mut child = foreign::blocker();
+    let mut child = blocker();
     let p = crate::Process::open_pid(child.id()).expect("open").expect("running");
     child.kill().expect("kill the root");
     crate::test_child::wait_until_zombie(child.id());

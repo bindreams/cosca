@@ -3,13 +3,14 @@
 //! in that group's CI lane.
 
 use std::io::{Read, Write};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 
 use super::owner_tests::{assert_never_started, owned_by};
 use super::rig::Owner;
 use super::*;
 use crate::elevation::shim::hooks::{Gate, Inject};
 use crate::elevation::shim::link::KillOutcome;
+use crate::test_child::{blocker_with, StdChild};
 use crate::test_groups::{namespaces, setuid, tracer_group, uid_switch, Group};
 
 // A pid namespace of its own -----
@@ -45,7 +46,7 @@ fn in_pid_namespace(path: &str) -> bool {
 }
 
 /// A process that is alive until it is dropped, and proves it with an echo.
-struct Stranger(Child);
+struct Stranger(StdChild);
 
 impl Stranger {
     /// Makes the next process of this namespace have pid `want`, and starts the stranger as it. A pid
@@ -57,9 +58,9 @@ impl Stranger {
             "ns_last_pid is the namespace's: write it only in the test's own"
         );
         std::fs::write("/proc/sys/kernel/ns_last_pid", (want - 1).to_string()).expect("set ns_last_pid");
-        let mut command = std::process::Command::new("cat");
-        command.stdin(Stdio::piped()).stdout(Stdio::piped());
-        let child = crate::test_spawn::spawn(&mut command).expect("the stranger starts");
+        let child = blocker_with(|cat| {
+            cat.stdout(Stdio::piped());
+        });
         assert_eq!(
             child.id(),
             want,
@@ -76,13 +77,6 @@ impl Stranger {
         }
         let mut echoed = [0u8; 2];
         self.0.stdout.as_mut().expect("piped").read_exact(&mut echoed).is_ok() && &echoed == b"x\n"
-    }
-}
-
-impl Drop for Stranger {
-    fn drop(&mut self) {
-        _ = self.0.kill();
-        _ = self.0.wait();
     }
 }
 

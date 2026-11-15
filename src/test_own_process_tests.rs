@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::Write as _;
 use std::os::fd::{AsRawFd as _, RawFd};
 
+use crate::test_child::blocker_with;
 use crate::test_own_process::{
     child_completion, drain, own_process, role, run, test_path, Completion, FailureKind, Role,
 };
@@ -128,30 +129,6 @@ fn a_filter_that_matches_no_test_fails_the_run() {
 
 // The verdict does not wait for EOF =====
 
-/// A long-lived process holding a write end of the token pipe, standing in for an unrelated
-/// process that forked while the end was not yet close-on-exec.
-struct Bystander(std::process::Child);
-
-impl Bystander {
-    fn holding(write: std::io::PipeWriter) -> Bystander {
-        Bystander(
-            crate::test_spawn::spawn(
-                std::process::Command::new("cat")
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::from(write)),
-            )
-            .expect("spawn the bystander"),
-        )
-    }
-}
-
-impl Drop for Bystander {
-    fn drop(&mut self) {
-        drop(self.0.stdin.take());
-        self.0.wait().expect("reap the bystander");
-    }
-}
-
 fn nonblocking_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
     let (read, write) = std::io::pipe().expect("pipe");
     rustix::fs::fcntl_setfl(&read, rustix::fs::OFlags::NONBLOCK).expect("non-blocking read end");
@@ -161,11 +138,15 @@ fn nonblocking_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
 #[skuld::test]
 fn drain_returns_what_an_exited_writer_left_while_a_bystander_holds_the_write_end() {
     let (mut read, mut write) = nonblocking_pipe();
-    let bystander = Bystander::holding(write.try_clone().expect("dup the write end"));
+    // A long-lived process holding a write end of the token pipe, standing in for an unrelated
+    // process that forked while the end was not yet close-on-exec.
+    let copy = write.try_clone().expect("dup the write end");
+    let _bystander = blocker_with(|cat| {
+        cat.stdout(std::process::Stdio::from(copy));
+    });
     write.write_all(b"started returned").expect("write");
     drop(write);
     assert_eq!(drain(&mut read).expect("drain"), b"started returned");
-    drop(bystander);
 }
 
 #[skuld::test]

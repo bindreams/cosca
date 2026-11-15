@@ -189,7 +189,7 @@ async fn async_foreign_graceful_shutdown_tree_kills_a_member_reparented_while_th
 #[skuld::test]
 async fn async_foreign_graceful_shutdown_graceful_path() {
     crate::tokio::test_runtime::assert_current_thread();
-    let mut child = foreign::blocker();
+    let mut child = crate::test_child::blocker();
     let p = crate::tokio::Process::open_pid(child.id())
         .expect("open")
         .expect("running");

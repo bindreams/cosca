@@ -67,8 +67,7 @@ fn fixture_outer_procfs_inner() {
 
     // A live child of the inner namespace: the outer `/proc` may not hold its pid or may give it to
     // another process; its pidfd does not care.
-    let mut child = crate::test_spawn::spawn(std::process::Command::new("cat").stdin(std::process::Stdio::piped()))
-        .expect("spawn cat");
+    let mut child = crate::test_child::blocker();
     let got = ProcessId::of(child.id());
     let Resolved::Found(id) = got else {
         panic!("an inner-namespace child: got {got:?}")

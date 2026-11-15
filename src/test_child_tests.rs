@@ -59,11 +59,10 @@ fn death_watch_accept_or_die_retries_a_kevent_wait_interrupted_by_a_signal() {
         return;
     };
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rendezvous listener");
-    let mut cmd = std::process::Command::new("/bin/cat");
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn a target that waits for its stdin to close");
+    let mut child = crate::test_child::blocker_with(|cat| {
+        cat.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    });
     let target = crate::identity::ProcessId::of(child.id())
         .found()
         .expect("resolve the freshly spawned target");

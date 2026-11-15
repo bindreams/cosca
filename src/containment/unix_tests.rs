@@ -3,6 +3,7 @@
 // (`unix_kill_tree_reaps_the_grandchild` in `tests/spawn_io.rs`).
 
 use super::{kill_group, term_group};
+use crate::test_child::blocker_with;
 use crate::test_groups::{stray_signal, Group};
 use crate::test_support::stated_root::StatedRoot;
 
@@ -88,12 +89,9 @@ fn kill_group_on_owned_group_succeeds() {
     use std::os::unix::process::ExitStatusExt as _;
     // Spawn a child in its own private group (pgid == child pid) so we can
     // SIGKILL it without disturbing the test runner's own group.
-    let mut child = crate::test_spawn::spawn(
-        std::process::Command::new("cat")
-            .stdin(std::process::Stdio::piped())
-            .process_group(0),
-    )
-    .expect("spawn cat");
+    let mut child = blocker_with(|cat| {
+        cat.process_group(0);
+    });
     // Closed right after the kill: a `kill_group` that signals nothing exits 0.
     let stdin = child.stdin.take().expect("piped stdin");
     let pgid = child.id() as i32;
@@ -179,12 +177,9 @@ fn term_group_on_owned_group_succeeds() {
     // `cat` installs no SIGTERM handler of its own, so a delivered SIGTERM actually ends it —
     // distinguishing "exited because of the signal" from "merely stayed reachable". Its stdin is
     // closed right after the call: a `term_group` that delivers nothing exits 0.
-    let mut child = crate::test_spawn::spawn(
-        std::process::Command::new("cat")
-            .stdin(std::process::Stdio::piped())
-            .process_group(0),
-    )
-    .expect("spawn cat");
+    let mut child = blocker_with(|cat| {
+        cat.process_group(0);
+    });
     let stdin = child.stdin.take().expect("piped stdin");
     let pgid = child.id() as i32;
     assert!(
