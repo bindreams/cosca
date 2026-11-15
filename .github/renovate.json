@@ -110,16 +110,19 @@
     },
     {
       "customType": "regex",
-      "description": "CI Rust toolchain pin (.github/ci-toolchain, read by setup-rust)",
+      "description": "CI Rust toolchain pin (.github/ci-toolchain, read by setup-rust) and the rustup install line of the devvm recipes, which carries the same version",
       "managerFilePatterns": [
-        "/^\\.github/ci-toolchain$/"
+        "/^\\.github/ci-toolchain$/",
+        "/^devvm/[^/]+\\.devvm\\.yaml$/"
       ],
       "matchStrings": [
-        "^(?<currentValue>(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*))\\n*$"
+        "^(?<currentValue>(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*))\\n*$",
+        "--default-toolchain (?<currentValue>(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*))"
       ],
       "depNameTemplate": "rust-lang/rust",
       "datasourceTemplate": "github-releases",
-      "depTypeTemplate": "ci-tool"
+      "depTypeTemplate": "ci-tool",
+      "matchStringsStrategy": "any"
     },
     {
       "customType": "regex",
@@ -141,9 +144,10 @@
     },
     {
       "customType": "regex",
-      "description": "cargo-nextest release assets the devvm scripts download: tag and SHA-256 on one line, so the digest moves with the version",
+      "description": "cargo-nextest release assets the devvm scripts and recipes download: tag and SHA-256 on one line, so the digest moves with the version",
       "managerFilePatterns": [
-        "/^scripts/devvm/provision/(linux-rust\\.sh|macos-rust\\.sh|windows-rust\\.ps1)$/"
+        "/^scripts/devvm/provision/(linux-rust\\.sh|macos-rust\\.sh|windows-rust\\.ps1)$/",
+        "/^devvm/[^/]+\\.devvm\\.yaml$/"
       ],
       "matchStrings": [
         "NEXTEST_TAG_[A-Z0-9_]+=\"(?<currentValue>cargo-nextest-[^\"]+)\" NEXTEST_SHA256_[A-Z0-9_]+=\"(?<currentDigest>[0-9a-f]{64})\"",

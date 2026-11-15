@@ -52,8 +52,8 @@ table of `~/.cargo/config.toml`.
 
 `ELEVATION` is an ordinary group of this kind: tests that really elevate with `sudo`, `doas`, `pkexec`,
 `osascript` or `ShellExecuteEx(runas)`. `COSCA_TEST_ELEVATION=0` turns it off, and it needs
-`COSCA_TEST_ELEVATION_CONSENT=1`. Run it only in a sandbox, set up as the `elevation_*` jobs in `.github/workflows/ci.yaml` do (passwords,
-polkit, `doas`). Those setups change system policy (the polkit rule, the macOS authorization right, the Windows
+`COSCA_TEST_ELEVATION_CONSENT=1`. Run it only in a sandbox, set up as the elevation lanes in `.github/workflows/ci.yaml` do (passwords,
+polkit, `doas`; on Linux `.github/scripts/elevation-lane.sh` is the whole lane). Those setups change system policy (the polkit rule, the macOS authorization right, the Windows
 `ConsentPromptBehaviorAdmin` value), so undo them when you are done: `unattended-gui-elevation.py` saves the prior
 state and restores it with `--revert` (same guard and root check as enabling; on Linux pass the same `--user`), and
 `elevation-lane-sudoers.sh --cleanup` and `elevation-lane-linux.sh --cleanup` undo the rest.
@@ -78,7 +78,7 @@ Two test groups run only as root (principles 9 and 10 in `docs/principles.md`):
 
 For each group, `=0` turns it off: its tests report as ignored. Otherwise
 `COSCA_TEST_<GROUP>_CONSENT=1` is required, and without it the test fails. An ordinary
-(unprivileged) run sets both switches to `0`. CI does this workflow-wide; the root lanes in
+(unprivileged) run sets both switches to `0`. CI's test jobs do this through `.github/test-group-defaults.env`; the root lanes in
 `.github/workflows/ci.yaml` turn `ROOT` on, and turn `UID_SWITCH` on only in the lanes that are real
 root (Linux root, `DAC_READ_SEARCH`, foreign `TMPDIR`, and macOS).
 
