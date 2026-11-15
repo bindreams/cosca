@@ -15,7 +15,8 @@ devvm up devvm/cosca-linux.devvm.yaml --name cosca-lane        # once: about 5 m
 devvm ssh cosca-lane -- bash -c "$(cat lane.sh)"               # lane.sh holds one block below
 ```
 
-Git Bash on Windows rewrites an argument after `--` that starts with `/`: set `MSYS_NO_PATHCONV=1` for such a command.
+Git Bash on Windows rewrites any argument of `devvm` that starts with `/` or holds `=/` into a Windows path: set
+`MSYS_NO_PATHCONV=1` for such a command.
 
 After an edit to a tracked file, rerun from a fresh instance: `devvm rm cosca-lane`, then `devvm up` again. Only the
 last step (`copy`) runs again, about 45 seconds; the layers above it are reused. `devvm rm cosca-lane` when done.
@@ -34,8 +35,7 @@ the block turns on its own with their `_CONSENT` variable. The lane's scripts se
 | tracer (debug, release)                   | the block: `TRACER`              | 19 passed, 2 skipped (both)                  |
 | stray signal (debug, release)             | the block: `STRAY_SIGNAL`        | 42 passed, 10 skipped; 41 passed, 10 skipped |
 
-Each block removes its `RUNNER_TEMP` directory on exit; the setuid lanes thereby remove their setuid-root helper, as
-CI's "Remove the setuid-root helper" step does.
+The setuid lanes remove their setuid-root helper on exit, as CI's "Remove the setuid-root helper" step does.
 
 ## Elevation
 
@@ -44,7 +44,6 @@ set -euo pipefail
 cd ~/cosca
 . devvm/lane-env.sh
 export RUNNER_TEMP="$(mktemp -d)"
-trap 'sudo rm -rf -- "$RUNNER_TEMP"' EXIT
 bash .github/scripts/elevation-lane.sh x86_64-unknown-linux-gnu
 ```
 
@@ -56,7 +55,6 @@ cd ~/cosca
 . devvm/lane-env.sh
 target=x86_64-unknown-linux-gnu
 export RUNNER_TEMP="$(mktemp -d)"
-trap 'sudo rm -rf -- "$RUNNER_TEMP"' EXIT
 cargo nextest archive --locked --features pty,tokio --target "$target" --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
 python3 .github/scripts/run-nextest.py cgroup sudo --preserve-env=COSCA_TEST_PIDFD_GROUP_SIGNAL,COSCA_TEST_PIDFD_GET_INFO "$(command -v python3)" .github/scripts/forward.py bash -ux .github/scripts/cgroup-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(id -u):$(id -g)"
 ```
@@ -70,7 +68,7 @@ cd ~/cosca
 target=x86_64-unknown-linux-gnu
 export RUNNER_TEMP="$(mktemp -d)"
 helper="$RUNNER_TEMP/cosca_testbin_setuid"
-trap 'sudo rm -rf -- "$RUNNER_TEMP"' EXIT
+trap 'sudo rm -f -- "$helper"' EXIT
 bash .github/scripts/setuid-helper.sh "$target" "$helper"
 bash .github/scripts/setuid-lane-check.sh "$helper"
 cargo nextest run --locked --no-run --features tokio --target "$target" --profile ci -E 'binary(cosca) | binary(group_teardown_setuid)'
@@ -87,7 +85,7 @@ cd ~/cosca
 target=x86_64-unknown-linux-gnu
 export RUNNER_TEMP="$(mktemp -d)"
 helper="$RUNNER_TEMP/cosca_testbin_setuid"
-trap 'sudo rm -rf -- "$RUNNER_TEMP"' EXIT
+trap 'sudo rm -f -- "$helper"' EXIT
 bash .github/scripts/setuid-helper.sh "$target" "$helper"
 bash .github/scripts/setuid-lane-check.sh "$helper"
 cargo nextest archive --locked --features pty,tokio --target "$target" --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
@@ -104,12 +102,12 @@ cd ~/cosca
 target=x86_64-unknown-linux-gnu
 export RUNNER_TEMP="$(mktemp -d)"
 helper="$RUNNER_TEMP/cosca_testbin_setuid"
-# The directory modes are put back and the lane's directory, with the helper in it, is removed on every exit.
+# The helper is removed and the directory modes are put back on every exit.
 restore() {
   status=$?
   trap - EXIT
+  sudo rm -f -- "$helper" || status=1
   bash .github/scripts/dir-modes.sh restore "$RUNNER_TEMP/dir-modes" || status=1
-  sudo rm -rf -- "$RUNNER_TEMP" || status=1
   exit "$status"
 }
 trap restore EXIT
@@ -128,7 +126,6 @@ cd ~/cosca
 . devvm/lane-env.sh
 target=x86_64-unknown-linux-gnu
 export RUNNER_TEMP="$(mktemp -d)"
-trap 'sudo rm -rf -- "$RUNNER_TEMP"' EXIT
 mkdir -p target/nextest "$RUNNER_TEMP/artifacts"
 cargo nextest archive --locked --target "$target" --archive-file "$RUNNER_TEMP/artifacts/root-lane.tar.zst"
 # The capabilities Docker gives a container's root; a lane adds to them as its `docker run` flags do.
@@ -167,7 +164,6 @@ cd ~/cosca
 . devvm/lane-env.sh
 target=x86_64-unknown-linux-gnu
 export RUNNER_TEMP="$(mktemp -d)"
-trap 'sudo rm -rf -- "$RUNNER_TEMP"' EXIT
 export COSCA_TEST_TRACER=1 COSCA_TEST_TRACER_CONSENT=1 SKULD_LABELS=tracer
 python3 .github/scripts/run-nextest.py tracer cargo nextest run --locked --no-tests=fail --features tokio --target "$target" -E 'binary(cosca)'
 python3 .github/scripts/run-nextest.py tracer-release cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target "$target"
@@ -181,7 +177,6 @@ cd ~/cosca
 . devvm/lane-env.sh
 target=x86_64-unknown-linux-gnu
 export RUNNER_TEMP="$(mktemp -d)"
-trap 'sudo rm -rf -- "$RUNNER_TEMP"' EXIT
 export COSCA_TEST_STRAY_SIGNAL=1 COSCA_TEST_STRAY_SIGNAL_CONSENT=1 SKULD_LABELS=stray_signal
 python3 .github/scripts/run-nextest.py stray-signal cargo nextest run --locked --no-tests=fail --features tokio --target "$target" -E 'binary(cosca) | binary(=process)'
 python3 .github/scripts/run-nextest.py stray-signal-release cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target "$target"
