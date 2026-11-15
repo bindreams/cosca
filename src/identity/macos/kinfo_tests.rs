@@ -330,6 +330,11 @@ fn exit_begun_is_p_wexit_or_a_zombie_and_no_other_flag() {
     assert!(!exit_begun(running, P_SYSTEM));
     assert!(exit_begun(running, P_WEXIT));
     assert!(exit_begun(zombie, 0));
+    // Only `P_WEXIT` without `SZOMB` is `Exiting`; a zombie is a zombie whether or not the flag shows.
+    assert_eq!(exit_state(running, 0), ExitState::Running);
+    assert_eq!(exit_state(running, P_WEXIT), ExitState::Exiting);
+    assert_eq!(exit_state(zombie, 0), ExitState::Zombie);
+    assert_eq!(exit_state(zombie, P_WEXIT), ExitState::Zombie);
 
     let me = kinfo(&HostKernel, std::process::id())
         .found()

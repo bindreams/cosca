@@ -37,7 +37,9 @@ impl Sig {
 /// What a send did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sent {
-    /// The signal was handed to the OS for the child.
+    /// The signal was handed to the OS for the child. It also covers a target whose exit had begun
+    /// when the send was refused (macOS: a `SIGKILL` answered `EPERM`, `P_WEXIT` set): nothing was
+    /// delivered, and the exit is on its way.
     Delivered,
     /// Nothing was delivered because the child is gone: reaped, or its pid no longer names it. Not
     /// an error; logged at `debug`.
@@ -277,7 +279,9 @@ pub(crate) fn via_audit_token(
     #[cfg(test)]
     crate::send_log::record(pid, sig, crate::send_log::Via::Identity);
     Ok(match sent? {
-        SignalByTokenOutcome::Delivered | SignalByTokenOutcome::ExitedUnreaped => Sent::Delivered,
+        SignalByTokenOutcome::Delivered | SignalByTokenOutcome::ExitedUnreaped | SignalByTokenOutcome::Exiting => {
+            Sent::Delivered
+        }
         SignalByTokenOutcome::Gone => Sent::Gone,
     })
 }

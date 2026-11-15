@@ -1125,8 +1125,8 @@ pub(crate) use backend::fault::force_unknown;
 /// The assert-free identity reads every `exit_only` check uses, and the purpose that names each.
 #[cfg(target_os = "macos")]
 pub(crate) use backend::{
-    has_exited, held_by, link, origin, own_unique_id, uniq_info, Held, Link, Origin, ReadPurpose, UniqInfo, UniqRead,
-    LAUNCHD,
+    exit_state_of, has_exited, held_by, link, origin, own_unique_id, uniq_info, Held, Link, Origin, ReadPurpose,
+    UniqInfo, UniqRead, LAUNCHD,
 };
 
 /// What a `proc_pidinfo` read by pid answers when it fails, the error of a [`Kernel`]'s short and BSD

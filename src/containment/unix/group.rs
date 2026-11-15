@@ -533,6 +533,8 @@ fn root_check_before_send(root: Option<&dyn Root>, pid: RawPid, signal: Option<S
 ///   (`pidfd_open` `EINVAL`/`ENOENT`, which a `Pidfs` id takes as lost and a `Ticks` id settles by
 ///   `id.exists()` saying `Gone`) and a ptraced zombie thread, and a macOS pid that names another
 ///   process.
+/// - `EPERM` from a member whose exit has begun (macOS `P_WEXIT`, not yet a zombie) is
+///   `Reached::Killed`; from a zombie or gone member, `Reached::Yes`; otherwise `Reached::No`.
 /// - `Error::NotThreadGroupLeader` is `Reached::Unknown`, with no fallback. The kernel did answer:
 ///   this pid is a live thread, not a process. `kill(2)` on a tid signals the whole thread group
 ///   that owns it, which is not the member that was listed.
@@ -607,9 +609,10 @@ fn resend_sigkill(
 /// at that check and exits to a zombie microseconds later still answers `EPERM` (measured,
 /// this file's Background — a foreign-uid zombie answers identically to a foreign-uid live
 /// refuser), so without this re-check a member that finished dying mid-teardown would be
-/// misreported as a survivor. Only `Survivor` is re-checked — `NotASurvivor`/`Unassessable`
-/// need no second look, since neither claims a definite, still-running refuser. A downgrade
-/// is logged so the decision is visible next to the original refusal.
+/// misreported as a survivor, when the second look finds it a zombie or gone. Only `Survivor` is
+/// re-checked — `NotASurvivor`/`Unassessable` need no second look, since neither claims a definite,
+/// still-running refuser. A downgrade is logged so the decision is visible next to the original
+/// refusal.
 ///
 /// **Downgrades on `Liveness::Dead` only — `Liveness::Unknown` keeps `Survivor`.** Downgrading
 /// on `Unknown` too would throw away STRONGER evidence for WEAKER: the `Survivor` this

@@ -71,6 +71,22 @@ impl kinfo_proc {
         record.set_e_ppid(ppid);
         record
     }
+
+    /// The host's record of the live process `pid`, stating its exit: `P_WEXIT` set when `begun` and
+    /// clear otherwise, and `p_stat` `SRUN` either way, as measured at every `EPERM` the token send
+    /// answered to an exiting child (the process is not yet a zombie).
+    pub(crate) fn of_host_with_exit(pid: RawPid, begun: bool) -> kinfo_proc {
+        let (Resolved::Found(mut record), _) = super::kernel::HostKernel.kinfo(pid) else {
+            panic!("pid {pid} is live and has a kinfo_proc");
+        };
+        record.kp_proc.p_stat = libc::SRUN as libc::c_char;
+        if begun {
+            record.kp_proc.p_flag |= P_WEXIT;
+        } else {
+            record.kp_proc.p_flag &= !P_WEXIT;
+        }
+        record
+    }
 }
 
 // E_PPID_OFFSET must stay inside the opaque tail it reads from - a compile-time companion to
@@ -166,10 +182,33 @@ pub(crate) const P_SYSTEM: libc::c_int = 0x00000200;
 /// whose children its exit had moved.
 pub(crate) const P_WEXIT: libc::c_int = 0x0000_2000;
 
-/// Whether a process that `kinfo_proc` shows with `p_stat` and `p_flag` has begun to exit: `P_WEXIT`
-/// is set, or it is already a zombie (XNU sets `P_LEXIT` first, but the state is the stronger fact).
+/// How far a process's exit has gone, as `kinfo_proc` shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitState {
+    /// `P_WEXIT` is clear and the process is not a zombie.
+    Running,
+    /// `P_WEXIT` is set and the process is not yet a zombie.
+    Exiting,
+    /// `p_stat` is `SZOMB`: exited and not reaped.
+    Zombie,
+}
+
+/// The [`ExitState`] of a process that `kinfo_proc` shows with `p_stat` and `p_flag`. A zombie is
+/// a zombie whether or not `P_WEXIT` shows (XNU sets `P_LEXIT` first, but the state is the stronger
+/// fact).
+pub(crate) fn exit_state(p_stat: libc::c_char, p_flag: libc::c_int) -> ExitState {
+    if p_stat as u32 == libc::SZOMB {
+        ExitState::Zombie
+    } else if p_flag & P_WEXIT != 0 {
+        ExitState::Exiting
+    } else {
+        ExitState::Running
+    }
+}
+
+/// Whether the exit has begun: [`ExitState::Exiting`] or [`ExitState::Zombie`].
 pub(crate) fn exit_begun(p_stat: libc::c_char, p_flag: libc::c_int) -> bool {
-    p_stat as u32 == libc::SZOMB || p_flag & P_WEXIT != 0
+    exit_state(p_stat, p_flag) != ExitState::Running
 }
 
 /// Read one `kinfo_proc` for `pid`. `None` means "not resolvable" — the EXPECTED miss is

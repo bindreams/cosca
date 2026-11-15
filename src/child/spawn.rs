@@ -1090,7 +1090,12 @@ fn unwatched_child_fate(pid: u32, unique: u64, front: bool) -> (ChildFate, Strin
         );
     }
     match via_audit_token(&crate::identity::HostKernel, pid, Some(unique), Sig::Kill) {
-        Ok(Sent::Delivered) => (ChildFate::Killed, "it was sent SIGKILL".to_owned(), None),
+        // `Delivered` also covers a child whose exit had begun at the send, so the clause says both.
+        Ok(Sent::Delivered) => (
+            ChildFate::Killed,
+            "it was sent SIGKILL, or its exit had begun when the send was made".to_owned(),
+            None,
+        ),
         Ok(Sent::Gone) => (
             ChildFate::Gone,
             "it was gone, or its pid names another process, so nothing was sent".to_owned(),
