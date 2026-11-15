@@ -861,6 +861,46 @@ fn the_wait_after_a_refused_kill_a_tree_kill_reached_warns_past_the_threshold() 
     assert_eq!(warns, 1);
 }
 
+/// A root whose kill was refused but that a tree kill reached has its reap pending, and its hook is
+/// told the root's kill was refused, not sent: the pending wait is the tree kill's. The fixture hook
+/// that releases a child a kill ends has fired once by then, from the tree kill's wait.
+///
+/// Mutant: `tear_down_between` tells its hook `Sent` for every pending wait.
+#[skuld::test]
+fn the_hook_is_told_a_refused_root_a_tree_kill_reached_was_refused_though_its_reap_is_pending() {
+    use crate::child::owned::teardown::RootKill;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let fake = fake()
+        .reaps([ReapAnswer::Reaped(exit())])
+        .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
+    let reach = FakeReach::answering(Ok(true));
+    let child = OwnedChild::new(Box::new(fake));
+    let fired = Rc::new(Cell::new(0));
+    let _armed = crate::child::spawn::fault::set_between_kill_and_wait({
+        let fired = fired.clone();
+        move || fired.set(fired.get() + 1)
+    });
+    let mut seen = None;
+    let kill = Kill {
+        disposition: Disposition::Leave,
+        tree: Some(&reach),
+    };
+
+    let torn = child.tear_down_between(Some(id()), kill, None, |kill| {
+        seen = Some((kill, child.is_reaped(), fired.get()));
+        false
+    });
+
+    assert_eq!(
+        seen,
+        Some((RootKill::Refused, false, 1)),
+        "the root's kill was refused, its reap was pending, and the fixture hook had fired once"
+    );
+    assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
+}
+
 /// The reap of a child a tree kill has just ended warns past the threshold it is given.
 ///
 /// Mutant: `reap_after_tree_kill` begins the wait with no threshold.

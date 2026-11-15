@@ -117,10 +117,7 @@ impl Settlement {
     }
 
     /// What became of an elevation front, which is sent nothing.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "only the Linux spawn words a front it looked at")
-    )]
+    #[cfg_attr(windows, allow(dead_code, reason = "no Windows spawn words a front it looked at"))]
     pub(crate) fn front_fate(&self) -> FrontFate {
         match &self.answer {
             Ok(ChildWaitOutcome::Exited(_)) => FrontFate::Reaped,

@@ -7,43 +7,6 @@ use crate::identity::{uniq_info, HostKernel, ReadPurpose, UniqRead};
 use crate::os_process::macos::kqueue::test_hooks;
 use crate::test_groups::{tracer_group, Group};
 use crate::test_support::tracer::{self, Mode, Report};
-use crate::wait::exit_only::{self, Reap, Target};
-use crate::wait::macos::{await_reapable, Waited};
-
-/// A held child is running until the tracer hands it back: the by-pid `ECHILD` is not a reap,
-/// the kqueue wait keeps waiting, and the hand-back's `NOTE_EXIT` ends it as `Reapable`.
-///
-/// Mutant: a by-pid `ECHILD` taken for a foreign reap without checking the pid still names the
-/// child.
-#[skuld::test]
-fn a_child_held_by_a_tracer_is_running_until_the_hand_back(#[fixture(tracer_group)] _group: &Group) {
-    let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
-    let stdin = tracee.stdin().expect("the tracee's stdin is piped");
-    let pid = tracee.pid();
-    let unique = match uniq_info(&HostKernel, pid, ReadPurpose::Adopt) {
-        UniqRead::Found(info) => info.unique_id,
-        other => panic!("the tracee's unique id: {other:?}"),
-    };
-    let mut helper = tracer::start(Mode::Auto).attach(&mut tracee);
-    assert_eq!(helper.recv(), Report::Attached);
-
-    let target = Target::pid(&HostKernel, pid, Some(unique));
-    assert_eq!(exit_only::try_reap(&target).expect("try_reap"), Reap::Running);
-    // An expired deadline: one look, no blocking.
-    let held = await_reapable(&HostKernel, pid, Some(unique), Some(Instant::now())).expect("wait");
-    assert_eq!(held, Waited::DeadlinePassed);
-
-    drop(stdin);
-    assert_eq!(helper.recv(), Report::Reaped);
-    // The zombie is ours again: an unbounded wait sees the exit.
-    assert_eq!(
-        await_reapable(&HostKernel, pid, Some(unique), None).expect("wait"),
-        Waited::Reapable
-    );
-    drop(helper);
-    let status = tracee.wait().expect("the handed-back zombie is ours to reap");
-    assert!(status.success(), "{status:?}");
-}
 
 /// A tracee held by a tracer, its handle, and the stdin that ends it.
 fn held() -> (crate::Child, crate::PipeWriter) {
@@ -379,7 +342,8 @@ fn tracee_with_unique() -> (crate::Child, crate::PipeWriter, u64) {
 /// disposition check. Round 1's is the helper's `reaped`: it follows the helper's `wait4`, which
 /// hands the zombie back and re-fires `NOTE_EXIT` to this process.
 ///
-/// Mutant: the wait registers no `NOTE_SIGNAL` on the child: round 0's look finds nothing.
+/// Mutant: the wait registers no `NOTE_SIGNAL` on the child: the look at the first staged wake finds
+/// nothing.
 #[skuld::test]
 fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group: &Group) {
     use std::cell::RefCell;
@@ -433,7 +397,7 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
 /// wait's kqueue. Round 1's is the inner helper's `reaped`: it follows the inner helper's `wait4`,
 /// which hands the zombie back and re-fires `NOTE_EXIT` to this process.
 ///
-/// Mutant: the walk stops at the child's tracer: round 0's look finds nothing.
+/// Mutant: the walk stops at the child's tracer: the look at the first staged wake finds nothing.
 #[skuld::test]
 fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixture(tracer_group)] _group: &Group) {
     use std::cell::RefCell;

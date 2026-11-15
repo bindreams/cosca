@@ -1,6 +1,7 @@
 //! A failed spawn's teardown of the child it holds after the spawn: on Linux, through its pidfd when
 //! the identity read or the attach that follows fails (sync and async) and of the child the
-//! handshake itself abandons; on Windows, the std and raw spawns' child over its process handle.
+//! handshake itself abandons; on Windows, the std and raw spawns' child over its process handle; on
+//! macOS, over the `MacosChild` the spawn builds right after the child's unique id is adopted.
 //! The teardown over a handle with what its caller expects of it ([`tear_down_expecting`]) and the
 //! look at a front (`look_at_failed_spawn_front`) are also what a cgroup leaf's abandonment
 //! builds on.
@@ -10,18 +11,16 @@ use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 use super::Diagnosis;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use super::FrontFate;
 use crate::child::drop_teardown::Torn;
-use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Kill, Past, Remains};
-#[cfg(target_os = "linux")]
+use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Kill, Past, Remains, RootKill};
+#[cfg(unix)]
 use crate::child::owned::teardown::{Reach, TeardownOutcome};
 use crate::child::owned::unreaped::DropKind;
 use crate::child::owned::OwnedChild;
 use crate::child::spawn::policy::SpawnPolicy;
-#[cfg(target_os = "linux")]
-use crate::containment::cgroup::Subtree;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use crate::elevation::front::Front;
 use crate::identity::ProcessId;
 #[cfg(target_os = "linux")]
@@ -29,14 +28,15 @@ use crate::os_process::linux::LinuxProcess;
 use crate::Unreaped;
 
 /// What a held child's teardown is told.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) struct HeldTeardown<'a> {
     /// The elevation front the child is, if it is one: sent nothing and looked at.
     pub(crate) front: Option<Front>,
     /// The child's identity, if the spawn read one.
     pub(crate) id: Option<ProcessId>,
-    /// Where a front's leaf's kill went. `None`: no leaf kill, so a running front is left.
-    pub(crate) subtree: Option<&'a Subtree>,
+    /// Where a front's leaf's kill went. `None`: no such kill, so a running front is left. Only a
+    /// Linux cgroup leaf makes one (its `Subtree`); on macOS this is always `None`.
+    pub(crate) reach: Option<&'a dyn Reach>,
     /// What the caller does with a child that still runs: hand it back, or leave it.
     pub(crate) disposition: Disposition,
     /// What the spawn was told of its teardowns: when the wait for a child the teardown killed, or a
@@ -49,14 +49,14 @@ pub(crate) struct HeldTeardown<'a> {
 /// `how.disposition` hands back one that still runs.
 ///
 /// A child that is not a front is killed and reaped. A front is sent nothing and looked at: reaped
-/// if it has exited, waited for (warning once past 1 s) if `how.subtree`, where its leaf's kill went,
+/// if it has exited, waited for (warning once past 1 s) if `how.reach`, where its leaf's kill went,
 /// shows that kill reached it, and otherwise running. `why` leads the teardown's one warn, if it has one.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) fn tear_down_held(child: OwnedChild, how: HeldTeardown<'_>, why: &mut Diagnosis) -> (Option<String>, Torn) {
     let HeldTeardown {
         front,
         id,
-        subtree,
+        reach,
         disposition,
         policy,
     } = how;
@@ -67,8 +67,7 @@ pub(crate) fn tear_down_held(child: OwnedChild, how: HeldTeardown<'_>, why: &mut
         let torn = tear_down_failed_spawn(child, id, Past::WaitMayFail, disposition, policy, why);
         return (None, torn);
     }
-    let reach = Ok(subtree.map(|subtree| subtree as &dyn Reach));
-    let (front_fate, torn) = look_at_failed_spawn_front(&child, id, reach, disposition, policy.teardown_warn_after);
+    let (front_fate, torn) = look_at_failed_spawn_front(&child, id, Ok(reach), disposition, policy.teardown_warn_after);
     let torn = HandleTeardown::new(torn, Expect::of(&child, Past::WaitMayFail));
     let torn = say_failed_spawn(child, id, true, torn, disposition, policy.unreaped_drop, why);
     let detail = if torn.unreaped.is_some() {
@@ -130,7 +129,6 @@ pub(crate) fn unexecuted_past(id: Option<ProcessId>) -> Past {
 /// `otherwise` returns what the teardown did beyond its fate (the `detail` of
 /// [`Error::MayHaveStarted`](crate::Error::MayHaveStarted)) and the child's [`Torn`]; it is each
 /// platform's own teardown of a child that may have run.
-#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn tear_down_after_failed_attach(
     child: OwnedChild,
     id: Option<ProcessId>,
@@ -212,11 +210,28 @@ pub(crate) fn tear_down_failed_spawn(
     policy: SpawnPolicy,
     why: &mut Diagnosis,
 ) -> Torn {
+    tear_down_failed_spawn_between(child, id, past, disposition, policy, why, |_, _, _| false)
+}
+
+/// [`tear_down_failed_spawn`], running `between(child, kill, why)` as [`OwnedChild::tear_down_between`]
+/// does; `between` may add to `why`, which leads the one warn.
+pub(crate) fn tear_down_failed_spawn_between(
+    child: OwnedChild,
+    id: Option<ProcessId>,
+    past: Past,
+    disposition: Disposition,
+    policy: SpawnPolicy,
+    why: &mut Diagnosis,
+    between: impl FnOnce(&OwnedChild, RootKill, &mut Diagnosis) -> bool,
+) -> Torn {
     let kill = Kill {
         disposition,
         tree: None,
     };
-    let torn = tear_down_expecting(&child, id, kill, past, policy.teardown_warn_after);
+    let outcome = child.tear_down_between(id, kill, policy.teardown_warn_after, |kill| {
+        between(&child, kill, &mut *why)
+    });
+    let torn = HandleTeardown::new(outcome, Expect::of(&child, past));
     say_failed_spawn(child, id, false, torn, disposition, policy.unreaped_drop, why)
 }
 
@@ -237,7 +252,7 @@ pub(crate) fn tear_down_expecting(
 /// and the look worded as the failed spawn's teardown of it (see [`OwnedChild::look_at_front`] for
 /// `reach`, `id` and `warn_after`). `disposition`: what the caller does with a front it finds
 /// running. The caller says the outcome.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) fn look_at_failed_spawn_front(
     child: &OwnedChild,
     id: Option<ProcessId>,

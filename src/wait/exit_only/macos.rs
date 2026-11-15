@@ -132,7 +132,7 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
 
 /// The consuming `kernel.consume`. `Ok(None)` when it finds nothing.
 fn consume(kernel: &dyn Kernel, pid: u32) -> io::Result<Option<crate::identity::Record>> {
-    kernel.consume(pid).map(|r| r.map(super::consumed))
+    kernel.consume(pid)
 }
 
 pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {

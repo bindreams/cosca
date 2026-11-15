@@ -69,7 +69,7 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     }
     let fd = pidfd(target);
     match waitid_record(fd, WaitIdOptions::EXITED | WaitIdOptions::NOHANG) {
-        Ok(Some(record)) => Ok(Reap::Reaped(exit_record_of(super::consumed(record)))),
+        Ok(Some(record)) => Ok(Reap::Reaped(exit_record_of(record))),
         // Peeked as an exit, then nothing to consume: a zombie only its tracer can reap.
         Ok(None) => Ok(Reap::Running),
         Err(Errno::CHILD) => Ok(Reap::Foreign(Foreign::Gone)),

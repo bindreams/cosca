@@ -46,9 +46,9 @@ fn teardown_with_forced_looks(point: SpawnPoint, force: fn(bool)) -> (ChildFate,
     (fate, warns)
 }
 
-/// The teardown after a failed attach (`kill_and_reap_verified`).
+/// The teardown after a failed attach (`held_teardown::tear_down_held`).
 ///
-/// Mutant: the attach arm gives `kill_and_reap_verified` no threshold.
+/// Mutant: the attach arm gives `tear_down_held` no threshold.
 #[skuld::test]
 async fn macos_a_teardown_after_a_failed_attach_warns_once_past_its_threshold() {
     let (fate, warns) = teardown_with_forced_looks(SpawnPoint::BeforeAttach, fault::set_force_attach_failure);

@@ -2,6 +2,7 @@
 //! it names no process, and answers from what the test stated. It records only which sends it was
 //! asked for, which is what a consumer's row reads.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
@@ -35,6 +36,9 @@ pub(crate) struct FakeContains {
     unobserved: Vec<u32>,
     /// Whether its kill states that its walk was not made.
     unwalked: bool,
+    /// What each [`send_kill`](Contains::send_kill) answers, in order, once; a send past them is the
+    /// kill that leaves nothing running.
+    kill_answers: Mutex<VecDeque<TreeKillOutcome>>,
     sends: Sends,
 }
 
@@ -51,9 +55,24 @@ impl FakeContains {
             #[cfg(unix)]
             unobserved: Vec::new(),
             unwalked: false,
+            kill_answers: Mutex::default(),
             sends: sends.clone(),
         };
         (fake, sends)
+    }
+
+    /// A mechanism whose successive [`send_kill`](Contains::send_kill)s answer `outcomes`, as a tree
+    /// whose sweeps went one way or another.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only a macOS row states what each sweep of a tree answered")
+    )]
+    pub(crate) fn answering_kills(self, outcomes: impl IntoIterator<Item = TreeKillOutcome>) -> FakeContains {
+        *self
+            .kill_answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = outcomes.into_iter().collect();
+        self
     }
 
     /// A mechanism whose settlement states that it killed `members` again, as a tree walk does for
@@ -94,6 +113,23 @@ impl FakeContains {
 }
 
 impl Contains for FakeContains {
+    /// The next answer [`answering_kills`](FakeContains::answering_kills) stated, else the kill that
+    /// [`kill`](Self::kill) is.
+    fn send_kill(&self, root: Option<&dyn Root>) -> TreeKillOutcome {
+        let stated = self
+            .kill_answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front();
+        match stated {
+            Some(answer) => {
+                self.record("kill");
+                answer
+            }
+            None => self.kill(root).outcome(),
+        }
+    }
+
     /// A kill that leaves nothing running, and states the members it reached.
     fn kill(&self, _root: Option<&dyn Root>) -> TreeKill<'_> {
         self.record("kill");

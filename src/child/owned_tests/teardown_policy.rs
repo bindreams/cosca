@@ -37,7 +37,7 @@ fn a_dropped_childs_wait_warns_past_its_spawns_threshold() {
 mod failed_spawn {
     use super::slow_to_be_reaped;
     use crate::child::owned::owned_tests::teardown::{fire_on_block, held_owned_blocker, slow_warns_during};
-    use crate::child::owned::teardown::{Disposition, Past};
+    use crate::child::owned::teardown::{Disposition, Past, RootKill};
     use crate::child::spawn::held_teardown::tear_down_failed_spawn;
     use crate::child::spawn::policy::SpawnPolicy;
     use crate::child::spawn::Diagnosis;
@@ -73,6 +73,137 @@ mod failed_spawn {
 
         assert_eq!(fate, Some(ChildFate::Reaped));
         assert_eq!(warns, 1);
+    }
+
+    /// A hook that waits for the killed root itself, warning past the threshold, leaves the wait
+    /// after it no threshold: the failed spawn warns of that root once, not once per wait.
+    ///
+    /// Mutant: the wait after the hook carries the policy's threshold too: two warns.
+    #[skuld::test]
+    fn a_hook_that_waited_with_the_threshold_leaves_the_settle_none() {
+        use crate::child::spawn::held_teardown::tear_down_failed_spawn_between;
+
+        let mut fake = None;
+        // One reap that is not ready: the wait blocks on it once, and the block's hook fires it.
+        let (owned, _stdin) = held_owned_blocker(|f| {
+            fake = Some(f.clone());
+            f.reaps([ReapAnswer::Running])
+        });
+        let _fire = fire_on_block(&fake.expect("the script ran"));
+        let mut fate = None;
+
+        let warns = slow_warns_during(|| {
+            let torn = tear_down_failed_spawn_between(
+                owned,
+                None,
+                Past::WaitMayFail,
+                Disposition::HandBack,
+                SpawnPolicy::WARNS_AT_ONCE,
+                &mut Diagnosis::default(),
+                |owned, kill, _| {
+                    assert_eq!(kill, RootKill::Sent, "the kill was sent");
+                    crate::child::spawn::warn_still_waiting(owned.pid(), std::time::Duration::ZERO);
+                    true
+                },
+            );
+            fate = Some(torn.fate);
+        });
+
+        assert_eq!(fate, Some(ChildFate::Reaped));
+        assert_eq!(warns, 1);
+    }
+
+    /// A root this handle had already reaped is sent nothing (`Gone`), and the hook is told so, as it
+    /// is told of a kill that was sent and of one that was refused: no wait is left pending, and the
+    /// kill was not refused.
+    ///
+    /// Mutant: the hook is told the kill was sent, or refused, whenever no wait is pending.
+    #[skuld::test]
+    fn the_hook_is_told_a_root_already_reaped_was_sent_nothing() {
+        use crate::child::spawn::held_teardown::tear_down_failed_spawn_between;
+
+        let (owned, stdin) = held_owned_blocker(|f| f);
+        drop(stdin);
+        owned.wait(None).expect("the released blocker exits");
+        let mut seen = None;
+        let _torn = tear_down_failed_spawn_between(
+            owned,
+            None,
+            Past::WaitMayFail,
+            Disposition::HandBack,
+            SpawnPolicy::SYNC,
+            &mut Diagnosis::default(),
+            |owned, kill, _| {
+                seen = Some((kill, owned.is_reaped()));
+                false
+            },
+        );
+        assert_eq!(
+            seen,
+            Some((RootKill::Reaped, true)),
+            "nothing was sent: the root was reaped already"
+        );
+    }
+
+    /// What a caller of `tear_down_failed_spawn_between` sees when its hook runs: the root's kill was
+    /// sent and the root is not reaped yet ([`RootKill::Sent`]), so it can act on a root that is a
+    /// zombie still, and the teardown goes on to reap it after the hook. A refused kill leaves
+    /// nothing to wait for ([`RootKill::Refused`]): the hook then runs after the one look, with the
+    /// root still running.
+    ///
+    /// Mutants: the hook runs after the reap, or never; it runs before the kill; a refused kill is
+    /// said to leave a wait pending.
+    #[skuld::test]
+    fn the_hook_between_the_kill_and_the_wait_runs_between_them() {
+        use super::super::teardown::held_owned_blocker as held;
+        use crate::child::spawn::held_teardown::tear_down_failed_spawn_between;
+
+        let run = |script: fn(crate::os_process::fake::FakeProcess) -> crate::os_process::fake::FakeProcess| {
+            let (owned, stdin) = held(script);
+            let mut seen = None;
+            let torn = tear_down_failed_spawn_between(
+                owned,
+                None,
+                Past::WaitMayFail,
+                Disposition::HandBack,
+                SpawnPolicy::SYNC,
+                &mut Diagnosis::default(),
+                |owned, kill, _| {
+                    seen = Some((kill, owned.is_reaped()));
+                    false
+                },
+            );
+            (seen, torn, stdin)
+        };
+
+        // The kill is the real one: the blocker dies of it, and the teardown reaps it after the hook.
+        let (seen, torn, stdin) = run(|f| f);
+        drop(stdin);
+        assert_eq!(
+            seen,
+            Some((RootKill::Sent, false)),
+            "the hook ran with the wait pending"
+        );
+        assert_eq!(torn.fate, ChildFate::Reaped);
+
+        // A refused kill: one look, nothing pending; the blocker still runs, and the test ends it. A
+        // Windows handle is never refused (`KillRefusal::Never`), so only Linux's can say this.
+        #[cfg(target_os = "linux")]
+        {
+            let (seen, torn, stdin) =
+                run(|f| f.signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]));
+            assert_eq!(
+                seen,
+                Some((RootKill::Refused, false)),
+                "the hook ran with no wait pending"
+            );
+            assert!(torn.unreaped.is_some(), "a running child is handed back");
+            drop(stdin);
+            torn.unreaped
+                .expect("handed back")
+                .wait()
+                .expect("the released blocker exits");
+        }
     }
 
     /// The `Unreaped` a failed spawn hands back does what the spawn's policy says when dropped: under

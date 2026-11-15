@@ -1055,26 +1055,12 @@ fn adoption_fails_when_a_kqueue_cannot_be_made() {
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
     let stdin = child.stdin.take().expect("piped stdin");
     let id = ProcessId::of(child.id()).found().expect("identity");
-    // SAFETY: plain descriptor and resource-limit calls on this throwaway re-exec; the limit is
-    // lowered to the lowest free descriptor, so the next one is refused, and restored after.
-    let (saved, probe) = unsafe {
-        let probe = libc::dup(0);
-        assert!(probe > 0, "dup: {}", std::io::Error::last_os_error());
-        let mut saved = std::mem::zeroed::<libc::rlimit>();
-        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved), 0);
-        let lowered = libc::rlimit {
-            rlim_cur: probe as libc::rlim_t,
-            rlim_max: saved.rlim_max,
-        };
-        assert_eq!(libc::close(probe), 0);
-        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &lowered), 0);
-        (saved, probe)
-    };
+    let refused = crate::test_child::refuse_new_descriptors();
     let adopted = adopt_std(child, id);
-    // SAFETY: restores the limit saved above.
-    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &saved) }, 0);
+    let limit = refused.limit;
+    drop(refused);
     let (error, mut child) = match adopted {
-        Ok(_) => panic!("adopted with the descriptor table full (limit {probe})"),
+        Ok(_) => panic!("adopted with the descriptor table full (limit {limit})"),
         Err(refused) => refused,
     };
     let Error::Io(e) = &error else {

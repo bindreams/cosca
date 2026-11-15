@@ -86,6 +86,13 @@ pub(crate) fn force_blind_snapshots(count: usize) {
     backend::force_blind_snapshots(count)
 }
 
+/// Test-only: panics unless every blind snapshot [`force_blind_snapshots`] armed was consumed.
+#[cfg(all(test, target_os = "macos"))]
+#[track_caller]
+pub(crate) fn assert_blind_snapshots_consumed() {
+    backend::assert_blind_snapshots_consumed()
+}
+
 /// Test-only re-export of the backend's fault seams, for the tree-walk propagation tests.
 #[cfg(all(test, any(target_os = "macos", windows)))]
 pub(crate) use backend::fault as backend_fault;

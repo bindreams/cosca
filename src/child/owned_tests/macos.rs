@@ -18,9 +18,7 @@ use crate::os_process::macos::kqueue::test_hooks;
 use crate::os_process::macos::ExitWatch;
 use crate::signal::Sig;
 use crate::test_groups::{setuid, Group};
-use crate::wait::exit_only::macos_tests::{
-    assert_zombie_consumed, echild_yet_resolvable, found, held_by_a_tracer_pid, parent_reads, unique_of,
-};
+use crate::wait::exit_only::macos_tests::{assert_zombie_consumed, echild_yet_resolvable, found, unique_of};
 
 fn far() -> Instant {
     Instant::now() + Duration::from_secs(3600)
@@ -387,10 +385,11 @@ pub(super) fn on_rounds(mut hook: impl FnMut(u32) -> bool + 'static) -> (crate::
 /// Each staged wake is looked at, at its block (`on_rounds`). Round 0's ordering edge is the `kill(2)`:
 /// XNU's `psignal_internal` posts `NOTE_SIGNAL` to the target's knotes before it returns, ahead of any
 /// disposition check. Round 1's is `wait_until_zombie` on the stand-in: a process's `NOTE_EXIT` is
-/// posted before it is a zombie (as in `await_reapable_tests`); its `SIGCHLD` lands on the wait's kqueue too, so round 1's look says that
+/// posted before it is a zombie; its `SIGCHLD` lands on the wait's kqueue too, so round 1's look says that
 /// the wait has an event to wake on, not which.
 ///
-/// Mutant: the wait registers no `NOTE_SIGNAL` on the child: round 0's look finds nothing.
+/// Mutant: the wait registers no `NOTE_SIGNAL` on the child: the look at the first staged wake finds
+/// nothing.
 #[skuld::test]
 fn a_wait_on_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
     use std::cell::{Cell, RefCell};
@@ -448,7 +447,7 @@ fn started_by_us_traced_by(tracer: u32) -> (libc::pid_t, libc::pid_t) {
 /// disposition check. The signal goes to the second blocker, not to this process,
 /// so no other event is on the wait's kqueue: a look that finds one is the registration.
 ///
-/// Mutant: the walk stops at the child's tracer: round 0's look finds nothing.
+/// Mutant: the walk stops at the child's tracer: the look at the staged wake finds nothing.
 #[skuld::test]
 fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
     use std::cell::Cell;
@@ -558,31 +557,6 @@ fn a_running_peek_of_a_pid_with_another_unique_id_is_foreign() {
     }
     b.end_child();
     wait_status(&b.owned);
-}
-
-/// The kqueue wait does not read a held child as reaped: it is still running at its deadline.
-///
-/// Mutant: the wait's peek without the id: `Gone`.
-#[skuld::test]
-fn the_kqueue_wait_keeps_waiting_for_a_child_that_answers_echild_yet_resolves() {
-    use crate::wait::macos::{await_reapable, Waited};
-    let (pid, unique) = echild_yet_resolvable();
-    // The first look, and the final one at expiry.
-    let kernel = parent_reads(pid, held_by_a_tracer_pid(), 2);
-    // An expired deadline: no blocking.
-    let waited = await_reapable(&kernel, pid, Some(unique), Some(Instant::now())).expect("wait");
-    assert_eq!(waited, Waited::DeadlinePassed);
-}
-
-/// The wait's verdict for a pid that reads as another process is `Gone`.
-///
-/// Mutant: the wait ignores the id.
-#[skuld::test]
-fn the_kqueue_wait_reports_gone_for_a_pid_with_another_unique_id() {
-    use crate::wait::macos::{await_reapable, Waited};
-    let (pid, unique) = echild_yet_resolvable();
-    let waited = await_reapable(&HostKernel, pid, Some(unique ^ 1), Some(Instant::now())).expect("wait");
-    assert_eq!(waited, Waited::Gone);
 }
 
 /// A `Child::wait` whose peek finds the zombie held by launchd (its tracer died) gives up on it with

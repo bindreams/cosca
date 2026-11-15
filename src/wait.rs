@@ -653,8 +653,7 @@ pub(crate) mod block_probe {
             record(armed);
         }
         let is_round = !matches!(on, WaitObject::Condvar | WaitObject::DrainAwait);
-        // The hooks armed now, in arming order: one armed by a hook first sees the next block, and
-        // one a hook disarmed does not run.
+        // A hook another hook disarmed meanwhile does not run.
         let ids: Vec<u64> = ON_BLOCK.with(|hooks| hooks.borrow().iter().map(|a| a.id).collect());
         for id in ids {
             let taken = ON_BLOCK.with(|hooks| {

@@ -34,7 +34,7 @@ impl Skip {
 
     /// Whether the reason is one a kill of the tree does not outlive: this handle's own reap left the
     /// root's pid naming no process or unreadable, or the root's number cannot be trusted (macOS).
-    fn moot_after_kill(&self) -> bool {
+    pub(crate) fn moot_after_kill(&self) -> bool {
         matches!(
             &self.why,
             Why::MayNameAnother(Refusal::ReapedPidGone(_) | Refusal::ReapedPidUnread(..), _) | Why::Untrusted { .. }

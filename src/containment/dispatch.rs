@@ -1346,19 +1346,6 @@ pub(crate) fn is_nested(marker_present: bool) -> bool {
     marker_present
 }
 
-/// What the spawn's identity read said of a child it cannot verify (macOS leaves such a child alone).
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(dead_code, reason = "only macOS leaves a child unverified")
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RootIdentity {
-    /// The root was already reaped (someone else reaped it, and its pid may be reused).
-    Gone,
-    /// The read was refused or could not be trusted.
-    Unknown,
-}
-
 /// Which Unix setup action to apply to a root `Command` for a given mode.
 /// Pure function: used by `prepare` and unit-tested separately to verify
 /// mutual exclusivity: Session → setsid only; Strongest/default → pgroup

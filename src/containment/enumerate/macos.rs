@@ -328,6 +328,15 @@ pub(crate) fn force_blind_snapshots(count: usize) {
     FORCE_BLIND.with(|c| c.set(count));
 }
 
+/// Panics unless every blind snapshot armed on this thread was consumed: a test that counts on a
+/// specific number of passes asserts it, so a pass that stopped happening fails by assertion.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn assert_blind_snapshots_consumed() {
+    let left = FORCE_BLIND.with(std::cell::Cell::get);
+    assert_eq!(left, 0, "{left} forced blind snapshot(s) were never consumed");
+}
+
 /// Join pids to `(pid, ppid)` edges, filtering non-positive pids first. Pure and taking its
 /// input as a plain slice - deterministically testable with a synthetic `[0, -1, <a real
 /// pid>]` input, unlike a live call, which depends on the host's process table happening to

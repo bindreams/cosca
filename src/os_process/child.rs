@@ -28,7 +28,6 @@ pub(crate) trait OsChild: OsProcess {
 
     /// What a kill through this handle may be refused for, as whatever built the handle knows it.
     /// A teardown's contract with its caller reads it.
-    #[cfg(any(target_os = "linux", windows))]
     fn kill_refusal(&self) -> KillRefusal;
 
     /// Look at the exit record without consuming it, and without touching anything a waiter waits
@@ -44,13 +43,6 @@ pub(crate) trait OsChild: OsProcess {
 
 /// What a kill through a handle may be refused for. The handle's constructor decides: it knows the
 /// rights it asked for or was granted.
-#[cfg_attr(
-    not(any(target_os = "linux", windows)),
-    allow(
-        dead_code,
-        reason = "only the Linux and Windows spawns tear a child down over a handle"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KillRefusal {
     /// Never: the handle can kill its process (a Windows handle holding `PROCESS_TERMINATE`), so a
@@ -60,7 +52,18 @@ pub(crate) enum KillRefusal {
     Never,
     /// For want of permission alone ([`PermissionDenied`](std::io::ErrorKind::PermissionDenied)): a
     /// Linux pidfd (`EPERM`), a Windows handle that lacks `PROCESS_TERMINATE`.
+    #[cfg_attr(
+        target_os = "macos",
+        allow(dead_code, reason = "a macOS kill is refused for any reason: `Any`")
+    )]
     Permission,
+    /// For any reason: macOS checks a kill by reading the process's unique id first, and the kernel
+    /// can refuse that read with any errno, besides the `EPERM` of the signal itself.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only a macOS kill is checked by an identity read")
+    )]
+    Any,
 }
 
 /// What [`OsChild::try_reap`] did.

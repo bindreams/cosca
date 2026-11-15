@@ -152,16 +152,6 @@ pub(crate) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
 #[cfg(unix)]
 pub(crate) use crate::identity::Record;
 
-/// `record`, as the test seam [`seams::force_consuming_record_once`] may have rewritten it.
-#[cfg(unix)]
-fn consumed(record: Record) -> Record {
-    #[cfg(all(test, target_os = "macos"))]
-    if let Some(si_code) = seams::take_forced_si_code() {
-        return Record { si_code, ..record };
-    }
-    record
-}
-
 /// Whether `si_code` is an exit record: `CLD_EXITED`, `CLD_KILLED` or `CLD_DUMPED`.
 #[cfg(unix)]
 pub(crate) fn is_exit_record(si_code: i32) -> bool {

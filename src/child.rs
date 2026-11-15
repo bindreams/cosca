@@ -26,7 +26,7 @@ pub(crate) mod spawn;
 pub(crate) mod drop_report;
 #[path = "child/drop_teardown.rs"]
 pub(crate) mod drop_teardown;
-#[cfg(all(unix, any(test, target_os = "linux")))]
+#[cfg(unix)]
 use drop_teardown::word_front;
 #[path = "child/owned.rs"]
 pub(crate) mod owned;

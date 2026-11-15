@@ -335,7 +335,6 @@ impl TeardownOutcome {
     /// warn or `why` is owed (the diagnosis is then the warn, and says what became of the child in
     /// it, whatever the clause's level); the caller logs the returned line. Otherwise the clause is
     /// logged here at its level, on its own.
-    #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn failed_spawn_line(self, why: &mut crate::child::spawn::Diagnosis) -> (Option<String>, Remains) {
         let label = crate::containment::dispatch::TeardownCaller::FailedSpawn.label();
         let one_warn = self.said_in_the_one_warn(why);
@@ -353,7 +352,6 @@ impl TeardownOutcome {
 
     /// Whether [`failed_spawn_line`](Self::failed_spawn_line) returns this outcome's clause as the
     /// event's one warn: it has a clause, and it is at warn or `why` is owed.
-    #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn said_in_the_one_warn(&self, why: &crate::child::spawn::Diagnosis) -> bool {
         self.said
             .as_ref()
@@ -365,10 +363,10 @@ impl TeardownOutcome {
 /// which the caller knows and the handle does not. What the handle allows is its constructor's
 /// ([`KillRefusal`]); the two make an [`Expect`].
 #[cfg_attr(
-    not(any(target_os = "linux", windows)),
+    target_os = "macos",
     allow(
         dead_code,
-        reason = "only the Linux and Windows spawns tear a child down over a handle"
+        reason = "a macOS wait can always fail, so macOS tears down as `WaitMayFail` throughout"
     )
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,22 +387,27 @@ pub(crate) enum Past {
     Unexecuted,
 }
 
+/// What a teardown's kill of the root came to, as [`OwnedChild::tear_down_between`] tells its hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootKill {
+    /// The root's kill was sent: its reap is pending, and the root may be a zombie still.
+    Sent,
+    /// This handle had already reaped the root, so nothing was sent and nothing is pending.
+    Reaped,
+    /// The root's kill was refused. One look settled the root (it is still running, or gone), unless
+    /// a tree kill through [`Kill::tree`] reached it: its reap is then pending, as after a sent kill,
+    /// and the root may be a zombie still.
+    Refused,
+}
+
 /// What a teardown over a handle is expected to come to: what the handle allows, from its
 /// constructor, and what already happened to it, from the caller.
-#[cfg_attr(
-    not(any(target_os = "linux", windows)),
-    allow(
-        dead_code,
-        reason = "only the Linux and Windows spawns tear a child down over a handle"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Expect {
     pub(crate) refusal: KillRefusal,
     pub(crate) past: Past,
 }
 
-#[cfg(any(target_os = "linux", windows))]
 impl Expect {
     /// What `past` and the allowance of `child`'s handle make of a teardown over it.
     pub(crate) fn of(child: &OwnedChild, past: Past) -> Expect {
@@ -416,26 +419,12 @@ impl Expect {
 }
 
 /// What a teardown over a handle came to, and what its caller expected of it.
-#[cfg_attr(
-    not(any(target_os = "linux", windows)),
-    allow(
-        dead_code,
-        reason = "only the Linux and Windows spawns tear a child down over a handle"
-    )
-)]
 #[derive(Debug)]
 pub(crate) struct HandleTeardown {
     pub(crate) outcome: TeardownOutcome,
     pub(crate) expect: Expect,
 }
 
-#[cfg_attr(
-    not(any(target_os = "linux", windows)),
-    allow(
-        dead_code,
-        reason = "only the Linux and Windows spawns tear a child down over a handle"
-    )
-)]
 impl HandleTeardown {
     pub(crate) fn new(outcome: TeardownOutcome, expect: Expect) -> HandleTeardown {
         HandleTeardown { outcome, expect }
@@ -444,7 +433,6 @@ impl HandleTeardown {
     /// Says the teardown as a failed spawn's
     /// ([`failed_spawn_line`](TeardownOutcome::failed_spawn_line)): its warn, if it has one, is
     /// logged through [`warn_teardown`], which asserts the teardown's contract with its caller.
-    #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn say_as_failed_spawn(self, why: &mut crate::child::spawn::Diagnosis) -> Remains {
         let (line, remains) = self.outcome.failed_spawn_line(why);
         warn_teardown(line.as_deref(), &remains, self.expect);
@@ -456,13 +444,6 @@ impl HandleTeardown {
 /// with its caller, asserted after the warn so that a panic does not lose it. That a child left
 /// uncollected has a warn is not asserted: an outcome of one cannot be built without it.
 /// `remains` is the teardown's ([`TeardownOutcome::remains`]); `expect` is its caller's.
-#[cfg_attr(
-    not(any(target_os = "linux", windows)),
-    allow(
-        dead_code,
-        reason = "only the Linux and Windows spawns tear a child down over a handle"
-    )
-)]
 fn warn_teardown(line: Option<&str>, remains: &Remains, expect: Expect) {
     let Remains {
         fate,
@@ -487,7 +468,7 @@ fn warn_teardown(line: Option<&str>, remains: &Remains, expect: Expect) {
         "the kill of a handle that is never refused was refused: {refused:?}"
     );
     debug_assert!(
-        refused.is_none_or(|kind| kind == io::ErrorKind::PermissionDenied),
+        refusal == KillRefusal::Any || refused.is_none_or(|kind| kind == io::ErrorKind::PermissionDenied),
         "the kill of a child's own handle was refused for a reason other than permission: {refused:?}"
     );
 }
@@ -510,22 +491,42 @@ impl OwnedChild {
     ///
     /// Returns the child's fate, and what to say of how it went (the outcome's clause). It
     /// logs nothing but that slow-teardown warn.
-    #[cfg_attr(
-        not(any(target_os = "linux", windows)),
-        allow(
-            dead_code,
-            reason = "only the Linux and Windows spawns tear a child down through this wrapper"
-        )
-    )]
     pub(crate) fn tear_down(
         &self,
         id: Option<ProcessId>,
         kill: Kill<'_>,
         warn_after: Option<Duration>,
     ) -> TeardownOutcome {
+        self.tear_down_between(id, kill, warn_after, |_| false)
+    }
+
+    /// [`tear_down`](Self::tear_down), running `between` once the kill is made and before the wait
+    /// for the root is settled, told what the root's kill came to ([`RootKill`]).
+    ///
+    /// `between` answers whether it waited for the root's exit itself, warning past `warn_after`;
+    /// the wait it leaves then carries no threshold, so one teardown warns once. Its wait has said so
+    /// only if it passed the threshold or saw the root reapable: a zombie a tracer holds counts as
+    /// exited there, and its reap may still be slow. The answer is read only when a wait is pending.
+    pub(crate) fn tear_down_between(
+        &self,
+        id: Option<ProcessId>,
+        kill: Kill<'_>,
+        warn_after: Option<Duration>,
+        between: impl FnOnce(RootKill) -> bool,
+    ) -> TeardownOutcome {
         match self.begin_tear_down(id, kill, warn_after) {
-            BeginOutcome::Done(torn) => torn,
-            BeginOutcome::Wait(wait) => wait.settle(self),
+            BeginOutcome::Done(torn) => {
+                between(if torn.refused.is_some() {
+                    RootKill::Refused
+                } else {
+                    RootKill::Reaped
+                });
+                torn
+            }
+            BeginOutcome::Wait(wait) => {
+                let warned = between(wait.root_kill);
+                wait.settle_unless_warned(self, warned)
+            }
         }
     }
 
@@ -554,6 +555,7 @@ impl OwnedChild {
                     id,
                     self.teardown_subject(),
                     disposition,
+                    RootKill::Sent,
                 );
                 // The reap is recorded for good: asking again answers it, and blocks on nothing.
                 if self.is_reaped() {
@@ -606,7 +608,7 @@ impl OwnedChild {
     ) -> TeardownWait {
         #[cfg(test)]
         crate::child::spawn::fault::run_between_kill_and_wait();
-        TeardownWait::new(self, warn_after, true, id, subject, disposition)
+        TeardownWait::new(self, warn_after, true, id, subject, disposition, RootKill::Refused)
     }
 
     /// What the clause of a root teardown calls a plain child.
@@ -650,8 +652,8 @@ impl OwnedChild {
     /// `Err`: the subtree that kill went through could not be read, so whether it reached the front
     /// is not known. `id` and `warn_after` are as for [`tear_down`](Self::tear_down).
     #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "only the Linux spawn looks at a front through this wrapper")
+        windows,
+        allow(dead_code, reason = "no Windows teardown looks at a front through this yet")
     )]
     pub(crate) fn look_at_front(
         &self,
@@ -777,6 +779,9 @@ pub(crate) struct TeardownWait {
     subject: String,
     /// As for [`Kill`].
     disposition: Disposition,
+    /// What the root's own kill came to, for [`OwnedChild::tear_down_between`]'s hook: `Sent`, or
+    /// `Refused` when only a tree kill ended the root.
+    root_kill: RootKill,
 }
 
 impl TeardownWait {
@@ -787,12 +792,14 @@ impl TeardownWait {
         id: Option<ProcessId>,
         subject: String,
         disposition: Disposition,
+        root_kill: RootKill,
     ) -> TeardownWait {
         TeardownWait {
             pending: Pending::new(child, warn_after, reached),
             id,
             subject,
             disposition,
+            root_kill,
         }
     }
 
@@ -801,6 +808,15 @@ impl TeardownWait {
     pub(crate) fn settle(self, child: &OwnedChild) -> TeardownOutcome {
         let settlement = self.pending.settle(child);
         self.outcome(child, &settlement)
+    }
+
+    /// [`settle`](Self::settle) with no threshold when `warned`: the caller's own wait has said the
+    /// root is slow.
+    fn settle_unless_warned(mut self, child: &OwnedChild, warned: bool) -> TeardownOutcome {
+        if warned {
+            self.pending.warn_after = None;
+        }
+        self.settle(child)
     }
 
     /// [`settle`](Self::settle) awaited, with no warn. By reference: a caller whose future is dropped
