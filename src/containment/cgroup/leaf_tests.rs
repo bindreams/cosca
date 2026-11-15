@@ -252,7 +252,8 @@ fn wait_drained_terminates_under_a_frozen_clock() {
 /// returned.
 ///
 /// Precondition on the kernel (cgroup-v2.rst): a `populated` flip generates a modify event on
-/// `cgroup.events`; not asserted here. A missed wake hangs this test: #985 row A1.
+/// `cgroup.events`; not asserted here. A pump that never broadcasts hangs this test;
+/// `a_changed_batch_notifies_a_listener_that_was_there_before_it` fails it by assertion.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _group: &Group) {
@@ -2065,8 +2066,9 @@ fn a_disarmed_leaf_whose_kill_attempt_failed_is_reported_at_warn() {
 
 /// A drain wait wakes when the leaf is removed, even with no event on `cgroup.events`: removing a
 /// cgroup cancels a `populated` notification the kernel had postponed (see `DrainWatch`), so a
-/// third party can remove a drained leaf while the wait still reads it populated. A missed wake
-/// hangs this test: #985 row A1.
+/// third party can remove a drained leaf while the wait still reads it populated. A pump that
+/// never broadcasts hangs this test; `a_changed_batch_notifies_a_listener_that_was_there_before_it`
+/// fails it by assertion.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_drain_wait_wakes_when_the_leaf_is_removed_without_a_populated_event() {
@@ -2725,6 +2727,102 @@ fn a_siblings_removal_wakes_no_wait() {
         waiter.join().expect("waiter").expect("wait"),
         TreeDrain::AllMembersExited
     );
+}
+
+/// A batch of changes the pump takes in notifies every listener that was already there: the
+/// broadcast is the only wake a blocked wait has, and two waits can block on one leaf.
+///
+/// The pump reports a batch before it broadcasts it, so the test joins the pump with `stop_pump`
+/// before polling.
+///
+/// Mutants: the pump takes a change in and does not notify; it notifies one listener
+/// (`notify(1)`).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_changed_batch_notifies_a_listener_that_was_there_before_it() {
+    use std::future::Future as _;
+
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+
+    let fake = FakeLeaf::new("cosca-broadcast", true);
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
+    let (batches, batches_rx) = std::sync::mpsc::channel();
+    fault::set_pump_batch_notifier("cosca-broadcast", batches);
+    let mut first = leaf.watch.listen().expect("start the pump");
+    let mut second = leaf.watch.listen().expect("a second listener");
+
+    FakeLeaf::set_populated(&fake.events, false);
+    assert!(
+        batches_rx.recv().expect("a batch"),
+        "a write to cgroup.events is a change"
+    );
+    leaf.watch.stop_pump();
+
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    for (which, listener) in [("first", &mut first), ("second", &mut second)] {
+        assert!(
+            std::pin::Pin::new(listener).poll(&mut context).is_ready(),
+            "the pump took the change in, and did not notify the {which} listener"
+        );
+    }
+}
+
+/// A change after a step's first read of the leaf and before its listener exists is seen by the read
+/// that follows the listener. The pump is running and has taken the change in by then, so the watch
+/// holds nothing more of it.
+///
+/// The change is made from the step's clock, which `drain_step_on` reads after its first read. An
+/// inotify watch on `cgroup.events` shows the first read opened it by then, and the leaf was still
+/// populated; the step's answer is then the second read's.
+///
+/// Mutants: `drain_step_on` returns `Block` after it listens without reading the leaf again; it
+/// reads the clock before its first read (the closure finds no open of `cgroup.events` yet).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_change_before_the_listener_exists_is_seen_by_the_read_after_it() {
+    use rustix::fs::inotify;
+
+    use crate::containment::cgroup::fault;
+    use crate::containment::cgroup::test_support::FakeLeaf;
+    use crate::containment::TreeDrain;
+
+    let fake = FakeLeaf::new("cosca-change-before-listen", true);
+    let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
+    let (batches, batches_rx) = std::sync::mpsc::channel();
+    fault::set_pump_batch_notifier("cosca-change-before-listen", batches);
+    let _running = leaf.watch.listen().expect("start the pump");
+
+    // Armed after the pump started, so only a read of the leaf by the step after this point opens
+    // the file.
+    let opens = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK).expect("inotify_init");
+    inotify::add_watch(&opens, &fake.events, inotify::WatchFlags::OPEN).expect("watch opens of cgroup.events");
+    let mut ran = false;
+
+    let step = leaf.drain_step_on(None, || {
+        ran = true;
+        let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
+        assert!(
+            inotify::Reader::new(&opens, &mut buf).next().is_ok(),
+            "the step read the clock before its first read of cgroup.events"
+        );
+        assert!(
+            FakeLeaf::is_populated(&fake.events),
+            "the leaf was populated at the step's first read"
+        );
+        FakeLeaf::set_populated(&fake.events, false);
+        assert!(
+            batches_rx.recv().expect("a batch"),
+            "a write to cgroup.events is a change"
+        );
+        std::time::Instant::now()
+    });
+
+    assert!(ran, "the step answered without reading the clock");
+    match step.expect("drain_step_on") {
+        DrainStep::Done(drain) => assert_eq!(drain, TreeDrain::AllMembersExited),
+        DrainStep::Block { .. } => panic!("the step returned Block: its read after the listener missed the drain"),
+    }
 }
 
 /// A pump started with no watch fails, waking its waits with the reason, rather than exiting

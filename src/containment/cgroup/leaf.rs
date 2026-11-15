@@ -687,7 +687,8 @@ impl CgroupLeaf {
     }
 
     /// [`drain_step`](Self::drain_step) reading `now` from `clock`, for a wait whose timer runs
-    /// on another clock (tokio's).
+    /// on another clock (tokio's). `clock` is read once, after the first read of the leaf and before
+    /// the listener, and only if that read found the leaf populated.
     pub(crate) fn drain_step_on(
         &self,
         deadline: Option<std::time::Instant>,
