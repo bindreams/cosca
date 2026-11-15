@@ -69,8 +69,8 @@ mod foreign_reap_tree_tests;
 mod root_number_matrix_tests;
 
 #[cfg(all(test, unix))]
-#[path = "child/own_reap_tests.rs"]
-mod own_reap_tests;
+#[path = "child/reap_at_drop_tests.rs"]
+mod reap_at_drop_tests;
 
 #[cfg(all(test, unix))]
 #[path = "child/killed_tree_tests.rs"]
@@ -315,9 +315,13 @@ impl Child {
 
     /// Block until the child exits, returning its status.
     ///
-    /// Reaps the root; a later drop then skips kills named by its number (a tree walk proves its own
-    /// root, and is not one of them), so call [`kill_tree`](Child::kill_tree) first to end
-    /// descendants (see `Drop`).
+    /// Observes the exit and consumes nothing: the root stays a zombie, which pins its number, until
+    /// this handle drops (see `Drop`). So a [`kill_tree`](Child::kill_tree) or the drop after `wait`
+    /// still names a process group, a session or a macOS marker's group by the root's number, and is
+    /// exact, on every platform. A tree walk names no tree by the root's number, and walks nothing
+    /// from an exited root, zombie or not. The cost is one process-table slot (and, on Linux, one
+    /// `RLIMIT_NPROC` and pids-cgroup charge) per exited handle that has not dropped; a handle that is
+    /// leaked (`mem::forget`) leaks its zombie.
     pub fn wait(&self) -> Result<std::process::ExitStatus, Error> {
         self.status_of_reap(self.reap_outcome()?)
     }
@@ -424,7 +428,7 @@ impl Child {
     /// Whether the root is running, read without reaping it, for the elevation front's gates.
     #[cfg(unix)]
     fn root_running(&self) -> std::io::Result<bool> {
-        let peeked = self.proc.hold(self.pid()).peek().map_err(Error::into_io)?;
+        let peeked = self.proc.peek().map_err(Error::into_io)?;
         Ok(matches!(peeked, crate::os_process::child::PeekOutcome::Running))
     }
 
@@ -628,9 +632,9 @@ impl Child {
     /// still named exactly by the root's pidfd, whoever reaped it: while the group has a member it is
     /// killed through the pidfd as usual, and each member's resend checks the group the same way
     /// first (below). A process listed by the group's number once the group has no member left is
-    /// in another group that took the number, and is sent nothing. A root reaped elsewhere, or after
-    /// this handle's own reap with its pid unreadable, whose group has no member left has no tree
-    /// left: nothing is sent, and the call is `Ok`.
+    /// in another group that took the number, and is sent nothing. A root reaped elsewhere, or whose
+    /// pid is unreadable, whose group has no member left has no tree left: nothing is sent, and the
+    /// call is `Ok`.
     ///
     /// **A root reaped by something else.** A process group, and a macOS fd marker's group and
     /// walk, are named by the root's pid. If the root's own handle shows it was reaped by another
@@ -646,18 +650,16 @@ impl Child {
     /// marker still kills its marker holders, which are named by the pipe they hold, so no pid reuse
     /// redirects the kill.
     ///
-    /// **After this handle's own reap.** The root's children were reparented at its exit, so no walk
-    /// runs from its pid. Another process at that pid means the group is empty: nothing is sent by
-    /// the pid, and the call is `Ok` once every marker holder was reached. A macOS fd marker with no
-    /// group, whose pid names no process, is answered the same way: it has no group to skip. A pid
-    /// that cannot be read is `Unassessable` as above, and so is any other pid that names no
-    /// process: once the group has no member, another process may take the number, and lead a group
-    /// by it, first. Descendants that outlived the reaped root are then not ended: call `kill_tree`
-    /// before [`wait`](Child::wait) to end them. A tree this handle already killed is `Ok`.
+    /// **After this handle's [`wait`](Child::wait).** The root is still a zombie of this handle, which
+    /// pins its number: a process group, a session and a macOS fd marker's group are killed by that
+    /// number as for a running root, on every platform. The root's children were reparented at its
+    /// exit, so no walk runs from its pid: a tree walk's kill walks nothing from an exited root (it
+    /// kills the members it finds, and is `Unassessable` when it finds none). A tree this handle
+    /// already killed is `Ok`. The zombie is consumed when the handle drops.
     ///
     /// **A reap after the look.** All of this is decided on one look at the root. A
-    /// [`wait`](Child::wait) on another thread is held off from the look until the sweep has sent
-    /// what it sends by the root's number. On Linux 6.9+ a process group's signal goes through the
+    /// [`wait`](Child::wait) on another thread consumes nothing, so it cannot free the root's number.
+    /// Only a reaper outside the handle can. On Linux 6.9+ a process group's signal goes through the
     /// root's pidfd, which names the group exactly, whoever reaps the root. Each send by the group's
     /// number (the `killpg` below 6.9 and on macOS, and the leader's signal) checks the root again
     /// right before it. Each member's resend opens the member by its identity, then checks the
@@ -746,10 +748,9 @@ impl Child {
             crate::elevation::front::Gate::CgroupOnly(front) => Some(Some(front)),
         };
         // The mechanism looks at the root right before it sends by the root's number, and sends the
-        // root its own signal through this handle. On Unix, this handle's reaps are held off from the
-        // look to the end of the sweep's sends.
-        let held = self.proc.hold(self.pid());
-        let root: Option<&dyn crate::containment::Root> = Some(&held);
+        // root its own signal through this handle.
+        let root_handle = self.proc.hold(self.pid());
+        let root: Option<&dyn crate::containment::Root> = Some(&root_handle);
         // What the settlement kills again is waited for with what the send reached.
         let (group_result, mut wait) = match kind {
             KillTree::Waiting => self.tree.kill(root).split(),
@@ -759,14 +760,14 @@ impl Child {
         let group_result = match group_result {
             // An answer that needs no kill ends the call: no backstop.
             answered @ TreeKillOutcome::Answered(_) => {
-                drop(held);
                 return self.settled_sweep(op, answered, Keeping::Nothing, wait, std::convert::identity);
             }
             TreeKillOutcome::Skipped(skip) => {
                 // The root's handle names the root even when its number is reused; its kill ends the
                 // root.
                 let sent = skip.root_alone.then(|| {
-                    held.signal(crate::signal::Sig::Kill)
+                    root_handle
+                        .signal(crate::signal::Sig::Kill)
                         .map_err(Error::into_io)
                         .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user()))
                 });
@@ -774,7 +775,6 @@ impl Child {
                 let answered = self
                     .skip_call(op, TreeSignal::Kill, earlier)
                     .answer(&self.tree, skip, sent);
-                drop(held);
                 wait.reaching(answered.killed_again);
                 return Swept::new(
                     op,
@@ -782,10 +782,7 @@ impl Child {
                     wait.with_root(self.proc.os_process(), self.pid(), root_ended),
                 );
             }
-            other => {
-                drop(held);
-                other
-            }
+            other => other,
         };
         // A walk not made runs no backstop: it would end a root that a retry walks from. The settlement
         // answers the walk's error, and keeps the members it holds while this handle sees the root running
@@ -958,10 +955,9 @@ impl Child {
     /// identity.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
-        // The mechanism looks at the root as for `kill_tree`, and on Unix this handle's reaps are held
-        // off until the signal is sent.
-        let held = self.proc.hold(self.pid());
-        let root: Option<&dyn crate::containment::Root> = Some(&held);
+        // The mechanism looks at the root as for `kill_tree`.
+        let root_handle = self.proc.hold(self.pid());
+        let root: Option<&dyn crate::containment::Root> = Some(&root_handle);
         // A separate `terminate_tree` is no call that sweeps: it holds its members for the next kill.
         let (outcome, _) = self.tree.terminate(self.pid(), root, None);
         #[cfg(unix)]
@@ -975,7 +971,7 @@ impl Child {
                     call.answer(&self.tree, skip, None).answer
                 }
                 TerminateOutcome::RootThroughPidfd(skip) => {
-                    let sent = held.signal(crate::signal::Sig::Term);
+                    let sent = root_handle.signal(crate::signal::Sig::Term);
                     call.answer(&self.tree, skip, Some(sent)).answer
                 }
             }
@@ -1042,7 +1038,9 @@ impl Child {
     }
 
     /// Consume the handle without killing or waiting for the child (opt out of
-    /// kill-on-drop). Also disarms the containment resource, so its own `Drop` never kills the
+    /// kill-on-drop). The handle's end reaps an exited child (on macOS only one this handle's `wait`
+    /// saw); one that still runs is left, and becomes a zombie once it exits, since cosca starts no
+    /// reaper. Also disarms the containment resource, so its own `Drop` never kills the
     /// tree itself — though after a kill on this handle its `Drop` can still wait for that kill's
     /// drain before giving up the leaf. When it waits, and what it leaves behind, is stated on
     /// [`Command::kill_on_drop`](crate::Command::kill_on_drop).
@@ -1183,11 +1181,15 @@ impl Child {
     }
 }
 
-/// Whether the root has been reaped, from its inputs: this handle's own reap, or the root's number
-/// reading `Gone` or as another process.
+/// Whether the root has been reaped, from its inputs: the handle's own peek showed a reap by another
+/// (`handle_reaped`), or the root's number reads `Gone` or as another process.
 #[cfg(unix)]
-pub(crate) fn root_reaped(own_reap: bool, id: Option<ProcessId>, now: crate::identity::Resolved<ProcessId>) -> bool {
-    own_reap
+pub(crate) fn root_reaped(
+    handle_reaped: bool,
+    id: Option<ProcessId>,
+    now: crate::identity::Resolved<ProcessId>,
+) -> bool {
+    handle_reaped
         || match now {
             // With no identity to compare, a number that names a process says nothing: the handle decides.
             crate::identity::Resolved::Found(now) => id.is_some_and(|id| now != id),
@@ -1199,11 +1201,15 @@ pub(crate) fn root_reaped(own_reap: bool, id: Option<ProcessId>, now: crate::ide
 /// With `kill_on_drop` set (the default), hard-kills the contained tree, then kills and reaps the
 /// root. See [`Command::kill_on_drop`](crate::Command::kill_on_drop) for the rest.
 ///
-/// Once the root is reaped the drop skips kills named by its number and warns; see
-/// [`Command::kill_on_drop`](crate::Command::kill_on_drop). On Linux 6.9+ a process
-/// group is decided by the root's pidfd instead: killed while it has a member left. A tree walk
-/// proves its root before it walks, so a reaped root, or one its handle cannot vouch for, walks as
-/// usual (on Linux).
+/// The drop is where the root is reaped, armed or not, and a root that still runs is left. On
+/// Linux a root that has exited without a [`wait`](Child::wait) is reaped too. On macOS the
+/// consume is by the root's number, so the handle consumes only an exit its own wait saw: an armed
+/// drop's teardown waits, so it consumes such a root too, and a disarmed drop leaves it (see
+/// [`Command::kill_on_drop`](crate::Command::kill_on_drop)). A root a foreign reaper took leaves
+/// the drop's kills named by its number skipped, with a warn; see
+/// [`Command::kill_on_drop`](crate::Command::kill_on_drop). On Linux 6.9+ a process group is decided
+/// by the root's pidfd instead: killed while it has a member left. A tree walk proves its root
+/// before it walks, so a reaped root, or one its handle cannot vouch for, walks as usual (on Linux).
 ///
 /// An elevated child behind a front (see [`Child::kill`]) gets no signal of its own while it runs.
 /// In a cgroup that holds it, the tree's kill ends it and the drop reaps it. Otherwise, or when

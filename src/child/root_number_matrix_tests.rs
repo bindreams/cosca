@@ -1,11 +1,13 @@
 //! What the tree paths send, for every mechanism that has a root, every way the root can be reaped
-//! or its handle fail to vouch for it, and every entry point that decides on one look at the root:
-//! the tree calls, the armed drop and a failed spawn's `finish_elevated`, and the async graceful
-//! shutdown, which is the one entry point the async `Child` makes its own waits for. After a reap the
-//! root's number may name another process, so nothing may go out by it: no `killpg`, no walk from
-//! the root's pid, no signal by a bare pid. What names the tree exactly still runs: an fd marker's
-//! holders, a cgroup's kill. A `TreeWalk` checks the root after its snapshot instead, and walks
-//! nothing once the root is gone.
+//! (or only waited on, which reaps nothing) or its handle fail to vouch for it, and every entry
+//! point that decides on one look at the root: the tree calls, the armed drop and a failed spawn's
+//! `finish_elevated`, and the async graceful shutdown, which is the one entry point the async
+//! `Child` makes its own waits for. After a reap by another the root's number may name another
+//! process, so nothing may go out by it: no `killpg`, no walk from the root's pid, no signal by a
+//! bare pid. What names the tree exactly still runs: an fd marker's holders, a cgroup's kill. A
+//! `TreeWalk` checks the root after its snapshot instead, and walks nothing once the root is gone.
+//! After the handle's own wait the root is a zombie of ours that pins its number, so the number is
+//! used as before the wait.
 //!
 //! The recorders replace `killpg` with a record and record every walk, holder signal, pidfd signal,
 //! `cgroup.kill` write and cgroup member's `SIGTERM` with its route.
@@ -139,6 +141,8 @@ fn said_eof(stderr: &[u8]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reap {
     None,
+    /// The handle's own wait saw the root exit: a zombie of ours, which pins its number.
+    Waited,
     /// Not reaped, but the root's own handle cannot answer (`RootState::Unknown`), so its pid may
     /// name another process. On Linux its pidfd still names it exactly.
     Unanswered,
@@ -146,10 +150,6 @@ enum Reap {
     /// time.
     #[cfg(target_os = "macos")]
     Unpinned,
-    OwnFree,
-    OwnReused,
-    /// This handle reaped the root, and its pid cannot be read (`Resolved::Unknown`).
-    OwnUnknown,
     ForeignFree,
     ForeignReused,
     /// [`ForeignFree`](Reap::ForeignFree), seen by a `try_wait` first: it answers `ECHILD`.
@@ -159,25 +159,24 @@ enum Reap {
 impl Reap {
     const ALL: &[Reap] = &[
         Reap::None,
+        Reap::Waited,
         Reap::Unanswered,
         #[cfg(target_os = "macos")]
         Reap::Unpinned,
-        Reap::OwnFree,
-        Reap::OwnReused,
-        Reap::OwnUnknown,
         Reap::ForeignFree,
         Reap::ForeignReused,
         Reap::ForeignSeen,
     ];
 
-    fn own(self) -> bool {
-        matches!(self, Reap::OwnFree | Reap::OwnReused | Reap::OwnUnknown)
+    /// Whether the root's number still names the root: nobody reaped it and its handle vouches for it.
+    fn pins_its_number(self) -> bool {
+        matches!(self, Reap::None | Reap::Waited)
     }
 
     /// Whether the root is reaped when the entry point runs.
     fn reaped(self) -> bool {
         match self {
-            Reap::None | Reap::Unanswered => false,
+            Reap::None | Reap::Waited | Reap::Unanswered => false,
             #[cfg(target_os = "macos")]
             Reap::Unpinned => false,
             _ => true,
@@ -200,12 +199,11 @@ impl Reap {
     /// answer.
     fn read(self, root: ProcessId) -> Option<Resolved<ProcessId>> {
         match self {
-            Reap::None | Reap::Unanswered => None,
+            Reap::None | Reap::Waited | Reap::Unanswered => None,
             #[cfg(target_os = "macos")]
             Reap::Unpinned => None,
-            Reap::OwnFree | Reap::ForeignFree | Reap::ForeignSeen => Some(Resolved::Gone),
-            Reap::OwnUnknown => Some(Resolved::Unknown),
-            Reap::OwnReused | Reap::ForeignReused => Some(Resolved::Found(root.with_other_value())),
+            Reap::ForeignFree | Reap::ForeignSeen => Some(Resolved::Gone),
+            Reap::ForeignReused => Some(Resolved::Found(root.with_other_value())),
         }
     }
 }
@@ -282,7 +280,7 @@ impl Reap {
 
     /// Whether the root is unreaped, but its handle cannot vouch for it.
     fn untrusted(self) -> bool {
-        !self.reaped() && self != Reap::None
+        !self.reaped() && !self.pins_its_number()
     }
 
     fn unpinned(self) -> bool {
@@ -424,35 +422,50 @@ struct Expected {
 fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     use nix::sys::signal::Signal::{SIGKILL, SIGTERM};
     let reaped = reap.reaped();
-    // After this handle's own reap with the pid naming nothing, the group may still have members,
-    // but once none survives another process may take the number first: nothing is sent by it.
-    let killpg = if mechanism.has_group() && reap == Reap::None {
+    // After a foreign reap with the pid naming nothing, the group may still have members, but once
+    // none survives another process may take the number first: nothing is sent by it.
+    let killpg = if mechanism.has_group() && reap.pins_its_number() {
+        Want::Yes
+    } else if cfg!(target_os = "linux") && mechanism.has_group() && reap == Reap::Unanswered && op == Op::FinishElevated
+    {
+        // The one failed peek is the cleanup's first look; its root wait then leaves a zombie that
+        // pins the number, so the early tree kill after that wait reads the root as unreaped.
         Want::Yes
     } else {
         Want::No
     };
-    let walk = if mechanism.walks() && reap == Reap::None {
-        Want::Yes
-    } else {
-        Want::No
+    // A walk from a waited root finds nothing (its children went to init), so whether one is made is
+    // not the number's use: `Any`. A mechanism that does not walk never makes one.
+    let walk = match (mechanism.walks(), reap) {
+        (true, Reap::None) => Want::Yes,
+        (true, Reap::Waited) => Want::Any,
+        _ => Want::No,
     };
     let by_pid = if mechanism.is_cgroup() && !op.kills() {
+        Want::No
+    } else if reap == Reap::Waited {
+        // The handle has recorded the exit, so a signal to the root is `Sent::Gone` before any send,
+        // and nothing else is sent by a bare pid.
         Want::No
     } else if cfg!(target_os = "macos") && op.tears_down() && reap == Reap::Unanswered {
         // A teardown kills the root through its handle, as `kill` does: on macOS by pid, after a
         // check of its unique id.
         Want::Yes
-    } else if reaped || reap != Reap::None {
+    } else if reaped || !reap.pins_its_number() {
         Want::No
     } else {
         Want::Any
     };
-    let holder: Option<&'static [nix::sys::signal::Signal]> = match (mechanism.is_marker(), reap == Reap::None) {
-        (true, false) => Some(match op {
-            Op::Kill | Op::Drop | Op::FinishElevated => &[SIGKILL],
-            Op::Terminate => &[SIGTERM],
-            Op::GracefulShutdown => &[SIGTERM, SIGKILL],
-        }),
+    let sweep: &'static [nix::sys::signal::Signal] = match op {
+        Op::Kill | Op::Drop | Op::FinishElevated => &[SIGKILL],
+        Op::Terminate => &[SIGTERM],
+        Op::GracefulShutdown => &[SIGTERM, SIGKILL],
+    };
+    let holder: Option<&'static [nix::sys::signal::Signal]> = match (mechanism.is_marker(), reap.pins_its_number()) {
+        (true, false) => Some(sweep),
+        // A waited root's children went to init, so its walk finds no `cat` and the sweep signals it by
+        // its marker, unless the group's `killpg` reached it first.
+        (true, true) if reap == Reap::Waited && !mechanism.has_group() => Some(sweep),
         // The walk reaches the `cat` first.
         (true, true) => None,
         (false, _) => Some(&[]),
@@ -477,6 +490,8 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     let pidfd = match (cfg!(target_os = "linux"), reaped, op) {
         (false, _, _) => Want::No,
         (true, true, _) => Want::Any,
+        // The handle has recorded the exit: its signals to the root are `Sent::Gone`, none through the pidfd.
+        (true, false, _) if reap == Reap::Waited => Want::No,
         (true, false, _) if reap != Reap::None => Want::Yes,
         (true, false, Op::Terminate) if mechanism.walks() => Want::Yes,
         (true, false, Op::Terminate) => Want::No,
@@ -488,6 +503,9 @@ fn expected(mechanism: Mechanism, reap: Reap, op: Op) -> Expected {
     let backstop =
         if cfg!(target_os = "linux") && mechanism == Mechanism::TreeWalk && reap == Reap::None && op == Op::Kill {
             Want::Yes
+        } else if reap == Reap::Waited {
+            // No kill goes through the root's handle at all, let alone a second.
+            Want::No
         } else {
             Want::Any
         };
@@ -651,15 +669,15 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let stdin = std::rc::Rc::new(std::cell::Cell::new(Some(child.stdin().expect("stdin pipe"))));
     let mut stderr = child.stderr().expect("stderr pipe");
     let root = child.pid();
+    if reap == Reap::Waited {
+        kill_own_child(root);
+        child.wait().expect("the wait sees the root exit");
+    }
     if reap.reaped() {
         kill_own_child(root);
-        if reap.own() {
-            child.wait().expect("this handle reaps the root");
-        } else {
-            crate::test_child::reaped_elsewhere::reap_behind(root);
-            if reap == Reap::ForeignSeen {
-                assert_echild(child.try_wait());
-            }
+        crate::test_child::reaped_elsewhere::reap_behind(root);
+        if reap == Reap::ForeignSeen {
+            assert_echild(child.try_wait());
         }
     }
     let scripted = reap.script(&mut child);
@@ -780,15 +798,15 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap) -> Sent {
     let stdin = std::rc::Rc::new(std::cell::Cell::new(Some(child.stdin().expect("stdin pipe"))));
     let mut stderr = child.stderr().expect("stderr pipe");
     let root = child.pid();
+    if reap == Reap::Waited {
+        kill_own_child(root);
+        child.wait().await.expect("the wait sees the root exit");
+    }
     if reap.reaped() {
         kill_own_child(root);
-        if reap.own() {
-            child.wait().await.expect("this handle reaps the root");
-        } else {
-            crate::test_child::reaped_elsewhere::reap_behind(root);
-            if reap == Reap::ForeignSeen {
-                assert_echild(child.try_wait());
-            }
+        crate::test_child::reaped_elsewhere::reap_behind(root);
+        if reap == Reap::ForeignSeen {
+            assert_echild(child.try_wait());
         }
     }
     let scripted = reap.script(&mut child.inner);
@@ -871,7 +889,8 @@ fn check_matrix(mechanisms: &[Mechanism]) {
 
 /// The process group, the tree walk, and on macOS both fd markers.
 ///
-/// Mutants: `root_number` answers `Trusted` for any of a foreign reap, an own reap whose pid is
+/// Mutants: a root the handle's own wait saw exit is read as reaped (no `killpg` after the wait);
+/// `root_number` answers `Trusted` for any of a foreign reap, an own reap whose pid is
 /// reused or names nothing (a group), or (macOS) a root that is
 /// `Unpinned` or `Unknown`; the holders sweep skipped after a reap or for an untrusted root; an
 /// `Unpinned` root signalled as a holder; `treewalk::hard_kill` or `treewalk::terminate` walks

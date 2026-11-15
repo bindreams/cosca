@@ -8,10 +8,6 @@ use crate::child::owned::teardown::{Remains, TeardownOutcome};
 use crate::containment::DropView;
 use crate::signal::RootState;
 
-/// The remedy for descendants that outlive a root this handle has reaped, in a drop's warn and in a
-/// tree call's error.
-pub(crate) const END_THEM_BEFORE_WAIT: &str = "call kill_tree() before wait() to end them";
-
 /// What kind of thing a part of a report says, to tell a repeat of what an earlier step of the same
 /// event reported from something new.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,14 +102,13 @@ impl<'a> DropReport<'a> {
             }
             parts.push((PartKey::Described, state));
         }
-        if let (RootState::Reaped { .. }, Some(action)) = (&self.view.root, &self.skipped) {
+        if let (RootState::Reaped, Some(action)) = (&self.view.root, &self.skipped) {
             let this = self.view.caller.this_event();
             parts.push((
                 PartKey::Described,
                 format!(
                     "the root is already reaped, so {this} does not {action}, whose number may now belong to an \
-                 unrelated process. Descendants that outlived the reaped root are not torn down by {this}; \
-                 {END_THEM_BEFORE_WAIT}"
+                 unrelated process. Descendants that outlived the reaped root are not torn down by {this}"
                 ),
             ));
         }
@@ -135,7 +130,7 @@ impl<'a> DropReport<'a> {
                 "RootState::Unknown: the root's ({pid}) own handle could not say whether it was reaped ({})",
                 crate::error::Report(e)
             )),
-            RootState::Reaped { .. } | RootState::Unreaped => None,
+            RootState::Reaped | RootState::Unreaped => None,
         }
     }
 }

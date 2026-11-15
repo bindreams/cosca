@@ -334,50 +334,6 @@ fn a_tree_is_actionable() {
     .is_ok());
 }
 
-/// A marker with no group has none to skip: once this handle reaped its root, and its pid names no
-/// process, its holders alone are the whole answer. A marker with a group skips what the pid names.
-#[cfg(target_os = "macos")]
-#[skuld::test]
-fn a_marker_without_a_group_answers_a_reaped_roots_unnamed_pid_with_its_holders_alone() {
-    use std::os::fd::{AsFd, AsRawFd};
-
-    use super::TreeKillOutcome;
-    use crate::containment::{Mechanism, Tree};
-    use crate::identity::Resolved;
-    use crate::signal::RootState;
-    use crate::test_support::stated_root::StatedRoot;
-
-    fn marker_with_pgid(pgid: Option<i32>) -> crate::containment::fdmarker::Marker {
-        let (read, write) = std::io::pipe().expect("pipe");
-        let handle = crate::containment::fdmarker::pipe_handle_of(write.as_fd()).expect("handle");
-        let read_handle = crate::containment::fdmarker::pipe_handle_of(read.as_fd()).expect("read handle");
-        let prepared = crate::containment::fdmarker::PreparedMarker {
-            read: std::os::fd::OwnedFd::from(read),
-            handle,
-            read_handle,
-            fd: write.as_fd().as_raw_fd(),
-        };
-        crate::containment::fdmarker::Marker::new(
-            prepared,
-            crate::containment::fdmarker::fdmarker_tests::inert_root(),
-            pgid,
-        )
-    }
-
-    let reaped = || {
-        StatedRoot::with_state(1234, || RootState::Reaped { own: true })
-            .holding(|| (Resolved::Gone, crate::identity::UnknownCause::default()))
-    };
-    let ungrouped = Tree::contained(Mechanism::Marker(marker_with_pgid(None)))
-        .kill(Some(&reaped()))
-        .outcome();
-    assert!(matches!(ungrouped, TreeKillOutcome::Answered(Ok(()))), "{ungrouped:?}");
-    let grouped = Tree::contained(Mechanism::Marker(marker_with_pgid(Some(1234))))
-        .kill(Some(&reaped()))
-        .outcome();
-    assert!(matches!(grouped, TreeKillOutcome::Skipped(_)), "{grouped:?}");
-}
-
 /// macOS: a root launchd holds (`Unpinned`), or one its handle cannot answer for, skips what names
 /// the tree by the root's pid: a tree walk walks nothing, and a marker sweeps its holders alone, the
 /// root excepted when it is not pinned. A root its handle shows unreaped is killed as usual.
@@ -2200,6 +2156,8 @@ fn a_held_member_that_refuses_its_kill_and_then_exits_leaves_the_unvouched_kind_
     // The helper exits at EOF: nothing killed it.
     drop(stdin);
     assert!(child.wait().expect("the helper exits on EOF").success());
+    // The handle's end consumes the zombie, which a wait leaves and a held identity still finds.
+    drop(child);
     killed
         .settle(Some(&walker()), TreeKillOutcome::NoRoot(ROOT_PID, None), true)
         .answer

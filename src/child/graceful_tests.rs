@@ -96,7 +96,6 @@ fn cleanup(child: &mut crate::Child) {
 #[skuld::test]
 fn graceful_tree_watch_error_still_sweeps_and_reaps() {
     let (child, stdin) = kill_only_blocker();
-    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     fault::set_force_watch_error(true);
     // Released between the sweep and the reap (see `release_at`).
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
@@ -108,15 +107,11 @@ fn graceful_tree_watch_error_still_sweeps_and_reaps() {
         "seam not consumed — the watch did not run on this thread"
     );
     assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
-    #[cfg(unix)]
-    assert_eq!(
-        id.exists(),
-        crate::identity::Existence::Gone,
-        "root must be swept AND reaped despite the watch error (a zombie would still exist)"
+    assert!(
+        child.proc.exit_seen(),
+        "root must be swept AND its exit seen despite the watch error"
     );
-    #[cfg(windows)]
-    let _ = id;
-    let status = child.wait().expect("cached status — already reaped by the graceful op");
+    let status = child.wait().expect("cached status — already seen by the graceful op");
     crate::test_child::assert_killed("the swept root", status);
 }
 
@@ -128,7 +123,6 @@ fn graceful_tree_watch_error_still_sweeps_and_reaps() {
 #[skuld::test]
 fn graceful_lone_watch_error_still_escalates_and_reaps() {
     let (child, stdin) = kill_only_blocker();
-    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     fault::set_force_watch_error(true);
     // Released between the kill and the reap (see `release_at`).
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
@@ -140,12 +134,11 @@ fn graceful_lone_watch_error_still_escalates_and_reaps() {
         "seam not consumed — the watch did not run on this thread"
     );
     assert!(matches!(err, crate::error::Error::Io(_)), "got {err:?}");
-    assert_eq!(
-        id.exists(),
-        crate::identity::Existence::Gone,
-        "child must be killed AND reaped despite the watch error (a zombie would still exist)"
+    assert!(
+        child.proc.exit_seen(),
+        "child must be killed AND its exit seen despite the watch error"
     );
-    let status = child.wait().expect("cached status — already reaped by the graceful op");
+    let status = child.wait().expect("cached status — already seen by the graceful op");
     crate::test_child::assert_killed("the escalated child", status);
 }
 
@@ -482,14 +475,10 @@ fn graceful_tree_terminate_refusal_still_sweeps_and_reaps() {
         ),
         "the refusal must be logged as discarded, not silently dropped"
     );
-    #[cfg(unix)]
-    assert_eq!(
-        id.exists(),
-        crate::identity::Existence::Gone,
-        "root must be swept AND reaped despite the forced terminate refusal"
+    assert!(
+        child.proc.exit_seen(),
+        "root must be swept AND its exit seen despite the forced terminate refusal"
     );
-    #[cfg(windows)]
-    let _ = id;
 }
 
 // Same hold-and-continue contract as the `Containment` test above, but for the OTHER
@@ -522,14 +511,10 @@ fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
         ),
         "the refusal must be logged as discarded, not silently dropped"
     );
-    #[cfg(unix)]
-    assert_eq!(
-        id.exists(),
-        crate::identity::Existence::Gone,
-        "root must be swept AND reaped despite the forced unassessable state"
+    assert!(
+        child.proc.exit_seen(),
+        "root must be swept AND its exit seen despite the forced unassessable state"
     );
-    #[cfg(windows)]
-    let _ = id;
 }
 
 // A failed check after the signal went out, whatever its variant, holds like a refusal does: the
@@ -538,21 +523,16 @@ fn graceful_tree_unassessable_per_member_still_sweeps_and_reaps() {
 #[skuld::test]
 fn graceful_tree_unassessable_with_a_source_still_sweeps_and_reaps() {
     let (child, stdin) = kill_only_blocker();
-    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     term_fault::set_force_terminate(term_fault::Forced::UnassessableMechanism);
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
     let status = child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
         .expect("a successful sweep must supersede the forced check failure");
     crate::test_child::assert_killed("the root", status);
-    #[cfg(unix)]
-    assert_eq!(
-        id.exists(),
-        crate::identity::Existence::Gone,
-        "root must be swept AND reaped despite the forced check failure"
+    assert!(
+        child.proc.exit_seen(),
+        "root must be swept AND its exit seen despite the forced check failure"
     );
-    #[cfg(windows)]
-    let _ = id;
 }
 
 // The sweep's failure is the answer, and what failed decides its variant, not how many things failed:
@@ -984,13 +964,12 @@ fn members_remain_still_reaps_an_already_exited_root(mode: crate::ContainMode, s
         !term_fault::kill_tree_armed(),
         "the sweep must have consumed the forced-failure seam"
     );
-    assert_eq!(
-        id.exists(),
-        crate::identity::Existence::Gone,
-        "an already-exited root must be best-effort reaped even when the sweep fails"
+    assert!(
+        child.proc.exit_seen(),
+        "an already-exited root's exit must be seen even when the sweep fails"
     );
     // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive, and the
-    // call above reaped the root.
+    // call above saw the root's exit.
     swept(&child);
     drop(stdin);
 }
@@ -1017,7 +996,6 @@ fn graceful_tree_with_only_unprovable_members_still_sweeps_in_a_cgroup(#[fixture
     use crate::containment::cgroup::fault::{fail_terminate_once, TerminateStep};
     let (child, stdin) = kill_only_blocker();
     assert_eq!(child.containment(), crate::containment::Containment::CgroupV2);
-    let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let _pin = fail_terminate_once(TerminateStep::Pin, libc::EMFILE);
     let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
 
@@ -1026,11 +1004,11 @@ fn graceful_tree_with_only_unprovable_members_still_sweeps_in_a_cgroup(#[fixture
         .expect("the sweep ends the tree the unprovable member left");
 
     crate::test_child::assert_killed("the root", status);
-    assert_eq!(id.exists(), crate::identity::Existence::Gone, "the root is reaped");
+    assert!(child.proc.exit_seen(), "the root's exit is seen");
 }
 
-/// A reaped root's group is not signalled by its number. The TERM-ignoring member keeps the group's
-/// number its own while the call runs.
+/// The root whose exit the shutdown saw is still a zombie that pins its group's number, so the group
+/// is signalled by it, and the TERM-ignoring member dies.
 #[cfg(unix)]
 #[skuld::test]
 fn graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_group() {
@@ -1039,10 +1017,9 @@ fn graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_
         // Below Linux 6.9 a group is signalled by its number alone.
         #[cfg(target_os = "linux")]
         let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
-        let err = child
+        child
             .kill_tree()
-            .expect_err("a reaped root's group is not signalled by its number");
-        assert!(matches!(err, crate::error::Error::Unassessable { .. }), "got {err:?}");
+            .expect("the root's zombie pins the group's number: the group is killed by it");
     });
 }
 
@@ -1083,12 +1060,11 @@ fn graceful_tree_that_left_a_descendant_reaps_the_root_the_backstop_killed_and_r
         .expect_err("a descendant was left");
 
     assert!(matches!(err, crate::error::Error::MembersLeft { .. }), "{err:?}");
-    assert_eq!(
-        id.exists(),
-        crate::identity::Existence::Gone,
-        "the root the backstop killed must be reaped before the error returns"
+    assert!(
+        child.proc.exit_seen(),
+        "the root the backstop killed must have its exit seen before the error returns"
     );
-    crate::test_child::assert_killed("the root", child.wait().expect("the reaped root's status is kept"));
+    crate::test_child::assert_killed("the root", child.wait().expect("the root's status is kept"));
 }
 
 // Windows twin of `graceful_tree_members_remain_still_reaps_an_already_exited_root` above,

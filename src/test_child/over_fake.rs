@@ -102,6 +102,6 @@ pub(crate) fn exited_unreaped(id: ProcessId) -> Box<Unreaped> {
     let exit = ExitRecord::Status(std::process::ExitStatus::default());
     let fake = FakeProcess::new([])
         .with_pid(id.pid())
-        .reaps([ReapAnswer::Reaped(exit)]);
+        .reaps([ReapAnswer::Exited(exit)]);
     Box::new(unreaped_over(&fake, Some(id)))
 }

@@ -13,7 +13,7 @@ use windows::Win32::System::Threading::{
     PROCESS_ACCESS_RIGHTS, PROCESS_ALL_ACCESS, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
-use super::child::{KillRefusal, OsChild, OsHandle, PeekOutcome, TryReapOutcome};
+use super::child::{KillRefusal, OsChild, OsHandle, PeekOutcome, TryObserveOutcome};
 use super::{Exit, OsProcess, WaitFor};
 use crate::error::{win32_io_error, Error};
 use crate::identity::{
@@ -21,7 +21,7 @@ use crate::identity::{
     Kernel, Liveness, Look, Opened, ProcessId, Termination,
 };
 use crate::signal::{Sent, Sig};
-use crate::wait::exit_only::{self, Reap, Target};
+use crate::wait::exit_only::{self, Target};
 
 #[cfg(feature = "tokio")]
 pub(crate) mod registered_wait;
@@ -245,13 +245,14 @@ impl<K: Kernel + Send> OsChild for WindowsProcess<K> {
         exit_only::peek(&Target::Handle(self.handle.as_handle())).map_err(Error::Io)
     }
 
-    fn try_reap(&self) -> Result<TryReapOutcome<'_>, Error> {
+    /// A signalled handle's exit code is the record.
+    fn try_observe(&self) -> Result<TryObserveOutcome<'_>, Error> {
         debug_assert!(self.has_synchronize(), "a child's handle can be waited on");
         let handle = self.handle.as_handle();
-        Ok(match exit_only::try_reap(&Target::Handle(handle)).map_err(Error::Io)? {
-            Reap::Reaped(record) => TryReapOutcome::Reaped(record),
-            Reap::Running => TryReapOutcome::Running(WaitFor::Signalled(handle)),
-            Reap::Foreign(foreign) => TryReapOutcome::Foreign(foreign),
+        Ok(match exit_only::peek(&Target::Handle(handle)).map_err(Error::Io)? {
+            PeekOutcome::Exit(record) => TryObserveOutcome::Exited(record),
+            PeekOutcome::Running => TryObserveOutcome::Running(WaitFor::Signalled(handle)),
+            PeekOutcome::Foreign(foreign) => TryObserveOutcome::Foreign(foreign),
         })
     }
 }

@@ -103,7 +103,7 @@ impl Unreaped {
     /// once more (a front, which is sent nothing, excepted), looks at it once without waiting and
     /// reaps it if it exited. It warns once naming the pid, except a child someone else reaped,
     /// which is logged at `debug` (a refused kill is warned regardless); a child not reaped is
-    /// given up, unreaped.
+    /// given up (a zombie once it exits).
     ///
     /// Needs the `tokio` feature. Portable code needs a runtime with the IO and time drivers (the
     /// `#[tokio::main]` / `#[tokio::test]` defaults): on Unix a runtime missing either makes tokio
@@ -120,7 +120,9 @@ impl Unreaped {
         }
     }
 
-    /// Give the child up, unreaped. Logs nothing.
+    /// Give the child up without killing or waiting for it. Logs nothing. The end of its handle
+    /// reaps an exited child as [`Child::detach`](crate::Child::detach) says; one that still runs is
+    /// left, and is a zombie once it exits.
     pub fn leak(mut self) {
         drop(self.child.take());
     }
@@ -206,7 +208,10 @@ impl Drop for Unreaped {
         let who = child_named(child.pid());
         // A destructor that blocks on a child during unwinding can hang the panic for good.
         if std::thread::panicking() {
-            log::warn!("{} while the thread is panicking; gave it up, unreaped", dropped(&who));
+            log::warn!(
+                "{} while the thread is panicking; gave it up, not waited for",
+                dropped(&who)
+            );
             return;
         }
         let settlement = Settlement::new(wait_to_exit(&child, None), false);

@@ -1502,9 +1502,7 @@ fn a_group_send_that_fails_while_a_holder_is_signalled_is_sent() {
 #[skuld::test]
 fn a_skipped_kill_names_the_walk_and_the_group_only_when_there_is_one() {
     let _serialize = test_spawn_lock();
-    let reaped = crate::test_support::stated_root::StatedRoot::with_state(4242, || crate::signal::RootState::Reaped {
-        own: false,
-    });
+    let reaped = crate::test_support::stated_root::StatedRoot::with_state(4242, || crate::signal::RootState::Reaped);
     let skipped = |marker| {
         let kill = crate::containment::Tree::contained(crate::containment::Mechanism::Marker(marker))
             .kill(Some(&reaped))

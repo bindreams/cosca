@@ -43,7 +43,7 @@ fn is_the_scripted_failure(err: &Error) -> bool {
 #[skuld::test]
 fn a_poisoned_lock_neither_aborts_nor_hangs() {
     let fake = FakeProcess::new([])
-        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .signals([Ok(Sent::Delivered)]);
     let child = owned_over(&fake);
     let poisoner = std::thread::spawn({
@@ -83,7 +83,7 @@ fn a_poisoned_lock_neither_aborts_nor_hangs() {
 /// panic in the hook, instead of a deadlock on its own thread.
 #[skuld::test]
 fn debug_inside_a_blocked_waiter_does_not_block() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let (printed_tx, printed_rx) = std::sync::mpsc::channel();
@@ -115,7 +115,7 @@ fn debug_inside_a_blocked_waiter_does_not_block() {
 /// scripted answers, and its hook never fires.
 #[skuld::test]
 fn a_second_wait_blocks_behind_the_holder() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let (waiter, blocked) = spawn_waiter(&child, |c| c.wait(None));
@@ -133,28 +133,28 @@ fn a_second_wait_blocks_behind_the_holder() {
 /// Mutant: no `E` write, so the second call reaps again, past the scripted answers.
 #[skuld::test]
 fn a_look_reaps_an_exited_child_once() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
     let child = OwnedChild::new(Box::new(fake.clone()));
     let first = status(try_wait(&child));
     let second = status(try_wait(&child));
     assert_eq!(first, second);
     assert_eq!(fake.looks(), 1);
-    assert!(child.is_reaped());
+    assert!(child.exit_seen());
 }
 
-/// A look that finds the child running records nothing: the child is reaped only once a look takes
-/// its record.
+/// A look that finds the child running records nothing: the exit is seen only once a look finds its
+/// record.
 ///
-/// Mutant: `is_reaped` reads the OS, or a look that found the child running records a reap.
+/// Mutant: `exit_seen` reads the OS, or a look that found the child running records an exit.
 #[skuld::test]
-fn is_reaped_only_once_the_record_is_taken() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
+fn exit_seen_only_once_the_record_is_found() {
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
     let child = OwnedChild::new(Box::new(fake.clone()));
-    assert!(!child.is_reaped());
+    assert!(!child.exit_seen());
     assert_eq!(try_wait(&child).expect("try_wait"), ChildWaitOutcome::DeadlinePassed);
-    assert!(!child.is_reaped(), "a look that found the child running is not a reap");
+    assert!(!child.exit_seen(), "a look that found the child running is not an exit");
     status(try_wait(&child));
-    assert!(child.is_reaped());
+    assert!(child.exit_seen());
 }
 
 /// A reap error is returned as it is, and the state stays `N`.
@@ -162,7 +162,7 @@ fn is_reaped_only_once_the_record_is_taken() {
 /// Mutant: an error taken for the foreign path, or the state left in `W`.
 #[skuld::test]
 fn a_look_that_fails_returns_the_error_and_stays_n() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Err(KIND), ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Err(KIND), ReapAnswer::Exited(exit())]);
     let child = OwnedChild::new(Box::new(fake));
     let err = try_wait(&child).expect_err("the scripted failure");
     assert!(is_the_scripted_failure(&err), "{err:?}");
@@ -179,7 +179,7 @@ fn a_look_that_fails_returns_the_error_and_stays_n() {
 #[skuld::test]
 fn signal_during_a_parked_wait_signals_and_the_holder_reaps() {
     let fake = FakeProcess::new([])
-        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .signals([Ok(Sent::Delivered)]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
@@ -210,7 +210,7 @@ fn signal_during_a_parked_wait_signals_and_the_holder_reaps() {
 #[skuld::test]
 fn a_deadline_waiter_behind_a_parked_holder_returns_at_its_deadline() {
     let fake = FakeProcess::new([])
-        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .peeks([Ok(PeekOutcome::Running)]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
@@ -256,7 +256,7 @@ fn a_deadline_waiter_behind_a_parked_holder_returns_at_its_deadline() {
 /// Mutant: the remaining time computed once, before the loop: both rounds are armed alike.
 #[skuld::test]
 fn a_spurious_wake_re_arms_a_deadline_waiter_with_less_time() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
@@ -316,7 +316,7 @@ fn a_spurious_wake_re_arms_a_deadline_waiter_with_less_time() {
 #[skuld::test]
 fn a_waiter_that_sees_an_exit_at_its_deadline_returns_its_status_without_reaping() {
     let fake = FakeProcess::new([])
-        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .peeks([Ok(PeekOutcome::Exit(exit()))]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
@@ -339,7 +339,7 @@ fn a_waiter_that_sees_an_exit_at_its_deadline_returns_its_status_without_reaping
 #[skuld::test]
 fn a_waiter_at_its_deadline_behind_a_holder_on_a_running_child_gets_deadline_passed() {
     let fake = FakeProcess::new([])
-        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .peeks([Ok(PeekOutcome::Running)]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
@@ -366,7 +366,7 @@ fn a_waiter_at_its_deadline_behind_a_holder_on_a_running_child_gets_deadline_pas
 #[skuld::test]
 fn a_non_holder_peek_that_is_foreign_returns_it_and_writes_nothing() {
     let fake = FakeProcess::new([])
-        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .peeks([Ok(PeekOutcome::Foreign(Foreign::Gone))]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(Some(far())));
@@ -377,17 +377,17 @@ fn a_non_holder_peek_that_is_foreign_returns_it_and_writes_nothing() {
         "a non-holder's foreign verdict writes nothing"
     );
     status(holder.release_and_join());
-    assert!(matches!(child.lock().state, State::E(_)));
+    assert!(matches!(child.lock().state, State::Exited(_)));
 }
 
 // The holder's reap =====
 
-/// An exit seen is reaped once, under the lock, and cached: a second `wait` never looks.
+/// An exit is seen once, under the lock, and cached: a second `wait` never looks.
 ///
 /// Mutant: no `E` write, so the second `wait` looks past the scripted answers.
 #[skuld::test]
-fn an_exit_seen_is_reaped_once_under_the_lock() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Reaped(exit())]);
+fn an_exit_is_seen_once_under_the_lock() {
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
     let child = OwnedChild::new(Box::new(fake.clone()));
     let first = status(child.wait(None));
     assert_eq!(status(child.wait(None)), first);
@@ -402,7 +402,7 @@ fn a_holders_normal_return_leaves_the_next_holder_alone() {
         ReapAnswer::Running,
         ReapAnswer::Foreign(Foreign::Gone),
         ReapAnswer::Running,
-        ReapAnswer::Reaped(exit()),
+        ReapAnswer::Exited(exit()),
     ]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
@@ -442,7 +442,7 @@ fn a_holders_normal_return_leaves_the_next_holder_alone() {
 /// Mutant: a `?` return that leaves `W`: the waiter never wakes.
 #[skuld::test]
 fn a_reap_error_restores_n_and_wakes_the_waiters() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Err(KIND), ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Err(KIND), ReapAnswer::Exited(exit())]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let (waiter, blocked) = spawn_waiter(&child, |c| c.wait(None));
@@ -466,7 +466,7 @@ fn an_expired_holder_hands_off_to_a_blocked_wait() {
         ReapAnswer::Running,
         ReapAnswer::Running,
         ReapAnswer::Running,
-        ReapAnswer::Reaped(exit()),
+        ReapAnswer::Exited(exit()),
     ]);
     fake.on_look(|look| {
         if look == 1 {
@@ -507,7 +507,7 @@ fn a_holder_that_sees_a_foreign_reap_returns_it_and_restores_n() {
 /// Mutant: no guard: the waiter never wakes.
 #[skuld::test]
 fn a_holder_that_panics_in_its_look_restores_n_and_wakes_the_waiters() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
     fake.on_look(|look| {
         if look == 1 {
             panic!("forced panic in the holder's look");
@@ -533,7 +533,7 @@ fn a_holder_that_panics_in_its_look_restores_n_and_wakes_the_waiters() {
 /// `Condvar` result that is `unwrap()`ped (the waiter panics).
 #[skuld::test]
 fn a_holder_that_panics_after_its_relock_restores_n_without_deadlocking() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
     // Armed in the first look, on the holder's thread: its second look's re-lock panics.
     fake.on_look(|look| {
         if look == 0 {
@@ -566,7 +566,7 @@ fn a_recheck_backs_off_until_the_zombie_shows() {
         ReapAnswer::Recheck,
         ReapAnswer::Recheck,
         ReapAnswer::Recheck,
-        ReapAnswer::Reaped(exit()),
+        ReapAnswer::Exited(exit()),
     ]);
     let child = OwnedChild::new(Box::new(fake.clone()));
     crate::wait::block_probe::take();
@@ -584,7 +584,7 @@ fn a_recheck_backs_off_until_the_zombie_shows() {
 #[skuld::test]
 fn a_holders_recheck_pause_leaves_the_handle_unlocked() {
     let fake = FakeProcess::new([])
-        .reaps([ReapAnswer::Recheck, ReapAnswer::Reaped(exit())])
+        .reaps([ReapAnswer::Recheck, ReapAnswer::Exited(exit())])
         .peeks([Ok(PeekOutcome::Running)]);
     let child = owned_over(&fake);
     let (peeked_tx, peeked_rx) = std::sync::mpsc::channel();
@@ -604,7 +604,7 @@ fn a_holders_recheck_pause_leaves_the_handle_unlocked() {
 #[skuld::test]
 fn a_holder_blocked_on_its_wait_holds_no_lock() {
     let fake = FakeProcess::new([])
-        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .signals([Ok(Sent::Delivered)]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
@@ -621,7 +621,7 @@ fn a_holder_blocked_on_its_wait_holds_no_lock() {
 /// Mutant: a holder that looks again without waiting (a spin).
 #[skuld::test]
 fn a_holder_blocked_on_its_wait_wakes_when_signalled() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     assert_eq!(fake.looks(), 1, "the holder has not looked again");
@@ -634,14 +634,14 @@ fn a_holder_blocked_on_its_wait_wakes_when_signalled() {
 /// Mutant: the foreign verdict written as `E`, or as a stuck `W`.
 #[skuld::test]
 fn a_foreign_reap_is_cached_as_nothing_and_wait_stays_n() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Foreign(Foreign::Gone), ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Foreign(Foreign::Gone), ReapAnswer::Exited(exit())]);
     let child = OwnedChild::new(Box::new(fake));
     assert_eq!(
         child.wait(None).expect("foreign"),
         ChildWaitOutcome::Foreign(Foreign::Gone)
     );
     assert!(matches!(child.lock().state, State::N));
-    assert!(!child.is_reaped());
+    assert!(!child.exit_seen());
     status(child.wait(None));
 }
 
@@ -654,7 +654,7 @@ fn exited_by_looks_through_exited_and_reaps_nothing() {
     let child = OwnedChild::new(Box::new(fake.clone()));
     assert!(child.exited_by(None).expect("exited_by"));
     assert_eq!(fake.looks(), 1);
-    assert!(!child.is_reaped());
+    assert!(!child.exit_seen());
 }
 
 // After the reap =====
@@ -664,7 +664,7 @@ fn exited_by_looks_through_exited_and_reaps_nothing() {
 /// Mutant: no `E` check: the look runs past the scripted answers.
 #[skuld::test]
 fn a_cached_status_never_reaches_the_os() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
     let child = OwnedChild::new(Box::new(fake.clone()));
     let first = status(child.wait(None));
     assert_eq!(status(child.wait(None)), first);
@@ -678,7 +678,7 @@ fn a_cached_status_never_reaches_the_os() {
 /// Mutant: a `signal` to the OS after `E`: the empty signal table panics.
 #[skuld::test]
 fn signal_after_the_reap_sends_nothing() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
     let child = OwnedChild::new(Box::new(fake.clone()));
     status(child.wait(None));
     assert_eq!(
@@ -688,13 +688,14 @@ fn signal_after_the_reap_sends_nothing() {
     assert_eq!(fake.signal_calls(), []);
 }
 
-/// `ReapHold::signal` after our own reap (`State::E`) reports `Gone` and sends nothing.
+/// `RootHandle::signal` after our own wait saw the exit (`State::Exited`) reports `Gone` and sends
+/// nothing.
 ///
-/// Mutant: it reports `Delivered`, or signals, after `E`.
+/// Mutant: it reports `Delivered`, or signals, after `Exited`.
 #[cfg(unix)]
 #[skuld::test]
 fn a_held_signal_after_our_own_reap_is_gone() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
     let child = OwnedChild::new(Box::new(fake.clone()));
     status(child.wait(None));
     assert_eq!(
@@ -707,38 +708,35 @@ fn a_held_signal_after_our_own_reap_is_gone() {
     assert_eq!(fake.signal_calls(), []);
 }
 
-// L8: an unreadable consuming record =====
-
-/// L8: a consuming reap that hands back a record that is not an exit is cached as
-/// `E(Unreadable)` and acts by no pid: every later wait answers it and `signal` sends nothing. In
-/// a debug build the contract breach panics, after the `E` write.
+/// A wait consumes nothing; the end of the handle asks to consume the exit record, once.
 ///
-/// Mutant: a panic before the `E` write: the state stays `W` and the guard restores `N` over a
-/// reaped pid.
+/// Mutant: a wait calls the consuming reap.
+#[cfg(unix)]
 #[skuld::test]
-fn an_unreadable_consuming_record_is_cached_and_acts_by_no_pid() {
-    let unreadable = ExitRecord::Unreadable { si_code: 99 };
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Reaped(unreadable)]);
+fn a_wait_consumes_nothing_and_the_drop_reaps_once() {
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
     let child = OwnedChild::new(Box::new(fake.clone()));
-    // In a debug build the call panics (after the write); in a release build it returns.
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| child.wait(None)));
-    if cfg!(debug_assertions) {
-        assert!(outcome.is_err(), "a debug build asserts the contract");
-    } else {
-        assert_eq!(
-            outcome.expect("release returns").expect("a record"),
-            ChildWaitOutcome::Exited(unreadable)
-        );
-    }
-    assert!(
-        matches!(child.lock().state, State::E(ExitRecord::Unreadable { si_code: 99 })),
-        "the state must already be E(Unreadable): {child:?}"
-    );
-    for outcome in [child.wait(None), child.wait(Some(far())), try_wait(&child)] {
-        assert_eq!(outcome.expect("cached"), ChildWaitOutcome::Exited(unreadable));
-    }
-    assert_eq!(child.signal(Sig::Kill).expect("signal"), Sent::Gone);
-    assert_eq!(fake.signal_calls(), []);
+    status(child.wait(None));
+    status(child.wait(None));
+    assert_eq!(fake.reap_calls(), 0, "a wait consumed the exit record");
+    drop(child);
+    assert_eq!(fake.reap_calls(), 1, "the handle's end did not consume it exactly once");
+}
+
+/// The zombie a wait left is reaped by something else behind the handle's back: the state says
+/// so, so no send goes by a number that may be taken.
+///
+/// Mutant: the state of a root whose exit was seen is cached, and never asks the OS again.
+#[cfg(unix)]
+#[skuld::test]
+fn a_zombie_reaped_elsewhere_after_the_wait_reads_as_a_foreign_reap() {
+    use crate::signal::RootState;
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Exited(exit())])
+        .peeks([Ok(PeekOutcome::Foreign(Foreign::Gone))]);
+    let child = OwnedChild::new(Box::new(fake.clone()));
+    status(child.wait(None));
+    assert!(matches!(child.state(), RootState::Reaped), "{:?}", child.state());
 }
 
 // Adoption =====
@@ -751,7 +749,7 @@ fn adopt_never_reaps() {
     let fake = FakeProcess::new([]);
     let child = OwnedChild::new(Box::new(fake.clone()));
     assert_eq!(fake.looks(), 0);
-    assert!(!child.is_reaped());
+    assert!(!child.exit_seen());
 }
 
 /// `adopt` never reaps: an already-exited child is still a zombie afterwards, so a later
@@ -822,68 +820,64 @@ fn clamp_block_caps_every_timed_block_below_infinite() {
 
 // The state of the root =====
 
-/// The state is `Reaped` once the reap is recorded, before the waiter returns, for every shape of
-/// deadline; and it reads the record, not the OS.
+/// The exit is recorded as soon as the look sees it, before the waiter returns, for every shape of
+/// deadline; and the root's state, asked meanwhile, is the OS's own answer for a zombie of ours
+/// (`Unreaped`).
 ///
-/// Mutant: `state` answers `Unreaped` once the reap is recorded.
+/// Mutant: the record is written after the waiter's park; `state` answers `Reaped` once the exit is
+/// recorded.
 #[skuld::test]
-fn the_state_is_reaped_as_soon_as_the_reap_is_recorded() {
+fn the_exit_is_recorded_as_soon_as_the_look_sees_it() {
     for deadline in [None, Some(far()), Some(Instant::now())] {
-        // No peek is scripted: a `state` that asks the OS panics.
-        let fake = FakeProcess::new([]).reaps([ReapAnswer::Reaped(exit())]);
+        let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
+        #[cfg(unix)]
+        let fake = fake.peeks([Ok(PeekOutcome::Exit(exit()))]);
         let child = OwnedChild::new(Box::new(fake));
         let (gate, reached, release) = seams::park_gate();
         std::thread::scope(|scope| {
             let a = scope.spawn(|| {
-                let _armed = seams::park_after_reap_recorded_on(gate);
+                let _armed = seams::park_after_exit_recorded_on(gate);
                 child.wait(deadline)
             });
-            reached.recv().expect("the reap was recorded");
+            reached.recv().expect("the exit was recorded");
             #[cfg(unix)]
-            let seen = matches!(
-                child.hold(UNREAD_PID).state(),
-                crate::signal::RootState::Reaped { own: true }
-            );
-            let seen_own = child.is_reaped();
+            let seen = matches!(child.hold(UNREAD_PID).state(), crate::signal::RootState::Unreaped);
+            let seen_own = child.exit_seen();
             release.send(()).expect("release");
             assert!(matches!(a.join().expect("join"), Ok(ChildWaitOutcome::Exited(_))));
             #[cfg(unix)]
-            assert!(seen, "the reap was recorded, but the state was not Reaped");
-            assert!(seen_own, "the reap was recorded, but is_reaped answered false");
+            assert!(seen, "the exit was recorded, but the state was not Unreaped");
+            assert!(seen_own, "the exit was recorded, but exit_seen answered false");
         });
     }
 }
 
-/// The state is `Unreaped` until a look returns the record, and `Reaped { own }` from then on,
-/// asked of the record and not of the OS.
+/// The state is the OS's own answer all along: a look that saw the exit records it, and the root
+/// still reads `Unreaped` (a zombie of ours) until the OS says otherwise.
 ///
-/// Mutant: `state` answers `Reaped` for a state that is not `E`, or asks the OS after `E`.
+/// Mutant: `state` answers `Reaped` for a recorded exit.
 #[cfg(unix)]
 #[skuld::test]
-fn the_state_is_an_own_reap_only_once_a_look_returns_the_record() {
+fn the_state_stays_the_oss_answer_once_a_look_returns_the_record() {
     use crate::signal::RootState;
     let fake = FakeProcess::new([])
-        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
-        .peeks([Ok(PeekOutcome::Running)]);
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
+        .peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Exit(exit()))]);
     let child = OwnedChild::new(Box::new(fake));
     assert_eq!(try_wait(&child).expect("try_wait"), ChildWaitOutcome::DeadlinePassed);
     assert!(matches!(child.hold(UNREAD_PID).state(), RootState::Unreaped));
-    assert!(!child.is_reaped());
+    assert!(!child.exit_seen());
     status(try_wait(&child));
-    // The one scripted peek is spent: a `state` that asks the OS now panics.
-    assert!(matches!(
-        child.hold(UNREAD_PID).state(),
-        RootState::Reaped { own: true }
-    ));
-    assert!(child.is_reaped());
+    assert!(matches!(child.hold(UNREAD_PID).state(), RootState::Unreaped));
+    assert!(child.exit_seen());
 }
 
 /// A hold's group check reads the hold's own state: an unreaped root's pid names its group, a root
-/// reaped by someone else or by this handle does not, whatever the pid reads. The own-reaped root's
-/// peek table is empty, so a check that peeks panics.
+/// reaped by someone else does not, whatever the pid reads. A root whose exit this handle saw is an
+/// unreaped zombie of ours, whatever the number reads: it pins the number.
 ///
-/// Mutant: the check passes whatever the state, reads the OS instead of the hold, or passes an own
-/// reap whose pid names no process.
+/// Mutant: the check passes whatever the state, reads the OS instead of the hold, or refuses a
+/// zombie this handle saw exit.
 #[cfg(unix)]
 #[skuld::test]
 fn a_hold_checks_the_roots_group_by_its_own_state() {
@@ -896,45 +890,18 @@ fn a_hold_checks_the_roots_group_by_its_own_state() {
     let refused = check().expect_err("reaped elsewhere");
     assert!(refused.contains("reaped elsewhere"), "{refused}");
 
-    let reaped_reading = |read| {
-        let fake = FakeProcess::new([])
-            .reaps([ReapAnswer::Reaped(exit())])
-            .number_reads_always(read);
-        let child = OwnedChild::new(Box::new(fake));
-        status(child.wait(None));
-        child
-    };
-    let child = reaped_reading(Resolved::Gone);
-    let check = || check_number(Some(&child.hold(UNREAD_PID))).map_err(|why| why.to_string());
-    let refused = check().expect_err("the pid names no process");
-    assert!(refused.contains("names no process"), "{refused}");
-    let child = reaped_reading(Resolved::Unknown);
-    let check = || check_number(Some(&child.hold(UNREAD_PID))).map_err(|why| why.to_string());
-    let refused = check().expect_err("the pid could not be read");
-    assert!(refused.contains("this handle reaped the root"), "{refused}");
-}
-
-/// A hold reads the number it was taken for, through the kernel its box owns, whatever pid the box
-/// learned: the row refuses the held pid, which the host does not have and would answer `Gone`, and
-/// the box's own pid has no row.
-///
-/// Mutant: `ReapHold::number_holder` reads the box's pid, or a host kernel.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_hold_reads_its_own_number_through_the_kernel_its_box_owns() {
-    use crate::containment::Root;
-    use crate::identity::{spawn_kernel, FakeKernel, HostKernel, Resolved};
-
-    const HELD: u32 = 2_000_000_000;
-    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(HELD, Err(rustix::io::Errno::MFILE));
     let fake = FakeProcess::new([])
-        .with_pid(HELD + 1)
-        .with_kernel(spawn_kernel(kernel));
+        .reaps([ReapAnswer::Exited(exit())])
+        .peeks([Ok(PeekOutcome::Exit(exit()))])
+        .number_reads_always(Resolved::Gone);
     let child = OwnedChild::new(Box::new(fake));
-    let (read, cause) = child.hold(HELD).number_holder();
-    assert!(matches!(read, Resolved::Unknown), "{read:?}");
-    let why = cause.into_error("the held pid").expect("the refused open is the cause");
-    assert_eq!(crate::error::first_os_code(&why), Some(libc::EMFILE), "{why:?}");
+    status(child.wait(None));
+    let check = || check_number(Some(&child.hold(UNREAD_PID))).map_err(|why| why.to_string());
+    assert_eq!(
+        check(),
+        Ok(()),
+        "a zombie of ours pins its number, whatever the number reads"
+    );
 }
 
 /// A waiter parked on its wait is a holder (`W`), not a reap.
@@ -945,14 +912,14 @@ fn a_hold_reads_its_own_number_through_the_kernel_its_box_owns() {
 fn the_state_is_unreaped_while_a_holder_waits() {
     use crate::signal::RootState;
     let fake = FakeProcess::new([])
-        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .peeks([Ok(PeekOutcome::Running)]);
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let seen = child.hold(UNREAD_PID).state();
-    let seen_own = child.is_reaped();
+    let seen_own = child.exit_seen();
     status(holder.release_and_join());
     assert!(matches!(seen, RootState::Unreaped), "{seen:?}");
-    assert!(!seen_own, "a holder is waiting, but is_reaped answered true");
-    assert!(child.is_reaped());
+    assert!(!seen_own, "a holder is waiting, but exit_seen answered true");
+    assert!(child.exit_seen());
 }

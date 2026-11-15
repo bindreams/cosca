@@ -864,7 +864,7 @@ fn reap_through(pid: libc::pid_t, child: &OwnedChild) -> io::Result<ProbeEnd> {
         ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code }) => {
             debug_assert!(
                 false,
-                "a consuming waitid on the probe's pidfd returned si_code {si_code}, which is no exit record: \
+                "a look at the probe's pidfd returned si_code {si_code}, which is no exit record: \
                  a kernel contract, which no policy's errno breaks"
             );
             ProbeEnd::Exit(-1)

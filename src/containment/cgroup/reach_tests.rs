@@ -1762,3 +1762,34 @@ fn the_probes_read_stands_only_if_its_child_was_shown_running() {
         _ => panic!("a failed peek is the probe's own failure, with the peek's error"),
     }
 }
+
+/// A wait on the probe's child never hands back an unreadable exit record (a kernel contract), so a
+/// debug build asserts it.
+///
+/// Mutant: the arm answers the release end in a debug build too.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "which is no exit record")]
+fn an_unreadable_record_from_the_probes_wait_asserts_in_debug() {
+    let _ = probe_end_of_an_unreadable_record();
+}
+
+/// In a release build the same record ends the probe as an exit with code `-1`.
+///
+/// Mutant: the arm panics, or answers a signal or another code.
+#[cfg(not(debug_assertions))]
+#[skuld::test]
+fn an_unreadable_record_from_the_probes_wait_is_an_exit_of_minus_one_in_release() {
+    assert!(matches!(probe_end_of_an_unreadable_record(), ProbeEnd::Exit(-1)));
+}
+
+/// `reap_through` over a child whose wait sees an unreadable exit record.
+fn probe_end_of_an_unreadable_record() -> ProbeEnd {
+    use crate::child::owned::OwnedChild;
+    use crate::os_process::child::ExitRecord;
+    use crate::os_process::fake::{FakeProcess, ReapAnswer};
+
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(ExitRecord::Unreadable { si_code: 7 })]);
+    let child = OwnedChild::new(Box::new(fake));
+    super::reap_through(1, &child).expect("the reap answers")
+}

@@ -129,7 +129,7 @@ fn each_send_by_the_group_number_has_its_own_check_right_before_it() {
 fn a_failed_check_sends_nothing_by_the_group_number() {
     let (mut child, stdin, _) = group_of_three();
     let pgid = child.id() as i32;
-    let root = StatedRoot::with_state(pgid as u32, || crate::signal::RootState::Reaped { own: false });
+    let root = StatedRoot::with_state(pgid as u32, || crate::signal::RootState::Reaped);
     let capture = crate::send_log::Capture::start();
     let err = kill_group(pgid, Some(&root), &mut Vec::new()).expect_err("a failed check is an error");
     let steps = capture.group_steps();
@@ -153,7 +153,7 @@ fn a_failed_check_sends_nothing_by_the_group_number() {
 fn a_terminate_whose_check_fails_says_nothing_was_sent() {
     let (mut child, stdin, _) = group_of_three();
     let pgid = child.id() as i32;
-    let root = StatedRoot::with_state(pgid as u32, || crate::signal::RootState::Reaped { own: false });
+    let root = StatedRoot::with_state(pgid as u32, || crate::signal::RootState::Reaped);
     let capture = crate::send_log::Capture::start();
     let sent = super::term_group_sent(pgid, Some(&root));
     let steps = capture.group_steps();

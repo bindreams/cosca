@@ -296,15 +296,14 @@ mod root_state {
     use crate::os_process::child::{Foreign, PeekOutcome};
     use crate::signal::RootState;
 
-    /// A child that is not ours to reap is never an own reap, whatever the verdict: `Reaped { own: true }`
-    /// is only what a handle that collected the exit itself reports.
+    /// A child that is not ours to reap reads `Reaped`, whatever the verdict.
     ///
-    /// Mutants: a reap by someone else is `Unknown`; a foreign verdict sets `own`.
+    /// Mutant: a reap by someone else is `Unknown`.
     #[skuld::test]
     fn a_foreign_reap_is_reaped() {
         for gone in [Foreign::Gone, Foreign::Other] {
             let state = RootState::of_peek(Ok(PeekOutcome::Foreign(gone)));
-            assert!(matches!(state, RootState::Reaped { own: false }), "{gone:?}: {state:?}");
+            assert!(matches!(state, RootState::Reaped), "{gone:?}: {state:?}");
         }
     }
 

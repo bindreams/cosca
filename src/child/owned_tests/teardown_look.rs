@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::io;
 use std::time::Duration;
 
-use super::teardown::{child_with_an_unreadable_exit, due_now, exit, fake, fire_on_block, id, slow_warns, PID};
+use super::teardown::{due_now, exit, fake, fire_on_block, id, slow_warns, PID};
 use crate::child::owned::teardown::{FrontLook, LookOutcome, Reach};
 use crate::child::owned::OwnedChild;
 use crate::error::{ChildFate, Error};
@@ -120,7 +120,7 @@ fn assert_outcome(torn: &FrontLook, fate: ChildFate, went_as: Went) {
 /// Mutant: the reach is asked first.
 #[skuld::test]
 fn a_front_that_has_exited_is_reaped_without_asking_where_it_is() {
-    let fake = fake().reaps([ReapAnswer::Reaped(exit())]);
+    let fake = fake().reaps([ReapAnswer::Exited(exit())]);
     let reach = FakeReach::answering(Ok(true));
     let torn = look(&fake, Some(&reach));
     assert_outcome(&torn, ChildFate::Reaped, Went::Ended);
@@ -160,7 +160,7 @@ fn a_running_front_the_kill_did_not_reach_is_left_running() {
 /// Mutants: it is left; the wait is a look; the wait is bounded.
 #[skuld::test]
 fn a_running_front_the_kill_reached_is_waited_for_and_reaped() {
-    let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
+    let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Exited(exit())]);
     let _fire = fire_on_block(&fake);
     let torn = look(&fake, Some(&FakeReach::answering(Ok(true))));
     assert_outcome(&torn, ChildFate::Reaped, Went::Ended);
@@ -263,7 +263,7 @@ fn a_front_whose_subtree_cannot_be_read_is_left_for_the_subtree_with_its_own_err
 /// Mutant: an unreadable subtree is looked at before the front.
 #[skuld::test]
 fn a_front_that_has_exited_is_reaped_though_its_subtree_cannot_be_read() {
-    let fake = fake().reaps([ReapAnswer::Reaped(exit())]);
+    let fake = fake().reaps([ReapAnswer::Exited(exit())]);
     let (torn, _) = look_logged(
         &fake,
         Some(id()),
@@ -281,10 +281,8 @@ mod worded {
     use super::super::teardown::warn_of;
     use super::super::teardown_lines::said_of;
     use super::*;
-    use crate::child::lifecycle::{Settlement, Wording};
+    use crate::child::lifecycle::Wording;
     use crate::child::owned::teardown::{Disposition, TeardownOutcome};
-    use crate::child::owned::ChildWaitOutcome;
-    use crate::os_process::child::ExitRecord;
 
     const WHY: &str = "the front is not in a cgroup this drop killed";
 
@@ -383,7 +381,7 @@ mod worded {
             assert_uncollected(
                 disposition,
                 Ok(None),
-                &fake().reaps([ReapAnswer::Reaped(exit())]),
+                &fake().reaps([ReapAnswer::Exited(exit())]),
                 false,
             );
             assert_uncollected(
@@ -398,8 +396,6 @@ mod worded {
                 &fake().reaps([ReapAnswer::Running, ReapAnswer::Foreign(Foreign::Gone)]),
                 false,
             );
-            let torn = child_with_an_unreadable_exit().look_at_front(Some(id()), Ok(None), None);
-            assert!(!crate::child::word_front(PID, &WHY, disposition, torn).uncollected());
         }
     }
 
@@ -547,50 +543,6 @@ mod worded {
         }
     }
 
-    /// A front the cgroup kill ended, whose reap consumed the zombie but read no exit record, is
-    /// worded as reaped with an unreadable record: not as a reap that failed, and with no hand-back
-    /// the caller has no child for. (A debug build asserts on the reap that produces it, so the
-    /// outcome is stated.)
-    ///
-    /// Mutant: an unreadable record is worded as a failed wait.
-    #[skuld::test]
-    fn a_front_reaped_with_an_unreadable_exit_record_is_worded_as_reaped() {
-        for disposition in BOTH {
-            let answer = Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 }));
-            let torn = FrontLook {
-                fate: ChildFate::Reaped,
-                look: LookOutcome::Ended(Settlement::new(answer, true)),
-            };
-            let worded = crate::child::word_front(PID, &WHY, disposition, torn);
-            assert_eq!(
-                warn_of(&worded),
-                Some(
-                    "elevation front pid 4242: reaped it after the kill; the child's exit record was unreadable \
-                     (si_code 7)"
-                ),
-                "{disposition:?}"
-            );
-        }
-    }
-
-    /// A front collected with its exit record unreadable at the first look is worded as reaped, without
-    /// a hand-back the caller has no child for.
-    ///
-    /// Mutant: a look that ended with an unreadable record is worded as a failure.
-    #[skuld::test]
-    fn a_front_collected_with_an_unreadable_exit_record_is_worded_without_a_hand_back() {
-        for disposition in BOTH {
-            let torn = child_with_an_unreadable_exit().look_at_front(Some(id()), Ok(None), None);
-            let worded = crate::child::word_front(PID, &WHY, disposition, torn);
-            let left = warn_of(&worded).expect("a warn to say");
-            assert!(left.contains("reaped it;") && left.contains("unreadable"), "{left}");
-            assert!(
-                !left.contains("failed") && !left.contains("handed back"),
-                "{disposition:?}: {left}"
-            );
-        }
-    }
-
     /// A front reaped with a status is said at `debug` as reaped, "after the kill" only after a wait
     /// that a kill sent elsewhere bounded.
     ///
@@ -601,13 +553,13 @@ mod worded {
             assert_debug(
                 disposition,
                 Ok(None),
-                &fake().reaps([ReapAnswer::Reaped(exit())]),
+                &fake().reaps([ReapAnswer::Exited(exit())]),
                 "elevation front pid 4242: reaped it",
             );
             assert_debug(
                 disposition,
                 Ok(Some(&FakeReach::answering(Ok(true)))),
-                &fake().reaps([ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Reaped(exit())]),
+                &fake().reaps([ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Exited(exit())]),
                 "elevation front pid 4242: reaped it after the kill",
             );
         }
@@ -764,10 +716,10 @@ fn a_front_waited_for_past_its_threshold_warns_once() {
     // reaps it.
     for (reaps, warned) in [
         (
-            vec![ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Reaped(exit())],
+            vec![ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Exited(exit())],
             1,
         ),
-        (vec![ReapAnswer::Running, ReapAnswer::Reaped(exit())], 0),
+        (vec![ReapAnswer::Running, ReapAnswer::Exited(exit())], 0),
     ] {
         let fake = fake().reaps(reaps);
         let _fire = fire_on_block(&fake);
@@ -780,16 +732,6 @@ fn a_front_waited_for_past_its_threshold_warns_once() {
         assert_outcome(&torn, ChildFate::Reaped, Went::Ended);
         assert_eq!(slow_warns(&records).len(), warned, "{records:?}");
     }
-}
-
-/// A front whose look consumed the zombie without an exit record is reaped: only its record is
-/// lost.
-///
-/// Mutant: a look that ended with an unreadable record is a failed look, `Unknown`.
-#[skuld::test]
-fn a_front_whose_look_found_the_exit_record_unreadable_is_reaped() {
-    let torn = child_with_an_unreadable_exit().look_at_front(Some(id()), Ok(None), None);
-    assert_eq!((went(&torn), &torn.fate), (Went::Ended, &ChildFate::Reaped), "{torn:?}");
 }
 
 /// A front left running is never waited for, so a threshold never has it look for the exit.
@@ -810,7 +752,7 @@ fn a_front_left_running_never_looks_for_the_exit() {
 #[skuld::test]
 fn a_look_teardown_counts_no_root_teardown() {
     let recorder = crate::child::owned::seams::record_root_teardowns();
-    let fake = fake().reaps([ReapAnswer::Reaped(exit())]);
+    let fake = fake().reaps([ReapAnswer::Exited(exit())]);
     let _ = look(&fake, None);
     assert_eq!(recorder.count(), 0);
 }

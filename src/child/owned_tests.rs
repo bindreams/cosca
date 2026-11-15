@@ -4,6 +4,9 @@
 //! The macOS tests that wait on a kqueue look at the wait's block from a
 //! [`block_probe`](crate::wait::block_probe) hook and assert there.
 
+#[cfg(unix)]
+#[path = "owned_tests/drop_reap.rs"]
+mod drop_reap;
 #[path = "owned_tests/fixtures.rs"]
 mod fixtures;
 #[cfg(target_os = "linux")]

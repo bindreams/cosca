@@ -69,12 +69,11 @@ fn a_failed_reap_stays_the_answer_whatever_it_holds() {
     assert_eq!(answer.to_string(), words);
 }
 
-/// An exit record is the status, and an unreadable one is the `InvalidData` every wait answers.
+/// An exit record is the status.
 ///
-/// Mutant: an unreadable record is answered as a status or as a foreign reap.
+/// Mutant: a record is answered as a foreign reap.
 #[skuld::test]
-fn an_exit_record_is_the_status_and_an_unreadable_one_invalid_data() {
-    use crate::error::Error;
+fn an_exit_record_is_the_status() {
     use crate::os_process::child::ExitRecord;
 
     let status = std::process::ExitStatus::default();
@@ -84,17 +83,6 @@ fn an_exit_record_is_the_status_and_an_unreadable_one_invalid_data() {
         Ok(ChildWaitOutcome::Exited(ExitRecord::Status(status))),
     );
     assert_eq!(answered.expect("an exit"), status);
-
-    let answer = super::graceful_status_of_reap(
-        4242,
-        "graceful_shutdown",
-        Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 })),
-    )
-    .expect_err("an unreadable record");
-    assert!(
-        matches!(&answer, Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidData),
-        "{answer:?}"
-    );
 }
 
 /// A zombie launchd holds has no status to collect: the macOS refusal, for both calls, with no source

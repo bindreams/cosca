@@ -522,28 +522,30 @@ impl Command {
     /// mechanism descendants are killed, not waited for. To wait explicitly, call
     /// [`kill_tree`](crate::Child::kill_tree) then [`wait_tree`](crate::Child::wait_tree).
     ///
-    /// **Once the root has been reaped, the drop does not kill by the root's number, and logs a
-    /// `warn` naming what it skipped.** On Linux 6.9+ a process group is the exception: the root's
+    /// **The drop is where the root is reaped**, armed or not; see [`Child::wait`](crate::Child::wait)
+    /// for what the zombie costs until then. A root that still runs is killed (armed) or left
+    /// (`kill_on_drop(false)`). On Linux a root that has exited without a `wait` is reaped by the
+    /// drop too, armed or not. On macOS the consume is by the root's number, so the handle consumes
+    /// only an exit its own wait saw: an armed drop's teardown waits for the root, so it consumes
+    /// one that had exited unwaited too, and a disarmed drop leaves such a zombie.
+    ///
+    /// **A root reaped by someone else is not killed by its number, and the drop logs a `warn`
+    /// naming what it skipped.** On Linux 6.9+ a process group is the exception: the root's
     /// pidfd names the group exactly, whoever reaped the root, so the drop kills the group while it
     /// has a member left, and sends nothing and logs no skipped kill once it has none. A root whose
     /// handle cannot say whether it was reaped has its group killed the same way while the group has
     /// a member.
     ///
-    /// The root is reaped by [`wait`](crate::Child::wait), by a
-    /// reaper outside the handle, or (on the sync handle) by the spawn itself, which reaps a root
-    /// that has already exited. Nothing pins the number after the reap, so a `killpg` to it could
-    /// hit an unrelated process that reused it. That covers a process group, and a macOS fd
+    /// The reaper is one outside the handle: nothing pins the number after its reap, so a `killpg` to
+    /// it could hit an unrelated process that reused it. That covers a process group, and a macOS fd
     /// marker's group and its walk from the root's pid; the fd marker still sweeps the descendants
     /// that hold the marker, which it names by identity. A tree walk is its own guard: it proves its
     /// root still holds its pid, so a reaped root walks nothing (on macOS it is skipped for a root
     /// launchd holds or whose handle cannot say). A cgroup and a Job Object name their tree without
-    /// the number, and still kill. A descendant that outlived the reaped root keeps running: call
-    /// [`kill_tree`](crate::Child::kill_tree) **before** `wait()` to end it; once it has killed the
-    /// tree completely, the skip is logged at `debug`. A root reaped by someone else is neither
-    /// killed nor waited for by its number either. The evidence is the child's own handle (on Linux
-    /// its pidfd), or the number no longer reading as the root. If the handle cannot say (a failed
-    /// peek), the same kills are skipped and a warning says so; the root itself is still killed
-    /// through its handle, and a tree walk walks as usual.
+    /// the number, and still kill. A descendant that outlived a root reaped elsewhere keeps running.
+    /// The evidence is the child's own handle (on Linux its pidfd), or the number no longer reading as
+    /// the root. If the handle cannot say (a failed peek), the same kills are skipped and a warning
+    /// says so; the root itself is still killed through its handle, and a tree walk walks as usual.
     ///
     /// **On macOS, a root whose zombie launchd holds** (its tracer died, so this process no longer
     /// pins its pid) is neither signalled, waited for nor reaped by the drop, which logs one `warn`
@@ -619,7 +621,9 @@ impl Command {
     /// terminated and reaped before it runs, and the error names the Job Object.
     ///
     /// # A child reaped by something else
-    /// Another reaper in the process (`SIGCHLD` set to `SIG_IGN`, `waitpid(-1, …)`) may reap the
+    /// [`wait`](crate::Child::wait) reaps nothing: the root stays a zombie, which pins its number,
+    /// until its handle drops, so a tree call after `wait` is as exact as before it. Another reaper in
+    /// the process (`SIGCHLD` set to `SIG_IGN`, `waitpid(-1, …)`) may reap the
     /// child. A cgroup kill stays exact (only the exit status is lost), and so, on Linux 6.9+, does a
     /// process group's, through the root's pidfd. Below 6.9 and on macOS, kills named by the root's
     /// pid (a process group; a macOS fd marker's group and walk) are skipped on evidence of a

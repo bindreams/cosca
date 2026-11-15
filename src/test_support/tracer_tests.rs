@@ -478,6 +478,8 @@ fn attach_refuses_a_reaped_tracee(#[fixture(tracer_group)] _group: &Group) {
     drop(stdin);
     let status = tracee.wait().expect("wait for the tracee");
     assert!(status.success(), "expected the tracee's own clean exit, got {status:?}");
+    // The wait leaves the zombie to the handle's drop: take it behind the handle's back.
+    crate::test_child::reaped_elsewhere::reap_behind(tracee.pid());
     let pending = super::start(Mode::Auto);
     let message = panic_of(|| drop(pending.attach(&mut tracee)));
     assert!(message.contains("not this process's unreaped child"), "{message}");

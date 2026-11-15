@@ -28,13 +28,13 @@ new code follows this document, not the old shape.
 
 A question about a _pid_ and a question about a _process you hold_ go to different places:
 
-| Layer                         | Is                                                                                                                                  | Answers                                                                                                         |
-| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| identity module (`ProcessId`) | who a process is: pid plus key (Linux 6.9+: the pidfd's inode, else the start time). `Copy`, serializable                           | questions about a number at the time of the read: `exists`, `is_alive`, `created_at`, `parent`, `children`      |
-| `OsProcess`                   | one black box per OS: any process, named so that pid reuse cannot misdirect an act on it (pidfd, process handle, macOS audit token) | signal, "has it exited, and if not, what to wait on". Never blocks, never caches                                |
-| `OsChild: OsProcess`          | a process this process is the parent of                                                                                             | what only the parent gets: the exit status, the reap, the process group (Linux)                                 |
-| `OwnedChild`                  | the parent's policy, written once                                                                                                   | reap once, "already reaped is gone", whether the root is still ours, holding off reaps across a check-then-send |
-| drivers                       | sync and async                                                                                                                      | the one wait loop: look, else wait on what the look returned                                                    |
+| Layer                         | Is                                                                                                                                  | Answers                                                                                                    |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| identity module (`ProcessId`) | who a process is: pid plus key (Linux 6.9+: the pidfd's inode, else the start time). `Copy`, serializable                           | questions about a number at the time of the read: `exists`, `is_alive`, `created_at`, `parent`, `children` |
+| `OsProcess`                   | one black box per OS: any process, named so that pid reuse cannot misdirect an act on it (pidfd, process handle, macOS audit token) | signal, "has it exited, and if not, what to wait on". Never blocks, never caches                           |
+| `OsChild: OsProcess`          | a process this process is the parent of                                                                                             | what only the parent gets: the exit status, the reap, the process group (Linux)                            |
+| `OwnedChild`                  | the parent's policy, written once                                                                                                   | observe the exit (a wait reaps nothing), reap once when the handle drops, whether the root is still ours   |
+| drivers                       | sync and async                                                                                                                      | the one wait loop: look, else wait on what the look returned                                               |
 
 The identity module asks the kernel through one interface, `Kernel` (`HostKernel` makes the calls;
 tests pass a `FakeKernel` of stated answers). The trait exists on every platform, so shared code
@@ -182,16 +182,14 @@ In order:
    `graceful_shutdown` and `graceful_shutdown_tree` are each one `async fn` (`shutdown_lone` and
    `shutdown_tree`, in `child/graceful/shutdown.rs`) over a `Waits` trait of their waits: the sync
    `Child` runs them with blocking waits through `run_ready` (one poll, a panic on `Pending`), and
-   the async `Child` awaits them. The root's identity read by number, after our own reap, is
-   `OsChild::number_holder`. The OS box reads the number through the kernel it owns
-   (`OsChild::kernel()`). `OwnedChild` asks the box, and a policy that holds a `Root` asks the root
-   (`Root::number_holder`, which `ReapHold` answers through its child). A test states the read on
-   the fake of the layer it holds, as it states peeks. For a spawned child that is its
-   `FakeProcess`: `number_reads` answers one read each, and `number_reads_always` answers every
-   later one. For a stated root it is `StatedRoot::holding`. Only the identity read's own tests
-   state `FakeKernel` rows for it, and the one helper that gives a policy test a real read's
-   cause: `test_support::emfile_number_read` runs `ProcessId::of_with` over a refused
-   `pidfd_open` row.
+   the async `Child` awaits them. The root's identity read by number, which a drop uses to catch a
+   reap by another that the handle cannot report, is `OsChild::number_holder`. The OS box reads the
+   number through the kernel it owns (`OsChild::kernel()`), and `OwnedChild` asks the box. A test
+   states the read on the fake of the layer it holds, as it states peeks. For a spawned child that
+   is its `FakeProcess`: `number_reads` answers one read each, and `number_reads_always` answers
+   every later one. Only the identity read's own tests state `FakeKernel` rows for it, and the one
+   helper that gives a policy test a real read's cause: `test_support::emfile_number_read` runs
+   `ProcessId::of_with` over a refused `pidfd_open` row.
 5. **Spawn:** produces an `OsChild`, its pipes, its containment and its elevation, for both halves.
    On Linux the one fork that execs is `child::spawn::fork_exec` ([#383](https://github.com/bindreams/cosca/issues/383)
    S2): a clone kind (vfork without `CLONE_VM`, or plain), the env block built in the parent, the

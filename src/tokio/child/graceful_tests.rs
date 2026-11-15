@@ -536,13 +536,12 @@ async fn members_remain_still_reaps_an_already_exited_root(
         !term_fault::kill_tree_armed(),
         "the sweep must have consumed the forced-failure seam"
     );
-    assert_eq!(
-        id.exists(),
-        crate::identity::Existence::Gone,
-        "an already-exited root must be best-effort reaped even when the sweep fails"
+    assert!(
+        child.inner.proc.exit_seen(),
+        "an already-exited root's exit must be seen even when the sweep fails"
     );
     // The forced sweep failure was a stub, so the TERM-ignoring descendant is still alive, and the
-    // call above reaped the root.
+    // call above saw the root's exit.
     swept(&mut child);
     // The descendant's stdin is released before the drain wait: it ends by itself when the sweep
     // sent nothing, and the wait cannot be left unbounded.
@@ -569,9 +568,10 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_i
     .await;
 }
 
-/// A reaped root's group is not signalled by its number. The TERM-ignoring member keeps the group's
-/// number its own while the call runs. On macOS the tree is the fd marker: the drain verdict is
-/// `AllMarkersClosed` or members remain, never proof to skip the sweep, and the root probe follows.
+/// The root whose exit the shutdown saw is still a zombie that pins its group's number, so the group
+/// is signalled by it, and the TERM-ignoring member dies. On macOS the tree is the fd marker: the drain
+/// verdict is `AllMarkersClosed` or members remain, never proof to skip the sweep, and the root probe
+/// follows.
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_group() {
@@ -580,10 +580,9 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_i
         // Below Linux 6.9 a group is signalled by its number alone.
         #[cfg(target_os = "linux")]
         let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
-        let err = child
+        child
             .send_kill_tree()
-            .expect_err("a reaped root's group is not signalled by its number");
-        assert!(matches!(err, crate::error::Error::Unassessable { .. }), "got {err:?}");
+            .expect("the root's zombie pins the group's number: the group is killed by it");
     })
     .await;
 }

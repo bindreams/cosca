@@ -48,10 +48,23 @@ pub(crate) trait OsChild: OsProcess {
     /// time.
     fn peek(&self) -> Result<PeekOutcome, Error>;
 
-    /// The waiter's look: prepare what it will wait on, then consume the exit record if there is
-    /// one (never a stop). [`TryReapOutcome::Running`] carries the wait, which the caller waits on
-    /// before it calls again. Only the one waiter that holds the reap calls it.
-    fn try_reap(&self) -> Result<TryReapOutcome<'_>, Error>;
+    /// The waiter's look: prepare what it will wait on, then read the exit record if there is one
+    /// (never a stop), **leaving it in place**: the zombie stays this process's, and keeps its
+    /// number. [`TryObserveOutcome::Running`] carries the wait, which the caller waits on before it
+    /// calls again. Only the one waiter that holds the wait calls it.
+    fn try_observe(&self) -> Result<TryObserveOutcome<'_>, Error>;
+
+    /// Consume the exit record if there is one, once and without blocking: the end of the child's
+    /// handle, which is where every reap of a child happens. [`Reap::Running`] when there was
+    /// nothing to consume (the child has not exited, or a tracer holds its zombie).
+    #[cfg(unix)]
+    fn try_reap(&self) -> Result<crate::wait::exit_only::Reap, Error>;
+
+    /// Whether [`try_reap`](Self::try_reap) names this child exactly (a pidfd), so it can only take
+    /// this child's exit record. `false`: it consumes by the child's number, a check and not a pin,
+    /// so the handle asks it only for an exit its own wait saw.
+    #[cfg(unix)]
+    fn exact_consume(&self) -> bool;
 }
 
 /// What a kill through a handle may be refused for. The handle's constructor decides: it knows the
@@ -79,11 +92,11 @@ pub(crate) enum KillRefusal {
     Any,
 }
 
-/// What [`OsChild::try_reap`] did.
+/// What [`OsChild::try_observe`] did.
 #[derive(Debug)]
-pub(crate) enum TryReapOutcome<'a> {
-    /// The exit record, consumed.
-    Reaped(ExitRecord),
+pub(crate) enum TryObserveOutcome<'a> {
+    /// The exit record, left in place.
+    Exited(ExitRecord),
     /// Not exited: wait on this, then look again.
     Running(WaitFor<'a>),
     /// An exit was seen but there is no record to consume, and nothing will signal the change (a
@@ -104,7 +117,8 @@ pub(crate) enum TryReapOutcome<'a> {
 pub(crate) enum ExitRecord {
     Status(ExitStatus),
     /// A consuming `waitid` that should have handed back a zombie's exit record gave another
-    /// `si_code`. A contract breach, but the zombie is consumed, so it is a cached outcome.
+    /// `si_code`. A contract breach, but the zombie is consumed, so it is a cached outcome. Only the
+    /// consuming reap at the end of a handle can see one.
     #[cfg_attr(windows, allow(dead_code, reason = "Windows has no `waitid` records"))]
     Unreadable {
         si_code: i32,

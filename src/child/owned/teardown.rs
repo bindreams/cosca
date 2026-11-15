@@ -170,7 +170,7 @@ impl FrontLook {
 /// warn that says so, and there is no outcome of one without it. That is not the
 /// [`fate`](Self::fate)'s to say: a refused kill whose look failed is `Unknown`, and a kill whose
 /// wait failed is `Killed`, and both are uncollected, while a `Killed` child someone else reaped is
-/// not, and neither is one this teardown reaped whose exit record was unreadable.
+/// not.
 ///
 /// The teardown logs none of the clause: the caller logs it at its level or folds it into its own
 /// warn, and takes it out of the outcome to do so ([`take_warn`](Self::take_warn),
@@ -399,7 +399,8 @@ pub(crate) enum Past {
 pub(crate) enum RootKill {
     /// The root's kill was sent: its reap is pending, and the root may be a zombie still.
     Sent,
-    /// This handle had already reaped the root, so nothing was sent and nothing is pending.
+    /// The root's exit is already recorded (`exit_seen`): the zombie is consumed at drop, and nothing
+    /// was sent or is pending.
     Reaped,
     /// The root's kill was refused. One look settled the root (it is still running, or gone), unless
     /// a tree kill through [`Kill::tree`] reached it: its reap is then pending, as after a sent kill,
@@ -564,8 +565,8 @@ impl OwnedChild {
                     disposition,
                     RootKill::Sent,
                 );
-                // The reap is recorded for good: asking again answers it, and blocks on nothing.
-                if self.is_reaped() {
+                // The exit is recorded for good: asking again answers it, and blocks on nothing.
+                if self.exit_seen() {
                     let settlement = Settlement::new(self.wait(None), wait.pending.reached);
                     return BeginOutcome::Done(wait.outcome(self, &settlement));
                 }

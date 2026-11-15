@@ -140,6 +140,110 @@ fn a_child_that_opted_out_is_not_handed_back() {
     assert_eq!(id.is_alive(), Liveness::Alive, "nothing was sent to it");
 }
 
+/// What a disarmed teardown says of the child, from the peek at its root, which the fake answers.
+/// An exit is `Reaped` where the handle's end consumes it (always on Windows, where there is no
+/// zombie; on Unix where the consume names the child exactly) and `Killed` where it only leaves the
+/// zombie; another's reap is `Gone`; no exit and a failed peek are `Running`, and the failed peek is
+/// logged at debug.
+///
+/// Mutants: an exit says `Running`, or ignores whether the end consumes; a foreign reap says
+/// `Running` or `Reaped`; a failed peek says `Unknown` or says nothing.
+#[skuld::test]
+fn a_disarmed_teardown_names_the_fate_the_peek_at_the_root_shows() {
+    use crate::os_process::child::{ExitRecord, Foreign, PeekOutcome};
+    use crate::os_process::fake::PeekAnswer;
+
+    crate::log_capture::install();
+    #[cfg(unix)]
+    let exacts = [true, false];
+    #[cfg(not(unix))]
+    let exacts = [true];
+    // `None`: the fate is `Running` with the child's identity.
+    type Row = (&'static str, fn() -> PeekAnswer, Option<fn(bool) -> ChildFate>, bool);
+    let rows: [Row; 5] = [
+        (
+            "an exit",
+            || Ok(PeekOutcome::Exit(ExitRecord::Status(Default::default()))),
+            Some(|consumes| if consumes { ChildFate::Reaped } else { ChildFate::Killed }),
+            false,
+        ),
+        (
+            "a foreign reap: gone",
+            || Ok(PeekOutcome::Foreign(Foreign::Gone)),
+            Some(|_| ChildFate::Gone),
+            false,
+        ),
+        (
+            "a foreign reap: another process",
+            || Ok(PeekOutcome::Foreign(Foreign::Other)),
+            Some(|_| ChildFate::Gone),
+            false,
+        ),
+        ("no exit", || Ok(PeekOutcome::Running), None, false),
+        (
+            "a failed peek",
+            || Err(std::io::Error::other("forced peek failure")),
+            None,
+            true,
+        ),
+    ];
+    for exact in exacts {
+        for (name, answer, expected, logged) in &rows {
+            let (mut child, stdin) = held_uncontained_blocker(false);
+            let id = child.id().expect(crate::test_child::IDENTITY_READ);
+            child.proc.script_over(|fake| {
+                let fake = fake.peeks([answer()]);
+                #[cfg(unix)]
+                let fake = fake.with_exact_consume(exact);
+                fake
+            });
+            let mark = crate::log_capture::mark();
+
+            let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::Leave);
+
+            let want = expected.map_or(ChildFate::Running { id: Some(id) }, |fate_of| fate_of(exact));
+            assert_eq!(fate, want, "{name} (exact consume: {exact})");
+            assert!(handed_back.is_none(), "{name}: the teardown handed the child back");
+            let said = crate::log_capture::records_since_on_current_thread(mark, "could not look at it");
+            match logged {
+                true => {
+                    let [(level, text)] = &said[..] else {
+                        panic!("{name}: one record expected: {said:?}");
+                    };
+                    assert_eq!(*level, log::Level::Debug, "{text}");
+                    assert!(text.contains("forced peek failure"), "{text}");
+                }
+                false => assert_eq!(said, [], "{name} logged"),
+            }
+        }
+    }
+}
+
+/// A child that opted out of `kill_on_drop` and has exited, with no wait of the handle having seen
+/// it, is not said to be running. Linux's drop consumes its exit (`Reaped`); macOS's leaves the
+/// zombie, which is dead and not collected (`Killed`).
+///
+/// Mutant: the fate is `Running` whenever the handle's own wait has seen no exit.
+#[cfg(unix)]
+#[skuld::test]
+fn a_disarmed_teardown_of_an_exited_child_the_wait_never_saw_does_not_say_it_runs() {
+    let (child, stdin) = held_uncontained_blocker(false);
+    let pid = child.pid();
+    drop(stdin);
+    crate::test_child::wait_until_zombie(pid);
+
+    let (fate, handed_back) = tear_down_holding(child, (), Disposition::Leave);
+
+    #[cfg(target_os = "linux")]
+    assert_eq!(fate, ChildFate::Reaped);
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(fate, ChildFate::Killed);
+        crate::test_child::reaped_elsewhere::reap_behind(pid);
+    }
+    assert!(handed_back.is_none(), "the teardown handed the child back");
+}
+
 /// A child that has exited was reaped by the look after the refused kill; there is nothing to give
 /// back.
 ///
@@ -276,7 +380,7 @@ fn a_job_contained_child_whose_kill_is_refused_and_look_shows_the_exit_is_not_ha
     let (mut child, stdin, _id) = crate::test_child::live_blocker();
     child.proc.script_over(|f| {
         f.signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))])
-            .reaps([ReapAnswer::Reaped(ExitRecord::Status(Default::default()))])
+            .reaps([ReapAnswer::Exited(ExitRecord::Status(Default::default()))])
     });
 
     let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);

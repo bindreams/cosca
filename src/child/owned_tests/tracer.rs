@@ -200,9 +200,10 @@ mod macos {
         assert_killed(wait_status(&b.owned));
     }
 
-    /// A child this process traces is reaped fully: XNU needs two reaps, because the first only
-    /// hands the zombie back to this same process (`reap_child_locked` in xnu-12377.121.6's
-    /// `kern_exit.c`), and the second peek consumes it.
+    /// A child this process traces is reaped fully by the end of its handle: XNU needs two reaps,
+    /// because the first only hands the zombie back to this same process (`reap_child_locked` in
+    /// xnu-12377.121.6's `kern_exit.c`), and the second peek consumes it. The wait before it
+    /// consumes nothing.
     ///
     /// Mutant: one consuming reap leaves the zombie, which the final peek still finds.
     #[skuld::test]
@@ -220,12 +221,15 @@ mod macos {
         kill_stopped(&b);
         step("wait");
         assert_killed(wait_status(&b.owned));
+        let pid = b.pid;
+        step("drop");
+        drop(b);
         // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let r = unsafe {
             libc::waitid(
                 libc::P_PID,
-                b.pid as libc::id_t,
+                pid as libc::id_t,
                 &mut info,
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
@@ -234,8 +238,8 @@ mod macos {
         assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
     }
 
-    /// A refused identity read in the second reap neither panics nor leaves the state `N`: the
-    /// first reap's status is kept, and one `warn` names the pid.
+    /// A refused identity read in the second reap, at the end of the handle, neither panics nor
+    /// touches the state: the wait's status is kept, and one `warn` names the pid.
     ///
     /// Mutant: a second reap that panics on a refused identity read.
     #[skuld::test]
@@ -257,9 +261,15 @@ mod macos {
         kill_stopped(&b);
         assert_killed(wait_status(&b.owned));
         assert!(
-            matches!(b.owned.lock().state, State::E(ExitRecord::Status(_))),
-            "the first reap's status is cached"
+            matches!(b.owned.lock().state, State::Exited(ExitRecord::Status(_))),
+            "the wait's status is cached"
         );
+        assert_eq!(
+            crate::log_capture::levels_since(mark, &marker),
+            Vec::<log::Level>::new(),
+            "the wait made no second reap"
+        );
+        drop(b);
         assert_eq!(crate::log_capture::levels_since(mark, &marker), vec![log::Level::Warn]);
     }
 }

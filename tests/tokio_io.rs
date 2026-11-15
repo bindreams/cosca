@@ -360,10 +360,9 @@ async fn async_drop_tears_down_a_contained_tree() {
     common::assert_members_torn_down(vec![(root, "the root"), (grand, "the grandchild")]);
 }
 
-// The mechanisms that still kill after the root is reaped: a macOS fd marker's holder sweep and a
-// Windows Job Object. A cgroup does on Linux, and a process group on Linux 6.9+, through the root's
-// pidfd, and not below 6.9: both are the library's tests. This binary cannot reach the seams that
-// release the tree at the kill, and a drop that killed nothing waits for it for ever.
+// The mechanisms that still kill after the root has exited and its wait returned: a macOS fd
+// marker's holder sweep and a Windows Job Object. This binary cannot reach the seams that release
+// the tree at the kill, and a drop that killed nothing waits for it for ever.
 #[cfg(feature = "tokio")]
 #[cfg(any(windows, target_os = "macos"))]
 #[skuld::test]
@@ -374,8 +373,8 @@ async fn async_drop_after_wait_still_tears_down_the_tree() {
 #[cfg(feature = "tokio")]
 #[cfg(any(windows, target_os = "macos"))]
 async fn drop_after_wait_still_tears_down_the_tree() {
-    // After awaiting the root's exit it is already reaped, so the drop has no root to signal and
-    // the tree teardown must come from attached.hard_kill() — proven by how the grandchild ended.
+    // After awaiting the root's exit the drop has no root left to signal,
+    // so the tree teardown must come from attached.hard_kill() — proven by how the grandchild ended.
     // The drop stays the killer: `wait_tree` never kills, so waiting on it first would hang.
     common::install_log_capture();
     let (mut child, root, grand) = common::spawn_released_tree_async().await;
@@ -389,9 +388,9 @@ async fn drop_after_wait_still_tears_down_the_tree() {
     root.sock
         .shutdown(std::net::Shutdown::Both)
         .expect("release the root so it exits");
-    child.wait().await.expect("wait reaps the root");
+    child.wait().await.expect("wait sees the root exit");
     assert_eq!(root_id.is_alive(), cosca::identity::Liveness::Dead, "root exited");
-    drop(child); // root already reaped → nothing to signal; attached.hard_kill must still kill the grandchild
+    drop(child); // root already exited → nothing to signal; attached.hard_kill must still kill the grandchild
     drop(root);
     common::assert_members_torn_down(vec![(grand, "the grandchild, after the root was waited")]);
 }

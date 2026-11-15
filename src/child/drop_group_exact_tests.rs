@@ -1,6 +1,8 @@
 //! Linux: the drop and a failed elevated spawn's cleanup, for a process group whose root is reaped.
 //! On 6.9+ the root's pidfd names the group exactly, whoever reaped the root, so they decide as
-//! `kill_tree` does (`group_exact_tests`); below 6.9 nothing goes out by the group's number.
+//! `kill_tree` does (`group_exact_tests`); below 6.9 nothing goes out by the number of a group whose
+//! root another reaper took, while a root this handle's wait saw exit is a zombie that pins it, so
+//! its group is killed by the number.
 
 use crate::child::group_exact_tests::root_with_a_member;
 use crate::send_log::{assert_group_signalled_first_through_the_pidfd, Capture};
@@ -68,8 +70,8 @@ fn kills_the_group_left_behind(reap: Reap, teardown: Teardown) {
     member.assert_killed();
 }
 
-/// Below 6.9 the old behaviour holds: a reaped root's group is sent nothing, and its member lives
-/// on.
+/// Below 6.9 a root reaped by someone else names no group: nothing goes out by its number, and its
+/// member lives on.
 fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
     let (child, member) = root_with_a_member();
     reap_root(&child, reap);
@@ -83,6 +85,28 @@ fn below_6_9_sends_nothing_to_the_group(reap: Reap, teardown: Teardown) {
     assert_eq!(groups.killed(), Vec::<i32>::new(), "no kill of the group by its number");
     assert_eq!(steps, [], "nothing was sent to the group");
     member.assert_survived();
+}
+
+/// Below 6.9 a root this handle's wait saw exit is still a zombie that pins its group's number: the
+/// teardown kills the group by that number, and its member dies.
+///
+/// Mutant: a wait consumes the zombie, so the number is unproven and nothing is sent.
+fn below_6_9_kills_the_group_of_a_waited_root_by_its_number(teardown: Teardown) {
+    let (child, member) = root_with_a_member();
+    reap_root(&child, Reap::Own);
+    let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let capture = Capture::start();
+    tear_down(child, teardown);
+    let steps = capture.group_steps();
+    drop(old_kernel);
+    assert!(
+        steps.contains(&crate::send_log::GroupStep::Group(
+            crate::send_log::Route::Number,
+            libc::SIGKILL
+        )),
+        "the group was killed by its number: {steps:?}"
+    );
+    member.assert_killed();
 }
 
 /// 6.9+: a reaped root whose group has no member left has no tree left behind: the teardown sends
@@ -128,8 +152,8 @@ fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_kills_the_group_left_be
 }
 
 #[skuld::test]
-fn a_drop_after_its_own_wait_below_6_9_sends_nothing_to_the_group() {
-    below_6_9_sends_nothing_to_the_group(Reap::Own, Teardown::Drop);
+fn a_drop_after_its_own_wait_below_6_9_kills_the_group_by_its_number() {
+    below_6_9_kills_the_group_of_a_waited_root_by_its_number(Teardown::Drop);
 }
 
 #[skuld::test]
@@ -138,8 +162,8 @@ fn a_drop_after_a_foreign_reap_below_6_9_sends_nothing_to_the_group() {
 }
 
 #[skuld::test]
-fn a_failed_elevated_spawns_cleanup_after_its_own_wait_below_6_9_sends_nothing_to_the_group() {
-    below_6_9_sends_nothing_to_the_group(Reap::Own, Teardown::FinishElevated);
+fn a_failed_elevated_spawns_cleanup_after_its_own_wait_below_6_9_kills_the_group_by_its_number() {
+    below_6_9_kills_the_group_of_a_waited_root_by_its_number(Teardown::FinishElevated);
 }
 
 #[skuld::test]
@@ -148,27 +172,11 @@ fn a_failed_elevated_spawns_cleanup_after_a_foreign_reap_below_6_9_sends_nothing
 }
 
 #[skuld::test]
-fn a_drop_after_its_own_wait_sends_nothing_to_an_empty_group_and_does_not_warn(
-    #[fixture(pidfd_group_signal)] _group: &Group,
-    #[fixture(stray_signal)] _stray: &Group,
-) {
-    sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::Own, Teardown::Drop);
-}
-
-#[skuld::test]
 fn a_drop_after_a_foreign_reap_sends_nothing_to_an_empty_group_and_does_not_warn(
     #[fixture(pidfd_group_signal)] _group: &Group,
     #[fixture(stray_signal)] _stray: &Group,
 ) {
     sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::Foreign, Teardown::Drop);
-}
-
-#[skuld::test]
-fn a_failed_elevated_spawns_cleanup_after_its_own_wait_reports_no_skip_for_an_empty_group(
-    #[fixture(pidfd_group_signal)] _group: &Group,
-    #[fixture(stray_signal)] _stray: &Group,
-) {
-    sends_nothing_to_an_empty_group_and_reports_no_skip(Reap::Own, Teardown::FinishElevated);
 }
 
 #[skuld::test]

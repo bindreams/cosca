@@ -75,12 +75,27 @@ impl Child {
         }
     }
 
-    /// What became of a child whose teardown a `kill_on_drop(false)` leaves.
+    /// What became of a child whose teardown a `kill_on_drop(false)` leaves, from a peek at the root:
+    /// an exit is the handle's to consume at its drop (`Reaped`), but where that drop consumes only
+    /// an exit its own wait saw, an exit it did not see stays a zombie, dead and uncollected
+    /// (`Killed`). Another's reap is `Gone`; a root that shows no exit may still run, and so may
+    /// one whose peek failed (the failure is logged at debug): the child is left alone either way,
+    /// so `Running { id }` hands the caller its identity where `Unknown` would not.
     fn fate_of_a_disarmed_child(&self) -> crate::error::ChildFate {
-        if self.proc.is_reaped() {
-            crate::error::ChildFate::Reaped
-        } else {
-            crate::error::ChildFate::Running { id: self.id }
+        use crate::error::ChildFate;
+        use crate::os_process::child::PeekOutcome;
+        match self.proc.peek() {
+            Ok(PeekOutcome::Exit(_)) if self.proc.consumes_at_drop() => ChildFate::Reaped,
+            Ok(PeekOutcome::Exit(_)) => ChildFate::Killed,
+            Ok(PeekOutcome::Foreign(_)) => ChildFate::Gone,
+            Ok(PeekOutcome::Running) => ChildFate::Running { id: self.id },
+            Err(e) => {
+                log::debug!(
+                    "a disarmed child's teardown could not look at it, so it may still run: {}",
+                    crate::error::Report(&e)
+                );
+                ChildFate::Running { id: self.id }
+            }
         }
     }
 
@@ -218,16 +233,14 @@ impl Child {
             crate::elevation::front::Gate::CgroupOnly(front) => Some(front),
             _ => None,
         };
-        // The hold names the root's group. The handle owns the child outright here, so no reap
-        // can land; it is dropped before anything below locks the child.
-        let held = self.proc.hold(self.pid());
+        // The root handle names the root's group.
+        let root_handle = self.proc.hold(self.pid());
         // The kill decides on the view's look, the one its report is worded from.
         // The drop sends alone: the wait for what it killed is the root's reap and the leaf's drain.
         let kill = {
-            let seen = crate::containment::Seen::new(&held, view.look());
+            let seen = crate::containment::Seen::new(&root_handle, view.look());
             self.tree.send_kill(Some(&seen))
         };
-        drop(held);
         kill.log_skip(&view);
         // A live member refused, or couldn't be confirmed — visible, not silently
         // discarded, on the RAII teardown path most callers actually hit. A mechanism
@@ -235,15 +248,11 @@ impl Child {
         // reported, never asserted on.
         let skipped = kill.left_undone(&view);
         // A reaped root is neither killed nor waited for: its number may name another child by now.
-        // Neither is a root this process does not pin (macOS: launchd holds its zombie). Its fate is
-        // `Reaped` by this handle's own reap, else `Gone`: nothing was signalled, so a root someone
-        // else reaped or launchd holds is `Gone`, as the classifier has it.
+        // Neither is a root this process does not pin (macOS: launchd holds its zombie). The view says
+        // the root is another's to have reaped, never this handle's (it consumes at its drop), and
+        // nothing was signalled, so its fate is `Gone`, as the classifier has it.
         if view.leaves_root_alone() {
-            let torn = TeardownOutcome::collected(if self.proc.is_reaped() {
-                ChildFate::Reaped
-            } else {
-                ChildFate::Gone
-            });
+            let torn = TeardownOutcome::collected(ChildFate::Gone);
             let parts = DropParts {
                 view,
                 skipped,

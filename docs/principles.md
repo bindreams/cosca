@@ -111,7 +111,9 @@ context ([tokio shutdown.rs]).
 With `kill_on_drop` set, a `Drop` kills the contained tree and the root through their handles, then
 blocks until the root's exit shows through its handle and is collected, and a cgroup leaf has
 drained and been removed. The async `Child` holds the sync one, so its `Drop` is the sync `Drop`.
-The collect is the root handle's own reap (principle 4). It waits in place on the dropping thread,
+The collect is the root handle's own reap (principle 4): its exit is observed first, with a
+`waitid(.., WNOWAIT)` that consumes nothing, and the one consuming `waitid` is the end of the
+handle's `OwnedChild`, armed or not, which never blocks. It waits in place on the dropping thread,
 on every runtime, never in `block_in_place`: tokio panics in it inside a `LocalSet`, even on a
 multi-thread runtime, and offers no way to ask first. Once the wait passes 1 s, the drop logs one
 `warn` naming the root's pid, and keeps waiting. The 1 s is for that message only: no wait ends on
@@ -158,6 +160,14 @@ second write is a different teardown's (a `kill_tree()` or `send_kill_tree()`, t
 root a drop gives up is still the handle's unreaped child: a zombie once it exits, since cosca
 starts no reaper (principle 1).
 
+A disarmed drop (`detach()`, `kill_on_drop(false)`, a `Command::status`, `output` or `read` of such a
+command) reaps the root the same way: that consume never blocks, and a root that still runs is
+left. On Linux (the pidfd names the child exactly) it reaps a root that has exited whether or not a
+`wait` saw it. On macOS the consume is by the root's number, a check and not a pin, so the handle
+consumes only the exit its own `wait` saw. An armed drop's teardown waits for the root, so it
+consumes a root that had exited unwaited too; a disarmed drop leaves a root whose exit its handle's
+`wait` never saw as it was before the handle consumed anything.
+
 On evidence of a foreign reap at drop time, armed or not (`detach()` and `kill_on_drop(false)`
 included), the drop neither signals nor waits for the root by its number, and logs what it skipped
 as principle 7 says (principle 5).
@@ -167,7 +177,7 @@ On Windows the `Drop` terminates the tree and the root, then waits for the root.
 An [`Unreaped`](../src/child/owned/unreaped.rs) a tokio call hands back does not block when it is
 dropped: it kills the child once more (an elevation front is sent none), looks once without
 waiting, and warns naming its pid (a refused kill warns regardless). A child it did not reap is
-given up, unreaped. An `Unreaped` from a sync call waits, as the `Drop` does.
+given up (a zombie once it exits). An `Unreaped` from a sync call waits, as the `Drop` does.
 
 **Why:** a kill that landed makes the wait as bounded as the kernel makes it, whether the drop or an
 earlier `kill_tree()` or `send_kill_tree()` sent it, and a drop that returns early leaks the zombie and the cgroup leaf.
@@ -210,8 +220,11 @@ macOS `Drop` that cannot confirm its child is ours leaks the child with a
 `warn` naming the pid; it never reaps on a guess.
 
 Where a group ID must be used (process-group or fd-marker containment), keep the root an unreaped
-zombie until the group kill is done. On Linux 6.9+ the root's pidfd names its group exactly, whoever
-reaped the root: the group is signalled through it (`PIDFD_SIGNAL_PROCESS_GROUP`), and a signal-0
+zombie until the group kill is done. The handle does: `wait` observes the exit and consumes nothing,
+and the zombie is consumed when the handle drops, so a tree call after `wait` names the group by a
+number the zombie still pins, on every platform. (A tree walk names no tree by the root's number, and
+walks nothing from an exited root, zombie or reaped.) On Linux 6.9+ the root's pidfd names its group
+exactly, whoever reaped the root: the group is signalled through it (`PIDFD_SIGNAL_PROCESS_GROUP`), and a signal-0
 send through it shows whether the group still has a member; while it has one, its number cannot be
 reissued. So a tree call, a drop and a failed spawn's cleanup (a spawn that fails at its identity
 read, an elevated spawn that cannot finish, an abandoned spawn whose cgroup leaf did not take its
@@ -249,7 +262,8 @@ unrelated process.
 ## 5. A foreign reap is a handled case, not a contract violation
 
 The application or another library may reap cosca's children (`SIGCHLD` set to `SIG_IGN`, or
-`waitpid(-1)`), and init and supervisor programs must. cosca detects it where it can (`ECHILD`,
+`waitpid(-1)`), and init and supervisor programs must. cosca's own `wait` is not one: it leaves the
+zombie to the handle's drop (principle 4). cosca detects a foreign reap where it can (`ECHILD`,
 `ESRCH`), releases the child without signalling it, logs it as principle 7 says, and never
 debug-asserts on it.
 

@@ -95,41 +95,40 @@ fn kill_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
     assert_eq!(steps, [], "nothing was sent");
 }
 
-/// Below 6.9, after this handle's own reap, a root pid that names no process may be taken once the
-/// group has no member, so `kill_tree` sends nothing by it, answers `Unassessable` with how to end
-/// the descendants, and the group's member lives on.
+/// Below 6.9, after this handle's wait, the root is still a zombie of its own, so its pid still names
+/// its group: `kill_tree` kills the members left by the group's number, and the member dies.
+///
+/// Mutant: a wait consumes the zombie, so the number is unproven below 6.9 and nothing is sent.
 #[skuld::test]
-fn kill_tree_below_6_9_sends_nothing_to_the_group_after_this_handles_own_reap() {
+fn kill_tree_below_6_9_after_wait_kills_the_group_left_behind() {
     let (child, member) = root_with_a_member();
     kill_own_child(child.pid());
-    child.wait().expect("this handle reaps the root");
+    child.wait().expect("this handle sees the root exit");
     let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
-    let refused = crate::containment::unix::fault::refuse_group_sends();
-    let groups = crate::containment::unix::fault::record_kill_group();
     let capture = Capture::start();
     let result = child.kill_tree();
     let steps = capture.group_steps();
-    drop((old_kernel, refused));
-    assert_eq!(groups.killed(), Vec::<i32>::new(), "no kill of the group by its number");
-    let err = result.expect_err("a group the pid no longer names is not assessable");
+    drop(old_kernel);
+    result.expect("the group is killed by its number: the root's zombie still holds it");
     assert!(
-        err.to_string()
-            .contains(crate::child::drop_report::END_THEM_BEFORE_WAIT),
-        "{err}"
+        steps.contains(&GroupStep::Group(Route::Number, libc::SIGKILL)),
+        "the group was signalled by its number: {steps:?}"
     );
-    assert_eq!(steps, [], "nothing was sent to the group");
-    member.assert_survived();
+    member.assert_killed();
 }
 
-/// 6.9+: after this handle's own reap the root's pidfd still names its group exactly, so `kill_tree`
-/// kills the members left through it, though the pid names no process.
+/// 6.9+: after this handle's wait, `kill_tree` signals the group through the root's pidfd, which
+/// names it exactly, whatever the root's number reads (here forced to name no process, as after a
+/// foreign reap).
+///
+/// Mutant: the group is signalled by its number once the handle's wait has seen the exit.
 #[skuld::test]
-fn kill_tree_after_this_handles_own_reap_kills_the_group_through_the_pidfd_while_it_has_a_member(
+fn kill_tree_after_this_handles_wait_kills_the_group_through_the_pidfd_whatever_the_number_reads(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
     let (mut child, member) = root_with_a_member();
     kill_own_child(child.pid());
-    child.wait().expect("this handle reaps the root");
+    child.wait().expect("this handle's wait sees the root exit");
     child.proc.number_reads_always(crate::identity::Resolved::Gone);
     let capture = Capture::start();
     let result = child.kill_tree();

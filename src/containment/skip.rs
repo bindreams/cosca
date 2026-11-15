@@ -32,13 +32,10 @@ impl Skip {
         tree.is_killed() && self.moot_after_kill()
     }
 
-    /// Whether the reason is one a kill of the tree does not outlive: this handle's own reap left the
-    /// root's pid naming no process or unreadable, or the root's number cannot be trusted (macOS).
+    /// Whether the reason is one a kill of the tree does not outlive: the root's number cannot be
+    /// trusted (macOS). A root reaped by another leaves descendants a kill by number may still owe.
     pub(crate) fn moot_after_kill(&self) -> bool {
-        matches!(
-            &self.why,
-            Why::MayNameAnother(Refusal::ReapedPidGone(_) | Refusal::ReapedPidUnread(..), _) | Why::Untrusted { .. }
-        )
+        matches!(&self.why, Why::Untrusted { .. })
     }
 
     /// The error of a sweep that skipped what the root's number names: the holders' sweep's own
@@ -168,7 +165,6 @@ pub(crate) use call::SkipCall;
 mod call {
     use super::{Skip, Why};
     use crate::containment::dispatch::{Keeping, SettleOutcome, Settled, TreeKillOutcome, TreeSignal};
-    use crate::containment::root::Refusal;
     use crate::containment::Tree;
     use crate::error::Error;
     use crate::signal::Sent;
@@ -398,25 +394,16 @@ mod call {
             }
         }
 
-        /// The one line that says the call skipped what names the tree by the root's number. After
-        /// this handle's own reap, with a pid that names no process, it ends with how to end the
-        /// descendants the reaped root left.
+        /// The one line that says the call skipped what names the tree by the root's number.
         pub(crate) fn skipped_detail(&self, skip: &Skip, sent: &str) -> String {
             let Why::MayNameAnother(refusal, _) = &skip.why else {
                 unreachable!("only a skip that may name another process is worded here")
-            };
-            let remedy = match refusal {
-                Refusal::ReapedPidGone(_) => format!(
-                    "; descendants that outlived the reaped root are not ended by it: {}",
-                    crate::child::drop_report::END_THEM_BEFORE_WAIT
-                ),
-                _ => String::new(),
             };
             let earlier = self
                 .earlier
                 .map_or_else(String::new, |sent| format!(", though {sent} was sent before it"));
             format!(
-                "{}(): {refusal}, so its number may name another process; it did not {}, and {sent}{earlier}{remedy}",
+                "{}(): {refusal}, so its number may name another process; it did not {}, and {sent}{earlier}",
                 self.op, skip.action
             )
         }

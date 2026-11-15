@@ -24,8 +24,8 @@ pub(super) enum Orphaned {
     Quiet,
 }
 
-/// A wait's `outcome` on the child `pid` as the status `Child` answers: `Some` for an exit
-/// (`Unreadable` is `InvalidData`), `None` for a deadline that passed.
+/// A wait's `outcome` on the child `pid` as the status `Child` answers: `Some` for an exit, `None`
+/// for a deadline that passed.
 pub(super) fn status_of_outcome(
     pid: Option<u32>,
     outcome: ChildWaitOutcome,
@@ -35,7 +35,7 @@ pub(super) fn status_of_outcome(
         ChildWaitOutcome::Exited(ExitRecord::Status(status)) => Ok(Some(status)),
         ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code }) => Err(Error::Io(io::Error::new(
             io::ErrorKind::InvalidData,
-            unreadable(si_code),
+            unreadable_from_a_wait(si_code),
         ))),
         ChildWaitOutcome::Foreign(foreign) => {
             if foreign == Foreign::Orphaned && orphaned == Orphaned::Warn {
@@ -57,7 +57,6 @@ pub(super) fn status_of_outcome(
 /// | answer                       | [`fate`](Self::fate)  | uncollected                        | [`front_fate`](Self::front_fate) | [`wording`](Self::wording)                                  |
 /// | ---------------------------- | --------------------- | ---------------------------------- | -------------------------------- | ----------------------------------------------------------- |
 /// | `Exited(Status)`             | `Reaped`              | no                                 | `Reaped`                         | debug "reaped it" ("after the kill" only if `killed`)       |
-/// | `Exited(Unreadable)`         | `Reaped`              | no                                 | `Reaped`                         | warn "reaped it; e" ("after the kill" only if `killed`)     |
 /// | `Foreign(Gone, Other)`       | `f.fate(killed)`      | no                                 | `Unaccounted`                    | debug "reaped by someone else"                              |
 /// | `Foreign(Orphaned)`          | `f.fate(killed)`      | no                                 | `Unaccounted`                    | warn "not ours to reap (launchd holds its zombie, ...)"     |
 /// | `Err(e)`, `killed`           | `Killed`              | yes                                | `Unaccounted`                    | warn "the wait failed: e", and where the child goes         |
@@ -67,9 +66,6 @@ pub(super) fn status_of_outcome(
 ///
 /// Every row has a clause, and every line leads with the caller's subject, a zombie launchd holds
 /// included.
-///
-/// An unreadable record means the consuming reap took the zombie: the child was collected, only its
-/// exit is lost, so it is `Reaped` whether or not a kill reached it.
 #[derive(Debug)]
 pub(crate) struct Settlement {
     answer: Result<ChildWaitOutcome, FailedWait>,
@@ -139,16 +135,6 @@ impl Settlement {
         }
     }
 
-    /// Why the child's exit record could not be read, if it could not: the child was reaped, and
-    /// only its exit is lost.
-    #[cfg(unix)]
-    pub(crate) fn unreadable_record(&self) -> Option<String> {
-        match &self.answer {
-            Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code })) => Some(unreadable(*si_code)),
-            _ => None,
-        }
-    }
-
     /// What to say of the child, and at what level: a clause for every answer, which the caller logs
     /// at that level or folds into its own warn. `subject` leads it. `running` is the whole line for
     /// a child still running; `None` for a wait with no deadline, which says it ended with no exit.
@@ -163,7 +149,7 @@ impl Settlement {
             }
             Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code })) => Wording::Collected(
                 log::Level::Warn,
-                format!("{subject}: reaped it{after}; {}", unreadable(*si_code)),
+                format!("{subject}: {}", unreadable_from_a_wait(*si_code)),
             ),
             Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)) => {
                 Wording::Collected(log::Level::Warn, format!("{subject}: {ORPHANED}"))
@@ -262,8 +248,16 @@ pub(super) fn unbounded_status(
         .ok_or_else(|| Error::Io(io::Error::other("an unbounded wait ended with no exit")))
 }
 
-/// The error of an exit record a consuming `waitid` could not read.
-fn unreadable(si_code: i32) -> String {
+/// What to say of an unreadable exit record that a wait handed back. A wait observes and consumes
+/// nothing, and a look yields an exit record only for an exit, so the record a wait hands back is
+/// always a status: only the consuming reap at the end of a handle can meet one that is not (see
+/// `OwnedChild`'s `Drop`). The contract is asserted in debug, except while unwinding; a release
+/// build answers the error rather than panicking in a public call.
+fn unreadable_from_a_wait(si_code: i32) -> String {
+    debug_assert!(
+        std::thread::panicking(),
+        "a look at a zombie found si_code {si_code}, which is no exit record"
+    );
     format!("the child's exit record was unreadable (si_code {si_code})")
 }
 

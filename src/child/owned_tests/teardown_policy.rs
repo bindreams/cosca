@@ -134,7 +134,7 @@ mod failed_spawn {
             SpawnPolicy::SYNC,
             &mut Diagnosis::default(),
             |owned, kill, _| {
-                seen = Some((kill, owned.is_reaped()));
+                seen = Some((kill, owned.exit_seen()));
                 false
             },
         );
@@ -169,7 +169,7 @@ mod failed_spawn {
                 SpawnPolicy::SYNC,
                 &mut Diagnosis::default(),
                 |owned, kill, _| {
-                    seen = Some((kill, owned.is_reaped()));
+                    seen = Some((kill, owned.exit_seen()));
                     false
                 },
             );

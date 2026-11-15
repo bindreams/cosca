@@ -930,7 +930,7 @@ mod awaited {
         crate::tokio::test_runtime::assert_current_thread();
         let (member, writer, id) = live_member();
         let root = root_looking([Answer::Running, Answer::Exited])
-            .reaps([ReapAnswer::Reaped(ExitRecord::Status(Default::default()))]);
+            .reaps([ReapAnswer::Exited(ExitRecord::Status(Default::default()))]);
         let mut child = tokio_child_reaching(&root, &[id]);
         let done = Cell::new(false);
 

@@ -103,7 +103,7 @@ fn a_late_childs_slow_wait_warns_once_and_the_child_is_reaped() {
     let record = ExitRecord::Status(std::process::ExitStatus::default());
     let fake = delivered_kill(PID, [Answer::Running, Answer::Exited])
         .peeks([Ok(PeekOutcome::Exit(record))])
-        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(record)]);
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(record)]);
     let _fire = fire_on_block(&fake);
 
     let (failure, warns) = abandon_over(&fake, PID);
@@ -131,7 +131,7 @@ fn a_root_exited_but_not_reapable_after_its_kill_is_warned_of_at_the_reap() {
     let record = ExitRecord::Status(std::process::ExitStatus::default());
     let fake = delivered_kill(PID, [Answer::Exited])
         .peeks([Ok(PeekOutcome::Running)])
-        .reaps([ReapAnswer::Running, ReapAnswer::Reaped(record)]);
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(record)]);
     let _fire = fire_on_block(&fake);
 
     let (failure, warns) = abandon_over(&fake, PID);
@@ -159,7 +159,7 @@ fn a_failed_wait_for_the_killed_root_is_recorded() {
             Answer::Err(std::io::ErrorKind::PermissionDenied),
         ],
     )
-    .reaps([ReapAnswer::Reaped(record)]);
+    .reaps([ReapAnswer::Exited(record)]);
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
 
@@ -211,9 +211,9 @@ enum Swept {
     Untrusted,
     /// As `Untrusted`, and its marker's holders were not all killed.
     UntrustedHoldersFailed,
-    /// It skipped what the root's number names, for a reason that outlives the root's kill (the pid
-    /// is held by another process, or the root was reaped elsewhere).
-    Taken,
+    /// It skipped what the root's number names, for a reason that outlives the root's kill (the
+    /// root was reaped elsewhere).
+    ReapedElsewhere,
 }
 
 /// One outcome of a late teardown: what each step came to, and what the teardown says of it.
@@ -315,7 +315,7 @@ const ROWS: &[Row] = &[
         name: "a second sweep skipped for a reason the kill outlives",
         kill: RootKilled::Landed(Waited::Zombie),
         first: Swept::Clean,
-        second: Swept::Taken,
+        second: Swept::ReapedElsewhere,
         walk: false,
         notes: &[NOT_FULLY, SKIPPED],
         absent: &[NOT_SWEPT_AGAIN],
@@ -425,7 +425,7 @@ fn swept_answer(swept: Swept) -> TreeKillOutcome {
         Swept::Clean => TreeKillOutcome::Ran(Ok(())),
         Swept::Untrusted => skip(untrusted(), None),
         Swept::UntrustedHoldersFailed => skip(untrusted(), holders_left()),
-        Swept::Taken => skip(Why::MayNameAnother(Refusal::ReapedPidTaken(4300), None), None),
+        Swept::ReapedElsewhere => skip(Why::MayNameAnother(Refusal::ReapedElsewhere(4300), None), None),
     }
 }
 
@@ -441,14 +441,14 @@ fn root_killed(kill: RootKilled, pid: u32) -> FakeProcess {
         RootKilled::Landed(Waited::Zombie) => root(vec![Answer::Exited])
             .signals([Ok(Sent::Delivered)])
             .peeks([Ok(PeekOutcome::Exit(record))])
-            .reaps([ReapAnswer::Reaped(record)]),
+            .reaps([ReapAnswer::Exited(record)]),
         RootKilled::Landed(Waited::Failed) => root(vec![Answer::Err(std::io::ErrorKind::PermissionDenied)])
             .signals([Ok(Sent::Delivered)])
-            .reaps([ReapAnswer::Reaped(record)]),
+            .reaps([ReapAnswer::Exited(record)]),
         RootKilled::Refused => root(Vec::new())
             .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))])
             .reaps_always(ReapAnswer::Running),
-        RootKilled::AlreadyReaped => root(Vec::new()).reaps([ReapAnswer::Reaped(record)]),
+        RootKilled::AlreadyReaped => root(Vec::new()).reaps([ReapAnswer::Exited(record)]),
     }
 }
 

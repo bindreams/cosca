@@ -1080,11 +1080,7 @@ fn a_handle_that_could_not_say_is_logged_when_the_number_shows_the_reap() {
 
     fake.assert_peeks_exhausted();
     fake.assert_number_reads_exhausted();
-    assert!(
-        matches!(view.root, crate::signal::RootState::Reaped { .. }),
-        "{:?}",
-        view.root
-    );
+    assert!(matches!(view.root, crate::signal::RootState::Reaped), "{:?}", view.root);
     let records = crate::log_capture::records_since_on_current_thread(mark, "handle doubt 6e2");
     assert_eq!(records.len(), 1, "{records:?}");
     assert!(
@@ -1152,7 +1148,7 @@ fn the_look_a_kill_decides_on_is_the_one_the_report_is_worded_from() {
     fake.assert_number_reads_exhausted();
     assert!(view.leaves_root_alone());
     assert!(
-        matches!(view.look(), crate::signal::RootState::Reaped { .. }),
+        matches!(view.look(), crate::signal::RootState::Reaped),
         "{:?}",
         view.look()
     );
