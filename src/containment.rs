@@ -370,6 +370,8 @@ mod root;
 
 #[path = "containment/skip.rs"]
 mod skip;
+#[cfg(unix)]
+pub(crate) use dispatch::marks_child_environment;
 #[cfg(target_os = "linux")]
 pub(crate) use dispatch::ChildHandle;
 #[cfg(unix)]

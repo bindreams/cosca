@@ -197,6 +197,9 @@ In order:
    S2): a clone kind (vfork without `CLONE_VM`, or plain), the env block built in the parent, the
    caller's async-signal-safe steps, and a status channel of errno and ready records read without
    blocking. The elevation shim uses it, and so does the ordinary spawn (`child::spawn::fork_spawn`,
-   the vfork kind): its outcome is the core's records alone. The ordinary spawn searches for the
-   program as `std::process::Command` does (libc's `execvp` in the child, which the core's
-   `Program::searching` asks for), and the shim by its own `program_path`; the lookup slice unifies them.
+   the vfork kind): its outcome is the core's records alone. Every unix spawn finds its program in the
+   parent, by the one search `resolve::posix::lookup` (the POSIX grammar of `crate::resolve`: the
+   child's `PATH` only, the first file that exists, an entry that cannot be examined ends the search);
+   the Linux child only `execve`s the path it is given (and the `PATH` entries after it that are
+   files, if that file is gone at the `execve`), and macOS hands std the path. macOS still
+   launches through std, whose `execvp` gives a file with no `#!` to `/bin/sh` until macOS forks itself.

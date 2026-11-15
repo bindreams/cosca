@@ -8,7 +8,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
-use super::{child_env, child_env_over, conclude, start_via, OnFailure, Program, Started};
+use super::{conclude, start_via, OnFailure, Program, Started};
+use crate::child::spawn::child_env::child_env_over;
 use crate::child::spawn::in_child::InChild;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::SpawnFailure;
@@ -19,7 +20,7 @@ use crate::test_own_process::{child_completion, own_process, run, test_filter, t
 use crate::test_stdio::RestoreStdio;
 use crate::Stdio;
 
-/// A program that does not exist: the spawn's `execvp` fails with `ENOENT`.
+/// A program that does not exist: the spawn's `execve` fails with `ENOENT`.
 const MISSING: &str = "/nonexistent/cosca-fork-spawn-tests";
 
 fn assert_not_found(spawned: Result<crate::Child, Error>, what: &str) {
@@ -228,8 +229,7 @@ fn start_over(fork: ForkFn, placement: Option<(&mut ReportChannel, bool)>) -> Re
         Some((channel, refusing)) => (Some(channel), refusing),
         None => (None, false),
     };
-    let program =
-        Program::searching(OsStr::new("/bin/true"), &[OsStr::new("true")], std::iter::empty()).expect("no NUL");
+    let program = Program::new(&[OsStr::new("/bin/true")], &[OsStr::new("true")], std::iter::empty()).expect("no NUL");
     let lock = crate::child::spawn::spawn_lock();
     start_via(
         fork,
@@ -508,8 +508,8 @@ fn a_pidfd_that_cannot_be_moved_above_stdio_fails_the_spawn_and_ends_the_child()
     ) else {
         return;
     };
-    let program = Program::searching(
-        OsStr::new("/bin/sleep"),
+    let program = Program::new(
+        &[OsStr::new("/bin/sleep")],
         &[OsStr::new("sleep"), OsStr::new("1000")],
         std::iter::empty(),
     )
@@ -565,8 +565,7 @@ fn the_pidfd_is_moved_above_stdio_before_the_status_channel_is_read() {
     ) else {
         return;
     };
-    let program =
-        Program::searching(OsStr::new(MISSING), &[OsStr::new("missing")], std::iter::empty()).expect("no NUL");
+    let program = Program::new(&[OsStr::new(MISSING)], &[OsStr::new("missing")], std::iter::empty()).expect("no NUL");
     assert_unmovable_pidfd_ends_the_child(start_with_an_unmovable_pidfd(&done, &program));
 }
 
@@ -657,7 +656,7 @@ fn a_failing_step_is_the_spawns_error_and_the_program_never_runs() {
     assert!(!ran.exists(), "the program ran although its step failed");
 }
 
-/// A program the spawn cannot start is a spawn error with the `execvp` errno, whichever it is.
+/// A program the spawn cannot start is a spawn error with the `execve` errno, whichever it is.
 #[skuld::test]
 fn an_exec_that_fails_is_the_spawns_error_with_its_errno() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -690,7 +689,12 @@ fn a_nul_in_an_argument_or_the_environment_is_invalid_input() {
     }
 }
 
-// The environment and the program's lookup are `std`'s ------------------------------------------
+// The environment is `std`'s ---------------------------------------------------------------------
+
+/// This process's environment, as [`child_env_over`] builds it.
+fn child_env(ops: &[crate::command::EnvOp], marker: bool) -> Vec<(OsString, OsString)> {
+    child_env_over(std::env::vars_os(), ops, marker)
+}
 
 /// The environment is this process's, changed by the ops in order, with the nesting marker last: an
 /// `env_clear` leaves the marker, and the keys are in order, as `std` gives them.
@@ -815,55 +819,6 @@ fn a_childs_environment_is_the_one_std_gives_for_the_same_ops() {
         }),
         "a clear and two variables"
     );
-}
-
-/// A script in `dir` called `name` with `body` and `mode`.
-fn script(dir: &std::path::Path, name: &str, body: &str, mode: u32) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    let path = dir.join(name);
-    std::fs::write(&path, body).expect("write the script");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-    path
-}
-
-/// The exit code of `cmd`'s program.
-fn exit_code(mut cmd: crate::Command) -> Option<i32> {
-    cmd.spawn().expect("spawn").wait().expect("wait").code()
-}
-
-/// The program is searched for as `std::process::Command` searches, which is libc's `execvp` over the
-/// child's own environment: the child's `PATH`, not this process's; a relative `PATH` element (with the
-/// directory the child enters); the system default path when the child has none; and `/bin/sh` for a
-/// file that is no executable format.
-///
-/// Mutants: the search reads this process's `PATH`; a relative element is skipped; no `/bin/sh` fallback.
-#[skuld::test]
-fn the_program_is_searched_for_as_std_searches() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    script(dir.path(), "tool", "#!/bin/sh\nexit 7\n", 0o755);
-    let command = || crate::test_child::command(crate::test_child::Console::Hidden);
-
-    let mut on_childs_path = command();
-    on_childs_path.args(["tool"]).env("PATH", dir.path());
-    assert_eq!(exit_code(on_childs_path), Some(7), "the child's PATH is searched");
-
-    let mut relative = command();
-    relative.args(["tool"]).env("PATH", ".").current_dir(dir.path());
-    assert_eq!(exit_code(relative), Some(7), "a relative PATH element is searched");
-
-    let mut default_path = command();
-    default_path.args(["sh", "-c", "exit 3"]).env_clear();
-    assert_eq!(
-        exit_code(default_path),
-        Some(3),
-        "a child with no PATH gets the system default"
-    );
-
-    let no_format = script(dir.path(), "no-format", "exit 5\n", 0o755);
-    let mut not_an_executable_format = command();
-    not_an_executable_format.args([no_format.as_os_str()]);
-    assert_eq!(exit_code(not_an_executable_format), Some(5), "ENOEXEC goes to /bin/sh");
 }
 
 /// The child's signal mask is the spawning thread's, as `std` leaves it (its `do_exec` resets `SIGPIPE`'s

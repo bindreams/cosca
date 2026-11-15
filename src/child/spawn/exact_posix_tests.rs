@@ -254,15 +254,18 @@ fn a_relative_exact_program_hands_std_no_current_dir() {
     }
 }
 
-/// Negative control: a `Search` program is not completed by cosca, so a relative `current_dir`
-/// is left for the child to read at the fork.
+/// A located `Search` program is found as written and read against the directory the child enters
+/// itself, as an `Exact` one is: std is handed no directory, and the name is not joined to it.
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn a_search_programs_relative_cwd_is_passed_through() {
+fn a_located_search_program_enters_its_directory_in_the_child() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("tool"), b"x").expect("write");
     let mut c = crate::test_child::command(Console::Hidden);
-    c.executable("tool").args(["tool"]).current_dir("sub");
+    c.executable("./tool").args(["tool"]).current_dir(dir.path());
     let std_cmd = std_command_of(&c);
-    assert_eq!(std_cmd.get_current_dir(), Some(std::path::Path::new("sub")));
+    assert_eq!(std_cmd.get_current_dir(), None);
+    assert_eq!(std_cmd.get_program(), "./tool");
 }
 
 // argv[0] =====

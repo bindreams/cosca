@@ -18,7 +18,6 @@ pub(crate) mod link;
 pub(crate) mod owner_helper;
 pub(crate) mod owner_watch;
 pub(crate) mod private_dir;
-pub(crate) mod program_path;
 pub(crate) mod protocol;
 #[cfg(target_os = "linux")]
 pub(crate) mod run;

@@ -48,8 +48,8 @@ fn dead_child() -> (
             });
             pid_tx.send(pid).expect("report the pid");
             seized_rx.recv().expect("the tracer seized the child");
-            let program = Program::searching(
-                std::ffi::OsStr::new("/bin/true"),
+            let program = Program::new(
+                &[std::ffi::OsStr::new("/bin/true")],
                 &[std::ffi::OsStr::new("true")],
                 std::iter::empty(),
             )

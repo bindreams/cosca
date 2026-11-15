@@ -1,6 +1,10 @@
 //! M18: what std's spawn does today with an executable file that has no `#!` and is not a binary.
 //! A shell fallback (`execvp`'s on `ENOEXEC`) runs it as a script. The test records; it asserts
 //! only its preconditions. Writes only in its own temp directory.
+//!
+//! The `absolute` case is what cosca's macOS spawn hands std (it finds the program itself), so it
+//! records the `/bin/sh` fallback that stays on macOS until macOS forks itself; Linux's own fork does
+//! not have it. The second test asserts it, through cosca's own spawn, on macOS and Linux.
 
 #[cfg(unix)]
 #[path = "common/mod.rs"]
@@ -84,6 +88,82 @@ fn m18_std_routes_and_the_shell_fallback() {
                 marker.exists()
             );
         }
+    }
+}
+
+/// The OS errno of a failed spawn, which the spawn gives as it is.
+#[cfg(unix)]
+fn raw_errno(error: &cosca::error::Error) -> Option<i32> {
+    match error {
+        cosca::error::Error::Io(e) => e.raw_os_error(),
+        other => panic!("expected the OS's own error, got {other:?}"),
+    }
+}
+
+/// cosca's spawn of a bare name finds the program itself, in the parent, and gives std (macOS) or the
+/// child (Linux) its absolute path: the first file on the child's `PATH` is the program, whatever its mode,
+/// where std's own `execvp` would skip it for a later executable one. And the `/bin/sh` fallback is the
+/// stated macOS limit: a file with no `#!` and no binary format runs through the shell on macOS, and is
+/// `ENOEXEC` on Linux, whose child makes one `execve`.
+///
+/// Mutants: the spawn leaves the search to std on macOS (the first file is skipped for the second); the
+/// Linux child retries `ENOEXEC` through `/bin/sh`; the macOS spawn stops the shell fallback.
+#[cfg(unix)]
+#[skuld::test]
+fn a_cosca_spawn_finds_its_program_in_the_parent_and_only_macos_falls_back_to_the_shell() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let write = |dir: &std::path::Path, name: &str, body: &str, mode: u32| {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+
+    // The first file is the program, though it cannot be started: not skipped for the second.
+    let first = tempfile::tempdir().expect("tempdir");
+    let second = tempfile::tempdir().expect("tempdir");
+    let ran = second.path().join("ran");
+    write(first.path(), "m18-tool", "#!/bin/sh\n", 0o644);
+    write(
+        second.path(),
+        "m18-tool",
+        &format!("#!/bin/sh\n: > '{}'\n", ran.display()),
+        0o755,
+    );
+    let mut cmd = common::command(common::Console::Hidden);
+    cmd.args(["m18-tool"]).env(
+        "PATH",
+        std::env::join_paths([first.path(), second.path()]).expect("join"),
+    );
+    assert_eq!(
+        raw_errno(&cmd.spawn().expect_err("the first file on the PATH is the program")),
+        Some(libc::EACCES)
+    );
+    assert!(!ran.exists(), "the second file ran");
+
+    // A file with no `#!` and no binary format.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("marker");
+    write(
+        dir.path(),
+        "m18-script",
+        &format!(": > '{}'\n", marker.display()),
+        0o755,
+    );
+    let mut cmd = common::command(common::Console::Hidden);
+    cmd.args(["m18-script"]).env("PATH", dir.path());
+    let spawned = cmd.spawn();
+    #[cfg(target_os = "macos")]
+    {
+        let child = spawned.expect("macOS runs a file with no `#!` through the shell");
+        assert_eq!(child.wait().expect("wait").code(), Some(0));
+        assert!(marker.exists(), "the shell did not run the script");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let error = spawned.expect_err("only macOS runs a file with no `#!` through the shell");
+        assert_eq!(raw_errno(&error), Some(libc::ENOEXEC), "{error:?}");
+        assert!(!marker.exists(), "the script ran");
     }
 }
 

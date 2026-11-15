@@ -248,6 +248,35 @@ impl Command {
     /// judgement that scripts are unsafe — this crate's existing, separate batch-path
     /// rejection (CVE-2024-24576) is unaffected either way.
     ///
+    /// # Lookup on Linux and macOS
+    ///
+    /// The program of every spawn, `executable` or `argv[0]`, is found by cosca in the parent before
+    /// the child exists, by these rules (they differ from `execvp`'s):
+    ///
+    /// - A name with a `/` is not searched: it is the entry it names, read against the child's working
+    ///   directory ([`current_dir`](Self::current_dir) when set), whether or not this process's own
+    ///   directory has a path. An entry that exists but is no file (a directory, a device) fails the spawn
+    ///   with the launch's own error, `EACCES`. A `current_dir` that cannot be entered is the spawn's
+    ///   error for such a name, with the directory's own errno (`ENOENT`, `ENOTDIR`, `EACCES`).
+    /// - A bare name is searched in the child's `PATH` (after [`env`](Self::env) and
+    ///   [`env_clear`](Self::env_clear)) and nowhere else. A child with no `PATH` searches nothing: there
+    ///   is no system default path. An empty or relative element is skipped, never the working directory.
+    /// - The first candidate that exists as a file is the program, whatever its mode: the execute bit is
+    ///   not part of the search. If it cannot be started the spawn fails with that error (`EACCES` is
+    ///   [`std::io::ErrorKind::PermissionDenied`]), and no later candidate is tried in its place. That
+    ///   holds for a script whose interpreter is missing (`ENOENT`: the script exists). (On Linux a
+    ///   candidate that is gone when the child starts it, removed after the search, is passed over for the
+    ///   next `PATH` entry that is a file, by the same rules.) A file that is no executable format and has
+    ///   no `#!` line fails with
+    ///   `ENOEXEC` on Linux, and is not handed to `/bin/sh`. (On macOS std's own launch still hands it to
+    ///   `/bin/sh`.)
+    /// - A candidate that cannot be examined (`EACCES` on a `PATH` directory, `ELOOP`, an I/O error) ends
+    ///   the search with that error, even if a later directory holds the program. Only a definite
+    ///   absence, `ENOENT` or `ENOTDIR`, goes on.
+    /// - A program that is not found is `ENOENT` ([`std::io::ErrorKind::NotFound`]); a name that names no
+    ///   file (`""`, `.`, `..`, one ending in `/`) or holds a NUL is [`std::io::ErrorKind::InvalidInput`].
+    ///   Either is the spawn's error before any child exists.
+    ///
     /// # Error kinds
     ///
     /// The two kinds answer different questions:

@@ -147,17 +147,7 @@ pub fn test_spawn_lock() -> TestSpawnLockGuard {
 pub struct TestSpawnLockGuard(#[allow(dead_code, reason = "held only for its Drop")] child::spawn::SpawnLockGuard);
 
 mod command;
-// Off Windows only the `Exact` completion (`resolve::exact`) is consumed, so the lib build sees
-// the search policy as dead. The module is deliberately NOT cfg-gated: keeping it platform-independent is what makes
-// its policy testable from a POSIX host, which is where most of this work happens. The allow
-// goes away when the POSIX and default spawn paths route through it too.
-#[cfg_attr(
-    not(windows),
-    allow(
-        dead_code,
-        reason = "off-windows only resolve::exact is consumed, so the lib build sees the search policy as dead"
-    )
-)]
+// Not cfg-gated: keeping the policy platform-independent is what makes it testable from any host.
 mod resolve;
 pub use command::Command;
 

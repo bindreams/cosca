@@ -1,8 +1,9 @@
 //! Which file a `Command` loads — on the spawn paths that currently consult it.
 //!
-//! **Coverage today: only the Windows raw `CreateProcessW` backend (sync and its tokio mirror),
-//! and only for a `Search` program** — i.e. one recorded by `Command::executable()`, or the
-//! argv[0]/first-token fallback when neither setter was called. That backend is reached when
+//! **Coverage: every unix spawn, on the POSIX grammar (`posix::lookup`), and the Windows raw
+//! `CreateProcessW` backend (sync and its tokio mirror), on the Windows grammar — in both, only for a
+//! `Search` program**, i.e. one recorded by `Command::executable()`, or the argv[0]/first-token
+//! fallback when neither setter was called. The Windows backend is reached when
 //! `Command::executable_path()` is set or an fd >= 3 is mapped.
 //!
 //! An `Exact` program, from `Command::raw_executable()`, deliberately does NOT come through
@@ -16,16 +17,12 @@
 //! that names no file via [`names_no_file`], so the two axes cannot drift apart on what counts as
 //! a filename. Classifying is not searching.
 //!
-//! Every other spawn path resolves a `Search` program itself, ignorant of this module: POSIX
-//! spawning calls `execvp`/`posix_spawn`'s own PATH search, and the Windows elevated
-//! (`ShellExecuteEx`) path passes argv[0] to `ShellExecuteEx` unresolved, and `executable()` is
-//! refused under elevation. `src/lib.rs`'s
-//! `#[cfg_attr(not(windows), allow(dead_code, reason = "..."))]` on this module tracks exactly
-//! that: the `allow` goes away once those paths route through [`resolve`] too.
-//! Producing an ABSOLUTE path is what would let a backend skip its own search once it is wired
-//! up — `execvp` does not search a name containing a separator, and `ShellExecuteEx` skips its
-//! directory search for an absolute `lpFile` (though not `PATHEXT`; see
-//! [`reject_unloadable_image`]) — but that wiring has not happened yet for either.
+//! The Windows elevated (`ShellExecuteEx`) path passes argv[0] to `ShellExecuteEx` unresolved, and
+//! `executable()` is refused under elevation. Producing an ABSOLUTE path is what lets a backend skip
+//! its own search: the unix spawns hand the child (Linux) or std (macOS) a path with a `/`, which
+//! `execve` and `execvp` do not search for, and `ShellExecuteEx` skips its directory search for an
+//! absolute `lpFile` (though not `PATHEXT`; see [`reject_unloadable_image`]) — that wiring has not
+//! happened yet for it.
 //!
 //! Classification is byte-level and parameterised by [`ResolveInput::windows`] rather than using
 //! `std::path`, whose parsing is host-specific — `Path::new("C:tool").prefix()` is `None` off
@@ -68,6 +65,8 @@ use std::path::{Path, PathBuf};
 
 pub(crate) mod exact;
 pub(crate) mod join;
+#[cfg(unix)]
+pub(crate) mod posix;
 
 /// Everything the policy reads. Taken as parameters so the rules are testable without touching
 /// the ambient environment.
@@ -78,11 +77,11 @@ pub(crate) struct ResolveInput<'a> {
     ///
     /// On the Windows grammar it must be fully qualified: the caller completes it as Win32 does
     /// (`windows_raw::resolve::complete_on`), since that needs this process's cwd and a drive's own
-    /// directory, which this module does not read. On the POSIX grammar a relative one is joined
-    /// onto this process's cwd.
+    /// directory, which this module does not read. On the POSIX grammar a relative base is probed
+    /// as given and `None` is the inherited directory: see `posix::lookup`.
     ///
-    /// `None` is allowed only for a name [`needs_base`] says needs none, which then reads nothing;
-    /// for any other name it is a contract violation and panics.
+    /// On the Windows grammar `None` is allowed only for a name [`needs_base`] says needs none,
+    /// which then reads nothing; for any other name it is a contract violation and panics.
     pub cwd: Option<&'a Path>,
     /// Directories searched for a bare name BEFORE `PATH`, in order, queried lazily: called at
     /// most once, and only from the `Shape::BareName` arm of [`resolve`] — after every shape
@@ -155,7 +154,8 @@ pub(crate) struct ResolveInput<'a> {
     /// resolution exactly as an ordinary spawn sees it.
     ///
     /// It also makes the search fail closed on a candidate whose existence cannot be determined,
-    /// where an ordinary search skips it with a warning: see [`resolve`].
+    /// where an ordinary Windows search skips it with a warning (a POSIX search never does: it stops
+    /// with the entry's own error): see [`resolve`].
     pub loadable_only: bool,
     /// How Win32 completes a located name that is verbatim (`\\?\`) only because the cwd base is:
     /// `GetFullPathNameW`, which the raw backend passes. Win32 normalises a name it completes
@@ -239,7 +239,9 @@ pub(crate) fn drive_len(bytes: &[u8]) -> Option<usize> {
 }
 
 /// `program` split after its drive (`C:`, any one unit and `:`), for a drive-absolute or
-/// drive-relative path; `None` for any other type.
+/// drive-relative path; `None` for any other type. Windows only: its one consumer is the raw
+/// backend's completion.
+#[cfg(windows)]
 pub(crate) fn split_drive(program: &OsStr) -> Option<(&OsStr, &OsStr)> {
     if !matches!(path_type(program), PathType::DriveAbsolute | PathType::DriveRelative) {
         return None;
@@ -768,68 +770,25 @@ fn split_path_var_windows(bytes: &[u8]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Whether a candidate is a file this platform could actually exec.
+/// Whether a candidate exists as a file, on either grammar.
 ///
-/// On POSIX the execute bit is part of the answer: `execvp` skips a readable-but-non-executable
-/// match and keeps searching (measured), so keying on existence alone stops at a file that would
-/// have been passed over and hands it to exec, turning a working command into `EACCES`.
-/// `faccessat(AT_EACCESS)` asks for the ids that will actually exec, unlike `access`.
-///
-/// That argument is about the `PATH` SEARCH, and it is applied to a [`Shape::Located`] name too,
-/// where `execvp` does not search and would report `EACCES` rather than skipping. So once the
-/// POSIX spawn path routes through this module (see the module doc), `resolve("./tool")` against
-/// a non-executable `./tool` will report `NotFound` where the platform reports
-/// `PermissionDenied`. That is deliberate — one predicate for "can this be exec'd" beats a
-/// shape-dependent one, and the caller learns the file is unusable either way — but the error
-/// KIND diverges, and anything matching on it should know that before the POSIX path lands.
-///
-/// Note the `windows` parameter is a runtime flag while the `faccessat` call sits behind
-/// `#[cfg(unix)]`: simulating POSIX on a Windows HOST therefore skips the execute-bit check
-/// entirely.
+/// Existence is the whole test, on both platforms: the execute bit, and every other reason the
+/// file cannot be started, is the launch's own error (`EACCES`, `ENOEXEC`), reported as that and
+/// not as a miss, and no later candidate is tried in its place. A directory is not a file, so a
+/// directory of the program's name does not end a search. `named`: the caller wrote this path, so
+/// whatever is there is the match (a directory or a device too, which a launch refuses with its own
+/// error); a miss would say the program is not there when it is.
 ///
 /// `Err` when the filesystem could not say whether `path` exists (a permission, I/O or network
 /// failure), as distinct from saying it does not: see [`resolve`] for what each caller does with
 /// that. Only a missing file or directory, a non-directory in the path, and a name no filesystem
 /// accepts are a definite "not here".
-fn is_execable(path: &Path, windows: bool) -> std::io::Result<bool> {
+fn is_file(path: &Path, named: bool) -> std::io::Result<bool> {
     match std::fs::metadata(path) {
-        Ok(meta) if meta.is_file() => {}
-        Ok(_) => return Ok(false),
-        Err(e) if is_absence(&e) => return Ok(false),
-        Err(e) => return Err(e),
+        Ok(meta) => Ok(named || meta.is_file()),
+        Err(e) if is_absence(&e) => Ok(false),
+        Err(e) => Err(e),
     }
-    #[cfg(unix)]
-    if !windows {
-        use std::os::unix::ffi::OsStrExt;
-        let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-            return Ok(false);
-        };
-        // SAFETY: a read-only permission query on a valid NUL-terminated path.
-        let rc = unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::X_OK, libc::AT_EACCESS) };
-        let errno = if rc == 0 {
-            0
-        } else {
-            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-        };
-        return execute_permission(rc, errno);
-    }
-    let _ = windows;
-    Ok(true)
-}
-
-/// The answer of an `X_OK` `faccessat` that returned `rc` with `errno`: executable, not (denied, or
-/// the file gone since `metadata` saw it), or undeterminable (any other failure), so that `resolve`
-/// applies the same disposition as to a failed `metadata`.
-#[cfg(unix)]
-fn execute_permission(rc: libc::c_int, errno: i32) -> std::io::Result<bool> {
-    if rc == 0 {
-        return Ok(true);
-    }
-    let e = std::io::Error::from_raw_os_error(errno);
-    if errno == libc::EACCES || is_absence(&e) {
-        return Ok(false);
-    }
-    Err(e)
 }
 
 /// Whether a metadata error says definitely "no such file": nothing at the path, a non-directory
@@ -894,11 +853,33 @@ pub(crate) fn rooted_on_verbatim(name: &Path) -> Error {
     ))
 }
 
+/// The refusal of a program for which [`names_no_file`] holds.
+fn names_no_file_refusal(program: &Path) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("program does not name a file: {program:?}"),
+    ))
+}
+
+#[cfg_attr(
+    not(any(windows, test)),
+    allow(
+        dead_code,
+        reason = "a unix spawn calls `search`; the Windows backend and the tests call this"
+    )
+)]
 pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
+    search(input).map(|(found, _)| found)
+}
+
+/// [`resolve`], and with the match the candidates after it: for a POSIX bare name, the `PATH`
+/// elements after the one the match is in, joined to the name, in order and fully qualified only
+/// (not probed); empty for any other name and for the Windows grammar.
+pub(crate) fn search(input: ResolveInput<'_>) -> Result<(PathBuf, Vec<PathBuf>), Error> {
     let name = input.program.as_os_str();
     // The base contract, reported at the call boundary rather than where the base is first used.
     debug_assert!(
-        input.cwd.is_some() || !needs_base(name, input.windows),
+        input.cwd.is_some() || !input.windows || !needs_base(name, input.windows),
         "{name:?} needs a base, and none was given"
     );
     debug_assert!(
@@ -912,10 +893,7 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
     // Guarding one candidate rule at a time leaves the next spelling open, so the shape is refused
     // outright. `InvalidInput`, not `NotFound`: nothing was looked for.
     if names_no_file(name, input.windows) {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("program does not name a file: {:?}", input.program),
-        )));
+        return Err(names_no_file_refusal(input.program));
     }
     // Refused EXPLICITLY, and before any search. `C:tool` did report `NotFound`, but only as a
     // side effect of candidate filtering — `PathBuf::push` clears for a prefixed path, so every
@@ -969,15 +947,17 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
         // An absolute name is its own location: joining it onto any directory yields it again, so
         // no cwd is read for it.
         Shape::Located if !needs_base(name, input.windows) => vec![PathBuf::new()],
-        // The cwd is absolutised BEFORE joining. A relative one would otherwise be applied twice:
-        // the resolver joins it, and std chdirs the child into it as well, so `./tool` with
-        // `current_dir("sub")` would exec `sub/sub/tool` (measured).
         Shape::Located => vec![match input.cwd {
             // Either reading counts: `std` knows only the host's grammar (and on Windows, only
             // letter drives), this module's classifier only the simulated one.
             Some(cwd) if accepted(cwd, input.windows) => cwd.to_path_buf(),
-            Some(cwd) if !input.windows => std::env::current_dir().map_err(Error::Io)?.join(cwd),
+            // POSIX: probed as given. The OS reads a relative base against the directory this
+            // process inherited, with no path of it, which is the directory the child reads the
+            // name against (it `chdir`s into `cwd` itself, so the name is not joined to `cwd`
+            // again: the caller keeps the name, see `posix::lookup`).
+            Some(cwd) if !input.windows => cwd.to_path_buf(),
             Some(cwd) => unreachable!("a Windows base must be fully qualified: {cwd:?}"),
+            None if !input.windows => PathBuf::new(),
             // A caller that supplies its own base passes `None` only for a name that
             // `needs_base` says needs none. Reading the process cwd here instead would be a second
             // read that caller cannot see.
@@ -1005,7 +985,7 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
         }
     };
 
-    for dir in dirs {
+    for (at, dir) in dirs.iter().enumerate() {
         for candidate in &candidates {
             let made_verbatim = input.windows
                 && shape == Shape::Located
@@ -1017,7 +997,7 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
             let joined = if made_verbatim {
                 PathBuf::from(join::concat(dir.as_os_str(), candidate, "\\"))
             } else {
-                join_candidate(&dir, candidate, input.windows)
+                join_candidate(dir, candidate, input.windows)
             };
             // Only a fully qualified `joined` is accepted — this is what actually keeps a relative
             // or empty `PATH` element from resolving through the current directory (an empty
@@ -1025,8 +1005,9 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
             // resolves against it just as surely). A drive-relative element (`C:` or `C:tools`)
             // joins to a drive-relative path, which would resolve through drive C's own current
             // directory, which cosca does not track. This single check is also what keeps the
-            // contract every backend relies on: the answer is always absolute.
-            if !accepted(&joined, input.windows) {
+            // contract every backend relies on: the answer is always absolute, except a POSIX
+            // located name, which is read against the inherited directory and is no search.
+            if !accepted(&joined, input.windows) && (input.windows || shape != Shape::Located) {
                 continue;
             }
             let probed = if made_verbatim {
@@ -1047,21 +1028,37 @@ pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
             } else {
                 Ok(joined.clone())
             }
-            .and_then(|path| Ok(is_execable(&path, input.windows)?.then_some(path)));
+            .and_then(|path| Ok(is_file(&path, !input.windows && shape == Shape::Located)?.then_some(path)));
             match probed {
-                Ok(Some(path)) => return Ok(path),
+                Ok(Some(path)) => {
+                    // A POSIX search also answers the candidates after the match, for a launch that finds
+                    // the match gone: see `posix::lookup`.
+                    let later = if !input.windows && shape == Shape::BareName {
+                        dirs[at + 1..]
+                            .iter()
+                            .flat_map(|dir| candidates.iter().map(move |c| join_candidate(dir, c, false)))
+                            .filter(|joined| accepted(joined, false))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok((path, later));
+                }
                 Ok(None) => {}
                 // A `loadable_only` search fails closed: skipping a candidate it could not check
                 // would let a later directory, perhaps one on `PATH` an attacker can write, supply
-                // the image.
+                // the image. So does every POSIX search: an entry that cannot be examined means the
+                // search cannot be carried out as written. It answers with the entry's own error,
+                // bare: a spawn's caller branches on the errno.
+                Err(e) if !input.windows => return Err(Error::Io(e)),
                 Err(e) if input.loadable_only => {
                     return Err(Error::Io(crate::error::io_context(
                         format!("could not tell whether {joined:?} exists, so the search stops"),
                         e,
                     )))
                 }
-                // An ordinary spawn goes on, so one unreadable `PATH` directory does not break
-                // every search, as `CreateProcessW`'s own does not.
+                // An ordinary Windows spawn goes on, so one unreadable `PATH` directory does not
+                // break every search, as `CreateProcessW`'s own does not.
                 Err(e) => log::warn!(
                     "skipping {joined:?}, whose existence could not be determined: {report}",
                     report = crate::error::Report(&e)

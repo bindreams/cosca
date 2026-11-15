@@ -239,6 +239,23 @@ fn is_nested_with_marker_is_true() {
     assert!(is_nested(true));
 }
 
+/// A unix spawn gives its child the nesting marker exactly when it is contained, a root (the inherited
+/// environment has no marker) and marks.
+///
+/// Mutants: an uncontained spawn marks; a nested spawn marks; an opaque request marks.
+#[cfg(unix)]
+#[skuld::test]
+fn a_unix_child_gets_the_marker_when_contained_root_and_marking() {
+    use crate::containment::{marks_child_environment, ContainMode, ContainRequest, Nesting};
+
+    let request = |mode, nesting| ContainRequest { mode, nesting };
+    let contained = Some(ContainMode::Session);
+    assert!(marks_child_environment(&request(contained, Nesting::Mark), false));
+    assert!(!marks_child_environment(&request(None, Nesting::Mark), false));
+    assert!(!marks_child_environment(&request(contained, Nesting::Mark), true));
+    assert!(!marks_child_environment(&request(contained, Nesting::Opaque), false));
+}
+
 // unix_setup_for mutual-exclusivity tests (S3) =====
 
 /// `ContainMode::Session` must select `UnixSetup::Session` (setsid) — never

@@ -16,9 +16,15 @@ use crate::os_process::linux::fork::{
 type Steps<'a> = &'a dyn Fn() -> Result<(), StepFailure>;
 
 fn program(candidate: &str, argv: &[&str], env: &[(&str, &str)]) -> Program {
+    candidates(&[candidate], argv, env)
+}
+
+/// The program whose `execve` tries `paths` in order.
+fn candidates(paths: &[&str], argv: &[&str], env: &[(&str, &str)]) -> Program {
+    let paths: Vec<&OsStr> = paths.iter().map(OsStr::new).collect();
     let argv: Vec<&OsStr> = argv.iter().map(OsStr::new).collect();
     let env = env.iter().map(|(k, v)| (OsString::from(k), OsString::from(v)));
-    Program::new(&[OsString::from(candidate)], &argv, env).expect("no NUL")
+    Program::new(&paths, &argv, env).expect("no NUL")
 }
 
 fn tool(candidate: &str) -> Program {
@@ -200,6 +206,151 @@ fn an_exec_that_fails_gives_its_errno_record() {
         assert_eq!(progress, Progress::Failed(Failure::Exec(libc::ENOENT)), "{kind:?}");
         assert!(!spawned.status.could_have_started().unwrap(), "{kind:?}");
         assert_eq!(exit_status(&spawned.child), 127, "{kind:?}");
+    }
+}
+
+/// The file `name` in `dir` with `body` and `mode`, as a path string.
+fn file_in(dir: &std::path::Path, name: &str, body: &str, mode: u32) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    path.into_os_string().into_string().expect("a UTF-8 path")
+}
+
+/// A candidate that is gone (`ENOENT`, or `ENOTDIR` under a file) is passed over for the next; the one
+/// after the last is the last's own error.
+///
+/// Mutants: the child tries one candidate only; `ENOTDIR` ends the candidates.
+#[skuld::test]
+fn an_exec_that_finds_no_file_goes_on_to_the_next_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+    let under_a_file = format!("{}/tool", file.display());
+    let gone = format!("{}/gone", dir.path().display());
+    let exits_7 = file_in(dir.path(), "exits-7", "#!/bin/sh\nexit 7\n", 0o755);
+    let exits_7 = exits_7.as_str();
+    for kind in [CloneKind::Vfork, CloneKind::Plain] {
+        let spawned = started(
+            kind,
+            &candidates(&[&gone, &under_a_file, exits_7], &["tool"], &[]),
+            &|| Ok(()),
+        );
+        assert_eq!(exit_status(&spawned.child), 7, "{kind:?}");
+
+        let mut none = started(kind, &candidates(&[&gone, &under_a_file], &["tool"], &[]), &|| Ok(()));
+        assert_eq!(
+            settled(&mut none.status),
+            Progress::Failed(Failure::Exec(libc::ENOTDIR)),
+            "{kind:?}: the last candidate's error"
+        );
+    }
+}
+
+/// Any other failure of a candidate's `execve` ends the candidates: `EACCES` and `ENOEXEC` are the
+/// spawn's error, and the candidate after them does not run in their place.
+///
+/// Mutants: the child goes on after `EACCES`; the child goes on after `ENOEXEC`.
+#[skuld::test]
+fn an_exec_that_fails_otherwise_ends_the_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let ran = file_in(
+        dir.path(),
+        "ran-it",
+        &format!("#!/bin/sh\necho > '{}'\n", marker.display()),
+        0o755,
+    );
+    let denied = file_in(dir.path(), "denied", "#!/bin/sh\n", 0o644);
+    let no_format = file_in(dir.path(), "no-format", "exit 5\n", 0o755);
+    for (first, errno) in [(&denied, libc::EACCES), (&no_format, libc::ENOEXEC)] {
+        let mut spawned = started(
+            CloneKind::Vfork,
+            &candidates(&[first, &ran], &["tool"], &[]),
+            &|| Ok(()),
+        );
+        assert_eq!(
+            spawned.status.progress().unwrap(),
+            Progress::Failed(Failure::Exec(errno)),
+            "{first}"
+        );
+        assert_eq!(exit_status(&spawned.child), 127, "{first}");
+        assert!(!marker.exists(), "{first}: the next candidate ran");
+    }
+}
+
+/// The first existing file is the program: a candidate that is there but whose `execve` says `ENOENT` (a
+/// script whose interpreter is missing) ends the candidates with that `ENOENT`, and the same-named file
+/// after it does not run.
+///
+/// Mutant: the child goes on after any `ENOENT` without asking whether the file is there.
+#[skuld::test]
+fn an_exec_enoent_of_a_file_that_exists_ends_the_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let later = tempfile::tempdir().unwrap();
+    let ran = file_in(
+        later.path(),
+        "tool",
+        &format!("#!/bin/sh\necho > '{}'\n", marker.display()),
+        0o755,
+    );
+    let no_interpreter = file_in(dir.path(), "tool", "#!/nonexistent/cosca-interpreter\n", 0o755);
+    for kind in [CloneKind::Vfork, CloneKind::Plain] {
+        let mut spawned = started(kind, &candidates(&[&no_interpreter, &ran], &["tool"], &[]), &|| Ok(()));
+        assert_eq!(
+            settled(&mut spawned.status),
+            Progress::Failed(Failure::Exec(libc::ENOENT)),
+            "{kind:?}"
+        );
+        assert_eq!(exit_status(&spawned.child), 127, "{kind:?}");
+        assert!(!marker.exists(), "{kind:?}: the later candidate ran");
+    }
+}
+
+/// A later candidate is checked before its `execve`: a directory of the name is not a program and is
+/// passed over as the parent's search passes it over, so the file after it runs. An entry that cannot be
+/// examined (a symlink loop: `ELOOP`) stops the search with its errno, and the file after it does not run.
+///
+/// Mutants: a later directory is `execve`d (`EACCES` ends the candidates); an entry that cannot be
+/// examined is passed over.
+#[skuld::test]
+fn a_later_candidate_that_is_not_a_file_is_skipped_and_one_that_cannot_be_examined_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let ran = file_in(
+        dir.path(),
+        "ran-it",
+        &format!("#!/bin/sh\necho > '{}'\nexit 7\n", marker.display()),
+        0o755,
+    );
+    let gone = format!("{}/gone", dir.path().display());
+    let a_directory = dir.path().join("a-directory");
+    std::fs::create_dir(&a_directory).unwrap();
+    let a_directory = a_directory.to_str().unwrap();
+    let looped = dir.path().join("loop");
+    std::os::unix::fs::symlink(&looped, &looped).unwrap();
+    let looped = looped.to_str().unwrap();
+    for kind in [CloneKind::Vfork, CloneKind::Plain] {
+        let spawned = started(kind, &candidates(&[&gone, a_directory, &ran], &["tool"], &[]), &|| {
+            Ok(())
+        });
+        assert_eq!(exit_status(&spawned.child), 7, "{kind:?}: the file after the directory");
+        assert!(marker.exists(), "{kind:?}");
+        std::fs::remove_file(&marker).unwrap();
+
+        let mut stopped = started(kind, &candidates(&[&gone, looped, &ran], &["tool"], &[]), &|| Ok(()));
+        assert_eq!(
+            settled(&mut stopped.status),
+            Progress::Failed(Failure::Exec(libc::ELOOP)),
+            "{kind:?}"
+        );
+        assert_eq!(exit_status(&stopped.child), 127, "{kind:?}");
+        assert!(
+            !marker.exists(),
+            "{kind:?}: the candidate after an unexaminable one ran"
+        );
     }
 }
 
