@@ -596,7 +596,7 @@ fn complete_exact(program: &Path, anchored: impl FnOnce() -> Result<PathBuf, Err
 /// own cwd only when no [`current_dir`](crate::Command::current_dir) is set). Reach it explicitly
 /// with `./helper`, which contains a separator.
 ///
-/// Existence is tested through `crate::resolve`'s `is_execable`, which asks `std::fs::metadata`
+/// Existence is tested through `crate::resolve`'s `is_file`, which asks `std::fs::metadata`
 /// for a file, not just for something: a directory is never a runnable program, so a same-named
 /// directory must not shadow the executable (which would end the search early and hand
 /// `CreateProcessW` an unlaunchable path with no fallback).
@@ -761,7 +761,7 @@ pub(crate) fn ensure_no_nul_wide(what: &str, s: &OsStr) -> Result<(), Error> {
 /// carry a NUL by the time it arrives:
 ///
 /// - Resolved by [`resolve_executable`] — every one of its returns is gated on `fs::metadata`
-///   (through `crate::resolve`'s `is_execable`), which fails for any path Win32 cannot encode, so
+///   (through `crate::resolve`'s `is_file`), which fails for any path Win32 cannot encode, so
 ///   such a path is never returned.
 /// - Passed through verbatim by `raw_executable()`'s `Exact` arm of `windows_raw::target_with` —
 ///   caller input, but `reject_batch_program` runs FIRST in both raw backends and

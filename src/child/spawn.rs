@@ -598,12 +598,16 @@ fn spawn_reported(
     #[cfg(unix)]
     let mut steps = in_child::InChild::default();
     #[cfg(target_os = "linux")]
-    let invocation = {
-        let invocation = invocation(cmd).not_started()?;
+    let (invocation, later, env) = {
+        let mut invocation = invocation(cmd).not_started()?;
+        // Before anything is made (stdio, a cgroup leaf), so a program that is nowhere fails the spawn
+        // with nothing to tear down.
+        let env = child_env::child_env_of(cmd);
+        let later = invocation.find(&env).not_started()?;
         if let Some(dir) = &invocation.cwd {
             enter_in_child(&mut steps, dir).not_started()?;
         }
-        invocation
+        (invocation, later, env)
     };
     #[cfg(target_os = "macos")]
     let (mut std_cmd, report) = build_std_command_with(cmd, &mut steps, unique_report::register).not_started()?;
@@ -686,8 +690,7 @@ fn spawn_reported(
         if let Some(leaf) = prepared.cgroup_leaf.as_ref().filter(|_| front.is_some()) {
             crate::containment::cgroup::front_placement(&kernel, || leaf.id()).not_started()?;
         }
-        let program =
-            fork_spawn::program(&invocation, cmd.env_ops(), prepared.marks_environment(&contain)).not_started()?;
+        let program = fork_spawn::program(&invocation, &later, env).not_started()?;
 
         let guard = spawn_lock();
         let refusing_placement = prepared.refuses_failed_placement();
@@ -1277,7 +1280,12 @@ pub(crate) fn build_std_command_with<R>(
     #[cfg(unix)] steps: &mut in_child::InChild,
     first: impl FnOnce(&mut std::process::Command) -> R,
 ) -> Result<(std::process::Command, R), Error> {
-    let invocation = invocation(cmd)?;
+    #[cfg_attr(not(unix), allow(unused_mut, reason = "only a unix spawn searches for its program"))]
+    let mut invocation = invocation(cmd)?;
+    // Found here, in the parent, over the `PATH` the child will have: std is handed a path with a `/` in
+    // it, which it does not search for.
+    #[cfg(unix)]
+    invocation.find(&child_env::child_env_of(cmd))?;
     let mut std_cmd = invocation.std_command();
     let Invocation { cwd, enter, .. } = invocation;
     apply_env(&mut std_cmd, cmd.env_ops());
@@ -1326,6 +1334,9 @@ struct Resolved {
     cwd: Option<std::path::PathBuf>,
     /// The child enters `cwd` itself; see `crate::resolve::exact::Anchored::enter`.
     enter: bool,
+    /// The program is a name to search for ([`Invocation::find`]); `false` for an `Exact` one.
+    #[cfg(unix)]
+    searched: bool,
 }
 
 // Pick the executable file to load (`executable` overrides argv[0]/first-token). On POSIX an
@@ -1336,6 +1347,8 @@ fn resolve_program(cmd: &Command, fallback: std::ffi::OsString) -> Result<Resolv
         program: exe.map_or(fallback, |p| p.as_os_str().to_os_string()),
         cwd: cmd.cwd().map(std::path::Path::to_path_buf),
         enter: false,
+        #[cfg(unix)]
+        searched: true,
     };
     #[cfg(unix)]
     if let Some(crate::command::ExecutableSpec::Exact(p)) = cmd.executable_spec() {
@@ -1344,6 +1357,7 @@ fn resolve_program(cmd: &Command, fallback: std::ffi::OsString) -> Result<Resolv
             program: a.program.into_os_string(),
             cwd: a.cwd,
             enter: a.enter,
+            searched: false,
         });
     }
     Ok(as_given(cmd.executable_path()))
@@ -1390,6 +1404,10 @@ pub(crate) struct Invocation {
         allow(dead_code, reason = "the Linux child enters every directory itself, asked or not")
     )]
     pub(crate) enter: bool,
+    /// POSIX: `program` is a name for [`find`](Invocation::find) to search for; `false` for one the
+    /// caller named exactly (`raw_executable`), which is launched as it is.
+    #[cfg(unix)]
+    pub(crate) searched: bool,
 }
 
 impl Invocation {
@@ -1424,7 +1442,16 @@ pub(crate) fn invocation(cmd: &Command) -> Result<Invocation, Error> {
     let invocation = match cmd.input() {
         CommandInput::Empty => return Err(Error::Io(std::io::Error::other("no program specified"))),
         CommandInput::Argv(argv) => {
-            let (Resolved { program, cwd, enter }, rest) = resolve_program_argv(cmd, argv)?;
+            let (
+                Resolved {
+                    program,
+                    cwd,
+                    enter,
+                    #[cfg(unix)]
+                    searched,
+                },
+                rest,
+            ) = resolve_program_argv(cmd, argv)?;
             Invocation {
                 program,
                 #[cfg(unix)]
@@ -1438,6 +1465,8 @@ pub(crate) fn invocation(cmd: &Command) -> Result<Invocation, Error> {
                 raw_args: None,
                 cwd,
                 enter,
+                #[cfg(unix)]
+                searched,
             }
         }
         CommandInput::CommandLine(line) => invocation_of_commandline(cmd, line)?,
@@ -1457,7 +1486,12 @@ fn invocation_of_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result
     if argv.is_empty() {
         return Err(Error::Io(std::io::Error::other("empty command line")));
     }
-    let Resolved { program, cwd, enter } = resolve_program(cmd, argv[0].clone())?;
+    let Resolved {
+        program,
+        cwd,
+        enter,
+        searched,
+    } = resolve_program(cmd, argv[0].clone())?;
     // When executable() overrides the loaded file, argv[0] from the command
     // line is the user's intended name.
     let arg0 = cmd.executable_path().map(|_| argv[0].clone());
@@ -1468,6 +1502,7 @@ fn invocation_of_commandline(cmd: &Command, line: &std::ffi::OsString) -> Result
         args,
         cwd,
         enter,
+        searched,
     })
 }
 
@@ -2798,6 +2833,14 @@ pub(crate) use batch_gate::reject_batch_path;
 #[cfg(unix)]
 #[path = "spawn/fd_map.rs"]
 pub(crate) mod fd_map;
+
+// The environment a unix child gets, and the one search that reads its `PATH`.
+#[cfg(unix)]
+#[path = "spawn/child_env.rs"]
+mod child_env;
+#[cfg(unix)]
+#[path = "spawn/lookup.rs"]
+mod lookup;
 
 // Every in-child step of a spawn: one `pre_exec` hook on macOS, the steps of the fork-exec core on Linux.
 #[cfg(unix)]

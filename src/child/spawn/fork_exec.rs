@@ -1,7 +1,7 @@
 //! The Linux spawn core: one fork that execs, on [`fork_with_pidfd`].
 //!
-//! The parent builds everything the child needs ([`Program`]: argv, the env block, the candidates
-//! `execve` tries) and a status channel, clones the child, and gets its pidfd from the clone. The
+//! The parent builds everything the child needs ([`Program`]: the paths to execute, argv and the env
+//! block) and a status channel, clones the child, and gets its pidfd from the clone. The
 //! child runs the caller's `steps`, writes a ready record, and attempts the `execve`. A failed step is a
 //! record on the channel and an `_exit` with the caller's code; a failed `execve` is a record and an
 //! `_exit(127)`. The channel's write end is close-on-exec, so a successful `execve` closes it.
@@ -11,7 +11,7 @@
 //! The parent reads the channel without blocking ([`Status::progress`]) and never waits for its end:
 //! another thread's fork-without-exec may hold a copy of the write end for as long as it lives.
 //!
-//! - A failure record means the program did not start: a step failed, or every `execve` failed.
+//! - A failure record means the program did not start: a step failed, or the `execve` failed.
 //! - No ready record means the child ended before it got to the `execve`: not started. A child whose
 //!   ready record cannot be written ends too, with the step code, and does not exec; only a broken
 //!   pipe (nobody reads) lets it exec.
@@ -35,11 +35,15 @@
 //! no formatting, no panic and no `debug_assert!` (both format), no `getenv`, no std I/O, nothing that
 //! reads libc's cached thread id (`raise`, `abort`, `pthread_*`). `steps` is bound by this too, and so
 //! is every function it calls. The core's own child code makes only `close`, `write`, `rt_sigprocmask`,
-//! `rt_sigpending`, `rt_sigtimedwait`, `execve` and `_exit`, and calls `steps`; a [`Program::searching`]
-//! child also sets `environ` and calls libc's `execvp`, which breaks this contract: POSIX does not list
-//! it as async-signal-safe, it calls `getenv`, and an older glibc's allocates past its stack cutoff (a
-//! long `PATH`, a long script argv), so a lock another thread held at the clone can deadlock the child.
-//! The program search moves into the parent, leaving the child `execve` alone.
+//! `rt_sigpending`, `rt_sigtimedwait`, `fstatat`, `execve` and `_exit`, and calls `steps`. The program is not searched
+//! for in the child (libc's `execvp` is not async-signal-safe: it calls `getenv`, and an older glibc's
+//! allocates past its stack cutoff, so a lock another thread held at the clone could deadlock the child):
+//! the parent finds the file, and the child `execve`s it, with no `/bin/sh` retry of `ENOEXEC`. It
+//! goes on to the next path only when the file is not there (`ENOENT`, `ENOTDIR`, and an `fstatat` of
+//! the path says so too), which a file found and then removed gives; a path that is there (a script whose
+//! interpreter is missing gives `ENOENT`) and any other failure of an `execve` are the spawn's error. A
+//! later path is `fstatat`ed first and is passed over unless it is a regular file. `fstatat` is a raw
+//! system call too.
 //!
 //! The vfork kind's child never waits on the parent: the parent is suspended until the child's `execve`
 //! or exit, so a wait on it never ends. The kernel releases the parent when the child's address space
@@ -67,86 +71,43 @@ use crate::os_process::linux::fork::{CloneKind, Fork, ForkFn, NewChild};
 /// The program to execute, with everything `execve` is given, built before the clone so that the
 /// child allocates nothing.
 pub(crate) struct Program {
-    lookup: Lookup,
+    /// The files the child `execve`s, in order.
+    paths: Vec<*const libc::c_char>,
     argv: Vec<*const libc::c_char>,
     envp: Vec<*const libc::c_char>,
     /// Keep the strings the pointers above point into alive.
     _strings: Vec<CString>,
 }
 
-/// How the child finds the file to execute.
-enum Lookup {
-    /// The caller searched: every candidate path, in the order the child tries them, with `execvp`'s
-    /// rules for each.
-    Candidates {
-        paths: Vec<*const libc::c_char>,
-        /// For each candidate, `/bin/sh <candidate> <args…>`, for a program `execve` refuses with `ENOEXEC`.
-        sh_argvs: Vec<Vec<*const libc::c_char>>,
-    },
-    /// The child searches, as `std::process::Command` does: it makes the program's environment its own and
-    /// calls libc's `execvp`, which reads `PATH` from it.
-    Execvp(*const libc::c_char),
-}
-
-const SH: &[u8] = b"/bin/sh\0";
-
 impl Program {
-    /// `candidates` in the order they are tried, `argv` (its first element is `argv[0]`), and exactly
-    /// the environment `env` names. `Err` if any of them holds a NUL.
+    /// The files `paths`, which the child `execve`s in order (a name with no `/` is read against the
+    /// child's directory, not searched for: the search is the caller's), `argv` (its first element is
+    /// `argv[0]`), and exactly the environment `env` names. `Err` if any of them holds a NUL.
+    ///
+    /// The first path is the file the caller found. The rest are for a first that is gone at the
+    /// `execve`: the child goes on to the next only when the first is no longer there, and the next is a
+    /// regular file (`exec_candidates` has the rules); any other failure of an `execve` is the spawn's
+    /// error as it is.
     pub(crate) fn new(
-        candidates: &[OsString],
+        paths: &[&OsStr],
         argv: &[&OsStr],
         env: impl Iterator<Item = (OsString, OsString)>,
     ) -> Result<Program, NulError> {
-        let candidate_c = candidates.iter().map(|c| cstring(c)).collect::<Result<Vec<_>, _>>()?;
-        let (argv_c, env_c) = argv_and_env(argv, env)?;
-        let sh = CString::from_vec_with_nul(SH.to_vec()).expect("a literal with its NUL");
-        // `sh <candidate> <args…>`: the candidate takes the place of `argv[0]`.
-        let sh_argvs = candidate_c
-            .iter()
-            .map(|candidate| {
-                let mut list: Vec<&CString> = vec![&sh, candidate];
-                list.extend(argv_c.iter().skip(1));
-                null_terminated(&list)
-            })
-            .collect();
-        let paths = candidate_c.iter().map(|c| c.as_ptr()).collect();
-        let mut strings = candidate_c;
-        strings.push(sh);
-        Ok(Program::over(
-            Lookup::Candidates { paths, sh_argvs },
-            argv_c,
-            env_c,
-            strings,
-        ))
-    }
-
-    /// `file`, which the child finds as `execvp` does (a name with a `/` as given, any other searched
-    /// for in the `PATH` of `env`), `argv` (its first element is `argv[0]`), and exactly the environment
-    /// `env` names. `Err` if any of them holds a NUL.
-    pub(crate) fn searching(
-        file: &OsStr,
-        argv: &[&OsStr],
-        env: impl Iterator<Item = (OsString, OsString)>,
-    ) -> Result<Program, NulError> {
-        let file = cstring(file)?;
-        let (argv_c, env_c) = argv_and_env(argv, env)?;
-        let lookup = Lookup::Execvp(file.as_ptr());
-        Ok(Program::over(lookup, argv_c, env_c, vec![file]))
-    }
-
-    /// The program over `lookup`, with the strings `lookup`'s pointers point into in `strings`.
-    fn over(lookup: Lookup, argv: Vec<CString>, env: Vec<CString>, mut strings: Vec<CString>) -> Program {
+        debug_assert!(!paths.is_empty(), "a program needs a file to execute");
+        let paths = paths.iter().map(|p| cstring(p)).collect::<Result<Vec<_>, _>>()?;
+        let (argv, env) = argv_and_env(argv, env)?;
         let argv_ptrs = null_terminated(&argv.iter().collect::<Vec<_>>());
         let envp = null_terminated(&env.iter().collect::<Vec<_>>());
+        let path_ptrs = paths.iter().map(|p| p.as_ptr()).collect();
+        let mut strings = paths;
         strings.extend(argv);
         strings.extend(env);
-        Program {
-            lookup,
+        Ok(Program {
+            paths: path_ptrs,
             argv: argv_ptrs,
             envp,
             _strings: strings,
-        }
+        })
     }
 }
 
@@ -191,7 +152,7 @@ pub(crate) struct StepFailure {
 pub(crate) enum Failure {
     /// A step failed.
     Step(StepFailure),
-    /// Every `execve` failed; the errno is the one `execvp` would report.
+    /// The `execve` failed with this errno.
     Exec(i32),
 }
 
@@ -443,16 +404,6 @@ pub(crate) unsafe fn spawn(
     }
 }
 
-/// Whether `errno` from `execve` means the next candidate is worth trying, as glibc's `execvp` reads it.
-/// The shim's search reads the same errnos of its probes in `shim::program_path::classify`; the two
-/// tables must agree.
-fn tries_the_next(errno: libc::c_int) -> bool {
-    matches!(
-        errno,
-        libc::ENOENT | libc::ENOTDIR | libc::ESTALE | libc::ENODEV | libc::ETIMEDOUT | libc::EACCES
-    )
-}
-
 /// A signal set as the kernel's `rt_sig*` calls take it: one bit per signal, signal `n` at bit `n - 1`.
 /// Eight bytes on every architecture the raw clone supports.
 type KernelSigSet = u64;
@@ -548,74 +499,91 @@ unsafe fn run_child(
             Ok(()) | Err(libc::EPIPE) => {}
             Err(_) => libc::_exit(step_exit),
         }
-        let errno = match &program.lookup {
-            Lookup::Candidates { paths, sh_argvs } => exec_candidates(program, paths, sh_argvs),
-            Lookup::Execvp(file) => exec_search(program, *file),
-        };
+        let errno = exec_candidates(program);
         write_record(write, Record::Failed(Failure::Exec(errno))).unwrap_or(());
         libc::_exit(127)
     }
 }
 
-/// `execvp`'s rules, over candidates prepared before the clone: the next one on `ENOENT` and its kin, and on
-/// `EACCES`, which is the answer only if nothing else is; anything else ends the search. Returns the errno
-/// of the failure; it returns only on one.
+/// What a candidate path is, by `fstatat` following symlinks.
+enum Entry {
+    RegularFile,
+    /// Something there that is not a regular file (a directory of the name).
+    NotAFile,
+    /// `ENOENT` or `ENOTDIR`, with the errno.
+    Absent(i32),
+    /// The entry cannot be examined (any other errno).
+    Unexaminable(i32),
+}
+
+/// What `path` is. One `fstatat` on a path built before the clone.
+///
+/// # Safety
+///
+/// Called only in the child of the clone, with a NUL-terminated `path`.
+unsafe fn entry(path: *const libc::c_char) -> Entry {
+    // SAFETY: a zeroed `stat` is a valid record for `fstatat` to fill; the caller's contract for `path`.
+    let (status, errno, st) = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        let status = libc::fstatat(libc::AT_FDCWD, path, &mut st, 0);
+        (status, *libc::__errno_location(), st)
+    };
+    match (status, errno) {
+        (0, _) if st.st_mode & libc::S_IFMT == libc::S_IFREG => Entry::RegularFile,
+        (0, _) => Entry::NotAFile,
+        (_, errno @ (libc::ENOENT | libc::ENOTDIR)) => Entry::Absent(errno),
+        (_, errno) => Entry::Unexaminable(errno),
+    }
+}
+
+/// `execve` of the program's paths in order; returns the errno of the failure, and only on one. The
+/// first existing file is the program, and no later file runs in its place:
+///
+/// - a later path (the first is the caller's find) is looked at first: a directory of the name is not a
+///   file and is passed over, a name that is not there is passed over, and an entry that cannot be examined
+///   ends the search with its errno;
+/// - an `execve` that fails with `ENOENT` or `ENOTDIR` goes on to the next path only if the path is no
+///   longer there (the file was removed); a path that is there (a script whose interpreter is missing
+///   gives `ENOENT` too) ends the search with the `execve`'s errno;
+/// - any other failure of an `execve` (`EACCES`, `ENOEXEC` included) ends it.
+///
+/// Makes `execve` and `fstatat` calls over pointers built before the clone, and nothing else.
 ///
 /// # Safety
 ///
 /// Called only in the child of the clone, bound by the module's contract.
-unsafe fn exec_candidates(
-    program: &Program,
-    paths: &[*const libc::c_char],
-    sh_argvs: &[Vec<*const libc::c_char>],
-) -> i32 {
+unsafe fn exec_candidates(program: &Program) -> i32 {
     let mut errno = libc::ENOENT;
-    let mut denied = false;
-    let mut stopped = false;
-    for (&candidate, sh_argv) in paths.iter().zip(sh_argvs) {
+    for (index, &path) in program.paths.iter().enumerate() {
         // SAFETY: the caller's contract; the pointers are into `program`'s strings, which outlive the child.
         unsafe {
-            libc::execve(candidate, program.argv.as_ptr(), program.envp.as_ptr());
+            if index > 0 {
+                match entry(path) {
+                    Entry::RegularFile => {}
+                    Entry::NotAFile => {
+                        errno = libc::ENOENT;
+                        continue;
+                    }
+                    Entry::Absent(gone) => {
+                        errno = gone;
+                        continue;
+                    }
+                    Entry::Unexaminable(failed) => return failed,
+                }
+            }
+            libc::execve(path, program.argv.as_ptr(), program.envp.as_ptr());
             errno = *libc::__errno_location();
-            if errno == libc::ENOEXEC {
-                libc::execve(SH.as_ptr().cast(), sh_argv.as_ptr(), program.envp.as_ptr());
-                errno = *libc::__errno_location();
+            if !matches!(errno, libc::ENOENT | libc::ENOTDIR) {
+                break;
+            }
+            match entry(path) {
+                Entry::Absent(_) => {}
+                Entry::RegularFile | Entry::NotAFile => break,
+                Entry::Unexaminable(failed) => return failed,
             }
         }
-        if !tries_the_next(errno) {
-            stopped = true;
-            break;
-        }
-        denied |= errno == libc::EACCES;
-    }
-    if denied && !stopped {
-        errno = libc::EACCES;
     }
     errno
-}
-
-extern "C" {
-    /// libc's environment: the array `execvp` reads `PATH` from, and the program's environment unless an
-    /// `exec` call is given its own.
-    static mut environ: *const *const libc::c_char;
-}
-
-/// What `std::process::Command` does in its child once the steps are done: the program's environment
-/// becomes the process's own, and libc's `execvp` does the search. Not async-signal-safe: see the module
-/// doc. Returns the errno of the failure; it returns only on one.
-///
-/// # Safety
-///
-/// Called only in the child of the clone, bound by the module's contract. The child's address space is its
-/// own (the clone has no `CLONE_VM`), so setting `environ` changes no other thread's.
-unsafe fn exec_search(program: &Program, file: *const libc::c_char) -> i32 {
-    // SAFETY: the caller's contract: `environ` is this process's own, set to an array of C strings that
-    // outlive the child.
-    unsafe {
-        environ = program.envp.as_ptr();
-        libc::execvp(file, program.argv.as_ptr());
-        *libc::__errno_location()
-    }
 }
 
 #[cfg(test)]

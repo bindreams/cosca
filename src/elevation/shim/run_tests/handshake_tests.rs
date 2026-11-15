@@ -115,7 +115,11 @@ fn refusal_codes_and_stderr_lines() {
     );
     rig_for(Spec::sh("true").inject(Inject::ForkFails), 117, true);
     rig_for(Spec::sh("true").inject(Inject::PipeFails), 117, true);
-    // After the fork: the status pipe's report, and the program's own status.
-    rig_for(Spec::new("/nonexistent/tool", &[]), 117, false);
+    // A program that is not there is found out before the fork, whether it is searched for or located.
+    rig_for(Spec::new("/nonexistent/tool", &[]), 117, true);
+    // After the fork: the status pipe's report (a file the exec refuses), and the program's own status.
+    let plain = nowhere.path().join("plain");
+    std::fs::write(&plain, "x").unwrap();
+    rig_for(Spec::new(plain.as_os_str(), &[]), 117, false);
     rig_for(Spec::sh("exit 3"), 3, false);
 }

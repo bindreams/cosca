@@ -2,7 +2,7 @@
 //! applied as a candidate filter.
 //!
 //! `windows: true` on a POSIX host is safe here for the reason `resolve_tests`' `HOST_WINDOWS`
-//! doc gives: tempdir paths hold no `;` and no drive prefix, and `is_execable` reduces to
+//! doc gives: tempdir paths hold no `;` and no drive prefix, and the existence test is
 //! `is_file()`.
 
 use super::*;

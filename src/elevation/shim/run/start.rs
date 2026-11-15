@@ -16,7 +16,6 @@ use super::{Exit, Shim};
 use crate::child::spawn::fork_exec::{Program, Spawned};
 use crate::elevation::shim::codes;
 use crate::elevation::shim::hooks::{Gate, Inject};
-use crate::elevation::shim::program_path;
 use crate::elevation::shim::protocol::{Errno, Frame, NotExecuted, ShimArgs};
 use crate::elevation::shim::step::{conclude, LoopState};
 use crate::os_process::linux::fork::{
@@ -107,11 +106,12 @@ pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &Owne
     };
     signals::reset_sigchld();
 
-    // Resolved before the clone, so that the child's only calls are `execve`.
+    // Found before the clone, by the one search, so that the child's only call is `execve`.
     let search = args.search_path.clone().or_else(|| std::env::var_os("PATH"));
-    let candidates = match program_path::resolve(&args.program, search.as_deref()) {
-        Ok(candidates) => candidates,
-        Err(Errno(errno)) => {
+    let found = match crate::resolve::posix::lookup(std::path::Path::new(&args.program), None, search.as_deref()) {
+        Ok(found) => found,
+        Err(error) => {
+            let errno = crate::resolve::posix::errno_of(&error);
             let e = std::io::Error::from_raw_os_error(errno);
             let why = args.program.to_string_lossy().into_owned();
             return Err(shim.not_executed(NotExecuted::ExecFailed(Errno(errno)), &why, &e));
@@ -120,8 +120,11 @@ pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &Owne
     let argv: Vec<&OsStr> = std::iter::once(args.program.as_os_str())
         .chain(args.args.iter().map(|a| a.as_os_str()))
         .collect();
+    let paths: Vec<&OsStr> = std::iter::once(found.path.as_os_str())
+        .chain(found.later.iter().map(|p| p.as_os_str()))
+        .collect();
     let program =
-        Program::new(&candidates, &argv, std::env::vars_os()).expect("argv carries no NUL: ShimArgs::parse checked");
+        Program::new(&paths, &argv, std::env::vars_os()).expect("argv carries no NUL: ShimArgs::parse checked");
     let gate_path = shim.hooks.and_then(|h| h.child_gate());
     let prepared = Prepared::new(
         inherited,

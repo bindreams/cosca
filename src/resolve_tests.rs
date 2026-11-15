@@ -380,8 +380,8 @@ fn a_name_with_a_separator_resolves_against_cwd() {
 /// Drive `resolve` with the WINDOWS rules regardless of host, so rules that only ship on Windows
 /// are still gated in ordinary CI rather than only on the Windows runner.
 ///
-/// Nothing here touches a Windows API: `is_execable` reduces to `is_file()` when `windows` is
-/// true, and the `PATH` splitting that the bare-name callers exercise is pure byte logic over
+/// Nothing here touches a Windows API: the existence test is `is_file()` on either grammar, and
+/// the `PATH` splitting that the bare-name callers exercise is pure byte logic over
 /// tempdir paths that contain no `;`. See `HOST_WINDOWS` for why simulating Windows on POSIX is
 /// safe here while the reverse never is.
 fn go_win_path(program: &str, cwd: &Path, path: Option<&OsStr>) -> Result<std::path::PathBuf, Error> {
@@ -459,7 +459,7 @@ fn empty_path_elements_are_skipped() {
     // An empty element means "the current directory" — resolving through it would reopen the
     // binary-planting hole `resolve()`'s doc on the current directory exists to close. This is
     // guarded by `resolve()`'s single `joined.is_absolute()` check: an empty `PATH` element joins
-    // to a RELATIVE path (`Shape::BareName` never puts `cwd` itself in `dirs`), which `is_execable`
+    // to a RELATIVE path (`Shape::BareName` never puts `cwd` itself in `dirs`), which `is_file`
     // would then stat against the PROCESS's real OS cwd, not the `cwd` parameter `go()` was handed.
     // For that hazard to be live, the process's real cwd must actually BE `cwd.path()` (holding the
     // planted file) for the duration — otherwise deleting `joined.is_absolute() &&` still finds
@@ -600,25 +600,8 @@ fn result_is_always_absolute() {
 
 // ── the execute bit, and the cwd ─────────────────────────────────────────────────────
 
-#[cfg(unix)]
 #[skuld::test]
-fn a_readable_but_non_executable_match_is_skipped() {
-    use std::os::unix::fs::PermissionsExt;
-    let cwd = tempfile::tempdir().unwrap();
-    let a = tempfile::tempdir().unwrap();
-    let b = tempfile::tempdir().unwrap();
-    let dud = touch(a.path(), "tool");
-    std::fs::set_permissions(&dud, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let want = touch(b.path(), "tool");
-    std::fs::set_permissions(&want, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let p = path_var(&[a.path(), b.path()]);
-    // execvp skips the non-executable match and keeps searching; keying on existence alone
-    // would return `a/tool` and hand it to exec as EACCES.
-    assert_eq!(go("tool", cwd.path(), Some(&p)).unwrap(), want);
-}
-
-#[skuld::test]
-fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
+fn a_relative_cwd_is_applied_to_the_name_once() {
     let tmp = tempfile::tempdir().unwrap();
     let sub = tmp.path().join("sub");
     std::fs::create_dir(&sub).unwrap();
@@ -634,11 +617,11 @@ fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&want, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    // `resolve()` absolutises a relative `cwd` via `std::env::current_dir()` (see resolve.rs's own
-    // "applied twice" note) — see `empty_path_elements_are_skipped`'s doc for why this runs in a
-    // re-exec'd child.
+    // The relative `cwd` must reach the name once: a caller that completes it (Windows) absolutises it
+    // against this process's cwd, and POSIX keeps it relative — see `empty_path_elements_are_skipped`'s
+    // doc for why this runs in a re-exec'd child.
     crate::test_child::run_fixture_with_cwd(
-        crate::test_child::fixture_path!(fixture_relative_cwd_is_absolutised),
+        crate::test_child::fixture_path!(fixture_relative_cwd_is_applied_once),
         tmp.path(),
         FIXTURE_RELATIVE_CWD_MARKER,
     );
@@ -646,12 +629,12 @@ fn a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice() {
 
 const FIXTURE_RELATIVE_CWD_MARKER: &str = "COSCA_FIXTURE_RELATIVE_CWD";
 
-/// The child half of [`a_relative_cwd_is_absolutised_so_it_cannot_be_applied_twice`]; see
+/// The child half of [`a_relative_cwd_is_applied_to_the_name_once`]; see
 /// [`fixture_empty_path_elements_are_skipped`]'s doc for the shared shape. Reconstructs `want`
 /// from its own (already-`tmp.path()`) cwd rather than receiving it from the parent, since the two
 /// are guaranteed equal by construction.
 #[skuld::test]
-fn fixture_relative_cwd_is_absolutised() {
+fn fixture_relative_cwd_is_applied_once() {
     let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_RELATIVE_CWD_MARKER) else {
         return; // picked up by an ordinary suite run — deliberately inert
     };
@@ -669,10 +652,19 @@ fn fixture_relative_cwd_is_absolutised() {
         .unwrap();
         resolve::resolve_executable(Path::new("./tool"), Some(&base), None).unwrap()
     };
+    // POSIX reads the relative base against the directory this process inherited and keeps it
+    // relative: it is the child that enters `sub`, so no path of this process's directory is read.
     #[cfg(not(windows))]
-    let got = go("./tool", Path::new("sub"), None).unwrap();
-    assert!(got.is_absolute(), "{got:?}");
-    assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
+    {
+        let got = go("./tool", Path::new("sub"), None).unwrap();
+        assert!(!got.is_absolute(), "{got:?}");
+        assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
+    }
+    #[cfg(windows)]
+    {
+        assert!(got.is_absolute(), "{got:?}");
+        assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
+    }
 }
 
 /// The end-to-end half of [`a_drive_relative_name_is_refused_on_shape`], on a real Windows runner
@@ -954,10 +946,9 @@ fn a_miss_is_reported_as_not_found() {
 
 #[skuld::test]
 fn a_directory_named_like_the_program_is_not_returned() {
-    // `is_execable` keys on `is_file()`, not `exists()`. It matters most on POSIX, where
-    // `faccessat(X_OK)` SUCCEEDS on a directory — so an `exists()`-based check would hand a
-    // directory to exec. Both existing gates for this live in the `#[cfg(windows)]` module, which
-    // is the wrong platform for the hazard.
+    // The existence test keys on `is_file()`, not `exists()`: an `exists()`-based check would hand a
+    // directory to exec (which answers `EACCES` for one). Both existing gates for this live in the
+    // `#[cfg(windows)]` module, which is the wrong platform for the hazard.
     let cwd = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
     std::fs::create_dir(bin.path().join(exe_name("tool"))).unwrap();

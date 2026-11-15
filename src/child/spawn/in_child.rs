@@ -211,8 +211,7 @@ pub(super) fn spawn_sh(script: &str, steps: &mut InChild) -> io::Result<super::f
     use std::ffi::OsStr;
 
     let argv = [OsStr::new("sh"), OsStr::new("-c"), OsStr::new(script)];
-    let program =
-        super::fork_exec::Program::searching(OsStr::new("/bin/sh"), &argv, std::env::vars_os()).expect("no NUL");
+    let program = super::fork_exec::Program::new(&[OsStr::new("/bin/sh")], &argv, std::env::vars_os()).expect("no NUL");
     let lock = super::spawn_lock();
     super::fork_spawn::start(
         &program,

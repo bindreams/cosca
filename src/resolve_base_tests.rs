@@ -224,17 +224,18 @@ fn a_leading_separator_is_never_a_drive_prefix() {
     assert_eq!(windows_prefix_len("\u{e9}:x".as_bytes()), 3);
 }
 
-/// A name that needs a base resolved without one is a caller's contract violation, never a
-/// second, untracked read of this process's cwd.
+/// On the Windows grammar a name that needs a base resolved without one is a caller's contract
+/// violation, never a second, untracked read of this process's cwd. (On the POSIX grammar `None` is
+/// the directory the process inherited, which the OS reads.)
 #[skuld::test]
 #[should_panic(expected = "needs a base")]
 fn a_located_name_without_a_base_is_a_contract_violation() {
     _ = resolve(ResolveInput {
-        program: Path::new("sub/tool"),
+        program: Path::new(r"sub\tool"),
         cwd: None,
         system_dirs: &no_system_dirs,
         path_var: None,
-        windows: false,
+        windows: true,
         loadable_only: false,
         normalise: &as_written,
     });
@@ -359,7 +360,11 @@ fn loop_then_open() -> (tempfile::TempDir, PathBuf, std::ffi::OsString) {
 
 /// A `chmod 0o000` directory, and the guard that unlocks it on drop.
 #[cfg(unix)]
-struct Locked(PathBuf, crate::test_child::RestoreMode);
+struct Locked(
+    PathBuf,
+    #[allow(dead_code, reason = "held for its drop, which restores the directory's mode")]
+    crate::test_child::RestoreMode,
+);
 
 #[cfg(unix)]
 impl Locked {
@@ -531,6 +536,64 @@ fn fixture_a_denied_candidate_is_skipped_by_an_ordinary_search() {
     assert_eq!(search_tool(&path, false).unwrap(), open.join("tool.exe"));
 }
 
+/// A POSIX search stops at an entry that is denied to the caller, with `PermissionDenied`, though
+/// the entry after it holds the program. Runs in a re-exec, as a caller
+/// with no DAC bypass.
+///
+/// Mutant: the denied entry is skipped with a warning.
+#[cfg(unix)]
+#[skuld::test]
+fn a_denied_entry_stops_a_posix_search_with_permission_denied() {
+    crate::test_child::run_fixture(crate::test_child::fixture_path!(
+        fixture_a_denied_entry_stops_a_posix_search_with_permission_denied
+    ));
+}
+
+/// The child half of [`a_denied_entry_stops_a_posix_search_with_permission_denied`].
+#[cfg(unix)]
+#[skuld::test]
+fn fixture_a_denied_entry_stops_a_posix_search_with_permission_denied() {
+    if !crate::test_child::is_fixture_reexec() {
+        return; // picked up by an ordinary suite run — deliberately inert
+    }
+    let (_root, locked, open, _windows_path) = locked_then_open();
+    let path = std::env::join_paths([&locked.0, &open]).unwrap();
+    match super::posix::lookup(Path::new("tool.exe"), None, Some(&path)) {
+        Err(e @ Error::Io(_)) => {
+            assert_eq!(crate::error::first_os_code(&e), Some(libc::EACCES), "{e}");
+            let Error::Io(io) = &e else { unreachable!() };
+            assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+        }
+        other => panic!("a denied entry must stop the search: {other:?}"),
+    }
+}
+
+/// A located name in a directory the caller cannot search is the directory's `PermissionDenied`, not
+/// the program's `NotFound`. Runs in a re-exec, as a caller with no DAC bypass.
+///
+/// Mutant: a denied probe of the located name is a miss.
+#[cfg(unix)]
+#[skuld::test]
+fn a_directory_that_cannot_be_searched_is_permission_denied_for_a_located_name() {
+    crate::test_child::run_fixture(crate::test_child::fixture_path!(
+        fixture_a_directory_that_cannot_be_searched_is_permission_denied_for_a_located_name
+    ));
+}
+
+/// The child half of [`a_directory_that_cannot_be_searched_is_permission_denied_for_a_located_name`].
+#[cfg(unix)]
+#[skuld::test]
+fn fixture_a_directory_that_cannot_be_searched_is_permission_denied_for_a_located_name() {
+    if !crate::test_child::is_fixture_reexec() {
+        return; // picked up by an ordinary suite run — deliberately inert
+    }
+    let (_root, locked, _open, _path) = locked_then_open();
+    match super::posix::lookup(Path::new("./tool.exe"), Some(&locked.0), None) {
+        Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EACCES), "{e:?}"),
+        other => panic!("a directory that cannot be searched must be the error: {other:?}"),
+    }
+}
+
 /// An `execve` from the fixture must not give DAC bypass back. `test_privilege` sets
 /// `no_new_privs` for exactly that: without it, a uid-0 `execve` regains the capabilities from the
 /// bounding set (`capabilities(7)`, set-user-ID-root compatibility). The driver needs a DAC bypass
@@ -596,21 +659,6 @@ fn only_definite_misses_count_as_absent() {
     for (code, want) in cases {
         let e = std::io::Error::from_raw_os_error(code);
         assert_eq!(is_absence(&e), want, "{e}");
-    }
-}
-
-/// The execute-permission answer: only "denied" and a definite absence are "not executable"; any
-/// other failure is undeterminable and reaches `resolve`'s disposition.
-#[cfg(unix)]
-#[skuld::test]
-fn only_a_denied_or_absent_execute_check_is_a_no() {
-    assert!(execute_permission(0, 0).unwrap());
-    for errno in [libc::EACCES, libc::ENOENT, libc::ENOTDIR] {
-        assert!(!execute_permission(-1, errno).unwrap(), "errno {errno}");
-    }
-    for errno in [libc::EIO, libc::ELOOP, libc::ENOMEM] {
-        let e = execute_permission(-1, errno).unwrap_err();
-        assert_eq!(e.raw_os_error(), Some(errno));
     }
 }
 

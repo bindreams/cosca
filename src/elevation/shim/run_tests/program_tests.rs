@@ -59,7 +59,7 @@ fn relative_and_empty_path_elements_are_never_searched() {
 }
 
 #[skuld::test]
-fn directory_and_non_executable_candidates_are_skipped_then_eacces() {
+fn a_directory_is_skipped_and_the_first_file_is_the_match_whatever_its_mode() {
     let tmp = tempfile::tempdir().unwrap();
     let marker = tmp.path().join("ran");
     let dirs: Vec<PathBuf> = ["d", "p", "x"].iter().map(|n| tmp.path().join(n)).collect();
@@ -75,31 +75,49 @@ fn directory_and_non_executable_candidates_are_skipped_then_eacces() {
             .collect::<Vec<_>>()
             .join(":")
     };
-    // Only skipped candidates: EACCES, and nothing ran.
+    // A directory is skipped; the first file is the match, whatever its mode: its exec is refused, and
+    // the executable file after it does not run in its place.
     let (outcome, _) = outcome_of(Spec::new("tool", &[]).search_path(join(&[&dirs[0], &dirs[1]])));
     assert_eq!(outcome, not_executed(NotExecuted::ExecFailed(Errno(libc::EACCES))));
     assert!(!marker.exists());
-    // A later executable one still wins.
-    let (outcome, code) = outcome_of(Spec::new("tool", &[]).search_path(join(&[&dirs[0], &dirs[1], &dirs[2]])));
+    let (outcome, _) = outcome_of(Spec::new("tool", &[]).search_path(join(&[&dirs[0], &dirs[1], &dirs[2]])));
+    assert_eq!(outcome, not_executed(NotExecuted::ExecFailed(Errno(libc::EACCES))));
+    assert!(!marker.exists(), "the search went on past the first file");
+    // Without the file without the bit, the executable one runs.
+    let (outcome, code) = outcome_of(Spec::new("tool", &[]).search_path(join(&[&dirs[0], &dirs[2]])));
     assert_eq!(outcome, LinkOutcome::Exited(0));
     assert_eq!(code, Some(0));
     assert!(marker.exists(), "the executable candidate did not run");
 }
 
+/// An executable file that is no executable format is `ENOEXEC`, and does not run through `/bin/sh`.
+///
+/// Mutant: the shim retries `ENOEXEC` through `/bin/sh`.
 #[skuld::test]
-fn no_shebang_script_runs_via_bin_sh() {
+fn a_file_that_is_no_executable_format_is_enoexec() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("out");
     let path = tmp.path().join("noshebang");
-    std::fs::write(&path, format!("echo \"$0|$1|$2\" > '{}'\n", out.display())).unwrap();
+    std::fs::write(&path, format!("echo ran > '{}'\n", out.display())).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (outcome, _) = outcome_of(Spec::new(path.as_os_str(), &["one", "two words"]));
-    assert_eq!(outcome, LinkOutcome::Exited(0));
-    // `/bin/sh <script> args…`: the script's path is `$0`, and the arguments are intact.
-    assert_eq!(
-        std::fs::read_to_string(out).unwrap(),
-        format!("{}|one|two words\n", path.display())
-    );
+    assert_eq!(outcome, not_executed(NotExecuted::ExecFailed(Errno(libc::ENOEXEC))));
+    assert!(!out.exists(), "the script ran");
+}
+
+/// A program that names no file is refused by its shape: `EINVAL`, not a miss.
+///
+/// Mutant: the shim reports every refusal as `ENOENT`.
+#[skuld::test]
+fn a_program_that_names_no_file_is_einval() {
+    for name in ["", ".", "..", "bin/", "/usr/bin/"] {
+        let (outcome, _) = outcome_of(Spec::new(name, &[]).search_path("/usr/bin:/bin"));
+        assert_eq!(
+            outcome,
+            not_executed(NotExecuted::ExecFailed(Errno(libc::EINVAL))),
+            "{name:?}"
+        );
+    }
 }
 
 /// The signal masks of a program that prints `/proc/self/status`.
@@ -155,7 +173,7 @@ fn program_keeps_the_callers_other_ignored_signals() {
     assert_eq!(caught, 0, "exec resets every handler");
 }
 
-// A candidate that changes between the search and the exec -----
+// The file found changes between the search and the exec -----
 
 /// Two directories, searched in this order, and the `PATH` that names them.
 struct Tools {
@@ -196,64 +214,48 @@ fn changed_before_the_clone(tools: &Tools, args: &[&str], change: impl FnOnce())
     outcome
 }
 
+/// The file found is gone at the exec: the child goes on to the next candidate on the `PATH`, as it
+/// would had the first never been there, and the program runs.
+///
+/// Mutant: the child tries the file found only.
 #[skuld::test]
-fn a_candidate_that_vanishes_before_the_exec_falls_through_to_the_next() {
+fn a_match_that_vanishes_before_the_exec_runs_the_next_candidate() {
     let tools = two_tool_dirs();
-    let (first_ran, second_ran) = (tools.first.join("ran"), tools.second.join("ran"));
-    script(&tools.first, "tool", &first_ran, 0o755);
-    script(&tools.second, "tool", &second_ran, 0o755);
+    let marker = tools.second.join("ran");
+    script(&tools.first, "tool", &tools.first.join("ran"), 0o755);
+    script(&tools.second, "tool", &marker, 0o755);
     let outcome = changed_before_the_clone(&tools, &[], || std::fs::remove_file(tools.first.join("tool")).unwrap());
     assert_eq!(outcome, LinkOutcome::Exited(0));
-    assert!(second_ran.exists(), "the next candidate did not run");
-    assert!(!first_ran.exists());
+    assert!(marker.exists(), "the next candidate did not run");
 }
 
+/// A match the exec is denied is `EACCES`, whatever follows it.
 #[skuld::test]
-fn a_denied_candidate_is_the_answer_when_nothing_else_runs() {
+fn a_match_that_is_denied_at_the_exec_is_eacces_and_the_next_does_not_run() {
     let tools = two_tool_dirs();
     let marker = tools.first.join("ran");
     script(&tools.first, "tool", &marker, 0o755);
     script(&tools.second, "tool", &marker, 0o755);
     let outcome = changed_before_the_clone(&tools, &[], || {
         std::fs::set_permissions(tools.first.join("tool"), std::fs::Permissions::from_mode(0o000)).unwrap();
-        std::fs::remove_file(tools.second.join("tool")).unwrap();
     });
     assert_eq!(outcome, not_executed(NotExecuted::ExecFailed(Errno(libc::EACCES))));
     assert!(!marker.exists());
 }
 
+/// Any other exec failure is the answer as it is.
 #[skuld::test]
-fn a_candidate_that_fails_otherwise_ends_the_search() {
+fn a_match_that_fails_otherwise_at_the_exec_is_the_answer() {
     let tools = two_tool_dirs();
     let marker = tools.second.join("ran");
     script(&tools.first, "tool", &marker, 0o755);
     script(&tools.second, "tool", &marker, 0o755);
     let outcome = changed_before_the_clone(&tools, &[], || {
-        // A symlink to itself: `execve` answers `ELOOP`, which `execvp` does not step over.
+        // A symlink to itself: `execve` answers `ELOOP`.
         let first = tools.first.join("tool");
         std::fs::remove_file(&first).unwrap();
         std::os::unix::fs::symlink("tool", &first).unwrap();
     });
     assert_eq!(outcome, not_executed(NotExecuted::ExecFailed(Errno(libc::ELOOP))));
     assert!(!marker.exists(), "the search went on past a failure");
-}
-
-#[skuld::test]
-fn the_shell_fallback_runs_the_candidate_that_was_refused_for_its_format() {
-    let tools = two_tool_dirs();
-    let out = tools._tmp.path().join("out");
-    std::fs::write(tools.first.join("tool"), "#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(tools.first.join("tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let second = tools.second.join("tool");
-    std::fs::write(&second, format!("echo \"$0|$1\" > '{}'\n", out.display())).unwrap();
-    std::fs::set_permissions(&second, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let outcome = changed_before_the_clone(&tools, &["one"], || {
-        std::fs::remove_file(tools.first.join("tool")).unwrap()
-    });
-    assert_eq!(outcome, LinkOutcome::Exited(0));
-    // `/bin/sh <the second candidate> one`, not the first.
-    assert_eq!(
-        std::fs::read_to_string(out).unwrap(),
-        format!("{}|one\n", second.display())
-    );
 }

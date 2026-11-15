@@ -217,6 +217,30 @@ fn strongest_fails_the_spawn_when_its_child_cannot_be_placed(#[fixture(cgroup)] 
     assert_strongest_fails(Step::Placement);
 }
 
+/// A program that is nowhere is found out before the spawn makes anything: `NotFound`, with no leaf
+/// attempted (the forced leaf failure is still armed, and would have made this a `Strongest` refusal).
+///
+/// Mutant: the program is searched for after `containment::prepare`.
+#[skuld::test]
+fn a_missing_program_is_not_found_before_any_leaf_is_made(#[fixture(cgroup)] _group: &Group) {
+    let _forced = Step::Leaf.force();
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(["cosca-strongest-no-such-program"])
+        .env("PATH", "/usr/bin:/bin");
+    cmd.contain_with(ContainMode::Strongest);
+
+    let spawned = cmd.spawn();
+
+    let Err(error) = spawned else {
+        panic!("a program found nowhere must fail the spawn");
+    };
+    assert!(
+        matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "not found, not a cgroup refusal: {error:?}"
+    );
+    assert!(fault::take_force_leaf_open_failure(), "a leaf was made for it");
+}
+
 #[skuld::test]
 fn best_effort_degrades_when_its_leaf_cannot_be_made(#[fixture(cgroup)] _group: &Group) {
     assert_best_effort_degrades(Step::Leaf);

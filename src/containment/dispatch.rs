@@ -73,13 +73,6 @@ impl Prepared {
         return crate::graceful::GracefulMechanism::Process;
     }
 
-    /// Linux: whether the child's environment carries the nesting marker, which the spawn sets itself.
-    /// `req` is the request this was prepared for.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn marks_environment(&self, req: &ContainRequest) -> bool {
-        marks_environment(req, self.is_root)
-    }
-
     /// Linux: the placement channel of the cgroup leaf this spawn made, if it made one.
     #[cfg(target_os = "linux")]
     pub(crate) fn placement_channel(&mut self) -> Option<&mut crate::containment::cgroup::ReportChannel> {
@@ -1442,6 +1435,15 @@ fn marks_environment(req: &ContainRequest, is_root: bool) -> bool {
     is_root && req.nesting == Nesting::Mark
 }
 
+/// Unix: whether a spawn of `req` gives its child the nesting marker, for an inherited environment that
+/// carries it or not (`marker_present`). [`prepare`] decides the same for the spawn, from this process's
+/// environment; the spawn builds the child's environment before it, so the program is searched for over
+/// the `PATH` the child has.
+#[cfg(unix)]
+pub(crate) fn marks_child_environment(req: &ContainRequest, marker_present: bool) -> bool {
+    req.mode.is_some() && marks_environment(req, !is_nested(marker_present))
+}
+
 /// Phase 1 (before spawn): env-marker root detection + pre-spawn OS setup. On Unix, what the child
 /// does for itself between `fork` and `exec` goes into `steps`, which the caller registers.
 ///
@@ -1547,7 +1549,7 @@ pub(crate) fn prepare(
             frozen: flags.suspended,
         });
     }
-    // Linux sets the marker in the environment it builds itself (see [`Prepared::marks_environment`]).
+    // Linux sets the marker in the environment it builds itself (see [`marks_child_environment`]).
     #[cfg(not(target_os = "linux"))]
     let marker_env = marks_environment(req, is_root);
     // Windows: hand std the whole environment, rebuilt from the snapshot the marker was read from,
