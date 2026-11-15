@@ -1,19 +1,18 @@
-# The Linux guest for cosca's sandbox lanes (`devvm/README.md`): Ubuntu 24.04, the packages the elevation and
-# cgroup tests need, the toolchain CI uses, and the git-tracked tree at ~/cosca. The tree comes last, so an edit
-# to a tracked file rebuilds nothing above it.
+# The Linux guest for cosca's sandbox lanes (`devvm/README.md`): Ubuntu 24.04, a C linker, the toolchain CI uses, and
+# the git-tracked tree at ~/cosca. The tree comes last, so an edit to a tracked file rebuilds nothing above it.
 from: ubuntu-24.04
 resources:
   cpus: 4
   memory: 8GiB
 steps:
-  # A C linker, and what the ELEVATION group elevates through: polkit (`pkexec`) and `doas`.
+  # A C linker. The elevation lane installs, and removes, what it elevates through (polkit, `doas`).
   - elevated: true
     shell: bash
     run: |
       set -euo pipefail
       export DEBIAN_FRONTEND=noninteractive
       apt-get -o DPkg::Lock::Timeout=-1 update -qq
-      apt-get -o DPkg::Lock::Timeout=-1 install -qq -y --no-install-recommends build-essential polkitd pkexec opendoas
+      apt-get -o DPkg::Lock::Timeout=-1 install -qq -y --no-install-recommends build-essential
   # `.github/scripts/unattended-gui-elevation.py` and `elevation-lane-sudoers.sh` weaken a machine only where this
   # file exists. It is written here, never by a script that could be run on a host.
   - elevated: true

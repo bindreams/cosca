@@ -742,89 +742,22 @@ jobs:
 
       # Elevation (Linux) =====
       #
-      # The ELEVATION group (`COSCA_TEST_ELEVATION`, off workflow-wide), selected by its label. This is a CI
-      # runner, so the group consents. `-E binary(=elevation)`: the only binary with elevation tests; libtest
-      # binaries ignore `SKULD_LABELS` and would run whole.
-      #
-      # polkit allows the runner user every action, so `pkexec` (`Auth::Gui`) asks nothing; the script checks that.
-      # Reverted after the lane: `unattended-gui-elevation.py --revert`, then `elevation-lane-linux.sh --cleanup`, which
-      # purges what apt installed here and restores `/etc/doas.conf`.
-      - name: Elevation (Linux) - allow unattended GUI elevation
-        id: lin_elev_policy
+      # `.github/scripts/elevation-lane.sh` has the explanation. 15 min: over 50 runs the lane's steps took 72 s at most
+      # and the tokio test build of this job 57 s; one hung test is cut at 301 s.
+      - name: Elevation (Linux)
+        id: lin_elev
         if: ${{ !cancelled() && matrix.os == 'linux' && matrix.arch == 'amd64' }}
+        timeout-minutes: 15
         shell: bash
-        run: |
-          set -euxo pipefail
-          python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --check-only
-          bash .github/scripts/elevation-lane-linux.sh --this-machine-is-disposable --record
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y polkitd pkexec opendoas
-          sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --user "$USER"
-
-      # `doas` lets the runner user run anything as root without a password (the `Backend::Doas` test).
-      - name: Elevation (Linux) - provision doas
-        id: lin_elev_doas
-        if: ${{ !cancelled() && steps.lin_elev_policy.outcome == 'success' }}
-        shell: bash
-        run: bash .github/scripts/elevation-lane-doas.sh "$USER"
-
-      # Rules and password: see elevation-lane-sudoers.sh. The password goes to the run step as an output, not
-      # through `GITHUB_ENV`.
-      - name: Elevation (Linux) - provision sudo
-        id: lin_elev_sudo
-        if: ${{ !cancelled() && steps.lin_elev_doas.outcome == 'success' }}
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          # No xtrace here: it would print the password before the mask takes effect.
-          set -euo pipefail
-          password="$(openssl rand -hex 16)"
-          echo "::add-mask::$password"
-          echo "password=$password" >> "$GITHUB_OUTPUT"
-          COSCA_TESTCFG_ELEVATION_PASSWORD="$password" bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable "$USER" "$PWD/target/$TARGET/debug/cosca_testbin"
-
-      - name: Elevation (Linux) - run the elevation tests
-        id: lin_elev_run
-        if: ${{ !cancelled() && steps.lin_elev_sudo.outcome == 'success' }}
-        timeout-minutes: 10
-        shell: bash
-        env:
-          COSCA_TEST_ELEVATION: "1"
-          COSCA_TEST_ELEVATION_CONSENT: "1"
-          COSCA_TESTCFG_ELEVATION_PASSWORD: ${{ steps.lin_elev_sudo.outputs.password }}
-          SKULD_LABELS: elevation
-        run: exec python3 .github/scripts/run-nextest.py elevation cargo nextest run --locked --features tokio --target ${{ matrix.target }} --no-tests=fail -E 'binary(=elevation)'
-
-      - name: Elevation (Linux) - check the JUnit result
-        if: ${{ !cancelled() && steps.lin_elev_run.outcome == 'success' }}
-        shell: bash
-        run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/elevation.xml" --tests 9
+        run: exec python3 .github/scripts/forward.py bash .github/scripts/elevation-lane.sh ${{ matrix.target }}
 
       - name: Elevation (Linux) - print the process table
-        if: ${{ steps.lin_elev_run.outcome == 'failure' || steps.lin_elev_run.outcome == 'cancelled' }}
+        if: ${{ steps.lin_elev.outcome == 'failure' || steps.lin_elev.outcome == 'cancelled' }}
         timeout-minutes: 2
         run: ps -eo pid,ppid,pgid,stat,etime,args
 
-      - name: Elevation (Linux) - remove the sudo rules
-        if: ${{ always() && steps.lin_elev_sudo.outcome != 'skipped' && steps.lin_elev_sudo.outcome != '' }}
-        shell: bash
-        env:
-          COSCA_TESTCFG_ELEVATION_PASSWORD: ${{ steps.lin_elev_sudo.outputs.password }}
-        run: bash .github/scripts/elevation-lane-sudoers.sh --this-machine-is-disposable --cleanup "$USER"
-
-      - name: Elevation (Linux) - revert unattended GUI elevation
-        if: ${{ always() && steps.lin_elev_policy.outcome != 'skipped' && steps.lin_elev_policy.outcome != '' }}
-        shell: bash
-        run: sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" python3 .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --user "$USER" --revert
-
-      - name: Elevation (Linux) - remove doas and the polkit packages
-        if: ${{ always() && steps.lin_elev_policy.outcome != 'skipped' && steps.lin_elev_policy.outcome != '' }}
-        shell: bash
-        run: bash .github/scripts/elevation-lane-linux.sh --this-machine-is-disposable --cleanup
-
       - name: Elevation (Linux) - upload JUnit
-        if: ${{ !cancelled() && steps.lin_elev_run.outcome != 'skipped' && steps.lin_elev_run.outcome != '' }}
+        if: ${{ !cancelled() && steps.lin_elev.outcome != 'skipped' && steps.lin_elev.outcome != '' }}
         uses: ./.github/actions/upload-junit
         with:
           name: elevation-linux-amd64
