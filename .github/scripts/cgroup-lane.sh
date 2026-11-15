@@ -6,8 +6,9 @@
 # `sudo`'s `secure_path` drops `~/.cargo/bin`, so the unprivileged user passes in `cargo-nextest`'s resolved path, the
 # archive it built (`cargo nextest archive --features pty,tokio`) and its own `uid:gid`, which gets `target/` back.
 #
-# The live cgroup tests belong to the CGROUP group: on unless COSCA_TEST_CGROUP=0 (ci.yaml's default) and, enabled,
-# they need COSCA_TEST_CGROUP_CONSENT=1 and fail without it. They need a cgroup the supervisor may create child
+# The live cgroup tests belong to the CGROUP group: on unless COSCA_TEST_CGROUP=0 (the default of
+# `.github/test-group-defaults.env`, which this lane overrides) and, enabled, they need COSCA_TEST_CGROUP_CONSENT=1 and
+# fail without it. They need a cgroup the supervisor may create child
 # cgroups under. We make a fresh leaf directly under the unified root cgroup: its `cgroup.subtree_control` is empty, so
 # the v2 "no internal processes" rule does not apply and a cgroup may hold BOTH the test process and a child leaf. We move this
 # shell into it and run the labelled tests there (as root, in parallel) across the `--lib` unit-test binary (which

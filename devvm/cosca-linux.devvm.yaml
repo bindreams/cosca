@@ -34,7 +34,10 @@ steps:
       install -d -m 0755 /artifacts
       install -d -m 1777 /junit-out
   # The version of `.github/ci-toolchain`; Renovate moves both (`.github/renovate.json`).
-  - run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.1
+  - shell: bash
+    run: |
+      set -euo pipefail
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.1
   # cargo-nextest's release tarball, checked before it is unpacked. The tag and digest share a line so Renovate
   # moves them together.
   - shell: bash
@@ -46,5 +49,6 @@ steps:
         "https://github.com/nextest-rs/nextest/releases/download/$NEXTEST_TAG_X86_64/$NEXTEST_TAG_X86_64-x86_64-unknown-linux-gnu.tar.gz"
       echo "$NEXTEST_SHA256_X86_64  $tarball" | sha256sum -c -
       tar -xzf "$tarball" -C "$HOME/.cargo/bin" cargo-nextest
+      rm -f "$tarball"
       "$HOME/.cargo/bin/cargo" nextest --version
   - copy: { from: git-tracked, to: ~/cosca, read-only: true }

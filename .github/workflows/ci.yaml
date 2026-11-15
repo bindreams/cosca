@@ -15,7 +15,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # One place for values several jobs share. `.config/nextest.toml`, windows-probes.yaml and the devvm provision scripts carry the same nextest version; Renovate moves them together (.github/renovate.json).
+  # One place for values several jobs share. `.config/nextest.toml`, windows-probes.yaml, the devvm provision scripts and `devvm/cosca-linux.devvm.yaml` carry the same nextest version; Renovate moves them together (.github/renovate.json).
   NEXTEST_VERSION: "0.9.151"
   # The root lanes' binaries, narrowed by `SKULD_LABELS=root`. Name only skuld binaries: a libtest
   # binary ignores `SKULD_LABELS` and would run whole. `process_root`'s test is the `UID_SWITCH` group.
@@ -373,7 +373,7 @@ jobs:
         run: |
           exec python3 .github/scripts/run-nextest.py cgroup sudo "$(command -v python3)" .github/scripts/forward.py bash -ux .github/scripts/cgroup-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(id -u):$(id -g)"
 
-      # The setuid group (`COSCA_TEST_SETUID`, off workflow-wide). It needs a setuid-root COPY of cosca_testbin
+      # The setuid group (`COSCA_TEST_SETUID`, off in `.github/test-group-defaults.env`). It needs a setuid-root COPY of cosca_testbin
       # (`.github/scripts/setuid-helper.sh`). The lane check fails the lane unless the helper really reaches uid 0 and
       # may create a user namespace. The group is selected by its label (`SKULD_LABELS=setuid`), in the two binaries
       # that carry it (see principle 10).
