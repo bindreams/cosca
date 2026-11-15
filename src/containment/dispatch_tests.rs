@@ -995,14 +995,14 @@ fn tree_left_with(pid: u32, resolved: Vec<crate::identity::ProcessId>) -> super:
 /// What a `settle` answers, and the state it leaves.
 type Want = (Result<super::SettleOutcome, Vec<String>>, Standing);
 
+/// What a table row runs once it has settled, given the row's name and the members its settlement
+/// killed again, before anything lets a held member go.
+type AfterRow = Box<dyn FnOnce(&str, &[crate::identity::ProcessId])>;
+
 /// Each outcome of the table settled over a tree that `enter` makes fresh: the answer (the
 /// errors' names, first to last) and the state left, against the row of `rows`. `enter` returns the
 /// tree, the pid it holds (or 0), and what to run once the row has settled.
-fn check_table(
-    state: &str,
-    rows: impl Fn(u32) -> [Want; 5],
-    enter: impl Fn() -> (super::TreeKilled, u32, Box<dyn FnOnce()>),
-) {
+fn check_table(state: &str, rows: impl Fn(u32) -> [Want; 5], enter: impl Fn() -> (super::TreeKilled, u32, AfterRow)) {
     use crate::error::Error;
     let name = |error: &Error| match error {
         Error::MemberNotKilled { pid, .. } => format!("pid {pid}"),
@@ -1013,15 +1013,39 @@ fn check_table(
         let (killed, pid, after) = enter();
         let (want_answer, want_standing) = rows(pid).into_iter().nth(at).expect("a row per outcome");
 
-        let got = killed
-            .settle(Some(&walker()), outcome, true)
-            .answer
-            .map_err(|left| left.left_members().into_iter().map(name).collect::<Vec<_>>());
+        let super::Settled { answer, killed_again } = killed.settle(Some(&walker()), outcome, true);
+        let got = answer.map_err(|left| left.left_members().into_iter().map(name).collect::<Vec<_>>());
 
         assert_eq!(got, want_answer, "{state} x {outcome_name}: answer");
         assert_eq!(standing(&killed), want_standing, "{state} x {outcome_name}: next state");
-        after();
+        after(&format!("{state} x {outcome_name}"), &killed_again);
     }
+}
+
+/// A row that expects its settlement to have killed `member` again: fails here, before the member is
+/// released, when `killed_again` does not hold it. The kill then sent nothing: a member still running
+/// means cosca classified a live member as gone (a product defect), one that exited 0 means it ended
+/// before the kill.
+fn assert_kill_accepted(row: &str, member: &crate::Child, killed_again: &[crate::identity::ProcessId]) {
+    let id = member.id().expect(crate::test_child::IDENTITY_READ);
+    if !killed_again.contains(&id) {
+        let look = member.try_wait();
+        panic!(
+            "{row}: the settlement sent no kill to the member {id:?} (killed_again {killed_again:?}); a look at it \
+             without waiting: {look:?}. Running: cosca classified a live member as gone. Exited 0: the member ended \
+             before the kill."
+        );
+    }
+}
+
+/// Releases a member whose kill `assert_kill_accepted` saw accepted, and reaps it. An accepted kill
+/// fixes the exit status, so an exit that is not a kill contradicts that.
+fn reap_accepted_kill(row: &str, member: crate::Child, stdin: crate::PipeWriter) {
+    drop(stdin);
+    crate::test_child::assert_killed(
+        &format!("{row}: the member, whose kill was accepted (killed_again holds it)"),
+        member.wait().expect("reap the member"),
+    );
 }
 
 fn gone() -> Vec<String> {
@@ -1056,7 +1080,7 @@ fn settle_answers_each_outcome_over_a_tree_never_settled_killed_or_left_an_unrea
         SettleOutcome::{Killed, Skipped},
         TreeKillOutcome, TreeKilled,
     };
-    let nothing = || -> Box<dyn FnOnce()> { Box::new(|| {}) };
+    let nothing = || -> AfterRow { Box::new(|_, _| {}) };
 
     check_table(
         "never settled",
@@ -1096,13 +1120,14 @@ fn settle_answers_each_outcome_over_a_tree_never_settled_killed_or_left_an_unrea
     });
 }
 
-/// A member whose kill by identity succeeds is gone after any outcome, but only an outcome that
-/// walked shows the tree killed: the member ran on after its kill was refused and may have forked,
-/// and killing it again does not reach its children. A gone root, a walk not made and a skipped kill
-/// each walked nothing, so the answer is the outcome's own (a gone root says the tree could not be
-/// walked) and the state is unvouched. Mutants: as the table above; a held member is not killed by
-/// an outcome that did not run; an outcome that walked nothing settles the tree as killed or as
-/// never settled.
+/// A member whose kill by identity succeeds is gone after any outcome: each row asserts that
+/// `killed_again` holds the member before it is released, then that its exit is a kill. But only an
+/// outcome that walked shows the tree killed: the member ran on after its kill was refused and may
+/// have forked, and killing it again does not reach its children. A gone root, a walk not made and a
+/// skipped kill each walked nothing, so the answer is the outcome's own (a gone root says the tree
+/// could not be walked) and the state is unvouched. Mutants: as the table above; a held member is
+/// not killed by an outcome that did not run (`killed_again` lacks it); an outcome that walked
+/// nothing settles the tree as killed or as never settled.
 #[skuld::test]
 fn settle_answers_each_outcome_over_a_tree_left_a_member_that_can_be_killed() {
     use super::{
@@ -1129,9 +1154,9 @@ fn settle_answers_each_outcome_over_a_tree_left_a_member_that_can_be_killed() {
             let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
             let id = blocker.id().expect(crate::test_child::IDENTITY_READ);
             let killed = tree_left_with(id.pid(), vec![id]);
-            let after: Box<dyn FnOnce()> = Box::new(move || {
-                drop(stdin);
-                crate::test_child::assert_killed("the member", blocker.wait().expect("reap the member"));
+            let after: AfterRow = Box::new(move |row, killed_again| {
+                assert_kill_accepted(row, &blocker, killed_again);
+                reap_accepted_kill(row, blocker, stdin);
             });
             (killed, id.pid(), after)
         },
@@ -1145,17 +1170,16 @@ fn unvouched_tree() -> (super::TreeKilled, Box<dyn FnOnce()>) {
     let (blocker, stdin) = crate::test_child::held_uncontained_blocker(false);
     let id = blocker.id().expect(crate::test_child::IDENTITY_READ);
     let killed = tree_left_with(id.pid(), vec![id]);
-    killed
-        .settle(Some(&walker()), TreeKillOutcome::NoRoot(ROOT_PID, None), true)
-        .answer
-        .expect_err("a gone root walked nothing");
+    let super::Settled { answer, killed_again } =
+        killed.settle(Some(&walker()), TreeKillOutcome::NoRoot(ROOT_PID, None), true);
+    answer.expect_err("a gone root walked nothing");
+    assert_kill_accepted("the unvouched tree's gone-root settlement", &blocker, &killed_again);
     assert_eq!(
         standing(&killed),
         Standing::Unvouched(super::UnvouchedKind::HeldMembersGone)
     );
     let after: Box<dyn FnOnce()> = Box::new(move || {
-        drop(stdin);
-        crate::test_child::assert_killed("the member", blocker.wait().expect("reap the member"));
+        reap_accepted_kill("the unvouched tree's gone-root settlement", blocker, stdin);
     });
     (killed, after)
 }
@@ -1215,7 +1239,8 @@ fn settle_answers_each_outcome_over_an_unvouched_tree() {
             ]
         },
         || {
-            let (killed, after) = unvouched_tree();
+            let (killed, reap) = unvouched_tree();
+            let after: AfterRow = Box::new(move |_, _| reap());
             (killed, 0, after)
         },
     );
@@ -1232,7 +1257,7 @@ fn settle_answers_each_outcome_over_a_tree_left_a_member_that_refuses_the_kill(
         let (child, stdin) = crate::test_privilege::spawn_setuid_blocker();
         let id = child.id().expect(crate::test_child::IDENTITY_READ);
         let killed = tree_left_with(id.pid(), vec![id]);
-        let after: Box<dyn FnOnce()> = Box::new(move || {
+        let after: AfterRow = Box::new(move |_, _| {
             // The helper exits at EOF: nothing killed it.
             drop(stdin);
             assert!(child.wait().expect("the helper exits on EOF").success());
