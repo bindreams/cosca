@@ -406,7 +406,7 @@ fn the_keep_rule_over_optional_keys_drops_a_keyless_read_only_under_a_bound() {
 #[skuld::test]
 fn a_reused_creator_edge_is_dropped_only_where_the_order_after_the_parent_is_the_proof() {
     use super::{resolution_of, OrderKey, OrderedRead, ParentRead, UnknownCause, ORDER_AFTER_PARENT};
-    use crate::containment::treewalk::descendants_with;
+    use crate::containment::treewalk::{descendants_with, AnchorReads};
 
     const ROOT: RawPid = 100;
     const X: RawPid = 200;
@@ -425,7 +425,16 @@ fn a_reused_creator_edge_is_dropped_only_where_the_order_after_the_parent_is_the
     };
 
     let root_bound = order_of(100);
-    let walk = descendants_with(id(ROOT, 100), root_bound, &[(X, ROOT), (Y, X)], resolve);
+    let walk = descendants_with(
+        id(ROOT, 100),
+        root_bound,
+        &[(X, ROOT), (Y, X)],
+        resolve,
+        &AnchorReads {
+            key_of: &|_| None,
+            creator_of: &|_| None,
+        },
+    );
 
     let members: Vec<RawPid> = walk.members.iter().map(ProcessId::pid).collect();
     let expected: &[RawPid] = if cfg!(windows) { &[X] } else { &[X, Y] };
