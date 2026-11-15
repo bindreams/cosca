@@ -6,7 +6,9 @@ The guest is Ubuntu 24.04 with the toolchain of `.github/ci-toolchain`, `cargo-n
 guest's is 6.8, and `lane-env.sh` turns off the groups that need a newer one and says which.
 
 Every lane runs as the guest's `user`, which may `sudo` without a password; the lanes that need root call `sudo`
-themselves. Nothing runs on the host. The guest is disposable: the elevation and setuid lanes change it.
+themselves. The guest is disposable: the elevation and setuid lanes change it.
+
+Lanes in one guest run one at a time; for lanes at once, start one instance per lane (`--name cosca-lane-<n>`).
 
 ## Run a lane
 
@@ -22,18 +24,19 @@ After an edit to a tracked file, rerun from a fresh instance: `devvm rm cosca-la
 last step (`copy`) runs again, about 45 seconds; the layers above it are reused. `devvm rm cosca-lane` when done.
 
 Each block sources `lane-env.sh`: the groups that are off by default (`.github/test-group-defaults.env`) are off, and
-the block turns on its own with their `_CONSENT` variable. The lane's scripts set the ones they need themselves.
+the lane's script turns on its own with their `_CONSENT` variable. All tests of the lane pass; skips are the groups
+`lane-env.sh` printed as off.
 
-| Lane (CI group)                           | Consent variables set by         | Passes with                                  |
-| ----------------------------------------- | -------------------------------- | -------------------------------------------- |
-| elevation                                 | `elevation-lane.sh`: `ELEVATION` | 9 tests run: 9 passed                        |
-| cgroup (`CGROUP`, `NAMESPACES`, `TRACER`) | `cgroup-lane.sh`                 | 482 tests run: 482 passed, 10 skipped        |
-| setuid                                    | the block: `SETUID`              | 40 tests run: 40 passed, 1 skipped           |
-| cgroup and setuid                         | the block: `CGROUP`, `SETUID`    | 1 test run: 1 passed                         |
-| setuid-root                               | the block: `SETUID`              | 1 test run: 1 passed                         |
-| root, uid switch (five variants)          | the block: `ROOT`, `UID_SWITCH`  | 69, 68, 69, 69, 68 passed                    |
-| tracer (debug, release)                   | the block: `TRACER`              | 19 passed, 2 skipped (both)                  |
-| stray signal (debug, release)             | the block: `STRAY_SIGNAL`        | 42 passed, 10 skipped; 41 passed, 10 skipped |
+| Lane (CI group)                           | Consent variables set by                    |
+| ----------------------------------------- | ------------------------------------------- |
+| elevation                                 | `elevation-lane.sh`: `ELEVATION`            |
+| cgroup (`CGROUP`, `NAMESPACES`, `TRACER`) | `cgroup-lane.sh`                            |
+| setuid                                    | `setuid-lane.sh`: `SETUID`                  |
+| cgroup and setuid                         | `cgroup-setuid-lane.sh`: `CGROUP`, `SETUID` |
+| setuid-root                               | `setuid-root-lane.sh`: `SETUID`             |
+| root, uid switch (five variants)          | the block: `ROOT`, `UID_SWITCH`             |
+| tracer (debug, release)                   | `tracer-lane.sh`: `TRACER`                  |
+| stray signal (debug, release)             | `stray-signal-lane.sh`: `STRAY_SIGNAL`      |
 
 The setuid lanes remove their setuid-root helper on exit, as CI's "Remove the setuid-root helper" step does.
 
@@ -55,8 +58,8 @@ cd ~/cosca
 . devvm/lane-env.sh
 target=x86_64-unknown-linux-gnu
 export RUNNER_TEMP="$(mktemp -d)"
-cargo nextest archive --locked --features pty,tokio --target "$target" --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
-python3 .github/scripts/run-nextest.py cgroup sudo --preserve-env=COSCA_TEST_PIDFD_GROUP_SIGNAL,COSCA_TEST_PIDFD_GET_INFO "$(command -v python3)" .github/scripts/forward.py bash -ux .github/scripts/cgroup-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(id -u):$(id -g)"
+bash .github/scripts/cgroup-archive.sh "$target"
+bash .github/scripts/cgroup-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$(id -u):$(id -g)"
 ```
 
 ## Setuid
@@ -68,12 +71,10 @@ cd ~/cosca
 target=x86_64-unknown-linux-gnu
 export RUNNER_TEMP="$(mktemp -d)"
 helper="$RUNNER_TEMP/cosca_testbin_setuid"
-trap 'sudo rm -f -- "$helper"' EXIT
+trap 'bash .github/scripts/setuid-helper.sh --remove "$helper"' EXIT
 bash .github/scripts/setuid-helper.sh "$target" "$helper"
 bash .github/scripts/setuid-lane-check.sh "$helper"
-cargo nextest run --locked --no-run --features tokio --target "$target" --profile ci -E 'binary(cosca) | binary(group_teardown_setuid)'
-COSCA_TEST_SETUID=1 COSCA_TEST_SETUID_CONSENT=1 COSCA_TESTCFG_SETUID_HELPER="$helper" SKULD_LABELS=setuid \
-  python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --no-tests=fail --features tokio --target "$target" -E 'binary(cosca) | binary(group_teardown_setuid)'
+bash .github/scripts/setuid-lane.sh "$target" "$helper"
 ```
 
 ## Cgroup and setuid
@@ -85,12 +86,11 @@ cd ~/cosca
 target=x86_64-unknown-linux-gnu
 export RUNNER_TEMP="$(mktemp -d)"
 helper="$RUNNER_TEMP/cosca_testbin_setuid"
-trap 'sudo rm -f -- "$helper"' EXIT
+trap 'bash .github/scripts/setuid-helper.sh --remove "$helper"' EXIT
 bash .github/scripts/setuid-helper.sh "$target" "$helper"
 bash .github/scripts/setuid-lane-check.sh "$helper"
-cargo nextest archive --locked --features pty,tokio --target "$target" --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
-COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1 COSCA_TEST_SETUID=1 COSCA_TEST_SETUID_CONSENT=1 COSCA_TESTCFG_SETUID_HELPER="$helper" SKULD_LABELS='cgroup & setuid' \
-  python3 .github/scripts/run-nextest.py cgroup-setuid bash -ux .github/scripts/cgroup-setuid-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst"
+bash .github/scripts/cgroup-archive.sh "$target"
+bash .github/scripts/cgroup-setuid-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$helper"
 ```
 
 ## Setuid-root
@@ -106,7 +106,7 @@ helper="$RUNNER_TEMP/cosca_testbin_setuid"
 restore() {
   status=$?
   trap - EXIT
-  sudo rm -f -- "$helper" || status=1
+  bash .github/scripts/setuid-helper.sh --remove "$helper" || status=1
   bash .github/scripts/dir-modes.sh restore "$RUNNER_TEMP/dir-modes" || status=1
   exit "$status"
 }
@@ -114,11 +114,13 @@ trap restore EXIT
 bash .github/scripts/setuid-helper.sh "$target" "$helper"
 bash .github/scripts/setuid-lane-check.sh "$helper"
 bash .github/scripts/setuid-root-archive.sh "$target"
-COSCA_TEST_SETUID=1 COSCA_TEST_SETUID_CONSENT=1 COSCA_TESTCFG_SETUID_HELPER="$helper" SKULD_LABELS=setuid_root \
-  python3 .github/scripts/run-nextest.py setuid-root sudo --preserve-env=COSCA_TEST_SETUID,COSCA_TEST_SETUID_CONSENT,COSCA_TESTCFG_SETUID_HELPER,SKULD_LABELS,COSCA_TEST_PIDFD_GROUP_SIGNAL,COSCA_TEST_PIDFD_GET_INFO "$(command -v python3)" .github/scripts/forward.py bash -eux .github/scripts/setuid-root-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract"
+bash .github/scripts/setuid-root-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract" "$helper"
 ```
 
 ## Root and uid switch
+
+This block approximates CI's `.github/actions/root-lane` container with `unshare` and `setpriv`; its variant table is
+taken from the root-lane steps of `ci.yaml`.
 
 ```bash
 set -euo pipefail
@@ -163,10 +165,8 @@ set -euo pipefail
 cd ~/cosca
 . devvm/lane-env.sh
 target=x86_64-unknown-linux-gnu
-export RUNNER_TEMP="$(mktemp -d)"
-export COSCA_TEST_TRACER=1 COSCA_TEST_TRACER_CONSENT=1 SKULD_LABELS=tracer
-python3 .github/scripts/run-nextest.py tracer cargo nextest run --locked --no-tests=fail --features tokio --target "$target" -E 'binary(cosca)'
-python3 .github/scripts/run-nextest.py tracer-release cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target "$target"
+bash .github/scripts/tracer-lane.sh "$target"
+bash .github/scripts/tracer-lane.sh "$target" release
 ```
 
 ## Stray signal
@@ -176,8 +176,6 @@ set -euo pipefail
 cd ~/cosca
 . devvm/lane-env.sh
 target=x86_64-unknown-linux-gnu
-export RUNNER_TEMP="$(mktemp -d)"
-export COSCA_TEST_STRAY_SIGNAL=1 COSCA_TEST_STRAY_SIGNAL_CONSENT=1 SKULD_LABELS=stray_signal
-python3 .github/scripts/run-nextest.py stray-signal cargo nextest run --locked --no-tests=fail --features tokio --target "$target" -E 'binary(cosca) | binary(=process)'
-python3 .github/scripts/run-nextest.py stray-signal-release cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target "$target"
+bash .github/scripts/stray-signal-lane.sh "$target"
+bash .github/scripts/stray-signal-lane.sh "$target" release
 ```

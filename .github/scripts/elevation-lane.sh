@@ -7,18 +7,13 @@
 # the lane keeps its records and the JUnit file (`$RUNNER_TEMP/junit/elevation.xml`). CI runs it under `forward.py`,
 # which passes the runner's stop signal on to the script's tree.
 #
-# In order: the guard; the record of the packages and `/etc/doas.conf`; apt-installs polkitd, pkexec and opendoas;
-# the polkit rule that allows the user every action, so `pkexec` (`Auth::Gui`) asks nothing; the `doas` rule that lets
-# the user run anything as root without a password (the `Backend::Doas` test); the build; the sudo rules and the user's
-# password (`elevation-lane-sudoers.sh`); the tests (selected by the label `elevation`; `-E binary(=elevation)` is the
-# only binary with elevation tests, and libtest binaries ignore `SKULD_LABELS` and would run whole); the JUnit check.
-# The machine is disposable, so the group consents.
+# Tests are selected by the label `elevation`; `-E binary(=elevation)` is the only binary with elevation tests, and
+# libtest binaries ignore `SKULD_LABELS` and would run whole. The machine is disposable, so the group consents.
 #
 # The password is made here and goes to the tests in the environment, never to a log or a file: nothing here runs under
 # xtrace. Keep it so.
 #
-# Every exit, whatever its cause, undoes the lane in this order, and the status is non-zero if the tests or any of
-# the three steps failed:
+# Every exit, whatever its cause, undoes the lane in this order:
 #   1. the sudo rules (`elevation-lane-sudoers.sh --cleanup`). First, because once they apply every `sudo` but `id`
 #      and the testbin asks for a password, and the steps after this one need a `sudo` that does not.
 #   2. the polkit rule (`unattended-gui-elevation.py --revert`), which restarts polkit.

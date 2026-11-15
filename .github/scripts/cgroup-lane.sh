@@ -2,29 +2,34 @@
 # Runs the cgroup v2 containment and namespace tests as root, in a fresh cgroup leaf.
 #
 # Usage: cgroup-lane.sh <cargo-nextest> <archive> <uid:gid>
-# Run it as root, from the checkout, as `sudo bash cgroup-lane.sh ...` (CI wraps that in `run-nextest.py cgroup`).
-# `sudo`'s `secure_path` drops `~/.cargo/bin`, so the unprivileged user passes in `cargo-nextest`'s resolved path, the
-# archive it built (`cargo nextest archive --features pty,tokio`) and its own `uid:gid`, which gets `target/` back.
+# Run it from the checkout, as root (CI wraps `sudo bash cgroup-lane.sh ...` in `run-nextest.py cgroup`) or as an
+# ordinary user that may `sudo` (it runs itself again under `sudo`, keeping the kernel-floor switches of
+# `devvm/lane-env.sh`). `sudo`'s `secure_path` drops `~/.cargo/bin`, so the unprivileged user passes in
+# `cargo-nextest`'s resolved path, the archive it built (`cgroup-archive.sh`) and its own `uid:gid`, which gets
+# `target/` back.
 #
 # The live cgroup tests belong to the CGROUP group: on unless COSCA_TEST_CGROUP=0 and, enabled, they need
-# COSCA_TEST_CGROUP_CONSENT=1 and fail without it. CI's jobs set the first to 0 through
-# `.github/test-group-defaults.env`; plain `sudo` resets the environment, so this lane sets its own variables below. The
-# tests need a cgroup the supervisor may create child cgroups under. We make a fresh leaf directly under the unified
-# root cgroup: its `cgroup.subtree_control` is empty, so the v2 "no internal processes" rule does not apply and a
-# cgroup may hold BOTH the test process and a child leaf. We move this shell into it and run the labelled tests there
-# (as root, in parallel) across the `--lib` unit-test binary (which
-# carries the white-box CgroupLeaf::wait_drained coverage in src/containment/cgroup/leaf_tests.rs, and with `tokio`
-# the async spawn's post-fork failure path), `spawn_io` and `tokio_io`. The tests assert CgroupV2/build a real leaf
-# and FAIL LOUDLY if it is unusable, never a silent skip.
+# COSCA_TEST_CGROUP_CONSENT=1 and fail without it. Plain `sudo` resets the environment, so this lane sets its own
+# variables below. The tests need a cgroup the supervisor may create child cgroups under. We make a fresh leaf directly
+# under the unified root cgroup: its `cgroup.subtree_control` is empty, so the v2 "no internal processes" rule does not
+# apply and a cgroup may hold BOTH the test process and a child leaf. We move this shell into it and run the labelled
+# tests there (as root, in parallel) across the `--lib` unit-test binary (which carries the white-box
+# CgroupLeaf::wait_drained coverage in src/containment/cgroup/leaf_tests.rs, and with `tokio` the async spawn's
+# post-fork failure path), `spawn_io` and `tokio_io`. The tests assert CgroupV2/build a real leaf and FAIL LOUDLY if it
+# is unusable, never a silent skip.
 #
 # The labels: `cgroup` (the CGROUP group, every test of `containment::cgroup`, and the tests labelled `cgroup`
-# explicitly, which keep in this lane what the old `test(/cgroup/)` name filter selected; most use fake leaves and
-# also run in the main lanes) and `namespaces` (the NAMESPACES group, which also gets its own consent here). `-E
-# binary(...)`: libtest binaries ignore `SKULD_LABELS` and would run whole. A test that is also in the `setuid` group
-# needs a caller that is not root, so this root run leaves it out (`!setuid`); the cgroup-setuid lane runs it.
+# explicitly; most use fake leaves and also run in the main lanes) and `namespaces` (the NAMESPACES group, which also
+# gets its own consent here). `-E binary(...)`: libtest binaries ignore `SKULD_LABELS` and would run whole. A test that
+# is also in the `setuid` group needs a caller that is not root, so this root run leaves it out (`!setuid`); the
+# cgroup-setuid lane runs it.
 #
 # No `-e`: the nextest status is collected below, and the exit trap reports what a failed run left behind.
 set -ux
+
+if [[ $EUID != 0 ]]; then
+    exec sudo --preserve-env=COSCA_TEST_PIDFD_GROUP_SIGNAL,COSCA_TEST_PIDFD_GET_INFO bash "$0" "$@"
+fi
 
 CG=/sys/fs/cgroup/cosca-ci
 PRIOR="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"
@@ -53,7 +58,7 @@ PY
     exit 1
 }
 trap leave EXIT
-echo $$ > "$CG/cgroup.procs"
+echo $$ > "$CG/cgroup.procs" || exit 1
 # A delegated cgroup and root in a sandbox (a CI runner, a devvm guest), so consent is given.
 # The profile is passed explicitly: sudo-rs (Ubuntu 26.04) ignores -E, so no variable survives.
 export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1
@@ -63,5 +68,5 @@ export COSCA_TEST_TRACER=1 COSCA_TEST_TRACER_CONSENT=1
 status=0
 SKULD_LABELS="(cgroup | namespaces) & !setuid" "$1" nextest run --archive-file "$2" --workspace-remap "$PWD" --profile ci-cgroup --no-capture --no-tests=fail -E "binary(cosca) | binary(spawn_io) | binary(tokio_io)" || status=1
 # Hand the target dir back so later steps can write to it.
-chown -R "$3" "$PWD/target"
+chown -R "$3" "$PWD/target" || status=1
 exit "$status"

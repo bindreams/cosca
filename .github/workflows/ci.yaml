@@ -64,7 +64,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      # The test groups that are off by default (`.github/test-group-defaults.env`); a step that runs one sets it itself.
       - name: Apply the test group defaults
         shell: bash
         run: sed -e '/^#/d' -e '/^$/d' .github/test-group-defaults.env >> "$GITHUB_ENV"
@@ -155,7 +154,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      # The test groups that are off by default (`.github/test-group-defaults.env`); a step that runs one sets it itself.
       - name: Apply the test group defaults
         shell: bash
         run: sed -e '/^#/d' -e '/^$/d' .github/test-group-defaults.env >> "$GITHUB_ENV"
@@ -229,27 +227,22 @@ jobs:
 
       # The `TRACER` group attaches a tracer to the tests' own children, as a debugger would; a CI
       # runner is the sandbox, so this step consents. Windows has no tracer tests.
-      # `-E 'binary(cosca)'` keeps libtest binaries out: they ignore `SKULD_LABELS`. `tokio` is for
-      # the group's one async test.
       - name: Run the tracer tests (Unix)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
         timeout-minutes: 10
         env:
           COSCA_TEST_TRACER: "1"
           COSCA_TEST_TRACER_CONSENT: "1"
-          SKULD_LABELS: tracer
-        run: ${{ matrix.nextest }} tracer cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca)'
+        run: ${{ matrix.nextest }} tracer bash .github/scripts/tracer-lane.sh ${{ matrix.target }}
 
-      # Only the Unix lanes have such tests. `binary(cosca)` and `binary(=process)` are the skuld binaries that
-      # hold them; libtest binaries ignore `SKULD_LABELS`.
+      # Only the Unix lanes have such tests.
       - name: Run the stray-signal tests (Unix)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
         timeout-minutes: 10
         env:
           COSCA_TEST_STRAY_SIGNAL: "1"
           COSCA_TEST_STRAY_SIGNAL_CONSENT: "1"
-          SKULD_LABELS: stray_signal
-        run: ${{ matrix.nextest }} stray-signal cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca) | binary(=process)'
+        run: ${{ matrix.nextest }} stray-signal bash .github/scripts/stray-signal-lane.sh ${{ matrix.target }}
 
 
       # `serde` is an additive feature flag; exercise the persisted-identity wire format.
@@ -329,8 +322,7 @@ jobs:
         env:
           COSCA_TEST_TRACER: "1"
           COSCA_TEST_TRACER_CONSENT: "1"
-          SKULD_LABELS: tracer
-        run: ${{ matrix.nextest }} tracer-release cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target ${{ matrix.target }}
+        run: ${{ matrix.nextest }} tracer-release bash .github/scripts/tracer-lane.sh ${{ matrix.target }} release
 
       # The stray-signal tests with `debug_assertions` off too.
       - name: Run the stray-signal tests (release — debug_assertions off)
@@ -339,8 +331,7 @@ jobs:
         env:
           COSCA_TEST_STRAY_SIGNAL: "1"
           COSCA_TEST_STRAY_SIGNAL_CONSENT: "1"
-          SKULD_LABELS: stray_signal
-        run: ${{ matrix.nextest }} stray-signal-release cargo nextest run --locked --no-tests=fail --release --lib --features tokio --target ${{ matrix.target }}
+        run: ${{ matrix.nextest }} stray-signal-release bash .github/scripts/stray-signal-lane.sh ${{ matrix.target }} release
 
 
       # Platform hooks (the Lint job skips them), clippy: `#[cfg(windows)]` and `cfg(target_os = "macos")` code is type-checked
@@ -362,9 +353,7 @@ jobs:
       # explanation. The unprivileged runner user builds the archive; only running it needs root.
       - name: Build cgroup v2 containment tests (Linux)
         if: matrix.os == 'linux'
-        run: |
-          set -euxo pipefail
-          cargo nextest archive --locked --features pty,tokio --target ${{ matrix.target }} --archive-file "$RUNNER_TEMP/cgroup.tar.zst"
+        run: bash .github/scripts/cgroup-archive.sh ${{ matrix.target }}
 
       - name: Run cgroup v2 containment and namespace tests (Linux)
         if: matrix.os == 'linux'
@@ -404,11 +393,9 @@ jobs:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
           COSCA_TESTCFG_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
-          SKULD_LABELS: setuid
-        run: exec python3 .github/scripts/run-nextest.py setuid cargo nextest run --locked --no-tests=fail --features tokio --target ${{ matrix.target }} -E 'binary(cosca) | binary(group_teardown_setuid)'
+        run: exec python3 .github/scripts/run-nextest.py setuid bash .github/scripts/setuid-lane.sh ${{ matrix.target }} "$COSCA_TESTCFG_SETUID_HELPER"
 
-      # The tests that are in both the `cgroup` and the `setuid` group, as the runner user in a cgroup it owns, over
-      # the archive of the cgroup lane: `.github/scripts/cgroup-setuid-lane.sh` has the explanation.
+      # `.github/scripts/cgroup-setuid-lane.sh` has the explanation.
       - name: Run cgroup tests that also need the setuid group (Linux)
         if: matrix.os == 'linux'
         timeout-minutes: 10
@@ -419,12 +406,10 @@ jobs:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
           COSCA_TESTCFG_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
-          SKULD_LABELS: cgroup & setuid
-        run: exec python3 .github/scripts/run-nextest.py cgroup-setuid bash -ux .github/scripts/cgroup-setuid-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst"
+        run: exec python3 .github/scripts/run-nextest.py cgroup-setuid bash -ux .github/scripts/cgroup-setuid-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$COSCA_TESTCFG_SETUID_HELPER"
 
       # The same test started as root, over its own archive: `.github/scripts/setuid-root-archive.sh` and
-      # `setuid-root-lane.sh` have the explanation. `sudo --preserve-env` keeps COSCA_TESTCFG_SETUID_HELPER and the
-      # group's variables (Ubuntu 26.04's sudo-rs ignores `-E`).
+      # `setuid-root-lane.sh` have the explanation.
       - name: Archive the setuid-root process-group teardown test (Linux)
         id: lin_setuid_archive
         if: matrix.os == 'linux'
@@ -438,12 +423,11 @@ jobs:
           COSCA_TEST_SETUID: "1"
           COSCA_TEST_SETUID_CONSENT: "1"
           COSCA_TESTCFG_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
-          SKULD_LABELS: setuid_root
-        run: exec python3 .github/scripts/run-nextest.py setuid-root sudo --preserve-env=COSCA_TEST_SETUID,COSCA_TEST_SETUID_CONSENT,COSCA_TESTCFG_SETUID_HELPER,SKULD_LABELS "$(command -v python3)" .github/scripts/forward.py bash -eux .github/scripts/setuid-root-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract"
+        run: exec python3 .github/scripts/run-nextest.py setuid-root sudo "$(command -v python3)" .github/scripts/forward.py bash -eux .github/scripts/setuid-root-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract" "$COSCA_TESTCFG_SETUID_HELPER"
 
       - name: Remove the setuid-root helper (Linux)
         if: ${{ always() && steps.lin_helper.outcome != 'skipped' && steps.lin_helper.outcome != '' }}
-        run: sudo rm -f -- "$RUNNER_TEMP/cosca_testbin_setuid"
+        run: bash .github/scripts/setuid-helper.sh --remove "$RUNNER_TEMP/cosca_testbin_setuid"
 
       - name: Restore the directory modes (Linux)
         if: ${{ always() && steps.lin_setuid_archive.outcome != 'skipped' && steps.lin_setuid_archive.outcome != '' }}
@@ -730,8 +714,8 @@ jobs:
 
       # Elevation (Linux) =====
       #
-      # `.github/scripts/elevation-lane.sh` has the explanation. 15 min: over 50 runs the lane's steps took 72 s at most
-      # and the tokio test build of this job 57 s; one hung test is cut at 301 s.
+      # `.github/scripts/elevation-lane.sh` has the explanation. 15 min: above the lane's slowest observed run plus one
+      # hung test (cut at 301 s).
       - name: Elevation (Linux)
         id: lin_elev
         if: ${{ !cancelled() && matrix.os == 'linux' && matrix.arch == 'amd64' }}

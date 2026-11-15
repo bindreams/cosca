@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Runs the tests that are in both the `cgroup` and the `setuid` group, as the ordinary user, in a cgroup it owns.
 #
-# Usage: cgroup-setuid-lane.sh <cargo-nextest> <archive>
-# Run it as the ordinary user, from the checkout, with COSCA_TEST_CGROUP, COSCA_TEST_SETUID, their `_CONSENT`
-# variables, COSCA_TESTCFG_SETUID_HELPER (see `setuid-helper.sh`) and SKULD_LABELS set. The archive is the one
-# `cgroup-lane.sh` runs.
+# Usage: cgroup-setuid-lane.sh <cargo-nextest> <archive> <helper>
+# Run it as the ordinary user, from the checkout, after `setuid-helper.sh` made `<helper>` and `setuid-lane-check.sh`
+# checked it; the groups consent here. The archive is the one `cgroup-lane.sh` runs (`cgroup-archive.sh`). CI runs it
+# under `run-nextest.py cgroup-setuid`.
 #
 # These tests need a delegated cgroup and a caller that is not root (the helper is only unsignalable by one), which
 # the cgroup lane, run as root, leaves out. Root makes the cgroup, hands it over and moves this shell into it: the user
@@ -27,6 +27,7 @@ leave() {
     exit 1
 }
 trap leave EXIT
-sudo chown "$(id -u):$(id -g)" "$CG" "$CG/cgroup.procs" "$CG/cgroup.subtree_control" "$CG/cgroup.threads"
-echo $$ | sudo tee "$CG/cgroup.procs" > /dev/null
+sudo chown "$(id -u):$(id -g)" "$CG" "$CG/cgroup.procs" "$CG/cgroup.subtree_control" "$CG/cgroup.threads" || exit 1
+echo $$ | sudo tee "$CG/cgroup.procs" > /dev/null || exit 1
+export COSCA_TEST_CGROUP=1 COSCA_TEST_CGROUP_CONSENT=1 COSCA_TEST_SETUID=1 COSCA_TEST_SETUID_CONSENT=1 COSCA_TESTCFG_SETUID_HELPER="$3" SKULD_LABELS="cgroup & setuid"
 "$1" nextest run --archive-file "$2" --workspace-remap "$PWD" --profile ci-cgroup-setuid --no-tests=fail -E "binary(cosca)"
