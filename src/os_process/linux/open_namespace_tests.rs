@@ -39,8 +39,7 @@ fn fixture_status_mounted_over() {
     ns::enter_private_mount_ns();
     // A live foreign process: opened through `open_verified_error_with`, then killed. Its
     // identity is read before the mount: `of` answers `Unknown` once a file is mounted over `/proc`.
-    let mut child = crate::test_spawn::spawn(std::process::Command::new("cat").stdin(std::process::Stdio::piped()))
-        .expect("spawn cat");
+    let mut child = crate::test_child::blocker();
     // The `/proc` path, as the rows below: the identity is the `starttime`.
     let id = crate::identity::ticks_id(child.id());
     // Read now as well: a read through the view is `Unknown` once a file is mounted below `/proc`.

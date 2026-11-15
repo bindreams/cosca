@@ -8,12 +8,6 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::send_log::Capture;
 
-/// A `cat` blocked on its piped stdin: it ends by `SIGTERM`'s default disposition, or with 0 once
-/// the stdin it holds is dropped.
-pub(crate) fn blocker() -> Child {
-    crate::test_spawn::spawn(Command::new("cat").stdin(Stdio::piped())).expect("spawn the blocker")
-}
-
 /// A root (see [`blocked_tree_root`](super::blocked_tree_root), which defines what it reports) with
 /// a `cat` grandchild blocked on the stdin held in `grandchild_stdin`.
 pub(crate) struct BlockedTree {

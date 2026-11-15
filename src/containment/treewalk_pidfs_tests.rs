@@ -12,6 +12,7 @@ use rustix::process::Pid;
 
 use crate::error::Error;
 use crate::identity::{FakeKernel, HostKernel, Kernel, Key, ProcessId};
+use crate::test_child::{blocker_with, StdChild};
 use crate::Recursive;
 
 const ROOT: u32 = 4242;
@@ -433,10 +434,10 @@ const KILLED_INO: u64 = 77;
 
 /// A `cat` that lives until its stdin closes, its pidfd, and a kernel in which that pid is `KILLED_INO`.
 /// The child is the pidfd's real target, so a signal sent through it is observable.
-fn live_child_in_a_table() -> (std::process::Child, ProcessId, FakeKernel<'static>) {
-    use std::process::{Command, Stdio};
-    let child =
-        crate::test_spawn::spawn(Command::new("cat").stdin(Stdio::piped()).stdout(Stdio::null())).expect("cat spawns");
+fn live_child_in_a_table() -> (StdChild, ProcessId, FakeKernel<'static>) {
+    let child = blocker_with(|cat| {
+        cat.stdout(std::process::Stdio::null());
+    });
     let pid = child.id();
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(pid, Ok(crate::child::front_cgroup_tests::pidfd_of(pid)))

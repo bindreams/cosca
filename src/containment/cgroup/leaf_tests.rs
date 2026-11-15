@@ -6,6 +6,8 @@ use crate::containment::cgroup::test_support::{
 };
 use crate::containment::cgroup::{DrainStep, LeafError, NotEntered, NotPlaced, PlacementReport, WithoutChild};
 #[cfg(target_os = "linux")]
+use crate::test_child::{blocker, blocker_with, StdChild};
+#[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
 #[cfg(target_os = "linux")]
 use crate::wait::block_probe::{on_drain_block, on_each_drain_block};
@@ -258,12 +260,10 @@ fn wait_drained_terminates_under_a_frozen_clock() {
 #[skuld::test]
 fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _group: &Group) {
     use crate::containment::cgroup::fault;
-    use crate::containment::cgroup::test_support::{
-        assert_bounded_conclusion, Member, WaitDeadlineArgGuard, WaitObserver,
-    };
+    use crate::containment::cgroup::test_support::{assert_bounded_conclusion, WaitDeadlineArgGuard, WaitObserver};
     use crate::containment::TreeDrain;
     use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -294,23 +294,21 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     // until it explicitly kills the member (below).
     let spawn_member = |leaf: &crate::containment::cgroup::CgroupLeaf,
                         channel: &crate::containment::cgroup::ReportChannel|
-     -> Member {
+     -> StdChild {
         let procs_fd = leaf.procs_fd();
         let slot = channel.slot();
-        let mut cmd = Command::new("cat");
-        cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
-        // SAFETY: `Command::pre_exec` runs this closure only between `fork` and `exec` in the
-        // child; `procs_fd` is a valid, open, writable fd owned by `leaf` for the parent's whole
-        // lifetime (fork gives the child its own fd-table entry pointing at the same underlying
-        // open file description, and `place_self_in_cgroup_pre_exec` closes only that child-side
-        // copy) — exactly its own documented contract. `leaf` and `channel` both outlive every
-        // member spawned through them in this test.
-        unsafe {
-            cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot));
-        }
-        let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn a real long-lived cgroup leaf member");
-        let stdin = child.stdin.take().expect("cat's stdin must be piped");
-        Member(child, stdin)
+        blocker_with(|cmd| {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+            // SAFETY: `Command::pre_exec` runs this closure only between `fork` and `exec` in the
+            // child; `procs_fd` is a valid, open, writable fd owned by `leaf` for the parent's whole
+            // lifetime (fork gives the child its own fd-table entry pointing at the same underlying
+            // open file description, and `place_self_in_cgroup_pre_exec` closes only that child-side
+            // copy) — exactly its own documented contract. `leaf` and `channel` both outlive every
+            // member spawned through them in this test.
+            unsafe {
+                cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot));
+            }
+        })
     };
 
     let channel_a = crate::containment::cgroup::ReportChannel::new().expect("open member a's report channel");
@@ -323,7 +321,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     // final").
     for (name, member, mut channel) in [("a", &a, channel_a), ("b", &b, channel_b)] {
         assert_eq!(
-            channel.wait(pidfd_of(member.0.id()).as_fd()),
+            channel.wait(pidfd_of(member.id()).as_fd()),
             PlacementReport::Placed,
             "member {name}'s own report must survive the other member's spawn"
         );
@@ -331,7 +329,7 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     let procs = std::fs::read_to_string(leaf.leaf_path.join("cgroup.procs")).expect("read cgroup.procs");
     for (name, member) in [("a", &a), ("b", &b)] {
         assert!(
-            procs.lines().any(|line| line.trim() == member.0.id().to_string()),
+            procs.lines().any(|line| line.trim() == member.id().to_string()),
             "member {name} must actually be placed in the leaf; cgroup.procs is {procs:?}"
         );
     }
@@ -367,8 +365,8 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     );
 
     // One survivor: `populated` never flips (still nonzero), so the verdict must not change.
-    a.0.kill().expect("kill member a");
-    a.0.wait().expect("reap member a");
+    a.kill().expect("kill member a");
+    a.wait().expect("reap member a");
     assert_eq!(
         bounded_wait_drained(),
         TreeDrain::MembersRemain,
@@ -392,8 +390,8 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
         rendezvous_rx
             .recv()
             .expect("drain_step must announce blocking before wait_drained returns");
-        b.0.kill().expect("kill member b");
-        b.0.wait().expect("reap member b");
+        b.kill().expect("kill member b");
+        b.wait().expect("reap member b");
         handle.join().expect("wait_drained thread must not panic")
     });
     // The rendezvous already consumed one signal via `recv` above; count whatever else arrived.
@@ -452,44 +450,37 @@ fn lane_leaf() -> crate::containment::cgroup::CgroupLeaf {
         })
 }
 
-/// A `cat` blocked on its piped stdin, in the test's own cgroup until the test moves it.
+/// A `cat` blocked on its piped stdin, in the test's own cgroup until the test moves it. Once
+/// placed in a leaf, declare it after the leaf, so it is killed and reaped before the leaf is
+/// removed.
 #[cfg(target_os = "linux")]
-fn cat_member() -> (
-    crate::containment::cgroup::test_support::Member,
-    crate::identity::ProcessId,
-) {
+fn cat_member() -> (StdChild, crate::identity::ProcessId) {
     cat_member_as(None)
 }
 
 /// [`cat_member`], run as `uid` where there is one (the cgroup group's root may switch to any).
 #[cfg(target_os = "linux")]
-fn cat_member_as(
-    uid: Option<u32>,
-) -> (
-    crate::containment::cgroup::test_support::Member,
-    crate::identity::ProcessId,
-) {
+fn cat_member_as(uid: Option<u32>) -> (StdChild, crate::identity::ProcessId) {
     use std::os::unix::process::CommandExt as _;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let mut cat = Command::new("cat");
-    cat.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
-    if let Some(uid) = uid {
-        cat.uid(uid);
-    }
-    let mut child = crate::test_spawn::spawn(&mut cat).expect("spawn a member");
-    let stdin = child.stdin.take().expect("cat's stdin is piped");
+    let child = blocker_with(|cat| {
+        cat.stdout(Stdio::null()).stderr(Stdio::null());
+        if let Some(uid) = uid {
+            cat.uid(uid);
+        }
+    });
     let id = crate::identity::ProcessId::of(child.id())
         .found()
         .expect("the member's identity");
-    (crate::containment::cgroup::test_support::Member(child, stdin), id)
+    (child, id)
 }
 
 /// Move `member` into the cgroup `dir`.
 #[cfg(target_os = "linux")]
-fn place(member: &crate::containment::cgroup::test_support::Member, dir: &std::path::Path) {
-    std::fs::write(dir.join("cgroup.procs"), member.0.id().to_string())
-        .unwrap_or_else(|e| panic!("move {} into {}: {e}", member.0.id(), dir.display()));
+fn place(member: &StdChild, dir: &std::path::Path) {
+    std::fs::write(dir.join("cgroup.procs"), member.id().to_string())
+        .unwrap_or_else(|e| panic!("move {} into {}: {e}", member.id(), dir.display()));
 }
 
 /// The listing a cgroup kill makes names the members of every cgroup under the leaf, `cgroup.kill`
@@ -842,7 +833,7 @@ fn a_member_moved_into_a_cgroup_under_the_leaf_before_it_is_pinned_is_listed(#[f
     place(&member, &leaf.leaf_path);
     // The listing has read the leaf's `cgroup.procs` and `nested`'s, and is about to open `deeper`.
     let (walks, _count) = count_walks_and({
-        let pid = member.0.id().to_string();
+        let pid = member.id().to_string();
         move |at| {
             if at == std::path::Path::new("./nested/deeper") {
                 std::fs::write(nested.join("cgroup.procs"), &pid).expect("move the member into nested");
@@ -876,8 +867,8 @@ fn a_cgroup_lists_its_members_before_it_kills_them(#[fixture(cgroup)] _group: &G
         let member = member.clone();
         move || {
             let mut member = member.borrow_mut();
-            member.0.kill().expect("end the member");
-            member.0.wait().expect("reap the member");
+            member.kill().expect("end the member");
+            member.wait().expect("reap the member");
         }
     });
 
@@ -908,7 +899,7 @@ fn a_cgroup_kill_the_kernel_refused_waits_for_no_member(#[fixture(cgroup)] _grou
     let leaf = lane_leaf();
     let (member, _) = cat_member();
     place(&member, &leaf.leaf_path);
-    let pid = member.0.id();
+    let pid = member.id();
     let _refused = fault::fail_next_kill_write();
 
     let (sent, wait) = leaf.kill(None).split();
@@ -948,7 +939,7 @@ fn a_member_that_left_the_leaf_before_the_kill_is_neither_killed_nor_waited_for(
     let leaf = lane_leaf();
     let (member, _) = cat_member();
     place(&member, &leaf.leaf_path);
-    let pid = member.0.id();
+    let pid = member.id();
     let outside = leaf
         .leaf_path
         .parent()
@@ -978,12 +969,12 @@ fn a_member_that_left_the_leaf_before_the_kill_is_neither_killed_nor_waited_for(
     assert!(!blocked.get(), "the wait blocked on a member that left the leaf");
     let mut member = member.borrow_mut();
     assert_eq!(
-        member.0.try_wait().expect("look at the member"),
+        member.try_wait().expect("look at the member"),
         None,
         "the member outside the leaf was not killed"
     );
-    member.0.kill().expect("end the member");
-    _ = member.0.wait();
+    member.kill().expect("end the member");
+    _ = member.wait();
 }
 
 /// After a kill that landed, a listed member still in the leaf was reached (whatever its credentials: the
@@ -1000,8 +991,8 @@ fn a_member_still_in_the_leaf_is_reached_by_the_kill_and_one_that_left_is_not(#[
     let (mut gone, gone_id) = cat_member();
     place(&inside, &leaf.leaf_path);
     place(&outside, leaf.leaf_path.parent().expect("the leaf has a parent cgroup"));
-    gone.0.kill().expect("end the member");
-    gone.0.wait().expect("reap the member");
+    gone.kill().expect("end the member");
+    gone.wait().expect("reap the member");
     leaf.kill.record(Ok(()));
 
     let (reached, unobserved) = leaf.reached_by_kill([inside_id, outside_id, gone_id].map(listed_before).to_vec());
@@ -1013,12 +1004,12 @@ fn a_member_still_in_the_leaf_is_reached_by_the_kill_and_one_that_left_is_not(#[
         (&mut outside, "the member outside"),
     ] {
         assert_eq!(
-            member.0.try_wait().expect("look at the member"),
+            member.try_wait().expect("look at the member"),
             None,
             "{who} was not signalled by the check"
         );
-        member.0.kill().expect("end the member");
-        _ = member.0.wait();
+        member.kill().expect("end the member");
+        _ = member.wait();
     }
 }
 
@@ -1055,12 +1046,12 @@ fn a_member_of_another_uid_still_in_the_leaf_is_reached_by_the_kill(#[fixture(cg
         "{unobserved:?} {unplaced:?}"
     );
     assert_eq!(
-        other.0.try_wait().expect("look at the member"),
+        other.try_wait().expect("look at the member"),
         None,
         "the check signalled nothing"
     );
-    other.0.kill().expect("end the member");
-    _ = other.0.wait();
+    other.kill().expect("end the member");
+    _ = other.wait();
 }
 
 /// A listed member that cannot be opened to be placed is not dropped: it is an error saying its exit
@@ -1096,8 +1087,8 @@ fn a_member_whose_place_cannot_be_checked_after_the_kill_is_an_unobserved_error(
         Some(unplaced_id.pid()),
         "the member's pid is carried with the error: {unobserved:?}"
     );
-    unplaced.0.kill().expect("end the member");
-    _ = unplaced.0.wait();
+    unplaced.kill().expect("end the member");
+    _ = unplaced.wait();
 }
 
 /// The wait over a leaf's listed members blocks on a member that is running, and ends once it has exited
@@ -1116,7 +1107,7 @@ fn the_wait_over_a_leafs_listed_members_blocks_on_a_running_member(#[fixture(cgr
     let leaf = lane_leaf();
     let (mut member, id) = cat_member();
     place(&member, &leaf.leaf_path);
-    let pid = member.0.id();
+    let pid = member.id();
     let (members, unobserved) = leaf.list_members(None);
     assert_eq!(
         members.iter().map(|m| m.id).collect::<Vec<_>>(),
@@ -1147,7 +1138,7 @@ fn the_wait_over_a_leafs_listed_members_blocks_on_a_running_member(#[fixture(cgr
     wait.wait().expect("the member exited and the leaf drained");
 
     assert!(blocked.get(), "the wait did not block on a member that was running");
-    _ = member.0.wait();
+    _ = member.wait();
 }
 
 /// The parent's `cgroup.procs` fd stays close-on-exec for as long as the parent holds it. The
@@ -3062,9 +3053,7 @@ fn take_placement_reads_the_childs_state_before_cgroup_procs() {
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
 
     // A live child, blocked reading a pipe nothing writes to.
-    let mut child =
-        crate::test_spawn::spawn(std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()))
-            .expect("spawn");
+    let mut child = blocker();
     let pid = child.id();
     let writer = std::thread::spawn(move || {
         // Blocks until the verdict opens the FIFO to read it.
@@ -3499,13 +3488,12 @@ fn cgroup_drop_of_an_abandoned_spawn_spares_an_occupant_that_is_not_its_child(#[
     // The occupant reports through a channel of its own, so the leaf's receives nothing.
     let own = crate::containment::cgroup::ReportChannel::new().expect("open the occupant's channel");
     let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
-    let mut cmd = std::process::Command::new("/bin/cat");
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped());
-    // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
-    // on descriptors `leaf` and `own` keep open across the spawn.
-    unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
-    let mut occupant = crate::test_spawn::spawn(&mut cmd).expect("spawn the occupant");
+    let mut occupant = blocker_with(|cmd| {
+        cmd.stdout(std::process::Stdio::piped());
+        // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
+        // on descriptors `leaf` and `own` keep open across the spawn.
+        unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
+    });
 
     drop(leaf);
 
@@ -3621,12 +3609,9 @@ fn an_abandoned_intent_given_no_pidfd_is_never_signalled() {
     let leaf_path = dir.path().join("cosca-abandoned-no-handle");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    let mut other = crate::test_spawn::spawn(
-        std::process::Command::new("/bin/cat")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped()),
-    )
-    .expect("spawn another child");
+    let mut other = blocker_with(|cmd| {
+        cmd.stdout(std::process::Stdio::piped());
+    });
     // SAFETY: the leaf's channel is open; the intent claims `other`'s pid.
     unsafe {
         leaf.placement_slot()
@@ -4407,9 +4392,7 @@ fn a_member_whose_placement_fails_is_named_with_the_os_text_once() {
     );
     let _placement = fail_pidfd_info();
     // A live child of this test, blocked on its stdin: the member the row names, reaped below.
-    let mut child =
-        crate::test_spawn::spawn(std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()))
-            .expect("spawn a member");
+    let mut child = blocker();
 
     let result = crate::containment::cgroup::CgroupLeaf::placeholder_for_test().terminate_member(child.id(), &subtree);
 

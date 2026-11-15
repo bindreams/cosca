@@ -506,45 +506,6 @@ pub(crate) fn remove_drained_leaf(leaf_path: &std::path::Path) {
     }
 }
 
-/// A real child placed in a leaf; `Drop` kills and reaps it so a panic cannot leak it or block
-/// the leaf's removal. Declare it after its leaf so it drops first. Field 1 is the piped stdin,
-/// held open so `cat` never exits on its own.
-#[cfg(target_os = "linux")]
-pub(crate) struct Member(
-    pub(crate) std::process::Child,
-    #[allow(
-        dead_code,
-        reason = "held only so dropping the Member closes the child's stdin; never read"
-    )]
-    pub(crate) std::process::ChildStdin,
-);
-
-#[cfg(target_os = "linux")]
-impl Drop for Member {
-    fn drop(&mut self) {
-        // Already killed and reaped by the test in the common case. If std's own `Child` already
-        // observed the exit (a prior `wait`/`try_wait`), `kill` checks its cached status first and
-        // returns `Ok` without a syscall — `InvalidInput` never happens on that path. If the child
-        // was reaped some other way instead (a foreign `waitpid`, principle 5), the syscall does
-        // run, and fails with `ESRCH`. Both are "already gone"; only something outside that set is
-        // the real signal/reap failure this guard exists to catch.
-        if let Err(e) = self.0.kill() {
-            debug_assert_eq!(
-                e.raw_os_error(),
-                Some(libc::ESRCH),
-                "Member::drop's kill failed unexpectedly: {e}"
-            );
-        }
-        if let Err(e) = self.0.wait() {
-            debug_assert_eq!(
-                e.raw_os_error(),
-                Some(libc::ECHILD),
-                "Member::drop's wait failed unexpectedly: {e}"
-            );
-        }
-    }
-}
-
 /// Send on `tx` at each drain wait of a cgroup leaf on this thread, just before it blocks or its
 /// task awaits, until the guard drops: the watch is armed and `populated` last read 1. A send with
 /// no live receiver is a contract violation by the test, which keeps the receiver until the guard
