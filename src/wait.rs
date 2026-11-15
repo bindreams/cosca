@@ -779,7 +779,7 @@ pub(crate) mod block_probe {
     }
 
     #[cfg(target_os = "linux")]
-    fn is_drain_wait(block: &Block<'_>) -> bool {
+    pub(crate) fn is_drain_wait(block: &Block<'_>) -> bool {
         matches!(block.on, WaitObject::Drain | WaitObject::DrainAwait)
     }
 

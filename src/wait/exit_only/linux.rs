@@ -17,7 +17,14 @@ fn pidfd<'a>(target: &Target<'a>) -> BorrowedFd<'a> {
 
 /// One `waitid(P_PIDFD, options)`: `Ok(None)` when nothing matched (`si_signo == 0`, rustix
 /// zeroes the `siginfo_t` first). `EINTR` retries.
+///
+/// `options` must carry `NOHANG`: a blocking `waitid` on a zombie its tracer holds sleeps until the
+/// tracer lets go.
 pub(crate) fn waitid_record(fd: BorrowedFd<'_>, options: WaitIdOptions) -> Result<Option<Record>, Errno> {
+    debug_assert!(
+        options.contains(WaitIdOptions::NOHANG),
+        "a blocking waitid on a zombie a tracer holds sleeps until the tracer lets go"
+    );
     loop {
         match waitid(WaitId::PidFd(fd), options) {
             Ok(status) => {

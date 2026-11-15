@@ -446,14 +446,14 @@ pub(crate) fn async_policy() -> crate::child::spawn::policy::SpawnPolicy {
 /// How long a failed spawn's teardown, or the armed drop, waits for what it killed before it warns
 /// that it is still waiting. Messaging only: no wait ends on it.
 #[cfg_attr(
-    all(test, not(target_os = "linux")),
-    allow(dead_code, reason = "a test opts in with its own threshold off Linux")
+    test,
+    allow(dead_code, reason = "a test opts in with its own threshold, never this one")
 )]
 const LATE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long a failed spawn's teardown, or the armed drop, waits for what it killed before it warns
 /// that it is still waiting: [`LATE`]. In a test, only one that opted in
-/// (`fault::warn_slow_teardowns`): a loaded runner could pass the threshold, and a test's verdict
+/// (`fault::warn_slow_teardowns_after`): a loaded runner could pass the threshold, and a test's verdict
 /// must not depend on elapsed time.
 pub(crate) fn slow_teardown_after() -> Option<std::time::Duration> {
     #[cfg(test)]
@@ -486,15 +486,10 @@ pub(crate) mod fault {
         static SLOW_TEARDOWN_AFTER: Cell<Option<std::time::Duration>> = const { Cell::new(None) };
     }
 
-    /// A failed spawn's teardown, or an armed drop, on THIS thread warns once its wait passes 1 s, as
-    /// outside tests (see [`slow_teardown_after`](super::slow_teardown_after)).
-    #[cfg(target_os = "linux")]
-    pub(crate) fn warn_slow_teardowns() -> WarnSlowTeardowns {
-        warn_slow_teardowns_after(super::LATE)
-    }
-
-    /// As [`warn_slow_teardowns`], past `after`: zero, for a test whose forced looks keep the child
-    /// from showing its exit within it.
+    /// A failed spawn's teardown, or an armed drop, on THIS thread warns once its wait passes
+    /// `after` (see [`slow_teardown_after`](super::slow_teardown_after)). At zero the threshold is
+    /// passed at the teardown's first look, with no elapsed time involved; a nonzero `after` is
+    /// stated under a frozen clock.
     pub(crate) fn warn_slow_teardowns_after(after: std::time::Duration) -> WarnSlowTeardowns {
         SLOW_TEARDOWN_AFTER.with(|w| w.set(Some(after)));
         WarnSlowTeardowns(())
