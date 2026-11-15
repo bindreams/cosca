@@ -127,7 +127,7 @@ jobs:
             timeout: 54
             target: x86_64-unknown-linux-gnu
             nextest: exec python3 .github/scripts/run-nextest.py
-            # lint: true lanes also run the cargo-clippy hook; one arch stands in for both (see "Platform hooks").
+            # lint: true lanes also run the cargo-clippy hook (see "Platform hooks").
             lint: true
           - os: linux
             arch: arm64
@@ -137,6 +137,7 @@ jobs:
             timeout: 29
             target: aarch64-unknown-linux-gnu
             nextest: exec python3 .github/scripts/run-nextest.py
+            lint: true
           - os: darwin
             arch: arm64
             runner: macos-latest
@@ -356,15 +357,15 @@ jobs:
 
 
       # Platform hooks (the Lint job skips them), clippy: `#[cfg(windows)]` and `cfg(target_os = "macos")` code is type-checked
-      # only by clippy on that OS, and Linux code only on linux/amd64. A
+      # only by clippy on that OS, and `cfg(target_arch)` code only by clippy on that arch. A
       # pre-push hook, so the stage is named.
       #
       # Placed after the test steps above, not right after Build: a clippy failure there would skip every later step
       # (their implicit `if: success()`), hiding test results. `!cancelled()` makes this step run even after an earlier
       # step has failed, so the lint result is always reported.
       #
-      # Runs on one arch per OS (`matrix.lint`), not on every lane: linting every arch would double the Windows and
-      # macOS runner-minutes spent on lint.
+      # Runs on the lanes with `matrix.lint`: both Linux arches, where the tree has `cfg(target_arch)` code, and one
+      # arch each for Windows and macOS, where linting both would double the runner-minutes spent on lint.
       - name: Platform hooks (cargo-clippy)
         if: ${{ !cancelled() && matrix.lint }}
         shell: bash
