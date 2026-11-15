@@ -19,41 +19,38 @@
 //! step falls back to the process-group mechanism without aborting the spawn.
 //!
 //! # Async-signal-safety
-//! `place_self_in_cgroup_pre_exec` is called from the spawn's in-child hook
-//! (after `fork`, before `exec`). The only async-signal-safe operations there
-//! are raw `libc::write`, `libc::close` and `libc::send` — no allocation, no
-//! `format!`, no `String`. Its outcome crosses back through a socket pair
-//! (`ReportChannel`).
+//! `placement_step` is one of the steps of the spawn core's child (after the clone, before
+//! `exec`; see `child::spawn::fork_exec`). The only async-signal-safe operations there
+//! are raw `libc::write` and `libc::close` — no allocation, no `format!`, no `String`. Its
+//! outcome crosses back as a report record on the core's status channel.
 //!
 //! # Placement reports: when one is final, and what cosca may kill
 //! Every decision about a leaf rests on these rules. `take_placement`,
 //! `abandon_without_child` and `Drop` each apply them; none has a rule of its own.
 //!
-//! **Messages.** In its `pre_exec` the child sends, in order: an *intent*, carrying its pid,
-//! before it touches the leaf; then, after its `cgroup.procs` write, its *report* — `Placed` or
-//! the write's errno. It sends nothing else, and nothing after `exec`. The child's handle is the
-//! pidfd the spawn's clone gave the parent, which the abandonment is given: unlike a pid, it
-//! cannot come to name another process, whoever reaps the child. A child that sent an intent has
-//! its pidfd in the parent, because the clone gives it before the child runs.
+//! **The record.** After its `cgroup.procs` write the child writes one *report* record on the
+//! status channel — `Placed` or the write's errno — before its ready record, and never waits for
+//! the parent. It writes nothing else for the leaf, and nothing after `exec`.
 //!
-//! **One verdict.** The parent ends the exchange exactly once, by one of two acts:
-//! - *Decide.* `take_placement` reads the report — waiting for it, or for the child's exit; then it
-//!   sends *proceed* and closes the channel. A child whose send fails because the parent has
-//!   decided finds *proceed* queued, and carries on.
-//! - *Abandon.* A spawn that failed before its verdict shuts the channel for reading. Every
-//!   message sent before that is still read; every send after it fails with no *proceed* queued,
-//!   and the child exits without `exec`. After abandonment no child execs, in or out of a leaf.
+//! **Final.** The spawn's clone suspends the parent until the child's `exec` or exit, so every
+//! record the child wrote is in the channel when the clone returns: the spawn reads them, and
+//! records the report on the leaf (`record_placement`). What it recorded is all there will ever
+//! be, and no verdict waits for anything.
 //!
-//! **Final.** After either act, what was received is all there will ever be. Before it, a report
-//! is final once received, or once the child has exited (seen through a pidfd or `waitid`) or
-//! the leaf is removed (a removed leaf admits no member). Otherwise it is in flight, whatever
-//! `spawn` returned — std's `spawn` can return before the child has run any `pre_exec`.
+//! **One verdict.** The leaf's verdict is taken exactly once: `take_placement` after the spawn
+//! (the attach, or a failed spawn that still holds its child), or `abandon_without_child` (and
+//! `Drop`) for a spawn that never reached it. Both read the one recorded report.
 //!
 //! **Absence.** Nothing of the child's is in the leaf only when there is proof of it:
-//! - a final report other than `Placed` — the child either never entered, or exited before
-//!   reporting (its placement may have been interrupted between the write and the send). Either
-//!   way it never exec'd, so it never ran a program that could fork into the leaf; or
+//! - a recorded report other than `Placed` or `Unknown` — the child either never entered (its write failed,
+//!   and a lenient slot's program then runs outside the leaf), or ended before reporting (its
+//!   placement may have been interrupted between the write and the record). Either way it never ran a
+//!   program that could fork into the leaf; or
 //! - the leaf's own removal — `rmdir` succeeds only on a leaf with no live member.
+//!
+//! `Unknown` is the report of a channel the spawn could not read: it is no proof of either, so the
+//! attach builds nothing on it (it fails the spawn), the leaf is killed through, and the child's
+//! process group is its containment too.
 //!
 //! **Kill.** cosca kills through a leaf whenever it lacks proof of absence, and never when it has
 //! it: an occupant of a leaf that provably holds nothing of the child's is not cosca's to kill.
@@ -94,12 +91,6 @@ mod degrade;
     )
 )]
 pub(crate) use degrade::*;
-
-#[cfg(target_os = "linux")]
-#[path = "cgroup/channel.rs"]
-mod channel;
-#[cfg(target_os = "linux")]
-pub(crate) use channel::*;
 
 #[cfg(target_os = "linux")]
 #[path = "cgroup/dir.rs"]

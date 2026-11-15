@@ -8,12 +8,12 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
-use super::{conclude, start_via, OnFailure, Program, Started};
+use super::{conclude, start, start_via, OnFailure, Program, Started};
 use crate::child::spawn::child_env::child_env_over;
 use crate::child::spawn::in_child::InChild;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::SpawnFailure;
-use crate::containment::cgroup::ReportChannel;
+use crate::containment::cgroup::{CgroupLeaf, NotEntered, NotPlaced};
 use crate::error::Error;
 use crate::os_process::linux::fork::{fails_with, CloneKind, Fork, ForkFn, NewChild, Path};
 use crate::test_own_process::{child_completion, own_process, run, test_filter, test_path};
@@ -222,9 +222,9 @@ pub(super) unsafe fn hand_over(_kind: CloneKind) -> Result<Fork, i32> {
         .ok_or(libc::EAGAIN)
 }
 
-/// [`start_via`] over `fork`, for a program that is never run. `placement`: the spawn's leaf channel and
+/// [`start_via`] over `fork`, for a program that is never run. `placement`: the spawn's leaf and
 /// whether its slot refuses a failed write.
-fn start_over(fork: ForkFn, placement: Option<(&mut ReportChannel, bool)>) -> Result<Started, SpawnFailure> {
+fn start_over(fork: ForkFn, placement: Option<(&mut CgroupLeaf, bool)>) -> Result<Started, SpawnFailure> {
     let (placement, refusing_placement) = match placement {
         Some((channel, refusing)) => (Some(channel), refusing),
         None => (None, false),
@@ -307,106 +307,258 @@ fn a_child_that_ended_before_exec_is_torn_down_and_the_spawn_did_not_start() {
     drop(child);
 }
 
-/// A child that placed itself in its cgroup leaf and then ended before its `execve` did not start,
-/// whatever its placement report says: only a refused placement hands a child to the attach.
+/// A test leaf in `dir`, whose `cgroup.procs` the verdict can read.
+fn test_leaf(dir: &std::path::Path) -> CgroupLeaf {
+    let leaf_path = dir.join("cosca-fork-spawn-leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("cgroup.procs"), "").expect("write cgroup.procs");
+    CgroupLeaf::for_test_at(leaf_path)
+}
+
+/// What `leaf`'s verdict says of the spawn's child, for any child: `Ok` is a placed one, the error says
+/// what it reported.
+fn verdict_of(leaf: &mut CgroupLeaf) -> Result<(), NotEntered> {
+    let pidfd = crate::containment::cgroup::test_support::pidfd_of(std::process::id());
+    leaf.take_placement(crate::containment::cgroup::test_support::handle_of(
+        std::process::id(),
+        &pidfd,
+    ))
+    .map_err(|not_placed| match not_placed {
+        NotPlaced::Absent { report, .. } | NotPlaced::Unreadable { report, .. } => report,
+    })
+}
+
+/// A spawn of `/bin/true` through the real clone, whose child runs the placement step on `procs_fd`
+/// (`refusing`: a failed write ends it), then `more`'s steps, with `leaf` to record its report on.
+fn start_placed(
+    leaf: &mut CgroupLeaf,
+    procs_fd: RawFd,
+    refusing: bool,
+    more: impl FnOnce(&mut InChild),
+) -> Result<Started, SpawnFailure> {
+    start_placed_expecting(leaf, procs_fd, refusing, refusing, more)
+}
+
+/// [`start_placed`] for a spawn whose parent expects a refusing child (`expects_refusal`) of a child that
+/// does not, or the other way round.
+fn start_placed_expecting(
+    leaf: &mut CgroupLeaf,
+    procs_fd: RawFd,
+    refusing: bool,
+    expects_refusal: bool,
+    more: impl FnOnce(&mut InChild),
+) -> Result<Started, SpawnFailure> {
+    let program = Program::new(&[OsStr::new("/bin/true")], &[OsStr::new("true")], std::iter::empty()).expect("no NUL");
+    let mut steps = InChild::default();
+    // SAFETY: `procs_fd` stays open until the spawn has returned.
+    unsafe { steps.place(procs_fd, refusing) };
+    more(&mut steps);
+    let lock = crate::child::spawn::spawn_lock();
+    start(
+        &program,
+        &mut steps,
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+        OnFailure {
+            policy: SpawnPolicy::SYNC,
+            front: None,
+            placement: Some(leaf),
+            refusing_placement: expects_refusal,
+        },
+        &lock,
+    )
+}
+
+/// An fd-map step that fails in the child: a mapping onto a descriptor number no process can have.
+fn failing_fd_map(steps: &mut InChild) {
+    crate::child::spawn::fd_map::install(
+        steps,
+        vec![crate::child::spawn::fd_map::FdMapping {
+            parent_fd: File::open("/dev/null").expect("open /dev/null").into(),
+            child_fd: i32::MAX,
+        }],
+    )
+    .expect("install the mapping");
+}
+
+/// A child that placed itself in its cgroup leaf and then ended before its `execve` (a later step failed)
+/// did not start, whatever its placement report says: only a refused placement hands a child to the
+/// attach. The spawn's error is the step's, and the leaf learned that the child entered it.
 ///
-/// Mutant: a child with no ready record is handed to the attach whenever it has a leaf.
+/// Mutants: a child that reported `Placed` is handed to the attach; the report is not recorded on the leaf.
 #[skuld::test]
 fn a_child_that_placed_itself_and_ended_before_exec_is_torn_down() {
-    let mut channel = ReportChannel::new().expect("open a report channel");
-    let child = hand_over_an_ended_child();
-    let pid = child.id();
-    // SAFETY: the channel is open and this process is listening.
-    unsafe { channel.slot().report_placed_for_test() };
-    assert_torn_down(start_over(hand_over, Some((&mut channel, true))), pid);
-    drop(child);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut leaf = test_leaf(dir.path());
+    let sink = File::options().write(true).open("/dev/null").expect("open /dev/null");
+    let failure = match start_placed(&mut leaf, sink.as_raw_fd(), true, failing_fd_map) {
+        Ok(started) => panic!("a child whose fd map failed started: pid {}", started.pid),
+        Err(failure) => failure,
+    };
+    let (cause, _fate) = failure.expect_not_started_with_child();
+    assert!(
+        matches!(&cause, Error::Io(e) if e.raw_os_error() == Some(libc::EBADF)),
+        "{cause:?}"
+    );
+    assert_eq!(
+        verdict_of(&mut leaf),
+        Ok(()),
+        "the child placed itself before its fd map failed"
+    );
 }
 
-/// A child that ended before its ready record having sent no placement report did not start either,
-/// and when it ended by its own exit status, not a placement hook's, the failure does not blame its
-/// placement.
-///
-/// Mutant: a child with no ready record is handed to the attach whenever it has a leaf; every child
-/// with no report is blamed on its placement.
-#[skuld::test]
-fn a_child_that_ended_before_it_reported_its_placement_is_torn_down() {
-    let mut channel = ReportChannel::new().expect("open a report channel");
-    let child = hand_over_a_child_that_exited_with(1);
-    let pid = child.id();
-    let said = assert_torn_down(start_over(hand_over, Some((&mut channel, true))), pid);
-    assert!(!said.contains("placement step"), "{said}");
-    drop(child);
-}
-
-/// A child that ended in its placement hook (the exit status the hook leaves it with when it cannot send
-/// its report, or when the spawn was abandoned) did not start, and the failure says its placement step
-/// is where it ended, for a slot that refuses a failed write and for one that does not.
-///
-/// Mutant: the exit status of the placement hook is not read, so the failure is the generic one.
-#[skuld::test]
-fn a_child_that_ended_in_its_placement_hook_says_so() {
-    use crate::containment::cgroup::{ABANDONED_EXIT, REFUSED_EXIT, UNSENT_EXIT};
-
-    for (code, refusing) in [(UNSENT_EXIT, false), (ABANDONED_EXIT, false), (REFUSED_EXIT, true)] {
-        let mut channel = ReportChannel::new().expect("open a report channel");
-        let child = hand_over_a_child_that_exited_with(code);
-        let pid = child.id();
-        let said = assert_torn_down(start_over(hand_over, Some((&mut channel, refusing))), pid);
-        assert!(
-            said.contains("died before exec in its cgroup placement step"),
-            "exit {code}, refusing {refusing}: {said}"
-        );
-        drop(child);
-    }
-}
-
-/// A child whose placement write failed in a slot that does not refuse a failed write goes on to its
-/// exec: when it then ends before its ready record, by its own exit status, the failure does not blame its
-/// placement.
+/// A child whose placement write failed in a slot that does not refuse a failed write goes on, and when a
+/// later step then ends it, the failure is that step's, not blamed on the placement; the leaf still learns
+/// what the child reported.
 ///
 /// Mutant: a reported failed write is read as the cause of any end before the ready record.
 #[skuld::test]
 fn a_child_that_reported_a_failed_placement_and_went_on_is_not_blamed_on_it() {
-    let mut channel = ReportChannel::new().expect("open a report channel");
-    let child = hand_over_an_ended_child();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut leaf = test_leaf(dir.path());
+    crate::containment::cgroup::fault::set_force_placement_write_result(
+        crate::containment::cgroup::fault::ForcedWrite::FailsWith(libc::EBUSY),
+    );
+    let failure = match start_placed(&mut leaf, -1, false, failing_fd_map) {
+        Ok(started) => panic!("a child whose fd map failed started: pid {}", started.pid),
+        Err(failure) => failure,
+    };
+    let (cause, _fate) = failure.expect_not_started_with_child();
+    assert!(
+        matches!(&cause, Error::Io(e) if e.raw_os_error() == Some(libc::EBADF)),
+        "the fd map's EBADF, not the placement's EBUSY: {cause:?}"
+    );
+    assert_eq!(verdict_of(&mut leaf), Err(NotEntered::WriteFailed(libc::EBUSY)));
+}
+
+/// A child whose refusing placement failed ended in its placement step: it is handed to the attach as it
+/// is, to read the report and say why, and the leaf holds the report.
+///
+/// Mutants: a refused child is torn down in the spawn (with the step's error, not the attach's); the
+/// refused report is not recorded.
+#[skuld::test]
+fn a_child_whose_placement_was_refused_is_handed_to_the_attach() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut leaf = test_leaf(dir.path());
+    crate::containment::cgroup::fault::set_force_placement_write_result(
+        crate::containment::cgroup::fault::ForcedWrite::FailsWith(libc::EBUSY),
+    );
+    let started = start_placed(&mut leaf, -1, true, |_| {})
+        .unwrap_or_else(|failure| panic!("a refused placement is the attach's to read: {failure:?}"));
+    assert_eq!(
+        crate::child::spawn::in_child::exit_code(&started),
+        Some(super::STEP_EXIT),
+        "the refused child ended in its placement step"
+    );
+    drop(started);
+    assert_eq!(verdict_of(&mut leaf), Err(NotEntered::WriteFailed(libc::EBUSY)));
+}
+
+/// A child that ended in its placement step, with a record that says so, did not start, and the failure
+/// names the placement step, as a placement failure is named elsewhere ([`Error::Containment`]), with the
+/// step's errno as its source: not the bare `Error::Io` of any other step.
+///
+/// A step that fails on its report write cannot be made to leave its record here (the record goes through
+/// the same write), so a refusing child whose write fails, under a parent that does not expect a refusal
+/// (and so does not hand it to the attach), stands in: the child ends in the placement step with the step's
+/// own record. Mutants: every step failure is a placement one (a child that ended in a later step, as in
+/// `a_child_that_placed_itself_and_ended_before_exec_is_torn_down`, says the step's own `Error::Io`); a
+/// placement step's failure is the bare `Error::Io`.
+#[skuld::test]
+fn a_child_that_ended_in_its_placement_step_says_so() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut leaf = test_leaf(dir.path());
+    crate::containment::cgroup::fault::set_force_placement_write_result(
+        crate::containment::cgroup::fault::ForcedWrite::FailsWith(libc::EBUSY),
+    );
+    let failure = match start_placed_expecting(&mut leaf, -1, true, false, |_| {}) {
+        Ok(started) => panic!("a child that ended in its placement step started: pid {}", started.pid),
+        Err(failure) => failure,
+    };
+    let (cause, _fate) = failure.expect_not_started_with_child();
+    let Error::Containment { detail, source } = &cause else {
+        panic!("a placement step's failure is a containment failure: {cause:?}");
+    };
+    assert!(
+        detail.contains("died before exec in its cgroup placement step: the program never ran"),
+        "{detail}"
+    );
+    assert!(
+        matches!(source.as_deref(), Some(Error::Io(e)) if e.raw_os_error() == Some(libc::EBUSY)),
+        "the step's errno is the source: {source:?}"
+    );
+}
+
+/// A child that ended before it reported anything, in a spawn with a leaf, is torn down with the generic
+/// error, and the leaf is left with no report.
+///
+/// Mutant: a child with no ready record is handed to the attach whenever it has a leaf; a child with no
+/// report is blamed on its placement.
+#[skuld::test]
+fn a_child_that_ended_before_it_reported_its_placement_is_torn_down() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut leaf = test_leaf(dir.path());
+    let child = hand_over_a_child_that_exited_with(1);
     let pid = child.id();
-    // SAFETY: fd -1 is never writable, so the placement fails with EBADF and is reported; the channel is open.
-    let hook = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, channel.slot()) };
-    hook.expect("a failed placement is reported and the hook returns");
-    let said = assert_torn_down(start_over(hand_over, Some((&mut channel, false))), pid);
-    assert!(!said.contains("placement step"), "{said}");
+    let said = assert_torn_down(start_over(hand_over, Some((&mut leaf, true))), pid);
+    assert!(!said.contains("placement"), "{said}");
+    assert_eq!(verdict_of(&mut leaf), Err(NotEntered::NotReported));
     drop(child);
 }
 
-/// A child whose refusing placement failed, and that ended for it, is handed to the attach as it is, to
-/// read the report and say why.
+/// A child with a cgroup leaf whose status channel says it reached its `execve` has reported its placement:
+/// its placement step writes the report before the ready record. A child that did not (here, one whose steps
+/// carry no placement) breaks that, which debug builds assert; release builds go on, and the leaf has no report.
 ///
-/// Mutant: every child with no ready record is torn down in the spawn.
+/// Mutants: the invariant is not asserted, so a spawn that lost the placement step records no report and goes
+/// on (debug); the leaf is given a report of its own (release).
 #[skuld::test]
-fn a_child_whose_placement_was_refused_is_handed_to_the_attach() {
-    let mut channel = ReportChannel::new().expect("open a report channel");
-    let child = hand_over_an_ended_child();
-    let pid = child.id();
-    // SAFETY: fd -1 is never writable, so the placement fails with EBADF and is reported; the channel is open.
-    let hook = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, channel.slot()) };
-    hook.expect("a failed placement is reported and the hook returns");
-    let started = start_over(hand_over, Some((&mut channel, true))).unwrap_or_else(|failure| {
-        panic!("a refused placement is the attach's to read: {failure:?}");
-    });
-    assert_eq!(started.pid, pid);
+#[cfg_attr(
+    debug_assertions,
+    should_panic(expected = "reached its execve with no placement report")
+)]
+fn a_child_with_a_leaf_that_reached_its_exec_without_a_report_asserts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut leaf = test_leaf(dir.path());
+    let started = start_via_the_real_clone(&mut leaf);
+    #[cfg(not(debug_assertions))]
+    assert_eq!(verdict_of(&mut leaf), Err(NotEntered::NotReported));
     drop(started);
-    drop(child);
+}
+
+/// A spawn of `/bin/true` through the real clone with no placement step, for `leaf`.
+fn start_via_the_real_clone(leaf: &mut CgroupLeaf) -> Result<Started, SpawnFailure> {
+    let program = Program::new(&[OsStr::new("/bin/true")], &[OsStr::new("true")], std::iter::empty()).expect("no NUL");
+    let lock = crate::child::spawn::spawn_lock();
+    start_via(
+        crate::os_process::linux::fork::fork_with_pidfd,
+        &program,
+        &mut InChild::default(),
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+        OnFailure {
+            policy: SpawnPolicy::SYNC,
+            front: None,
+            placement: Some(leaf),
+            refusing_placement: false,
+        },
+        &lock,
+    )
 }
 
 /// A status channel the spawn cannot read proves nothing: the spawn goes on as one of a program that may have
 /// started (`Ok`), and warns, naming the child. The channel is made here, its read end replaced with a
-/// directory (a read of it is `EISDIR`), and handed to the spawn's conclusion with the child.
+/// directory (a read of it is `EISDIR`), and handed to the spawn's conclusion with the child. Where the child
+/// has a cgroup leaf, its placement is unknown: the leaf records that and the read's errno, and does not
+/// take the child as placed (the attach must not build on a proof the spawn does not have), nor as absent (a
+/// kill through the leaf is owed, whether or not the child entered).
 ///
-/// Mutant: an unreadable channel fails the spawn, or is taken as "did not start" and the child torn down.
+/// Mutants: an unreadable channel fails the spawn, or is taken as "did not start" and the child torn down;
+/// the leaf is taken to hold the child as placed, or to hold no child.
 #[skuld::test]
 fn an_unreadable_status_channel_is_a_started_spawn_with_a_warning() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut leaf = test_leaf(dir.path());
     let child = hand_over_an_ended_child();
     let pid = child.id();
     let handed = HANDED_OVER
@@ -425,12 +577,17 @@ fn an_unreadable_status_channel_is_a_started_spawn_with_a_warning() {
         OnFailure {
             policy: SpawnPolicy::SYNC,
             front: None,
-            placement: None,
+            placement: Some(&mut leaf),
             refusing_placement: false,
         },
     )
     .unwrap_or_else(|failure| panic!("an unreadable status channel failed the spawn: {failure:?}"));
     assert_eq!(started.pid, pid);
+    assert_eq!(
+        verdict_of(&mut leaf),
+        Err(NotEntered::Unknown(libc::EISDIR)),
+        "the leaf records that the placement is unknown, with the read's errno"
+    );
     let warns = crate::log_capture::warns_since(mark, "its status channel is unreadable");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(warns[0].contains(&pid.to_string()), "{warns:?}");
@@ -514,15 +671,52 @@ fn a_pidfd_that_cannot_be_moved_above_stdio_fails_the_spawn_and_ends_the_child()
         std::iter::empty(),
     )
     .expect("no NUL");
-    assert_unmovable_pidfd_ends_the_child(start_with_an_unmovable_pidfd(&done, &program));
+    assert_unmovable_pidfd_ends_the_child(start_with_an_unmovable_pidfd(&done, &program, None));
+}
+
+/// A child whose pidfd cannot be moved still tells its leaf where it placed itself: the spawn fails, the
+/// child is torn down, and the leaf, which the failed spawn's `Drop` kills through when the child entered
+/// it, holds the report.
+///
+/// Mutant: the placement report is read only when the pidfd moved.
+#[skuld::test]
+fn a_child_whose_pidfd_cannot_be_moved_still_tells_its_leaf_where_it_placed_itself() {
+    let Some(done) = own_process(
+        test_path!(a_child_whose_pidfd_cannot_be_moved_still_tells_its_leaf_where_it_placed_itself),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut leaf = test_leaf(dir.path());
+    let sink = File::options().write(true).open("/dev/null").expect("open /dev/null");
+    let program = Program::new(
+        &[OsStr::new("/bin/sleep")],
+        &[OsStr::new("sleep"), OsStr::new("1000")],
+        std::iter::empty(),
+    )
+    .expect("no NUL");
+    assert_unmovable_pidfd_ends_the_child(start_with_an_unmovable_pidfd(
+        &done,
+        &program,
+        Some((&mut leaf, sink.as_raw_fd())),
+    ));
+    assert_eq!(verdict_of(&mut leaf), Ok(()), "the child reported its placement");
 }
 
 /// [`start_via`] over [`clone_then_refuse_new_descriptors`] with stdio slot 0 closed, so the clone's pidfd
-/// takes it and cannot be moved.
+/// takes it and cannot be moved. `placement`: a leaf, and the descriptor its child's placement step writes.
 fn start_with_an_unmovable_pidfd(
     done: &crate::test_own_process::Completion,
     program: &Program,
+    placement: Option<(&mut CgroupLeaf, RawFd)>,
 ) -> Result<Started, SpawnFailure> {
+    let mut steps = InChild::default();
+    let leaf = placement.map(|(leaf, procs_fd)| {
+        // SAFETY: the caller keeps `procs_fd` open until the spawn has returned.
+        unsafe { steps.place(procs_fd, false) };
+        leaf
+    });
     let mut before = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -535,12 +729,12 @@ fn start_with_an_unmovable_pidfd(
     let failure = start_via(
         clone_then_refuse_new_descriptors,
         program,
-        &mut InChild::default(),
+        &mut steps,
         crate::identity::spawn_kernel(crate::identity::HostKernel),
         OnFailure {
             policy: SpawnPolicy::SYNC,
             front: None,
-            placement: None,
+            placement: leaf,
             refusing_placement: false,
         },
         &lock,
@@ -566,7 +760,7 @@ fn the_pidfd_is_moved_above_stdio_before_the_status_channel_is_read() {
         return;
     };
     let program = Program::new(&[OsStr::new(MISSING)], &[OsStr::new("missing")], std::iter::empty()).expect("no NUL");
-    assert_unmovable_pidfd_ends_the_child(start_with_an_unmovable_pidfd(&done, &program));
+    assert_unmovable_pidfd_ends_the_child(start_with_an_unmovable_pidfd(&done, &program, None));
 }
 
 /// The spawn failed as a child that may be running, for the failed move of its pidfd, and the child it made

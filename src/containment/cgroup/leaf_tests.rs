@@ -1,10 +1,8 @@
 #[cfg(target_os = "linux")]
 use std::os::fd::AsFd as _;
 
-use crate::containment::cgroup::test_support::{
-    block_on, childs_copy, entered_leaf_at, fork_running, handle_of, pidfd_of,
-};
-use crate::containment::cgroup::{DrainStep, LeafError, NotEntered, NotPlaced, PlacementReport, WithoutChild};
+use crate::containment::cgroup::test_support::{entered_leaf_at, handle_of, pidfd_of};
+use crate::containment::cgroup::{DrainStep, LeafError, NotEntered, NotPlaced, PlacementReport};
 #[cfg(target_os = "linux")]
 use crate::test_child::{blocker, blocker_with, StdChild};
 #[cfg(target_os = "linux")]
@@ -247,7 +245,7 @@ fn wait_drained_terminates_under_a_frozen_clock() {
 // Linux + cgroup-v2 only; each takes the `cgroup` fixture.
 
 /// Two real, simultaneously live processes placed directly in the same leaf via the crate's own
-/// `place_self_in_cgroup_pre_exec` — not a synthetic membership list — exercising `wait_drained`'s
+/// `place_self_in_cgroup` — not a synthetic membership list — exercising `wait_drained`'s
 /// full mechanism: the real kernel `populated` 1→0 transition once both members are gone, and a
 /// real park at `wait_drained`'s `Block` arm — proven by counting the pump's changed batches
 /// (`fault::set_pump_batch_notifier`) against every park that woke, not just that the wait call
@@ -287,45 +285,29 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     fault::set_pump_batch_notifier(leaf_name, batches_tx);
     let mut total_woken = 0usize;
 
-    // Each member reports through its OWN channel. The leaf's channel carries one report for the whole
-    // leaf (see `ReportChannel`), so two members sharing it would read as whichever wrote first.
-    //
     // Each member is `cat` reading from a pipe this test holds open and never writes to or closes
     // until it explicitly kills the member (below).
-    let spawn_member = |leaf: &crate::containment::cgroup::CgroupLeaf,
-                        channel: &crate::containment::cgroup::ReportChannel|
-     -> StdChild {
+    let spawn_member = |leaf: &crate::containment::cgroup::CgroupLeaf| -> StdChild {
         let procs_fd = leaf.procs_fd();
-        let slot = channel.slot();
         blocker_with(|cmd| {
             cmd.stdout(Stdio::null()).stderr(Stdio::null());
             // SAFETY: `Command::pre_exec` runs this closure only between `fork` and `exec` in the
             // child; `procs_fd` is a valid, open, writable fd owned by `leaf` for the parent's whole
             // lifetime (fork gives the child its own fd-table entry pointing at the same underlying
-            // open file description, and `place_self_in_cgroup_pre_exec` closes only that child-side
-            // copy) — exactly its own documented contract. `leaf` and `channel` both outlive every
-            // member spawned through them in this test.
+            // open file description, and the placement closes only that child-side copy) — exactly
+            // its own documented contract. `leaf` outlives every member spawned through it in this
+            // test.
             unsafe {
-                cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot));
+                cmd.pre_exec(move || crate::containment::cgroup::test_support::place_in_pre_exec(procs_fd));
             }
         })
     };
 
-    let channel_a = crate::containment::cgroup::ReportChannel::new().expect("open member a's report channel");
-    let channel_b = crate::containment::cgroup::ReportChannel::new().expect("open member b's report channel");
-    let mut a = spawn_member(&leaf, &channel_a);
-    let mut b = spawn_member(&leaf, &channel_b);
+    // `spawn()` returned after each member's `exec`, so its placement write has returned: a write that
+    // failed would have failed the spawn.
+    let mut a = spawn_member(&leaf);
+    let mut b = spawn_member(&leaf);
 
-    // Placement is proven by the `Placed` report, sent only after the `cgroup.procs` write
-    // returns — `spawn()` returning does not imply it (see `ReportChannel`, "When the report is
-    // final").
-    for (name, member, mut channel) in [("a", &a, channel_a), ("b", &b, channel_b)] {
-        assert_eq!(
-            channel.wait(pidfd_of(member.id()).as_fd()),
-            PlacementReport::Placed,
-            "member {name}'s own report must survive the other member's spawn"
-        );
-    }
     let procs = std::fs::read_to_string(leaf.leaf_path.join("cgroup.procs")).expect("read cgroup.procs");
     for (name, member) in [("a", &a), ("b", &b)] {
         assert!(
@@ -1472,9 +1454,12 @@ fn drop_reports_a_leaf_it_could_not_remove() {
     );
 }
 
-/// `Drop` writes `cgroup.kill` through an unremovable leaf only when the child reported `Placed`
-/// (see the module's report contract). Before the verdict, `Drop` abandons the exchange first,
-/// which makes what was received final: nothing received then means the child never execs.
+/// `Drop` writes `cgroup.kill` through an unremovable leaf unless the child provably never entered it
+/// (see the module's report contract): when it reported `Placed`, or when the spawn could not read
+/// what it reported (`Unknown`). Before the verdict, `Drop` abandons the spawn first, which
+/// reads the report the spawn recorded: nothing recorded then means the child never execs.
+///
+/// Mutant: an unreadable report is read as proof of absence.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
@@ -1483,11 +1468,12 @@ fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
         PlacementReport::NotReported,
         PlacementReport::WriteFailed(libc::EBADF),
         PlacementReport::Placed,
+        PlacementReport::Unknown(libc::EIO),
     ];
-    // Before the verdict `Drop` reads the report from the channel; after it, from what the
-    // verdict recorded when it released the channel.
+    // Before the verdict `Drop` reads the report the leaf holds; after it, from what the verdict
+    // recorded when it took it.
     for (report, verdict_taken) in reports.into_iter().flat_map(|report| [(report, false), (report, true)]) {
-        let kills = report == PlacementReport::Placed;
+        let kills = matches!(report, PlacementReport::Placed | PlacementReport::Unknown(_));
         let dir = tempfile::tempdir().expect("tempdir");
         let leaf_path = dir.path().join("cosca-drop-kill-leaf");
         std::fs::create_dir(&leaf_path).expect("create the leaf");
@@ -1495,16 +1481,7 @@ fn drop_kills_through_a_leaf_unless_the_child_provably_never_entered() {
         std::fs::write(leaf_path.join("occupant"), "").expect("make the leaf unremovable");
 
         let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-        match report {
-            PlacementReport::NotReported => {}
-            // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
-            // no-op. The slot's channel lives as long as `leaf`.
-            PlacementReport::WriteFailed(_) => {
-                _ = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
-            }
-            // SAFETY: the slot's channel lives as long as `leaf`.
-            PlacementReport::Placed => unsafe { leaf.placement_slot().report_placed_for_test() },
-        }
+        leaf.record_placement(report);
         if verdict_taken {
             // The verdict needs a live pid: this process's own stands in for the child.
             assert_eq!(
@@ -1744,9 +1721,7 @@ fn drop_kills_only_a_leaf_its_child_entered_and_that_is_armed() {
             entered_leaf_at(leaf_path.clone())
         } else {
             let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-            // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
-            // no-op. The slot's channel lives as long as `leaf`.
-            _ = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
+            leaf.record_placement(PlacementReport::WriteFailed(libc::EBADF));
             assert!(
                 leaf.take_placement(handle_of(std::process::id(), &pidfd_of(std::process::id())))
                     .is_err(),
@@ -2217,14 +2192,16 @@ fn entered_real_leaf_of(
     let mut leaf =
         crate::containment::cgroup::try_create_leaf(&crate::identity::spawn_kernel(crate::identity::HostKernel), None)
             .expect("create a real leaf");
-    let (procs_fd, slot) = (leaf.procs_fd(), leaf.placement_slot());
+    let procs_fd = leaf.procs_fd();
     // SAFETY: as `cgroup_wait_drained_tracks_two_real_members_through_exit`'s member spawn: the
     // closure runs between fork and exec, and `leaf` outlives the spawn.
     unsafe {
-        cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot));
+        cmd.pre_exec(move || crate::containment::cgroup::test_support::place_in_pre_exec(procs_fd));
     }
     let mut member = crate::test_spawn::spawn(&mut cmd).expect("spawn a member");
     let stdin = member.stdin.take().expect("piped stdin");
+    // std's spawn returned after the `exec`: the member placed itself.
+    leaf.record_placement(PlacementReport::Placed);
     leaf.take_placement(handle_of(member.id(), &pidfd_of(member.id())))
         .expect("the member entered the leaf");
     (leaf, member, stdin)
@@ -2938,37 +2915,6 @@ fn create_leaf_under_reports_an_unopenable_cgroup_procs_and_removes_the_leaf() {
     );
 }
 
-/// A report channel that cannot be opened is its own degrade reason, and unwinds the leaf too.
-/// `OpenReportChannel` is a condition that did not exist before the placement report did, so the
-/// step it names, and the fact it leaves nothing behind, are both worth pinning.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn create_leaf_under_reports_an_unopenable_report_channel_and_removes_the_leaf() {
-    let dir = own_cgroup_dir();
-    crate::containment::cgroup::fault::set_force_kill_supported(true);
-    crate::containment::cgroup::fault::set_force_report_channel_failure(true);
-    let err = match crate::containment::cgroup::create_leaf_under(
-        dir.path(),
-        &crate::identity::spawn_kernel(crate::identity::HostKernel),
-        None,
-    ) {
-        Err(e) => e,
-        Ok(_) => panic!("the report channel could not be opened; leaf creation must fail"),
-    };
-    assert!(
-        !crate::containment::cgroup::fault::report_channel_failure_armed(),
-        "the seam must be consumed by the channel it fails"
-    );
-    assert!(
-        matches!(err, LeafError::OpenReportChannel(_)),
-        "expected OpenReportChannel, got {err:?}"
-    );
-    assert_eq!(first_source_code(&err), Some(libc::EMFILE), "got {err:?}");
-
-    let strays = strays_in(dir.path());
-    assert!(strays.is_empty(), "a failed channel left {strays:?} behind");
-}
-
 /// A `cgroup.procs` that cannot be read is reported with the read's own error.
 #[cfg(target_os = "linux")]
 #[skuld::test]
@@ -3007,8 +2953,7 @@ fn take_placement_reads_the_real_procs_and_state_of_a_child_that_did_not_enter()
     std::fs::write(leaf_path.join("cgroup.procs"), &listed).expect("write cgroup.procs");
 
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
-    // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a no-op.
-    _ = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
+    leaf.record_placement(PlacementReport::WriteFailed(libc::EBADF));
 
     let mut child = crate::test_spawn::spawn(&mut std::process::Command::new("/bin/true")).expect("spawn");
     let pid = child.id();
@@ -3092,379 +3037,235 @@ fn take_placement_reads_the_childs_state_before_cgroup_procs() {
     }
 }
 
-// What the placement hook returns -----
-// `pre_exec` failing aborts the spawn. A failed placement must not (the child degrades to its
-// process group); a report the waiting parent can never receive must (it would read as never
-// placed for as long as the child lives).
+// What the placement step does -----
+// It runs in the child of the spawn core and reports on the core's status channel. A failed placement
+// must not end the child (it degrades to its process group), except for a refusing slot; a report the
+// parent can never read must (it would read as never placed for as long as the child lives).
 
-/// A failed placement whose report is delivered lets the spawn proceed.
+/// A child of the spawn core that runs [`placement_step`](crate::containment::cgroup::placement_step) on
+/// `procs_fd` and then `/bin/true`, with the core's status channel to read.
 #[cfg(target_os = "linux")]
-#[skuld::test]
-fn placement_hook_proceeds_past_a_failed_placement() {
-    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
-    // SAFETY: fd -1 is never writable, so the placement fails with EBADF; the channel is open.
-    let result = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, channel.slot()) };
-    assert!(
-        result.is_ok(),
-        "a failed placement must not abort the spawn: {result:?}"
-    );
-    assert_eq!(channel.report_for_test(), PlacementReport::WriteFailed(libc::EBADF));
-}
+fn run_placement_step(procs_fd: std::os::fd::RawFd, refusing: bool) -> crate::child::spawn::fork_exec::Spawned {
+    use crate::child::spawn::fork_exec::{spawn, Program, StepFailure};
+    use crate::os_process::linux::fork::{fork_with_pidfd, CloneKind};
+    use std::ffi::OsStr;
 
-/// A refusing slot's failed placement fails the spawn with the write's errno, after the report that
-/// carries the same errno to the parent is sent. A placement that succeeds proceeds, as it does for
-/// any slot.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_refusing_placement_hook_fails_a_failed_placement_and_reports_it() {
-    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
-    // SAFETY: fd -1 is never writable, so the placement fails with EBADF; the channel is open.
-    let result = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(-1, channel.slot().refusing()) };
-    assert_eq!(
-        result.expect_err("a refused placement fails the spawn").raw_os_error(),
-        Some(libc::EBADF)
-    );
-    assert_eq!(channel.report_for_test(), PlacementReport::WriteFailed(libc::EBADF));
-
-    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
-    let sink = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/null")
-        .expect("open /dev/null");
-    let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
-    // SAFETY: `procs_fd` is open and closed by the hook; the channel is open.
-    let result =
-        unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, channel.slot().refusing()) };
-    assert!(result.is_ok(), "a placed child proceeds: {result:?}");
-    assert_eq!(channel.report_for_test(), PlacementReport::Placed);
-}
-
-/// A report that cannot be sent to a parent still waiting for it fails the spawn.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn placement_hook_fails_when_its_report_cannot_be_sent() {
-    let sink = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/null")
-        .expect("open /dev/null");
-    let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
-    // fd -1 is never open, so the send fails with EBADF.
-    let slot = crate::containment::cgroup::ReportSlot {
-        fd: -1,
-        parent_fd: -1,
-        refusing: false,
-    };
-    // SAFETY: `procs_fd` is open and closed by the hook; the slot's fd is deliberately invalid.
-    let result = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot) };
-    assert_eq!(
-        result.map_err(|e| e.raw_os_error()),
-        Err(Some(libc::EBADF)),
-        "an undeliverable report must abort the spawn"
-    );
-}
-
-/// A parent that decided without the exchange sends *proceed* and closes its end. In a real
-/// spawn the child's own inherited copy of that end would keep the socket open, so the hook closes
-/// it first; the child's send then fails, finds *proceed*, and the child carries on to `exec` —
-/// without `SIGPIPE`, and without touching the leaf it no longer needs.
-///
-/// Ordered by primitives: the forked child signals, then waits on a gate that the deciding thread
-/// opens only after it has decided.
-///
-/// Runs in a copy of this test binary running only this test. Any other process this one forks
-/// while the channel is open holds a copy of the parent's end until its own `exec`, and would keep
-/// the socket open past the parent's close — the child's send would then queue, and the child
-/// carry on having written its placement: a decision honoured, but not the branch under test.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn placement_hook_proceeds_when_the_parent_decided_without_the_exchange() {
-    use std::io::{Read, Write};
-    use std::os::fd::{AsRawFd, IntoRawFd};
-    use std::os::unix::process::CommandExt;
-
-    const NAME: &str =
-        "containment::cgroup::leaf::leaf_tests::placement_hook_proceeds_when_the_parent_decided_without_the_exchange";
-    const INNER: &str = "COSCA_TESTCFG_DECIDED_ALONE";
-    if std::env::var_os(INNER).is_none() {
-        let out = crate::test_spawn::output_captured(
-            crate::test_reexec::with_json_events(
-                crate::test_reexec::command(std::env::current_exe().expect("this test binary")).args([
-                    NAME,
-                    "--exact",
-                    crate::test_reexec::NOCAPTURE,
-                    "--test-threads=1",
-                ]),
-            )
-            .env(INNER, "1"),
-        )
-        .expect("run the case alone");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if let Err(why) = crate::test_reexec::suite_passed_exactly_one(&out) {
-            panic!(
-                "{why}\n{}\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        return;
-    }
-
-    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
-    let slot = channel.slot();
-    let (procs_read, procs_write) = std::io::pipe().expect("a pipe standing in for cgroup.procs");
-    let procs_fd = procs_write.into_raw_fd();
-    let (mut forked_read, forked_write) = std::io::pipe().expect("open the forked signal");
-    let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
-    let (forked_fd, gate_fd) = (forked_write.as_raw_fd(), gate_read.as_raw_fd());
-    let decider = std::thread::spawn(move || {
-        let mut byte = [0u8; 1];
-        forked_read.read_exact(&mut byte).expect("the child forked");
-        channel.proceed();
-        gate_write.write_all(b"x").expect("release the child");
-    });
-    let mut cmd = std::process::Command::new("/bin/true");
-    // SAFETY: the closure runs between fork and exec, and makes only async-signal-safe calls on
-    // descriptors this test keeps open across the spawn.
+    let program = Program::new(&[OsStr::new("/bin/true")], &[OsStr::new("true")], std::iter::empty()).expect("no NUL");
+    let _lock = crate::child::spawn::spawn_lock();
+    // SAFETY: this thread holds `spawn_lock`, and the step makes raw system calls only and never waits on
+    // the parent.
     unsafe {
-        cmd.pre_exec(move || {
-            libc::write(forked_fd, b"x".as_ptr().cast(), 1);
-            block_on(gate_fd);
-            crate::containment::cgroup::placement_hook(procs_fd, slot)
-        })
-    };
-    let status = crate::test_spawn::spawn(&mut cmd)
-        .expect("a decided exchange must not abort the spawn")
-        .wait();
-    // SAFETY: the parent's own copy, closed once.
-    unsafe { libc::close(procs_fd) };
-    decider.join().expect("the deciding thread");
-    drop(forked_write);
-    assert!(status.expect("wait").success(), "the child must have exec'd");
-    assert_eq!(
-        std::io::read_to_string(procs_read).expect("read the pipe"),
-        "",
-        "no placement write"
-    );
-}
-
-/// A parent that abandoned the spawn shut its end without *proceed*: the child's first send fails,
-/// and the hook fails the spawn with `ECANCELED` before touching the leaf — so the child exits
-/// instead of exec'ing.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn placement_hook_fails_a_spawn_the_parent_abandoned_before_touching_the_leaf() {
-    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
-    let (_end, slot) = childs_copy(&channel);
-    let (procs_read, procs_write) = std::io::pipe().expect("a pipe standing in for cgroup.procs");
-    let received = channel.shut();
-    assert!(received.pid.is_none(), "nothing was sent before the shut");
-    // SAFETY: as above.
-    let result = unsafe {
-        crate::containment::cgroup::place_self_in_cgroup_pre_exec(
-            std::os::fd::IntoRawFd::into_raw_fd(procs_write),
-            slot,
+        spawn(
+            CloneKind::Vfork,
+            fork_with_pidfd,
+            &program,
+            &[],
+            // This closure is the child's step: it runs only in the child of the clone.
+            &mut |reporter| {
+                crate::containment::cgroup::placement_step(procs_fd, refusing, reporter).map_err(|e| StepFailure {
+                    kind: 1,
+                    value: e.raw_os_error().expect("an errno") as u16,
+                })
+            },
+            PLACEMENT_STEP_EXIT,
         )
-    };
-    assert_eq!(result.map_err(|e| e.raw_os_error()), Err(Some(libc::ECANCELED)));
-    assert_eq!(
-        std::io::read_to_string(procs_read).expect("read the pipe"),
-        "",
-        "no placement write"
-    );
+    }
+    .unwrap_or_else(|e| panic!("the core made no child: {e:?}"))
 }
 
-/// A child held before its hook while the parent abandons the spawn never execs: released, its
-/// first send fails with no *proceed*, and it exits from inside its hook with `ABANDONED_EXIT`,
-/// rather than return an error to `std` — which would write its error record to the fd number its
-/// error channel had, a stdio slot once `std` returned early. A regression exits 0 here (the
-/// forked body's own `_exit`).
+/// The exit code of the step's child when its step failed.
 #[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_child_released_after_its_spawn_was_abandoned_never_execs() {
-    use std::io::Write;
-    use std::os::fd::{AsRawFd, IntoRawFd};
+const PLACEMENT_STEP_EXIT: i32 = 126;
 
-    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
-    let slot = channel.slot();
-    let (procs_read, procs_write) = std::io::pipe().expect("a pipe standing in for cgroup.procs");
-    let procs_fd = procs_write.into_raw_fd();
-    let (gate_read, mut gate_write) = std::io::pipe().expect("open the gate");
-    let gate = gate_read.as_raw_fd();
-    let guard = fork_running(&[gate, procs_fd, slot.fd, slot.parent_fd], move || {
-        block_on(gate);
-        // SAFETY: this child's inherited copies of the channel's ends and the pipe.
-        _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
-    });
-    // SAFETY: the parent's own copy, closed once; the child keeps its own.
-    unsafe { libc::close(procs_fd) };
-    let received = channel.shut();
-    assert!(received.pid.is_none(), "the child was held before its hook");
-    gate_write.write_all(b"x").expect("release the child");
-
-    let pid = guard.defuse();
-    let mut status = 0;
-    // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
-    assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
-    assert!(libc::WIFEXITED(status), "status {status:#x}");
-    assert_eq!(
-        libc::WEXITSTATUS(status),
-        crate::containment::cgroup::ABANDONED_EXIT,
-        "the abandoned child must exit from its hook, not exec"
-    );
-    assert_eq!(
-        std::io::read_to_string(procs_read).expect("read the pipe"),
-        "",
-        "no placement write"
-    );
-}
-
-/// A child whose refusing placement failed exits from inside its hook with `REFUSED_EXIT`, after
-/// its report, rather than return an error to `std` (which would write its error record to the fd
-/// number its error channel had: a stdio slot once `std` returned early). A regression exits 0
-/// here (the forked body's own `_exit`).
+/// What `spawned`'s status has said once it has said all it will, with the report among it.
 #[cfg(target_os = "linux")]
-#[skuld::test]
-fn a_child_whose_refusing_placement_failed_exits_from_its_hook() {
-    use std::os::fd::IntoRawFd;
-
-    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
-    let slot = channel.slot().refusing();
-    // A descriptor open for reading only: the placement write fails with EBADF.
-    let procs_fd = std::fs::File::open("/dev/null").expect("open /dev/null").into_raw_fd();
-    let guard = fork_running(&[procs_fd, slot.fd, slot.parent_fd], move || {
-        // SAFETY: this child's inherited copies of the channel's ends and the descriptor.
-        _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
-    });
-    // SAFETY: the parent's own copy, closed once; the child keeps its own.
-    unsafe { libc::close(procs_fd) };
-
-    let pid = guard.defuse();
-    let mut status = 0;
-    // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
-    assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
-    assert!(libc::WIFEXITED(status), "status {status:#x}");
-    assert_eq!(
-        libc::WEXITSTATUS(status),
-        crate::containment::cgroup::REFUSED_EXIT,
-        "a refused child must exit from its hook, not return an error to std"
-    );
-    assert_eq!(channel.shut().placement(), PlacementReport::WriteFailed(libc::EBADF));
+fn settled_status(
+    spawned: &mut crate::child::spawn::fork_exec::Spawned,
+) -> (crate::child::spawn::fork_exec::Progress, Option<u16>) {
+    let progress = crate::test_support::settled(&mut spawned.status);
+    (progress, spawned.status.reported())
 }
 
-/// A child whose refusing placement cannot report it exits from its hook with `REFUSED_EXIT` too,
-/// having sent nothing: the parent reads no cause from the channel, and takes the child as one that
-/// sent no report.
+/// The exit status of `spawned`'s child, reaped through its pidfd.
+#[cfg(target_os = "linux")]
+fn exit_code_of(spawned: &crate::child::spawn::fork_exec::Spawned) -> i32 {
+    crate::test_support::exit_status(&spawned.child)
+}
+
+/// A placement whose write failed, in a slot that does not refuse it, is reported with the write's
+/// errno and the child goes on to its program.
 ///
-/// Mutant: a refusing slot's unsent report exits `UNSENT_EXIT`, or returns to `exec`.
+/// Mutants: the failed write is not reported; a failed write ends the child in a lenient slot.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_child_whose_refusing_placement_cannot_report_it_exits_refused_with_nothing_sent() {
-    use std::os::fd::IntoRawFd;
+fn a_failed_placement_is_reported_and_the_child_goes_on() {
+    use crate::child::spawn::fork_exec::Progress;
 
-    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
-    let slot = crate::containment::cgroup::test_support::unsendable(channel.slot().refusing());
-    let procs_fd = std::fs::File::open("/dev/null").expect("open /dev/null").into_raw_fd();
-    let guard = fork_running(&[procs_fd], move || {
-        // SAFETY: this child's inherited copy of the descriptor; the report end is deliberately not open.
-        _ = unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) };
-    });
-    // SAFETY: the parent's own copy, closed once; the child keeps its own.
-    unsafe { libc::close(procs_fd) };
-
-    let pid = guard.defuse();
-    let mut status = 0;
-    // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
-    assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
-    assert!(libc::WIFEXITED(status), "status {status:#x}");
+    // fd -1 is never writable, so the placement fails with EBADF.
+    let mut spawned = run_placement_step(-1, false);
     assert_eq!(
-        libc::WEXITSTATUS(status),
-        crate::containment::cgroup::REFUSED_EXIT,
-        "a refusing child that cannot report exits from its hook"
+        settled_status(&mut spawned),
+        (Progress::Ended { ready: true }, Some(libc::EBADF as u16))
     );
-    assert_eq!(channel.shut().placement(), PlacementReport::NotReported);
+    assert_eq!(exit_code_of(&spawned), 0, "the program ran");
 }
 
-/// A lenient child whose report cannot be sent exits from its hook with `UNSENT_EXIT` instead of
-/// returning an error to `std`: with fds 0 and 2 closed, `std`'s status pipe takes the child's
-/// stderr number and `std` returns before the hook runs, so an error record would be written into
-/// the caller's stderr target (a file here, which must stay empty). Runs in a process of its own,
-/// since closing fds is process-wide.
+/// A refusing slot's failed placement ends the child before its program with the write's errno, after
+/// the report that carries the same errno to the parent.
 ///
-/// Mutant: the hook returns the send error to `std`.
+/// Mutants: the refusing slot's child goes on to its program; the report is not written before the
+/// failure.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn a_lenient_child_whose_report_cannot_be_sent_exits_without_writing_into_its_stdio() {
-    use crate::test_own_process::{own_process, test_path};
-    use crate::test_spawn::spawn;
-    use crate::test_stdio::RestoreStdio;
-    use std::os::fd::IntoRawFd;
-    use std::os::unix::process::CommandExt;
+fn a_refusing_placement_that_fails_is_reported_and_ends_the_child() {
+    use crate::child::spawn::fork_exec::{Failure, Progress, StepFailure};
 
-    let Some(done) = own_process(
-        test_path!(a_lenient_child_whose_report_cannot_be_sent_exits_without_writing_into_its_stdio),
-        spawn,
-    ) else {
-        return;
+    let mut spawned = run_placement_step(-1, true);
+    let failure = StepFailure {
+        kind: 1,
+        value: libc::EBADF as u16,
     };
-    let dir = tempfile::tempdir().expect("tempdir");
-    let stderr_file = dir.path().join("stderr");
-    let procs_fd = std::fs::File::open("/dev/null").expect("open /dev/null").into_raw_fd();
-    // The child's end is not open, so the first send fails with EBADF.
-    let slot = crate::containment::cgroup::ReportSlot {
-        fd: -1,
-        parent_fd: -1,
-        refusing: false,
-    };
-    let mut cmd = std::process::Command::new("/bin/true");
-    // Opened before the close, so they land above stdio.
-    cmd.stdin(std::fs::File::open("/dev/null").expect("open /dev/null"));
-    cmd.stdout(std::fs::File::open("/dev/null").expect("open /dev/null"));
-    cmd.stderr(std::fs::File::create(&stderr_file).expect("create the stderr file"));
-    // SAFETY: the closure runs between fork and exec; the hook performs only async-signal-safe calls.
-    unsafe { cmd.pre_exec(move || crate::containment::cgroup::placement_hook(procs_fd, slot)) };
-
-    let restore = RestoreStdio::close(&done, &[0, 2]);
-    let spawned = spawn(&mut cmd);
-    drop(restore);
-
-    let mut child = spawned.expect("std returns before the hook runs, with fds 0 and 2 closed");
-    let status = child.wait().expect("wait");
     assert_eq!(
-        std::os::unix::process::ExitStatusExt::into_raw(status),
-        crate::containment::cgroup::UNSENT_EXIT << 8,
-        "the child exits from its hook"
+        settled_status(&mut spawned),
+        (Progress::Failed(Failure::Step(failure)), Some(libc::EBADF as u16))
     );
-    assert_eq!(
-        std::fs::read(&stderr_file).expect("read the stderr file"),
-        b"",
-        "the child wrote into its stderr"
-    );
+    assert_eq!(exit_code_of(&spawned), PLACEMENT_STEP_EXIT, "the program never ran");
 }
 
-/// Through a real spawn: an undeliverable report aborts it rather than exec'ing a child the
-/// parent would misread as never placed.
+/// A placement that succeeds is reported `Placed` and the child goes on, in either slot.
+///
+/// Mutant: a placement is reported with the write's errno, or not at all.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn placement_hook_aborts_a_spawn_whose_report_cannot_be_sent() {
-    use std::os::unix::process::CommandExt;
+fn a_successful_placement_is_reported_and_the_child_goes_on() {
+    use crate::child::spawn::fork_exec::Progress;
+
+    for refusing in [false, true] {
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
+        // The child closes its own copy; this one closes when `sink` does, after the spawn.
+        let mut spawned = run_placement_step(std::os::fd::AsRawFd::as_raw_fd(&sink), refusing);
+        assert_eq!(
+            settled_status(&mut spawned),
+            (Progress::Ended { ready: true }, Some(0)),
+            "refusing: {refusing}"
+        );
+        assert_eq!(exit_code_of(&spawned), 0, "refusing: {refusing}");
+    }
+}
+
+/// Only a write of the whole `"0"` is a placement. A write that returns without writing it — 0, where
+/// no errno is set — is a failed placement, reported as `EIO`, never as `Placed`.
+///
+/// Mutant: a write that returned 0 is reported `Placed`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_write_that_wrote_nothing_is_reported_as_failed() {
+    use crate::child::spawn::fork_exec::Progress;
 
     let sink = std::fs::OpenOptions::new()
         .write(true)
         .open("/dev/null")
         .expect("open /dev/null");
-    let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
-    let slot = crate::containment::cgroup::ReportSlot {
-        fd: -1,
-        parent_fd: -1,
-        refusing: false,
-    };
-    let mut cmd = std::process::Command::new("/bin/true");
-    // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls.
-    unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
-    let result = crate::test_spawn::spawn(&mut cmd);
-    // SAFETY: the parent's own copy of the descriptor, closed exactly once.
-    unsafe { libc::close(procs_fd) };
-    assert!(result.is_err(), "the spawn must fail");
+    crate::containment::cgroup::fault::set_force_placement_write_result(
+        crate::containment::cgroup::fault::ForcedWrite::Returns0,
+    );
+    let mut spawned = run_placement_step(std::os::fd::AsRawFd::as_raw_fd(&sink), false);
+    assert_eq!(
+        settled_status(&mut spawned),
+        (Progress::Ended { ready: true }, Some(libc::EIO as u16))
+    );
+    assert_eq!(exit_code_of(&spawned), 0);
+}
+
+/// A child whose placement report cannot be written ends before its program, whatever the slot: a
+/// missing report is the parent's proof that the program never ran, so a report lost alone must not be
+/// followed by an `exec`. The report fails here (the channel's write end is closed) while the ready record
+/// the core writes next would succeed (a spare pipe is put on the channel's number once the step returns
+/// `Ok`), so the child's end is the step's alone.
+///
+/// The channel's write end is the second lowest free number, as `pipe2` makes it: probed in the parent and
+/// checked in the child.
+///
+/// Mutant: `placement_step` ignores a failed report (the program runs).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_placement_whose_report_cannot_be_written_ends_the_child() {
+    use crate::child::spawn::fork_exec::{spawn, Program, Progress};
+    use crate::os_process::linux::fork::{fork_with_pidfd, CloneKind};
+    use std::ffi::OsStr;
+    use std::os::fd::AsRawFd;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let spare = std::io::pipe().expect("spare pipe");
+    let spare_write = spare.1.as_raw_fd();
+    let procs = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .expect("open /dev/null");
+    let procs_fd = procs.as_raw_fd();
+    let marker = dir.path().join("ran");
+    let ran = Program::new(
+        &[OsStr::new("/bin/sh")],
+        &[
+            OsStr::new("sh"),
+            OsStr::new("-c"),
+            OsStr::new("echo > \"$1\""),
+            OsStr::new("sh"),
+            marker.as_os_str(),
+        ],
+        std::iter::empty(),
+    )
+    .expect("no NUL");
+    for refusing in [false, true] {
+        let _lock = crate::child::spawn::spawn_lock();
+        // The two lowest free numbers, which the core's `pipe2` takes next: the write end gets the second.
+        // SAFETY: `fcntl` of a descriptor number the process owns; the two probes are closed right away.
+        let channel_fd = unsafe {
+            let first = libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3);
+            let second = libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3);
+            libc::close(first);
+            libc::close(second);
+            second
+        };
+        // SAFETY: this thread holds `spawn_lock`; the step makes raw system calls only.
+        let mut spawned = unsafe {
+            spawn(
+                CloneKind::Plain,
+                fork_with_pidfd,
+                &ran,
+                &[],
+                &mut |reporter| {
+                    // A guess that is not the channel's write end ends the child with 99, not the step's code.
+                    if libc::fcntl(channel_fd, libc::F_GETPIPE_SZ) < 0
+                        || libc::fcntl(channel_fd, libc::F_GETFL) & libc::O_ACCMODE != libc::O_WRONLY
+                    {
+                        libc::_exit(99);
+                    }
+                    // The report's write fails: the channel's write end is closed.
+                    libc::close(channel_fd);
+                    let placed = crate::containment::cgroup::placement_step(procs_fd, refusing, reporter);
+                    // A step that went on gets a channel to write its ready record to, and the program runs.
+                    if placed.is_ok() {
+                        libc::dup2(spare_write, channel_fd);
+                    }
+                    placed.map_err(|_| crate::child::spawn::fork_exec::StepFailure { kind: 1, value: 0 })
+                },
+                PLACEMENT_STEP_EXIT,
+            )
+        }
+        .expect("the core made a child");
+        drop(_lock);
+        assert_eq!(exit_code_of(&spawned), PLACEMENT_STEP_EXIT, "refusing: {refusing}");
+        assert_eq!(
+            settled_status(&mut spawned),
+            (Progress::Ended { ready: false }, None),
+            "refusing: {refusing}"
+        );
+        assert!(!marker.exists(), "refusing: {refusing}: the program ran");
+    }
 }
 
 /// A leaf dropped before its verdict, with no report received and nothing in it, is removed: a
@@ -3479,9 +3280,9 @@ fn drop_removes_an_empty_leaf_whose_report_is_in_flight_without_a_kill() {
     assert!(!leaf_path.exists(), "the leaf must be removed");
 }
 
-/// A real leaf dropped before its verdict, occupied by a process that is not its child: the
-/// abandoned exchange received nothing, so nothing of the child's is there, and the occupant is
-/// not cosca's to kill. It survives — proven by an echo — and the leaf is reported, not killed.
+/// A real leaf dropped before its verdict, occupied by a process that is not its child: the spawn
+/// recorded no report on it, so nothing of the child's is there, and the occupant is not cosca's to
+/// kill. It survives — proven by an echo — and the leaf is reported, not killed.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_drop_of_an_abandoned_spawn_spares_an_occupant_that_is_not_its_child(#[fixture(cgroup)] _group: &Group) {
@@ -3491,14 +3292,13 @@ fn cgroup_drop_of_an_abandoned_spawn_spares_an_occupant_that_is_not_its_child(#[
         crate::containment::cgroup::try_create_leaf(&crate::identity::spawn_kernel(crate::identity::HostKernel), None)
             .expect("a delegated cgroup v2 leaf");
     let leaf_path = leaf.leaf_path.clone();
-    // The occupant reports through a channel of its own, so the leaf's receives nothing.
-    let own = crate::containment::cgroup::ReportChannel::new().expect("open the occupant's channel");
-    let (procs_fd, slot) = (leaf.procs_fd(), own.slot());
+    // The occupant enters the leaf by itself, and no report is recorded on the leaf for it.
+    let procs_fd = leaf.procs_fd();
     let mut occupant = blocker_with(|cmd| {
         cmd.stdout(std::process::Stdio::piped());
         // SAFETY: the closure runs between fork and exec, and performs only async-signal-safe calls
-        // on descriptors `leaf` and `own` keep open across the spawn.
-        unsafe { cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot)) };
+        // on a descriptor `leaf` keeps open across the spawn.
+        unsafe { cmd.pre_exec(move || crate::containment::cgroup::test_support::place_in_pre_exec(procs_fd)) };
     });
 
     drop(leaf);
@@ -3582,87 +3382,28 @@ fn an_abandoned_spawns_failed_leaf_kill_is_warned_when_the_removal_succeeds() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
     // The report says `Placed`, as a child that entered the leaf sends; no child is given.
-    let sink = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/null")
-        .expect("open /dev/null");
-    let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
-    // SAFETY: `procs_fd` is open and closed by the hook; the channel is open.
-    unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, leaf.placement_slot()) }
-        .expect("report a placement");
+    leaf.record_placement(PlacementReport::Placed);
     let _first_write_fails = crate::containment::cgroup::fault::fail_next_kill_write();
 
     let mark = crate::log_capture::mark();
-    assert_eq!(
-        leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn),
-        WithoutChild::Named
-    );
+    leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn);
 
     assert!(!leaf_path.exists(), "the leaf is removed");
     let warns = crate::log_capture::records_since_on_current_thread(mark, "cgroup.kill failed");
     assert_eq!(warns.len(), 1, "the failed kill is warned once: {warns:?}");
 }
 
-/// An intent names its child by a number alone, which `std` may have freed by reaping it. Given no
-/// pidfd for it, the abandonment answers for no child and sends nothing, even when the number
-/// names a live child of this process: that child is not this spawn's.
+/// A spawn abandoned with no report recorded cannot tell whether its child forked, but a child with
+/// no report never exec'd, so nothing of it is in the leaf: the empty leaf is removed.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn an_abandoned_intent_given_no_pidfd_is_never_signalled() {
-    use std::io::{Read, Write};
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-abandoned-no-handle");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    let mut other = blocker_with(|cmd| {
-        cmd.stdout(std::process::Stdio::piped());
-    });
-    // SAFETY: the leaf's channel is open; the intent claims `other`'s pid.
-    unsafe {
-        leaf.placement_slot()
-            .send(crate::containment::cgroup::TAG_INTENT, other.id() as i32)
-            .expect("send a forged intent");
-    }
-
-    assert_eq!(
-        leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn),
-        WithoutChild::Named,
-        "the intent named a pid"
-    );
-
-    let mut echo = [0u8; 1];
-    other
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(b"x")
-        .expect("write to the other child");
-    other
-        .stdout
-        .as_mut()
-        .expect("stdout")
-        .read_exact(&mut echo)
-        .expect("the other child must be alive to echo");
-    other.kill().expect("kill the other child");
-    other.wait().expect("reap the other child");
-}
-
-/// A spawn abandoned before its child sent anything cannot tell whether it forked: a child that
-/// exists exits at its first send, but nothing holds its pid to reap it. That is not `Ended`.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn an_abandoned_spawn_whose_child_sent_nothing_may_leave_it_unreaped() {
+fn an_abandoned_spawn_with_no_report_removes_its_leaf() {
     let dir = tempfile::tempdir().expect("tempdir");
     let leaf_path = dir.path().join("cosca-abandoned-silent");
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path.clone());
 
-    assert_eq!(
-        leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn),
-        WithoutChild::Unnamed,
-        "nothing named a pid"
-    );
+    leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn);
     assert!(!leaf_path.exists(), "the empty leaf is removed");
 }
 
@@ -3679,37 +3420,47 @@ fn an_abandonment_without_a_child_repeated_is_a_breach() {
     std::fs::create_dir(&leaf_path).expect("create the leaf");
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
 
-    assert_eq!(
-        leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn),
-        WithoutChild::Unnamed
-    );
-    assert_eq!(
-        leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn),
-        WithoutChild::AlreadyAbandoned
-    );
+    leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn);
+    leaf.abandon_without_child(&mut crate::containment::cgroup::NoWarn);
 }
 
-/// Only a write of the whole `"0"` is a placement. A write that returns without writing it — 0,
-/// where no errno is set — is a failed placement, reported as `EIO`, never as `Placed`.
+/// The first report the spawn records stands: a later one does not replace it.
+///
+/// Mutant: a later report replaces the first.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn placement_hook_reports_a_write_that_wrote_nothing_as_failed() {
-    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
-    let sink = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/null")
-        .expect("open /dev/null");
-    let procs_fd = std::os::fd::IntoRawFd::into_raw_fd(sink);
-    crate::containment::cgroup::fault::set_force_placement_write_result(
-        crate::containment::cgroup::fault::ForcedWrite::Returns0,
-    );
-    // SAFETY: `procs_fd` is open and closed by the hook; the channel is open.
-    let result = unsafe { crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, channel.slot()) };
-    assert!(
-        result.is_ok(),
-        "a failed placement must not abort the spawn: {result:?}"
-    );
-    assert_eq!(channel.report_for_test(), PlacementReport::WriteFailed(libc::EIO));
+fn the_first_recorded_placement_report_stands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-first-report");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    std::fs::write(leaf_path.join("cgroup.procs"), "").expect("write cgroup.procs");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    leaf.record_placement(PlacementReport::WriteFailed(libc::EBUSY));
+    leaf.record_placement(PlacementReport::Placed);
+    match leaf.take_placement(handle_of(std::process::id(), &pidfd_of(std::process::id()))) {
+        Err(NotPlaced::Absent { report, .. }) => assert_eq!(report, NotEntered::WriteFailed(libc::EBUSY)),
+        other => panic!("the first report was a failed write: {other:?}"),
+    }
+}
+
+/// A report recorded after the verdict was taken is a breach: debug builds assert, release builds
+/// ignore it, and the verdict stands.
+///
+/// Mutant: a late report is taken without the assertion (debug), or panics (release, which this test
+/// shows only when built so).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+#[cfg_attr(debug_assertions, should_panic(expected = "after its verdict was taken"))]
+fn a_report_recorded_after_the_verdict_is_ignored() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leaf_path = dir.path().join("cosca-late-report");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
+    leaf.record_placement(PlacementReport::Placed);
+    leaf.take_placement(handle_of(std::process::id(), &pidfd_of(std::process::id())))
+        .expect("a placed child");
+    leaf.record_placement(PlacementReport::WriteFailed(libc::EBUSY));
+    assert!(leaf.child_entered(), "the taken verdict stands");
 }
 
 /// `rmdir` refuses a leaf that holds a child cgroup with the same `EBUSY` it gives a populated
@@ -3726,7 +3477,7 @@ fn placement_hook_reports_a_write_that_wrote_nothing_as_failed() {
 fn cgroup_drop_removes_a_leaf_holding_child_cgroups(#[fixture(cgroup)] _group: &Group) {
     // Placed: killed through, drained, swept. Nothing received: swept without a kill.
     for placed in [true, false] {
-        let leaf = crate::containment::cgroup::try_create_leaf(
+        let mut leaf = crate::containment::cgroup::try_create_leaf(
             &crate::identity::spawn_kernel(crate::identity::HostKernel),
             None,
         )
@@ -3734,8 +3485,7 @@ fn cgroup_drop_removes_a_leaf_holding_child_cgroups(#[fixture(cgroup)] _group: &
         let leaf_path = leaf.leaf_path.clone();
         std::fs::create_dir_all(leaf_path.join("nested").join("deeper")).expect("create child cgroups");
         if placed {
-            // SAFETY: the slot's channel lives as long as `leaf`.
-            unsafe { leaf.placement_slot().report_placed_for_test() };
+            leaf.record_placement(PlacementReport::Placed);
         }
         let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
         let observer = crate::containment::cgroup::fault::observe_rmdirs({
@@ -4067,22 +3817,16 @@ fn real_leaf_with_members(
             .expect("create a real leaf");
     let members = (0..n)
         .map(|_| {
-            // Each member reports through its own channel: the leaf's carries one report.
-            let mut channel = crate::containment::cgroup::ReportChannel::new().expect("open a report channel");
             let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
-            let (procs_fd, slot) = (leaf.procs_fd(), channel.slot());
+            let procs_fd = leaf.procs_fd();
             // SAFETY: as `entered_real_leaf_of`'s member spawn: the closure runs between fork and
             // exec, and `leaf` outlives the spawn.
             unsafe {
-                cmd.pre_exec(move || crate::containment::cgroup::place_self_in_cgroup_pre_exec(procs_fd, slot));
+                cmd.pre_exec(move || crate::containment::cgroup::test_support::place_in_pre_exec(procs_fd));
             }
-            let mut member = crate::test_spawn::spawn(&mut cmd).expect("spawn a member");
+            // std's spawn returns after the `exec`: a member whose placement write failed is no member.
+            let mut member = crate::test_spawn::spawn(&mut cmd).expect("spawn a member that entered the leaf");
             let stdin = member.stdin.take().expect("piped stdin");
-            assert_eq!(
-                channel.wait(pidfd_of(member.id()).as_fd()),
-                PlacementReport::Placed,
-                "the member entered the leaf"
-            );
             (member, stdin)
         })
         .collect();

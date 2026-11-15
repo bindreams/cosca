@@ -209,8 +209,10 @@ pub enum ContainMode {
     ///   opened, or an own cgroup its mount does not show) gets a process group, with no error; so
     ///   does a host whose new leaf has no `cgroup.kill` (a kernel before Linux 5.14), and the
     ///   leaf is removed. Every other failure fails the spawn: a limit such as `cgroup.max.depth`,
-    ///   the report channel, the inotify watch, and the child's own placement write, whose failure
-    ///   stops the child before `exec`.
+    ///   the inotify watch, and the child's own placement write, whose failure stops the child
+    ///   before `exec`. A child whose placement the spawn cannot learn (its status channel cannot
+    ///   be read) is not trusted to be in its leaf: the spawn fails as [`Error::MayHaveStarted`],
+    ///   with the child torn down and the leaf killed through.
     /// - **macOS:** the inherited-fd marker, always offered. A failure to install it fails the
     ///   spawn. An explicit [`Session`](ContainMode::Session) or [`TreeWalk`](ContainMode::TreeWalk)
     ///   installs the marker too, and degrades when it fails.
@@ -231,11 +233,12 @@ pub enum ContainMode {
     /// [`Child::containment`](crate::Child::containment) reports what the spawn got.
     ///
     /// - **Linux:** a failed step of setting up the leaf (no cgroup offered, no `cgroup.kill`, the
-    ///   leaf's directory, `cgroup.procs`, report channel or inotify watch), or a child whose
-    ///   placement write failed, degrades to the process group the spawn set up. A child that sends
-    ///   no report of its placement never ran its program (its hook ends it before `exec`), so
-    ///   that spawn fails with [`Error::Containment`], as under `Strongest`, instead of handing
-    ///   back a child that never ran.
+    ///   leaf's directory, `cgroup.procs` or inotify watch), or a child whose placement write
+    ///   failed, degrades to the process group the spawn set up. A child that ends before it
+    ///   reports its placement never ran its program, so that spawn fails as one that did not
+    ///   start, as under `Strongest`, instead of handing back a child that never ran. A child
+    ///   whose placement the spawn cannot learn does not degrade either: it fails as under
+    ///   `Strongest`.
     /// - **macOS:** a failed install of the fd marker degrades to the process group.
     /// - **Windows:** a child that cannot be assigned to its Job Object is resumed anyway and
     ///   contained by [`ContainMode::TreeWalk`].

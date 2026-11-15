@@ -57,8 +57,7 @@ fn drain_warns_at_release(fake: &FakeLeaf, end: impl FnOnce()) -> (Option<usize>
 fn a_dropped_leafs_slow_drain_warns_once() {
     let fake = FakeLeaf::new("cosca-dropped-slow-drain", true);
     let mut leaf = CgroupLeaf::for_test_warning_after(fake.leaf.clone(), Some(Duration::ZERO));
-    // SAFETY: the slot's channel lives as long as `leaf`.
-    unsafe { leaf.placement_slot().report_placed_for_test() };
+    leaf.record_placement(crate::containment::cgroup::PlacementReport::Placed);
     // The verdict needs a live pid: this process's own stands in for the child.
     leaf.take_placement(handle_of(std::process::id(), &pidfd_of(std::process::id())))
         .expect("the child reported Placed");

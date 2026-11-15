@@ -102,10 +102,11 @@ In order:
      hands back does when dropped). On
      Linux the teardown also ends every spawn failure (`fork_spawn`'s `conclude`, and the
      identity and attach arms, `held_teardown.rs`), while a cgroup leaf a failed spawn drops
-     ends its own exchange with the child (`CgroupLeaf::abandon_without_child`: killed through if
-     the child entered it, then removed, the child sent nothing). On macOS the identity and
-     attach arms tear down through `held_teardown` as Linux's do (a refused kill, or a front
-     still running, comes back as an `Unreaped`). On Windows `held_teardown::tear_down_failed_spawn`
+     takes its verdict without a child (`CgroupLeaf::abandon_without_child`: killed through if
+     the child's recorded report says it entered, then removed). The report is a record the child
+     wrote on the spawn core's status channel, which `fork_spawn` reads and records on the leaf. On
+     macOS the identity and attach arms tear down through `held_teardown` as Linux's do (a refused
+     kill, or a front still running, comes back as an `Unreaped`). On Windows `held_teardown::tear_down_failed_spawn`
      ends every failure of the std and raw spawns; a refused kill comes back in the spawn's
      failure as an `Unreaped`, and so does a UAC child whose pid or identity cannot be read (ended
      by the same teardown and waited for). An identity read the OS refuses fails no spawn: the
@@ -193,9 +194,9 @@ In order:
 5. **Spawn:** produces an `OsChild`, its pipes, its containment and its elevation, for both halves.
    On Linux the one fork that execs is `child::spawn::fork_exec` ([#383](https://github.com/bindreams/cosca/issues/383)
    S2): a clone kind (vfork without `CLONE_VM`, or plain), the env block built in the parent, the
-   caller's async-signal-safe steps, and a status channel of errno and ready records read without
-   blocking. The elevation shim uses it, and so does the ordinary spawn (`child::spawn::fork_spawn`,
-   the vfork kind): its outcome is the core's records alone. Every unix spawn finds its program in the
+   caller's async-signal-safe steps, and a status channel of errno, ready and report records read
+   without blocking. The elevation shim uses it, and so does the ordinary spawn
+   (`child::spawn::fork_spawn`, the vfork kind): its outcome is the core's records alone. Every unix spawn finds its program in the
    parent, by the one search `resolve::posix::lookup` (the POSIX grammar of `crate::resolve`: the
    child's `PATH` only, the first file that exists, an entry that cannot be examined ends the search);
    the Linux child only `execve`s the path it is given (and the `PATH` entries after it that are

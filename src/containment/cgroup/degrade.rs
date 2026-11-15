@@ -69,11 +69,6 @@ pub(crate) enum LeafError {
         #[source]
         source: io::Error,
     },
-    /// The channel the child reports its self-placement outcome through could not be opened, or
-    /// its ends moved to fd 3 or above. Without it the child's own report would be
-    /// unobservable, so the leaf is not created half-instrumented.
-    #[error("could not open the placement-report channel shared with the forked child")]
-    OpenReportChannel(#[source] io::Error),
     /// The watch the leaf's removal waits on could not be armed: an inotify instance or watch
     /// (`fs.inotify.max_user_instances`, `fs.inotify.max_user_watches`), or `cgroup.events`
     /// itself. It is armed at creation so that no later teardown can find itself without one.
@@ -98,7 +93,6 @@ impl LeafError {
         let detail = format!("cgroup v2: {self}");
         let source = match self {
             LeafError::ReadProcSelfCgroup(source)
-            | LeafError::OpenReportChannel(source)
             | LeafError::OpenOwnCgroup { source, .. }
             | LeafError::CreateLeafDir { source, .. }
             | LeafError::CheckKill { source, .. }
@@ -110,16 +104,15 @@ impl LeafError {
     }
 }
 
-/// What the child's own `pre_exec` self-placement write reported back to the parent.
+/// What the child's own self-placement write reported back to the parent.
 ///
-/// This is the one step whose reason lives entirely in the forked child: it runs after
-/// `fork`, in a copy-on-write address space, under async-signal-safety rules that forbid
-/// allocating or formatting anything. The child therefore reports a single word through a
-/// socket pair (see [`ReportChannel`]), which this enum names.
+/// This is the one step whose reason lives entirely in the forked child: it runs after the clone,
+/// in a copy-on-write address space, under async-signal-safety rules that forbid allocating or
+/// formatting anything. The child therefore reports a single word, a report record on the spawn
+/// core's status channel (see `child::spawn::fork_exec`), which this enum names.
 ///
-/// The channel belongs to the LEAF, not to a child. Production creates one leaf per spawn, so the
-/// distinction is invisible there; several children sharing one leaf would share one channel, and
-/// the first report written would stand for all of them (see [`ReportChannel`]).
+/// The report belongs to the LEAF, not to a child: the spawn records what it read on the leaf of
+/// the spawn ([`CgroupLeaf::record_placement`]). Production creates one leaf per spawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -129,33 +122,57 @@ impl LeafError {
     )
 )]
 pub(crate) enum PlacementReport {
-    /// The child exited before reporting its placement outcome: its `pre_exec` may not have run,
-    /// or may have been interrupted between the write and the send. It never exec'd either way.
+    /// The child's report is not in its status channel: it ended before its placement step wrote it,
+    /// or the spawn has recorded none.
     NotReported,
     /// The child's `write` to `cgroup.procs` succeeded — at that instant it WAS a member.
     Placed,
     /// The child's `write` to `cgroup.procs` failed with this errno.
     WriteFailed(i32),
+    /// The spawn could not read the child's status channel (this errno), so what the child reported, and
+    /// whether it exec'd, is not known: it may be in the leaf, in its process group, or neither.
+    Unknown(i32),
+}
+
+impl PlacementReport {
+    /// The report a child's report record `value` says: 0 is a placement, any other value the write's
+    /// errno.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "read only by the linux-gated spawn")
+    )]
+    pub(crate) fn of_record(value: u16) -> PlacementReport {
+        match value {
+            0 => PlacementReport::Placed,
+            errno => PlacementReport::WriteFailed(i32::from(errno)),
+        }
+    }
 }
 
 impl fmt::Display for PlacementReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PlacementReport::NotReported => f.write_str(
-                "the child exited before reporting its placement outcome (its pre_exec may not \
+                "the child exited before reporting its placement outcome (its placement step may not \
                      have run, or may have been interrupted)",
             ),
-            PlacementReport::Placed => f.write_str("the child's pre_exec self-placement write succeeded"),
+            PlacementReport::Placed => f.write_str("the child's self-placement write succeeded"),
             PlacementReport::WriteFailed(errno) => write!(
                 f,
-                "the child's pre_exec write to cgroup.procs failed: {} (errno {errno})",
+                "the child's write to cgroup.procs failed: {} (errno {errno})",
+                io::Error::from_raw_os_error(*errno)
+            ),
+            PlacementReport::Unknown(errno) => write!(
+                f,
+                "the spawn could not read the child's status channel, so it is not known whether the child \
+                 entered its leaf: {} (errno {errno})",
                 io::Error::from_raw_os_error(*errno)
             ),
         }
     }
 }
 
-/// What a child with nothing in its leaf reported: never a successful write.
+/// What a child that is not proven to be in its leaf reported: never a successful write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -169,6 +186,8 @@ pub(crate) enum NotEntered {
     NotReported,
     /// Its `write` to `cgroup.procs` failed with this errno.
     WriteFailed(i32),
+    /// The spawn could not read what it reported (see [`PlacementReport::Unknown`]): it may be in the leaf.
+    Unknown(i32),
 }
 
 impl fmt::Display for NotEntered {
@@ -176,6 +195,7 @@ impl fmt::Display for NotEntered {
         match *self {
             NotEntered::NotReported => PlacementReport::NotReported.fmt(f),
             NotEntered::WriteFailed(errno) => PlacementReport::WriteFailed(errno).fmt(f),
+            NotEntered::Unknown(errno) => PlacementReport::Unknown(errno).fmt(f),
         }
     }
 }

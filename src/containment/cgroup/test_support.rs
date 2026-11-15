@@ -302,31 +302,20 @@ pub(crate) fn block_on(gate: std::os::fd::RawFd) {
     debug_assert_eq!(n, 1, "read");
 }
 
-/// A copy of `channel`'s child end, standing in for the one a forked child inherits: the parent's
-/// own copy closes when the exchange ends, as it does in a real spawn.
+/// A `pre_exec` closure's placement of a std child into the leaf whose `cgroup.procs` is `procs_fd`:
+/// std's `spawn` returns only after the `exec`, so a spawn that returned placed its child, and one whose
+/// write failed fails with the write's errno. Pair it with `CgroupLeaf::record_placement` for the
+/// leaf's verdict.
+///
+/// # Safety
+/// As [`place_self_in_cgroup`](crate::containment::cgroup::place_self_in_cgroup), in a `pre_exec` closure.
 #[cfg(target_os = "linux")]
-pub(crate) fn childs_copy(
-    channel: &crate::containment::cgroup::ReportChannel,
-) -> (std::os::fd::OwnedFd, crate::containment::cgroup::ReportSlot) {
-    use std::os::fd::{AsRawFd, BorrowedFd};
-
-    // SAFETY: the slot's descriptor is open for as long as `channel` lives, which spans this call.
-    let end = unsafe { BorrowedFd::borrow_raw(channel.slot().fd) }
-        .try_clone_to_owned()
-        .expect("dup the child's end");
-    let slot = crate::containment::cgroup::ReportSlot {
-        fd: end.as_raw_fd(),
-        parent_fd: -1,
-        refusing: false,
-    };
-    (end, slot)
-}
-
-/// `slot` with a child's end that is not open, so the child's every send fails with `EBADF`: a
-/// report that cannot be sent.
-#[cfg(target_os = "linux")]
-pub(crate) fn unsendable(slot: crate::containment::cgroup::ReportSlot) -> crate::containment::cgroup::ReportSlot {
-    crate::containment::cgroup::ReportSlot { fd: -1, ..slot }
+pub(crate) unsafe fn place_in_pre_exec(procs_fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: the caller's contract.
+    match unsafe { crate::containment::cgroup::place_self_in_cgroup(procs_fd) } {
+        0 => Ok(()),
+        errno => Err(std::io::Error::from_raw_os_error(i32::from(errno))),
+    }
 }
 
 /// Run the test `name` (its full path) alone, in a copy of this test binary, and assert it passed.
@@ -388,8 +377,7 @@ pub(crate) fn handle_of(pid: u32, pidfd: &std::os::fd::OwnedFd) -> crate::contai
 #[cfg(target_os = "linux")]
 pub(crate) fn entered_leaf_at(leaf_path: std::path::PathBuf) -> crate::containment::cgroup::CgroupLeaf {
     let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
-    // SAFETY: the slot's channel lives as long as `leaf`.
-    unsafe { leaf.placement_slot().report_placed_for_test() };
+    leaf.record_placement(crate::containment::cgroup::PlacementReport::Placed);
     // The verdict needs a live pid: this process's own stands in for the child.
     leaf.take_placement(handle_of(std::process::id(), &pidfd_of(std::process::id())))
         .expect("the child reported Placed");

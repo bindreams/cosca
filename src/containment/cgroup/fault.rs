@@ -9,12 +9,8 @@ thread_local! {
     static AFTER_PROCS_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static AFTER_TERMINATE_PIN: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static MEMBER_TERMS: std::cell::RefCell<Vec<MemberTerm>> = const { std::cell::RefCell::new(Vec::new()) };
-    static AFTER_SHUT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
-    static ON_WAIT: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
     static BEFORE_STATE_READ: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-    static WAITED_PIDFD: Cell<Option<std::os::fd::RawFd>> = const { Cell::new(None) };
     static FORCE_KILL_SUPPORTED: Cell<bool> = const { Cell::new(false) };
-    static FORCE_REPORT_CHANNEL_FAILURE: Cell<bool> = const { Cell::new(false) };
     static FORCE_PLACEMENT_WRITE_RESULT: Cell<Option<ForcedWrite>> = const { Cell::new(None) };
     static FORCE_OCCUPY_BEFORE_UNWIND: Cell<bool> = const { Cell::new(false) };
     static DRAIN_ZERO_REMAINING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -498,19 +494,6 @@ pub(crate) fn kill_supported_armed() -> bool {
     FORCE_KILL_SUPPORTED.with(|f| f.get())
 }
 
-/// Fail the NEXT `ReportChannel::new` with `EMFILE` — the real exhaustion this channel can hit,
-/// which no test may provoke for real: the fd limit is process-wide, and would fail every
-/// other test running in this binary.
-pub(crate) fn set_force_report_channel_failure(on: bool) {
-    FORCE_REPORT_CHANNEL_FAILURE.with(|f| f.set(on));
-}
-pub(crate) fn take_force_report_channel_failure() -> bool {
-    FORCE_REPORT_CHANNEL_FAILURE.with(|f| f.replace(false))
-}
-pub(crate) fn report_channel_failure_armed() -> bool {
-    FORCE_REPORT_CHANNEL_FAILURE.with(|f| f.get())
-}
-
 /// Make the NEXT lookup of the own cgroup on this thread read `file` as `/proc/self/cgroup`, with
 /// the cgroup filesystem at `root`: the host fact a real spawn cannot be given (an own cgroup this
 /// process is refused, or that the mount does not show).
@@ -550,32 +533,6 @@ pub(crate) fn take_force_occupy_before_unwind() -> bool {
 }
 pub(crate) fn occupy_before_unwind_armed() -> bool {
     FORCE_OCCUPY_BEFORE_UNWIND.with(|f| f.get())
-}
-
-/// Run `hook` at the start of the NEXT report wait on this thread, before it reads anything. The
-/// hook reads which pidfd that wait is given with [`waited_pidfd`], so a test can fail by assertion
-/// where a wrong one would block the wait forever.
-pub(crate) fn set_on_wait(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
-    crate::oneshot_hook::arm(&ON_WAIT, hook)
-}
-pub(crate) fn notify_wait_entry(pidfd: std::os::fd::RawFd) {
-    WAITED_PIDFD.with(|p| p.set(Some(pidfd)));
-    crate::oneshot_hook::fire(&ON_WAIT);
-}
-/// The pidfd the report wait was given, as a raw fd number.
-pub(crate) fn waited_pidfd() -> Option<std::os::fd::RawFd> {
-    WAITED_PIDFD.with(|p| p.get())
-}
-
-/// Run `hook` in the NEXT abandonment on this thread, after it has read what the child sent and
-/// before it closes the channel — the window a send must not slip through unread.
-pub(crate) fn set_after_shut_read(hook: impl FnOnce() + 'static) {
-    AFTER_SHUT_READ.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-}
-pub(crate) fn run_after_shut_read() {
-    if let Some(hook) = AFTER_SHUT_READ.with(|h| h.borrow_mut().take()) {
-        hook();
-    }
 }
 
 /// RAII: dropping this clears the hook [`set_after_fork_still_locked`] armed, even if

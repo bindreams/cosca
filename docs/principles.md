@@ -62,10 +62,11 @@ Each runs through [`wait_warning`](../src/wait/teardown_warn.rs), as the armed d
 drain do on Unix: it takes the wait as an argument and warns before it if what it waits for has not
 ended within the threshold.
 
-What the spawn waits for on the pool is bounded by the child's own progress: cosca's placement
-report ([`ReportChannel::wait`](../src/containment/cgroup/channel.rs)) and the wait for `exec`
-complete before `exec`, so a child stopped or stuck in D state between `fork` and `exec` holds the
-pool thread. The wait for macOS's unique-id report
+What the spawn waits for on the pool is bounded by the child's own progress: the clone itself (the
+kernel holds the parent until the child's `exec` or exit) completes at `exec`, so a child stopped or
+stuck in D state between the clone and `exec` holds the pool thread. Cosca's placement report is a
+record on the status channel the spawn reads when the clone returns: it waits for nothing. The wait
+for macOS's unique-id report
 ([`unique_report::await_report`](../src/child/spawn/unique_report.rs)) is bounded the same way, with
 accepted residuals: if something else reaps the child and another child of this process takes its
 pid before the wait registers its watch, the wait lasts as long as that process; and a tracer

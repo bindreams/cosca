@@ -106,7 +106,7 @@ fn offered_from(found: Result<OwnCgroup, LeafError>) -> Result<Option<OwnCgroup>
 ///    never shows it.
 ///
 /// Every other failure is an error: `EAGAIN` (`cgroup.max.depth`, `cgroup.max.descendants`),
-/// `ENODEV`, `ENOMEM`, `EMFILE`, a `cgroup.kill` lookup that fails otherwise, the report channel,
+/// `ENODEV`, `ENOMEM`, `EMFILE`, a `cgroup.kill` lookup that fails otherwise,
 /// the drain watch, `getrandom`, and the child's own placement. A refusal is the host stating what
 /// it lets this process do, as for `cgroup.kill`; it is no hidden failure. A policy's `EPERM`
 /// (seccomp) or a `/sys/fs/cgroup` that is not cgroup2 reads the same, since `mkdir` there answers

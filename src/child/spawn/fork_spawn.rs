@@ -7,18 +7,18 @@
 //!
 //! - an errno record: a step or the `execve` failed, the program did not start, and the errno is the
 //!   spawn's error;
-//! - no ready record: the child ended before it got to the `execve`; the program did not start, and the
-//!   child is torn down through its box ([`Past::Unexecuted`]). A child placed in a cgroup leaf that
-//!   left with the exit status of the placement hook says its placement step is where it ended; any other
-//!   end is not blamed on the placement, even when the child reported its placement write failed (a slot
-//!   that does not refuse a failed write goes on to its exec). The one exception is a refused placement (a
-//!   refusing slot whose child reported its write failed, and exited): the child is handed to the attach,
-//!   which reads the report, says why and tears it down;
+//! - no ready record: the child ended before its `execve`; the program did not start, and the child is
+//!   torn down through its box ([`Past::Unexecuted`]). Exception: a refused placement, which goes to the
+//!   attach (see `OnFailure::refusing_placement`);
 //! - a ready record and no errno: the program started, or was killed between the ready record and the
 //!   `execve`. `Ok` means the spawn could not prove the program did not start, and the child's wait
 //!   reports the signal.
 //!
-//! The clone's pidfd is the first thing the spawn moves above the stdio slots, before the channel is read.
+//! The channel also carries the child's placement report when it has a cgroup leaf: the spawn records it
+//! on the leaf, whatever becomes of the child, and the leaf's verdict reads it without waiting. A channel
+//! the spawn cannot read leaves the placement unknown
+//! ([`PlacementReport::Unknown`]): the child may be in the leaf, in its process group, or neither, so the
+//! attach fails the spawn and tears the child down, and the leaf is killed through.
 //!
 //! The child's steps are [`InChild`]'s (stdio, directory, process group, then cosca's own). Neither side
 //! waits for the other: no step may wait on the parent.
@@ -29,17 +29,17 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 use super::fork_exec::{self, Failure, Program, Progress, SpawnError, Spawned, Status, StepFailure};
-use super::in_child::InChild;
+use super::in_child::{InChild, Step, StepError};
 use super::policy::SpawnPolicy;
 use super::{held_teardown, Diagnosis, Invocation, SpawnFailure, SpawnLockGuard};
 use crate::child::drop_teardown::Torn;
 use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
-use crate::containment::cgroup::{PlacementReport, ReportChannel, ABANDONED_EXIT, REFUSED_EXIT, UNSENT_EXIT};
+use crate::containment::cgroup::{CgroupLeaf, PlacementReport};
 use crate::elevation::front::Front;
 use crate::error::Error;
 use crate::identity::SpawnKernel;
@@ -47,6 +47,9 @@ use crate::os_process::linux::fork::{fork_with_pidfd, CloneKind, ForkFn, NewChil
 
 /// The kind of step failure the child reports: an in-child step failed, with this errno.
 const KIND_STEP: u8 = 1;
+
+/// The kind of step failure of the placement step: the child's cgroup placement failed, with this errno.
+const KIND_PLACEMENT: u8 = 2;
 
 /// The exit status of a child whose step failed: not the 127 of a failed `execve`.
 const STEP_EXIT: i32 = 126;
@@ -63,13 +66,12 @@ pub(super) struct OnFailure<'a> {
     pub(super) policy: SpawnPolicy,
     /// The elevation front the child is, if it is one: a teardown sends it nothing.
     pub(super) front: Option<Front>,
-    /// The placement channel of the cgroup leaf the child is placed in, if it has one: a refused
-    /// placement it reports hands a child that ended before its ready record to the attach, and the
-    /// child's exit status is read as the placement hook's only when the child has one.
-    pub(super) placement: Option<&'a mut ReportChannel>,
+    /// The cgroup leaf the child is placed in, if it has one: the child's placement report is recorded
+    /// on it, whatever becomes of the child.
+    pub(super) placement: Option<&'a mut CgroupLeaf>,
     /// Whether the child must not run without its placement (its slot refuses a failed write). A child
-    /// of such a spawn that ended before its ready record, having reported its placement refused, is
-    /// handed over as it is: the attach reads the report and ends it.
+    /// of such a spawn that reported its placement refused is handed over as it is, ended: the attach
+    /// reads the report.
     pub(super) refusing_placement: bool,
 }
 
@@ -125,7 +127,7 @@ pub(super) fn start_via(
             fork,
             program,
             &keep_off,
-            &mut || steps.run().map_err(step_failure),
+            &mut |reporter| steps.run(reporter).map_err(step_failure),
             STEP_EXIT,
         )
     };
@@ -135,11 +137,15 @@ pub(super) fn start_via(
     }
 }
 
-fn step_failure(error: io::Error) -> StepFailure {
+/// The failure record of a failed step: the placement step's own kind, or the other steps'.
+fn step_failure(failed: StepError) -> StepFailure {
     StepFailure {
-        kind: KIND_STEP,
+        kind: match failed.step {
+            Step::Placement => KIND_PLACEMENT,
+            _ => KIND_STEP,
+        },
         // An error with no errno is an `EINVAL`.
-        value: error.raw_os_error().unwrap_or(libc::EINVAL) as u16,
+        value: failed.error.raw_os_error().unwrap_or(libc::EINVAL) as u16,
     }
 }
 
@@ -177,11 +183,24 @@ fn kernel_release() -> String {
     }
 }
 
-/// The error of a child that ended before the program started, from its record.
-fn failed(failure: Failure) -> Error {
+/// The error of the child `pid`, which ended before the program started, from its record: a failure of the
+/// placement step is [`Error::Containment`]; any other is the errno.
+fn failed(pid: u32, failure: Failure) -> Error {
     let errno = match failure {
         Failure::Exec(errno) => errno,
         Failure::Step(StepFailure { kind: KIND_STEP, value }) => i32::from(value),
+        Failure::Step(StepFailure {
+            kind: KIND_PLACEMENT,
+            value,
+        }) => {
+            return Error::Containment {
+                detail: format!(
+                    "the spawned child ({}) died before exec in its cgroup placement step: the program never ran",
+                    super::named(Some(pid))
+                ),
+                source: Some(Error::io_cause(io::Error::from_raw_os_error(i32::from(value)))),
+            };
+        }
         Failure::Step(other) => {
             debug_assert!(
                 false,
@@ -194,52 +213,44 @@ fn failed(failure: Failure) -> Error {
     Error::Io(io::Error::from_raw_os_error(errno))
 }
 
-/// The error of a child that ended with no ready record and no record of a failure. `in_hook`: it left
-/// with the exit status of the placement hook, which is the placement step's own end; any other end is
-/// not blamed on the placement, whatever the hook reported (a slot that does not refuse a failed write
-/// goes on to its exec).
-fn died_before_exec(pid: u32, in_hook: bool) -> Error {
-    let named = super::named(Some(pid));
-    if in_hook {
-        Error::Containment {
-            detail: format!(
-                "the spawned child ({named}) died before exec in its cgroup placement step: the program never ran"
-            ),
-            source: None,
-        }
-    } else {
-        Error::Io(io::Error::other(format!(
-            "the spawned child ({named}) died before exec: the program never ran"
-        )))
-    }
+/// The error of a child that ended with no ready record and no record of a failure.
+fn died_before_exec(pid: u32) -> Error {
+    Error::Io(io::Error::other(format!(
+        "the spawned child ({}) died before exec: the program never ran",
+        super::named(Some(pid))
+    )))
 }
 
-/// The exit code of the child `pidfd` names, which ended: it closed its status channel with no ready
-/// record, which only its exit does, so the wait is for the exit that is under way. Nothing is reaped.
-/// `None` for a child killed by a signal (it has no exit code), and, logged at debug, when the wait or the
-/// look fails.
-fn exit_code_of_ended(pidfd: BorrowedFd<'_>) -> Option<i32> {
-    use rustix::event::{PollFd, PollFlags};
-
-    use crate::os_process::child::{ExitRecord, PeekOutcome};
-    use crate::wait::exit_only::{linux::peek, Target};
-
-    // The pidfd is readable once the child has exited, whoever reaps it.
-    if let Err(e) = crate::wait::poll_ready(&mut [PollFd::new(&pidfd, PollFlags::IN)]) {
-        log::debug!("waiting for an ended child's pidfd failed ({e}); its exit code is unknown");
-        return None;
-    }
-    match peek(&Target::PidFd(pidfd)) {
-        Ok(PeekOutcome::Exit(ExitRecord::Status(status))) => status.code(),
-        Ok(_) => None,
-        Err(e) => {
-            log::debug!("looking at an ended child through its pidfd failed ({e}); its exit code is unknown");
+/// What `status` says so far and what the child reported of its placement, which is recorded on `leaf`
+/// when there is one. The records are final once the progress is a failure, the end or `Ready`.
+///
+/// A channel that cannot be read does not say where the child is, nor whether it reported: that is
+/// [`PlacementReport::Unknown`], not a placement and not an absence (a kill through the leaf is owed
+/// wherever there is no proof of absence, and the attach builds nothing on a proof it lacks).
+fn read_records(status: &mut Status, leaf: Option<&mut CgroupLeaf>) -> (io::Result<Progress>, Option<PlacementReport>) {
+    let progress = status.progress();
+    let reported = status.reported().map(PlacementReport::of_record);
+    let report = match (&progress, reported) {
+        (_, Some(report)) => Some(report),
+        // An error with no errno is an `EIO`.
+        (Err(e), None) => Some(PlacementReport::Unknown(e.raw_os_error().unwrap_or(libc::EIO))),
+        (Ok(progress), None) => {
+            // The child's placement step writes the report before its ready record.
+            debug_assert!(
+                leaf.is_none() || !matches!(progress, Progress::Ready | Progress::Ended { ready: true }),
+                "a child with a cgroup leaf reached its execve with no placement report"
+            );
             None
         }
+    };
+    if let (Some(leaf), Some(report)) = (leaf, report) {
+        leaf.record_placement(report);
     }
+    (progress, report)
 }
 
-/// What the status channel says of `child`: started, or torn down, and the program did not start.
+/// What the status channel says of `child`: started, or torn down, and the program did not start. The
+/// child's placement report, if the channel holds one, is recorded on `on_failure.placement`.
 fn conclude(
     child: NewChild,
     mut status: Status,
@@ -249,43 +260,40 @@ fn conclude(
     let pid = child.pid.unsigned_abs();
     // First of all: the clone's pidfd takes the lowest free number, which can be a stdio slot that another
     // thread of the application may `dup2` over, closing it. A pidfd that cannot be moved is a failed spawn
-    // of a child that may be running, whatever the channel would have said.
+    // of a child that may be running, whatever the channel would have said (the leaf still learns what the
+    // child reported of its placement).
     let pidfd = match crate::above_stdio::above_stdio_keeping(child.pidfd) {
         Ok(pidfd) => pidfd,
-        Err((e, pidfd)) => return Err(unmovable(pid, pidfd, e, kernel, on_failure)),
+        Err((e, pidfd)) => {
+            _ = read_records(&mut status, on_failure.placement.as_deref_mut());
+            return Err(unmovable(pid, pidfd, e, kernel, on_failure));
+        }
     };
+    let (progress, report) = read_records(&mut status, on_failure.placement.as_deref_mut());
+    // A child whose refusing placement failed ended in its placement step: the attach reads the report,
+    // which says why, and ends the child.
+    let refused = on_failure.refusing_placement && matches!(report, Some(PlacementReport::WriteFailed(_)));
     // `Some`: the program did not start, for this reason.
-    let did_not_start = match status.progress() {
-        Ok(Progress::Failed(failure)) => Some(failed(failure)),
-        progress => match progress.and_then(|_| status.could_have_started()) {
-            Ok(true) => None,
-            // A refused placement ended the child in its placement step: the attach reads the report, which
-            // says why, and ends the child. Any other child with no ready record is torn down here, with its
-            // placement named when its exit status is the placement hook's.
-            Ok(false) => {
-                let report = on_failure.placement.as_mut().and_then(|channel| channel.reported());
-                match report {
-                    Some(PlacementReport::WriteFailed(_)) if on_failure.refusing_placement => None,
-                    _ => {
-                        let in_hook = on_failure.placement.is_some() && {
-                            let code = exit_code_of_ended(pidfd.as_fd());
-                            matches!(code, Some(UNSENT_EXIT | REFUSED_EXIT | ABANDONED_EXIT))
-                        };
-                        Some(died_before_exec(pid, in_hook))
-                    }
+    let did_not_start = if refused {
+        None
+    } else {
+        match progress {
+            Ok(Progress::Failed(failure)) => Some(failed(pid, failure)),
+            progress => match progress.and_then(|_| status.could_have_started()) {
+                Ok(true) => None,
+                Ok(false) => Some(died_before_exec(pid)),
+                // A status channel that cannot be read proves nothing: the program did start, as far as
+                // this spawn can tell.
+                Err(e) => {
+                    log::warn!(
+                        "{}: its status channel is unreadable ({}); taken to have started",
+                        super::named(Some(pid)),
+                        crate::error::Report(&e)
+                    );
+                    None
                 }
-            }
-            // A status channel that cannot be read proves nothing: the program did start, as far as this
-            // spawn can tell.
-            Err(e) => {
-                log::warn!(
-                    "{}: its status channel is unreadable ({}); taken to have started",
-                    super::named(Some(pid)),
-                    crate::error::Report(&e)
-                );
-                None
-            }
-        },
+            },
+        }
     };
     let owned = OwnedChild::over_pidfd(kernel, Some(pid), pidfd);
     match did_not_start {

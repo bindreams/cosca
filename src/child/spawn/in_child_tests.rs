@@ -120,7 +120,9 @@ fn every_in_child_step_takes_effect() {
 fn every_in_child_step_takes_effect() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut steps = InChild::default();
-    let mut channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
+    let leaf_path = dir.path().join("leaf");
+    std::fs::create_dir(&leaf_path).expect("create the leaf");
+    let mut leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(leaf_path);
     let (mut procs_read, procs_write) = std::io::pipe().expect("pipe");
     let (mut mapped_read, mapped_write) = std::io::pipe().expect("pipe");
     let (mut stdout_read, stdout_write) = std::io::pipe().expect("pipe");
@@ -139,12 +141,17 @@ fn every_in_child_step_takes_effect() {
         }],
     )
     .expect("install the mapping");
-    // SAFETY: `procs_write` stays open, and the channel too, until the spawn has returned.
-    unsafe { steps.place(procs_write.as_raw_fd(), channel.slot()) };
+    // SAFETY: `procs_write` stays open until the spawn has returned.
+    unsafe { steps.place(procs_write.as_raw_fd(), false) };
     steps.session();
     steps.enter(std::ffi::CString::new(dir.path().as_os_str().as_bytes()).expect("no NUL"));
 
-    let started = super::spawn_sh(&format!("pwd -P; echo mapped > /dev/fd/{mapped_fd}"), &mut steps).expect("spawn");
+    let started = super::spawn_sh_placed(
+        &format!("pwd -P; echo mapped > /dev/fd/{mapped_fd}"),
+        &mut steps,
+        Some(&mut leaf),
+    )
+    .expect("spawn");
     // The parent's copies: each pipe reads EOF once the child is done with its own.
     drop(steps);
     drop(procs_write);
@@ -152,11 +159,12 @@ fn every_in_child_step_takes_effect() {
     let mut written = String::new();
     procs_read.read_to_string(&mut written).expect("read the placement");
     assert_eq!(written, "0", "the placement step writes \"0\" to its cgroup.procs fd");
-    assert_eq!(
-        channel.wait(started.owned.pidfd().expect("a pidfd box")),
-        crate::containment::cgroup::PlacementReport::Placed,
-        "the placement step reports its write"
-    );
+    // The spawn recorded the child's report on the leaf: a verdict of a placed child is `Ok`.
+    leaf.take_placement(crate::containment::ChildHandle {
+        pid: started.pid,
+        pidfd: started.owned.pidfd().expect("a pidfd box"),
+    })
+    .expect("the placement step reports its write");
 
     let mut stdout = String::new();
     stdout_read.read_to_string(&mut stdout).expect("read the stdout");
@@ -189,11 +197,10 @@ fn a_failing_enter_step_stops_the_child_before_placement() {
     let dir = tempfile::tempdir().expect("tempdir");
     let missing = dir.path().join("missing");
 
-    let channel = crate::containment::cgroup::ReportChannel::new().expect("open the report channel");
     let (mut procs_read, procs_write) = std::io::pipe().expect("pipe");
     let mut steps = InChild::default();
-    // SAFETY: `procs_write` stays open, and the channel too, until the spawn has returned.
-    unsafe { steps.place(procs_write.as_raw_fd(), channel.slot()) };
+    // SAFETY: `procs_write` stays open until the spawn has returned.
+    unsafe { steps.place(procs_write.as_raw_fd(), false) };
     steps.enter(std::ffi::CString::new(missing.as_os_str().as_bytes()).expect("no NUL"));
 
     let err = match super::spawn_sh("true", &mut steps) {

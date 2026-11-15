@@ -692,7 +692,7 @@ fn spawn_reported(
         let on_failure = fork_spawn::OnFailure {
             policy,
             front,
-            placement: prepared.placement_channel(),
+            placement: prepared.placement_leaf(),
             refusing_placement,
         };
         let started = fork_spawn::start(&program, &mut steps, kernel, on_failure, &guard);
@@ -2282,8 +2282,14 @@ pub(crate) fn kill_group_before_teardown(
 ) -> Option<Failures> {
     let refusal = prepared.kill_group_before_attach(child).err()?;
     note_refused_group_kill(Some(child.pid), refusal, false, why);
+    refused_group_kill_failure(child.pid, refusal)
+}
+
+/// The failure of a kernel's refusal (`refusal`) of the kill of the process group of the root `pid`.
+#[cfg(target_os = "linux")]
+pub(crate) fn refused_group_kill_failure(pid: u32, refusal: nix::errno::Errno) -> Option<Failures> {
     Failures::collect([Error::io_cause(crate::error::io_context(
-        format!("killing the process group of {}", named(Some(child.pid))),
+        format!("killing the process group of {}", named(Some(pid))),
         std::io::Error::from(refusal),
     ))])
 }
@@ -2885,10 +2891,6 @@ mod windows_child_end;
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
-
-#[cfg(all(test, target_os = "linux"))]
-#[path = "spawn/placement_reuse_tests.rs"]
-mod placement_reuse_tests;
 
 #[cfg(test)]
 #[path = "spawn/spawn_lock_tests.rs"]

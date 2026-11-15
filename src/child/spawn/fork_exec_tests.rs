@@ -2,18 +2,19 @@ use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
-use rustix::event::{PollFd, PollFlags};
 use rustix::process::{pidfd_send_signal, waitid, Signal, WaitId, WaitIdOptions};
 
 use super::{
-    channel, spawn, Failure, Program, Progress, Record, RefusalKind, SpawnError, Spawned, Status, StepFailure,
+    channel, spawn, Failure, Program, Progress, Record, RefusalKind, Reporter, SpawnError, Spawned, Status, StepFailure,
 };
 use crate::child::spawn::spawn_lock;
 use crate::os_process::linux::fork::{
     clone_with_pidfd, fails_with, fallback, fork_with_pidfd, CloneKind, Fork, ForkFn, NewChild,
 };
+use crate::test_support::{close_every_descriptor_above_stdio, exit_status, settled};
 
 type Steps<'a> = &'a dyn Fn() -> Result<(), StepFailure>;
+type ReportingSteps<'a> = &'a dyn Fn(Reporter) -> Result<(), StepFailure>;
 
 fn program(candidate: &str, argv: &[&str], env: &[(&str, &str)]) -> Program {
     candidates(&[candidate], argv, env)
@@ -37,10 +38,20 @@ const STEP_EXIT: i32 = 117;
 
 /// A spawn of `program` through `fork`, under `spawn_lock`.
 fn start(kind: CloneKind, fork: ForkFn, program: &Program, steps: Steps<'_>) -> Result<Spawned, SpawnError> {
+    start_reporting(kind, fork, program, &|_| steps())
+}
+
+/// [`start`] for steps that report: they are given the child's [`Reporter`].
+fn start_reporting(
+    kind: CloneKind,
+    fork: ForkFn,
+    program: &Program,
+    steps: ReportingSteps<'_>,
+) -> Result<Spawned, SpawnError> {
     let _lock = spawn_lock();
     // SAFETY: this thread holds `spawn_lock`, and every `steps` of these tests makes raw system calls
     // only.
-    unsafe { spawn(kind, fork, program, &[], &mut || steps(), STEP_EXIT) }
+    unsafe { spawn(kind, fork, program, &[], &mut |reporter| steps(reporter), STEP_EXIT) }
 }
 
 fn started(kind: CloneKind, program: &Program, steps: Steps<'_>) -> Spawned {
@@ -48,32 +59,9 @@ fn started(kind: CloneKind, program: &Program, steps: Steps<'_>) -> Spawned {
         .unwrap_or_else(|e| panic!("the spawn of a {kind:?} child failed: {e:?}"))
 }
 
-/// Blocks until the status has said all it will: a failure record, or the end. Waits on the real
-/// condition (the descriptor's readiness) each round.
-fn settled(status: &mut Status) -> Progress {
-    loop {
-        match status.progress().expect("the status pipe reads") {
-            Progress::Pending | Progress::Ready => {
-                let fd = status.as_fd();
-                let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-                crate::wait::poll_ready(&mut fds).expect("poll the status pipe");
-            }
-            settled => return settled,
-        }
-    }
-}
-
-/// The exit status of `child`, reaped through its pidfd.
-fn exit_status(child: &NewChild) -> i32 {
-    let done = waitid(WaitId::PidFd(child.pidfd.as_fd()), WaitIdOptions::EXITED)
-        .expect("waitid on the pidfd")
-        .expect("a blocking wait returns a status");
-    done.exit_status().unwrap_or_else(|| {
-        panic!(
-            "the child did not exit: it died of signal {:?}",
-            done.terminating_signal()
-        )
-    }) as i32
+fn started_reporting(kind: CloneKind, program: &Program, steps: ReportingSteps<'_>) -> Spawned {
+    start_reporting(kind, fork_with_pidfd, program, steps)
+        .unwrap_or_else(|e| panic!("the spawn of a {kind:?} child failed: {e:?}"))
 }
 
 /// The signal the child died of, reaped through its pidfd.
@@ -700,21 +688,21 @@ fn signal_mask(dump: &str, field: &str) -> u64 {
 /// Runs a plain-cloned child through `steps` and then the record writes with the status read end
 /// already dropped (the write of each record is a broken pipe), and returns the program's
 /// `/proc/<pid>/status`. The child holds before its record writes until the read end is gone.
-fn status_of_a_program_whose_parent_stopped_reading(steps: impl Fn() + 'static) -> String {
+fn status_of_a_program_whose_parent_stopped_reading(steps: impl Fn(Reporter) + 'static) -> String {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("status");
     let out_c = std::ffi::CString::new(out.to_str().unwrap()).unwrap();
     let dump = status_dump();
     let (release_read, release_write) = std::io::pipe().unwrap();
     let hold = held_until_released(&release_read, &release_write);
-    let Spawned { child, status } = started(CloneKind::Plain, &dump, &move || {
+    let Spawned { child, status } = started_reporting(CloneKind::Plain, &dump, &move |reporter| {
         // SAFETY: `open`, `dup2` and `close` on a prebuilt path and a descriptor it returned.
         unsafe {
             let file = libc::open(out_c.as_ptr(), libc::O_WRONLY | libc::O_CREAT, 0o644);
             libc::dup2(file, 1);
             libc::close(file);
         }
-        steps();
+        steps(reporter);
         hold()
     });
     // The child closed its copy of the read end before its steps, so this is the last one.
@@ -746,7 +734,7 @@ fn block_sigpipe() {
 /// `execve`; the mask is not put back.
 #[skuld::test]
 fn a_child_whose_parent_stopped_reading_still_execs_with_its_signals_as_inherited() {
-    let dump = status_of_a_program_whose_parent_stopped_reading(|| {
+    let dump = status_of_a_program_whose_parent_stopped_reading(|_| {
         // SAFETY: `sigaction` on a valid, zeroed record.
         unsafe {
             let mut default: libc::sigaction = std::mem::zeroed();
@@ -766,7 +754,7 @@ fn a_child_whose_parent_stopped_reading_still_execs_with_its_signals_as_inherite
 /// discarded by: it is queued, and survives the `execve`.
 #[skuld::test]
 fn a_blocked_sigpipe_raised_by_a_record_write_is_not_left_pending_for_the_program() {
-    let dump = status_of_a_program_whose_parent_stopped_reading(block_sigpipe);
+    let dump = status_of_a_program_whose_parent_stopped_reading(|_| block_sigpipe());
     assert_eq!(signal_mask(&dump, "SigPnd:") & SIGPIPE_BIT, 0, "{dump}");
     assert_ne!(
         signal_mask(&dump, "SigBlk:") & SIGPIPE_BIT,
@@ -781,7 +769,7 @@ fn a_blocked_sigpipe_raised_by_a_record_write_is_not_left_pending_for_the_progra
 /// Mutant: a broken pipe consumes the `SIGPIPE` pending whether the write raised it or not.
 #[skuld::test]
 fn a_sigpipe_pending_before_the_record_writes_still_reaches_the_program() {
-    let dump = status_of_a_program_whose_parent_stopped_reading(|| {
+    let dump = status_of_a_program_whose_parent_stopped_reading(|_| {
         block_sigpipe();
         // SAFETY: raw system calls: this thread's own `tgkill`.
         unsafe {
@@ -814,23 +802,142 @@ fn a_ready_record_that_cannot_be_written_stops_the_child_before_its_exec() {
         &[],
     );
     let mut spawned = started(CloneKind::Plain, &ran, &|| {
-        // SAFETY: a raw `close_range` of every descriptor above stdio; where the kernel has none (it is
-        // Linux 5.9, above the floor), a `close` of every number below the descriptor limit.
-        unsafe {
-            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) == -1 {
-                let mut limit = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
-                for fd in 3..limit.rlim_cur.min(libc::c_int::MAX as u64) as libc::c_int {
-                    libc::close(fd);
-                }
-            }
-        }
+        close_every_descriptor_above_stdio();
         Ok(())
     });
     assert_eq!(exit_status(&spawned.child), STEP_EXIT);
     assert_eq!(settled(&mut spawned.status), Progress::Ended { ready: false });
     assert!(!marker.exists(), "the program ran with no ready record written");
+}
+
+// Reports ---------------------------------------------------------------------------------------
+
+/// A step's report as a failure of that step, for the steps below that report and go on.
+fn report_failed(errno: i32) -> StepFailure {
+    StepFailure {
+        kind: 6,
+        value: errno as u16,
+    }
+}
+
+/// The status keeps the first report beside the ready record and a failure: a report is neither.
+///
+/// Mutants: a report is read as the ready record; a later report replaces the first; a failure forgets
+/// the report.
+#[skuld::test]
+fn the_status_keeps_the_first_report_beside_the_other_records() {
+    let (mut status, writer) = channel(CloneKind::Plain, &[]).expect("a channel");
+    assert_eq!(status.reported(), None);
+    write_record(&writer, Record::Reported(0));
+    assert_eq!(
+        status.progress().unwrap(),
+        Progress::Pending,
+        "a report is not the ready record"
+    );
+    assert_eq!(status.reported(), Some(0));
+    write_record(&writer, Record::Reported(9));
+    write_record(&writer, Record::Ready);
+    assert_eq!(status.progress().unwrap(), Progress::Ready);
+    assert_eq!(status.reported(), Some(0), "the first report stays");
+    write_record(&writer, Record::Failed(Failure::Exec(libc::ENOENT)));
+    assert_eq!(
+        status.progress().unwrap(),
+        Progress::Failed(Failure::Exec(libc::ENOENT))
+    );
+    assert_eq!(status.reported(), Some(0));
+}
+
+/// A report a step wrote is in the channel when the spawn returns, before the ready record, and the
+/// child goes on to its program.
+///
+/// Mutants: the child does not write the report; the report is written as the ready record.
+#[skuld::test]
+fn a_steps_report_is_read_by_the_parent_and_the_program_runs() {
+    let exits_3 = program("/bin/sh", &["sh", "-c", "exit 3"], &[]);
+    for kind in [CloneKind::Vfork, CloneKind::Plain] {
+        let mut spawned = started_reporting(kind, &exits_3, &|reporter| {
+            // SAFETY: in the child, which is where steps run.
+            unsafe { reporter.report(0) }.map_err(report_failed)?;
+            // SAFETY: as above.
+            unsafe { reporter.report(7) }.map_err(report_failed)
+        });
+        assert_eq!(
+            settled(&mut spawned.status),
+            Progress::Ended { ready: true },
+            "{kind:?}"
+        );
+        assert_eq!(spawned.status.reported(), Some(0), "{kind:?}: the first report");
+        assert_eq!(exit_status(&spawned.child), 3, "{kind:?}");
+    }
+}
+
+/// A report written before a step failed is readable beside the failure, and the program never runs.
+///
+/// Mutant: a failed step's record is written without the report before it (or the report is dropped
+/// on a failure).
+#[skuld::test]
+fn a_report_before_a_failed_step_is_readable_beside_the_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let ran = program(
+        "/bin/sh",
+        &["sh", "-c", "echo > \"$1\"", "sh", marker.to_str().unwrap()],
+        &[],
+    );
+    let failure = report_failed(libc::EPERM);
+    for kind in [CloneKind::Vfork, CloneKind::Plain] {
+        let mut spawned = started_reporting(kind, &ran, &|reporter| {
+            // SAFETY: in the child, which is where steps run.
+            unsafe { reporter.report(libc::EPERM as u16) }.map_err(report_failed)?;
+            Err(failure)
+        });
+        assert_eq!(
+            settled(&mut spawned.status),
+            Progress::Failed(Failure::Step(failure)),
+            "{kind:?}"
+        );
+        assert_eq!(spawned.status.reported(), Some(libc::EPERM as u16), "{kind:?}");
+        assert_eq!(exit_status(&spawned.child), STEP_EXIT, "{kind:?}");
+        assert!(!marker.exists(), "{kind:?}: the program ran");
+    }
+}
+
+/// A report that cannot be written for a reason other than a broken pipe is that errno, for the step to
+/// fail on: the program of a child whose report is lost must not start.
+///
+/// Mutant: the errno is swallowed (`Ok`), or reported as another.
+#[skuld::test]
+fn a_report_that_cannot_be_written_is_its_errno() {
+    let mut spawned = started_reporting(CloneKind::Plain, &tool("/bin/true"), &|reporter| {
+        close_every_descriptor_above_stdio();
+        // SAFETY: in the child, which is where steps run.
+        let written = unsafe { reporter.report(1) };
+        // SAFETY: a plain system call.
+        unsafe { libc::_exit(if written == Err(libc::EBADF) { 41 } else { 42 }) }
+    });
+    assert_eq!(exit_status(&spawned.child), 41);
+    assert_eq!(settled(&mut spawned.status), Progress::Ended { ready: false });
+}
+
+/// A report to a parent that stopped reading is not an error (nobody reads: the program runs, as with
+/// the ready record), and, like the ready record, raises no `SIGPIPE` the program is left with.
+///
+/// Mutants: the broken pipe is the report's error and the child never execs; the `SIGPIPE` the write
+/// raised stays pending.
+#[skuld::test]
+fn a_report_to_a_parent_that_stopped_reading_is_no_error_and_leaves_no_sigpipe() {
+    let dump = status_of_a_program_whose_parent_stopped_reading(|reporter| {
+        block_sigpipe();
+        // SAFETY: in the child, which is where steps run.
+        if unsafe { reporter.report(1) }.is_err() {
+            // SAFETY: a plain system call.
+            unsafe { libc::_exit(43) }
+        }
+    });
+    assert_eq!(signal_mask(&dump, "SigPnd:") & SIGPIPE_BIT, 0, "{dump}");
+    assert_ne!(
+        signal_mask(&dump, "SigBlk:") & SIGPIPE_BIT,
+        0,
+        "the mask the child inherited is back: {dump}"
+    );
 }
