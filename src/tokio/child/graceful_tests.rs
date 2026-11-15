@@ -554,7 +554,9 @@ async fn members_remain_still_reaps_an_already_exited_root(
 }
 
 /// The root probe after a drain verdict that does not clear the tree, awaited: the root has exited, so
-/// the best-effort reap follows a failed sweep. The leaf is swept by its own handle.
+/// the best-effort reap follows a failed sweep. The leaf is swept by its own handle. A pump that never
+/// broadcasts hangs this test; `a_changed_batch_notifies_a_listener_that_was_there_before_it` fails it by
+/// assertion.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_cgroup(

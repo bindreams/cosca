@@ -2434,7 +2434,9 @@ fn cgroup_a_leaf_whose_drain_cannot_be_watched_is_not_created(#[fixture(cgroup)]
 // every change; waits only listen and re-read the leaf.
 
 /// A wait polled once and then never again holds nothing another wait needs: a second wait on
-/// the same leaf, already blocked when the leaf drains, still returns.
+/// the same leaf, already blocked when the leaf drains, still returns. A pump that never
+/// broadcasts hangs this test; `a_changed_batch_notifies_a_listener_that_was_there_before_it`
+/// fails it by assertion.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
 #[skuld::test]
 fn a_parked_async_wait_does_not_hold_up_another() {
@@ -2479,7 +2481,8 @@ fn a_parked_async_wait_does_not_hold_up_another() {
 }
 
 /// A sync and an async wait on one leaf both return once it drains, on the leaf's one watch: no
-/// second inotify instance is armed.
+/// second inotify instance is armed. A pump that never broadcasts hangs this test;
+/// `a_changed_batch_notifies_a_listener_that_was_there_before_it` fails it by assertion.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
 #[skuld::test]
 fn a_sync_and_an_async_wait_share_the_leafs_one_watch() {
@@ -2606,7 +2609,8 @@ fn blocked_wait(
 }
 
 /// The pump starts with the first wait that blocks, and dropping the leaf stops and joins it
-/// before `drop` returns.
+/// before `drop` returns. A pump that never broadcasts hangs this test;
+/// `a_changed_batch_notifies_a_listener_that_was_there_before_it` fails it by assertion.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn dropping_the_leaf_stops_and_joins_its_pump() {
@@ -2712,7 +2716,9 @@ fn a_failed_pump_wakes_every_wait_with_its_error() {
     );
 }
 
-/// A sibling's removal reaches the pump, which wakes no wait for it.
+/// A sibling's removal reaches the pump, which wakes no wait for it. A pump that never
+/// broadcasts hangs this test; `a_changed_batch_notifies_a_listener_that_was_there_before_it`
+/// fails it by assertion.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_siblings_removal_wakes_no_wait() {

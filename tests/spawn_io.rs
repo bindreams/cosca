@@ -1632,6 +1632,10 @@ fn on_one_cpu<T>(f: impl FnOnce() -> T) -> T {
 /// The root can exit before cosca looks at the leaf, and `cgroup.procs` lists only live tasks,
 /// so the root is then absent from it although the kernel accepted its placement. Parent and
 /// child share one CPU here, which makes that the common outcome rather than a rare one.
+///
+/// A pump that never broadcasts hangs this test;
+/// `containment::cgroup::leaf::leaf_tests::a_changed_batch_notifies_a_listener_that_was_there_before_it` (a unit
+/// test of the library) fails it by assertion.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited(#[fixture(cgroup)] _group: &Group) {
@@ -1718,6 +1722,10 @@ fn linux_cgroup_v2_keeps_the_worker_of_a_root_that_already_exited(#[fixture(cgro
 
 /// `accept_or_signalled` must fail once the leaf drains with nothing having connected, not wait
 /// forever. The contained `sh` exits at once and leaves no descendant.
+///
+/// A pump that never broadcasts hangs this test;
+/// `containment::cgroup::leaf::leaf_tests::a_changed_batch_notifies_a_listener_that_was_there_before_it` (a unit
+/// test of the library) fails it by assertion.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn death_watch_linux_cgroup_v2_accept_or_signalled_panics_when_the_leaf_drains_before_anything_connects(

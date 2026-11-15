@@ -232,6 +232,9 @@ mod leaf_drain {
     /// written: the drain it bounds is awaited, not left to the leaf's drop.
     ///
     /// Mutant: the teardown returns at its first half without awaiting the drain.
+    ///
+    /// A pump that never broadcasts hangs this test;
+    /// `a_changed_batch_notifies_a_listener_that_was_there_before_it` fails it by assertion.
     #[skuld::test]
     async fn death_watch_a_teardown_of_a_reaped_root_awaits_the_leafs_drain() {
         crate::tokio::test_runtime::assert_current_thread();
@@ -286,6 +289,9 @@ mod leaf_drain {
     /// fake leaf's id never reads, so the order shows nothing.
     ///
     /// Mutant: the closed-gate arm drops the leaf in the first half, which waits for the drain.
+    ///
+    /// A pump that never broadcasts hangs this test;
+    /// `a_changed_batch_notifies_a_listener_that_was_there_before_it` fails it by assertion.
     #[skuld::test]
     async fn death_watch_a_teardown_of_a_front_behind_a_closed_gate_awaits_the_leafs_drain() {
         crate::tokio::test_runtime::assert_current_thread();
