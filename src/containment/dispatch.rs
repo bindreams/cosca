@@ -73,12 +73,11 @@ impl Prepared {
         return crate::graceful::GracefulMechanism::Process;
     }
 
-    /// Linux: the placement channel of the cgroup leaf this spawn made, if it made one.
+    /// Linux: the cgroup leaf this spawn made, if it made one, for the spawn to record the child's
+    /// placement report on.
     #[cfg(target_os = "linux")]
-    pub(crate) fn placement_channel(&mut self) -> Option<&mut crate::containment::cgroup::ReportChannel> {
-        self.cgroup_leaf
-            .as_mut()
-            .map(crate::containment::cgroup::CgroupLeaf::placement_channel)
+    pub(crate) fn placement_leaf(&mut self) -> Option<&mut crate::containment::cgroup::CgroupLeaf> {
+        self.cgroup_leaf.as_mut()
     }
 
     /// Linux: whether the leaf's slot refuses a failed placement (`Strongest`): the child of this spawn
@@ -88,7 +87,7 @@ impl Prepared {
         self.cgroup_leaf.is_some() && self.mode.is_some_and(ContainMode::is_strict)
     }
 
-    /// End the placement exchange of a spawn that failed while the caller still holds its child:
+    /// End the placement verdict of a spawn that failed while the caller still holds its child:
     /// take the verdict, as `attach` would, so the leaf answers only for the tree and
     /// never for the child the caller will reap. Nothing is taken without a leaf, or once the
     /// verdict is taken. A child the leaf does not hold is only logged: the leaf answers for the
@@ -122,12 +121,13 @@ impl Prepared {
     }
 
     /// Whether the root's process group is its containment: the root is a Session or process-group
-    /// root, and no cgroup leaf took it, as `attach` would decide. On Linux the leaf's verdict is
-    /// taken first ([`settle_verdict`](Self::settle_verdict)).
+    /// root, and no cgroup leaf provably took it, as `attach` would decide. A child whose placement
+    /// report could not be read may be in its process group as well as in its leaf. On Linux the leaf's
+    /// verdict is taken first ([`settle_verdict`](Self::settle_verdict)).
     #[cfg(unix)]
     pub(crate) fn group_is_containment(&self) -> bool {
         #[cfg(target_os = "linux")]
-        let taken_by_a_leaf = self.cgroup_leaf.as_ref().is_some_and(|leaf| leaf.child_entered());
+        let taken_by_a_leaf = self.cgroup_leaf.as_ref().is_some_and(|leaf| leaf.child_proven_in());
         #[cfg(not(target_os = "linux"))]
         let taken_by_a_leaf = false;
         self.is_root && !taken_by_a_leaf && matches!(self.mode, Some(mode) if !matches!(mode, ContainMode::TreeWalk))
@@ -1618,14 +1618,12 @@ pub(crate) fn prepare(
             };
             if let Some(ref l) = leaf {
                 // The child's self-placement step. Under `Strongest` a failed placement stops the
-                // child before `exec` (see `ReportSlot::refusing`). Otherwise it returns Ok (e.g.
+                // child before `exec` (see `placement_step`). Otherwise it returns Ok (e.g.
                 // EBUSY — "no internal processes" rule), so the spawn proceeds and `attach` falls
                 // back to the already-configured process group. Both the sync and the tokio spawn
                 // add this one step through `prepare`.
-                let slot = l.placement_slot();
-                // SAFETY: the leaf, which owns both the fd and the report channel, stays in
-                // `Prepared` until after the spawn.
-                unsafe { steps.place(l.procs_fd(), if strict { slot.refusing() } else { slot }) };
+                // SAFETY: the leaf, which owns the fd, stays in `Prepared` until after the spawn.
+                unsafe { steps.place(l.procs_fd(), strict) };
             }
             return Ok(Prepared {
                 mode,
@@ -1750,7 +1748,7 @@ pub(crate) fn not_started_failure(
             format!("cgroup v2: the child could not be placed in its leaf cgroup {path}, so the program did not run"),
             Some(Error::io_cause(std::io::Error::from_raw_os_error(errno))),
         ),
-        NotEntered::WriteFailed(_) => return Err(reason),
+        NotEntered::WriteFailed(_) | NotEntered::Unknown(_) => return Err(reason),
     };
     log::debug!(
         "cgroup v2: the program did not run: {report}",
@@ -1764,6 +1762,44 @@ pub(crate) fn not_started_failure(
         #[cfg(windows)]
         proven: None,
     })
+}
+
+/// The failure of an attach whose child has no proven placement (`reason`, in the leaf at `path`): the
+/// spawn could not read the child's status channel, so the child may be in the leaf, in its process group
+/// (a `BestEffort` write that failed), or neither, and the program may have run. Nothing is built on it, in
+/// any mode: the failure is the spawn's, whose teardown ends the child, and the leaf is dropped here, which
+/// kills through it (nothing proves it holds nothing of the child's). A child that exec'd outside the leaf
+/// may have forked into its process group, so that is killed through the `child`'s pidfd too, and a kill the
+/// kernel refuses is the failure's `cleanup`. The read's errno is the error's source, and a failed read of
+/// `cgroup.procs` for the diagnosis a second cause beside it.
+#[cfg(target_os = "linux")]
+fn unproven_failure(
+    leaf: crate::containment::cgroup::CgroupLeaf,
+    reason: crate::containment::cgroup::NotPlaced,
+    path: &str,
+    errno: i32,
+    child: ChildHandle<'_>,
+) -> AttachFailure {
+    log::debug!(
+        "cgroup v2: the child's placement is unknown: {report}",
+        report = crate::error::Report(&reason)
+    );
+    drop(leaf);
+    let cleanup = kill_group_through_pidfd(child.pidfd, Some(child.pid))
+        .err()
+        .and_then(|refusal| crate::child::spawn::refused_group_kill_failure(child.pid, refusal));
+    let cause = Error::Containment {
+        detail: format!(
+            "cgroup v2: the spawn could not read the child's status channel, so it is not known whether the \
+             child entered its leaf cgroup {path}; the child is torn down"
+        ),
+        source: Some(Error::io_cause(std::io::Error::from_raw_os_error(errno))),
+    }
+    .with_peers(reason.into_read_failure().map(Error::io_cause));
+    AttachFailure {
+        cleanup,
+        ..AttachFailure::from(cause)
+    }
 }
 
 impl From<Error> for AttachFailure {
@@ -1847,12 +1883,13 @@ fn attach_tree(
                 // Strongest and BestEffort: the cgroup leaf if `prepare` made one, else the
                 // process group.
                 if let Some(mut leaf) = prepared.cgroup_leaf.take() {
-                    // The pre_exec write can fail (EBUSY — the "no internal processes" rule
+                    // The child's placement write can fail (EBUSY — the "no internal processes" rule
                     // when the supervisor is itself an undelegated leaf). The child's own
                     // report of that write decides membership; re-reading cgroup.procs cannot,
                     // because it lists only live tasks and a placed child may already have
-                    // exited. Taking the verdict waits for that report — `spawn` returning does
-                    // not mean the child has made it — then releases the leaf's fd and pipe.
+                    // exited. The spawn read that report from the child's status channel and
+                    // recorded it on the leaf; taking the verdict waits for nothing and
+                    // releases the leaf's fd.
                     match leaf.take_placement(child) {
                         Ok(()) => {
                             return Ok(Tree::contained(Mechanism::Cgroup(leaf)));
@@ -1862,6 +1899,11 @@ fn attach_tree(
                         // removed without writing cgroup.kill.
                         Err(reason) => {
                             let path = leaf.path().display().to_string();
+                            // A report the spawn could not read proves nothing: no containment is built
+                            // on it, and the leaf, which may hold the child, is killed through.
+                            if let crate::containment::cgroup::NotEntered::Unknown(errno) = reason.report() {
+                                return Err(unproven_failure(leaf, reason, &path, errno, child));
+                            }
                             leaf.remove_unentered();
                             let strict = prepared.mode.is_some_and(ContainMode::is_strict);
                             return match not_started_failure(reason, &path, strict) {

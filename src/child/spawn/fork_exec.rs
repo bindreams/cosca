@@ -19,6 +19,10 @@
 //!   and the `execve`. [`Status::could_have_started`] says this much and no more: `Ok` means the
 //!   spawn could not prove the program did not start, and the child's wait reports the signal.
 //!
+//! - A step may also write reports ([`Reporter::report`]): the core keeps the first ([`Status::reported`])
+//!   and gives it no meaning. A report is neither a failure nor the ready record; it comes before the
+//!   ready record, so it is in the channel whenever the ready record, a failure or the end is.
+//!
 //! The child's writes to the channel never kill it with `SIGPIPE` and leave its signal mask,
 //! disposition and pending signals as they were: a parent that dropped the read end costs the child
 //! its records, not its `execve`.
@@ -175,17 +179,20 @@ pub(crate) enum Progress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Record {
     Ready,
+    Reported(u16),
     Failed(Failure),
 }
 
 /// The kinds the core reserves; a caller's [`StepFailure::kind`] is a `u8`, so it cannot collide.
 const KIND_READY: u16 = 0xffff;
 const KIND_EXEC: u16 = 0xfffe;
+const KIND_REPORT: u16 = 0xfffd;
 
 impl Record {
     fn encode(self) -> [u8; 4] {
         let (kind, value) = match self {
             Record::Ready => (KIND_READY, 0),
+            Record::Reported(value) => (KIND_REPORT, value),
             Record::Failed(Failure::Exec(errno)) => (KIND_EXEC, errno as u16),
             Record::Failed(Failure::Step(step)) => (u16::from(step.kind), step.value),
         };
@@ -198,6 +205,7 @@ impl Record {
         let (kind, value) = ((word >> 16) as u16, word as u16);
         match kind {
             KIND_READY => Ok(Record::Ready),
+            KIND_REPORT => Ok(Record::Reported(value)),
             KIND_EXEC => Ok(Record::Failed(Failure::Exec(i32::from(value)))),
             kind => match u8::try_from(kind) {
                 Ok(kind) => Ok(Record::Failed(Failure::Step(StepFailure { kind, value }))),
@@ -214,6 +222,8 @@ pub(crate) struct Status {
     /// How the child was cloned: whether a channel with nothing in it means "not started".
     kind: CloneKind,
     ready: bool,
+    /// The first report a step wrote ([`Reporter::report`]), once read.
+    reported: Option<u16>,
     /// A failure or the end, once read: the answer for good.
     settled: Option<Progress>,
     /// What made the channel unusable, once something did: for good.
@@ -259,6 +269,7 @@ impl Status {
             match rustix::io::read(&self.read, &mut bytes) {
                 Ok(4) => match Record::decode(bytes) {
                     Ok(Record::Ready) => self.ready = true,
+                    Ok(Record::Reported(value)) => _ = self.reported.get_or_insert(value),
                     Ok(Record::Failed(failure)) => return Ok(*self.settled.insert(Progress::Failed(failure))),
                     Err(kind) => return Err(self.garble(Garbled::Kind(kind))),
                 },
@@ -269,6 +280,12 @@ impl Status {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    /// The first report a step wrote, as far as [`progress`](Self::progress) has read; final once it returns
+    /// a failure, the end, or `Ready`.
+    pub(crate) fn reported(&self) -> Option<u16> {
+        self.reported
     }
 
     /// Ends the channel: a bug in debug builds, an error without them.
@@ -320,6 +337,7 @@ pub(super) fn channel(kind: CloneKind, keep_off: &[RawFd]) -> io::Result<(Status
             read,
             kind,
             ready: false,
+            reported: None,
             settled: None,
             garbled: None,
         },
@@ -369,10 +387,35 @@ pub(crate) struct Spawned {
     pub(crate) status: Status,
 }
 
+/// The child's end of the status channel, which the steps write their reports to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Reporter {
+    fd: RawFd,
+}
+
+impl Reporter {
+    /// Writes a report record, which the parent reads as [`Status::reported`]. The write never kills the
+    /// child with `SIGPIPE` and leaves its signal state as it found it (see the module docs); a broken
+    /// pipe is `Ok`: nobody reads, and the program runs, as with the ready record. `Err` is the errno of
+    /// any other failure, with the report lost: a step whose report must reach the parent fails on it.
+    ///
+    /// # Safety
+    ///
+    /// Called only in the child of the clone, by a step, which the child's contract binds.
+    pub(crate) unsafe fn report(self, value: u16) -> Result<(), i32> {
+        // SAFETY: the caller's contract; `fd` is the child's open write end until its `execve`.
+        match unsafe { write_record(self.fd, Record::Reported(value)) } {
+            Err(libc::EPIPE) => Ok(()),
+            written => written,
+        }
+    }
+}
+
 /// Clones a child by `fork` (`fork_with_pidfd`, or a stand-in) of `kind`, which runs `steps` and then
 /// `program`. A child whose step fails, or whose ready record cannot be written (a broken pipe aside),
 /// exits with `step_exit`, distinct from the 127 of a failed `execve`. The channel's write end is on none
-/// of the numbers in `keep_off`: the descriptor numbers `steps` may `dup2` onto.
+/// of the numbers in `keep_off`: the descriptor numbers `steps` may `dup2` onto. `steps` is given the
+/// child's [`Reporter`].
 ///
 /// # Safety
 ///
@@ -385,7 +428,7 @@ pub(crate) unsafe fn spawn(
     fork: ForkFn,
     program: &Program,
     keep_off: &[RawFd],
-    steps: &mut dyn FnMut() -> Result<(), StepFailure>,
+    steps: &mut dyn FnMut(Reporter) -> Result<(), StepFailure>,
     step_exit: libc::c_int,
 ) -> Result<Spawned, SpawnError> {
     let (status, write) =
@@ -480,14 +523,14 @@ unsafe fn run_child(
     read: RawFd,
     write: RawFd,
     program: &Program,
-    steps: &mut dyn FnMut() -> Result<(), StepFailure>,
+    steps: &mut dyn FnMut(Reporter) -> Result<(), StepFailure>,
     step_exit: libc::c_int,
 ) -> ! {
     // SAFETY: raw system calls and async-signal-safe libc wrappers on valid arguments; nothing
     // allocates.
     unsafe {
         libc::close(read);
-        if let Err(failure) = steps() {
+        if let Err(failure) = steps(Reporter { fd: write }) {
             // A record that cannot be written is lost; the child ends either way.
             write_record(write, Record::Failed(Failure::Step(failure))).unwrap_or(());
             libc::_exit(step_exit)

@@ -66,11 +66,6 @@ fn leaf_error_names_step_and_path_and_keeps_the_reason_as_its_source() {
             Some(libc::EACCES),
         ),
         (
-            LeafError::OpenReportChannel(std::io::Error::from_raw_os_error(libc::EMFILE)),
-            &["report"],
-            Some(libc::EMFILE),
-        ),
-        (
             LeafError::WatchDrain {
                 path: PathBuf::from("/sys/fs/cgroup/slice/cosca-7-0/cgroup.events"),
                 source: std::io::Error::from_raw_os_error(libc::ENOSPC),
@@ -148,7 +143,7 @@ fn placement_absent_renders_every_observed_fact() {
     );
 }
 
-/// A child whose `pre_exec` closure never ran made no write at all, and is reported as such.
+/// A child whose placement step never ran made no write at all, and is reported as such.
 #[skuld::test]
 fn placement_absent_renders_a_child_that_reported_nothing() {
     let rendered = NotPlaced::Absent {

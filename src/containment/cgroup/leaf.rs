@@ -10,6 +10,8 @@ use crate::containment::tree_kill::Unnamed;
 use crate::identity::ProcessId;
 
 #[cfg(target_os = "linux")]
+use crate::child::spawn::fork_exec::Reporter;
+#[cfg(target_os = "linux")]
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -219,10 +221,10 @@ pub(crate) struct Listed {
 }
 
 /// A live leaf sub-cgroup created for a single spawned process tree. See
-/// [`place_self_in_cgroup_pre_exec`] for the placement write's contract.
+/// [`place_self_in_cgroup`] for the placement write's contract.
 ///
-/// [`CgroupLeaf::take_placement`] releases the `cgroup.procs` fd and the report channel: the child
-/// needs them only until its `exec`.
+/// [`CgroupLeaf::take_placement`] releases the `cgroup.procs` fd and takes the placement verdict: the
+/// child needs the fd only until its `exec`.
 ///
 /// `Drop` removes the leaf directory, but only if the child reported entering it. If the leaf is
 /// still occupied, it fires `cgroup.kill` itself — but only while still armed (not
@@ -249,11 +251,16 @@ pub(crate) struct CgroupLeaf {
     /// 3 or above, so it never shares a number with the child's stdio. `None` once the
     /// placement verdict is taken.
     procs_fd: Option<OwnedFd>,
-    /// Where the forked child reports whether its self-placement write succeeded. `None` once
-    /// the placement verdict is taken.
-    pub(super) report: Option<ReportChannel>,
-    /// Whether the child reported entering the leaf, recorded when `report` is released.
+    /// What the spawn read of the child's placement report ([`record_placement`](Self::record_placement)):
+    /// [`NotReported`](PlacementReport::NotReported) until it records one. `Some` until the placement
+    /// verdict is taken.
+    pub(super) verdict: Option<PlacementReport>,
+    /// Whether the child may be in the leaf (it reported entering it, or the spawn could not read its
+    /// report), recorded when the verdict is taken: the leaf is killed through unless it is false.
     pub(super) entered: bool,
+    /// Whether `entered` rests on an unreadable report rather than the child's own: the child may be
+    /// outside the leaf, in its process group, so the leaf is not its whole containment.
+    pub(super) unproven: bool,
     /// The leaf's unified-hierarchy path, as `/proc/<pid>/cgroup` prints it. `None` for a leaf
     /// created outside the cgroup filesystem.
     cgroup_path: Option<String>,
@@ -307,9 +314,30 @@ pub(crate) const KILL_PAYLOAD: &[u8] = b"1";
 
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
-    /// Whether the placement verdict is still to be taken: the exchange has not ended.
     pub(crate) fn holds_verdict_to_take(&self) -> bool {
-        self.report.is_some()
+        self.verdict.is_some()
+    }
+
+    /// Records what the spawn read of the child's placement report. Only before the verdict is taken
+    /// (a later one is a breach: asserted in debug builds, ignored otherwise); the first report stands.
+    pub(crate) fn record_placement(&mut self, report: PlacementReport) {
+        let Some(verdict) = self.verdict.as_mut() else {
+            debug_assert!(
+                false,
+                "a placement report ({report}) was recorded after its verdict was taken"
+            );
+            return;
+        };
+        if *verdict == PlacementReport::NotReported {
+            *verdict = report;
+        }
+    }
+
+    /// Takes `report` as the verdict's answer: whether the child may be in the leaf, and whether that
+    /// is only because the report could not be read.
+    fn settle(&mut self, report: PlacementReport) {
+        self.entered = matches!(report, PlacementReport::Placed | PlacementReport::Unknown(_));
+        self.unproven = matches!(report, PlacementReport::Unknown(_));
     }
 
     /// Returns the raw `cgroup.procs` fd for the in-child placement step. Only before the
@@ -318,10 +346,19 @@ impl CgroupLeaf {
         self.procs_fd.as_ref().expect(RELEASED).as_raw_fd()
     }
 
-    /// Whether the child reported entering this leaf, once the verdict is taken.
+    /// Whether the child may be in this leaf, once the verdict is taken: it reported entering it, or its
+    /// report could not be read.
     pub(crate) fn child_entered(&self) -> bool {
-        debug_assert!(self.report.is_none(), "the verdict is not taken yet");
+        debug_assert!(self.verdict.is_none(), "the verdict is not taken yet");
         self.entered
+    }
+
+    /// Whether the child reported entering this leaf, so that the leaf is its whole containment, once
+    /// the verdict is taken. `false` for a child whose report could not be read: it may be in its
+    /// process group instead.
+    pub(crate) fn child_proven_in(&self) -> bool {
+        debug_assert!(self.verdict.is_none(), "the verdict is not taken yet");
+        self.entered && !self.unproven
     }
 
     /// Neutralize `Drop`'s kill, for `detach()`.
@@ -359,42 +396,27 @@ impl CgroupLeaf {
         debug_assert!(!self.child_entered(), "remove_unentered on a leaf its child entered");
     }
 
-    /// A `Copy` handle to this leaf's placement-report slot, for the in-child placement step.
-    /// Only before the placement verdict is taken.
-    pub(crate) fn placement_slot(&self) -> ReportSlot {
-        self.report.as_ref().expect(RELEASED).slot()
-    }
-
-    /// The placement-report channel, for a spawn that reads what a child that ended before its `exec`
-    /// reported. Only before the placement verdict is taken.
-    pub(crate) fn placement_channel(&mut self) -> &mut ReportChannel {
-        self.report.as_mut().expect(RELEASED)
-    }
-
     /// Whether `child` entered this leaf: `Ok` when its own write into it succeeded.
     ///
-    /// Used once, post-spawn (parent side). Blocks until the report is final — `spawn` returning
-    /// does not make it so (see [`ReportChannel`], which also says why the wait goes through the
-    /// child's pidfd). The child's report is the verdict: `cgroup.procs` lists only live tasks, so
-    /// a placed child that has already exited reads back absent from it. Only a child that reported
-    /// no successful write has `cgroup.procs` and its state read, to diagnose why — see
-    /// [`NotPlaced`].
+    /// Used once, post-spawn (parent side), over what the spawn recorded
+    /// ([`record_placement`](Self::record_placement)). The child's report is the verdict:
+    /// `cgroup.procs` lists only live tasks, so a placed child that has already exited reads back
+    /// absent from it. Only a child that reported no successful write has `cgroup.procs` and its state
+    /// read, to diagnose why — see [`NotPlaced`].
     ///
-    /// Taking the verdict closes the `cgroup.procs` fd and the report channel: nothing
-    /// needs either after the child's `exec`, and otherwise every live contained child would
-    /// hold three fds in the supervisor.
+    /// Taking the verdict closes the `cgroup.procs` fd: nothing needs it after the child's `exec`,
+    /// and otherwise every live contained child would hold one fd in the supervisor.
     pub(crate) fn take_placement(&mut self, child: crate::containment::ChildHandle<'_>) -> Result<(), NotPlaced> {
         #[cfg(test)]
         fault::run_on_take_placement();
-        let mut channel = self.report.take().expect(RELEASED);
+        let report = self.verdict.take().expect(RELEASED);
         self.procs_fd = None;
-        let report = channel.wait(child.pidfd);
-        channel.proceed();
-        self.entered = report == PlacementReport::Placed;
+        self.settle(report);
         let report = match report {
             PlacementReport::Placed => return Ok(()),
             PlacementReport::NotReported => NotEntered::NotReported,
             PlacementReport::WriteFailed(errno) => NotEntered::WriteFailed(errno),
+            PlacementReport::Unknown(errno) => NotEntered::Unknown(errno),
         };
         let path = self.leaf_path.join("cgroup.procs");
         let child_state = proc_state(&*self.kernel, child);
@@ -1215,8 +1237,9 @@ impl CgroupLeaf {
             dir,
             leaf_path,
             procs_fd: None,
-            report: Some(ReportChannel::new().expect("open a placement-report channel")),
+            verdict: Some(PlacementReport::NotReported),
             entered: false,
+            unproven: false,
             cgroup_path: None,
             abandoned: false,
             armed: AtomicBool::new(true),
@@ -1244,9 +1267,8 @@ impl CgroupLeaf {
         self.placed.clone()
     }
 
-    /// Whether the leaf still holds its `cgroup.procs` fd or its report channel.
     pub(crate) fn holds_spawn_resources(&self) -> bool {
-        self.procs_fd.is_some() || self.report.is_some()
+        self.procs_fd.is_some() || self.verdict.is_some()
     }
 }
 
@@ -1266,21 +1288,11 @@ impl CgroupLeaf {
         // uses the watch itself.
         self.watch.stop_pump();
         self.procs_fd = None;
-        // Before the verdict — a spawn that failed, maybe after its fork — end the exchange. A
-        // spawn that gave the leaf its child ended it already, so this is a spawn with none.
-        if self.report.is_some() {
-            match self.abandon_without_child(warn) {
-                // Nothing named itself: there is no child to answer for.
-                WithoutChild::Unnamed => {}
-                // A child that named itself is one the spawn already tore down through its pidfd
-                // (or a failed spawn reaped after the clone): it is not ours to reap, and the
-                // leaf's own part is done.
-                WithoutChild::Named => {}
-                // The report was still here, so the exchange was not yet ended.
-                WithoutChild::AlreadyAbandoned => {
-                    debug_assert!(false, "a leaf with its report channel had already ended its exchange");
-                }
-            }
+        // Before the verdict — a spawn that failed, maybe after its clone — abandon it. A spawn that
+        // gave the leaf its child took the verdict already, so this is a spawn with none, or one whose
+        // child the spawn tore down through its pidfd: it is not ours to reap.
+        if self.verdict.is_some() {
+            self.abandon_without_child(warn);
         }
         if std::mem::replace(&mut self.abandoned, true) {
             return;
@@ -1356,59 +1368,27 @@ impl CgroupLeaf {
     }
 }
 
-/// What [`CgroupLeaf::abandon_without_child`] found of a child it was given no handle for.
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WithoutChild {
-    /// The child never named itself: it may not have been forked, and one that was exits at its
-    /// first send, with nothing here to reap it.
-    Unnamed,
-    /// The child named a pid. A child that named itself was cloned, and the spawn that cloned it
-    /// holds its pidfd (the clone gives it before the child runs): the spawn tore the child down
-    /// through that pidfd, or a failed spawn reaped it after the clone, so there is no handle
-    /// left for the leaf to be given. Its one consumer is `CgroupLeaf`'s `Drop`
-    /// ([`tear_down`](CgroupLeaf::tear_down)); the tokio path asserts against it.
-    Named,
-    /// The exchange was already ended: a breach of the call-once contract.
-    AlreadyAbandoned,
-}
-
 #[cfg(target_os = "linux")]
 impl CgroupLeaf {
-    /// End the exchange of a spawn that has no child to give the leaf (a spawn failed before its
-    /// verdict, and the spawn already tore the child down through its pidfd, or none was cloned): kill
-    /// through the leaf if the child entered it, and remove the leaf. Nothing is sent to the child, which nothing here
-    /// holds. Answers whether the child named itself ([`WithoutChild`]).
+    /// Take the verdict of a spawn that has no child to give the leaf (a spawn failed before its
+    /// attach, and the spawn already tore the child down through its pidfd, or none was cloned): kill
+    /// through the leaf if the child entered it, and remove the leaf. The child, if there was one, is
+    /// not the leaf's to reap.
     ///
-    /// Called once per leaf: the channel is taken once, and a repeat is a breach, which debug
-    /// builds assert and which is answered [`WithoutChild::AlreadyAbandoned`]. `Drop` does nothing
+    /// Called once per leaf: a repeat is a breach, which debug builds assert. `Drop` does nothing
     /// after it.
-    #[must_use = "a child that named itself and was given no handle is a breach for a caller to act on"]
-    pub(crate) fn abandon_without_child(&mut self, warn: &mut dyn TeardownWarn) -> WithoutChild {
-        let Some(received) = self.shut_exchange() else {
+    pub(crate) fn abandon_without_child(&mut self, warn: &mut dyn TeardownWarn) {
+        let Some(report) = self.verdict.take() else {
             debug_assert!(false, "the leaf answers for a child once");
-            return WithoutChild::AlreadyAbandoned;
+            return;
         };
+        self.procs_fd = None;
+        self.abandoned = true;
+        self.settle(report);
         // What the abandonment finds wrong on the way, warned once when it ends.
         let mut why = crate::child::spawn::Diagnosis::default();
         self.kill_entered(&mut why);
         self.remove_abandoned(warn);
-        if received.pid.is_some() {
-            WithoutChild::Named
-        } else {
-            WithoutChild::Unnamed
-        }
-    }
-
-    /// Takes and shuts the report channel, and records whether the child entered the leaf: what an
-    /// abandonment starts with. `None` once an abandonment has done it.
-    fn shut_exchange(&mut self) -> Option<Received> {
-        let channel = self.report.take()?;
-        self.procs_fd = None;
-        self.abandoned = true;
-        let received = channel.shut();
-        self.entered = received.placement() == PlacementReport::Placed;
-        Some(received)
     }
 
     /// Kills through the leaf if the child entered it ([`kill_unless_written`](Self::kill_unless_written)).
@@ -1779,15 +1759,7 @@ pub(crate) fn create_leaf_under(
         }
     }
 
-    // The report channel is opened before the procs fd so a failure here unwinds nothing but
-    // the directory: a leaf whose child could not report its placement outcome would reopen
-    // exactly the silence this module is reporting its way out of.
-    let report = match ReportChannel::new() {
-        Ok(r) => r,
-        Err(e) => return Err(fail(&leaf_path, LeafError::OpenReportChannel(e))),
-    };
-
-    // Open cgroup.procs for writing, close-on-exec: the child's pre_exec write runs after fork
+    // Open cgroup.procs for writing, close-on-exec: the child's placement write runs after the clone
     // and before exec, where the fd is still open.
     //
     // Then move it to fd 3 or above. `open` takes the lowest free number, so with 0, 1 or 2
@@ -1841,8 +1813,9 @@ pub(crate) fn create_leaf_under(
         kernel: std::sync::Arc::clone(kernel),
         watch: Box::new(Watcher::new(Some(watch), leaf_name.clone().into())),
         procs_fd: Some(procs_fd),
-        report: Some(report),
+        verdict: Some(PlacementReport::NotReported),
         entered: false,
+        unproven: false,
         cgroup_path: None,
         abandoned: false,
         armed: AtomicBool::new(true),
@@ -1854,90 +1827,51 @@ pub(crate) fn create_leaf_under(
     })
 }
 
-/// The status an abandoned spawn's child exits with, from inside its hook.
+/// The report of a child whose placement write succeeded; any other value is the write's errno
+/// (which is never 0).
 #[cfg(target_os = "linux")]
-pub(crate) const ABANDONED_EXIT: i32 = 125;
+const REPORT_PLACED: u16 = 0;
 
-/// The status a child exits with from inside its hook when its [`refusing`](ReportSlot::refusing)
-/// placement failed, or it could not send its report. Distinct from [`ABANDONED_EXIT`] so a status
-/// in a log tells them apart; the parent decides from the leaf's report, never from this: the
-/// cause is in it when it was sent, and a child that sent none never ran the program
-/// ([`PlacementReport::NotReported`]).
-#[cfg(target_os = "linux")]
-pub(crate) const REFUSED_EXIT: i32 = 124;
-
-/// The status a child exits with from inside its hook when it could not send its placement report
-/// and its slot is not [`refusing`](ReportSlot::refusing). The parent does not read it: a child
-/// that sent no report never ran the program ([`PlacementReport::NotReported`]).
-#[cfg(target_os = "linux")]
-pub(crate) const UNSENT_EXIT: i32 = 123;
-
-/// The placement hook a contained spawn registers: close the forked child's inherited copy of the
-/// parent's end, then place the child (see [`place_self_in_cgroup_pre_exec`]).
+/// The child's placement step, one of the steps of the spawn core's child (see
+/// `child::spawn::in_child`): place the child ([`place_self_in_cgroup`]) and report the outcome on the
+/// core's status channel ([`Reporter::report`]), which the spawn reads as a [`PlacementReport`].
 ///
-/// It never returns an error to `std`. A child that never execs needs no error channel, and `std`
-/// would write its error record to the number its channel had — which, once `std`'s spawn returned
-/// early because two of fds 0–2 were closed, is one of the child's own stdio slots. So every
-/// failure `_exit`s here: a spawn the parent abandoned with [`ABANDONED_EXIT`], any other failure of
-/// a [`refusing`](ReportSlot::refusing) slot with [`REFUSED_EXIT`] (its refused write, or a report
-/// that cannot be sent), and a report that cannot be sent from any other slot with [`UNSENT_EXIT`].
-/// `Ok` is a child that goes on to `exec`.
+/// A failed write (e.g. `EBUSY` when the supervisor's cgroup is itself a leaf — the "no internal
+/// processes" rule) is `Ok`: the child proceeds in the process group already set up, and the parent
+/// degrades on the report. A `refusing` slot's failed write is `Err` with the write's errno, after
+/// the report: the program never runs, and the spawn reads the cause from the report. A report that
+/// cannot be written is `Err` with its errno too: a child whose report the parent cannot read must not
+/// run its program, because a missing report is the parent's proof that it never ran.
+///
+/// Waits for nothing.
 ///
 /// # Safety
-/// As [`place_self_in_cgroup_pre_exec`], in a forked child only.
+/// As [`place_self_in_cgroup`], called in the spawn core's child only (as a step: see
+/// [`Reporter::report`]).
 #[cfg(target_os = "linux")]
-pub(crate) unsafe fn placement_hook(procs_fd: RawFd, slot: ReportSlot) -> io::Result<()> {
-    // Safety: the caller's guarantee: this is the forked child.
-    unsafe { slot.close_parents_end() };
+pub(crate) unsafe fn placement_step(procs_fd: RawFd, refusing: bool, reporter: Reporter) -> io::Result<()> {
     // Safety: the caller's guarantee.
-    match unsafe { place_self_in_cgroup_pre_exec(procs_fd, slot) } {
-        // Safety: `_exit` is async-signal-safe, and runs nothing of this process's.
-        Err(e) if e.raw_os_error() == Some(libc::ECANCELED) => unsafe { libc::_exit(ABANDONED_EXIT) },
-        // Safety: as above.
-        Err(_) if slot.refusing => unsafe { libc::_exit(REFUSED_EXIT) },
-        // Safety: as above.
-        Err(_) => unsafe { libc::_exit(UNSENT_EXIT) },
-        ok => ok,
+    let report = unsafe { place_self_in_cgroup(procs_fd) };
+    // Safety: the caller's guarantee.
+    let reported = unsafe { reporter.report(report) };
+    reported.map_err(io::Error::from_raw_os_error)?;
+    if refusing && report != REPORT_PLACED {
+        return Err(io::Error::from_raw_os_error(i32::from(report)));
     }
+    Ok(())
 }
 
 /// Place the calling process into the pre-created cgroup leaf by writing `"0"`
-/// to `procs_fd`, then close the fd so it does not propagate to grandchildren.
-///
-/// Called inside a `pre_exec` closure (post-fork, pre-exec), whose `Err` aborts the spawn. It is
-/// the child's half of the placement exchange (see the module's contract): it sends its intent,
-/// makes the write, and sends its report.
-///
-/// A failed write (e.g. `EBUSY` when the supervisor's cgroup is itself a leaf — the "no internal
-/// processes" rule) returns `Ok`: the child proceeds in the process group already set up, and the
-/// parent degrades on the report. So does a parent that decided without the exchange: the child
-/// then skips whatever of it is left. `Err` is a spawn the parent abandoned (`ECANCELED`), or a
-/// message that could not be sent: a parent still waiting for it would misread the child for its
-/// whole life, so the spawn fails instead.
-///
-/// A [`refusing`](ReportSlot::refusing) slot's failed write is an `Err` too, with its errno, after
-/// the report is sent: the program never runs, and the parent reads the cause from the report.
+/// to `procs_fd`, then close the fd so it does not propagate to grandchildren. Returns what the child
+/// reports: [`REPORT_PLACED`] (0) for a write of the whole `"0"`, else the write's errno.
 ///
 /// # Safety
-/// Must be called only from a `pre_exec` closure. `procs_fd` must be a valid,
-/// open, writable fd in the child process, and `slot`'s channel must still be open.
+/// Must be called only in a forked child, before its `exec`. `procs_fd` must be a valid,
+/// open, writable fd in the child process.
 /// Async-signal-safe: raw `libc` syscalls, no allocation, no format strings.
 #[cfg(target_os = "linux")]
-pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: ReportSlot) -> io::Result<()> {
+pub(crate) unsafe fn place_self_in_cgroup(procs_fd: RawFd) -> u16 {
     static ZERO: &[u8] = b"0";
-    let abandoned = || io::Error::from_raw_os_error(libc::ECANCELED);
-    // The intent goes first, before the leaf is touched: a child the parent has abandoned never
-    // enters it.
-    // Safety: the caller guarantees the slot's channel is open.
-    let intent = unsafe { slot.send_intent() };
-    if !matches!(intent, Ok(Delivery::Queued)) {
-        // Safety: procs_fd is valid; close is async-signal-safe.
-        unsafe { libc::close(procs_fd) };
-        return match intent? {
-            Delivery::Abandoned => Err(abandoned()),
-            _ => Ok(()),
-        };
-    }
     // Test-only fault seam: a write that returns this instead of writing (take semantics — see
     // `fault`), so a failed placement leaves the child out of the leaf, as a real one does.
     #[cfg(test)]
@@ -1967,24 +1901,15 @@ pub(crate) unsafe fn place_self_in_cgroup_pre_exec(procs_fd: RawFd, slot: Report
     // Always close the fd — even on error — so it does not propagate to children.
     // Safety: procs_fd is valid; close is async-signal-safe.
     unsafe { libc::close(procs_fd) };
-    let report = match ret {
+    match ret {
         // Only the whole write is a placement.
         _ if ret == ZERO.len() as isize => REPORT_PLACED,
-        // `write(2)` only ever sets a positive errno, but a report of -1 means "placed", so a
+        // `write(2)` only ever sets a positive errno, but a report of 0 means "placed", so a
         // nonsensical value is mapped to EIO rather than read back as a fabricated placement.
-        -1 if errno > 0 => errno,
+        // An errno fits 16 bits.
+        -1 if errno > 0 && errno <= i32::from(u16::MAX) => errno as u16,
         // A write that returned without writing (0) sets no errno.
-        _ => libc::EIO,
-    };
-    // Safety: the caller guarantees the slot's channel is open.
-    match unsafe { slot.send_report(report) }? {
-        Delivery::Abandoned => Err(abandoned()),
-        // A refusing slot's child stops here: the report is sent, and the parent reads the cause
-        // from it. `placement_hook` turns this `Err` into an exit.
-        Delivery::Queued | Delivery::Decided if slot.refusing && report != REPORT_PLACED => {
-            Err(io::Error::from_raw_os_error(report))
-        }
-        Delivery::Queued | Delivery::Decided => Ok(()),
+        _ => libc::EIO as u16,
     }
 }
 

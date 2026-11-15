@@ -111,7 +111,7 @@ pub(in crate::elevation::shim) fn spawn(
             fork,
             program,
             &[],
-            &mut || steps(prepared),
+            &mut |_| steps(prepared),
             crate::elevation::shim::codes::NOT_EXECUTED,
         )
     }

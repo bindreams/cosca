@@ -3069,6 +3069,9 @@ enum ChildReport {
     /// The write failed with this errno, which the child reported.
     WriteFailedWith(i32),
     NotReported,
+    /// The spawn could not read the child's status channel (this errno), so what the child reported is
+    /// not known.
+    Unknown(i32),
 }
 
 /// Run the decision for a leaf at `leaf_path` whose child reported `report`, for a root that asked
@@ -3085,25 +3088,14 @@ fn decide_for(
     leaf_path: &std::path::Path,
     report: ChildReport,
 ) -> Result<crate::containment::Tree, super::AttachFailure> {
-    use crate::containment::cgroup::{place_self_in_cgroup_pre_exec, CgroupLeaf};
+    use crate::containment::cgroup::{CgroupLeaf, PlacementReport};
 
-    let leaf = CgroupLeaf::for_test_at(leaf_path.to_path_buf());
+    let mut leaf = CgroupLeaf::for_test_at(leaf_path.to_path_buf());
     match report {
-        // SAFETY: the slot's pipe lives as long as `leaf`.
-        ChildReport::Placed => unsafe { leaf.placement_slot().report_placed_for_test() },
-        ChildReport::WriteFailed => {
-            // SAFETY: fd -1 is never writable, so the write fails with EBADF; closing -1 is a
-            // no-op. The slot's pipe lives as long as `leaf`.
-            _ = unsafe { place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
-        }
-        ChildReport::WriteFailedWith(errno) => {
-            crate::containment::cgroup::fault::set_force_placement_write_result(
-                crate::containment::cgroup::fault::ForcedWrite::FailsWith(errno),
-            );
-            // SAFETY: fd -1 is never writable, and the forced result stands for its write; closing -1
-            // is a no-op. The slot's pipe lives as long as `leaf`.
-            _ = unsafe { place_self_in_cgroup_pre_exec(-1, leaf.placement_slot()) };
-        }
+        ChildReport::Placed => leaf.record_placement(PlacementReport::Placed),
+        ChildReport::WriteFailed => leaf.record_placement(PlacementReport::WriteFailed(libc::EBADF)),
+        ChildReport::WriteFailedWith(errno) => leaf.record_placement(PlacementReport::WriteFailed(errno)),
+        ChildReport::Unknown(errno) => leaf.record_placement(PlacementReport::Unknown(errno)),
         ChildReport::NotReported => {}
     }
     let prepared = super::Prepared {
@@ -3294,51 +3286,110 @@ fn an_unreported_child_fails_the_attach_in_every_mode() {
     }
 }
 
-/// A child whose placement report cannot be sent stops in its hook, before `exec`, and sent no
-/// report, so the spawn fails as one that did not start, under `BestEffort` too: the program never
-/// ran.
+/// A child whose report the spawn could not read may or may not be in its leaf (and, under `BestEffort`,
+/// in the process group instead), so the attach builds no containment on it, in any mode: it fails as a
+/// spawn that may have started, naming the leaf and keeping the read's errno as its source, and the leaf is
+/// killed through, since nothing proves it holds nothing of the child's.
+///
+/// Mutants: the attach builds the cgroup tree on it (`Ok`); a `BestEffort` attach degrades to the process
+/// group and removes the leaf unkilled; the failure is a not-started one; the leaf is not written
+/// `cgroup.kill`; the read's errno is lost; the child's process group is not killed (a `BestEffort`
+/// child that exec'd outside the leaf may have forked into it); a refused group kill is dropped
+/// instead of going into the failure's `cleanup`.
+#[cfg(target_os = "linux")]
+#[skuld::test(labels = [crate::test_harness::CGROUP])]
+fn an_unreadable_report_fails_the_attach_and_kills_through_the_leaf() {
+    for mode in [
+        crate::containment::ContainMode::Strongest,
+        crate::containment::ContainMode::BestEffort,
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf_path = occupied_leaf_for_test(dir.path(), "cosca-unknown-report-leaf");
+
+        // The test's own process stands in for the child: its group is not sent anything, the kernel's
+        // refusal is answered in its place.
+        let refused = crate::containment::unix::fault::refuse_group_sends();
+        let capture = crate::send_log::Capture::start();
+        let failure = decide_for(mode, &leaf_path, ChildReport::Unknown(libc::EISDIR))
+            .expect_err("a child whose placement is unknown has no containment built on it");
+        let steps = capture.group_steps();
+        drop((refused, capture));
+
+        assert_eq!(
+            steps,
+            [crate::send_log::GroupStep::Group(
+                crate::send_log::Route::Pidfd,
+                libc::SIGKILL
+            )],
+            "{mode:?}: the child's process group is killed through its pidfd"
+        );
+        let cleanup = failure
+            .cleanup
+            .as_ref()
+            .expect("the refused group kill is the cleanup's");
+        assert_eq!(cleanup.iter().len(), 1, "{mode:?}: {cleanup:?}");
+        assert_eq!(
+            crate::error::first_os_code(cleanup.first().as_ref()),
+            Some(libc::EPERM),
+            "{mode:?}: {cleanup:?}"
+        );
+
+        assert!(!failure.not_started, "{mode:?}: the program may have run: {failure:?}");
+        let crate::error::Error::Containment { detail, .. } = &failure.cause else {
+            panic!("{mode:?}: {failure:?}");
+        };
+        assert_eq!(
+            detail,
+            &format!(
+                "cgroup v2: the spawn could not read the child's status channel, so it is not known whether \
+                 the child entered its leaf cgroup {}; the child is torn down",
+                leaf_path.display()
+            ),
+            "{mode:?}"
+        );
+        assert_eq!(
+            crate::error::first_os_code(&failure.cause),
+            Some(libc::EISDIR),
+            "{mode:?}"
+        );
+        assert_eq!(
+            std::fs::read(leaf_path.join("cgroup.kill")).expect("read cgroup.kill"),
+            b"1",
+            "{mode:?}: the leaf is killed through: nothing proves it holds nothing of the child's"
+        );
+    }
+}
+
+/// A child whose placement is unknown may be in its process group as well as in its leaf, so the group is
+/// its containment too: a failed spawn's group kill is owed (`group_is_containment`), where a child
+/// the leaf provably holds is the leaf's alone.
+///
+/// Mutant: an unknown placement is taken as the leaf's.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn an_unsent_report_fails_a_best_effort_attach_as_a_spawn_that_did_not_start() {
-    use crate::containment::cgroup::test_support::{fork_running, handle_of, pidfd_of, unsendable};
-    use crate::containment::cgroup::{placement_hook, CgroupLeaf};
+fn a_child_of_unknown_placement_has_its_group_as_containment() {
+    use crate::containment::cgroup::{CgroupLeaf, PlacementReport};
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let leaf_path = dir.path().join("cosca-decision-leaf");
-    std::fs::create_dir(&leaf_path).expect("create the leaf");
-    let leaf = CgroupLeaf::for_test_at(leaf_path.clone());
-    let slot = unsendable(leaf.placement_slot());
-    let guard = fork_running(&[], move || {
-        // SAFETY: this is the forked child; the descriptors are deliberately not open.
-        _ = unsafe { placement_hook(-1, slot) };
-    });
-    let pid = guard.defuse();
-    let pidfd = pidfd_of(pid);
-    let prepared = super::Prepared {
-        mode: Some(crate::containment::ContainMode::BestEffort),
-        is_root: true,
-        cgroup_leaf: Some(leaf),
-    };
-
-    let result = super::attach_tree(
-        pid,
-        Ok(crate::identity::ProcessId::current()),
-        handle_of(pid, &pidfd),
-        prepared,
-    );
-
-    let mut status = 0;
-    // SAFETY: `pid` is this process's own child; `status` is a valid, writable int.
-    assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, 0) }, pid as i32);
-    let failure = result.expect_err("an unsent report fails the attach");
-    assert!(failure.not_started, "the program never ran: {failure:?}");
-    assert!(
-        matches!(failure.cause, crate::error::Error::Containment { .. }),
-        "{failure:?}"
-    );
-    let said = crate::error::Report(&failure.cause).to_string();
-    assert!(said.contains("did not report its placement"), "{said}");
-    assert!(!leaf_path.exists(), "the failed attach must remove the leaf it created");
+    for (report, group_is_containment) in [
+        (PlacementReport::Placed, false),
+        (PlacementReport::Unknown(libc::EIO), true),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf_path = dir.path().join("cosca-group-leaf");
+        std::fs::create_dir(&leaf_path).expect("create the leaf");
+        let mut leaf = CgroupLeaf::for_test_at(leaf_path);
+        leaf.record_placement(report);
+        let mut prepared = super::Prepared {
+            mode: Some(crate::containment::ContainMode::BestEffort),
+            is_root: true,
+            cgroup_leaf: Some(leaf),
+        };
+        let pidfd = crate::containment::cgroup::test_support::pidfd_of(std::process::id());
+        let handle = crate::containment::cgroup::test_support::handle_of(std::process::id(), &pidfd);
+        // This test's own process stands in for the child: the verdict is taken, nothing is signalled.
+        prepared.settle_verdict(handle);
+        assert_eq!(prepared.group_is_containment(), group_is_containment, "{report:?}");
+    }
 }
 
 /// Removing a leaf the child never entered must never write `cgroup.kill`, even when the leaf

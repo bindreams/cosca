@@ -576,9 +576,8 @@ fn routes_to_raw_backend_answers_for_executables_and_high_descriptors() {
     assert!(super::routes_to_raw_backend(&both));
 }
 
-/// A spawn whose identity check fails ends the leaf's placement exchange before it kills the child:
-/// the leaf then answers only for the tree, as it does after an attach failure, and the kill never
-/// races the exchange's reads.
+/// A spawn whose identity check fails takes the leaf's placement verdict before it kills the child:
+/// the leaf then answers only for the tree, as it does after an attach failure.
 ///
 /// Mutant: the identity-failure arm settles the verdict after the kill, or not at all.
 #[cfg(target_os = "linux")]

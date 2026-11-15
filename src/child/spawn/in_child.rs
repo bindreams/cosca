@@ -8,15 +8,15 @@
 //!    the directory of `current_dir` too);
 //! 3. Linux: the new process group (`setpgid`), then `SIGPIPE` back to its default, in std's order;
 //! 4. `setsid` (session containment);
-//! 5. cgroup self-placement (Linux), whose `cgroup.procs` descriptor, and the channel it reports
-//!    through, a later `dup2` could replace: the write would then miss, silently downgrading
-//!    `CgroupV2` to a process group, or put a stray "0" into the caller's descriptor;
+//! 5. cgroup self-placement (Linux), whose `cgroup.procs` descriptor a later `dup2` could replace: the
+//!    write would then miss, silently downgrading `CgroupV2` to a process group, or put a stray "0"
+//!    into the caller's descriptor;
 //! 6. keep the fd marker open across `exec` (macOS);
 //! 7. the fd map's `dup2`s, last, so they cannot replace a descriptor an earlier step still needs.
 //!
 //! On Linux the first step that fails is a record on the core's status channel, whose write end is on
-//! none of the numbers the fd map `dup2`s onto (`InChild::mapped_fds`); cgroup self-placement
-//! `_exit`s from the hook and reports through its own channel (see `containment::cgroup::placement_hook`).
+//! none of the numbers the fd map `dup2`s onto (`InChild::mapped_fds`); cgroup self-placement reports
+//! its outcome as a record on the same channel (see `containment::cgroup::placement_step`).
 //! On macOS the steps are one `pre_exec` hook of std's, and a failure goes through std's error channel.
 //!
 //! On macOS a command with no step gets no hook, so std is free to take its `posix_spawn` route.
@@ -32,7 +32,7 @@ use std::os::unix::process::CommandExt;
 
 use super::fd_map;
 #[cfg(target_os = "linux")]
-use crate::containment::cgroup::ReportSlot;
+use super::fork_exec::Reporter;
 
 /// The in-child steps of one spawn. Every field is made in the parent, so running them allocates
 /// nothing.
@@ -49,11 +49,48 @@ pub(crate) struct InChild {
     #[cfg(target_os = "linux")]
     sigpipe_default: bool,
     session: bool,
+    /// Linux: the `cgroup.procs` descriptor, and whether a failed write ends the child.
     #[cfg(target_os = "linux")]
-    placement: Option<(RawFd, ReportSlot)>,
+    placement: Option<(RawFd, bool)>,
     #[cfg(target_os = "macos")]
     preserved: Vec<OwnedFd>,
     fd_map: Option<fd_map::Plan>,
+}
+
+/// The step of [`InChild::run`] that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    #[cfg(target_os = "linux")]
+    Stdio,
+    Enter,
+    #[cfg(target_os = "linux")]
+    ProcessGroup,
+    #[cfg(target_os = "linux")]
+    SigpipeDefault,
+    Session,
+    #[cfg(target_os = "linux")]
+    Placement,
+    #[cfg(target_os = "macos")]
+    Preserve,
+    FdMap,
+}
+
+impl Step {
+    /// This step's failure with `error`.
+    fn failed(self, error: io::Error) -> StepError {
+        StepError { step: self, error }
+    }
+}
+
+/// The failure of a step of [`InChild::run`]: the step, and its error.
+#[derive(Debug)]
+pub(crate) struct StepError {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only the Linux spawn reports which step failed")
+    )]
+    pub(super) step: Step,
+    pub(super) error: io::Error,
 }
 
 impl InChild {
@@ -91,15 +128,16 @@ impl InChild {
         self.session = true;
     }
 
-    /// Place the child in its cgroup leaf; see `containment::cgroup::placement_hook`.
+    /// Place the child in its cgroup leaf and report it on the status channel; see
+    /// `containment::cgroup::placement_step`. `refusing`: a failed write ends the child before its `exec`.
     ///
     /// # Safety
     ///
-    /// `procs_fd` must stay open, and `slot`'s channel open, until the command has spawned.
+    /// `procs_fd` must stay open until the command has spawned.
     #[cfg(target_os = "linux")]
-    pub(crate) unsafe fn place(&mut self, procs_fd: RawFd, slot: ReportSlot) {
+    pub(crate) unsafe fn place(&mut self, procs_fd: RawFd, refusing: bool) {
         debug_assert!(self.placement.is_none(), "a spawn places its child once");
-        self.placement = Some((procs_fd, slot));
+        self.placement = Some((procs_fd, refusing));
     }
 
     /// Keep `fd` open across `exec` at its own number, in the child only.
@@ -125,7 +163,7 @@ impl InChild {
         let mut steps = self;
         // SAFETY: every step makes only raw syscalls on values made before the fork, and allocates
         // nothing; see `run`.
-        unsafe { cmd.pre_exec(move || steps.run()) };
+        unsafe { cmd.pre_exec(move || steps.run().map_err(|failed| failed.error)) };
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -144,12 +182,13 @@ impl InChild {
         enter.is_none() && !session && other && fd_map.is_none()
     }
 
-    /// Runs in the forked child: every step in the module's order, stopping at the first failure.
-    /// Bound by the child's contract in `child::spawn::fork_exec` on Linux.
-    pub(super) fn run(&mut self) -> io::Result<()> {
+    /// Runs in the forked child: every step in the module's order, stopping at the first failure, which
+    /// names its step. Bound by the child's contract in `child::spawn::fork_exec` on Linux, where the steps
+    /// report on the core's channel through `reporter`.
+    pub(super) fn run(&mut self, #[cfg(target_os = "linux")] reporter: Reporter) -> Result<(), StepError> {
         #[cfg(target_os = "linux")]
         if let Some(plan) = &mut self.stdio {
-            plan.apply()?;
+            plan.apply().map_err(|error| Step::Stdio.failed(error))?;
         }
         if let Some(dir) = &self.enter {
             #[expect(
@@ -160,36 +199,37 @@ impl InChild {
             // SAFETY: `chdir` is async-signal-safe, and `dir` was allocated before the fork.
             let status = unsafe { libc::chdir(dir.as_ptr()) };
             if status != 0 {
-                return Err(io::Error::last_os_error());
+                return Err(Step::Enter.failed(io::Error::last_os_error()));
             }
         }
         // std's own order: the process group, then `SIGPIPE`.
         // SAFETY: `setpgid` is async-signal-safe.
         #[cfg(target_os = "linux")]
         if self.process_group && unsafe { libc::setpgid(0, 0) } == -1 {
-            return Err(io::Error::last_os_error());
+            return Err(Step::ProcessGroup.failed(io::Error::last_os_error()));
         }
         #[cfg(target_os = "linux")]
         if self.sigpipe_default {
             // SAFETY: `signal` of a disposition that is not a handler is async-signal-safe.
             if unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) } == libc::SIG_ERR {
-                return Err(io::Error::last_os_error());
+                return Err(Step::SigpipeDefault.failed(io::Error::last_os_error()));
             }
         }
         // EPERM if the child already leads a session.
         // SAFETY: `setsid` is async-signal-safe.
         if self.session && unsafe { libc::setsid() } == -1 {
-            return Err(io::Error::last_os_error());
+            return Err(Step::Session.failed(io::Error::last_os_error()));
         }
         #[cfg(target_os = "linux")]
-        if let Some((procs_fd, slot)) = self.placement {
-            // SAFETY: this is the forked child, and `place`'s caller keeps both descriptors open.
-            unsafe { crate::containment::cgroup::placement_hook(procs_fd, slot) }?;
+        if let Some((procs_fd, refusing)) = self.placement {
+            // SAFETY: this is the forked child, and `place`'s caller keeps the descriptor open.
+            unsafe { crate::containment::cgroup::placement_step(procs_fd, refusing, reporter) }
+                .map_err(|error| Step::Placement.failed(error))?;
         }
         #[cfg(target_os = "macos")]
-        fd_map::preserve(&self.preserved)?;
+        fd_map::preserve(&self.preserved).map_err(|error| Step::Preserve.failed(error))?;
         if let Some(plan) = &mut self.fd_map {
-            plan.apply()?;
+            plan.apply().map_err(|error| Step::FdMap.failed(error))?;
         }
         Ok(())
     }
@@ -208,6 +248,16 @@ pub(crate) fn register_alone<R>(cmd: &mut std::process::Command, add: impl FnOnc
 /// `steps` as the child's steps, in this process's environment. The spawn's error is the `io::Error` of its errno.
 #[cfg(all(test, target_os = "linux"))]
 pub(super) fn spawn_sh(script: &str, steps: &mut InChild) -> io::Result<super::fork_spawn::Started> {
+    spawn_sh_placed(script, steps, None)
+}
+
+/// [`spawn_sh`] for a child with a cgroup `leaf`, on which the spawn records the child's placement report.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn spawn_sh_placed(
+    script: &str,
+    steps: &mut InChild,
+    leaf: Option<&mut crate::containment::cgroup::CgroupLeaf>,
+) -> io::Result<super::fork_spawn::Started> {
     use std::ffi::OsStr;
 
     let argv = [OsStr::new("sh"), OsStr::new("-c"), OsStr::new(script)];
@@ -220,7 +270,7 @@ pub(super) fn spawn_sh(script: &str, steps: &mut InChild) -> io::Result<super::f
         super::fork_spawn::OnFailure {
             policy: super::policy::SpawnPolicy::SYNC,
             front: None,
-            placement: None,
+            placement: leaf,
             refusing_placement: false,
         },
         &lock,

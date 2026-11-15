@@ -22,7 +22,7 @@
 //!
 //! Nor does it mean the child has reported yet. With two of this process's fds 0 to 2 closed, std's
 //! close-on-exec pipe takes one of the child's stdio numbers, so std returns before the child's
-//! hooks run (see `crate::containment::cgroup::channel::ReportChannel`), and a failed `exec` is
+//! hooks run, and a failed `exec` is
 //! invisible to it. [`Channel::run`] checks for that condition before the spawn, and every id from
 //! such a spawn is [`Report::Late`], whether or not it beat the parent's first read: the program may
 //! have started and std's own spawn is not trusted, so the spawn tears the child down through its
