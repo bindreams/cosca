@@ -196,7 +196,7 @@ fn a_leaf_drained_past_1s_after_a_failed_attach_warns_once(
         let release = Rc::clone(&release);
         move || release()
     });
-    let _backstop = leaf_fault::set_before_drain_block({
+    let _backstop = crate::wait::block_probe::on_drain_block({
         let release = Rc::clone(&release);
         move || release()
     });

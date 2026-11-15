@@ -50,9 +50,6 @@ thread_local! {
 /// whatever kind, so no wait there can hold the test, and counts as the failure only an unbounded
 /// exit wait (a `WaitObject::Handles` block armed `None`, the one a wait run on the pool by mistake
 /// makes): the test fails by asserting [`PoolBlocks::assert_none`] after its join.
-///
-/// The hook is armed on every pool thread, so a wait that calls `spawn_blocking` directly is
-/// watched too.
 #[cfg(windows)]
 pub(crate) fn watched_pool_runtime(held: Vec<Parked>) -> (::tokio::runtime::Runtime, PoolBlocks) {
     use crate::wait::block_probe::{on_each_block, WaitObject};

@@ -146,7 +146,7 @@ impl DrainWatch {
                 return Ok(());
             }
             #[cfg(test)]
-            super::fault::notify_drain_blocking();
+            crate::wait::block_probe::blocking(None, crate::wait::block_probe::WaitObject::Drain);
             let mut fds = [PollFd::from_borrowed_fd(self.fd.as_fd(), PollFlags::IN)];
             crate::wait::poll_ready(&mut fds).map_err(|e| Error::Io(e.into()))?;
             self.consume()?;

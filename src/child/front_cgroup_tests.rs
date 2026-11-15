@@ -174,7 +174,7 @@ type Once = Box<dyn FnOnce()>;
 #[must_use = "dropping this disarms the release"]
 pub(crate) struct KillRelease {
     _after_write: crate::oneshot_hook::Armed,
-    _before_drain: crate::oneshot_hook::Armed,
+    _before_drain: crate::wait::block_probe::Armed,
     _before_wait: crate::oneshot_hook::Armed,
     observed: Rc<RefCell<Vec<(u32, OwnedFd)>>>,
     ended: Rc<RefCell<Option<Released>>>,
@@ -220,7 +220,7 @@ pub(crate) fn release_by_cgroup_kill_and_at_wait(
         let fire = Rc::clone(&fire);
         move || fire(true)
     });
-    let before_drain = crate::containment::cgroup::fault::set_before_drain_block({
+    let before_drain = crate::wait::block_probe::on_drain_block({
         let fire = Rc::clone(&fire);
         move || fire(false)
     });

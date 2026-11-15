@@ -334,13 +334,11 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
     tracer.wait().expect("reap the stand-in tracer");
 }
 
-/// What [`on_rounds`] saw: for each round whose hook staged a wake, the round's index and whether the
-/// wait's kqueue held an event at the block (`ready()`). Empty until a round stages one, so a wait that
-/// never blocks leaves it empty too.
+/// For each round whose hook staged a wake: its index and whether the wait's kqueue held an event at
+/// the block (`ready()`).
 #[derive(Clone, Default)]
 pub(super) struct Looks(std::rc::Rc<std::cell::RefCell<Vec<Look>>>);
 
-/// A round's index and what its look found.
 type Look = (u32, Option<bool>);
 
 impl Looks {
@@ -388,9 +386,8 @@ pub(super) fn on_rounds(mut hook: impl FnMut(u32) -> bool + 'static) -> (crate::
 ///
 /// Each staged wake is looked at, at its block (`on_rounds`). Round 0's ordering edge is the `kill(2)`:
 /// XNU's `psignal_internal` posts `NOTE_SIGNAL` to the target's knotes before it returns, ahead of any
-/// disposition check (`kern_sig.c:2126`). Round 1's is `wait_until_zombie` on the stand-in: a process's
-/// `NOTE_EXIT` is posted before it is a zombie (`kern_exit.c:2562` against `:2631`, as in
-/// `await_reapable_tests`); its `SIGCHLD` lands on the wait's kqueue too, so round 1's look says that
+/// disposition check. Round 1's is `wait_until_zombie` on the stand-in: a process's `NOTE_EXIT` is
+/// posted before it is a zombie (as in `await_reapable_tests`); its `SIGCHLD` lands on the wait's kqueue too, so round 1's look says that
 /// the wait has an event to wake on, not which.
 ///
 /// Mutant: the wait registers no `NOTE_SIGNAL` on the child: round 0's look finds nothing.
@@ -448,7 +445,7 @@ fn started_by_us_traced_by(tracer: u32) -> (libc::pid_t, libc::pid_t) {
 ///
 /// The staged wake is looked at, at its block (`on_rounds`). The ordering edge is the `kill(2)`: XNU's
 /// `psignal_internal` posts `NOTE_SIGNAL` to the target's knotes before it returns, ahead of any
-/// disposition check (`kern_sig.c:2126`). The signal goes to the second blocker, not to this process,
+/// disposition check. The signal goes to the second blocker, not to this process,
 /// so no other event is on the wait's kqueue: a look that finds one is the registration.
 ///
 /// Mutant: the walk stops at the child's tracer: round 0's look finds nothing.

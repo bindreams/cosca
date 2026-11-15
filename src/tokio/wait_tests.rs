@@ -309,7 +309,8 @@ async fn exited_by_id_resolves_immediately_on_an_identity_mismatch() {
 }
 
 /// The async cgroup drain wait wakes when the leaf is removed, even with no event on
-/// `cgroup.events` — the removal can cancel the one notification a drain sends.
+/// `cgroup.events` — the removal can cancel the one notification a drain sends. A missed wake
+/// hangs this test: #985 row A1.
 #[cfg(target_os = "linux")]
 #[skuld::test(labels = [crate::test_harness::CGROUP])]
 async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_populated_event() {
@@ -318,26 +319,11 @@ async fn cgroup_wait_tree_drained_wakes_when_the_leaf_is_removed_without_a_popul
 
     let fake = FakeLeaf::new("cosca-async-removed-while-waited", true);
     let removed = fake.leaf.clone();
-    let (blocking_tx, blocking_rx) = std::sync::mpsc::channel::<()>();
-    // Loops on `recv` rather than returning after the first, so its receiver stays alive for as
-    // long as the notifier is installed: `drain_step` can legally re-block (a spurious wake, or
-    // the removal notification racing a stale re-read) before this wait ever completes, and a
-    // send with no live receiver by then is a contract violation `notify_drain_blocking`
-    // debug-asserts against.
-    let remover = std::thread::spawn(move || {
-        let mut removed_once = false;
-        while blocking_rx.recv().is_ok() {
-            if !removed_once {
-                FakeLeaf::remove(&removed);
-                removed_once = true;
-            }
-        }
-    });
-    crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking_tx);
+    // One-shot: `drain_step` can legally re-block (a spurious wake, or the removal notification
+    // racing a stale re-read), and the leaf is gone by then.
+    let _remover = crate::wait::block_probe::on_drain_block(move || FakeLeaf::remove(&removed));
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(fake.leaf.clone());
     let drained = crate::containment::drain_edge::cgroup_wait_tree_drained(&leaf, None).await;
-    crate::containment::cgroup::fault::take_drain_blocking_notifier();
-    remover.join().expect("remover");
 
     assert_eq!(drained.expect("wait"), TreeDrain::AllMembersExited);
 }

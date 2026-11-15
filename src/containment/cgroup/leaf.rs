@@ -629,7 +629,7 @@ impl CgroupLeaf {
                     deadline: None,
                 } => {
                     #[cfg(test)]
-                    crate::wait::block_probe::blocking(None, crate::wait::block_probe::WaitObject::Listener);
+                    crate::wait::block_probe::blocking(None, crate::wait::block_probe::WaitObject::Drain);
                     listener.wait();
                     #[cfg(test)]
                     fault::notify_wait_site_park(fault::WaitSitePark {
@@ -647,7 +647,7 @@ impl CgroupLeaf {
                     #[cfg(test)]
                     crate::wait::block_probe::blocking(
                         Some(at.saturating_duration_since(std::time::Instant::now())),
-                        crate::wait::block_probe::WaitObject::Listener,
+                        crate::wait::block_probe::WaitObject::Drain,
                     );
                     #[cfg(test)]
                     let call_start = std::time::Instant::now();
@@ -707,8 +707,6 @@ impl CgroupLeaf {
         if let Some(drain) = self.drain_seen()? {
             return Ok(DrainStep::Done(drain));
         }
-        #[cfg(test)]
-        fault::notify_drain_blocking();
         Ok(DrainStep::Block { listener, deadline })
     }
 

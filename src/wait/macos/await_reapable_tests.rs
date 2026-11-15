@@ -258,7 +258,7 @@ const MARKER_KNOTE: &str = "COSCA_TESTCFG_AWAIT_KNOTE";
 /// After the round that delivered `NOTE_EXIT`, no `EVFILT_PROC` event arrives again: the knote is
 /// registered with `EV_CLEAR`, so a backoff `kevent` blocks for its interval rather than
 /// re-activating at once. (An `EVFILT_SIGNAL` event may legitimately land later: `NOTE_EXIT`
-/// posts before `SZOMB` and the `SIGCHLD`, `kern_exit.c:2562` against `:2631`, `:2637`.)
+/// posts before `SZOMB` and the `SIGCHLD`.)
 ///
 /// Mutant: the knote registered without `EV_CLEAR`.
 #[skuld::test]
@@ -336,7 +336,7 @@ const MARKER_ESRCH: &str = "COSCA_TESTCFG_AWAIT_ESRCH";
 /// A registration that got `ESRCH` sends the wait to its backoff, and the backoff follows the
 /// kernel, not the `SIGCHLD` disposition: the disposition is flipped between re-peeks (default to
 /// `SIG_IGN`, and back), and the wait ends with whichever verdict the kernel produced, `Reapable`
-/// if the zombie is there and `Gone` if XNU reaped the child itself (`kern_exit.c:2577`).
+/// if the zombie is there and `Gone` if XNU reaped the child itself.
 ///
 /// Mutant: a wait that decides from the disposition it saw when it started.
 #[skuld::test]
@@ -395,7 +395,7 @@ fn a_macos_esrch_wait_follows_the_kernel_not_the_disposition() {
 /// sibling XNU sends no `SIGCHLD`, and nothing else would wake the kqueue.
 ///
 /// The block's hook ends the child, waits until the kernel has reaped it itself (`NOTE_EXIT` is
-/// posted before that reap, `kern_exit.c:2562` against `:2577-2601`), and looks at the wait's kqueue:
+/// posted before that reap), and looks at the wait's kqueue:
 /// the `NOTE_EXIT` must be on it. A look that finds nothing is ended by a byte on a pipe the test
 /// registered on the same kqueue, so the assertion on the look fails instead of the wait blocking.
 ///

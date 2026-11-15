@@ -7,6 +7,8 @@ use crate::containment::cgroup::test_support::{
 use crate::containment::cgroup::{DrainStep, LeafError, NotEntered, NotPlaced, PlacementReport, WithoutChild};
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
+#[cfg(target_os = "linux")]
+use crate::wait::block_probe::{on_drain_block, on_each_drain_block};
 
 // removed_after_drain tests -----
 // Linux-only: the function itself is `#[cfg(target_os = "linux")]` (it interprets raw kernel
@@ -248,6 +250,9 @@ fn wait_drained_terminates_under_a_frozen_clock() {
 /// real park at `wait_drained`'s `Block` arm — proven by counting the pump's changed batches
 /// (`fault::set_pump_batch_notifier`) against every park that woke, not just that the wait call
 /// returned.
+///
+/// Precondition on the kernel (cgroup-v2.rst): a `populated` flip generates a modify event on
+/// `cgroup.events`; not asserted here. A missed wake hangs this test: #985 row A1.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _group: &Group) {
@@ -370,10 +375,10 @@ fn cgroup_wait_drained_tracks_two_real_members_through_exit(#[fixture(cgroup)] _
     // Both gone: an UNBOUNDED wait_drained blocks on the real kernel `populated` 1→0 edge — the
     // "external event that might never happen" case the crate's no-sleep-sync rule allows a real
     // wait for. Made deterministic without timing: run the wait on its own thread, and kill and
-    // reap the last member only once that thread's own `drain_blocking` signal proves it armed a
+    // reap the last member only once that thread's own `signal_when_drain_blocks` signal proves it armed a
     // listener while the leaf still read populated — a real rendezvous, not a race against how
-    // fast the kernel clears `populated` relative to `wait()` returning. A missed wake then hangs
-    // until the suite slow-timeout, not a duration this test invented.
+    // fast the kernel clears `populated` relative to `wait()` returning. The wait has no end this
+    // test controls, so a wake that never arrives is not an assertion here.
     let (rendezvous_tx, rendezvous_rx) = mpsc::channel();
     let (result, parks, zero_remainings) = std::thread::scope(|scope| {
         let handle = scope.spawn(|| {
@@ -1754,31 +1759,7 @@ fn drop_kills_only_a_leaf_its_child_entered_and_that_is_armed() {
 
 // A killed leaf's drain, armed and disarmed -----
 // Each test gives a fake leaf cgroupfs's `rmdir` answers through the rmdir hook, and drives it from
-// another thread that acts only once the drop's drain wait is about to block.
-
-/// Run `act` on another thread each time a drain wait on THIS thread is about to block, until the
-/// returned guard drops. `act` gets the number of the block, from 0.
-#[cfg(target_os = "linux")]
-fn on_each_drain_block(mut act: impl FnMut(usize) + Send + 'static) -> impl Drop {
-    struct Stop(Option<std::thread::JoinHandle<()>>);
-    impl Drop for Stop {
-        fn drop(&mut self) {
-            // Dropping the only sender ends the actor's loop.
-            crate::containment::cgroup::fault::take_drain_blocking_notifier();
-            self.0.take().expect("actor").join().expect("actor thread");
-        }
-    }
-    let (blocking_tx, blocking_rx) = std::sync::mpsc::channel();
-    let actor = std::thread::spawn(move || {
-        let mut n = 0;
-        while blocking_rx.recv().is_ok() {
-            act(n);
-            n += 1;
-        }
-    });
-    crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking_tx);
-    Stop(Some(actor))
-}
+// the thread of the drop's drain wait, as that wait is about to block.
 
 /// An armed `Drop` that kills through its leaf removes it only once the leaf has drained: no
 /// `rmdir` after the `cgroup.kill` write sees `populated 1`.
@@ -1792,7 +1773,7 @@ fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
     let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
     fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
     let events = fake.events.clone();
-    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
+    let actor = on_each_drain_block(move || FakeLeaf::set_populated(&events, false));
 
     fault::record_leaf_steps();
     drop(entered_leaf_at(fake.leaf.clone()));
@@ -1828,7 +1809,7 @@ fn an_armed_drop_removes_its_leaf_only_after_it_drains() {
 /// report the leaf left behind while the kill it already made is still draining.
 ///
 /// Deterministic, no sleeps: `on_each_drain_block` drives the fake leaf's `populated` flag from
-/// another thread, released only once `Drop`'s wait is actually blocked on it.
+/// `Drop`'s own thread, as its wait is about to block.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains() {
@@ -1839,7 +1820,7 @@ fn a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains() {
     let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
     fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
     let events = fake.events.clone();
-    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
+    let actor = on_each_drain_block(move || FakeLeaf::set_populated(&events, false));
 
     let leaf = entered_leaf_at(fake.leaf.clone());
     leaf.disarm();
@@ -1867,13 +1848,15 @@ fn a_disarmed_leaf_whose_tree_was_killed_removes_itself_only_after_it_drains() {
 
 /// An armed `Drop` after a `cgroup.kill` that failed does not write it again: the failure is final,
 /// the leaf is left behind and the failed kill is warned once. The fault fails only the first
-/// write, so a second would be recorded as a kill (and would drain the leaf, so the drop would wait
-/// for it, with nothing to end the wait: the suite slow-timeout bounds it).
+/// write, so a second would be recorded as a kill, and the drop would then wait for the leaf's drain.
+/// A fake leaf nothing drains holds that wait open, so the drop ends it itself, at the moment it is
+/// about to block, and the test sees that it did: the drop's own thread is both the waiter and the
+/// one that ends the wait, so the order between them is the call order.
 ///
 /// Mutant: the armed `Drop` writes `cgroup.kill` again after a failed write.
 #[cfg(target_os = "linux")]
 #[skuld::test]
-fn death_watch_an_armed_drop_after_a_failed_kill_does_not_write_it_again() {
+fn an_armed_drop_after_a_failed_kill_does_not_write_it_again() {
     use crate::containment::cgroup::fault;
     use crate::containment::cgroup::test_support::FakeLeaf;
 
@@ -1882,6 +1865,15 @@ fn death_watch_an_armed_drop_after_a_failed_kill_does_not_write_it_again() {
     let fake = FakeLeaf::new(name, true);
     let (leaf_dir, events) = (fake.leaf.clone(), fake.events.clone());
     fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf_dir, &events));
+    let waited = std::rc::Rc::new(std::cell::Cell::new(false));
+    let events = fake.events.clone();
+    let _release = crate::wait::block_probe::on_drain_block({
+        let waited = std::rc::Rc::clone(&waited);
+        move || {
+            waited.set(true);
+            FakeLeaf::set_populated(&events, false);
+        }
+    });
     let leaf = entered_leaf_at(fake.leaf.clone());
     {
         let _first_write_fails = fault::fail_next_kill_write();
@@ -1893,6 +1885,10 @@ fn death_watch_an_armed_drop_after_a_failed_kill_does_not_write_it_again() {
     let steps = fault::take_leaf_steps();
     fault::take_rmdir_hook();
 
+    assert!(
+        !waited.get(),
+        "the drop waited for a drain, so it wrote cgroup.kill again"
+    );
     assert_eq!(steps, ["rmdir populated 1"], "no second write, and no wait for a drain");
     assert_eq!(fake.kill_written(), b"", "nothing wrote cgroup.kill");
     assert!(fake.leaf.exists(), "the leaf is left behind");
@@ -1914,7 +1910,7 @@ fn an_armed_drop_after_a_landed_kill_waits_for_its_drain_and_does_not_write_it_a
     let (leaf_dir, events) = (fake.leaf.clone(), fake.events.clone());
     fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf_dir, &events));
     let events = fake.events.clone();
-    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
+    let actor = on_each_drain_block(move || FakeLeaf::set_populated(&events, false));
 
     let leaf = entered_leaf_at(fake.leaf.clone());
     leaf.hard_kill().expect("kill the tree");
@@ -2069,7 +2065,8 @@ fn a_disarmed_leaf_whose_kill_attempt_failed_is_reported_at_warn() {
 
 /// A drain wait wakes when the leaf is removed, even with no event on `cgroup.events`: removing a
 /// cgroup cancels a `populated` notification the kernel had postponed (see `DrainWatch`), so a
-/// third party can remove a drained leaf while the wait still reads it populated.
+/// third party can remove a drained leaf while the wait still reads it populated. A missed wake
+/// hangs this test: #985 row A1.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_drain_wait_wakes_when_the_leaf_is_removed_without_a_populated_event() {
@@ -2080,7 +2077,7 @@ fn a_drain_wait_wakes_when_the_leaf_is_removed_without_a_populated_event() {
     let waited = fake.leaf.clone();
     let removed = fake.leaf.clone();
     let waiter = std::thread::spawn(move || {
-        let _actor = on_each_drain_block(move |_| FakeLeaf::remove(&removed));
+        let _actor = on_drain_block(move || FakeLeaf::remove(&removed));
         crate::containment::cgroup::CgroupLeaf::for_test_at(waited).wait_drained(None)
     });
 
@@ -2104,7 +2101,7 @@ fn an_armed_drop_whose_leaf_a_third_party_removes_reports_nothing() {
     let (leaf, events) = (fake.leaf.clone(), fake.events.clone());
     fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&leaf, &events));
     let removed = fake.leaf.clone();
-    let actor = on_each_drain_block(move |_| FakeLeaf::remove(&removed));
+    let actor = on_drain_block(move || FakeLeaf::remove(&removed));
 
     let mark = crate::log_capture::mark();
     drop(entered_leaf_at(fake.leaf.clone()));
@@ -2141,7 +2138,7 @@ fn an_armed_drop_reports_an_rmdir_refused_after_its_drain_once_without_retrying(
         FakeLeaf::rmdir(&leaf, &events)
     });
     let events = fake.events.clone();
-    let actor = on_each_drain_block(move |_| FakeLeaf::set_populated(&events, false));
+    let actor = on_each_drain_block(move || FakeLeaf::set_populated(&events, false));
 
     let mark = crate::log_capture::mark();
     drop(entered_leaf_at(fake.leaf.clone()));
@@ -2275,7 +2272,7 @@ fn drop_under_a_mount(
         enter_a_private_mount_namespace();
         mount_a_tmpfs_over(&over);
         let mut stdin = Some(member_stdin);
-        let _guard = on_each_drain_block(move |_| {
+        let _guard = on_each_drain_block(move || {
             if let Some(mut s) = stdin.take() {
                 crate::test_child::write_to_possibly_dead_stdin(&mut s, b"x");
             }
@@ -2338,7 +2335,7 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_t
         mount_a_tmpfs_over(&leaf_path);
         // Released after Drop's `hard_kill()`; see `drop_under_a_mount`.
         let mut stdin = Some(stdin);
-        let _guard = on_each_drain_block(move |_| {
+        let _guard = on_each_drain_block(move || {
             if let Some(mut s) = stdin.take() {
                 crate::test_child::write_to_possibly_dead_stdin(&mut s, b"x");
             }
@@ -2421,12 +2418,6 @@ fn cgroup_a_leaf_whose_drain_cannot_be_watched_is_not_created(#[fixture(cgroup)]
 // A leaf holds one inotify instance. Its pump, a thread the leaf owns, blocks on it and broadcasts
 // every change; waits only listen and re-read the leaf.
 
-/// A thread's own notifier for "a wait is about to block", as a sender to share.
-#[cfg(all(target_os = "linux", feature = "tokio"))]
-fn signal_when_blocking(tx: std::sync::mpsc::Sender<()>) {
-    crate::containment::cgroup::fault::set_drain_blocking_notifier(tx);
-}
-
 /// A wait polled once and then never again holds nothing another wait needs: a second wait on
 /// the same leaf, already blocked when the leaf drains, still returns.
 #[cfg(all(target_os = "linux", feature = "tokio"))]
@@ -2451,7 +2442,7 @@ fn a_parked_async_wait_does_not_hold_up_another() {
         let (blocking, blocking_rx) = std::sync::mpsc::channel();
         let other_leaf = leaf.clone();
         let other = std::thread::spawn(move || {
-            signal_when_blocking(blocking);
+            let _signal = crate::containment::cgroup::test_support::signal_when_drain_blocks(blocking);
             let runtime = ::tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -2486,12 +2477,12 @@ fn a_sync_and_an_async_wait_share_the_leafs_one_watch() {
 
     let (sync_leaf, sync_blocking) = (leaf.clone(), blocking.clone());
     let sync_waiter = std::thread::spawn(move || {
-        signal_when_blocking(sync_blocking);
+        let _signal = crate::containment::cgroup::test_support::signal_when_drain_blocks(sync_blocking);
         sync_leaf.wait_drained(None)
     });
     let (async_leaf, async_blocking) = (leaf.clone(), blocking.clone());
     let async_waiter = std::thread::spawn(move || {
-        signal_when_blocking(async_blocking);
+        let _signal = crate::containment::cgroup::test_support::signal_when_drain_blocks(async_blocking);
         let runtime = ::tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2535,7 +2526,7 @@ fn a_cancelled_async_wait_leaves_the_others_waiting() {
 
     let async_leaf = leaf.clone();
     let async_waiter = std::thread::spawn(move || {
-        signal_when_blocking(blocking);
+        let _signal = crate::containment::cgroup::test_support::signal_when_drain_blocks(blocking);
         let runtime = ::tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2580,8 +2571,8 @@ fn a_wait_past_its_deadline_answers_from_the_leafs_state() {
 /// Block a wait on `leaf` on a thread of its own, returning once it blocks. The caller must keep
 /// the returned `Receiver` alive until the handle is joined: `drain_step` can legally re-block
 /// (`populated` is re-read before the pump's own broadcast lands), sending on this notifier
-/// again, and a send with no live receiver is a contract violation `notify_drain_blocking`
-/// debug-asserts against.
+/// again, and a send with no live receiver is a contract violation `signal_when_drain_blocks`
+/// asserts against.
 #[cfg(target_os = "linux")]
 fn blocked_wait(
     leaf: &std::sync::Arc<crate::containment::cgroup::CgroupLeaf>,
@@ -2592,7 +2583,7 @@ fn blocked_wait(
     let (blocking, blocking_rx) = std::sync::mpsc::channel();
     let leaf = leaf.clone();
     let waiter = std::thread::spawn(move || {
-        crate::containment::cgroup::fault::set_drain_blocking_notifier(blocking);
+        let _signal = crate::containment::cgroup::test_support::signal_when_drain_blocks(blocking);
         leaf.wait_drained(None)
     });
     blocking_rx.recv().expect("the wait blocks");
@@ -3602,8 +3593,13 @@ fn placement_hook_reports_a_write_that_wrote_nothing_as_failed() {
 
 /// `rmdir` refuses a leaf that holds a child cgroup with the same `EBUSY` it gives a populated
 /// one, and killing through the leaf removes no directory. A leaf dropped with its report in
-/// flight must remove the empty child cgroups itself rather than kill-and-retry forever. A
-/// regression hangs this test in `drop`.
+/// flight must remove the empty child cgroups itself rather than kill-and-retry forever.
+///
+/// The `rmdir` observer counts each attempt, and the production removal runs it: the drop makes one, then
+/// sweeps and makes one more, and a third is the retry. The hook runs on the dropping thread at
+/// each attempt, so the count is in call order.
+///
+/// Mutant: the drop kills and retries the `rmdir` until it succeeds, with no sweep.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_drop_removes_a_leaf_holding_child_cgroups(#[fixture(cgroup)] _group: &Group) {
@@ -3616,9 +3612,26 @@ fn cgroup_drop_removes_a_leaf_holding_child_cgroups(#[fixture(cgroup)] _group: &
             // SAFETY: the slot's channel lives as long as `leaf`.
             unsafe { leaf.placement_slot().report_placed_for_test() };
         }
+        let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observer = crate::containment::cgroup::fault::observe_rmdirs({
+            let attempts = attempts.clone();
+            move |_| {
+                attempts.set(attempts.get() + 1);
+                assert!(
+                    attempts.get() <= 2,
+                    "placed: {placed}: the drop made a third rmdir of a leaf it had swept"
+                );
+            }
+        });
 
         drop(leaf);
+        drop(observer);
 
+        assert_eq!(
+            attempts.get(),
+            2,
+            "placed: {placed}: the drop makes one rmdir, sweeps the child cgroups, and makes one more"
+        );
         assert!(
             !leaf_path.exists(),
             "placed: {placed}: the leaf and its child cgroups must be removed"

@@ -723,10 +723,10 @@ fn failed_write() -> Result<(), crate::error::Error> {
 fn release_when_the_drain_blocks<T: 'static>(
     mechanism: Mechanism,
     stdin: &std::rc::Rc<std::cell::Cell<Option<T>>>,
-) -> Option<crate::oneshot_hook::Armed> {
+) -> Option<crate::wait::block_probe::Armed> {
     mechanism.is_cgroup().then(|| {
         let stdin = std::rc::Rc::clone(stdin);
-        crate::containment::cgroup::fault::set_before_drain_block(move || drop(stdin.take()))
+        crate::wait::block_probe::on_drain_block(move || drop(stdin.take()))
     })
 }
 

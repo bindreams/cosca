@@ -134,18 +134,26 @@ async fn a_teardown_future_dropped_while_panicking_gives_the_child_up_and_warns(
 
 /// The awaited teardown awaits its cgroup leaf's drain and never blocks the thread on it: a drain
 /// that is pending leaves the teardown pending. A fake leaf that no one empties holds the drain
-/// open. The rows fail only by hanging (a teardown that blocks on the drain never returns).
+/// open. A teardown that blocks its thread on the drain is let go as it blocks, which the row sees in
+/// [`assert_never_blocked`](UndrainedLeaf::assert_never_blocked); the awaited drain is a
+/// [`DrainAwait`](crate::wait::block_probe::WaitObject::DrainAwait) await, no block. The release runs on the
+/// teardown's own thread as it blocks, so the order is the call order.
 #[cfg(target_os = "linux")]
 mod leaf_drain {
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::task::Poll;
 
     use crate::containment::cgroup::fault as leaf_fault;
     use crate::containment::cgroup::test_support::{entered_leaf_at, FakeLeaf};
     use crate::test_child::{held_blocker_async, Console};
+    use crate::wait::block_probe::{on_each_block, Armed, WaitObject};
 
     /// A fake leaf `populated 1` until [`drain`](Self::drain), under an async child's spawn.
     struct UndrainedLeaf {
         fake: FakeLeaf,
+        blocked: Rc<Cell<bool>>,
+        _release: Armed,
     }
 
     impl UndrainedLeaf {
@@ -153,7 +161,30 @@ mod leaf_drain {
             let fake = FakeLeaf::new(name, true);
             let (path, events) = (fake.leaf.clone(), fake.events.clone());
             leaf_fault::set_rmdir_hook(move |_| FakeLeaf::rmdir(&path, &events));
-            UndrainedLeaf { fake }
+            let blocked = Rc::new(Cell::new(false));
+            let _release = on_each_block({
+                let (blocked, events) = (Rc::clone(&blocked), fake.events.clone());
+                move |block| {
+                    if matches!(block.on, WaitObject::Drain) {
+                        blocked.set(true);
+                        FakeLeaf::set_populated(&events, false);
+                    }
+                }
+            });
+            UndrainedLeaf {
+                fake,
+                blocked,
+                _release,
+            }
+        }
+
+        /// The teardown never blocked its thread on the leaf's drain.
+        #[track_caller]
+        fn assert_never_blocked(&self) {
+            assert!(
+                !self.blocked.get(),
+                "the teardown blocked its thread on the leaf's drain instead of awaiting it"
+            );
         }
 
         /// The held blocker, spawned into the leaf.
@@ -211,6 +242,7 @@ mod leaf_drain {
         let mut teardown = Box::pin(child.tear_down_awaiting());
 
         let first = poll_once(&mut teardown).await;
+        leaf.assert_never_blocked();
         assert!(first.is_pending(), "the leaf has not drained, so the teardown waits");
         leaf.drain();
         let torn = teardown.await;
@@ -246,6 +278,7 @@ mod leaf_drain {
         assert_eq!(said.len(), 1, "{said:?}");
         let warned = crate::log_capture::records_since(mark, "its drain could not be watched");
         assert_eq!(warned.len(), 1, "the leaf's drop reports it left behind: {warned:?}");
+        leaf.assert_never_blocked();
     }
 
     /// A front behind a closed gate: the leaf is killed through and its drain awaited, then the front
@@ -262,6 +295,7 @@ mod leaf_drain {
         let mut teardown = Box::pin(child.tear_down_awaiting());
 
         let first = poll_once(&mut teardown).await;
+        leaf.assert_never_blocked();
         assert!(first.is_pending(), "the leaf has not drained, so the teardown waits");
         leaf.drain();
         let torn = teardown.await;
@@ -291,6 +325,7 @@ mod leaf_drain {
 
         assert!(!leaf.fake.leaf.exists(), "the empty leaf is removed");
         assert!(leaf.fake.kill_written().is_empty(), "an empty leaf is written no kill");
+        leaf.assert_never_blocked();
     }
 
     /// The leaf removed by the awaited teardown's first step is not removed again by its drop: a
@@ -314,5 +349,6 @@ mod leaf_drain {
             .filter(|step| step.starts_with("rmdir"))
             .count();
         assert_eq!(rmdirs, 1, "the leaf is removed once");
+        leaf.assert_never_blocked();
     }
 }
