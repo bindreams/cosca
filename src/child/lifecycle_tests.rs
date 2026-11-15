@@ -56,6 +56,8 @@ fn wait_tree_reports_the_drained_verdict_when_the_tree_drains() {
     wait_tree_drained_verdict(drainable_gives());
 }
 
+/// A pump that never broadcasts hangs this test; `a_changed_batch_notifies_a_listener_that_was_there_before_it`
+/// fails it by assertion.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn wait_tree_reports_the_drained_verdict_when_the_tree_drains(#[fixture(cgroup)] _group: &Group) {
@@ -143,6 +145,8 @@ fn wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already
     wait_tree_timeout_zero_drained_verdict(drainable_gives());
 }
 
+/// A pump that never broadcasts hangs this test; `a_changed_batch_notifies_a_listener_that_was_there_before_it`
+/// fails it by assertion.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn wait_tree_timeout_zero_reports_the_drained_verdict_after_the_tree_has_already_drained(
