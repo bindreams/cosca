@@ -6,26 +6,39 @@ use std::os::fd::{AsFd, OwnedFd};
 use super::child::{KillRefusal, OsChild, OsHandle, PeekOutcome, TryReapOutcome};
 use super::{Exit, OsProcess, WaitFor};
 use crate::error::Error;
+use crate::identity::Kernel;
 use crate::signal::{send_pidfd, Sent, Sig};
 use crate::wait::exit_only::{self, Reap, Target};
 
 pub(crate) mod fork;
 pub(crate) mod open;
 
-#[derive(Debug)]
-pub(crate) struct LinuxProcess {
+/// A process named by a pidfd. It owns the [`Kernel`] it was built with, which a read of the process by
+/// its number asks (see [`OsChild::kernel`]).
+pub(crate) struct LinuxProcess<K> {
+    kernel: K,
     pid: Option<u32>,
     pidfd: OwnedFd,
 }
 
-impl LinuxProcess {
-    /// A process named by `pidfd`, which was opened while `pid` (if known) was provably it.
-    pub(crate) fn new(pid: Option<u32>, pidfd: OwnedFd) -> Self {
-        Self { pid, pidfd }
+impl<K> std::fmt::Debug for LinuxProcess<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinuxProcess")
+            .field("pid", &self.pid)
+            .field("pidfd", &self.pidfd)
+            .finish_non_exhaustive()
     }
 }
 
-impl OsProcess for LinuxProcess {
+impl<K: Kernel + Send> LinuxProcess<K> {
+    /// A process named by `pidfd`, which was opened while `pid` (if known) was provably it, asking
+    /// `kernel`, which the process then owns.
+    pub(crate) fn new(kernel: K, pid: Option<u32>, pidfd: OwnedFd) -> Self {
+        Self { kernel, pid, pidfd }
+    }
+}
+
+impl<K: Kernel + Send> OsProcess for LinuxProcess<K> {
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         let sent = send_pidfd(self.pidfd.as_fd(), self.pid, sig);
         // After the syscall, whatever it answered, as macOS's `send_with_token` records.
@@ -47,9 +60,13 @@ impl OsProcess for LinuxProcess {
     }
 }
 
-impl OsChild for LinuxProcess {
+impl<K: Kernel + Send> OsChild for LinuxProcess<K> {
     fn pid(&self) -> Option<u32> {
         self.pid
+    }
+
+    fn kernel(&self) -> &dyn Kernel {
+        &self.kernel
     }
 
     /// `pidfd_send_signal` is refused only with `EPERM`.

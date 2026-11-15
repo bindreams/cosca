@@ -33,7 +33,11 @@ fn teardown_with_forced_looks(point: SpawnPoint, force: fn(bool)) -> (ChildFate,
     });
     let _warn = crate::tokio::child::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
     force(true);
-    let spawned = crate::child::spawn::spawn_uncommitted(cmd.as_sync_mut(), crate::tokio::child::async_policy());
+    let spawned = crate::child::spawn::spawn_uncommitted(
+        cmd.as_sync_mut(),
+        crate::tokio::child::async_policy(),
+        crate::identity::HostKernel,
+    );
     force(false);
     let failed = spawned.expect_err("the forced failure fails the spawn");
     assert_peeks_exhausted();

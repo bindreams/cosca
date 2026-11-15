@@ -11,7 +11,6 @@ use crate::containment::mechanism::AwaitableRelease;
 use crate::containment::mechanism::{Contains, Release};
 use crate::containment::treewalk::Listing;
 use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
-use crate::identity::HostKernel;
 
 // The leaf's `Debug` hides its path; `subject` names it.
 impl std::fmt::Debug for CgroupLeaf {
@@ -68,7 +67,7 @@ impl Contains for CgroupLeaf {
         let sent = self.send_kill(root);
         let members = match sent {
             TreeKillOutcome::Ran(Ok(())) => {
-                let (reached, unplaced) = self.reached_by_kill(&HostKernel, listed);
+                let (reached, unplaced) = self.reached_by_kill(listed);
                 unobserved.extend(unplaced);
                 reached
             }
@@ -108,7 +107,7 @@ impl Contains for CgroupLeaf {
     /// under it (see [`Subtree::holds`](super::Subtree::holds)): a `cgroup.kill` reaches it whatever
     /// its credentials.
     fn would_reach(&self, pid: u32, pidfd: Option<BorrowedFd<'_>>) -> Result<bool, crate::error::Error> {
-        self.subtree()?.holds(pid, pidfd)
+        self.subtree()?.holds(&*self.kernel, pid, pidfd)
     }
 
     /// A `cgroup.kill` that landed (or found the leaf gone) and where `child` is says it was in the

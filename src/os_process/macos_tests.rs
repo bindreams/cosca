@@ -263,8 +263,7 @@ fn a_refused_reread_after_esrch_keeps_the_errno() {
 /// then, and not a refusal: the process is on its way out.
 ///
 /// The `EPERM` and the record are stated here, not read from a really exiting child: that window
-/// was hit about 1 in 1000 sends (the knowledge-base note "macOS - proc_signal_with_audittoken
-/// answers EPERM to an exiting child before ESRCH"), so a host test of it cannot be deterministic.
+/// is hit about 1 in 1000 sends, so a host test of it cannot be deterministic.
 /// The measurement is a probe run on CI, not a test.
 ///
 /// Mutants: the `EPERM` is surfaced raw whether or not the exit has begun; the exit is read from

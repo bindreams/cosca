@@ -6,6 +6,7 @@ use super::{
     adopted_id, await_report, failed_spawn_error, read_report, register, seams, set_nonblocking, Report, Unadoptable,
 };
 use crate::error::Error;
+use crate::identity::HostKernel;
 use crate::wait::block_probe::{self, on_blocking, on_each_block};
 
 /// A non-blocking pipe, as the parent's read end is.
@@ -243,7 +244,7 @@ fn run_through_channel(cmd: &mut std::process::Command) -> (std::io::Result<std:
     #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `guard`")]
     let (spawned, first) = channel.run(|| cmd.spawn(), |c| Some(c.id()));
     drop(guard);
-    (spawned, first.finish())
+    (spawned, first.finish(&HostKernel))
 }
 
 /// A program that cannot be exec'd fails the spawn after the hook reported an id: std's own error
@@ -349,7 +350,7 @@ fn awaiting_a_written_report_answers_late() {
     let (child, stdin) = live_child();
     let (r, mut w) = pipe();
     w.write_all(&report_bytes(1, 0xabc)).unwrap();
-    assert!(matches!(await_report(&r, child.id()), Report::Late(0xabc)));
+    assert!(matches!(await_report(&HostKernel, &r, child.id()), Report::Late(0xabc)));
     end(child, stdin);
 }
 
@@ -361,7 +362,7 @@ fn awaiting_a_closed_empty_pipe_answers_missing() {
     let (child, stdin) = live_child();
     let (r, w) = pipe();
     drop(w);
-    let report = await_report(&r, child.id());
+    let report = await_report(&HostKernel, &r, child.id());
     assert!(matches!(report, Report::Missing), "{report:?}");
     end(child, stdin);
 }
@@ -402,7 +403,7 @@ fn awaiting_is_woken_by_the_report_through_the_pipe() {
         }
     });
     let _ = seams::take_wake();
-    let report = await_report(&r, child.id());
+    let report = await_report(&HostKernel, &r, child.id());
     assert_eq!(pending.get(), Some(true), "the wait must watch the pipe");
     assert_eq!(blocks.get(), Some(1), "a readable pipe ends the wait");
     assert_eq!(seams::take_wake(), Some(seams::Wake::Pipe));
@@ -425,7 +426,7 @@ fn awaiting_a_child_that_exited_unreported_answers_missing_without_blocking() {
     crate::test_child::wait_until_zombie(child.id());
     let _release = release_on_block(copy);
     block_probe::take();
-    let report = await_report(&r, child.id());
+    let report = await_report(&HostKernel, &r, child.id());
     assert_eq!(block_probe::take(), [], "a child already gone is not waited for");
     assert!(matches!(report, Report::Missing), "{report:?}");
     child.wait().expect("reap cat");
@@ -447,7 +448,7 @@ fn awaiting_a_child_that_exits_during_the_wait_is_ended_by_its_exit() {
         crate::test_child::wait_until_zombie(pid);
         drop(copy);
     });
-    let report = await_report(&r, pid);
+    let report = await_report(&HostKernel, &r, pid);
     assert_eq!(
         seams::take_wake(),
         Some(seams::Wake::ChildGone),
@@ -469,7 +470,7 @@ fn awaiting_a_pid_that_is_not_our_child_answers_missing_without_blocking() {
     let stranger = unsafe { libc::getppid() } as u32;
     let _release = release_on_block(copy);
     block_probe::take();
-    let report = await_report(&r, stranger);
+    let report = await_report(&HostKernel, &r, stranger);
     assert_eq!(block_probe::take(), [], "a stranger is not waited for");
     assert!(matches!(report, Report::Missing), "{report:?}");
 }
@@ -486,7 +487,7 @@ fn awaiting_a_reaped_pid_answers_missing_without_blocking() {
     let (r, copy) = pipe();
     let _release = release_on_block(copy);
     block_probe::take();
-    let report = await_report(&r, pid);
+    let report = await_report(&HostKernel, &r, pid);
     assert_eq!(block_probe::take(), [], "a reaped child is not waited for");
     assert!(matches!(report, Report::Missing), "{report:?}");
 }
@@ -513,7 +514,7 @@ fn awaiting_a_child_launchd_holds_after_its_tracer_died_answers_missing_without_
     let _parents = crate::identity::kinfo::fault::force_parents(pid, || forked_by_us_held_by(crate::identity::LAUNCHD));
     let _release = release_on_block(copy);
     block_probe::take();
-    let report = await_report(&r, pid);
+    let report = await_report(&HostKernel, &r, pid);
     assert_eq!(block_probe::take(), [], "a child launchd holds is not waited for");
     assert!(matches!(report, Report::Missing), "{report:?}");
     end(child, stdin);
@@ -573,7 +574,7 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
         }
     });
     let _ = seams::take_wake();
-    let report = await_report(&r, pid);
+    let report = await_report(&HostKernel, &r, pid);
     assert_eq!(pending.get(), Some(true), "the tracer's exit must wake the wait");
     assert_eq!(
         seams::take_wake(),
@@ -646,7 +647,7 @@ fn awaiting_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
         }
     });
     let _ = seams::take_wake();
-    let report = await_report(&r, pid);
+    let report = await_report(&HostKernel, &r, pid);
     assert_eq!(attach_woke.get(), Some(true), "the attach's signal must wake the wait");
     assert_eq!(
         exit_woke.get(),
@@ -675,7 +676,7 @@ fn a_failed_spawn_reads_the_report_once_and_does_not_wait() {
     let _refused = seams::refuse_the_wait();
     let (spawned, first) = channel.run(|| Err::<(), ()>(()), |_| unreachable!("a failed spawn has no child"));
     drop(guard);
-    let report = first.finish();
+    let report = first.finish(&HostKernel);
     assert!(spawned.is_err());
     assert!(matches!(report, Report::Unwritten), "{report:?}");
 }
@@ -713,7 +714,7 @@ fn await_held(
         }
     });
     block_probe::take();
-    let report = await_report(&r, child);
+    let report = await_report(&HostKernel, &r, child);
     (report, block_probe::take())
 }
 
@@ -788,7 +789,7 @@ fn a_wait_warns_once_that_the_report_is_late() {
     });
     let mark = crate::log_capture::mark();
     block_probe::take();
-    let report = await_report(&r, child.id());
+    let report = await_report(&HostKernel, &r, child.id());
     assert!(matches!(report, Report::Missing), "{report:?}");
     assert_eq!(waiting_warns(mark), 1, "one warning, however long the wait");
     let timeouts = block_probe::take();
@@ -808,4 +809,76 @@ fn a_wait_warns_once_that_the_report_is_late() {
 fn production_warns_after_one_second_and_a_test_only_with_a_guard() {
     assert_eq!(super::SAY_WAITING_AFTER, std::time::Duration::from_secs(1));
     assert_eq!(seams::say_waiting_after(), None);
+}
+
+/// The wait's look at the child asks the kernel the spawn started with: its row says the pid is a
+/// running child, where the host, which has no child of that number, says it is gone.
+///
+/// Mutant: `check` reads through a host kernel.
+#[skuld::test]
+fn the_look_at_the_child_asks_the_kernel_it_was_given() {
+    use crate::identity::FakeKernel;
+
+    /// Above macOS's `PID_MAX`: no host process has it.
+    const STATED: u32 = 2_000_000_000;
+    let kernel = FakeKernel::over(&HostKernel).on_peek(STATED, Ok(None));
+    assert!(matches!(super::check(&kernel, STATED), Ok(super::Check::Running)));
+}
+
+/// A wait on a child a tracer holds asks the spawn's kernel who forked it and holds it (`origin`),
+/// and where the tracer is (`TracerWatch::held_by`): every row stated for them answers, so that the
+/// child is a `Traced` one, its tracer is gone, and the next look at the child finds it exited and
+/// ends the wait. The host answers none of them, for a tracer no process has.
+///
+/// Mutants: `check` reads `origin` through a host kernel; `watch` walks the tracer through a host
+/// kernel. Either leaves rows untaken, and a wait that blocks is ended at EOF by the released pipe.
+#[skuld::test]
+fn a_wait_on_a_traced_child_asks_the_kernel_it_was_given_for_the_child_and_its_tracer() {
+    use crate::identity::kinfo::kinfo_proc;
+    use crate::identity::{exit_record, FakeKernel};
+    use crate::os_process::macos::kqueue::Subscription;
+    use crate::wait::exit_only::macos_tests::found;
+
+    /// Above macOS's `PID_MAX`: no host process has it.
+    const TRACER: u32 = 2_000_000_000;
+    let (child, stdin) = live_child();
+    let pid = child.id();
+    let me = std::process::id() as libc::pid_t;
+    // Ids above this process's own, so the child reads as forked after it.
+    let (child_unique, tracer_unique) = (u64::MAX - 1, u64::MAX);
+    let kernel = FakeKernel::over(&HostKernel)
+        // `waitid` answers `ECHILD` while a tracer holds the child, then shows its exit.
+        .on_peek(pid, Err(std::io::Error::from_raw_os_error(libc::ECHILD)))
+        .on_peek(pid, Ok(Some(exit_record(0))))
+        // `origin`: the child was forked by this process and is held by the tracer.
+        .on_unique_info(pid, found(child_unique))
+        .on_kinfo(pid, kinfo_proc::of_host_held_by(pid, me, TRACER as libc::pid_t))
+        .on_unique_info(pid, found(child_unique))
+        // `held_by`: the tracer is a process whose registration is refused, so it is gone.
+        .on_unique_info(TRACER, found(tracer_unique))
+        .on_kinfo(TRACER, kinfo_proc::of_host_held_by(pid, 0, 1))
+        .on_unique_info(TRACER, found(tracer_unique))
+        .on_subscribe_refused(
+            Subscription::Process {
+                pid: TRACER,
+                signals: true,
+                reap: false,
+            },
+            libc::ESRCH,
+        );
+    let (r, copy) = pipe();
+    let _release = release_on_block(copy);
+    block_probe::take();
+    let report = await_report(&kernel, &r, pid);
+    assert_eq!(
+        block_probe::take(),
+        [],
+        "a child whose tracer is gone is not waited for"
+    );
+    assert!(matches!(report, Report::Missing), "{report:?}");
+    assert!(
+        kernel.all_rows_taken(),
+        "the child and its tracer were read through the spawn's kernel"
+    );
+    end(child, stdin);
 }

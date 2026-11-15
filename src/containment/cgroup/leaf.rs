@@ -236,6 +236,10 @@ pub(crate) struct CgroupLeaf {
     pub(super) leaf_path: PathBuf,
     /// The leaf's directory and its parent, held from creation.
     dir: LeafDir,
+    /// The kernel its spawn started with, which every read by a task's number asks (`/proc`, a pidfd):
+    /// a clone of the child box's, since a failed spawn tears the leaf down before any box exists and
+    /// `Child` drops its box before its tree.
+    pub(super) kernel: crate::identity::SpawnKernel,
     /// The leaf's drain watch, held from creation so that no wait on it ever lacks one. Read by
     /// the pump this watcher owns, which broadcasts each change to every wait.
     /// Boxed: its pump would make every `Mechanism` as large as a leaf.
@@ -387,7 +391,7 @@ impl CgroupLeaf {
             PlacementReport::WriteFailed(errno) => NotEntered::WriteFailed(errno),
         };
         let path = self.leaf_path.join("cgroup.procs");
-        let child_state = proc_state(&crate::identity::HostKernel, child);
+        let child_state = proc_state(&*self.kernel, child);
         Err(match self.dir.read("cgroup.procs") {
             Ok(procs) => NotPlaced::Absent {
                 pid: child.pid,
@@ -479,7 +483,7 @@ impl CgroupLeaf {
             let opened = self.dir.open("cgroup.events", rustix::fs::OFlags::PATH);
             opened.ok().map(|_| false)
         };
-        match super::proc_names(&crate::identity::HostKernel, path, pid, outside_if_live, false) {
+        match super::proc_names(&*self.kernel, path, pid, outside_if_live, false) {
             Ok(inside) => self.placed.record(pid, inside),
             Err(e) => {
                 log::debug!(
@@ -941,16 +945,17 @@ impl CgroupLeaf {
         use crate::error::Error;
         use crate::identity::Resolved;
 
-        let pidfd = match pin_member(pid) {
+        let pidfd = match pin_member(&*self.kernel, pid) {
             Ok(pidfd) => pidfd,
             Err(rustix::io::Errno::SRCH) => return Ok(None),
             Err(e) => return Err(Error::Io(io::Error::from_raw_os_error(e.raw_os_error()))),
         };
-        let seen = match placed_or_exited(pidfd.as_fd(), subtree.holds_seen(pid, Some(pidfd.as_fd()), None))? {
+        let held = subtree.holds_seen(&*self.kernel, pid, Some(pidfd.as_fd()), None);
+        let seen = match placed_or_exited(pidfd.as_fd(), held)? {
             PlacedOrExitedOutcome::Placed((true, seen)) => seen,
             _ => return Ok(None),
         };
-        match ProcessId::of_held_with(&crate::identity::HostKernel, pid, pidfd.as_fd()) {
+        match ProcessId::of_held_with(&*self.kernel, pid, pidfd.as_fd()) {
             (Resolved::Found(id), _) => Ok(Some(Listed { id, seen })),
             (Resolved::Gone, _) => Ok(None),
             (Resolved::Unknown, cause) => Err(crate::identity::unqueryable(&format!("pid {pid}"), cause)),
@@ -966,15 +971,11 @@ impl CgroupLeaf {
     /// moved out after the kill reached it reads the same: it was sent `SIGKILL` and is not waited
     /// for (a stated limit, see [`Child::kill_tree`](crate::Child::kill_tree)). One already gone was in
     /// the tree and has exited: it is kept, and its wait ends at once.
-    pub(crate) fn reached_by_kill(
-        &self,
-        kernel: &dyn crate::identity::Kernel,
-        members: Vec<Listed>,
-    ) -> (Vec<ProcessId>, Vec<Unnamed>) {
+    pub(crate) fn reached_by_kill(&self, members: Vec<Listed>) -> (Vec<ProcessId>, Vec<Unnamed>) {
         let subtree = self.listing_subtree();
         let (mut reached, mut unobserved) = (Vec::new(), Vec::new());
         for member in members {
-            match kill_reached(kernel, &subtree, member) {
+            match kill_reached(&*self.kernel, &subtree, member) {
                 Ok(true) => reached.push(member.id),
                 Ok(false) => {}
                 Err(why) => unobserved.push(Unnamed::member(member.id.pid(), why)),
@@ -988,7 +989,7 @@ impl CgroupLeaf {
     /// it logs at `debug`; `Err` says why a pid that may be a member got none.
     fn terminate_member(&self, pid: u32, subtree: &Subtree) -> Result<(), Unsignalled> {
         use std::os::fd::AsFd as _;
-        let pidfd = match pin_member(pid) {
+        let pidfd = match pin_member(&*self.kernel, pid) {
             Ok(pidfd) => pidfd,
             Err(rustix::io::Errno::SRCH) => {
                 log::debug!("cgroup terminate: pid {pid} is gone; not signalled");
@@ -1007,7 +1008,8 @@ impl CgroupLeaf {
         fault::run_after_terminate_pin();
         // The exit check follows the read: a process still running after it held `pid` throughout,
         // so the read was its own and not a reused pid's.
-        let inside = match placed_or_exited(pidfd.as_fd(), subtree.holds(pid, Some(pidfd.as_fd()))) {
+        let held = subtree.holds(&*self.kernel, pid, Some(pidfd.as_fd()));
+        let inside = match placed_or_exited(pidfd.as_fd(), held) {
             Ok(PlacedOrExitedOutcome::Placed(inside)) => inside,
             Ok(PlacedOrExitedOutcome::Exited(placement)) => {
                 log::debug!(
@@ -1075,7 +1077,7 @@ fn kill_reached(
         return Ok(true);
     };
     let pidfd = os.os_handle();
-    match placed_or_exited(pidfd, subtree.reached_by(pid, Some(pidfd), member.seen))? {
+    match placed_or_exited(pidfd, subtree.reached_by(kernel, pid, Some(pidfd), member.seen))? {
         PlacedOrExitedOutcome::Placed(false) => {
             log::debug!(
                 "cgroup kill: pid {pid} is outside the leaf after the kill, so it is taken to have left it before, \
@@ -1120,16 +1122,16 @@ fn placed_or_exited<T>(
     }
 }
 
-/// A pidfd that pins the process `pid` names, for [`CgroupLeaf::terminate`]; a test build lets a
-/// `fail_terminate` seam answer in its place.
-fn pin_member(pid: u32) -> rustix::io::Result<std::os::fd::OwnedFd> {
+/// A pidfd that pins the process `pid` names, opened through `kernel`, for [`CgroupLeaf::terminate`];
+/// a test build lets a `fail_terminate` seam answer in its place.
+fn pin_member(kernel: &dyn crate::identity::Kernel, pid: u32) -> rustix::io::Result<std::os::fd::OwnedFd> {
     #[cfg(test)]
     if let Some(errno) = fault::terminate_fails(fault::TerminateStep::Pin) {
         return Err(rustix::io::Errno::from_raw_os_error(errno));
     }
     rustix::process::Pid::from_raw(pid as i32)
         .ok_or(rustix::io::Errno::INVAL)
-        .and_then(|raw| rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()))
+        .and_then(|raw| kernel.pidfd_open(raw, rustix::process::PidfdFlags::empty()))
 }
 
 /// Whether [`CgroupLeaf::terminate`]'s member has exited, reaped or not: its pidfd turns readable at
@@ -1203,6 +1205,7 @@ impl CgroupLeaf {
                 DrainWatch::arm(&dir).expect("arm a test leaf's drain watch"),
                 dir.name().to_os_string(),
             )),
+            kernel: std::sync::Arc::new(crate::identity::HostKernel),
             dir,
             leaf_path,
             procs_fd: None,
@@ -1222,6 +1225,12 @@ impl CgroupLeaf {
     /// Give a test leaf the unified-hierarchy path `/proc/<pid>/cgroup` prints for it.
     pub(crate) fn set_cgroup_path_for_test(&mut self, path: String) {
         self.cgroup_path = Some(path);
+    }
+
+    /// A test leaf that asks `kernel`, as a spawn's leaf asks the kernel the spawn started with.
+    pub(crate) fn asking_for_test(mut self, kernel: crate::identity::SpawnKernel) -> Self {
+        self.kernel = kernel;
+        self
     }
 
     /// The record of the watched front's place, as the leaf's subtrees read it.
@@ -1630,17 +1639,21 @@ fn warn_leaf_left_behind(leaf_path: &Path, what_failed: fmt::Arguments<'_>) {
 /// current process not in a v2 cgroup (v1-only system), leaf directory not
 /// writable (undelegated slice), or `cgroup.kill` absent (kernel < 5.14).
 #[cfg(target_os = "linux")]
-pub(crate) fn try_create_leaf(teardown_warn_after: Option<std::time::Duration>) -> Result<CgroupLeaf, LeafError> {
-    create_leaf_in(&find_own_cgroup()?, teardown_warn_after)
+pub(crate) fn try_create_leaf(
+    kernel: &crate::identity::SpawnKernel,
+    teardown_warn_after: Option<std::time::Duration>,
+) -> Result<CgroupLeaf, LeafError> {
+    create_leaf_in(&find_own_cgroup()?, kernel, teardown_warn_after)
 }
 
 /// Create a leaf sub-cgroup of `own`, the supervisor's own cgroup. The failing step on any failure.
 #[cfg(target_os = "linux")]
 pub(crate) fn create_leaf_in(
     own: &OwnCgroup,
+    kernel: &crate::identity::SpawnKernel,
     teardown_warn_after: Option<std::time::Duration>,
 ) -> Result<CgroupLeaf, LeafError> {
-    let mut leaf = create_leaf_under(own.dir(), teardown_warn_after)?;
+    let mut leaf = create_leaf_under(own.dir(), kernel, teardown_warn_after)?;
     let name = leaf.leaf_path.file_name().expect("a leaf has a name").to_string_lossy();
     leaf.cgroup_path = Some(format!("{}/{name}", own.rel_path().trim_end_matches('/')));
     Ok(leaf)
@@ -1666,10 +1679,11 @@ pub(crate) fn leaf_name() -> io::Result<String> {
 /// production, and a temp directory in the tests that fail each precondition for real.
 ///
 /// Every early return names its step: the caller fails or degrades, but never silently.
-/// `teardown_warn_after`: see [`CgroupLeaf`]'s field of that name.
+/// `teardown_warn_after`: see [`CgroupLeaf`]'s field of that name. The leaf owns a clone of `kernel`.
 #[cfg(target_os = "linux")]
 pub(crate) fn create_leaf_under(
     current: &Path,
+    kernel: &crate::identity::SpawnKernel,
     teardown_warn_after: Option<std::time::Duration>,
 ) -> Result<CgroupLeaf, LeafError> {
     // The own cgroup is held and its `cgroup.procs` opened for writing before anything is made: a
@@ -1817,6 +1831,7 @@ pub(crate) fn create_leaf_under(
     Ok(CgroupLeaf {
         leaf_path,
         dir,
+        kernel: std::sync::Arc::clone(kernel),
         watch: Box::new(Watcher::new(Some(watch), leaf_name.clone().into())),
         procs_fd: Some(procs_fd),
         report: Some(report),
@@ -1979,6 +1994,10 @@ mod leaf_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "leaf_state_tests.rs"]
 mod leaf_state_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "leaf_kernel_tests.rs"]
+mod leaf_kernel_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "placement_reuse_tests.rs"]

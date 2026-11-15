@@ -113,12 +113,13 @@ fn offered_from(found: Result<OwnCgroup, LeafError>) -> Result<Option<OwnCgroup>
 /// `EPERM`.
 pub(crate) fn leaf_if_offered(
     offered: Result<Option<OwnCgroup>, LeafError>,
+    kernel: &crate::identity::SpawnKernel,
     teardown_warn_after: Option<std::time::Duration>,
 ) -> Result<Option<CgroupLeaf>, crate::error::Error> {
     let Some(own) = offered.map_err(LeafError::into_containment)? else {
         return Ok(None);
     };
-    let e = match create_leaf_in(&own, teardown_warn_after) {
+    let e = match create_leaf_in(&own, kernel, teardown_warn_after) {
         Ok(leaf) => return Ok(Some(leaf)),
         Err(e) => e,
     };

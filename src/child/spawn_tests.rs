@@ -352,6 +352,126 @@ fn assert_a_refused_teardown_kill_is_handed_back(
     }
 }
 
+/// The spawn builds its child's box over the kernel it was started with, reads the child's identity
+/// through it, and keeps nothing of it once the child is gone: the test's own handle on the kernel is
+/// the only one left. Where a kernel has methods (Linux, macOS), the child's box answers from a row
+/// stated for a pid no host process can have, and the identity read is counted: on Linux a `pidfs_ino`
+/// of the held pidfd, on macOS a unique-id read of the child's pid. The cgroup leaf's kernel is
+/// `cgroup_a_created_leaf_reads_through_the_kernel_it_was_created_over`'s.
+///
+/// Mutants: the child's box is built over a kernel of its own; `resolve_identity` reads through a host
+/// kernel (Linux, macOS); the box is leaked.
+#[skuld::test]
+fn a_spawn_hands_its_kernel_to_the_boxes_it_makes_and_keeps_nothing_after() {
+    use std::sync::Arc;
+
+    #[cfg(unix)]
+    use crate::identity::{FakeKernel, HostKernel};
+
+    /// The pid the stated row is about: above Linux's `PID_MAX_LIMIT` and macOS's `PID_MAX`, so no
+    /// host process has it.
+    #[cfg(unix)]
+    const STATED: u32 = 2_000_000_000;
+
+    #[cfg(windows)]
+    let kernel = {
+        /// Windows's `Kernel` has no methods: a kernel to count handles on.
+        struct Counted;
+        impl crate::identity::Kernel for Counted {}
+        Arc::new(Counted)
+    };
+    #[cfg(target_os = "linux")]
+    let kernel = Arc::new(FakeKernel::over(&HostKernel).on_signal_probe(
+        rustix::process::Pid::from_raw(STATED as i32).expect("a positive pid"),
+        Err(rustix::io::Errno::PERM),
+    ));
+    #[cfg(target_os = "macos")]
+    let kernel = Arc::new(FakeKernel::over(&HostKernel).on_peek(STATED, Ok(None)));
+
+    // On Windows both backends: std's and the raw `CreateProcessW`'s, which an `executable()` routes to.
+    #[cfg(unix)]
+    let backends = [false];
+    #[cfg(windows)]
+    let backends = [false, true];
+    for raw in backends {
+        let mut c = crate::test_child::command(Console::Hidden);
+        #[cfg(unix)]
+        c.args(["true"]);
+        #[cfg(windows)]
+        c.args(["cmd", "/C", "exit 0"]);
+        #[cfg(windows)]
+        if raw {
+            c.executable("cmd");
+        }
+        {
+            let child = super::spawn_with(&mut c, Arc::clone(&kernel)).expect("spawn");
+            // Windows's kernel has no method to ask, so the box's hold on it is all there is to see.
+            #[cfg(windows)]
+            assert!(
+                Arc::strong_count(&kernel) >= 2,
+                "the child's box owns a handle on the kernel (raw backend: {raw})"
+            );
+            // The box lends the kernel it owns, which answers from the stated row.
+            let lent: &dyn crate::identity::Kernel = child.proc.kernel();
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                lent.signal_probe(rustix::process::Pid::from_raw(STATED as i32).expect("a positive pid")),
+                Err(rustix::io::Errno::PERM),
+                "the child's box asks the spawn's kernel"
+            );
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                lent.peek(STATED).expect("the stated row"),
+                None,
+                "the child's box asks the spawn's kernel"
+            );
+            #[cfg(windows)]
+            let _ = lent;
+            // The identity check of the spawn, which no row can state: its pid is the child's.
+            #[cfg(target_os = "linux")]
+            assert!(
+                kernel.pidfs_ino_calls() >= 1,
+                "the identity check reads the held pidfd through the spawn's kernel"
+            );
+            #[cfg(target_os = "macos")]
+            assert!(
+                kernel.unique_info_reads(child.pid() as crate::identity::RawPid) >= 1,
+                "the identity check reads the child through the spawn's kernel"
+            );
+            assert!(child.wait().expect("wait").success());
+        }
+        assert_eq!(
+            Arc::strong_count(&kernel),
+            1,
+            "no box or leaf of the spawn outlives its child (raw backend: {raw})"
+        );
+    }
+}
+
+/// The spawn's pre-fork probe of `pidfd_open` asks the kernel the spawn was started with: a refusal
+/// stated for this process's own pid fails the spawn before a child is made, which the host, that
+/// answers the probe, would not.
+///
+/// Mutant: the spawn probes through a host kernel, so the spawn succeeds.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_spawn_probes_pidfd_support_through_the_kernel_it_was_given() {
+    use crate::identity::{FakeKernel, HostKernel};
+
+    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(std::process::id(), Err(rustix::io::Errno::MFILE));
+    let mut c = crate::test_child::command(Console::Hidden);
+    c.args(["true"]);
+    let failure = match super::spawn_with(&mut c, kernel) {
+        Ok(child) => {
+            child.wait().expect("reap the child");
+            panic!("a refused probe fails the spawn");
+        }
+        Err(failure) => failure,
+    };
+    let err = failure.expect_not_started();
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EMFILE), "{err:?}");
+}
+
 #[skuld::test]
 fn spawn_unelevated_runs_a_plain_child() {
     let mut c = crate::test_child::command(Console::Hidden);
@@ -360,7 +480,13 @@ fn spawn_unelevated_runs_a_plain_child() {
     #[cfg(windows)]
     c.args(["cmd", "/C", "exit 0"]);
     let kill_on_drop = c.kill_on_drop_flag();
-    let child = super::spawn_unelevated(&mut c, kill_on_drop, SpawnPolicy::SYNC).expect("spawn");
+    let child = super::spawn_unelevated(
+        &mut c,
+        kill_on_drop,
+        SpawnPolicy::SYNC,
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+    )
+    .expect("spawn");
     assert!(child.wait().expect("wait").success());
 }
 
@@ -677,7 +803,8 @@ fn kill_on_drop_false_disarms_the_leaf_only_when_the_spawn_commits() {
         make_entered_leaf(&leaf_path);
         let (mut cmd, stdin) = blocker_with_held_stdin();
         cmd.kill_on_drop(false);
-        let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+        let mut child =
+            super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC, crate::identity::HostKernel).expect("spawn");
         put_in_leaf(&mut child, &leaf_path);
         if commit {
             child = child.commit_kill_on_drop().expect("commit");
@@ -713,7 +840,7 @@ fn a_failed_password_write_kills_the_contained_tree() {
     make_entered_leaf(&leaf_path);
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC, crate::identity::HostKernel).expect("spawn");
     put_in_leaf(&mut child, &leaf_path);
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
     child.tree.disarm().expect("disarm");
@@ -774,7 +901,7 @@ fn a_failed_password_write_removes_the_leaf_once_the_tree_drains() {
     let _exits = crate::wait::block_probe::on_drain_block(move || FakeLeaf::set_populated(&members, false));
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC, crate::identity::HostKernel).expect("spawn");
     child.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(entered_leaf_at(
         fake.leaf.clone(),
     )));
@@ -810,7 +937,7 @@ fn a_failed_password_write_warns_when_the_tree_kill_fails() {
     make_entered_leaf(&leaf_path);
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC, crate::identity::HostKernel).expect("spawn");
     put_in_leaf(&mut child, &leaf_path);
     // Rule out the leaf's `Drop`: only the failure path itself may kill.
     child.tree.disarm().expect("disarm");
@@ -1093,7 +1220,7 @@ fn failed_write() -> Result<(), Error> {
 fn a_failed_password_write_kills_and_reaps_a_delegated_root() {
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC, crate::identity::HostKernel).expect("spawn");
     child.tree = crate::containment::Tree::delegated();
     let pid = child.pid();
 
@@ -1123,7 +1250,7 @@ fn a_failed_password_write_reaps_the_root_when_the_tree_kill_fails() {
     std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill unwritable");
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC, crate::identity::HostKernel).expect("spawn");
     put_in_leaf(&mut child, &leaf_path);
     let pid = child.pid();
 
@@ -1167,7 +1294,7 @@ fn a_failed_password_writes_cleanup_lists_its_failures_in_the_order_they_happene
     std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill unwritable");
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC, crate::identity::HostKernel).expect("spawn");
     put_in_leaf(&mut child, &leaf_path);
     fault::set_force_reap_failure("cosca-finish-elevated-order-9b3d");
 
@@ -1210,7 +1337,7 @@ fn a_failed_tree_kill_and_an_unknown_root_share_one_warn() {
     std::fs::create_dir(leaf_path.join("cgroup.kill")).expect("make cgroup.kill unwritable");
     let (mut cmd, teardown) = teardown_blocker();
     cmd.kill_on_drop(false);
-    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC).expect("spawn");
+    let mut child = super::spawn_uncommitted(&mut cmd, SpawnPolicy::SYNC, crate::identity::HostKernel).expect("spawn");
     put_in_leaf(&mut child, &leaf_path);
     let pid = child.pid();
     let mark = crate::log_capture::mark();
@@ -1713,7 +1840,7 @@ fn resolve_identity_of_a_reaped_child_whose_pid_a_same_tick_reuser_holds_is_gone
         .live_without_pidfs(pid, pidfd.try_clone().expect("the pidfd duplicates"))
         .same_view()
         .on_read(&format!("{pid}/stat"), Ok(&look_alike));
-    let held = OwnedChild::over_pidfd(Some(pid), held_through(&kernel, pid));
+    let held = OwnedChild::over_pidfd(HostKernel, Some(pid), held_through(&kernel, pid));
     let (read, _, _) = super::resolve_identity(&kernel, pid, &held);
     assert!(
         matches!(read, Resolved::Gone),
@@ -1763,7 +1890,7 @@ fn resolve_identity_reads_the_held_pidfd_and_needs_no_second_open() {
     let (child, pidfd) = live_child_with_pidfd();
     let pid = child.id();
     let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(pid, Err(rustix::io::Errno::MFILE));
-    let (read, _, why) = super::resolve_identity(&kernel, pid, &OwnedChild::over_pidfd(Some(pid), pidfd));
+    let (read, _, why) = super::resolve_identity(&kernel, pid, &OwnedChild::over_pidfd(HostKernel, Some(pid), pidfd));
     let Resolved::Found(id) = read else {
         panic!("the held pidfd answers whatever a second open would: {read:?}")
     };
@@ -1788,7 +1915,7 @@ fn resolve_identity_with_a_failing_fstat_on_the_held_pidfd_is_unknown() {
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(pid, Ok(pidfd.try_clone().expect("the pidfd duplicates")))
         .on_pidfs_ino(pid, Err(rustix::io::Errno::BADF));
-    let held = OwnedChild::over_pidfd(Some(pid), held_through(&kernel, pid));
+    let held = OwnedChild::over_pidfd(HostKernel, Some(pid), held_through(&kernel, pid));
     let (read, _, _) = super::resolve_identity(&kernel, pid, &held);
     assert!(matches!(read, Resolved::Unknown), "{read:?}");
     release(child);
@@ -1807,7 +1934,7 @@ fn resolve_identity_with_a_held_pidfd_that_has_no_inode_reads_proc() {
     let pid = child.id();
     let kernel =
         FakeKernel::over(&HostKernel).live_without_pidfs(pid, pidfd.try_clone().expect("the pidfd duplicates"));
-    let held = OwnedChild::over_pidfd(Some(pid), held_through(&kernel, pid));
+    let held = OwnedChild::over_pidfd(HostKernel, Some(pid), held_through(&kernel, pid));
     let (read, _, _) = super::resolve_identity(&kernel, pid, &held);
     match read {
         Resolved::Found(id) => assert_eq!(id, crate::identity::ticks_id(pid)),
@@ -1846,7 +1973,7 @@ fn resolve_identity_of_a_reaped_child_is_gone() {
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(pid, Ok(pidfd.try_clone().expect("the pidfd duplicates")))
         .on_pidfs_ino(pid, Ok(Some(1)));
-    let held = OwnedChild::over_pidfd(Some(pid), held_through(&kernel, pid));
+    let held = OwnedChild::over_pidfd(HostKernel, Some(pid), held_through(&kernel, pid));
     let (read, _, _) = super::resolve_identity(&kernel, pid, &held);
     assert!(matches!(read, Resolved::Gone), "a reaped child is gone: {read:?}");
 }

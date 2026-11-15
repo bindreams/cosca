@@ -234,6 +234,31 @@ fn try_reap_of_a_zombie_only_its_tracer_sees_is_recheck(#[fixture(tracer_group)]
     tracer.finish();
 }
 
+/// A Linux box owns the kernel it was built with, lends it through its `OwnedChild`, and lets it go
+/// with the box: the row the test stated before the hand-over answers, and the test's own handle on
+/// the kernel is the only one left once the box is dropped.
+///
+/// Mutant: the box lends a host kernel, drops its kernel at construction, or keeps it past its drop.
+#[skuld::test]
+fn a_linux_child_owns_and_lends_the_kernel_it_was_built_with() {
+    use std::sync::Arc;
+
+    use crate::identity::FakeKernel;
+    use crate::os_process::linux::LinuxProcess;
+
+    let target = rustix::process::Pid::from_raw(4242).expect("a positive pid");
+    let kernel = Arc::new(FakeKernel::new().on_signal_probe(target, Err(rustix::io::Errno::PERM)));
+    // The box never looks through this descriptor.
+    let stand_in: std::os::fd::OwnedFd = std::fs::File::open("/dev/null").expect("/dev/null opens").into();
+    let owned = crate::child::owned::OwnedChild::new(Box::new(LinuxProcess::new(Arc::clone(&kernel), None, stand_in)));
+    assert_eq!(Arc::strong_count(&kernel), 2, "the box owns a handle on the kernel");
+
+    assert_eq!(owned.kernel().signal_probe(target), Err(rustix::io::Errno::PERM));
+
+    drop(owned);
+    assert_eq!(Arc::strong_count(&kernel), 1, "dropping the box releases the kernel");
+}
+
 /// A child whose pid is unknown (its spawn failed after the handshake opened its pidfd) is signalled
 /// and reaped through the pidfd alone.
 ///
@@ -253,7 +278,8 @@ fn a_pidless_linux_child_is_signalled_and_reaped_through_its_pidfd() {
     let pidfd = crate::child::front_cgroup_tests::pidfd_of(id.pid());
     // std's `Child` neither kills nor reaps on drop; the pidfd is all that is left of it.
     drop(child);
-    let owned = crate::child::owned::OwnedChild::new(Box::new(LinuxProcess::new(None, pidfd)));
+    let owned =
+        crate::child::owned::OwnedChild::new(Box::new(LinuxProcess::new(crate::identity::HostKernel, None, pidfd)));
     assert_eq!(owned.pid(), None);
     let torn = owned.tear_down(
         None,
@@ -283,7 +309,7 @@ fn a_signal_to_a_reaped_pidless_linux_child_is_named_without_a_number() {
         .found()
         .expect("the live child has an identity");
     let pidfd = crate::child::front_cgroup_tests::pidfd_of(id.pid());
-    let os = LinuxProcess::new(None, pidfd);
+    let os = LinuxProcess::new(crate::identity::HostKernel, None, pidfd);
     assert_eq!(os.signal(Sig::Kill).expect("kill"), Sent::Delivered);
     child.wait().expect("reap the killed child");
     let mark = crate::log_capture::mark();
@@ -317,7 +343,7 @@ fn adopting_a_pidfd_that_is_not_our_child_is_refused() {
     let parent = unsafe { libc::getppid() } as u32;
     let kernel =
         FakeKernel::over(&HostKernel).on_pidfd_open(id.pid(), Ok(crate::child::front_cgroup_tests::pidfd_of(parent)));
-    let error = match adopt_pidfd(&kernel, id) {
+    let error = match adopt_pidfd(kernel, id) {
         Ok(_) => panic!("adopted a pidfd that is not our child"),
         Err(refused) => refused,
     };

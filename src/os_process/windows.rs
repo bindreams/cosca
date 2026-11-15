@@ -18,7 +18,7 @@ use super::{Exit, OsProcess, WaitFor};
 use crate::error::{win32_io_error, Error};
 use crate::identity::{
     windows_exit_look, windows_granted_access, windows_open_dropping_refused, windows_terminate_held, HandleIdentity,
-    Liveness, Look, Opened, ProcessId, Termination,
+    Kernel, Liveness, Look, Opened, ProcessId, Termination,
 };
 use crate::signal::{Sent, Sig};
 use crate::wait::exit_only::{self, Reap, Target};
@@ -32,8 +32,10 @@ pub(crate) mod test_event;
 /// among them.
 pub(crate) const CREATE_PROCESS_ACCESS: PROCESS_ACCESS_RIGHTS = PROCESS_ALL_ACCESS;
 
-#[derive(Debug)]
-pub(crate) struct WindowsProcess {
+/// A process named by a handle. It owns the [`Kernel`] it was built with, which a read of the process by
+/// its number asks (see [`OsChild::kernel`]).
+pub(crate) struct WindowsProcess<K> {
+    kernel: K,
     /// `None`: a UAC launch whose `GetProcessId` failed.
     pid: Option<u32>,
     handle: OwnedHandle,
@@ -42,15 +44,27 @@ pub(crate) struct WindowsProcess {
     granted: PROCESS_ACCESS_RIGHTS,
 }
 
-impl WindowsProcess {
-    /// Open the process `id` names. `Ok(None)`: it is gone, or its pid now names another process.
-    pub(crate) fn open(id: ProcessId) -> Result<Option<Self>, Error> {
+impl<K> std::fmt::Debug for WindowsProcess<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowsProcess")
+            .field("pid", &self.pid)
+            .field("handle", &self.handle)
+            .field("granted", &self.granted)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K: Kernel + Send> WindowsProcess<K> {
+    /// Open the process `id` names, asking `kernel`, which the process then owns. `Ok(None)`: it is
+    /// gone, or its pid now names another process.
+    pub(crate) fn open(kernel: K, id: ProcessId) -> Result<Option<Self>, Error> {
         let Some((handle, granted)) = open_verified(id)? else {
             return Ok(None);
         };
         #[cfg(test)]
         crate::wait::read_probe::mark("identity verified");
         Ok(Some(Self {
+            kernel,
             pid: Some(id.pid()),
             // SAFETY: `open_verified` hands over a freshly opened handle that nothing else owns.
             handle: unsafe { OwnedHandle::from_raw_handle(handle.0 as _) },
@@ -60,8 +74,9 @@ impl WindowsProcess {
 
     /// The child `pid` that `CreateProcess` created, by the handle it returned, which holds
     /// [`CREATE_PROCESS_ACCESS`]: its kill is never refused.
-    pub(crate) fn for_child(handle: OwnedHandle, pid: u32) -> Self {
+    pub(crate) fn for_child(kernel: K, handle: OwnedHandle, pid: u32) -> Self {
         Self {
+            kernel,
             pid: Some(pid),
             handle,
             granted: CREATE_PROCESS_ACCESS,
@@ -71,9 +86,14 @@ impl WindowsProcess {
     /// The child that a UAC elevation (`ShellExecuteEx`) created, by the handle it returned, whose
     /// pid is `pid` (`None`: it could not be read), with the access that handle was granted, read
     /// from it here ([`uac_access`]).
-    pub(crate) fn for_uac(handle: OwnedHandle, pid: Option<u32>) -> Self {
+    pub(crate) fn for_uac(kernel: K, handle: OwnedHandle, pid: Option<u32>) -> Self {
         let granted = uac_access(HANDLE(handle.as_raw_handle()));
-        Self { pid, handle, granted }
+        Self {
+            kernel,
+            pid,
+            handle,
+            granted,
+        }
     }
 
     fn raw(&self) -> HANDLE {
@@ -170,7 +190,7 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<(HANDLE, PROCESS_ACC
     Ok(Some((handle, granted)))
 }
 
-impl OsProcess for WindowsProcess {
+impl<K: Kernel + Send> OsProcess for WindowsProcess<K> {
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         match sig {
             Sig::Kill => match windows_terminate_held(self.raw(), self.granted) {
@@ -203,9 +223,13 @@ impl OsProcess for WindowsProcess {
     }
 }
 
-impl OsChild for WindowsProcess {
+impl<K: Kernel + Send> OsChild for WindowsProcess<K> {
     fn pid(&self) -> Option<u32> {
         self.pid
+    }
+
+    fn kernel(&self) -> &dyn Kernel {
+        &self.kernel
     }
 
     fn kill_refusal(&self) -> KillRefusal {

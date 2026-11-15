@@ -78,6 +78,7 @@ use super::{SpawnFailure, SpawnLockGuard};
 use crate::child::owned::teardown::Past;
 use crate::child::owned::OwnedChild;
 use crate::error::{ChildFate, Error};
+use crate::identity::SpawnKernel;
 
 const GO: u8 = 1;
 /// A report's tag: the child's pidfd is attached as `SCM_RIGHTS`; the value is 0.
@@ -112,8 +113,13 @@ pub(crate) struct Held {
 /// Reap `child`, which never ran the program, through `pidfd`: it is dead or on its way out. Says
 /// what became of it. With `warn_after`, the wait for its exit warns once it passes that long, and
 /// goes on. std's `Child` reaps nothing on drop: the pidfd is the only reaper.
-fn reap_unexecuted(child: std::process::Child, pidfd: OwnedFd, warn_after: Option<std::time::Duration>) -> ChildFate {
-    end_unexecuted(OwnedChild::over_pidfd(Some(child.id()), pidfd), warn_after)
+fn reap_unexecuted(
+    child: std::process::Child,
+    pidfd: OwnedFd,
+    kernel: SpawnKernel,
+    warn_after: Option<std::time::Duration>,
+) -> ChildFate {
+    end_unexecuted(OwnedChild::over_pidfd(kernel, Some(child.id()), pidfd), warn_after)
 }
 
 /// Give up on `child`: no pidfd reached this process, so there is none to reap it through. `why`
@@ -290,7 +296,11 @@ impl Handshake {
     /// The child runs the program only once told to go, so every failure proves the program did not
     /// start: std's `spawn` fails only on a report from the child before `exec`, and collects that
     /// child.
-    pub(crate) fn run(self, spawn: impl FnOnce() -> io::Result<std::process::Child>) -> Result<Held, SpawnFailure> {
+    pub(crate) fn run(
+        self,
+        kernel: SpawnKernel,
+        spawn: impl FnOnce() -> io::Result<std::process::Child>,
+    ) -> Result<Held, SpawnFailure> {
         let Handshake {
             parent_end,
             child_end,
@@ -398,7 +408,7 @@ impl Handshake {
                 (Outcome::NoReport, Some((what, cause))) => Outcome::Unwatched(what, cause),
                 (outcome, _) => outcome,
             };
-            conclude(spawned, outcome, warn_after)
+            conclude(spawned, outcome, kernel, warn_after)
         })
     }
 }
@@ -762,24 +772,25 @@ fn join_helper(helper: std::thread::ScopedJoinHandle<'_, Outcome>, #[cfg(test)] 
 ///
 /// Only a child the helper told to go can run the program, and std fails its `spawn` only on a
 /// report from the child before `exec`, so every failure answers that the program did not start.
-/// `warn_after`: see [`Handshake::warning_past`].
+/// `warn_after`: see [`Handshake::warning_past`]. The box over the pidfd owns `kernel`.
 fn conclude(
     spawned: io::Result<std::process::Child>,
     outcome: Outcome,
+    kernel: SpawnKernel,
     warn_after: Option<std::time::Duration>,
 ) -> Result<Held, SpawnFailure> {
     let not_started = |error| -> Result<Held, SpawnFailure> { Err(SpawnFailure::NotStarted(error)) };
     let with_child = |cause, fate| Err(SpawnFailure::NotStartedWithChild { cause, fate });
     match (spawned, outcome) {
         (Ok(child), Outcome::Opened(pidfd)) => {
-            let owned = OwnedChild::over_pidfd(Some(child.id()), pidfd);
+            let owned = OwnedChild::over_pidfd(kernel, Some(child.id()), pidfd);
             Ok(Held { child, owned })
         }
         // Not told to go, so it cannot have execed: it was killed on its way, which std reads as
         // success.
         (Ok(child), Outcome::Gone(pidfd)) => {
             let named = super::named(Some(child.id()));
-            let fate = reap_unexecuted(child, pidfd, warn_after);
+            let fate = reap_unexecuted(child, pidfd, kernel, warn_after);
             with_child(
                 Error::Io(io::Error::other(format!(
                     "the spawned child ({named}) died before exec: the program never ran"
@@ -789,7 +800,7 @@ fn conclude(
         }
         // Not told to go, as in every arm below but the first with `Opened`.
         (Ok(child), Outcome::Failed(e, Some(pidfd))) => {
-            let fate = reap_unexecuted(child, pidfd, warn_after);
+            let fate = reap_unexecuted(child, pidfd, kernel, warn_after);
             with_child(e, fate)
         }
         // Not told to go either: it dies at its hook, if it has not yet, and is left to its reaper.
@@ -813,7 +824,7 @@ fn conclude(
         // The spawn failed after the fork, and std collected the child of a spawn it fails: the
         // program never ran. A child still there is ended through the pidfd.
         (Err(e), Outcome::Opened(pidfd)) => {
-            let owned = OwnedChild::over_pidfd(None, pidfd);
+            let owned = OwnedChild::over_pidfd(kernel, None, pidfd);
             // A peek of our own child's pidfd fails only with `ECHILD` (foreign reap, an `Ok`) or
             // `EBADF`/`EINVAL` (not our pidfd). A sandbox policy may return another errno, which says
             // nothing about the child.
@@ -832,7 +843,7 @@ fn conclude(
         }
         // Not told to go, so it never ran the program.
         (Err(e), Outcome::Gone(pidfd)) => {
-            let fate = end_unexecuted(OwnedChild::over_pidfd(None, pidfd), warn_after);
+            let fate = end_unexecuted(OwnedChild::over_pidfd(kernel, None, pidfd), warn_after);
             with_child(Error::Io(e), fate)
         }
         // The helper failed too, and its error explains the abort std reports.
@@ -840,7 +851,7 @@ fn conclude(
             let error = answer_of_failed_spawn_and_helper(spawn, helper);
             match pidfd {
                 Some(pidfd) => {
-                    let fate = end_unexecuted(OwnedChild::over_pidfd(None, pidfd), warn_after);
+                    let fate = end_unexecuted(OwnedChild::over_pidfd(kernel, None, pidfd), warn_after);
                     with_child(error, fate)
                 }
                 None => not_started(error),

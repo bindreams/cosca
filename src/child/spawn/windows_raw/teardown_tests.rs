@@ -26,7 +26,7 @@ use crate::child::spawn::held_teardown::tear_down_failed_spawn;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::Diagnosis;
 use crate::error::ChildFate;
-use crate::identity::ProcessId;
+use crate::identity::{HostKernel, ProcessId};
 use crate::os_process::child::{ExitRecord, KillRefusal, OsChild};
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::os_process::windows::WindowsProcess;
@@ -55,7 +55,7 @@ impl Suspended {
         )
         .expect("spawn suspended");
         Suspended {
-            owned: OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid))),
+            owned: OwnedChild::new(Box::new(WindowsProcess::for_child(HostKernel, proc, pid))),
             pid,
         }
     }
@@ -122,12 +122,12 @@ impl Drop for Suspended {
 /// A fake that answers from its tables and, past them, from the real `handle` of the process `pid`,
 /// as a `CreateProcess` handle is built.
 fn real(handle: OwnedHandle, pid: u32) -> FakeProcess {
-    FakeProcess::over(Box::new(WindowsProcess::for_child(handle, pid)))
+    FakeProcess::over(Box::new(WindowsProcess::for_child(HostKernel, handle, pid)))
 }
 
 /// A [`WindowsProcess`] over a handle a UAC elevation returned, which allows what it was granted.
-fn uac_process(handle: OwnedHandle, pid: u32) -> WindowsProcess {
-    WindowsProcess::for_uac(handle, Some(pid))
+fn uac_process(handle: OwnedHandle, pid: u32) -> WindowsProcess<HostKernel> {
+    WindowsProcess::for_uac(HostKernel, handle, Some(pid))
 }
 
 /// [`real`] for a handle a UAC elevation returned.
@@ -396,7 +396,7 @@ fn an_untracked_uac_child_is_waited_for_and_a_refused_kill_hands_it_back() {
                 Err(read_failure())
             }
         };
-        let process = |handle, pid: u32| WindowsProcess::for_uac(handle, pid_read.then_some(pid));
+        let process = |handle, pid: u32| WindowsProcess::for_uac(HostKernel, handle, pid_read.then_some(pid));
         let ended = |child, pid| {
             crate::child::spawn::failure::error_parts(end_untracked(child, unread(pid), SpawnPolicy::SYNC).into())
         };
@@ -445,9 +445,9 @@ fn an_untracked_uac_child_is_waited_for_and_a_refused_kill_hands_it_back() {
 #[skuld::test]
 fn each_windows_handle_kind_states_what_its_kill_may_be_refused_for() {
     let owner = Suspended::spawn();
-    let kind = |process: WindowsProcess| process.kill_refusal();
+    let kind = |process: WindowsProcess<HostKernel>| process.kill_refusal();
     assert_eq!(
-        kind(WindowsProcess::for_child(owner.duplicate(), owner.pid)),
+        kind(WindowsProcess::for_child(HostKernel, owner.duplicate(), owner.pid)),
         KillRefusal::Never
     );
     assert_eq!(

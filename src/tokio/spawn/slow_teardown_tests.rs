@@ -1,7 +1,7 @@
 //! A failed async spawn's teardown waits for the killed child and warns once, naming it, once its
 //! wait passes the threshold (principle 2). Each row fails the spawn at one arm and pins that the arm
 //! passes `async_policy` to its wait. The seams are thread-local, so rows call
-//! `spawn_uncommitted(cmd, async_policy())` on the test thread. A foreign tracer holds the killed
+//! `spawn_uncommitted(cmd, async_policy(), HostKernel)` on the test thread. A foreign tracer holds the killed
 //! child's zombie, so the wait cannot end before the tracer lets go. The threshold is zero, so no
 //! look before the warn blocks or pauses and the warn is out before the wait first does; the
 //! tracer lets go only then.
@@ -22,7 +22,12 @@ use crate::test_support::foreign_tracer::{
 
 /// What the async spawn's hop runs, on this thread: the sync spawn, told the async policy.
 fn spawn_on_this_thread(cmd: &mut crate::tokio::Command) -> Result<(), crate::child::spawn::SpawnFailure> {
-    crate::child::spawn::spawn_uncommitted(cmd.as_sync_mut(), crate::tokio::child::async_policy()).map(drop)
+    crate::child::spawn::spawn_uncommitted(
+        cmd.as_sync_mut(),
+        crate::tokio::child::async_policy(),
+        crate::identity::HostKernel,
+    )
+    .map(drop)
 }
 
 /// Fails the spawn at `point`, with `arm` making it fail from there, and `disarm` undoing `arm`.

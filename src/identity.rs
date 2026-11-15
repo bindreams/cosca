@@ -746,6 +746,16 @@ pub(crate) use backend::kernel::PIDFD_THREAD;
 #[cfg(windows)]
 pub(crate) use no_reads::{HostKernel, Kernel};
 
+/// The one kernel a spawn starts with, erased, so the spawn is written once whatever kernel it is
+/// given. Its boxes (the child's, the cgroup leaf's, the placement probe's) each own a clone of the
+/// `Arc`, which answers as the original. `Kernel` is `Sync`, so the `Arc` is `Send`.
+pub(crate) type SpawnKernel = std::sync::Arc<dyn Kernel + Send>;
+
+/// `kernel`, erased into a [`SpawnKernel`]. A spawn calls it once, at its entry.
+pub(crate) fn spawn_kernel(kernel: impl Kernel + Send + 'static) -> SpawnKernel {
+    std::sync::Arc::new(kernel)
+}
+
 /// The [`Kernel`] of the platform whose reads no test answers yet.
 #[cfg(windows)]
 mod no_reads {

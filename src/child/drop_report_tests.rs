@@ -739,8 +739,12 @@ fn child_in_a_leaf_whose_kill_fails() -> (
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
-    let mut child = crate::child::spawn::spawn_uncommitted(&mut cmd, crate::child::spawn::policy::SpawnPolicy::SYNC)
-        .expect("spawn");
+    let mut child = crate::child::spawn::spawn_uncommitted(
+        &mut cmd,
+        crate::child::spawn::policy::SpawnPolicy::SYNC,
+        crate::identity::HostKernel,
+    )
+    .expect("spawn");
     child.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(
         crate::containment::cgroup::test_support::entered_leaf_at(leaf_path.clone()),
     ));

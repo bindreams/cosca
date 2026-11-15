@@ -103,6 +103,7 @@ pub(crate) fn spawn_raw(
     fds: BTreeMap<Fd, ResolvedStdio>,
     kill_on_drop: bool,
     policy: SpawnPolicy,
+    kernel: crate::identity::SpawnKernel,
 ) -> Result<Child, SpawnFailure> {
     // .bat/.cmd rejected on the raw program token BEFORE resolution, so a bad/nonexistent batch
     // path still errors loudly (CVE-2024-24576) rather than surfacing as a spawn failure.
@@ -204,9 +205,9 @@ pub(crate) fn spawn_raw(
         graceful: crate::containment::windows::mechanism_from_flags(flags),
         frozen: cmd.flags_request().suspended,
     };
-    let owned = OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid)));
+    let owned = OwnedChild::new(Box::new(WindowsProcess::for_child(kernel, proc, pid)));
     let raw_handle = owned.os_handle().as_raw_handle();
-    let (resolved, cause, mut why) = resolve_identity(&crate::identity::HostKernel, pid);
+    let (resolved, cause, mut why) = resolve_identity(owned.kernel(), pid);
     let id = match resolved {
         crate::identity::Resolved::Found(id) => Ok(id),
         // Kept with no identity; see `Child::id`.

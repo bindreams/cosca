@@ -1416,7 +1416,8 @@ pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> Wind
 /// does for itself between `fork` and `exec` goes into `steps`, which the caller registers.
 ///
 /// `teardown_warn_after` is the spawn policy's: the cgroup leaf made here warns once this long into
-/// each of its waits for its drain, whoever drops or abandons it (principle 2).
+/// each of its waits for its drain, whoever drops or abandons it (principle 2). The leaf owns a clone
+/// of `kernel`, the spawn's, and asks it.
 ///
 /// `reserved_fds` and `marker_suppressed` drive the macOS fd-marker install only; every
 /// other platform ignores them. `flags` is the caller's creation-flag request, which only
@@ -1462,6 +1463,14 @@ pub(crate) fn prepare(
         allow(unused_variables, reason = "only a Linux cgroup leaf waits for its drain")
     )]
     teardown_warn_after: Option<std::time::Duration>,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            unused_variables,
+            reason = "only a Linux cgroup leaf owns a clone of the spawn's kernel"
+        )
+    )]
+    kernel: &crate::identity::SpawnKernel,
 ) -> Result<Prepared, Error> {
     let mode = req.mode;
     // Read once, above every branch, so the word is composed exactly once per spawn and no two
@@ -1563,12 +1572,13 @@ pub(crate) fn prepare(
                 // offers no cgroup is the process group set above.
                 crate::containment::cgroup::leaf_if_offered(
                     crate::containment::cgroup::offered_cgroup(),
+                    kernel,
                     teardown_warn_after,
                 )?
             } else {
                 // A failed leaf creation degrades this spawn to the process group set above, and
                 // `log_degrade` names the step that failed and the kernel's reason for it.
-                match crate::containment::cgroup::try_create_leaf(teardown_warn_after) {
+                match crate::containment::cgroup::try_create_leaf(kernel, teardown_warn_after) {
                     Ok(leaf) => Some(leaf),
                     Err(e) => {
                         crate::containment::cgroup::log_degrade(&e);

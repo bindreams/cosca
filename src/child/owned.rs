@@ -169,11 +169,18 @@ impl OwnedChild {
         }
     }
 
-    /// Take over the child `pidfd` names, whose pid is `pid` if known. **Makes no call to it**, as
-    /// [`new`](Self::new). The one constructor of a Linux box over a pidfd.
+    /// Take over the child `pidfd` names, whose pid is `pid` if known, asking `kernel`, which the box
+    /// then owns. **Makes no call to it**, as [`new`](Self::new). The one constructor of a Linux box
+    /// over a pidfd.
     #[cfg(target_os = "linux")]
-    pub(crate) fn over_pidfd(pid: Option<u32>, pidfd: std::os::fd::OwnedFd) -> OwnedChild {
-        OwnedChild::new(Box::new(crate::os_process::linux::LinuxProcess::new(pid, pidfd)))
+    pub(crate) fn over_pidfd<K: crate::identity::Kernel + Send + 'static>(
+        kernel: K,
+        pid: Option<u32>,
+        pidfd: std::os::fd::OwnedFd,
+    ) -> OwnedChild {
+        OwnedChild::new(Box::new(crate::os_process::linux::LinuxProcess::new(
+            kernel, pid, pidfd,
+        )))
     }
 
     /// Take over the std `child`, whose identity `id` the caller has just read, through
@@ -221,6 +228,12 @@ impl OwnedChild {
     /// The child as the process the OS names, to watch for its exit without reaping it.
     pub(crate) fn os_process(&self) -> &dyn crate::os_process::OsProcess {
         &*self.os
+    }
+
+    /// The kernel the child's box was built with, lent for a read the policy layer makes by the
+    /// child's number; see [`OsChild::kernel`].
+    pub(crate) fn kernel(&self) -> &dyn crate::identity::Kernel {
+        self.os.kernel()
     }
 
     /// What a kill of the child may be refused for; see [`OsChild::kill_refusal`].

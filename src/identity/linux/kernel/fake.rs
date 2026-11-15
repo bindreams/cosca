@@ -5,6 +5,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use rustix::io::Errno;
@@ -31,6 +32,8 @@ pub(crate) struct FakeKernel<'a> {
     pidfs_inos: Vec<PidfsRow>,
     /// The descriptors this kernel has handed out, so that `pidfs_ino` can tell whose they are.
     opened: Mutex<Vec<Opened>>,
+    /// How many times `pidfs_ino` has been asked, whoever answered.
+    pidfs_ino_calls: AtomicUsize,
 }
 
 /// The call of a read or listing that a row's errno answers for.
@@ -93,7 +96,14 @@ impl<'a> FakeKernel<'a> {
             pidfd_opens: Vec::new(),
             pidfs_inos: Vec::new(),
             opened: Mutex::new(Vec::new()),
+            pidfs_ino_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// How many times the kernel has been asked for a pidfd's `pidfs_ino`: an identity read of a
+    /// held pidfd, whose pid no row can name beforehand, asks it.
+    pub(crate) fn pidfs_ino_calls(&self) -> usize {
+        self.pidfs_ino_calls.load(Ordering::Relaxed)
     }
 
     /// A kernel that answers its rows and passes every other call to `real`.
@@ -329,6 +339,7 @@ impl Kernel for FakeKernel<'_> {
     }
 
     fn pidfs_ino(&self, fd: BorrowedFd<'_>) -> Result<Option<u64>, Errno> {
+        self.pidfs_ino_calls.fetch_add(1, Ordering::Relaxed);
         let raw = fd.as_raw_fd();
         let opened = self.opened.lock().expect("no panic holds the opens");
         let Some(open) = opened.iter().rev().find(|o| o.fd == raw) else {

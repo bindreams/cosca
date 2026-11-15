@@ -21,13 +21,22 @@ use crate::child::spawn::SpawnFailure;
 use crate::command::Command;
 use crate::error::ChildFate;
 use crate::error::Error;
-use crate::identity::FakeKernel;
+use crate::identity::{spawn_kernel, FakeKernel};
 use crate::os_process::linux::open::probe_pidfd_support_with;
 use crate::stdio::Stdio;
 use crate::test_child::fixture_path;
 use crate::test_child::namespaces as ns;
 use crate::test_groups::{namespaces, Group};
 use crate::test_seccomp::PIDFD_OPEN_REFUSALS;
+
+/// [`super::conclude`] over the host's kernel: no test here states a row of its own.
+fn conclude_over_host(
+    spawned: std::io::Result<std::process::Child>,
+    outcome: Outcome,
+    warn_after: Option<std::time::Duration>,
+) -> Result<super::Held, SpawnFailure> {
+    super::conclude(spawned, outcome, spawn_kernel(crate::identity::HostKernel), warn_after)
+}
 
 /// A command that writes `ran` to a pipe and exits, and the read end of that pipe.
 fn marker_command() -> (Command, std::io::PipeReader) {
@@ -384,7 +393,7 @@ fn fail_after_exec() -> crate::child::spawn::fault::TeardownBlocker {
     let guard = super::super::spawn_lock();
     let handshake = pending.open(&guard).expect("open");
     #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `guard`")]
-    let result = handshake.run(|| {
+    let result = handshake.run(spawn_kernel(crate::identity::HostKernel), || {
         let child = std_cmd.spawn()?;
         drop(child);
         Err::<std::process::Child, _>(std::io::Error::other("post-fork failure (test)"))
@@ -418,7 +427,7 @@ fn a_later_hook_failure_leaves_nothing_to_kill() {
     let guard = super::super::spawn_lock();
     let handshake = pending.open(&guard).expect("open");
     #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `guard`")]
-    let result = handshake.run(|| std_cmd.spawn());
+    let result = handshake.run(spawn_kernel(crate::identity::HostKernel), || std_cmd.spawn());
     drop(guard);
     drop(hook);
 
@@ -727,7 +736,9 @@ fn a_spawn_that_fails_before_the_fork_ends_the_helper() {
     let guard = super::super::spawn_lock();
     let handshake = pending.open(&guard).expect("open");
     let probes = fault::arm_end_probes();
-    let result = handshake.run(|| Err::<std::process::Child, _>(std::io::Error::other("failed before the fork")));
+    let result = handshake.run(spawn_kernel(crate::identity::HostKernel), || {
+        Err::<std::process::Child, _>(std::io::Error::other("failed before the fork"))
+    });
     drop(probes);
     assert_ends_closed(fault::take_ends(), "a spawn that fails before the fork");
     drop(guard);
@@ -1147,7 +1158,7 @@ fn an_abandoned_child_is_worded_by_its_cause() {
 
     let mark = crate::log_capture::mark();
     let failed = Outcome::Failed(Error::Io(std::io::Error::other("the report was cut short")), None);
-    let err = super::conclude(Ok(ended_cat()), failed, None).err();
+    let err = conclude_over_host(Ok(ended_cat()), failed, None).err();
     assert_eq!(
         err.map(|e| crate::error::said(&e.expect_not_started())).as_deref(),
         Some(crate::error::io_said("the report was cut short").as_str())
@@ -1159,7 +1170,7 @@ fn an_abandoned_child_is_worded_by_its_cause() {
     );
 
     let mark = crate::log_capture::mark();
-    super::conclude(Ok(ended_cat()), Outcome::NoReport, None).err();
+    conclude_over_host(Ok(ended_cat()), Outcome::NoReport, None).err();
     let why = said(mark);
     assert!(why.contains("died before it sent its pidfd"), "{why}");
 }
@@ -1294,7 +1305,7 @@ fn a_child_gone_before_its_go_is_reaped_through_its_pidfd() {
     let pid = cat.id();
     cat.kill().expect("kill the child");
     crate::test_child::wait_until_zombie(pid);
-    super::conclude(
+    conclude_over_host(
         Err::<NoChild, _>(std::io::Error::other("killed on its way")),
         Outcome::Gone(pidfd),
         None,
@@ -1320,14 +1331,14 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
         pidfd
     };
     // Told no go, spawn failed, child killed on its way: torn down through its pidfd.
-    let (_, fate) = super::conclude(Err::<NoChild, _>(io("gone")), Outcome::Gone(killed()), None)
+    let (_, fate) = conclude_over_host(Err::<NoChild, _>(io("gone")), Outcome::Gone(killed()), None)
         .err()
         .expect("the spawn fails")
         .expect_not_started_with_child();
     assert_eq!(fate, ChildFate::Reaped);
 
     // The helper failed after sending the pidfd.
-    let (_, fate) = super::conclude(
+    let (_, fate) = conclude_over_host(
         Err::<NoChild, _>(io("x")),
         Outcome::Failed(Error::Io(io("helper")), Some(killed())),
         None,
@@ -1343,7 +1354,7 @@ fn a_not_started_failure_carries_the_fate_of_the_child_it_held() {
         Outcome::NoReport,
         Outcome::Unwatched("what", io("cause")),
     ] {
-        let failure = super::conclude(Err::<NoChild, _>(io("x")), outcome, None)
+        let failure = conclude_over_host(Err::<NoChild, _>(io("x")), outcome, None)
             .err()
             .expect("the spawn fails");
         assert!(matches!(failure, SpawnFailure::NotStarted(_)), "{failure:?}");
@@ -1359,7 +1370,7 @@ fn a_returned_childs_failure_carries_its_teardowns_fate() {
     let (mut cat, pidfd) = cat_with_pidfd();
     drop(cat.stdin.take());
     cat.wait().expect("collect the child");
-    let (_, fate) = super::conclude(Ok(cat), Outcome::Gone(pidfd), None)
+    let (_, fate) = conclude_over_host(Ok(cat), Outcome::Gone(pidfd), None)
         .err()
         .expect("the spawn fails")
         .expect_not_started_with_child();
@@ -1367,7 +1378,7 @@ fn a_returned_childs_failure_carries_its_teardowns_fate() {
 
     // Running: killed and reaped.
     let (cat, pidfd) = cat_with_pidfd();
-    let (_, fate) = super::conclude(
+    let (_, fate) = conclude_over_host(
         Ok(cat),
         Outcome::Failed(Error::Io(std::io::Error::other("helper")), Some(pidfd)),
         None,
@@ -1393,7 +1404,7 @@ fn a_returned_child_with_no_pidfd_is_killed() {
         let (mut cat, _pidfd) = cat_with_pidfd();
         drop(cat.stdin.take());
         crate::test_child::wait_until_zombie(cat.id());
-        let (_, fate) = super::conclude(Ok(cat), outcome, None)
+        let (_, fate) = conclude_over_host(Ok(cat), outcome, None)
             .err()
             .expect("the spawn fails")
             .expect_not_started_with_child();
@@ -1417,7 +1428,7 @@ fn conclude_answers_whether_the_program_could_have_started() {
     let (mut cat, pidfd) = cat_with_pidfd();
     // Released after the kill: a kill that sent nothing exits 0.
     let teardown = crate::child::spawn::fault::release_between_kill_and_wait(cat.stdin.take());
-    answered(super::conclude(
+    answered(conclude_over_host(
         Err::<NoChild, _>(io("std")),
         Outcome::Opened(pidfd),
         None,
@@ -1431,32 +1442,32 @@ fn conclude_answers_whether_the_program_could_have_started() {
     let (mut cat, pidfd) = cat_with_pidfd();
     cat.kill().expect("kill the child");
     crate::test_child::wait_until_zombie(cat.id());
-    answered(super::conclude(
+    answered(conclude_over_host(
         Err::<NoChild, _>(io("gone")),
         Outcome::Gone(pidfd),
         None,
     ))
     .expect_not_started();
-    answered(super::conclude(
+    answered(conclude_over_host(
         Err::<NoChild, _>(io("x")),
         Outcome::Failed(failed("helper"), None),
         None,
     ))
     .expect_not_started();
-    answered(super::conclude(Err::<NoChild, _>(io("x")), Outcome::NoReport, None)).expect_not_started();
-    answered(super::conclude(
+    answered(conclude_over_host(Err::<NoChild, _>(io("x")), Outcome::NoReport, None)).expect_not_started();
+    answered(conclude_over_host(
         Err::<NoChild, _>(io("x")),
         Outcome::Unwatched("what", io("cause")),
         None,
     ))
     .expect_not_started();
     let (cat, pidfd) = cat_with_pidfd();
-    super::conclude(Ok(cat), Outcome::Gone(pidfd), None)
+    conclude_over_host(Ok(cat), Outcome::Gone(pidfd), None)
         .err()
         .expect("the spawn fails")
         .expect_not_started();
     let (cat, pidfd) = cat_with_pidfd();
-    super::conclude(Ok(cat), Outcome::Failed(failed("helper"), Some(pidfd)), None)
+    conclude_over_host(Ok(cat), Outcome::Failed(failed("helper"), Some(pidfd)), None)
         .err()
         .expect("the spawn fails")
         .expect_not_started();
@@ -1484,19 +1495,19 @@ fn conclude_answers_every_remaining_pair() {
 
     // Told to go, and the spawn succeeded: it carries on.
     let (cat, pidfd) = ended_cat();
-    let held = super::conclude(Ok(cat), Outcome::Opened(pidfd), None).expect("a child told to go is held");
+    let held = conclude_over_host(Ok(cat), Outcome::Opened(pidfd), None).expect("a child told to go is held");
     let mut cat = held.child;
     cat.wait().expect("collect the child");
 
     // Never told to go, and the spawn succeeded anyway: the helper's error stands, not started.
     let (cat, _pidfd) = ended_cat();
-    let error = super::conclude(Ok(cat), Outcome::Failed(failed("helper"), None), None)
+    let error = conclude_over_host(Ok(cat), Outcome::Failed(failed("helper"), None), None)
         .err()
         .expect("the spawn fails")
         .expect_not_started();
     assert!(matches!(&error, Error::Io(e) if e.to_string() == "helper"), "{error:?}");
     let (cat, _pidfd) = ended_cat();
-    let error = super::conclude(Ok(cat), Outcome::NoReport, None)
+    let error = conclude_over_host(Ok(cat), Outcome::NoReport, None)
         .err()
         .expect("the spawn fails")
         .expect_not_started();
@@ -1505,7 +1516,7 @@ fn conclude_answers_every_remaining_pair() {
         "{error:?}"
     );
     let (cat, _pidfd) = ended_cat();
-    let error = super::conclude(Ok(cat), Outcome::Unwatched("what", io("cause")), None)
+    let error = conclude_over_host(Ok(cat), Outcome::Unwatched("what", io("cause")), None)
         .err()
         .expect("the spawn fails")
         .expect_not_started();
@@ -1519,7 +1530,7 @@ fn conclude_answers_every_remaining_pair() {
     let mut cat = cat;
     drop(cat.stdin.take());
     cat.wait().expect("collect the child");
-    let error = super::conclude(
+    let error = conclude_over_host(
         Err::<NoChild, _>(io("spawn")),
         Outcome::Failed(failed("helper"), Some(pidfd)),
         None,
@@ -1548,7 +1559,7 @@ fn handshake_warns_since(mark: usize) -> Vec<String> {
 fn a_failed_spawn_whose_helper_failed_too_answers_the_helpers_io_and_warns_of_the_spawn() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let error = super::conclude(
+    let error = conclude_over_host(
         Err::<NoChild, _>(std::io::Error::other("spawn 6e1a")),
         Outcome::Failed(Error::Io(std::io::Error::other("helper 6e1a")), None),
         None,
@@ -1577,7 +1588,7 @@ fn a_refused_pidfd_open_beside_a_failed_spawn_answers_unsupported_with_the_spawn
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let refused = crate::os_process::linux::open::spawn_open_error(Errno::PERM);
-    let error = super::conclude(
+    let error = conclude_over_host(
         Err::<NoChild, _>(std::io::Error::other("spawn 2b7c")),
         Outcome::Failed(refused, None),
         None,
@@ -1608,7 +1619,7 @@ fn a_refused_pidfd_open_beside_a_failed_spawn_answers_unsupported_with_the_spawn
 fn a_failed_spawn_whose_watch_failed_too_answers_the_spawns_io_and_warns_of_the_watch() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let error = super::conclude(
+    let error = conclude_over_host(
         Err::<NoChild, _>(std::io::Error::other("spawn 9d40")),
         Outcome::Unwatched("a watch 9d40", std::io::Error::other("cause 9d40")),
         None,
@@ -1640,7 +1651,7 @@ fn a_child_ended_through_its_pidfd_is_said_reaped_under_the_failed_spawns_name()
     let mark = crate::log_capture::mark();
 
     let fate = super::tear_down_leaving(
-        &crate::child::owned::OwnedChild::over_pidfd(Some(pid), pidfd),
+        &crate::child::owned::OwnedChild::over_pidfd(crate::identity::HostKernel, Some(pid), pidfd),
         None,
         super::Past::Clean,
         None,

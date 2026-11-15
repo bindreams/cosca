@@ -1247,8 +1247,13 @@ fn an_untracked_childs_failure_follows_how_its_teardown_ended() {
 fn an_already_elevated_spawn_leaves_the_callers_command_without_a_report() {
     let mut cmd = crate::test_child::command(crate::test_child::Console::Hidden);
     cmd.args(["cmd", "/c", "exit", "0"]);
-    let child = super::spawn_already_elevated(&mut cmd, true, crate::child::spawn::policy::SpawnPolicy::SYNC)
-        .expect("an ordinary spawn");
+    let child = super::spawn_already_elevated(
+        &mut cmd,
+        true,
+        crate::child::spawn::policy::SpawnPolicy::SYNC,
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+    )
+    .expect("an ordinary spawn");
     assert!(cmd.elevation_report().is_none(), "{:?}", cmd.elevation_report());
     assert_eq!(
         child.elevation().map(|report| report.via),

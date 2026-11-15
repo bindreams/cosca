@@ -39,7 +39,11 @@ fn teardown_with_an_exit_under_way(backend: Backend, force: fn(bool)) -> (ChildF
     let _end = crate::wait::block_probe::on_blocking(move || drop(writer));
     let refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     force(true);
-    let spawned = crate::child::spawn::spawn_uncommitted(cmd.as_sync_mut(), crate::tokio::child::async_policy());
+    let spawned = crate::child::spawn::spawn_uncommitted(
+        cmd.as_sync_mut(),
+        crate::tokio::child::async_policy(),
+        crate::identity::HostKernel,
+    );
     force(false);
     let (_, fate) = crate::child::spawn::failure::expect_may_have_started_with(crate::error::Error::from(
         spawned.expect_err("the forced failure fails the spawn"),

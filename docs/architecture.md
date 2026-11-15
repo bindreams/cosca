@@ -42,12 +42,17 @@ takes `&dyn Kernel` with no `#[cfg]`; Linux's and macOS's have the methods, and 
 yet. A method enters with its first caller. A read that a test answers takes `&dyn Kernel`; code
 that runs between fork and exec never does, and stays raw.
 
-The OS layer owns the kernel it asks. `os_process::open_with(kernel, id)` checks `id` through
-`&kernel` and, on macOS, moves the same kernel into the `MacosProcess` it returns; `MacosChild`
-takes its kernel the same way. Linux and Windows drop it once the open is done. A borrow, a `Box`
-and an `Arc` of a kernel are kernels, so the walks, which open one process per member from one
-borrowed kernel, pass `&dyn Kernel`, and tests move a `FakeKernel` in. `Process` and `OwnedChild`
-hold a `Box<dyn OsProcess>` or `Box<dyn OsChild>`: the kernel's type stops at the OS layer.
+The OS layer owns the kernel it asks, on every platform. `os_process::open_with(kernel, id)` checks
+`id` through `&kernel` and moves the same kernel into the process it returns (`LinuxProcess<K>`,
+`WindowsProcess<K>`, `MacosProcess<K>`); each child box (`OsChild`) takes its kernel the same way and
+lends it through `OsChild::kernel()`. A spawn starts with one kernel (`spawn_with(cmd, kernel)`;
+production passes `HostKernel`), erased once at its entry into a `SpawnKernel`, an `Arc<dyn Kernel +
+Send>`, so the spawn body below the entry is not generic. The child's box owns it, and the cgroup
+leaf and the placement probe's box each own a clone of the `Arc`; the spawn's own reads ask it as
+`&dyn Kernel`. A borrow, a `Box` and an `Arc` of a kernel are kernels, so the walks, which open one
+process per member from one borrowed kernel, pass `&dyn Kernel`, and tests move a `FakeKernel` in.
+`Process` and `OwnedChild` hold a `Box<dyn OsProcess>` or `Box<dyn OsChild>`: the kernel's type stops
+at the OS layer.
 
 The public types follow the same line:
 
@@ -183,7 +188,7 @@ In order:
    left is to remove `child::fault::force_root_reads` and `force_next_root_read`, a
    thread-local hook that answers the root's identity read (`root_identity_now`) beside
    `FakeKernel`: the root's read moves into `OwnedChild`, which borrows the kernel its OS box owns
-   (`OsProcess::kernel()`, added with this move: nothing calls it before) for that one identity
+   (`OsChild::kernel()`, which `OwnedChild::kernel()` lends) for that one identity
    read, and those tests state `FakeKernel` rows (owner, 2026-11-05: kept until then; needs
    [#877](https://github.com/bindreams/cosca/issues/877) on macOS). Beside them goes
    `containment::cgroup::fault::hide_proc` and `hide_proc_as`, a thread-local hook that makes the

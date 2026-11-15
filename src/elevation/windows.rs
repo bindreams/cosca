@@ -387,12 +387,17 @@ fn elevated_params(argv: &[OsString]) -> Result<OsString, Error> {
 }
 
 // Both the sync (`spawn_elevated`) and async spawn arms route an elevated `Command` here.
-pub(crate) fn launch_runas(cmd: &Command, policy: SpawnPolicy) -> Result<RunasOutcome, SpawnFailure> {
+pub(crate) fn launch_runas(
+    cmd: &Command,
+    policy: SpawnPolicy,
+    kernel: crate::identity::SpawnKernel,
+) -> Result<RunasOutcome, SpawnFailure> {
     let request = cmd.elevation_request();
     launch_runas_with_host(
         cmd,
         &Host::detect(request.backend, &request.auth, None, is_elevated()),
         policy,
+        kernel,
     )
 }
 
@@ -571,6 +576,7 @@ pub(crate) fn launch_runas_with_host(
     cmd: &Command,
     host: &Host,
     policy: SpawnPolicy,
+    kernel: crate::identity::SpawnKernel,
 ) -> Result<RunasOutcome, SpawnFailure> {
     let launch = match plan_runas(cmd, host).not_started()? {
         RunasStep::AlreadyElevated => return Ok(RunasOutcome::AlreadyElevated),
@@ -625,7 +631,11 @@ pub(crate) fn launch_runas_with_host(
         pid => Ok(pid),
     };
     // The box first: the process is running, and everything after reaches it through the box.
-    let owned = OwnedChild::new(Box::new(WindowsProcess::for_uac(proc, pid.as_ref().ok().copied())));
+    let owned = OwnedChild::new(Box::new(WindowsProcess::for_uac(
+        kernel,
+        proc,
+        pid.as_ref().ok().copied(),
+    )));
     // Identity from the OWNED handle — no second OpenProcess.
     let handle = HANDLE(owned.os_handle().as_raw_handle());
     // What could not be read: the pid's error, or the pid with the identity read's.
@@ -656,9 +666,10 @@ pub(crate) fn spawn_elevated(
     cmd: &mut Command,
     kill_on_drop: bool,
     policy: SpawnPolicy,
+    kernel: crate::identity::SpawnKernel,
 ) -> Result<crate::child::Child, SpawnFailure> {
-    match launch_runas(&*cmd, policy)? {
-        RunasOutcome::AlreadyElevated => spawn_already_elevated(cmd, kill_on_drop, policy),
+    match launch_runas(&*cmd, policy, std::sync::Arc::clone(&kernel))? {
+        RunasOutcome::AlreadyElevated => spawn_already_elevated(cmd, kill_on_drop, policy, kernel),
         RunasOutcome::Launched { owned, id, report } => Ok(crate::child::Child::from_parts(
             owned,
             Some(id),
@@ -677,6 +688,7 @@ fn spawn_already_elevated(
     cmd: &mut Command,
     kill_on_drop: bool,
     policy: SpawnPolicy,
+    kernel: crate::identity::SpawnKernel,
 ) -> Result<crate::child::Child, SpawnFailure> {
     let (input, env_ops) = (cmd.input().clone(), cmd.env_ops().to_vec());
     let mut derived = cmd.derive_for_elevation(
@@ -684,7 +696,7 @@ fn spawn_already_elevated(
         env_ops,
         crate::elevation::already_elevated_report(ElevatedStdio::Passthrough),
     );
-    crate::child::spawn::spawn_unelevated(&mut derived, kill_on_drop, policy)
+    crate::child::spawn::spawn_unelevated(&mut derived, kill_on_drop, policy, kernel)
 }
 
 #[cfg(test)]

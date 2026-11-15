@@ -75,6 +75,23 @@ pub(crate) struct FakeKernel<'a> {
     subscribes: Rows<Subscription, Result<(), i32>>,
     /// How many `kinfo_proc` reads each pid has had, whoever answered them.
     kinfo_reads: Mutex<Vec<(RawPid, usize)>>,
+    /// How many unique-id reads each pid has had, whoever answered them.
+    unique_info_reads: Mutex<Vec<(RawPid, usize)>>,
+}
+
+/// Counts one more read of `pid` in `counts`.
+fn count_read(counts: &Mutex<Vec<(RawPid, usize)>>, pid: RawPid) {
+    let mut counts = counts.lock().expect("no panic holds the counts");
+    match counts.iter_mut().find(|(p, _)| *p == pid) {
+        Some((_, n)) => *n += 1,
+        None => counts.push((pid, 1)),
+    }
+}
+
+/// How many reads of `pid` `counts` holds.
+fn reads_of(counts: &Mutex<Vec<(RawPid, usize)>>, pid: RawPid) -> usize {
+    let counts = counts.lock().expect("no panic holds the counts");
+    counts.iter().find(|(p, _)| *p == pid).map_or(0, |(_, n)| *n)
 }
 
 /// A row builder enters with the first test that states that call's answer.
@@ -91,6 +108,7 @@ impl<'a> FakeKernel<'a> {
             kinfos: Rows::new(),
             subscribes: Rows::new(),
             kinfo_reads: Mutex::new(Vec::new()),
+            unique_info_reads: Mutex::new(Vec::new()),
         }
     }
 
@@ -184,8 +202,12 @@ impl<'a> FakeKernel<'a> {
 
     /// How many `kinfo_proc` reads of `pid` the kernel has been asked for.
     pub(crate) fn kinfo_reads(&self, pid: RawPid) -> usize {
-        let counts = self.kinfo_reads.lock().expect("no panic holds the counts");
-        counts.iter().find(|(p, _)| *p == pid).map_or(0, |(_, n)| *n)
+        reads_of(&self.kinfo_reads, pid)
+    }
+
+    /// How many unique-id reads of `pid` the kernel has been asked for.
+    pub(crate) fn unique_info_reads(&self, pid: RawPid) -> usize {
+        reads_of(&self.unique_info_reads, pid)
     }
 
     /// Whether every row stated for one call has answered it, `on_every_*` rows aside. A row left
@@ -221,6 +243,7 @@ impl Kernel for FakeKernel<'_> {
     }
 
     fn unique_info(&self, pid: RawPid) -> UniqRead {
+        count_read(&self.unique_info_reads, pid);
         self.unique_infos.take(&pid).unwrap_or_else(|| {
             self.real(format_args!("a unique-id read of pid {pid}"))
                 .unique_info(pid)
@@ -241,13 +264,7 @@ impl Kernel for FakeKernel<'_> {
     }
 
     fn kinfo(&self, pid: RawPid) -> KinfoAnswer {
-        {
-            let mut counts = self.kinfo_reads.lock().expect("no panic holds the counts");
-            match counts.iter_mut().find(|(p, _)| *p == pid) {
-                Some((_, n)) => *n += 1,
-                None => counts.push((pid, 1)),
-            }
-        }
+        count_read(&self.kinfo_reads, pid);
         self.kinfos
             .take(&pid)
             .unwrap_or_else(|| self.real(format_args!("a kinfo_proc read of pid {pid}")).kinfo(pid))

@@ -122,6 +122,7 @@ fn signal_failure_carries_the_win32_code() {
     use windows::Win32::Foundation::ERROR_INVALID_HANDLE;
 
     let p = super::WindowsProcess::for_child(
+        crate::identity::HostKernel,
         super::test_event::new_test_event().expect("create an event handle"),
         std::process::id(),
     );
@@ -130,6 +131,33 @@ fn signal_failure_carries_the_win32_code() {
         panic!("expected Io, got {err:?}");
     };
     assert_eq!(io.raw_os_error(), Some(ERROR_INVALID_HANDLE.0 as i32), "{io:?}");
+}
+
+/// A Windows box owns the kernel it was built with, lends it, and lets it go with the box: the test's
+/// own handle on the kernel is the only one left once the box is dropped.
+///
+/// Mutant: the box drops its kernel at construction, or keeps it past its drop.
+#[skuld::test]
+fn a_windows_child_owns_the_kernel_it_was_built_with() {
+    use std::sync::Arc;
+
+    use crate::identity::Kernel;
+    use crate::os_process::child::OsChild as _;
+
+    /// A kernel with something to count: Windows's `Kernel` has no methods.
+    struct Counted;
+    impl Kernel for Counted {}
+
+    let kernel = Arc::new(Counted);
+    let p = super::WindowsProcess::for_child(
+        Arc::clone(&kernel),
+        super::test_event::new_test_event().expect("create an event handle"),
+        std::process::id(),
+    );
+    assert_eq!(Arc::strong_count(&kernel), 2, "the box owns a handle on the kernel");
+    let _lent: &dyn Kernel = p.kernel();
+    drop(p);
+    assert_eq!(Arc::strong_count(&kernel), 1, "dropping the box releases the kernel");
 }
 
 /// A UAC handle whose access cannot be read is taken to hold `SYNCHRONIZE` and no more, so a

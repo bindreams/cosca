@@ -157,11 +157,10 @@ impl OpenFailure {
 }
 
 /// [`open`] through `kernel`: the one entry to the open, on every platform. The open checks `id`
-/// through `kernel`, and on macOS the process it returns owns the same `kernel`, so every later read
-/// of it asks that one. The kernel is as long-lived as the process: a borrow (what the walks pass,
-/// of one kernel they open every member from) gives a process that lives inside the walk. Linux
-/// consults the kernel for the open alone, and Windows drops it unread: its
-/// [`Kernel`](crate::identity::Kernel) has no methods yet.
+/// through `kernel`, and the process it returns owns the same `kernel`, so every later read of it asks
+/// that one. The kernel is as long-lived as the process: a borrow (what the walks pass, of one kernel
+/// they open every member from) gives a process that lives inside the walk. Windows's
+/// [`Kernel`](crate::identity::Kernel) has no methods yet, so its open asks it nothing.
 pub(crate) fn open_with<'k, K: crate::identity::Kernel + Send + 'k>(
     kernel: K,
     id: ProcessId,
@@ -169,12 +168,11 @@ pub(crate) fn open_with<'k, K: crate::identity::Kernel + Send + 'k>(
     #[cfg(target_os = "linux")]
     {
         Ok(linux::open::open_verified_with(&kernel, id)?
-            .map(|pidfd| Box::new(linux::LinuxProcess::new(Some(id.pid()), pidfd)) as Box<dyn OsProcess + 'k>))
+            .map(|pidfd| Box::new(linux::LinuxProcess::new(kernel, Some(id.pid()), pidfd)) as Box<dyn OsProcess + 'k>))
     }
     #[cfg(windows)]
     {
-        let _ = kernel;
-        Ok(windows::WindowsProcess::open(id)?.map(|p| Box::new(p) as Box<dyn OsProcess + 'k>))
+        Ok(windows::WindowsProcess::open(kernel, id)?.map(|p| Box::new(p) as Box<dyn OsProcess + 'k>))
     }
     #[cfg(target_os = "macos")]
     {
