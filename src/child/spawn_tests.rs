@@ -354,32 +354,32 @@ fn assert_a_refused_teardown_kill_is_handed_back(
 
 /// The spawn builds its child's box over the kernel it was started with, reads the child's identity
 /// through it, and keeps nothing of it once the child is gone: the test's own handle on the kernel is
-/// the only one left. Where a kernel has methods (Linux, macOS), the child's box answers from a row
-/// stated for a pid no host process can have, and the identity read is counted: on Linux a `pidfs_ino`
-/// of the held pidfd, on macOS a unique-id read of the child's pid. The cgroup leaf's kernel is
-/// `cgroup_a_created_leaf_reads_through_the_kernel_it_was_created_over`'s.
+/// the only one left. The child's box answers from a stated row (Linux, macOS: for a pid no host
+/// process can have; Windows: a `terminate` row, one per backend), and the identity read is counted:
+/// on Linux a `pidfs_ino` of the held pidfd, on macOS a unique-id read of the child's pid. The
+/// cgroup leaf's kernel is `cgroup_a_created_leaf_reads_through_the_kernel_it_was_created_over`'s.
 ///
-/// Mutants: the child's box is built over a kernel of its own; `resolve_identity` reads through a host
-/// kernel (Linux, macOS); the box is leaked.
+/// Mutants: the child's box is built over its own kernel; `resolve_identity` reads through a host
+/// kernel; the box is leaked.
 #[skuld::test]
 fn a_spawn_hands_its_kernel_to_the_boxes_it_makes_and_keeps_nothing_after() {
     use std::sync::Arc;
 
+    use crate::identity::FakeKernel;
     #[cfg(unix)]
-    use crate::identity::{FakeKernel, HostKernel};
+    use crate::identity::HostKernel;
 
     /// The pid the stated row is about: above Linux's `PID_MAX_LIMIT` and macOS's `PID_MAX`, so no
     /// host process has it.
     #[cfg(unix)]
     const STATED: u32 = 2_000_000_000;
 
+    // One row per backend: each child's box answers it once. The host would fail a `terminate` of a
+    // null handle with `ERROR_INVALID_HANDLE`, not with this.
     #[cfg(windows)]
-    let kernel = {
-        /// Windows's `Kernel` has no methods: a kernel to count handles on.
-        struct Counted;
-        impl crate::identity::Kernel for Counted {}
-        Arc::new(Counted)
-    };
+    let stated = windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_NOT_SUPPORTED.0);
+    #[cfg(windows)]
+    let kernel = Arc::new(FakeKernel::new().on_terminate(Err(stated)).on_terminate(Err(stated)));
     #[cfg(target_os = "linux")]
     let kernel = Arc::new(FakeKernel::over(&HostKernel).on_signal_probe(
         rustix::process::Pid::from_raw(STATED as i32).expect("a positive pid"),
@@ -405,12 +405,6 @@ fn a_spawn_hands_its_kernel_to_the_boxes_it_makes_and_keeps_nothing_after() {
         }
         {
             let child = super::spawn_with(&mut c, Arc::clone(&kernel)).expect("spawn");
-            // Windows's kernel has no method to ask, so the box's hold on it is all there is to see.
-            #[cfg(windows)]
-            assert!(
-                Arc::strong_count(&kernel) >= 2,
-                "the child's box owns a handle on the kernel (raw backend: {raw})"
-            );
             // The box lends the kernel it owns, which answers from the stated row.
             let lent: &dyn crate::identity::Kernel = child.proc.kernel();
             #[cfg(target_os = "linux")]
@@ -426,7 +420,13 @@ fn a_spawn_hands_its_kernel_to_the_boxes_it_makes_and_keeps_nothing_after() {
                 "the child's box asks the spawn's kernel"
             );
             #[cfg(windows)]
-            let _ = lent;
+            assert_eq!(
+                lent.terminate(windows::Win32::Foundation::HANDLE::default(), 0)
+                    .expect_err("the stated row refuses")
+                    .code(),
+                stated,
+                "the child's box asks the spawn's kernel (raw backend: {raw})"
+            );
             // The identity check of the spawn, which no row can state: its pid is the child's.
             #[cfg(target_os = "linux")]
             assert!(

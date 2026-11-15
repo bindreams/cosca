@@ -7,6 +7,7 @@
 //! so a row where "a fake answers" needs an answer no real handle gives.
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::sync::Arc;
 use std::time::Duration;
 
 use windows::core::HRESULT;
@@ -26,7 +27,7 @@ use crate::child::spawn::held_teardown::tear_down_failed_spawn;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::Diagnosis;
 use crate::error::ChildFate;
-use crate::identity::{HostKernel, ProcessId};
+use crate::identity::{refusing_the_next_terminate, HostKernel, Kernel, ProcessId};
 use crate::os_process::child::{ExitRecord, KillRefusal, OsChild};
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::os_process::windows::WindowsProcess;
@@ -122,7 +123,12 @@ impl Drop for Suspended {
 /// A fake that answers from its tables and, past them, from the real `handle` of the process `pid`,
 /// as a `CreateProcess` handle is built.
 fn real(handle: OwnedHandle, pid: u32) -> FakeProcess {
-    FakeProcess::over(Box::new(WindowsProcess::for_child(HostKernel, handle, pid)))
+    real_over(HostKernel, handle, pid)
+}
+
+/// [`real`] whose handle's box owns `kernel`, which a test states rows of.
+fn real_over(kernel: impl Kernel + Send + 'static, handle: OwnedHandle, pid: u32) -> FakeProcess {
+    FakeProcess::over(Box::new(WindowsProcess::for_child(kernel, handle, pid)))
 }
 
 /// A [`WindowsProcess`] over a handle a UAC elevation returned, which allows what it was granted.
@@ -138,6 +144,16 @@ fn uac(handle: OwnedHandle, pid: u32) -> FakeProcess {
 /// An [`OwnedChild`] over `fake`, and `fake` for the test to read what it was asked.
 fn owned(fake: FakeProcess) -> (OwnedChild, FakeProcess) {
     (OwnedChild::new(Box::new(fake.clone())), fake)
+}
+
+/// An [`OwnedChild`] over a duplicate of `owner`'s handle whose box owns `kernel`, and the fake
+/// under it, which `script` states rows of.
+fn handle_over(
+    owner: &Suspended,
+    kernel: impl Kernel + Send + 'static,
+    script: impl FnOnce(FakeProcess) -> FakeProcess,
+) -> (OwnedChild, FakeProcess) {
+    owned(script(real_over(kernel, owner.duplicate(), owner.pid)))
 }
 
 // A failed spawn's teardown =====
@@ -208,15 +224,18 @@ fn a_failed_spawn_teardown_of_an_exited_child_with_warnings_on_does_not_warn() {
 fn a_failed_spawn_teardown_of_a_running_child_with_warnings_on_warns_once_naming_it() {
     for disposition in DISPOSITIONS {
         let owner = Suspended::spawn();
-        let (child, _fake) = owned(real(owner.duplicate(), owner.pid));
-        let refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+        let kernel = Arc::new(refusing_the_next_terminate());
+        let (child, _fake) = handle_over(&owner, Arc::clone(&kernel), |fake| fake);
         crate::log_capture::install();
         let mark = crate::log_capture::mark();
         // Ends the process once the wait blocks, which is after the look.
         let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
         let (fate, unreaped) = after_a_failed_spawn(child, None, Past::Clean, disposition, Some(Duration::ZERO));
 
-        refusal.assert_fired();
+        assert!(
+            kernel.all_rows_taken(),
+            "the kill reached TerminateProcess to be refused"
+        );
         assert_eq!(
             fate,
             ChildFate::Reaped,
@@ -668,11 +687,6 @@ fn a_failed_spawn_teardown_that_failed_in_nothing_has_no_cleanup() {
 
 // The drop's teardown =====
 
-/// An [`OwnedChild`] over a duplicate of `owner`'s handle, and the fake under it.
-fn handle_over(owner: &Suspended, script: impl FnOnce(FakeProcess) -> FakeProcess) -> (OwnedChild, FakeProcess) {
-    owned(script(real(owner.duplicate(), owner.pid)))
-}
-
 /// The kill is delivered and the teardown waits for the exit it started, then answers `Reaped`.
 ///
 /// Mutants: `TerminateProcess` a no-op reporting `Ok` or `ERROR_ACCESS_DENIED`, so the process is
@@ -680,7 +694,7 @@ fn handle_over(owner: &Suspended, script: impl FnOnce(FakeProcess) -> FakeProces
 #[skuld::test]
 fn a_kill_teardown_of_a_child_waits_for_the_exit_it_started() {
     let owner = Suspended::spawn();
-    let (handle, _fake) = handle_over(&owner, |fake| fake);
+    let (handle, _fake) = handle_over(&owner, HostKernel, |fake| fake);
     // Keeps a no-op terminate from hanging the wait; see `Suspended::end_with_code_zero`.
     let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
     let torn = handle.tear_down(
@@ -788,9 +802,9 @@ fn teardown_of_a_handle_without_terminate_to_an_exited_child_reaps_it() {
 #[skuld::test]
 fn teardown_of_an_exiting_unsignalled_child_reaps_it() {
     let owner = Suspended::spawn();
-    let (handle, _fake) = handle_over(&owner, |fake| fake);
+    let kernel = Arc::new(refusing_the_next_terminate());
+    let (handle, _fake) = handle_over(&owner, Arc::clone(&kernel), |fake| fake);
     let _end = crate::wait::block_probe::on_blocking(owner.end_with_code_zero());
-    let _refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     let torn = handle.tear_down(
         Some(owner.id()),
         Kill {
@@ -798,6 +812,10 @@ fn teardown_of_an_exiting_unsignalled_child_reaps_it() {
             tree: None,
         },
         None,
+    );
+    assert!(
+        kernel.all_rows_taken(),
+        "the kill reached TerminateProcess to be refused"
     );
     assert_eq!(torn.fate(), ChildFate::Reaped, "{torn:?}");
     assert!(
@@ -810,12 +828,12 @@ fn teardown_of_an_exiting_unsignalled_child_reaps_it() {
 /// nothing of what became of the child: `Unknown`. One scripted
 /// answer, so a second wait would be the real one and fail the count.
 ///
-/// Mutant: a failed wait is `Killed` whatever the kill did.
+/// Mutants: a failed wait is `Killed` whatever the kill did; the teardown skips its kill.
 #[skuld::test]
 fn teardown_of_an_exiting_child_with_a_failed_wait_is_unknown() {
     let owner = Suspended::spawn();
-    let (handle, fake) = handle_over(&owner, |fake| fake.reaps([ReapAnswer::Err(KIND)]));
-    let _refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let kernel = Arc::new(refusing_the_next_terminate());
+    let (handle, fake) = handle_over(&owner, Arc::clone(&kernel), |fake| fake.reaps([ReapAnswer::Err(KIND)]));
     let torn = handle.tear_down(
         Some(owner.id()),
         Kill {
@@ -823,6 +841,10 @@ fn teardown_of_an_exiting_child_with_a_failed_wait_is_unknown() {
             tree: None,
         },
         None,
+    );
+    assert!(
+        kernel.all_rows_taken(),
+        "the kill reached TerminateProcess to be refused"
     );
     assert_eq!(torn.fate(), ChildFate::Unknown, "{torn:?}");
     assert_eq!(fake.looks(), 1, "the teardown made the wait that failed");

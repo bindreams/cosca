@@ -9,6 +9,7 @@
 
 use crate::child::spawn::fault;
 use crate::error::ChildFate;
+use crate::identity::refusing_the_next_terminate;
 use crate::log_capture::warns_since;
 use crate::test_child::Console;
 
@@ -37,19 +38,19 @@ fn teardown_with_an_exit_under_way(backend: Backend, force: fn(bool)) -> (ChildF
     cmd.stdout(crate::stdio::Stdio::null()).expect("set stdout");
     let _warn = crate::tokio::child::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
     let _end = crate::wait::block_probe::on_blocking(move || drop(writer));
-    let refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
+    let kernel = std::sync::Arc::new(refusing_the_next_terminate());
     force(true);
     let spawned = crate::child::spawn::spawn_uncommitted(
         cmd.as_sync_mut(),
         crate::tokio::child::async_policy(),
-        crate::identity::HostKernel,
+        std::sync::Arc::clone(&kernel),
     );
     force(false);
     let (_, fate) = crate::child::spawn::failure::expect_may_have_started_with(crate::error::Error::from(
         spawned.expect_err("the forced failure fails the spawn"),
     ));
-    // The refusal stands in for the kill's `TerminateProcess`, so the teardown did send its kill.
-    refusal.assert_fired();
+    // The row stands in for the kill's `TerminateProcess`, so the teardown did send its kill.
+    assert!(kernel.all_rows_taken(), "the teardown sent its kill");
     (fate, warns_since(mark, "still waiting"))
 }
 

@@ -1,8 +1,11 @@
 //! Windows-only `OwnedChild` tests over a real process handle.
 
+use std::sync::Arc;
+
 use super::fixtures::{wait_status, Blocker};
 use crate::child::owned::OwnedChild;
-use crate::os_process::child::adopted_blocker;
+use crate::identity::refusing_the_next_terminate;
+use crate::os_process::child::{adopt_std_over, spawned_blocker};
 use crate::os_process::fake::FakeProcess;
 use crate::signal::{Sent, Sig};
 
@@ -39,14 +42,18 @@ fn an_exit_seen_on_the_handle_is_cached() {
 /// Mutant: `signal` waits for the exit after a refusal that finds it under way.
 #[skuld::test]
 fn kill_never_waits() {
-    let (os, _id, stdin) = adopted_blocker();
-    let fake = FakeProcess::over(os);
+    let (blocker, id, stdin) = spawned_blocker();
+    let kernel = Arc::new(refusing_the_next_terminate());
+    let fake = FakeProcess::over(adopt_std_over(Arc::clone(&kernel), blocker, id));
     let child = OwnedChild::new(Box::new(fake.clone()));
     drop(stdin);
-    let _refusal = crate::identity::windows_fault::refuse_next_terminate_as_exiting();
     assert_eq!(
         child.signal(Sig::Kill).expect("a refusal under way is no error"),
         Sent::Gone
+    );
+    assert!(
+        kernel.all_rows_taken(),
+        "the kill reached TerminateProcess to be refused"
     );
     assert_eq!(fake.looks(), 0, "the kill must not look at the exit");
     wait_status(&child);
