@@ -402,15 +402,13 @@ Linux `test` job and the macOS root lane, each behind `setuid-lane-check.sh`, an
 `SKULD_LABELS=setuid` selects its tests, and `setuid_root` the one the Linux root-run step also
 runs. So does
 `COSCA_TEST_UID_SWITCH` (the tests that run as real root and switch to other real uids), a
-`test_group!` row joined with `#[fixture(uid_switch)] _group: &Group`: CI turns it off
-workflow-wide and opts in only in the root lanes that can `setuid` to those uids, which select it
-with `SKULD_LABELS=root`. So does `COSCA_TEST_TRACER` (the tests that attach a tracer to their own
-children, as a debugger does), joined with `#[fixture(tracer_group)] _group: &Group`: CI turns it
-off workflow-wide, and the two tracer steps of the `test` job (debug and release) opt in, selected
+`test_group!` row joined with `#[fixture(uid_switch)] _group: &Group`: CI opts in only in the root
+lanes that can `setuid` to those uids, which select it with `SKULD_LABELS=root`. So does `COSCA_TEST_TRACER` (the tests that attach a tracer to their own
+children, as a debugger does), joined with `#[fixture(tracer_group)] _group: &Group`: CI opts in
+in the two tracer steps of the `test` job (debug and release), selected
 by `SKULD_LABELS=tracer`; the cgroup step opts in too, for the `namespaces` tests that also trace.
 So does `COSCA_TEST_CGROUP` (the tests that need the unconfined cgroup lane), a `test_group!` row joined
-with `#[fixture(cgroup)] _group: &Group`: CI turns it off workflow-wide and the cgroup step opts
-in. So does
+with `#[fixture(cgroup)] _group: &Group`: CI opts in in the cgroup step. So does
 `COSCA_TEST_DRIVE_MAPPING` (the two drive-mapping tests of `windows_process_cwd`), a `test_group!` row joined with
 `#[fixture(drive_mapping)] _group: &Group`, selected by `SKULD_LABELS=drive_mapping`. So does
 `COSCA_TEST_ELEVATION` (tests that run commands with real administrator or root privileges), a `test_group!` row
@@ -419,7 +417,10 @@ Windows groups: `COSCA_TEST_PATH_PROBES` (the `windows_path_resolution` canaries
 `COSCA_TEST_SHELL_EXECUTE` (`windows_shell_execute`), `COSCA_TEST_SHELL_PROBES`
 (`windows_shell_resolution`) and `COSCA_TEST_ELEVATION_ROUTES` (`windows_elevation_routes`), which
 are `test_group!` rows like `namespaces`. The `Test (windows/...)` jobs of `ci.yaml` select them by label, as does `windows-probes.yaml` (weekly, on dispatch).
-CI turns each off workflow-wide and opts in only in the step or job that runs it.
+CI's test jobs turn each off through `.github/test-group-defaults.env` (a step appends it to `$GITHUB_ENV`) and opt in
+only in the step or job that runs it; `devvm/lane-env.sh` applies the same file in a Linux guest. `windows-probes.yaml`
+does not read the file: its workflow `env` block turns the four probe groups off itself, and the job or action step
+that runs a group opts it in.
 
 **Why:** a test that can end in a destructive outcome, or does a visible operation on shared
 resources, harms or disturbs whatever machine it runs on when it goes wrong, so the sandbox, not the
