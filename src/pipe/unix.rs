@@ -23,6 +23,14 @@ pub(crate) fn pair() -> io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
     std::io::pipe()
 }
 
+/// Sets `O_NONBLOCK` on `fd`'s own open file description, which the other end of a pipe does not
+/// share.
+pub(crate) fn set_nonblocking(fd: &impl AsFd) -> io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(fd)?;
+    rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK)?;
+    Ok(())
+}
+
 /// The pipe for one piped slot: the child's end, and the parent's, as `dir` says (`In`: the child
 /// reads, the parent writes). The caller holds `spawn_lock` on macOS, as for [`pair`].
 pub(crate) fn child_pipe(dir: Direction) -> io::Result<(OwnedFd, ParentEnd)> {

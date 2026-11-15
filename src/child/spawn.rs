@@ -2748,6 +2748,11 @@ pub(crate) mod in_child;
 #[path = "spawn/fd_channel.rs"]
 pub(crate) mod fd_channel;
 
+// Linux: the one fork that execs, on `fork_with_pidfd`.
+#[cfg(target_os = "linux")]
+#[path = "spawn/fork_exec.rs"]
+pub(crate) mod fork_exec;
+
 // A failed spawn's answer to whether the program could have started.
 #[path = "spawn/failure.rs"]
 pub(crate) mod failure;

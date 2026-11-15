@@ -5,14 +5,15 @@ use std::os::fd::AsFd;
 
 use super::*;
 use crate::elevation::shim::hooks::Inject;
-use crate::elevation::shim::protocol::{Errno, NotExecuted};
+use crate::elevation::shim::protocol::{Errno, NotExecuted, Signal as WaitSignal};
 use rustix::process::{pidfd_send_signal, Signal};
 
 #[skuld::test]
-fn fault_before_exec_kills_the_child_and_is_reported_as_its_status() {
+fn fault_before_exec_kills_the_child_and_is_reported_as_not_started() {
     // Each synchronous fault signal, sent to the child while it waits before `exec`, kills it. A
     // handler there would return to the faulting instruction for ever, so the first loop is the
-    // test: it ends before any spin.
+    // test: it ends before any spin. The child writes no record when it dies, but its channel ends
+    // with no ready record, so no `execve` ran: the program was not started.
     let faults = [
         (Signal::SEGV, libc::SIGSEGV),
         (Signal::BUS, libc::SIGBUS),
@@ -33,7 +34,7 @@ fn fault_before_exec_kills_the_child_and_is_reported_as_its_status() {
         // A child that survived the signal is released, and then runs the program to its end.
         run.release_child_if_waiting();
         assert_eq!(
-            killed_by(rig.link.link.wait().unwrap()),
+            terminated_before_exec_by(rig.link.link.wait().unwrap()),
             Some(number),
             "signal {number}"
         );
@@ -46,16 +47,21 @@ fn fault_before_exec_kills_the_child_and_is_reported_as_its_status() {
     let marker = tmp.path().join("ran");
     let mut run = rig.spawn(marker_program(&marker).child_fault());
     run.wait_for("first byte: A");
-    assert_eq!(killed_by(rig.link.link.wait().unwrap()), Some(libc::SIGSEGV));
+    assert_eq!(
+        terminated_before_exec_by(rig.link.link.wait().unwrap()),
+        Some(libc::SIGSEGV)
+    );
     assert!(!marker.exists(), "the program ran");
     run.finish();
 }
 
-/// The signal a program died of, whether or not it dumped core (a core pattern that pipes to a handler
-/// can dump whatever the limit says).
-fn killed_by(outcome: LinkOutcome) -> Option<i32> {
+/// The signal a child that never reached its `execve` died of, as the shim reports it.
+fn terminated_before_exec_by(outcome: LinkOutcome) -> Option<i32> {
     match outcome {
-        LinkOutcome::Exited(status) if status & 0x7f != 0 => Some(status & 0x7f),
+        LinkOutcome::NotStarted(NotStarted {
+            cause: NotStartedCause::NotExecuted(NotExecuted::TerminatedBeforeExec(WaitSignal(signal))),
+            ..
+        }) => Some(signal),
         _ => None,
     }
 }

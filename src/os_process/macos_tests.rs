@@ -259,12 +259,11 @@ fn a_refused_reread_after_esrch_keeps_the_errno() {
 }
 
 /// The token send answers `EPERM` to a process whose exit has begun and that is not yet a zombie
-/// (measured: `P_WEXIT` set and `p_stat` `SRUN` at every such answer). The send is not an error
-/// then, and not a refusal: the process is on its way out.
+/// (`P_WEXIT` set, `p_stat` `SRUN`). The send is not an error then, and not a refusal: the process is
+/// on its way out.
 ///
-/// The `EPERM` and the record are stated here, not read from a really exiting child: that window
-/// is hit about 1 in 1000 sends, so a host test of it cannot be deterministic.
-/// The measurement is a probe run on CI, not a test.
+/// The `EPERM` and the record are stated here, not read from a really exiting child: the window is
+/// too narrow for a host test of it to be deterministic.
 ///
 /// Mutants: the `EPERM` is surfaced raw whether or not the exit has begun; the exit is read from
 /// `p_stat` alone (`SZOMB`), which is not set in this window.

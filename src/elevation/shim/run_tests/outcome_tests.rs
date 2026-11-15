@@ -3,7 +3,7 @@
 use super::*;
 use crate::elevation::shim::hooks::Inject;
 use crate::elevation::shim::link::KillOutcome;
-use crate::elevation::shim::protocol::{Errno, NotExecuted};
+use crate::elevation::shim::protocol::{Errno, NotExecuted, Signal};
 
 #[skuld::test]
 fn real_link_and_real_shim_with_no_front() {
@@ -52,14 +52,20 @@ fn fork_pipe_and_exec_failures_are_distinct_causes() {
     }
 }
 
+/// A child killed in its steps writes no failure record, but its channel ends with no ready record,
+/// which proves that no `execve` ran: the program was not started, however the child died.
+///
+/// Mutant: an end with no ready record is read as the `exec`, and the death is the program's status.
 #[skuld::test]
-fn sigkill_before_exec_is_reported_as_the_programs_status() {
+fn sigkill_before_exec_is_not_started_though_the_child_wrote_no_record() {
     let rig = ShimRig::new();
     let mut run = started(&rig, Spec::sh("exit 0").child_gate());
     run.wait_for("child: waiting at gate");
     assert_eq!(rig.link.link.kill().unwrap(), KillOutcome::Delivered);
     run.wait_for("control: signal Kill");
-    // Killed before `exec`: there is no evidence the program never ran, so it is its status.
-    assert_eq!(rig.link.link.wait().unwrap(), LinkOutcome::Exited(libc::SIGKILL));
-    assert_eq!(run.finish().code, Some(128 + libc::SIGKILL));
+    assert_eq!(
+        rig.link.link.wait().unwrap(),
+        not_executed(NotExecuted::TerminatedBeforeExec(Signal(libc::SIGKILL)))
+    );
+    assert_eq!(run.finish().code, Some(117));
 }

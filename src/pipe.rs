@@ -28,7 +28,7 @@ use windows as sys;
 
 pub(crate) use sys::child_pipe;
 #[cfg(unix)]
-pub(crate) use sys::pair;
+pub(crate) use sys::{pair, set_nonblocking};
 
 /// A parent-side pipe end retained for a configured descriptor.
 #[derive(Debug)]

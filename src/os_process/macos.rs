@@ -181,9 +181,9 @@ pub(crate) fn read_version(kernel: &dyn Kernel, pid: u32, unique: u64, sig: Sig)
 /// follows the process across an `exec` and is left at the version it was last sent at. The kernel
 /// checks the pid with its `p_idversion` and signals while it holds a reference, so only the
 /// documented 2^32 version wrap can redirect it. A refused send is the bare errno, so an `EPERM`
-/// stays raw for the callers that promise it. The one exception is a `SIGKILL` (the measured case;
-/// any other signal keeps the raw `EPERM`): a read of the process `unique` names, taken after the
-/// `EPERM`, finds how it ended:
+/// stays raw for the callers that promise it. The one exception is a `SIGKILL` (any other signal
+/// keeps the raw `EPERM`): a read of the process `unique` names, taken after the `EPERM`, finds how
+/// it ended:
 ///
 /// - exit begun, not yet a zombie: [`SignalByTokenOutcome::Exiting`];
 /// - a zombie: [`SignalByTokenOutcome::ExitedUnreaped`], as `ESRCH` from a zombie is;
