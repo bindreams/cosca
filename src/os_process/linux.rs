@@ -58,6 +58,10 @@ impl OsChild for LinuxProcess {
     }
 
     fn peek(&self) -> Result<PeekOutcome, Error> {
+        #[cfg(test)]
+        if let Some(forced) = exit_only::seams::take_forced_peek() {
+            return forced.map_err(Error::Io);
+        }
         exit_only::linux::peek(&Target::PidFd(self.pidfd.as_fd())).map_err(Error::Io)
     }
 

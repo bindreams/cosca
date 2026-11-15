@@ -9,6 +9,8 @@
 use super::failure::{expect_may_have_started_with, expect_not_started};
 use super::fault;
 use super::policy::SpawnPolicy;
+#[cfg(target_os = "linux")]
+use crate::child::owned::OwnedChild;
 use crate::command::Command;
 use crate::error::ChildFate;
 use crate::error::Error;
@@ -1688,7 +1690,6 @@ fn resolve_identity_of_a_reaped_child_whose_pid_a_same_tick_reuser_holds_is_gone
 
     use crate::identity::stat_parse::stat_fixture;
     use crate::identity::{FakeKernel, HostKernel, Resolved};
-    use crate::wait::exit_only::Target;
 
     #[allow(
         clippy::zombie_processes,
@@ -1712,8 +1713,8 @@ fn resolve_identity_of_a_reaped_child_whose_pid_a_same_tick_reuser_holds_is_gone
         .live_without_pidfs(pid, pidfd.try_clone().expect("the pidfd duplicates"))
         .same_view()
         .on_read(&format!("{pid}/stat"), Ok(&look_alike));
-    let held = held_through(&kernel, pid);
-    let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&held)));
+    let held = OwnedChild::over_pidfd(Some(pid), held_through(&kernel, pid));
+    let (read, _, _) = super::resolve_identity(&kernel, pid, &held);
     assert!(
         matches!(read, Resolved::Gone),
         "a look-alike with the child's token is not the child: {read:?}"
@@ -1758,12 +1759,11 @@ fn release(mut child: std::process::Child) {
 #[skuld::test]
 fn resolve_identity_reads_the_held_pidfd_and_needs_no_second_open() {
     use crate::identity::{FakeKernel, HostKernel, ProcessId, Resolved};
-    use crate::wait::exit_only::Target;
 
     let (child, pidfd) = live_child_with_pidfd();
     let pid = child.id();
     let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(pid, Err(rustix::io::Errno::MFILE));
-    let (read, _, why) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&pidfd)));
+    let (read, _, why) = super::resolve_identity(&kernel, pid, &OwnedChild::over_pidfd(Some(pid), pidfd));
     let Resolved::Found(id) = read else {
         panic!("the held pidfd answers whatever a second open would: {read:?}")
     };
@@ -1782,15 +1782,14 @@ fn resolve_identity_reads_the_held_pidfd_and_needs_no_second_open() {
 #[skuld::test]
 fn resolve_identity_with_a_failing_fstat_on_the_held_pidfd_is_unknown() {
     use crate::identity::{FakeKernel, HostKernel, Resolved};
-    use crate::wait::exit_only::Target;
 
     let (child, pidfd) = live_child_with_pidfd();
     let pid = child.id();
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(pid, Ok(pidfd.try_clone().expect("the pidfd duplicates")))
         .on_pidfs_ino(pid, Err(rustix::io::Errno::BADF));
-    let held = held_through(&kernel, pid);
-    let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&held)));
+    let held = OwnedChild::over_pidfd(Some(pid), held_through(&kernel, pid));
+    let (read, _, _) = super::resolve_identity(&kernel, pid, &held);
     assert!(matches!(read, Resolved::Unknown), "{read:?}");
     release(child);
 }
@@ -1803,14 +1802,13 @@ fn resolve_identity_with_a_failing_fstat_on_the_held_pidfd_is_unknown() {
 #[skuld::test]
 fn resolve_identity_with_a_held_pidfd_that_has_no_inode_reads_proc() {
     use crate::identity::{FakeKernel, HostKernel, Resolved};
-    use crate::wait::exit_only::Target;
 
     let (child, pidfd) = live_child_with_pidfd();
     let pid = child.id();
     let kernel =
         FakeKernel::over(&HostKernel).live_without_pidfs(pid, pidfd.try_clone().expect("the pidfd duplicates"));
-    let held = held_through(&kernel, pid);
-    let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&held)));
+    let held = OwnedChild::over_pidfd(Some(pid), held_through(&kernel, pid));
+    let (read, _, _) = super::resolve_identity(&kernel, pid, &held);
     match read {
         Resolved::Found(id) => assert_eq!(id, crate::identity::ticks_id(pid)),
         other => panic!("{other:?}"),
@@ -1829,7 +1827,6 @@ fn resolve_identity_of_a_reaped_child_is_gone() {
     use rustix::process::{pidfd_open, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions};
 
     use crate::identity::{FakeKernel, HostKernel, Resolved};
-    use crate::wait::exit_only::Target;
 
     #[allow(
         clippy::zombie_processes,
@@ -1849,9 +1846,121 @@ fn resolve_identity_of_a_reaped_child_is_gone() {
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(pid, Ok(pidfd.try_clone().expect("the pidfd duplicates")))
         .on_pidfs_ino(pid, Ok(Some(1)));
-    let held = held_through(&kernel, pid);
-    let (read, _, _) = super::resolve_identity(&kernel, pid, &Target::PidFd(std::os::fd::AsFd::as_fd(&held)));
+    let held = OwnedChild::over_pidfd(Some(pid), held_through(&kernel, pid));
+    let (read, _, _) = super::resolve_identity(&kernel, pid, &held);
     assert!(matches!(read, Resolved::Gone), "a reaped child is gone: {read:?}");
+}
+
+/// A failed identity peek (a seccomp or sandbox policy may answer `waitid` with an errno the kernel
+/// never does) cannot show the read named our child, but the pidfd pins the child whatever the peek
+/// said: the spawn keeps the child with no identity, its pid intact. The failed check is logged once
+/// at debug naming its own error, the keep once at debug, and nothing warns: a kept child owes no
+/// failure. The child is killed and waited for through its pidfd like any other.
+///
+/// Mutants: the failed check is taken for `Running` (the child has an identity); it warns though the
+/// child is kept; it is never logged; the spawn fails, or kills the child.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_failed_identity_peek_keeps_the_child_without_an_identity() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    crate::log_capture::install();
+    let (stdin, _teardown) = fault::teardown_blocker_stdin();
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    let pid = Rc::new(Cell::new(0));
+    let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+        let pid = Rc::clone(&pid);
+        move || pid.set(fault::spawn_pid())
+    });
+    let _forced = crate::wait::exit_only::seams::force_peek_once(Err(std::io::Error::other(
+        "forced identity-check failure 3b7e",
+    )));
+    let mark = crate::log_capture::mark();
+
+    let outcome = cmd.spawn();
+
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
+    let child = outcome.expect("a failed identity peek keeps the child");
+    assert_eq!(
+        child.id(),
+        None,
+        "the read could not be checked, so the child has no identity"
+    );
+    assert_ne!(pid.get(), 0, "the spawn noted the child's pid");
+    assert_eq!(child.pid(), pid.get(), "the pid is the spawned child's");
+    assert_eq!(
+        crate::log_capture::warns_since(mark, ""),
+        Vec::<String>::new(),
+        "a kept child warns of nothing"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "forced identity-check failure 3b7e"),
+        [log::Level::Debug],
+        "the failed check is logged once, at debug, naming its own error"
+    );
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "kept without an identity"),
+        [log::Level::Debug],
+        "the keep is logged once, at debug"
+    );
+    child.kill().expect("a kept child is killed through its pidfd");
+    let status = child.wait().expect("a kept child is waited on");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL),
+        "the kill ended the child"
+    );
+}
+
+/// A tree walk cannot do without the identity, so the failed peek fails the spawn with the kept
+/// error and the child is torn down: killed and reaped. The failed check and that teardown are one
+/// event: the check is folded into the teardown's warn, never warned twice.
+///
+/// Mutants: the failure arm tears down with a fresh diagnosis, which leaves the failed check to be
+/// logged apart from the teardown's warn (two warns); the check warns at the call as well as at the
+/// teardown (two warns); the child is not reaped; the error is built from the read's cause, and not
+/// from the failed peek.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_failed_identity_peek_fails_a_tree_walk_spawn_and_warns_once_of_the_check() {
+    crate::log_capture::install();
+    let (stdin, _teardown) = fault::teardown_blocker_stdin();
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let _forced = crate::wait::exit_only::seams::force_peek_once(Err(std::io::Error::other(
+        "forced identity-check failure 8e2f",
+    )));
+    let mark = crate::log_capture::mark();
+
+    let outcome = cmd.spawn();
+
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
+    let (err, fate) =
+        expect_may_have_started_with(outcome.expect_err("a tree walk without an identity fails the spawn"));
+    assert!(
+        matches!(
+            &err,
+            Error::Unassessable { source: Some(source), .. }
+                if crate::error::said(&**source).contains("forced identity-check failure 8e2f")
+        ),
+        "a failed peek is Unassessable with the peek's own error as source, not a vanish: {err:?}"
+    );
+    assert_eq!(
+        fate,
+        ChildFate::Reaped,
+        "the child is killed and reaped through its pidfd"
+    );
+    let warns = crate::log_capture::warns_since(mark, "");
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains("could not be checked against its handle (forced identity-check failure 8e2f)"),
+        "the one warn names the failed check: {warns:?}"
+    );
 }
 
 /// Every pipe a spawn makes is std's kind: the parent's end overlapped (no synchronous-I/O flag in

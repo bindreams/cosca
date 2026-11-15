@@ -73,9 +73,10 @@ use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, ReturnFlags, SendFlags, Shutdown, SocketFlags, SocketType};
 
 use super::fd_channel::{above_stdio, above_stdio_keeping, publish_ends, register as register_hook, Shared};
-use super::held_teardown::{say_teardown_of_failed_spawn, tear_down_pidfd};
+use super::held_teardown::tear_down_leaving;
 use super::{SpawnFailure, SpawnLockGuard};
-use crate::child::owned::teardown::{Past, Remains};
+use crate::child::owned::teardown::Past;
+use crate::child::owned::OwnedChild;
 use crate::error::{ChildFate, Error};
 
 const GO: u8 = 1;
@@ -102,17 +103,17 @@ pub(crate) struct Handshake {
     warn_after: Option<std::time::Duration>,
 }
 
-/// A spawned child, and the pidfd it sent while it was held before `exec`.
+/// A spawned child, and the `OwnedChild` over the pidfd it sent while it was held before `exec`.
 pub(crate) struct Held {
     pub(crate) child: std::process::Child,
-    pub(crate) pidfd: OwnedFd,
+    pub(crate) owned: OwnedChild,
 }
 
 /// Reap `child`, which never ran the program, through `pidfd`: it is dead or on its way out. Says
 /// what became of it. With `warn_after`, the wait for its exit warns once it passes that long, and
 /// goes on. std's `Child` reaps nothing on drop: the pidfd is the only reaper.
 fn reap_unexecuted(child: std::process::Child, pidfd: OwnedFd, warn_after: Option<std::time::Duration>) -> ChildFate {
-    end_unexecuted(Some(child.id()), pidfd, warn_after)
+    end_unexecuted(OwnedChild::over_pidfd(Some(child.id()), pidfd), warn_after)
 }
 
 /// Give up on `child`: no pidfd reached this process, so there is none to reap it through. `why`
@@ -770,7 +771,10 @@ fn conclude(
     let not_started = |error| -> Result<Held, SpawnFailure> { Err(SpawnFailure::NotStarted(error)) };
     let with_child = |cause, fate| Err(SpawnFailure::NotStartedWithChild { cause, fate });
     match (spawned, outcome) {
-        (Ok(child), Outcome::Opened(pidfd)) => Ok(Held { child, pidfd }),
+        (Ok(child), Outcome::Opened(pidfd)) => {
+            let owned = OwnedChild::over_pidfd(Some(child.id()), pidfd);
+            Ok(Held { child, owned })
+        }
         // Not told to go, so it cannot have execed: it was killed on its way, which std reads as
         // success.
         (Ok(child), Outcome::Gone(pidfd)) => {
@@ -809,11 +813,11 @@ fn conclude(
         // The spawn failed after the fork, and std collected the child of a spawn it fails: the
         // program never ran. A child still there is ended through the pidfd.
         (Err(e), Outcome::Opened(pidfd)) => {
-            use crate::wait::exit_only::{peek, Target};
-            use std::os::fd::AsFd as _;
-            // A peek that fails tells nothing, and a look on the pidfd having failed, a wait on it
-            // may fail too.
-            let past = match peek(&Target::PidFd(pidfd.as_fd())) {
+            let owned = OwnedChild::over_pidfd(None, pidfd);
+            // A peek of our own child's pidfd fails only with `ECHILD` (foreign reap, an `Ok`) or
+            // `EBADF`/`EINVAL` (not our pidfd). A sandbox policy may return another errno, which says
+            // nothing about the child.
+            let past = match owned.peek() {
                 Ok(_) => Past::Clean,
                 Err(e) => {
                     log::debug!(
@@ -823,12 +827,12 @@ fn conclude(
                     Past::WaitMayFail
                 }
             };
-            end_through_pidfd(None, pidfd, past, warn_after, &mut super::Diagnosis::default());
+            tear_down_leaving(&owned, None, past, warn_after, &mut super::Diagnosis::default());
             not_started(Error::Io(e))
         }
         // Not told to go, so it never ran the program.
         (Err(e), Outcome::Gone(pidfd)) => {
-            let fate = end_unexecuted(None, pidfd, warn_after);
+            let fate = end_unexecuted(OwnedChild::over_pidfd(None, pidfd), warn_after);
             with_child(Error::Io(e), fate)
         }
         // The helper failed too, and its error explains the abort std reports.
@@ -836,7 +840,7 @@ fn conclude(
             let error = answer_of_failed_spawn_and_helper(spawn, helper);
             match pidfd {
                 Some(pidfd) => {
-                    let fate = end_unexecuted(None, pidfd, warn_after);
+                    let fate = end_unexecuted(OwnedChild::over_pidfd(None, pidfd), warn_after);
                     with_child(error, fate)
                 }
                 None => not_started(error),
@@ -892,29 +896,14 @@ fn warn_beside_the_answer(what: &str, failure: &(dyn std::error::Error + 'static
     );
 }
 
-/// [`tear_down_pidfd`] for the child `pidfd` names, whose pid is `pid` if known: a child it could
-/// not end is left running and warned of, the warn led by `why`; the fate says so. `past`: see
-/// [`Past`]. With `warn_after`, the wait for the killed child warns once it passes that long.
-/// Answers what is left of the teardown, whose clause is said. A spawn this module concludes did not
-/// start, and its answer has no `cleanup`, so each failure of the teardown that its warn did not
-/// hold is logged at warn ([`say_teardown_of_failed_spawn`]).
-fn end_through_pidfd(
-    pid: Option<u32>,
-    pidfd: OwnedFd,
-    past: Past,
-    warn_after: Option<std::time::Duration>,
-    why: &mut super::Diagnosis,
-) -> Remains {
-    say_teardown_of_failed_spawn(tear_down_pidfd(pid, pidfd, None, past, warn_after), why)
-}
-
-/// [`end_through_pidfd`] for a child that was never told to go, so it never ran the program
-/// ([`Past::Unexecuted`]): nothing has looked at its pidfd, and nothing but its being gone can
-/// refuse its kill.
-fn end_unexecuted(pid: Option<u32>, pidfd: OwnedFd, warn_after: Option<std::time::Duration>) -> ChildFate {
-    end_through_pidfd(
-        pid,
-        pidfd,
+/// Ends a child that was never told to go, so it never ran the program ([`Past::Unexecuted`]):
+/// nothing has looked at its pidfd, and nothing but its being gone can refuse its kill. A spawn this
+/// module concludes did not start, and its answer has no `cleanup`, so each failure of the teardown
+/// that its warn did not hold is logged at warn.
+fn end_unexecuted(child: OwnedChild, warn_after: Option<std::time::Duration>) -> ChildFate {
+    tear_down_leaving(
+        &child,
+        None,
         Past::Unexecuted,
         warn_after,
         &mut super::Diagnosis::default(),

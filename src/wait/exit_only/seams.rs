@@ -2,9 +2,13 @@
 //! call; each `force_*` returns a guard that disarms an unconsumed force on drop, so a leftover
 //! never leaks into the next test on this thread.
 //!
-//! Only code that holds no kernel it can be given still needs them: the spawn-time macOS code
-//! (`HostKernel`) and every Linux peek (a `waitid` on a pidfd). Code over a macOS `Kernel` states
-//! `FakeKernel` peek and consume rows instead.
+//! The one seam that answers a box's peek in the OS's place, on macOS (in `exit_only::peek` and its
+//! variants) and Linux (in `LinuxProcess::peek`); Windows has none. A test that holds its box states
+//! the answer on it (`OwnedChild::script_over`, a `FakeKernel` row) instead. This one is for a
+//! test that runs a whole spawn, whose box it cannot reach. A Linux peek is a `waitid` on a pidfd
+//! that the kernel answers only with `ECHILD` (a foreign reap, `Ok(Gone)`) or `EBADF`/`EINVAL` (a
+//! pidfd that is not ours, debug-asserted); a seccomp or sandbox policy may answer more, and that
+//! is what a Linux test forces here.
 
 use std::cell::RefCell;
 use std::io;

@@ -206,11 +206,7 @@ pub(crate) fn spawn_raw(
     };
     let owned = OwnedChild::new(Box::new(WindowsProcess::for_child(proc, pid)));
     let raw_handle = owned.os_handle().as_raw_handle();
-    let (resolved, cause, mut why) = resolve_identity(
-        &crate::identity::HostKernel,
-        pid,
-        &crate::wait::exit_only::Target::Handle(owned.os_handle()),
-    );
+    let (resolved, cause, mut why) = resolve_identity(&crate::identity::HostKernel, pid);
     let id = match resolved {
         crate::identity::Resolved::Found(id) => Ok(id),
         // Kept with no identity; see `Child::id`.

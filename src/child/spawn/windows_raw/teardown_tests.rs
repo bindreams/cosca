@@ -29,7 +29,7 @@ use crate::error::ChildFate;
 use crate::identity::ProcessId;
 use crate::os_process::child::{ExitRecord, KillRefusal, OsChild};
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
-use crate::os_process::windows::{uac_access, WindowsProcess};
+use crate::os_process::windows::WindowsProcess;
 use crate::test_spawn::console_flags::NO_WINDOW;
 
 const KIND: std::io::ErrorKind = std::io::ErrorKind::Other;
@@ -125,11 +125,9 @@ fn real(handle: OwnedHandle, pid: u32) -> FakeProcess {
     FakeProcess::over(Box::new(WindowsProcess::for_child(handle, pid)))
 }
 
-/// A [`WindowsProcess`] over a handle a UAC elevation returned, which allows what it was granted:
-/// the access is read from `handle`, as the launch reads it.
+/// A [`WindowsProcess`] over a handle a UAC elevation returned, which allows what it was granted.
 fn uac_process(handle: OwnedHandle, pid: u32) -> WindowsProcess {
-    let granted = uac_access(HANDLE(handle.as_raw_handle()));
-    WindowsProcess::for_uac(handle, pid, granted)
+    WindowsProcess::for_uac(handle, Some(pid))
 }
 
 /// [`real`] for a handle a UAC elevation returned.
@@ -372,6 +370,69 @@ fn a_failed_wait_on_a_handle_the_spawn_expected_to_wait_on_breaks_the_contract()
     let (child, _fake) = owned(real(owner.duplicate(), owner.pid).reaps([ReapAnswer::Err(KIND)]));
     crate::log_capture::install();
     after_a_failed_spawn(child, None, Past::Clean, Disposition::Leave, None);
+}
+
+// A UAC child that could not be tracked =====
+
+/// A launched UAC child whose pid or identity could not be read is ended as any failed spawn ends
+/// its child: its kill is waited for (`Reaped`, not `Killed`: the exit is collected), and one whose
+/// kill is refused, which a UAC handle without `PROCESS_TERMINATE` is, comes back in the failure as
+/// an `Unreaped`, not left running with nothing to name it. A child whose pid could not be read
+/// (`GetProcessId` failed: a box with no pid) is ended the same, and its error and detail name no pid.
+///
+/// Mutants: the child is killed and not waited for; the refused child is not handed back; the error of
+/// a child with no pid names the process's pid.
+#[skuld::test]
+fn an_untracked_uac_child_is_waited_for_and_a_refused_kill_hands_it_back() {
+    use crate::elevation::windows::{end_untracked, Unread};
+
+    let read_failure = || windows::core::Error::from_hresult(HRESULT::from_win32(6));
+    // The rows: the identity could not be resolved (the box has its pid), or the pid could not be read.
+    for pid_read in [true, false] {
+        let unread = |pid: u32| -> Unread {
+            if pid_read {
+                Ok((pid, read_failure()))
+            } else {
+                Err(read_failure())
+            }
+        };
+        let process = |handle, pid: u32| WindowsProcess::for_uac(handle, pid_read.then_some(pid));
+        let ended = |child, pid| {
+            crate::child::spawn::failure::error_parts(end_untracked(child, unread(pid), SpawnPolicy::SYNC).into())
+        };
+
+        let owner = Suspended::spawn();
+        let child = OwnedChild::new(Box::new(process(owner.duplicate(), owner.pid)));
+        let (cause, fate, unreaped) = ended(child, owner.pid);
+        assert_eq!(
+            fate,
+            ChildFate::Reaped,
+            "the kill was waited for (pid read: {pid_read})"
+        );
+        assert!(unreaped.is_none(), "a collected child is handed back by none");
+        assert!(
+            !owner.wait_for_exit().success(),
+            "the process was terminated, not left to run"
+        );
+        if !pid_read {
+            assert!(
+                !format!("{cause:?}").contains(&owner.pid.to_string()),
+                "a child with no pid is named by none: {cause:?}"
+            );
+        }
+
+        let owner = Suspended::spawn();
+        let child = OwnedChild::new(Box::new(process(owner.without_terminate_right(), owner.pid)));
+        let (cause, fate, unreaped) = ended(child, owner.pid);
+        assert_eq!(fate, ChildFate::Running { id: None }, "(pid read: {pid_read})");
+        if !pid_read {
+            assert!(
+                !format!("{cause:?}").contains(&owner.pid.to_string()),
+                "a refused child with no pid is named by none: {cause:?}"
+            );
+        }
+        unreaped.expect("a child whose kill was refused is handed back").leak();
+    }
 }
 
 // What each handle kind allows: the contract of a kill's refusal =====

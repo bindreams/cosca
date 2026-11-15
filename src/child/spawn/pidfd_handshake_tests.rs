@@ -330,6 +330,48 @@ fn a_child_gone_before_its_go_ahead_fails_the_spawn_and_is_reaped() {
 /// Mutant: the pidfd is dropped when the spawn fails.
 #[skuld::test]
 fn a_spawn_that_fails_after_the_child_execed_kills_and_reaps_it() {
+    let teardown = fail_after_exec();
+    teardown.assert_killed();
+    let recorded = teardown.recorded();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_no_child_of_this_thread("the child is reaped through its pidfd");
+}
+
+/// The same, when the failed spawn's look at its child's pidfd fails (a sandbox policy may answer
+/// `waitid` with an errno the kernel never does): the look says nothing of the child, which is
+/// still killed and reaped through its pidfd, and the spawn still answers that it did not start.
+/// The failed look is logged once at debug, and nothing warns.
+///
+/// Mutant: a failed look ends the arm without ending the child.
+#[skuld::test]
+fn a_failed_spawns_child_whose_pidfd_cannot_be_peeked_is_still_killed_and_reaped() {
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let _forced =
+        crate::wait::exit_only::seams::force_peek_once(Err(std::io::Error::other("forced peek failure 5c1d")));
+
+    let teardown = fail_after_exec();
+
+    crate::wait::exit_only::seams::assert_peeks_exhausted();
+    teardown.assert_killed();
+    let recorded = teardown.recorded();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_no_child_of_this_thread("the child is reaped through its pidfd");
+    assert_eq!(
+        crate::log_capture::levels_since(mark, "cannot be peeked"),
+        [log::Level::Debug],
+        "the failed look is logged once, at debug"
+    );
+    assert_eq!(
+        crate::log_capture::warns_since(mark, ""),
+        Vec::<String>::new(),
+        "a child that was ended owes no warn"
+    );
+}
+
+/// A handshake whose spawn execs a child that only a kill ends and then fails: the answer is the
+/// spawn's own error, `NotStarted`. The guard holds the teardown's record.
+fn fail_after_exec() -> crate::child::spawn::fault::TeardownBlocker {
     let (reader, writer) = std::io::pipe().expect("pipe");
     let (mut std_cmd, pending) = raw_command(crate::test_child::BLOCKER_ARGV[0]);
     std_cmd
@@ -353,10 +395,7 @@ fn a_spawn_that_fails_after_the_child_execed_kills_and_reaps_it() {
         Err(SpawnFailure::NotStarted(Error::Io(e))) => assert_eq!(e.to_string(), "post-fork failure (test)"),
         other => panic!("expected the spawn's own error, got {:?}", other.err()),
     }
-    teardown.assert_killed();
-    let recorded = teardown.recorded();
-    assert_eq!(recorded.len(), 1, "{recorded:?}");
-    assert_no_child_of_this_thread("the child is reaped through its pidfd");
+    teardown
 }
 
 /// A hook after the handshake's fails: std reports it and collects the child, so there is nothing
@@ -1362,28 +1401,6 @@ fn a_returned_child_with_no_pidfd_is_killed() {
     }
 }
 
-/// A failed spawn's child whose pidfd cannot be peeked is taken to be uncollected, and is still
-/// ended through its pidfd: the failure answers that the program did not start.
-#[skuld::test]
-fn a_failed_spawns_child_that_cannot_be_peeked_is_still_ended_through_its_pidfd() {
-    let (mut cat, pidfd) = cat_with_pidfd();
-    // Released after the kill: a kill that sent nothing exits 0.
-    let teardown = crate::child::spawn::fault::release_between_kill_and_wait(cat.stdin.take());
-    let _unpeekable = crate::wait::exit_only::seams::force_peek_once(Err(std::io::Error::from_raw_os_error(libc::EIO)));
-    super::conclude(
-        Err::<NoChild, _>(std::io::Error::other("spawn failed")),
-        Outcome::Opened(pidfd),
-        None,
-    )
-    .err()
-    .expect("the spawn fails")
-    .expect_not_started();
-    crate::wait::exit_only::seams::assert_peeks_exhausted();
-    teardown.assert_killed();
-    drop(teardown);
-    assert_no_child_of_this_thread("the cat is reaped through its pidfd");
-}
-
 /// Only a child told to go can run the program, and std fails its `spawn` only on a report from the
 /// child before `exec`, so every arm of `conclude` answers that the program did not start.
 /// `conclude_answers_every_remaining_pair` drives the pairs this leaves.
@@ -1622,9 +1639,9 @@ fn a_child_ended_through_its_pidfd_is_said_reaped_under_the_failed_spawns_name()
     let pid = cat.id();
     let mark = crate::log_capture::mark();
 
-    let fate = super::end_through_pidfd(
-        Some(pid),
-        pidfd,
+    let fate = super::tear_down_leaving(
+        &crate::child::owned::OwnedChild::over_pidfd(Some(pid), pidfd),
+        None,
         super::Past::Clean,
         None,
         &mut crate::child::spawn::Diagnosis::default(),

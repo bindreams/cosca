@@ -632,7 +632,7 @@ fn spawn_reported(
     // Linux holds the child before `exec` until the parent has its pidfd; see `pidfd_handshake`.
     // Everything from the channel's creation to the helper's join is under `spawn_lock`.
     #[cfg(target_os = "linux")]
-    let (mut prepared, child, pidfd, parent_ends) = {
+    let (mut prepared, child, owned, parent_ends) = {
         // Before `prepare`, so a refused stdio fails before containment makes a cgroup leaf.
         let parent_ends = resolve_into_std(&mut std_cmd, &mut steps, &fds).not_started()?;
         let prepared = crate::containment::prepare(
@@ -665,7 +665,7 @@ fn spawn_reported(
         // resolution or the post-spawn attach has nothing to do with a breakaway request.
         #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `_guard` above")]
         let held = handshake.run(|| std_cmd.spawn())?;
-        (prepared, held.child, held.pidfd, parent_ends)
+        (prepared, held.child, held.owned, parent_ends)
     };
     #[cfg(windows)]
     let (mut prepared, child, parent_ends) = {
@@ -699,17 +699,13 @@ fn spawn_reported(
     };
     // Phase 2 (after spawn, before adopt): attach the mechanism (job/cgroup/...).
     // `prepared` is consumed here: Linux cgroup leaf ownership moves to the tree's cgroup mechanism.
-    // Linux holds the child through the pidfd it sent: nothing there kills or reaps by pid. std's
-    // `Child` holds no stdio (it all went to the child; the parent ends are in `parent_ends`), so
-    // dropping it neither kills nor reaps. Every arm below tears down, or adopts, this one handle.
+    // Linux holds the child through the box the handshake built over its pidfd; std's `Child`
+    // neither kills nor reaps on drop. Every arm below tears down or adopts this one handle.
     #[cfg(target_os = "linux")]
-    let (pid, owned) = {
+    let pid = {
         let pid = child.id();
         drop(child);
-        (
-            pid,
-            OwnedChild::new(Box::new(crate::os_process::linux::LinuxProcess::new(Some(pid), pidfd))),
-        )
+        pid
     };
     // Windows holds it through std's process handle, which becomes the `OwnedChild`'s own.
     #[cfg(windows)]
@@ -760,18 +756,14 @@ fn spawn_reported(
         prepared.watch_front(pid);
     }
     // Read the identity while the child is still unreaped, and check the read against what the spawn
-    // holds of the child: the pidfd on Linux, the process handle on Windows (`Target::Handle`), and on
-    // macOS the unique id the child reported (the pid alone does not say whom it names once something
-    // else has reaped the child). The attach takes
+    // holds of the child: the box's pidfd on Linux, its unique id on macOS (the pid alone does not say
+    // whom it names once something else has reaped the child); on Windows the process handle pins
+    // the pid, so the read stands. The attach takes
     // this identity and does not re-read the root's, so a reap and reuse after the check cannot
     // make the containment name a stranger. Nothing here reaps the child, so this is also the
     // identity the adopted `OwnedChild` takes.
     #[cfg(test)]
     fault::run_at(fault::SpawnPoint::BeforeIdentity, pid);
-    #[cfg(target_os = "linux")]
-    let through = crate::wait::exit_only::Target::PidFd(owned.os_handle());
-    #[cfg(windows)]
-    let through = crate::wait::exit_only::Target::Handle(owned.os_handle());
     #[cfg(target_os = "linux")]
     let handle = crate::containment::ChildHandle {
         pid,
@@ -780,9 +772,7 @@ fn spawn_reported(
     let (resolved, cause, mut why) = resolve_identity(
         &crate::identity::HostKernel,
         pid,
-        #[cfg(not(target_os = "macos"))]
-        &through,
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         &owned,
     );
     let id = match resolved {
@@ -1017,9 +1007,6 @@ fn abandon_unadopted(
 /// shows its pid still names it and no `MacosChild` can be built. It is not signalled or waited on
 /// by pid and is left unreaped, and a warning names the pid; the spawn still fails, and the caller
 /// must not assume the program did not start. Dropping the `std` `Child` closes our pipe ends only.
-///
-/// Only macOS adopts by a reported id. Linux opens the pidfd before `exec` (see `pidfd_handshake`)
-/// and Windows takes std's process handle, so on both adoption cannot fail.
 #[cfg(target_os = "macos")]
 fn leave_unverified_child(child: std::process::Child) -> ChildFate {
     let pid = child.id();
@@ -1030,7 +1017,6 @@ fn leave_unverified_child(child: std::process::Child) -> ChildFate {
          nothing signalled or waited on by pid, and it may still be running"
     );
     drop(child);
-    // No unique id was read, so there is no identity to give.
     ChildFate::Running { id: None }
 }
 
@@ -1751,22 +1737,20 @@ pub(crate) fn spawn_identity_error(
     }
 }
 
-/// Read the spawned child's stable identity, then check through `through`, the handle held since
-/// the spawn, that the read named our child.
+/// Read the spawned child's stable identity, then check through `through`, the box held since the
+/// spawn (on Unix), that the read named our child.
 ///
-/// - **Linux:** the key is read from the held pidfd, with no second `pidfd_open` of the pid: on
+/// - **Linux:** the key is read from the box's pidfd, with no second `pidfd_open` of the pid: on
 ///   pidfs (6.9+) its inode, else (no inode of its own) the `/proc` `starttime` by pid. Then a peek
 ///   through the pidfd. `Running` and `Exit` keep the read (a reap is irreversible, so the pid
 ///   named our child throughout); `Foreign` is `Gone`; a failed peek is `Unknown`, and the child is
 ///   kept without an identity ([`kept_without_identity`]): the check is logged at debug, and warned
 ///   only if a failing attach's teardown folds it into its warn. On pidfs the pidfd, not the pid,
 ///   named the read, so the peek does not check it: it shows whether another party reaped the child.
-/// - **macOS:** the same, but the peek compares the pid's current unique id with the one `through`
+/// - **macOS:** the same, but the peek compares the pid's current unique id with the one the box
 ///   carries; a mismatch is `Foreign`, an unreadable id is an error (`Unknown`), and `Orphaned`
 ///   (held by launchd after its tracer died) is `Gone`, as every foreign verdict is.
-/// - **Windows:** the process handle pins the pid, so the read stands.
-///
-/// On macOS `through` is the box, which names the child by the unique id it reported before `exec`.
+/// - **Windows:** the process handle pins the pid, so the read stands and there is no check.
 ///
 /// What the check found out, when it could not show the read named our child, comes back as a
 /// [`Diagnosis`]: the failed spawn's teardown carries it in its one `warn`, unless the child is kept
@@ -1775,9 +1759,7 @@ pub(crate) fn spawn_identity_error(
 pub(crate) fn resolve_identity(
     kernel: &dyn crate::identity::Kernel,
     pid: u32,
-    // On macOS the handle is the box: its peek checks the read against its own unique id.
-    #[cfg(not(target_os = "macos"))] through: &crate::wait::exit_only::Target<'_>,
-    #[cfg(target_os = "macos")] through: &OwnedChild,
+    #[cfg(unix)] through: &OwnedChild,
 ) -> (
     crate::identity::Resolved<ProcessId>,
     crate::identity::UnknownCause,
@@ -1786,13 +1768,8 @@ pub(crate) fn resolve_identity(
     use crate::identity::Resolved;
 
     #[cfg(target_os = "linux")]
-    let (read, cause) = {
-        let crate::wait::exit_only::Target::PidFd(held) = *through;
-        resolve_identity_unchecked(kernel, pid, held)
-    };
-    #[cfg(target_os = "macos")]
-    let (read, cause) = resolve_identity_unchecked(kernel, pid);
-    #[cfg(windows)]
+    let (read, cause) = resolve_identity_unchecked(kernel, pid, through.os_handle());
+    #[cfg(not(target_os = "linux"))]
     let (read, cause) = resolve_identity_unchecked(kernel, pid);
     let Resolved::Found(_) = read else {
         return (read, cause, Diagnosis::default());
@@ -1802,11 +1779,7 @@ pub(crate) fn resolve_identity(
     #[cfg(unix)]
     {
         use crate::os_process::child::PeekOutcome;
-        #[cfg(target_os = "linux")]
-        let peeked = crate::wait::exit_only::peek(through);
-        #[cfg(target_os = "macos")]
-        let peeked = through.peek().map_err(Error::into_io);
-        match peeked {
+        match through.peek().map_err(Error::into_io) {
             Ok(PeekOutcome::Running | PeekOutcome::Exit(_)) => (read, cause, Diagnosis::default()),
             // Orphaned: `Gone`, warned.
             Ok(PeekOutcome::Foreign(crate::os_process::child::Foreign::Orphaned)) => (
@@ -1832,7 +1805,6 @@ pub(crate) fn resolve_identity(
     }
     #[cfg(windows)]
     {
-        let _ = through;
         (read, cause, Diagnosis::default())
     }
 }
@@ -2762,10 +2734,6 @@ pub(crate) mod identity_macos_tests;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "spawn/late_report_tests.rs"]
 pub(crate) mod late_report_tests;
-
-#[cfg(all(test, target_os = "linux"))]
-#[path = "spawn/identity_peek_tests.rs"]
-mod identity_peek_tests;
 
 #[cfg(target_os = "macos")]
 #[path = "spawn/unique_report.rs"]

@@ -6,8 +6,6 @@
 //! look at a front (`look_at_failed_spawn_front`) are also what a cgroup leaf's abandonment
 //! builds on.
 
-#[cfg(target_os = "linux")]
-use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 use super::Diagnosis;
@@ -23,8 +21,6 @@ use crate::child::spawn::policy::SpawnPolicy;
 #[cfg(unix)]
 use crate::elevation::front::Front;
 use crate::identity::ProcessId;
-#[cfg(target_os = "linux")]
-use crate::os_process::linux::LinuxProcess;
 use crate::Unreaped;
 
 /// What a held child's teardown is told.
@@ -98,17 +94,29 @@ pub(crate) fn tear_down_unexecuted(
     policy: SpawnPolicy,
     why: &mut Diagnosis,
 ) -> Torn {
-    let kill = Kill {
-        disposition: Disposition::Leave,
-        tree: None,
-    };
-    let torn = tear_down_expecting(&child, id, kill, past, policy.teardown_warn_after);
-    let remains = say_teardown_of_failed_spawn(torn, why);
+    let remains = tear_down_leaving(&child, id, past, policy.teardown_warn_after, why);
     Torn {
         fate: remains.fate,
         unreaped: None,
         cleanup: None,
     }
+}
+
+/// Kills and reaps `child`, which a failed spawn holds and whose answer has no place for it: one it
+/// cannot end is left, not handed back. Says the teardown as the failed spawn's one warn, `why`
+/// leading it, and answers what is left. `past`, `warn_after`: see [`tear_down_expecting`].
+pub(crate) fn tear_down_leaving(
+    child: &OwnedChild,
+    id: Option<ProcessId>,
+    past: Past,
+    warn_after: Option<Duration>,
+    why: &mut Diagnosis,
+) -> Remains {
+    let kill = Kill {
+        disposition: Disposition::Leave,
+        tree: None,
+    };
+    say_teardown_of_failed_spawn(tear_down_expecting(child, id, kill, past, warn_after), why)
 }
 
 /// What a Linux spawn knows of its pidfd when it ends a child that never ran: with the identity read,
@@ -286,26 +294,4 @@ fn say_failed_spawn(
         unreaped,
         cleanup: remains.failures,
     }
-}
-
-/// Kills the child `pidfd` names, whose pid is `pid` if known, and reaps it, through an
-/// [`OwnedChild`] over the pidfd. A child it could not collect (its kill refused and it still
-/// running, a look or a wait that failed) is left, which the outcome's `uncollected` says, not the
-/// fate; the caller owns the one warn, and says it with [`HandleTeardown::say_as_failed_spawn`], or
-/// logs its own line through [`HandleTeardown::warn`]. `past`: see [`Past`]. With `warn_after`, the wait
-/// for the killed child warns once it has lasted that long.
-#[cfg(target_os = "linux")]
-pub(crate) fn tear_down_pidfd(
-    pid: Option<u32>,
-    pidfd: OwnedFd,
-    id: Option<ProcessId>,
-    past: Past,
-    warn_after: Option<Duration>,
-) -> HandleTeardown {
-    let child = OwnedChild::new(Box::new(LinuxProcess::new(pid, pidfd)));
-    let kill = Kill {
-        disposition: Disposition::Leave,
-        tree: None,
-    };
-    tear_down_expecting(&child, id, kill, past, warn_after)
 }
