@@ -230,18 +230,12 @@ jobs:
       - name: Run the tracer tests (Unix)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
         timeout-minutes: 10
-        env:
-          COSCA_TEST_TRACER: "1"
-          COSCA_TEST_TRACER_CONSENT: "1"
         run: ${{ matrix.nextest }} tracer bash .github/scripts/tracer-lane.sh ${{ matrix.target }}
 
       # Only the Unix lanes have such tests.
       - name: Run the stray-signal tests (Unix)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
         timeout-minutes: 10
-        env:
-          COSCA_TEST_STRAY_SIGNAL: "1"
-          COSCA_TEST_STRAY_SIGNAL_CONSENT: "1"
         run: ${{ matrix.nextest }} stray-signal bash .github/scripts/stray-signal-lane.sh ${{ matrix.target }}
 
 
@@ -319,18 +313,12 @@ jobs:
       - name: Run the tracer tests (release — debug_assertions off)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
         timeout-minutes: 10
-        env:
-          COSCA_TEST_TRACER: "1"
-          COSCA_TEST_TRACER_CONSENT: "1"
         run: ${{ matrix.nextest }} tracer-release bash .github/scripts/tracer-lane.sh ${{ matrix.target }} release
 
       # The stray-signal tests with `debug_assertions` off too.
       - name: Run the stray-signal tests (release — debug_assertions off)
         if: matrix.os == 'darwin' || matrix.os == 'linux'
         timeout-minutes: 10
-        env:
-          COSCA_TEST_STRAY_SIGNAL: "1"
-          COSCA_TEST_STRAY_SIGNAL_CONSENT: "1"
         run: ${{ matrix.nextest }} stray-signal-release bash .github/scripts/stray-signal-lane.sh ${{ matrix.target }} release
 
 
@@ -390,8 +378,6 @@ jobs:
         timeout-minutes: 10
         shell: bash
         env:
-          COSCA_TEST_SETUID: "1"
-          COSCA_TEST_SETUID_CONSENT: "1"
           COSCA_TESTCFG_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
         run: exec python3 .github/scripts/run-nextest.py setuid bash .github/scripts/setuid-lane.sh ${{ matrix.target }} "$COSCA_TESTCFG_SETUID_HELPER"
 
@@ -401,10 +387,6 @@ jobs:
         timeout-minutes: 10
         shell: bash
         env:
-          COSCA_TEST_CGROUP: "1"
-          COSCA_TEST_CGROUP_CONSENT: "1"
-          COSCA_TEST_SETUID: "1"
-          COSCA_TEST_SETUID_CONSENT: "1"
           COSCA_TESTCFG_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
         run: exec python3 .github/scripts/run-nextest.py cgroup-setuid bash -ux .github/scripts/cgroup-setuid-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/cgroup.tar.zst" "$COSCA_TESTCFG_SETUID_HELPER"
 
@@ -420,8 +402,6 @@ jobs:
         timeout-minutes: 10
         shell: bash
         env:
-          COSCA_TEST_SETUID: "1"
-          COSCA_TEST_SETUID_CONSENT: "1"
           COSCA_TESTCFG_SETUID_HELPER: ${{ steps.lin_helper.outputs.helper }}
         run: exec python3 .github/scripts/run-nextest.py setuid-root sudo "$(command -v python3)" .github/scripts/forward.py bash -eux .github/scripts/setuid-root-lane.sh "$(command -v cargo-nextest)" "$RUNNER_TEMP/setuid-root.tar.zst" "$RUNNER_TEMP/setuid-root-extract" "$COSCA_TESTCFG_SETUID_HELPER"
 
