@@ -258,6 +258,9 @@ fn parse_search(a: &OsStr) -> Result<Option<OsString>, ShimArgsError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotExecuted {
     ForkFailed(Errno),
+    /// The kernel or its filter refuses both clones that give a child a pidfd (`clone3` and
+    /// `clone(CLONE_PIDFD)`), so cosca can never spawn there (principle 4); the errno is the second's.
+    Unsupported(Errno),
     ExecFailed(Errno),
     SetupFailed(Errno),
     TerminatedBeforeExec(Signal),
@@ -322,6 +325,7 @@ const KIND_FORK: u16 = 1;
 const KIND_EXEC: u16 = 2;
 const KIND_SETUP: u16 = 3;
 const KIND_TERM: u16 = 4;
+const KIND_UNSUPPORTED: u16 = 5;
 
 impl Frame {
     pub(crate) fn encode(&self) -> Vec<u8> {
@@ -336,6 +340,7 @@ impl Frame {
                     NotExecuted::ExecFailed(Errno(e)) => (KIND_EXEC, e),
                     NotExecuted::SetupFailed(Errno(e)) => (KIND_SETUP, e),
                     NotExecuted::TerminatedBeforeExec(Signal(s)) => (KIND_TERM, s),
+                    NotExecuted::Unsupported(Errno(e)) => (KIND_UNSUPPORTED, e),
                 };
                 debug_assert!(
                     (1..=0xffff).contains(&value),
@@ -357,9 +362,9 @@ fn payload_byte_ok(tag: u8, p: &[u8], i: usize) -> bool {
     match (tag, i) {
         (b'U', _) | (b'R', 1..) => p[i] == 0,
         (b'R', 0) => Refusal::from_code(i32::from(p[0])).is_some(),
-        // The 16-bit value, nonzero, then the 16-bit kind, 1 to 4.
+        // The 16-bit value, nonzero, then the 16-bit kind, 1 to 5.
         (b'F', 1) => p[0] != 0 || p[1] != 0,
-        (b'F', 2) => (1..=4).contains(&p[2]),
+        (b'F', 2) => (1..=5).contains(&p[2]),
         (b'F', 3) => p[3] == 0,
         _ => true,
     }
@@ -399,6 +404,7 @@ pub(crate) fn decode_frame(bytes: &[u8]) -> Result<Frame, FrameError> {
             KIND_EXEC => NotExecuted::ExecFailed(Errno(low)),
             KIND_SETUP => NotExecuted::SetupFailed(Errno(low)),
             KIND_TERM => NotExecuted::TerminatedBeforeExec(Signal(low)),
+            KIND_UNSUPPORTED => NotExecuted::Unsupported(Errno(low)),
             _ => unreachable!("checked per byte"),
         }),
         _ => unreachable!("tag checked above"),

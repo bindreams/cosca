@@ -1,7 +1,7 @@
 //! Helpers the cgroup module's tests share.
 
 #[cfg(target_os = "linux")]
-use crate::os_process::linux::fork::{fork_with_pidfd, Fork};
+use crate::os_process::linux::fork::{fork_with_pidfd, CloneKind, Fork};
 
 /// Fork a child that runs `body` and `_exit(0)`s; `body` must be async-signal-safe (this process
 /// has other threads). The child never `exec`s, so an unreaped orphan keeps this binary's
@@ -69,7 +69,7 @@ fn fork_running_held(held: Held<'_>, keep: Option<&[std::os::fd::RawFd]>, body: 
     });
     // SAFETY: `held` is this thread's `spawn_lock`; the child runs only `body`, async-signal-safe by
     // the caller's contract, then `_exit`s without unwinding or running destructors.
-    let forked = unsafe { fork_with_pidfd() };
+    let forked = unsafe { fork_with_pidfd(CloneKind::Plain) };
     match forked {
         Err(errno) => panic!("fork: {}", std::io::Error::from_raw_os_error(errno)),
         Ok(Fork::Child) => {

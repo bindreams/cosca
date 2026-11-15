@@ -1,8 +1,10 @@
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-use super::{drain_control, drain_status, Status};
-use crate::elevation::shim::protocol::{Errno, NotExecuted};
+use super::{drain_control, drained, Drained};
+use crate::child::spawn::fork_exec::{Failure, Progress, SpawnError, StepFailure};
+use crate::elevation::shim::protocol::{Errno, NotExecuted, Signal};
+use crate::elevation::shim::run::child::{died_before_exec, not_spawned};
 use crate::elevation::shim::run::log::Log;
 use crate::elevation::shim::step::Control;
 
@@ -35,59 +37,126 @@ fn logged(reader: &OwnedFd) -> String {
 
 // The status pipe -----
 
+/// Nothing yet, and a ready record, leave the `exec` pending.
+///
+/// Mutant: a ready record is taken for the `exec`.
 #[skuld::test]
-fn the_status_pipe_says_nothing_until_the_child_writes() {
-    let (reader, _writer) = pipe();
+fn nothing_and_a_ready_record_say_nothing_yet() {
     let (log, _, _keep) = captured_log();
-    assert!(matches!(drain_status(reader.as_fd(), &log), Status::Nothing));
+    assert!(matches!(drained(Ok(Progress::Pending), &log), Drained::Nothing));
+    assert!(matches!(drained(Ok(Progress::Ready), &log), Drained::Nothing));
 }
 
+/// Each failure of the child is the report of its kind, and the channel's end is the `exec`.
+///
+/// Mutants: a kind is reported as another; an end that followed a ready record, or did not, is a report.
 #[skuld::test]
-fn a_status_report_is_decoded_and_a_closed_pipe_is_eof() {
-    let (reader, writer) = pipe();
+fn a_failure_is_the_report_of_its_kind_and_the_end_is_eof() {
     let (log, _, _keep) = captured_log();
-    let exec_failed = (2i32 << 16) | libc::ENOENT;
-    rustix::io::write(&writer, &exec_failed.to_le_bytes()).unwrap();
-    match drain_status(reader.as_fd(), &log) {
-        Status::Report(report) => assert_eq!(report, NotExecuted::ExecFailed(Errno(libc::ENOENT))),
-        _ => panic!("a report"),
+    let report = |failure| match drained(Ok(Progress::Failed(failure)), &log) {
+        Drained::Report(report) => report,
+        _ => panic!("a report for {failure:?}"),
+    };
+    assert_eq!(
+        report(Failure::Exec(libc::ENOENT)),
+        NotExecuted::ExecFailed(Errno(libc::ENOENT))
+    );
+    assert_eq!(
+        report(Failure::Step(StepFailure {
+            kind: 3,
+            value: libc::EACCES as u16
+        })),
+        NotExecuted::SetupFailed(Errno(libc::EACCES))
+    );
+    assert_eq!(
+        report(Failure::Step(StepFailure {
+            kind: 4,
+            value: libc::SIGTERM as u16
+        })),
+        NotExecuted::TerminatedBeforeExec(Signal(libc::SIGTERM))
+    );
+    assert!(matches!(
+        drained(Ok(Progress::Ended { ready: true }), &log),
+        Drained::Eof
+    ));
+}
+
+/// A channel that ended with no ready record means the child died inside its steps and no `execve`
+/// ran, which is not the `exec`.
+///
+/// Mutant: an end without a ready record is the `exec`.
+#[skuld::test]
+fn an_end_with_no_ready_record_is_the_child_dying_before_exec() {
+    let (log, _, _keep) = captured_log();
+    assert!(matches!(
+        drained(Ok(Progress::Ended { ready: false }), &log),
+        Drained::Died
+    ));
+}
+
+/// The report of a child that died before its ready record: the signal it died of, and `EIO` when the
+/// wait status names none.
+///
+/// Mutant: the signal is dropped, or a plain exit is taken for a signal.
+#[skuld::test]
+fn a_child_that_died_before_exec_is_reported_by_how_it_died() {
+    assert_eq!(
+        died_before_exec(Some(libc::SIGSEGV)),
+        NotExecuted::TerminatedBeforeExec(Signal(libc::SIGSEGV))
+    );
+    // A core dump sets bit 7 of the status.
+    assert_eq!(
+        died_before_exec(Some(libc::SIGSEGV | 0x80)),
+        NotExecuted::TerminatedBeforeExec(Signal(libc::SIGSEGV))
+    );
+    for status in [Some(119 << 8), None] {
+        assert_eq!(died_before_exec(status), NotExecuted::SetupFailed(Errno(libc::EIO)));
     }
-    drop(writer);
-    assert!(matches!(drain_status(reader.as_fd(), &log), Status::Eof));
 }
 
-#[cfg(debug_assertions)]
+/// Each way the core makes no child is its own report: a clone refused on both paths is the
+/// `Unsupported` of principle 4, not a fork failure, and an exhausted descriptor table is a setup
+/// failure with the pipe's errno.
+///
+/// Mutants: `Unsupported` is reported as `ForkFailed`; `Pipe` as `ForkFailed`.
 #[skuld::test]
-#[should_panic(expected = "a short read of 2 bytes from the status pipe")]
-fn a_short_status_read_is_a_bug() {
-    let (reader, writer) = pipe();
-    let (log, _, _keep) = captured_log();
-    rustix::io::write(&writer, &[1, 2]).unwrap();
-    drain_status(reader.as_fd(), &log);
-}
-
-/// Without `debug_assertions` the short read is logged and says nothing.
-#[cfg(not(debug_assertions))]
-#[skuld::test]
-fn a_short_status_read_is_logged_and_says_nothing() {
-    let (reader, writer) = pipe();
-    let (log, lines, _keep) = captured_log();
-    rustix::io::write(&writer, &[1, 2]).unwrap();
-    assert!(matches!(drain_status(reader.as_fd(), &log), Status::Nothing));
-    assert!(logged(&lines).contains("a short read of 2 bytes"));
+fn a_spawn_that_made_no_child_reports_its_own_cause() {
+    let (unsupported, what, errno) = not_spawned(SpawnError::Unsupported(libc::EPERM));
+    assert_eq!(unsupported, NotExecuted::Unsupported(Errno(libc::EPERM)));
+    assert_eq!(
+        (what, errno),
+        ("the kernel cannot make a child with a pidfd", libc::EPERM)
+    );
+    assert_eq!(
+        not_spawned(SpawnError::Fork(libc::EAGAIN)).0,
+        NotExecuted::ForkFailed(Errno(libc::EAGAIN))
+    );
+    assert_eq!(
+        not_spawned(SpawnError::Pipe(libc::EMFILE)).0,
+        NotExecuted::SetupFailed(Errno(libc::EMFILE))
+    );
 }
 
 #[skuld::test]
 fn a_status_read_error_is_logged_and_says_nothing() {
-    // Reading a pipe's write end fails with `EBADF`: not `EAGAIN`, so not silence.
-    let (_reader, writer) = pipe();
     let (log, lines, _keep) = captured_log();
-    assert!(matches!(drain_status(writer.as_fd(), &log), Status::Nothing));
+    let failed = std::io::Error::from_raw_os_error(libc::EBADF);
+    assert!(matches!(drained(Err(failed), &log), Drained::Nothing));
     let text = logged(&lines);
-    assert!(
-        text.contains(&format!("reading the status pipe: errno {}", libc::EBADF)),
-        "{text:?}"
-    );
+    assert!(text.contains("reading the status pipe"), "{text:?}");
+}
+
+/// A step failure whose kind the shim never gives its child is the channel being wrong, not a report
+/// of some kind: it is logged, and says nothing.
+///
+/// Mutant: it is reported as an exec failure with `EIO`.
+#[skuld::test]
+fn a_step_failure_of_no_kind_is_logged_and_says_nothing() {
+    let (log, lines, _keep) = captured_log();
+    let unknown = Failure::Step(StepFailure { kind: 9, value: 1 });
+    assert!(matches!(drained(Ok(Progress::Failed(unknown)), &log), Drained::Nothing));
+    let text = logged(&lines);
+    assert!(text.contains("no kind names"), "{text:?}");
 }
 
 // Cosca's connection -----

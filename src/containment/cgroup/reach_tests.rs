@@ -1281,7 +1281,7 @@ fn a_probe_with_no_descriptor_for_its_childs_pidfd_fails_with_the_clones_errno()
 fn keep_only_own_needs_no_free_descriptor_number() {
     use std::os::fd::AsRawFd as _;
 
-    use crate::os_process::linux::fork::{fork_with_pidfd, Fork};
+    use crate::os_process::linux::fork::{fork_with_pidfd, CloneKind, Fork};
 
     const KEPT: i32 = 0;
     const WALK_FAILED: i32 = 1;
@@ -1300,7 +1300,7 @@ fn keep_only_own_needs_no_free_descriptor_number() {
         let _lock = crate::child::spawn::spawn_lock();
         // SAFETY: this thread holds `spawn_lock`, and the child makes only raw system calls and
         // `keep_only_own`'s, and ends in `_exit`.
-        match unsafe { fork_with_pidfd() }.expect("fork") {
+        match unsafe { fork_with_pidfd(CloneKind::Plain) }.expect("fork") {
             // SAFETY: this is the forked child.
             Fork::Child => unsafe {
                 let mut full: libc::c_int = 0;

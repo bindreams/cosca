@@ -201,3 +201,8 @@ In order:
    in the OS's place (`TerminateProcess` refusing as an exit under way); the Windows `Kernel` methods
    enter with their first caller, and those tests state rows (owner, 2026-11-06).
 5. **Spawn:** produces an `OsChild`, its pipes, its containment and its elevation, for both halves.
+   On Linux the one fork that execs is `child::spawn::fork_exec` ([#383](https://github.com/bindreams/cosca/issues/383)
+   S2): a clone kind (vfork without `CLONE_VM`, or plain), the env block built in the parent, the
+   caller's async-signal-safe steps, and a status channel of errno and ready records read without
+   blocking. The elevation shim uses it. The ordinary spawn is std's `Command` and the handshake;
+   both go when it moves onto the core.

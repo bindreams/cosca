@@ -57,6 +57,7 @@ fn truncated_and_garbled_frames_are_shim_lost() {
 fn f_frame_is_not_started() {
     let kinds = [
         NotExecuted::ForkFailed(Errno(11)),
+        NotExecuted::Unsupported(Errno(38)),
         NotExecuted::ExecFailed(Errno(2)),
         NotExecuted::SetupFailed(Errno(24)),
         NotExecuted::TerminatedBeforeExec(Signal(15)),

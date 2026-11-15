@@ -121,7 +121,8 @@ fn probe_fs(path: &Path) -> Candidate {
 }
 
 /// What a failed check of `path` means to the search, by `errno`, as glibc's `execvp` reads the
-/// errno of `execve`.
+/// errno of `execve`. The child's `execve` loop reads the same errnos in
+/// `child::spawn::fork_exec::tries_the_next`; the two tables must agree.
 fn classify(path: &Path, errno: i32) -> Candidate {
     match errno {
         libc::ENOENT | libc::ENOTDIR | libc::ESTALE | libc::ENODEV | libc::ETIMEDOUT => Candidate::Missing,

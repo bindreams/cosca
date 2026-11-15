@@ -1,13 +1,11 @@
 //! Unix: stdin, stdout and stderr go through one `poll` loop on the calling thread.
 
 use std::io::{self, ErrorKind, Read, Write};
-use std::os::fd::AsFd;
 
 use rustix::event::{PollFd, PollFlags};
-use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
 
 use super::{Drain, Pump, Slot, CHUNK};
-use crate::pipe::{PipeReader, PipeWriter};
+use crate::pipe::{set_nonblocking, PipeReader, PipeWriter};
 use crate::wait;
 
 impl<'a> Pump<'a, PipeWriter, PipeReader> {
@@ -23,12 +21,12 @@ impl<'a> Pump<'a, PipeWriter, PipeReader> {
             stdout,
             stderr,
             |pipe| {
-                nonblocking(&pipe)?;
+                set_nonblocking(&pipe)?;
                 forbid_sigpipe(&pipe)?;
                 Ok(pipe)
             },
             |pipe| {
-                nonblocking(&pipe)?;
+                set_nonblocking(&pipe)?;
                 Ok(pipe)
             },
         )
@@ -96,14 +94,6 @@ impl Drain<PipeReader> {
             }
         }
     }
-}
-
-/// Sets `O_NONBLOCK` on the pipe's own open file description. The child holds the other end of the
-/// pipe, a different description, so it is unaffected.
-fn nonblocking(pipe: &impl AsFd) -> io::Result<()> {
-    let flags = fcntl_getfl(pipe)?;
-    fcntl_setfl(pipe, flags | OFlags::NONBLOCK)?;
-    Ok(())
 }
 
 // SIGPIPE =====

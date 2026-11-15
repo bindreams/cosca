@@ -446,6 +446,7 @@ fn all_frames() -> Vec<(Frame, Vec<u8>)> {
         (Frame::StatusLost, b"U\x00\x00\x00\x00".to_vec()),
         (f(NotExecuted::ForkFailed(Errno(11))), b"F\x0b\x00\x01\x00".to_vec()),
         (f(NotExecuted::ExecFailed(Errno(2))), b"F\x02\x00\x02\x00".to_vec()),
+        (f(NotExecuted::Unsupported(Errno(38))), b"F\x26\x00\x05\x00".to_vec()),
         (f(NotExecuted::SetupFailed(Errno(24))), b"F\x18\x00\x03\x00".to_vec()),
         (
             f(NotExecuted::TerminatedBeforeExec(Signal(15))),
@@ -486,7 +487,7 @@ fn a_prefix_that_is_already_garbled_is_garbled() {
     for bytes in [
         &b"F\x00\x00"[..],
         b"F\x00\x00\x02",
-        b"F\x05\x00\x05",
+        b"F\x05\x00\x06",
         b"F\x05\x00\x00",
         b"F\x05\x00\x01\x01",
         b"F\x05\x00\x02\x01",
@@ -536,10 +537,11 @@ fn f_kinds_round_trip_and_unknown_kind_or_zero_value_is_garbled() {
         f(0xffff, 4),
         Ok(Frame::NotExecuted(NotExecuted::TerminatedBeforeExec(Signal(0xffff))))
     );
-    for kind in [0, 5, 6, 0x100, 0xffff] {
+    assert_eq!(f(5, 5), Ok(Frame::NotExecuted(NotExecuted::Unsupported(Errno(5)))));
+    for kind in [0, 6, 7, 0x100, 0xffff] {
         assert_eq!(f(5, kind), Err(FrameError::Garbled), "kind {kind}");
     }
-    for kind in 0..=5 {
+    for kind in 0..=6 {
         assert_eq!(f(0, kind), Err(FrameError::Garbled), "zero value, kind {kind}");
     }
 }

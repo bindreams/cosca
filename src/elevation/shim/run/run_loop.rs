@@ -12,10 +12,11 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::io::Errno;
 use rustix::net::{recv, RecvFlags};
 
-use super::child::{decode_report, signal};
+use super::child::{died_before_exec, not_executed, signal};
 use super::fds::wait_readable;
 use super::log::Log;
 use super::reap::{kill, reap};
+use crate::child::spawn::fork_exec::{Progress, Status};
 use crate::elevation::shim::protocol::NotExecuted;
 use crate::elevation::shim::step::{decide, Actions, Control, Events, ExecEvent, LoopState};
 use crate::os_process::linux::fork::NewChild;
@@ -36,8 +37,8 @@ pub(super) struct Loop<'a> {
     pub(super) child: &'a NewChild,
     /// The read end of the pipe the signal handlers write to.
     pub(super) wake: BorrowedFd<'a>,
-    /// The read end of the status pipe.
-    pub(super) status: BorrowedFd<'a>,
+    /// The spawn core's status channel.
+    pub(super) status: &'a mut Status,
     /// Test hook: becomes readable to fail supervision.
     pub(super) failure: Option<OwnedFd>,
     /// Test hook: a host thread's reap is complete once this is readable.
@@ -45,40 +46,41 @@ pub(super) struct Loop<'a> {
     pub(super) state: LoopState,
 }
 
-/// What reading the status pipe gave.
-enum Status {
+/// What reading the status channel gave.
+enum Drained {
     Report(NotExecuted),
+    /// The channel ended after the ready record: the `exec` closed it.
     Eof,
+    /// The channel ended with no ready record: the child died inside its steps, and no `execve` ran.
+    Died,
     Nothing,
 }
 
-/// Reads the status pipe without blocking. A read that fails for a reason other than `EAGAIN` is
-/// logged, and the loop goes on: the child's exit ends the wait for a report.
-fn drain_status(fd: BorrowedFd<'_>, log: &Log) -> Status {
-    let mut value = [0u8; 4];
-    loop {
-        return match rustix::io::read(fd, &mut value) {
-            Ok(4) => Status::Report(decode_report(i32::from_le_bytes(value))),
-            Ok(0) => Status::Eof,
-            Ok(n) => {
-                // The child writes its four bytes in one `write`, which a pipe keeps whole.
-                debug_assert!(false, "a short read of {n} bytes from the status pipe");
-                log.warn(format_args!("a short read of {n} bytes from the status pipe"));
-                Status::Nothing
-            }
-            Err(Errno::INTR) => continue,
-            // The child has not exec'd yet.
-            Err(Errno::AGAIN) => Status::Nothing,
-            Err(e) => {
-                log.warn(format_args!(
-                    "reading the status pipe: errno {} ({})",
-                    e.raw_os_error(),
-                    crate::error::Report(&e)
-                ));
-                Status::Nothing
-            }
-        };
+/// Reads the status channel without blocking. A read that fails is logged, and the loop goes on: the
+/// child's exit ends the wait for a report. A ready record is nothing yet: the report is a failure,
+/// and the end is the `exec`, or the child's death before it.
+fn drain_status(status: &mut Status, log: &Log) -> Drained {
+    drained(status.progress(), log)
+}
+
+/// What the loop makes of what the status channel said.
+fn drained(progress: std::io::Result<Progress>, log: &Log) -> Drained {
+    match progress {
+        Ok(Progress::Failed(failure)) => match not_executed(failure) {
+            Ok(report) => Drained::Report(report),
+            Err(e) => unreadable(&e, log),
+        },
+        Ok(Progress::Ended { ready: true }) => Drained::Eof,
+        Ok(Progress::Ended { ready: false }) => Drained::Died,
+        Ok(Progress::Pending | Progress::Ready) => Drained::Nothing,
+        Err(e) => unreadable(&e, log),
     }
+}
+
+/// A status channel that said what it cannot say: logged, and nothing to act on.
+fn unreadable(e: &std::io::Error, log: &Log) -> Drained {
+    log.warn(format_args!("reading the status pipe: {}", crate::error::Report(e)));
+    Drained::Nothing
 }
 
 /// Reads without blocking what cosca has sent, in order: the bytes, then `Eof` if the connection ended.
@@ -133,7 +135,7 @@ impl Loop<'_> {
                 st.conn_open.then_some(self.conn),
                 st.owner_watched.then_some(self.owner),
                 self.failure.as_ref().map(|f| f.as_fd()),
-                st.exec_pending.then_some(self.status),
+                st.exec_pending.then(|| self.status.as_fd()),
             ]);
             let [_, child_ready, _, owner_ready, failure_ready, status_ready] = match polled {
                 Ok(ready) => ready,
@@ -148,16 +150,22 @@ impl Loop<'_> {
             events.forced_failure = failure_ready;
             if status_ready || (events.child_exited && st.exec_pending) {
                 match drain_status(self.status, self.log) {
-                    Status::Report(r) => {
+                    Drained::Report(r) => {
                         events.exec = ExecEvent::Report;
                         self.log.line(format_args!("status pipe: report {r:?}"));
                         report = Some(r);
                     }
-                    Status::Eof => {
+                    Drained::Eof => {
                         events.exec = ExecEvent::Eof;
                         self.log.line(format_args!("status pipe: EOF"));
                     }
-                    Status::Nothing => {}
+                    Drained::Died => {
+                        // The report is made after the reap, which names how the child died.
+                        events.exec = ExecEvent::Eof;
+                        self.log
+                            .line(format_args!("status pipe: ended before the ready record"));
+                    }
+                    Drained::Nothing => {}
                 }
             }
             // Every byte cosca has sent, in order, before the owner's exit or the connection's end: the
@@ -199,9 +207,12 @@ impl Loop<'_> {
             }
         };
         if report.is_none() {
-            // A report already written is positive evidence, whatever the reap gave.
-            if let Status::Report(r) = drain_status(self.status, self.log) {
-                report = Some(r);
+            // A report already written is positive evidence, whatever the reap gave. So is a channel
+            // that ended with no ready record: no `execve` ran, and the reap says how the child died.
+            match drain_status(self.status, self.log) {
+                Drained::Report(r) => report = Some(r),
+                Drained::Died => report = Some(died_before_exec(reaped)),
+                Drained::Eof | Drained::Nothing => {}
             }
         }
         Finished {

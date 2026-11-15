@@ -1,5 +1,6 @@
-//! After the answer `A`: the status pipe, the program's resolution, the clone, the check that cosca
-//! is still there, and the supervision loop, ending with the one frame.
+//! After the answer `A`: the release pipe, the program's resolution, the clone (the spawn core's, with
+//! its status channel), the check that cosca is still there, and the supervision loop, ending with the
+//! one frame.
 
 use std::ffi::OsStr;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
@@ -12,12 +13,15 @@ use super::fds::replace_stdio;
 use super::run_loop::Loop;
 use super::signals;
 use super::{Exit, Shim};
+use crate::child::spawn::fork_exec::{Program, Spawned};
 use crate::elevation::shim::codes;
 use crate::elevation::shim::hooks::{Gate, Inject};
 use crate::elevation::shim::program_path;
 use crate::elevation::shim::protocol::{Errno, Frame, NotExecuted, ShimArgs};
 use crate::elevation::shim::step::{conclude, LoopState};
-use crate::os_process::linux::fork::{clone_with_pidfd, fails_with, fallback, fork_with_pidfd, Fork, ForkFn};
+use crate::os_process::linux::fork::{
+    clone_with_pidfd, fails_with, fallback, fork_with_pidfd, CloneKind, Fork, ForkFn,
+};
 
 /// `Inject::Clone3Enosys`: the first clone answers `ENOSYS`, as under a seccomp profile that refuses
 /// `clone3`, and the shim's fork falls back to `clone(CLONE_PIDFD)`.
@@ -25,21 +29,15 @@ use crate::os_process::linux::fork::{clone_with_pidfd, fails_with, fallback, for
 /// # Safety
 ///
 /// As [`fork_with_pidfd`].
-unsafe fn clone3_enosys() -> Result<Fork, i32> {
+unsafe fn clone3_enosys(kind: CloneKind) -> Result<Fork, i32> {
     // SAFETY: the caller's contract.
-    unsafe { fallback(|| fails_with(libc::ENOSYS), clone_with_pidfd) }
+    unsafe { fallback(|_| fails_with(libc::ENOSYS), clone_with_pidfd, kind) }
 }
 
 /// A pipe, both ends close-on-exec.
 fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     let (reader, writer) = std::io::pipe()?;
     Ok((reader.into(), writer.into()))
-}
-
-fn nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
-    let flags = rustix::fs::fcntl_getfl(fd)?;
-    rustix::fs::fcntl_setfl(fd, flags | OFlags::NONBLOCK)?;
-    Ok(())
 }
 
 /// A host thread of the shim that reaps with `waitpid(-1)` once released (a test hook): `go` releases
@@ -89,18 +87,15 @@ fn open_failure(path: &std::path::Path) -> OwnedFd {
 pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &OwnedFd) -> Result<i32, Exit> {
     let saved_mask = signals::block_all();
     let inherited = shim.inherited.take().expect("the signals are caught before hello");
-    // The status pipe: the child's report of an `exec` failure, or of a termination before it. And
-    // the release pipe, which holds the child until cosca has been seen alive after the clone.
+    // The release pipe, which holds the child until cosca has been seen alive after the clone. The
+    // child's report of an `exec` failure, or of a termination before it, is the core's status channel.
     let pipes = (|| -> std::io::Result<_> {
         if shim.injected(Inject::PipeFails) {
             return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
         }
-        let status = pipe()?;
-        let release = pipe()?;
-        nonblocking(&status.0)?;
-        Ok((status, release))
+        pipe()
     })();
-    let ((status_rx, status_tx), (release_rx, release_tx)) = match pipes {
+    let (release_rx, release_tx) = match pipes {
         Ok(pipes) => pipes,
         Err(e) => {
             return Err(shim.not_executed(
@@ -125,14 +120,12 @@ pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &Owne
     let argv: Vec<&OsStr> = std::iter::once(args.program.as_os_str())
         .chain(args.args.iter().map(|a| a.as_os_str()))
         .collect();
+    let program =
+        Program::new(&candidates, &argv, std::env::vars_os()).expect("argv carries no NUL: ShimArgs::parse checked");
     let gate_path = shim.hooks.and_then(|h| h.child_gate());
     let prepared = Prepared::new(
-        &candidates,
-        &argv,
-        std::env::vars_os(),
         inherited,
         saved_mask,
-        (status_rx.as_raw_fd(), status_tx.as_raw_fd()),
         (release_rx.as_raw_fd(), release_tx.as_raw_fd()),
         shim.log.fd(),
         gate_path.as_deref().map(|p| p.as_os_str()),
@@ -156,7 +149,7 @@ pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &Owne
 
     shim.gate(Gate::BeforeClone);
     let fork: ForkFn = if shim.injected(Inject::ForkFails) {
-        || fails_with(libc::EAGAIN)
+        |_| fails_with(libc::EAGAIN)
     } else if shim.injected(Inject::Clone3Enosys) {
         clone3_enosys
     } else {
@@ -164,16 +157,17 @@ pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &Owne
     };
     let spawned = {
         let _lock = crate::child::spawn::spawn_lock();
-        child::spawn(&prepared, fork)
+        child::spawn(&prepared, &program, fork)
     };
-    let child = match spawned {
-        Ok(child) => child,
-        Err(errno) => {
+    let Spawned { child, mut status } = match spawned {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let (report, what, errno) = child::not_spawned(error);
             let e = std::io::Error::from_raw_os_error(errno);
-            return Err(shim.not_executed(NotExecuted::ForkFailed(Errno(errno)), "fork", &e));
+            return Err(shim.not_executed(report, what, &e));
         }
     };
-    drop((status_tx, release_rx));
+    drop(release_rx);
     shim.log
         .line(format_args!("forked child pid={} via {:?}", child.pid, child.path));
     // The child has its own copy of the blocked mask, and keeps it until its handlers are set up. The
@@ -210,7 +204,7 @@ pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &Owne
         owner: owner.as_fd(),
         child: &child,
         wake: shim.wake().rx.as_fd(),
-        status: status_rx.as_fd(),
+        status: &mut status,
         failure,
         host_reap_done: reaper.as_ref().map(|r| r.done.as_fd()),
         state,

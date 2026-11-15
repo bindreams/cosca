@@ -45,11 +45,38 @@ pub(crate) enum Fork {
     Parent(NewChild),
 }
 
+/// How the child is cloned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloneKind {
+    /// The parent is suspended until the child's `execve` or exit, as `vfork` does, but the child has
+    /// an address space of its own (no `CLONE_VM`). The child must never wait on the parent: the
+    /// parent is not running, so it would wait for ever.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the kind of a spawn that waits for the exec; the shim spawns Plain"
+        )
+    )]
+    Vfork,
+    /// The parent runs on. The child may wait on the parent.
+    Plain,
+}
+
+impl CloneKind {
+    fn flags(self) -> u64 {
+        match self {
+            CloneKind::Vfork => CLONE_VFORK,
+            CloneKind::Plain => 0,
+        }
+    }
+}
+
 /// A fork: [`fork_with_pidfd`], or a stand-in for it.
-pub(crate) type ForkFn = unsafe fn() -> Result<Fork, i32>;
+pub(crate) type ForkFn = unsafe fn(CloneKind) -> Result<Fork, i32>;
 
 /// A fork the kernel refused with `errno`: no child was made. The stand-in a test or an injected fault
-/// puts in a [`ForkFn`]'s place, as `|| fails_with(libc::EAGAIN)`.
+/// puts in a [`ForkFn`]'s place, as `|_| fails_with(libc::EAGAIN)`.
 pub(crate) fn fails_with(errno: i32) -> Result<Fork, i32> {
     Err(errno)
 }
@@ -69,10 +96,12 @@ struct CloneArgs {
 }
 
 const CLONE_PIDFD: u64 = 0x1000;
+const CLONE_VFORK: u64 = 0x4000;
 
-/// Forks this process, as `fork` does, and hands the parent a pidfd for the child. `Err` is the
-/// errno, and no child was made. Allocates and logs nothing, in either process: [`NewChild::path`]
-/// says which clone ran, for the parent to log.
+/// Forks this process, as `fork` does, and hands the parent a pidfd for the child. `kind` says whether
+/// the parent is suspended until the child's `execve` or exit. `Err` is the errno, and no child was
+/// made. Allocates and logs nothing, in either process: [`NewChild::path`] says which clone ran, for
+/// the parent to log.
 ///
 /// `clone3` is tried first, and `clone(CLONE_PIDFD)` replaces it where its errno is a refusal: `ENOSYS`
 /// (the kernel lacks `clone3`, or Docker's default seccomp profile refuses it) or `EPERM` (a seccomp
@@ -94,10 +123,13 @@ const CLONE_PIDFD: u64 = 0x1000;
 /// does not exist in the child may have held, and block for ever. A grandchild is made by this
 /// function, which logs and allocates nothing, so it is itself safe to call in such a child.
 ///
+/// With [`CloneKind::Vfork`] the parent does not return until the child has made its `execve`, or has
+/// exited, and the child must not hold it up in any other way.
+///
 /// [`spawn_lock`]: crate::child::spawn::spawn_lock
-pub(crate) unsafe fn fork_with_pidfd() -> Result<Fork, i32> {
+pub(crate) unsafe fn fork_with_pidfd(kind: CloneKind) -> Result<Fork, i32> {
     // SAFETY: the caller's contract.
-    unsafe { fallback(clone3_with_pidfd, clone_with_pidfd) }
+    unsafe { fallback(clone3_with_pidfd, clone_with_pidfd, kind) }
 }
 
 /// `first`, and `second` where `first`'s errno is `ENOSYS` or `EPERM`, a refusal that made no child.
@@ -105,11 +137,11 @@ pub(crate) unsafe fn fork_with_pidfd() -> Result<Fork, i32> {
 /// # Safety
 ///
 /// As [`fork_with_pidfd`].
-pub(crate) unsafe fn fallback(first: ForkFn, second: ForkFn) -> Result<Fork, i32> {
+pub(crate) unsafe fn fallback(first: ForkFn, second: ForkFn, kind: CloneKind) -> Result<Fork, i32> {
     // SAFETY: the caller's contract.
-    match unsafe { first() } {
+    match unsafe { first(kind) } {
         // SAFETY: the caller's contract; `first` made no child.
-        Err(libc::ENOSYS | libc::EPERM) => unsafe { second() },
+        Err(libc::ENOSYS | libc::EPERM) => unsafe { second(kind) },
         forked => forked,
     }
 }
@@ -119,11 +151,11 @@ pub(crate) unsafe fn fallback(first: ForkFn, second: ForkFn) -> Result<Fork, i32
 /// # Safety
 ///
 /// As [`fork_with_pidfd`].
-unsafe fn clone3_with_pidfd() -> Result<Fork, i32> {
+unsafe fn clone3_with_pidfd(kind: CloneKind) -> Result<Fork, i32> {
     debug_assert_locked();
     let mut pidfd: libc::c_int = -1;
     let args = CloneArgs {
-        flags: CLONE_PIDFD,
+        flags: CLONE_PIDFD | kind.flags(),
         pidfd: (&mut pidfd as *mut libc::c_int) as u64,
         exit_signal: libc::SIGCHLD as u64,
         ..CloneArgs::default()
@@ -139,10 +171,10 @@ unsafe fn clone3_with_pidfd() -> Result<Fork, i32> {
 /// # Safety
 ///
 /// As [`fork_with_pidfd`].
-pub(crate) unsafe fn clone_with_pidfd() -> Result<Fork, i32> {
+pub(crate) unsafe fn clone_with_pidfd(kind: CloneKind) -> Result<Fork, i32> {
     debug_assert_locked();
     let mut pidfd: libc::c_int = -1;
-    let flags = CLONE_PIDFD | libc::SIGCHLD as u64;
+    let flags = CLONE_PIDFD | kind.flags() | libc::SIGCHLD as u64;
     // SAFETY: the legacy `clone` with no stack, as `fork`; the pidfd is stored through the
     // `parent_tid` argument. The argument order is the architecture's.
     let pid = unsafe { raw_clone(flags, &mut pidfd) };

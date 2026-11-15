@@ -11,7 +11,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use crate::child::spawn::{spawn_lock, SpawnLockGuard};
 use crate::containment::cgroup::test_support::{close_range_except, fork_running_locked, KillOnDrop};
 use crate::identity::ProcessId;
-use crate::os_process::linux::fork::{fork_with_pidfd, Fork};
+use crate::os_process::linux::fork::{fork_with_pidfd, CloneKind, Fork};
 
 // Child exit codes ====================================================================
 
@@ -356,7 +356,7 @@ pub(super) fn try_build_reaped_pgid_leader() -> Result<(ProcessId, ReapedLeaderF
         // thread absent from L may have held: L would block for ever. `fork_with_pidfd` takes none.
         // L's copy of this thread's `spawn_lock` state says held, as the primitive requires, and M
         // runs raw system calls only.
-        let m = unsafe { fork_with_pidfd() };
+        let m = unsafe { fork_with_pidfd(CloneKind::Plain) };
         let Ok(m) = m else {
             exit_child(ChildStep::ForkM.exit_code());
         };

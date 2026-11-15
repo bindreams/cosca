@@ -1,28 +1,28 @@
 //! Creating the program's process, Linux.
 //!
-//! The child is made by [`fork_with_pidfd`](crate::os_process::linux::fork::fork_with_pidfd); every
-//! signal and reap afterwards goes through its pidfd.
+//! The child is made by the spawn core ([`fork_exec`](crate::child::spawn::fork_exec)), on
+//! [`fork_with_pidfd`](crate::os_process::linux::fork::fork_with_pidfd); every signal and reap
+//! afterwards goes through its pidfd. The clone is [`CloneKind::Plain`]: the child waits on the shim
+//! (the release pipe below), which a vfork child must never do.
 //!
-//! **The child makes raw system calls only, from the clone to `execve`.** Any host thread may hold a
-//! lock at that instant, and a raw clone runs no atfork handlers, so the child allocates nothing,
-//! formats nothing, calls no `getenv`, no std I/O and nothing that reads libc's cached thread id
-//! (`raise`, `abort`, `pthread_*`), and it neither panics nor debug-asserts. Everything it uses is
-//! prepared before the clone: [`Prepared`].
+//! **The child makes raw system calls only, from the clone to `execve`.** The core's contract
+//! binds [`steps`]: it allocates nothing, formats nothing, calls no `getenv`, no std I/O and nothing
+//! that reads libc's cached thread id (`raise`, `abort`, `pthread_*`), and it neither panics nor
+//! debug-asserts. Everything it uses is prepared before the clone: [`Prepared`].
 //!
 //! The child is held before it arms anything: after its handlers are set up it blocks reading the
 //! release pipe, and the shim lets it go only once it has checked, with the child already created,
 //! that cosca is still there. A shim that died instead closes the pipe the same way, and the child
 //! finds that out when it arms `PDEATHSIG` and looks at its parent.
 
-use std::ffi::{CString, OsStr, OsString};
 use std::os::fd::RawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use super::signals::{Inherited, FAULTS, TERMINATIONS};
-use crate::elevation::shim::protocol::{Errno, Frame, NotExecuted};
+use crate::child::spawn::fork_exec::{self, Failure, Program, SpawnError, Spawned, StepFailure};
+use crate::elevation::shim::protocol::{Errno, NotExecuted, Signal};
 use crate::elevation::shim::step::ToChild;
-use crate::os_process::linux::fork::{Fork, ForkFn, NewChild};
+use crate::os_process::linux::fork::{CloneKind, ForkFn, NewChild};
 
 /// A termination that reached the child before its `exec` (the first one).
 static TERMINATED: AtomicI32 = AtomicI32::new(0);
@@ -37,88 +37,37 @@ extern "C" fn nothing(_: libc::c_int) {}
 const LOG_AT_GATE: &[u8] = b"child: waiting at gate (handlers ready)\n";
 const LOG_NO_PARENT: &[u8] = b"child: the shim is gone before exec; exit 119\n";
 
-/// What the child needs, built before the clone.
+/// What the child's steps need, built before the clone.
 pub(in crate::elevation::shim) struct Prepared {
-    /// Every candidate path, in the order the child tries them.
-    candidates: Vec<*const libc::c_char>,
-    argv: Vec<*const libc::c_char>,
-    envp: Vec<*const libc::c_char>,
-    /// For each candidate, `/bin/sh <candidate> <args…>`, for a program `execve` refuses with `ENOEXEC`.
-    sh_argvs: Vec<Vec<*const libc::c_char>>,
-    /// Keep the strings the pointers above point into alive.
-    _strings: Vec<CString>,
     max_signal: libc::c_int,
     ignored: *const bool,
     handleable: *const bool,
-    inherited: Inherited,
+    // Keeps the tables `ignored` and `handleable` point into alive.
+    _inherited: Inherited,
     saved_mask: libc::sigset_t,
     all_signals: libc::sigset_t,
     shim_pid: libc::pid_t,
-    status_read: RawFd,
-    status_write: RawFd,
     /// The release pipe: the child reads, the shim closes its end to let the child go.
     release_read: RawFd,
     release_write: RawFd,
     log_fd: RawFd,
-    gate: Option<CString>,
+    gate: Option<std::ffi::CString>,
     fault: bool,
     /// The signal the child asks to receive when the shim dies: `SIGKILL`.
     parent_death_signal: libc::c_ulong,
 }
 
-const SH: &[u8] = b"/bin/sh\0";
-
 impl Prepared {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the child's whole world, gathered once before the clone"
-    )]
     pub(in crate::elevation::shim) fn new(
-        candidates: &[OsString],
-        argv: &[&OsStr],
-        env: impl Iterator<Item = (OsString, OsString)>,
         inherited: Inherited,
         saved_mask: libc::sigset_t,
-        status: (RawFd, RawFd),
         release: (RawFd, RawFd),
         log_fd: Option<RawFd>,
-        gate: Option<&OsStr>,
+        gate: Option<&std::ffi::OsStr>,
         fault: bool,
         setup_fails: bool,
     ) -> Prepared {
-        let cstring = |s: &OsStr| CString::new(s.as_bytes()).expect("argv carries no NUL: ShimArgs::parse checked");
-        let candidate_c: Vec<CString> = candidates.iter().map(|c| cstring(c)).collect();
-        let argv_c: Vec<CString> = argv.iter().map(|a| cstring(a)).collect();
-        let env_c: Vec<CString> = env
-            .map(|(mut k, v)| {
-                k.push("=");
-                k.push(v);
-                cstring(&k)
-            })
-            .collect();
-        let sh = CString::from_vec_with_nul(SH.to_vec()).expect("a literal with its NUL");
-        let ptrs = |list: &[&CString]| -> Vec<*const libc::c_char> {
-            list.iter()
-                .map(|s| s.as_ptr())
-                .chain(std::iter::once(std::ptr::null()))
-                .collect()
-        };
-        let argv_ptrs = ptrs(&argv_c.iter().collect::<Vec<_>>());
-        let envp = ptrs(&env_c.iter().collect::<Vec<_>>());
-        // `sh <candidate> <args…>`: the candidate takes the place of `argv[0]`.
-        let sh_argvs = candidate_c
-            .iter()
-            .map(|candidate| {
-                let mut list: Vec<&CString> = vec![&sh, candidate];
-                list.extend(argv_c.iter().skip(1));
-                ptrs(&list)
-            })
-            .collect();
-        let candidate_ptrs = candidate_c.iter().map(|c| c.as_ptr()).collect();
-        let mut strings = candidate_c;
-        strings.extend(argv_c);
-        strings.extend(env_c);
-        strings.push(sh);
+        use std::os::unix::ffi::OsStrExt;
         // SAFETY: an all-zero set is a valid out-parameter; `sigfillset` initialises it.
         let all_signals = unsafe {
             let mut all: libc::sigset_t = std::mem::zeroed();
@@ -126,24 +75,17 @@ impl Prepared {
             all
         };
         Prepared {
-            candidates: candidate_ptrs,
-            argv: argv_ptrs,
-            envp,
-            sh_argvs,
-            _strings: strings,
             max_signal: inherited.max,
             ignored: inherited.ignored_ptr(),
             handleable: inherited.handleable_ptr(),
-            inherited,
+            _inherited: inherited,
             saved_mask,
             all_signals,
             shim_pid: rustix::process::getpid().as_raw_nonzero().get(),
-            status_read: status.0,
-            status_write: status.1,
             release_read: release.0,
             release_write: release.1,
             log_fd: log_fd.unwrap_or(-1),
-            gate: gate.map(cstring),
+            gate: gate.map(|g| std::ffi::CString::new(g.as_bytes()).expect("a gate path carries no NUL")),
             fault,
             // A test seam makes the request fail, as the kernel would refuse a signal it has not got.
             parent_death_signal: if setup_fails {
@@ -155,73 +97,92 @@ impl Prepared {
     }
 }
 
-/// Creates the child with `fork`: `fork_with_pidfd`, or the clone a test injects in its place. The
-/// caller holds `spawn_lock`. `Err` is the errno, and the program never ran.
-pub(in crate::elevation::shim) fn spawn(prepared: &Prepared, fork: ForkFn) -> Result<NewChild, i32> {
-    // SAFETY: the caller holds `spawn_lock`, and the child runs `child_body`, raw system calls only,
-    // which ends in `execve` or `_exit`.
-    match unsafe { fork() }? {
-        // SAFETY: this is the child, and `prepared` was built for it.
-        Fork::Child => unsafe { child_body(prepared) },
-        Fork::Parent(child) => Ok(child),
-    }
-}
-
-/// The kinds of `F` frame the child reports, as the protocol numbers them.
-const KIND_EXEC: u16 = 2;
-const KIND_SETUP: u16 = 3;
-const KIND_TERMINATED: u16 = 4;
-
-/// The `F` payload as the status pipe carries it: the frame's little-endian value.
-fn status_value(kind: u16, value: i32) -> i32 {
-    i32::from(kind) << 16 | value & 0xffff
-}
-
-/// What the child wrote to the status pipe, as a [`NotExecuted`].
-pub(in crate::elevation::shim) fn decode_report(value: i32) -> NotExecuted {
-    let mut bytes = vec![b'F'];
-    bytes.extend_from_slice(&value.to_le_bytes());
-    match crate::elevation::shim::protocol::decode_frame(&bytes) {
-        Ok(Frame::NotExecuted(report)) => report,
-        other => {
-            debug_assert!(false, "the child wrote a value no F frame has: {other:?}");
-            NotExecuted::ExecFailed(Errno(libc::EIO))
-        }
-    }
-}
-
-/// Reports that the child could not set itself up, and ends it. The program never runs.
-///
-/// # Safety
-///
-/// Called only in the child of a raw clone.
-unsafe fn fail_setup(p: &Prepared, errno: libc::c_int) -> ! {
-    let value = status_value(KIND_SETUP, errno);
-    // SAFETY: raw system calls on valid arguments.
+/// Creates the child with the core, by `fork`. The caller holds `spawn_lock`. `Err` means the program never ran.
+pub(in crate::elevation::shim) fn spawn(
+    prepared: &Prepared,
+    program: &Program,
+    fork: ForkFn,
+) -> Result<Spawned, SpawnError> {
+    // SAFETY: the caller holds `spawn_lock`, and `steps` makes raw system calls only; it runs in the
+    // child, for which `prepared` was built.
     unsafe {
-        libc::write(p.status_write, (&value as *const i32).cast(), 4);
-        libc::_exit(crate::elevation::shim::codes::NOT_EXECUTED)
+        fork_exec::spawn(
+            CloneKind::Plain,
+            fork,
+            program,
+            &|| steps(prepared),
+            crate::elevation::shim::codes::NOT_EXECUTED,
+        )
     }
 }
 
-/// Whether `errno` from `execve` means the next candidate is worth trying, as glibc's `execvp` reads it.
-fn tries_the_next(errno: libc::c_int) -> bool {
-    matches!(
-        errno,
-        libc::ENOENT | libc::ENOTDIR | libc::ESTALE | libc::ENODEV | libc::ETIMEDOUT | libc::EACCES
-    )
+/// What a spawn that made no child says: the report, what failed, and the errno.
+pub(in crate::elevation::shim) fn not_spawned(error: SpawnError) -> (NotExecuted, &'static str, i32) {
+    match error {
+        SpawnError::Pipe(errno) => (NotExecuted::SetupFailed(Errno(errno)), "cannot create a pipe", errno),
+        SpawnError::Unsupported(errno) => (
+            NotExecuted::Unsupported(Errno(errno)),
+            "the kernel cannot make a child with a pidfd",
+            errno,
+        ),
+        SpawnError::Fork(errno) => (NotExecuted::ForkFailed(Errno(errno)), "fork", errno),
+    }
 }
 
-/// Everything between the clone and `execve`. Raw system calls only.
+/// What a child that ended before its ready record says: the channel ended with no record, so no
+/// `execve` ran. `status` is its wait status, when someone reaped it. A signal is reported as the
+/// child's termination; a plain exit, or a status nobody collected, names no cause and is a setup
+/// failure with `EIO`.
+pub(in crate::elevation::shim) fn died_before_exec(status: Option<i32>) -> NotExecuted {
+    match status {
+        Some(status) if status & 0x7f != 0 => NotExecuted::TerminatedBeforeExec(Signal(status & 0x7f)),
+        _ => NotExecuted::SetupFailed(Errno(libc::EIO)),
+    }
+}
+
+/// The kinds of step failure the child reports, as the protocol numbers the `F` frames.
+const KIND_SETUP: u8 = 3;
+const KIND_TERMINATED: u8 = 4;
+
+/// What the child wrote to the status channel, as a [`NotExecuted`]. A step failure of a kind the shim
+/// never gives its child is not the child's: an error.
+pub(in crate::elevation::shim) fn not_executed(failure: Failure) -> std::io::Result<NotExecuted> {
+    Ok(match failure {
+        Failure::Exec(errno) => NotExecuted::ExecFailed(Errno(errno)),
+        Failure::Step(StepFailure {
+            kind: KIND_SETUP,
+            value,
+        }) => NotExecuted::SetupFailed(Errno(i32::from(value))),
+        Failure::Step(StepFailure {
+            kind: KIND_TERMINATED,
+            value,
+        }) => NotExecuted::TerminatedBeforeExec(Signal(i32::from(value))),
+        Failure::Step(other) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("the child failed a step no kind names: {other:?}"),
+            ));
+        }
+    })
+}
+
+/// The child could not set itself up: the program never runs.
+fn setup_failed(errno: libc::c_int) -> StepFailure {
+    StepFailure {
+        kind: KIND_SETUP,
+        value: errno as u16,
+    }
+}
+
+/// Everything between the clone and the core's `execve`. Raw system calls only.
 ///
 /// # Safety
 ///
 /// Called only in the child of a raw clone, with the `Prepared` the parent made for it.
-unsafe fn child_body(p: &Prepared) -> ! {
+unsafe fn steps(p: &Prepared) -> Result<(), StepFailure> {
     // SAFETY: the callees below are raw system calls and async-signal-safe libc wrappers on valid
     // arguments; nothing allocates.
     unsafe {
-        libc::close(p.status_read);
         libc::close(p.release_write);
         let mut record: libc::sigaction = std::mem::zeroed();
         record.sa_sigaction = record_termination as *const () as usize;
@@ -239,7 +200,7 @@ unsafe fn child_body(p: &Prepared) -> ! {
             if is_in(&FAULTS, signal) {
                 // A fault before exec kills the child; a no-op would refault for ever.
                 if libc::sigaction(signal, &default, std::ptr::null_mut()) != 0 {
-                    fail_setup(p, *libc::__errno_location());
+                    return Err(setup_failed(*libc::__errno_location()));
                 }
                 continue;
             }
@@ -249,12 +210,12 @@ unsafe fn child_body(p: &Prepared) -> ! {
             }
             let action = if is_in(&TERMINATIONS, signal) { &record } else { &noop };
             if libc::sigaction(signal, action, std::ptr::null_mut()) != 0 {
-                fail_setup(p, *libc::__errno_location());
+                return Err(setup_failed(*libc::__errno_location()));
             }
         }
         let unblocked = libc::pthread_sigmask(libc::SIG_SETMASK, &p.saved_mask, std::ptr::null_mut());
         if unblocked != 0 {
-            fail_setup(p, unblocked);
+            return Err(setup_failed(unblocked));
         }
         // Held here until the shim has checked that cosca is alive and closes its end of the pipe.
         let mut byte = 0u8;
@@ -265,7 +226,7 @@ unsafe fn child_body(p: &Prepared) -> ! {
             }
             let errno = *libc::__errno_location();
             if errno != libc::EINTR {
-                fail_setup(p, errno);
+                return Err(setup_failed(errno));
             }
         }
         libc::close(p.release_read);
@@ -283,7 +244,7 @@ unsafe fn child_body(p: &Prepared) -> ! {
             std::ptr::write_volatile(8 as *mut i32, 0);
         }
         if libc::prctl(libc::PR_SET_PDEATHSIG, p.parent_death_signal) != 0 {
-            fail_setup(p, *libc::__errno_location());
+            return Err(setup_failed(*libc::__errno_location()));
         }
         if libc::getppid() != p.shim_pid {
             write_log(p.log_fd, LOG_NO_PARENT);
@@ -291,48 +252,26 @@ unsafe fn child_body(p: &Prepared) -> ! {
         }
         let blocked = libc::pthread_sigmask(libc::SIG_BLOCK, &p.all_signals, std::ptr::null_mut());
         if blocked != 0 {
-            fail_setup(p, blocked);
+            return Err(setup_failed(blocked));
         }
         let terminated = TERMINATED.load(Ordering::Relaxed);
         if terminated != 0 {
-            let value = status_value(KIND_TERMINATED, terminated);
-            libc::write(p.status_write, (&value as *const i32).cast(), 4);
-            libc::_exit(crate::elevation::shim::codes::NOT_EXECUTED);
+            return Err(StepFailure {
+                kind: KIND_TERMINATED,
+                value: terminated as u16,
+            });
         }
         // A termination that arrives from here on ends the child by default. It is never swallowed.
         for signal in TERMINATIONS {
             if !*p.ignored.add(signal as usize) && libc::sigaction(signal, &default, std::ptr::null_mut()) != 0 {
-                fail_setup(p, *libc::__errno_location());
+                return Err(setup_failed(*libc::__errno_location()));
             }
         }
         let unblocked = libc::pthread_sigmask(libc::SIG_SETMASK, &p.saved_mask, std::ptr::null_mut());
         if unblocked != 0 {
-            fail_setup(p, unblocked);
+            return Err(setup_failed(unblocked));
         }
-        // `execvp`'s rules, over candidates the shim prepared: the next one on `ENOENT` and its kin,
-        // and on `EACCES`, which is the answer only if nothing else is; anything else ends the search.
-        let mut errno = libc::ENOENT;
-        let mut denied = false;
-        let mut stopped = false;
-        for (&candidate, sh_argv) in p.candidates.iter().zip(&p.sh_argvs) {
-            libc::execve(candidate, p.argv.as_ptr(), p.envp.as_ptr());
-            errno = *libc::__errno_location();
-            if errno == libc::ENOEXEC {
-                libc::execve(SH.as_ptr().cast(), sh_argv.as_ptr(), p.envp.as_ptr());
-                errno = *libc::__errno_location();
-            }
-            if !tries_the_next(errno) {
-                stopped = true;
-                break;
-            }
-            denied |= errno == libc::EACCES;
-        }
-        if denied && !stopped {
-            errno = libc::EACCES;
-        }
-        let value = status_value(KIND_EXEC, errno);
-        libc::write(p.status_write, (&value as *const i32).cast(), 4);
-        libc::_exit(127)
+        Ok(())
     }
 }
 

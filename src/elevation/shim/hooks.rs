@@ -53,7 +53,7 @@ impl Gate {
 pub enum Inject {
     /// The clone fails with `EAGAIN`.
     ForkFails,
-    /// Creating the status pipe fails with `EMFILE`.
+    /// Creating the release pipe fails with `EMFILE`.
     PipeFails,
     /// `clone3` answers `ENOSYS`, as Docker's default seccomp profile does.
     Clone3Enosys,

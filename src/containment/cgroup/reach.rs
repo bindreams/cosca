@@ -20,7 +20,7 @@ use crate::child::owned::teardown::Reach;
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::error::Error;
 use crate::os_process::child::{ExitRecord, PeekOutcome};
-use crate::os_process::linux::fork::{fork_with_pidfd, Fork, Path};
+use crate::os_process::linux::fork::{fork_with_pidfd, CloneKind, Fork, Path};
 use crate::signal::{Sent, Sig};
 
 /// `PIDFD_GET_INFO` for the first version of `struct pidfd_info` (`PIDFD_INFO_SIZE_VER0` bytes): `_IOWR(PIDFS_IOCTL_MAGIC
@@ -605,7 +605,7 @@ fn fork_probe(
     };
     // SAFETY: this thread holds `spawn_lock`, and the child makes only async-signal-safe calls and
     // never returns into Rust.
-    let forked = unsafe { fork_with_pidfd() }.map_err(io::Error::from_raw_os_error)?;
+    let forked = unsafe { fork_with_pidfd(CloneKind::Plain) }.map_err(io::Error::from_raw_os_error)?;
     let new = match forked {
         // SAFETY: this is the forked child.
         Fork::Child => unsafe { probe_child(proc, parent, dumpable, ends) },

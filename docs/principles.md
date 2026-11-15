@@ -201,8 +201,10 @@ process:
 
 On Linux cosca requires a pidfd for every child it spawns. When `pidfd_open` is refused (a kernel
 before 5.3, or a seccomp profile that blocks it), spawn fails with `Error::Unsupported`, and cosca
-itself never reaps by pid on Linux. macOS has no pidfd, so it reaps by pid, only while the process
-is an unreaped child. A macOS `Drop` that cannot confirm its child is ours leaks the child with a
+itself never reaps by pid on Linux. The Linux spawn core (`child::spawn::fork_exec`) takes the pidfd
+from the clone itself, and answers `Unsupported` when both `clone3` and `clone(CLONE_PIDFD)` are
+refused. macOS has no pidfd, so it reaps by pid, only while the process is an unreaped child. A
+macOS `Drop` that cannot confirm its child is ours leaks the child with a
 `warn` naming the pid; it never reaps on a guess.
 
 Where a group ID must be used (process-group or fd-marker containment), keep the root an unreaped

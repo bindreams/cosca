@@ -120,7 +120,8 @@ fn owner_exit_kills_the_program_despite_fd_copies() {
     let rig = ShimRig::new();
     let mut owner = Owner::start("plain");
     let mut run = owned_by(&rig, &owner, Spec::new("cat", &[]).stdin_held());
-    run.wait_for("program pid=");
+    // The program has exec'd: a kill before that is a death before the `execve`, not the program's status.
+    run.wait_for("status pipe: EOF");
     // A host fork without exec: the copy holds the listener and the connection.
     owner.fork_copy();
     owner.kill();

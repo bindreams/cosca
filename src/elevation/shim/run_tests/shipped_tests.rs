@@ -24,9 +24,14 @@ fn a_shipped_shim_takes_p_for_a_protocol_violation() {
     // With hooks `P` is a ping and the `T` after it ends the program with SIGTERM. Shipped, `P` is
     // a byte no cosca sends: the program is killed before the `T` that follows can end it.
     let rig = ShimRig::new();
-    let run = rig.spawn(Spec::new("cat", &[]).stdin_held().shipped());
+    let mut run = rig.spawn(Spec::sh("echo up; exec cat").stdin_held().shipped());
     rig.link.expect_event(LinkEvent::Accepted);
     rig.link.expect_event(LinkEvent::Answered(Command::Allow));
+    // A shipped shim logs nothing to wait on: the program's own first word says it has exec'd, and a
+    // kill before that would be a death before the `execve`, which is not the program's status.
+    let mut up = [0u8; 3];
+    std::io::Read::read_exact(&mut run.take_stdout(), &mut up).expect("the program's first line");
+    assert_eq!(&up, b"up\n");
     rig.link.link.send_control(b'P').unwrap();
     // The shim may already have closed the link, so `T` can be refused; the verdict is the same
     // either way. `T` stays so a shim that took `P` for a ping ends the program with SIGTERM and

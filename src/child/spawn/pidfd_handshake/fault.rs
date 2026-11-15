@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use rustix::io::Errno;
 
-use crate::os_process::linux::fork::{fork_with_pidfd, Fork};
+use crate::os_process::linux::fork::{fork_with_pidfd, CloneKind, Fork};
 
 /// What the next child does around its report.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -429,7 +429,8 @@ pub(super) fn fork_holder_if_armed() {
     let (r, w) = (release_r.as_raw_fd(), release_w.as_raw_fd());
     // SAFETY: the copy makes only async-signal-safe calls (`close`, `read`, `_exit`), and the
     // caller holds `spawn_lock`.
-    let forked = unsafe { fork_with_pidfd() }.unwrap_or_else(|errno| panic!("fork the holder: errno {errno}"));
+    let forked =
+        unsafe { fork_with_pidfd(CloneKind::Plain) }.unwrap_or_else(|errno| panic!("fork the holder: errno {errno}"));
     let new = match forked {
         // SAFETY: as above; it waits for the release end's EOF, then exits.
         Fork::Child => unsafe {

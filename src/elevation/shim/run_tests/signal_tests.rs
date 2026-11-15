@@ -66,8 +66,13 @@ fn sigint_before_exec_is_not_started() {
 #[skuld::test]
 fn unknown_control_byte_kills_and_reports_the_status() {
     let rig = ShimRig::new();
-    let mut run = rig.spawn(Spec::new("cat", &[]).stdin_held().gate(Gate::BeforeLoop));
+    let mut run = rig.spawn(Spec::sh("echo up; exec cat").stdin_held().gate(Gate::BeforeLoop));
     run.wait_for("gate: waiting at before-loop");
+    // The program's first line says it has exec'd; a kill before that would be a death before the
+    // `execve`, which is not the program's status.
+    let mut up = [0u8; 3];
+    std::io::Read::read_exact(&mut run.take_stdout(), &mut up).expect("the program's first line");
+    assert_eq!(&up, b"up\n");
     // Both bytes are queued before the loop reads either: the `X` ends the program, and a shim that
     // finished before the `P` was sent would make that send fail.
     rig.link.link.send_control(b'X').unwrap();
