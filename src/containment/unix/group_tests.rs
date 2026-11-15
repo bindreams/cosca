@@ -597,6 +597,71 @@ fn converge_sigkill_lists_through_its_kernel_and_sends_nothing_when_a_pidfd_cann
     _ = child.wait();
 }
 
+/// macOS: the `SIGKILL` resend to a member whose exit has begun (`killpg` just killed it) can be
+/// answered `EPERM` by the token send, while the member is not yet a zombie. The member is not a
+/// survivor: the group is `Cleared`, and the member is one the kill's wait goes on to wait for.
+///
+/// Mutant: the `EPERM` is surfaced raw, so the member is a confirmed survivor and the group `Refused`.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn converge_clears_a_member_whose_exit_began_when_the_resend_was_refused() {
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    await_member_ready(&mut child);
+    let pid = child.id();
+
+    let kernel = crate::identity::FakeKernel::over(&HostKernel)
+        .on_kinfo(pid, crate::identity::kinfo::kinfo_proc::of_host_with_exit(pid, true));
+    let refused = crate::signal::seams::refuse_kills();
+    let mut killed = Vec::new();
+    let state = super::converge(
+        &kernel,
+        pid as i32,
+        Signal::SIGKILL,
+        Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+        &mut killed,
+    );
+    drop(refused);
+
+    assert!(matches!(state, Ok(GroupState::Cleared)), "got {state:?}");
+    assert_eq!(killed.iter().map(|id| id.pid()).collect::<Vec<_>>(), [pid]);
+    assert!(kernel.all_rows_taken(), "the exit was read");
+    _ = child.kill();
+    _ = child.wait();
+}
+
+/// The same refusal from a member whose exit has not begun is a live refuser: the group is `Refused`.
+///
+/// Mutant: any `EPERM` from the resend is read as an exit.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn converge_refuses_a_member_whose_resend_was_refused_with_no_exit_begun() {
+    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    await_member_ready(&mut child);
+    let pid = child.id();
+
+    let kernel = crate::identity::FakeKernel::over(&HostKernel)
+        .on_kinfo(pid, crate::identity::kinfo::kinfo_proc::of_host_with_exit(pid, false));
+    let refused = crate::signal::seams::refuse_kills();
+    let mut killed = Vec::new();
+    let state = super::converge(
+        &kernel,
+        pid as i32,
+        Signal::SIGKILL,
+        Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+        &mut killed,
+    );
+    drop(refused);
+
+    assert!(
+        matches!(&state, Ok(GroupState::Refused { refused, .. }) if refused.len() == 1 && refused[0].0 == pid),
+        "got {state:?}"
+    );
+    assert!(killed.is_empty(), "nothing was delivered: {killed:?}");
+    assert!(kernel.all_rows_taken(), "the exit was read, and found running");
+    _ = child.kill();
+    _ = child.wait();
+}
+
 /// A member that is a live non-leader thread is `Unknown`, with a warn naming that cause, and is
 /// never signalled by its number (a `kill` on a tid signals its whole thread group).
 #[cfg(target_os = "linux")]

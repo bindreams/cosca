@@ -17,7 +17,10 @@ use mach2::message::audit_token_t;
 
 use super::{Exit, OsProcess, WaitFor, EXIT_CONSEQUENCE, OPEN_CONSEQUENCE};
 use crate::error::{io_context, Error};
-use crate::identity::{has_exited, uniq_info, Existence, Kernel, ProcessId, ReadPurpose, UniqInfo, UniqRead};
+use crate::identity::kinfo::ExitState;
+use crate::identity::{
+    exit_state_of, has_exited, uniq_info, Existence, Kernel, ProcessId, ReadPurpose, Resolved, UniqInfo, UniqRead,
+};
 use crate::signal::{Sent, Sig};
 use kqueue::{Kqueue, Subscription};
 
@@ -148,9 +151,15 @@ pub(crate) enum SignalByTokenOutcome {
     /// The kernel took the signal.
     Delivered,
     /// The process has exited and is not reaped: `ESRCH`, and the pid still has the same unique id
-    /// at the same `p_idversion`. Nothing was delivered. A caller that owns the child reads this as
-    /// delivered, as a zombie it owns is on Linux; a caller that holds no child reads it as gone.
+    /// at the same `p_idversion`; or a `SIGKILL` was refused with `EPERM` and the process is a
+    /// zombie. Nothing was delivered. A caller that owns the child reads this as delivered, as a
+    /// zombie it owns is on Linux; a caller that holds no child reads it as gone.
     ExitedUnreaped,
+    /// A `SIGKILL` was refused with `EPERM` and the process's exit has begun (`P_WEXIT`, with
+    /// `p_stat` not yet `SZOMB`). Nothing was delivered. The kernel answers `EPERM` to a send in that
+    /// window, so it is no refusal. Every caller reads it as delivered, a holder of no child too,
+    /// since the exit is still to come.
+    Exiting,
     /// The process is gone, or its pid names another process.
     Gone,
 }
@@ -172,7 +181,14 @@ pub(crate) fn read_version(kernel: &dyn Kernel, pid: u32, unique: u64, sig: Sig)
 /// follows the process across an `exec` and is left at the version it was last sent at. The kernel
 /// checks the pid with its `p_idversion` and signals while it holds a reference, so only the
 /// documented 2^32 version wrap can redirect it. A refused send is the bare errno, so an `EPERM`
-/// stays raw for the callers that promise it.
+/// stays raw for the callers that promise it. The one exception is a `SIGKILL` (the measured case;
+/// any other signal keeps the raw `EPERM`): a read of the process `unique` names, taken after the
+/// `EPERM`, finds how it ended:
+///
+/// - exit begun, not yet a zombie: [`SignalByTokenOutcome::Exiting`];
+/// - a zombie: [`SignalByTokenOutcome::ExitedUnreaped`], as `ESRCH` from a zombie is;
+/// - gone, or the pid names another process: [`SignalByTokenOutcome::Gone`];
+/// - still running, or the read refused: the raw `EPERM`.
 ///
 /// `pid` must be a single-process signal target. No cap on the loop: each pass past the first needs
 /// a fresh `exec` of the process.
@@ -187,7 +203,30 @@ pub(crate) fn signal_by_token(
         match send_with_token(pid, *idversion, sig) {
             Ok(()) => return Ok(SignalByTokenOutcome::Delivered),
             Err(libc::ESRCH) => {}
-            // `EPERM` and the rest are surfaced, not swallowed.
+            // `P_WEXIT` is never cleared, so an `EPERM` that came from the exit shows it at this read.
+            Err(libc::EPERM) if sig == Sig::Kill => {
+                return match exit_state_of(kernel, pid, unique, ReadPurpose::Kill) {
+                    Resolved::Found(ExitState::Exiting) => {
+                        log::debug!("{sig:?} to pid {pid}: refused with EPERM, its exit has begun");
+                        Ok(SignalByTokenOutcome::Exiting)
+                    }
+                    Resolved::Found(ExitState::Zombie) => {
+                        log::debug!("{sig:?} to pid {pid}: refused with EPERM, it has exited and is not reaped yet");
+                        Ok(SignalByTokenOutcome::ExitedUnreaped)
+                    }
+                    Resolved::Gone => {
+                        log::debug!(
+                            "{sig:?} to pid {pid}: refused with EPERM, and it is gone, or its pid names another process"
+                        );
+                        Ok(SignalByTokenOutcome::Gone)
+                    }
+                    Resolved::Unknown => {
+                        log::debug!("{sig:?} to pid {pid}: refused with EPERM, and its exit state could not be read");
+                        Err(io::Error::from_raw_os_error(libc::EPERM))
+                    }
+                    Resolved::Found(ExitState::Running) => Err(io::Error::from_raw_os_error(libc::EPERM)),
+                };
+            }
             Err(errno) => return Err(io::Error::from_raw_os_error(errno)),
         }
         // `ESRCH` is a zombie, an `exec`, or a process that is gone: read what the pid names.
@@ -221,7 +260,7 @@ impl<K: Kernel + Send> OsProcess for MacosProcess<K> {
         let outcome = signal_by_token(&self.kernel, pid, self.unique, &mut idversion, sig);
         self.idversion.store(idversion, Ordering::Relaxed);
         match outcome.map_err(Error::Io)? {
-            SignalByTokenOutcome::Delivered => Ok(Sent::Delivered),
+            SignalByTokenOutcome::Delivered | SignalByTokenOutcome::Exiting => Ok(Sent::Delivered),
             // This process holds no child: an exited process is gone to it.
             SignalByTokenOutcome::ExitedUnreaped | SignalByTokenOutcome::Gone => Ok(Sent::Gone),
         }

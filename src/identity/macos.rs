@@ -236,6 +236,37 @@ pub(crate) fn has_exited(kernel: &dyn Kernel, pid: RawPid, expected: u64, purpos
     }
 }
 
+/// How far the exit of the process whose unique id is `expected` has gone, read from its
+/// `kinfo_proc` between two unique-id reads, as in [`held_by`]. A pid that names another process now,
+/// or none, is `Gone`; a read that was refused is `Unknown`.
+///
+/// The bracket is the unique id, not [`exit_begun`]'s start key, because the token send that asks
+/// holds only the unique id.
+pub(crate) fn exit_state_of(
+    kernel: &dyn Kernel,
+    pid: RawPid,
+    expected: u64,
+    purpose: ReadPurpose,
+) -> Resolved<kinfo::ExitState> {
+    let read = short_read(kernel, pid, expected, purpose, |pid| {
+        Ok(match kinfo::kinfo(kernel, pid) {
+            Resolved::Found(info) => Resolved::Found(kinfo::exit_state(info.kp_proc.p_stat, info.kp_proc.p_flag)),
+            // Both id reads matched, so the process was in the pid hash at both ends, and a miss
+            // here is `sysctl` and `proc_pidinfo` disagreeing: nothing is known of its exit.
+            Resolved::Gone => {
+                debug_assert!(false, "pid {pid}: kinfo said gone between two matching id reads");
+                Resolved::Unknown
+            }
+            Resolved::Unknown => Resolved::Unknown,
+        })
+    });
+    match read {
+        Ok(state) => state,
+        Err(Mismatch::Other | Mismatch::Gone) => Resolved::Gone,
+        Err(Mismatch::Refused(_)) => Resolved::Unknown,
+    }
+}
+
 /// Why a [`short_read`] did not read the process it was asked for.
 enum Mismatch {
     /// The pid names another process now.

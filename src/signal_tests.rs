@@ -251,6 +251,26 @@ mod macos {
         child.wait().expect("reap");
     }
 
+    /// A child whose exit has begun and that is not yet a zombie answers the token send `EPERM`; it is
+    /// ours and on its way out, so the kill is `Delivered`, as for a zombie.
+    ///
+    /// Mutant: the `EPERM` is surfaced raw, so `Child::kill` of a child that is exiting is an error.
+    #[skuld::test]
+    fn a_child_whose_exit_began_is_delivered() {
+        let (mut child, stdin) = spawn();
+        let identity = read_identity(&HostKernel, child.id()).expect("readable");
+        let kernel = FakeKernel::over(&HostKernel).on_kinfo(
+            child.id(),
+            crate::identity::kinfo::kinfo_proc::of_host_with_exit(child.id(), true),
+        );
+        let refused = crate::signal::seams::refuse_kills();
+        let sent = via_audit_token(&kernel, child.id(), identity, Sig::Kill);
+        drop(refused);
+        assert_eq!(sent.expect("an exiting child is no refuser"), Sent::Delivered);
+        drop(stdin);
+        child.wait().expect("reap");
+    }
+
     /// Mutant: the send is not recorded, or nothing is sent.
     #[skuld::test]
     fn a_verified_live_child_is_signalled_and_recorded() {
