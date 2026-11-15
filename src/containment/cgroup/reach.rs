@@ -97,7 +97,7 @@ pub(crate) fn proc_names(
         }
         crate::identity::ProcView::Unassessable(why) => return Err(view_unreadable(pid, why)),
     };
-    let text = match read_cgroup(kernel, &proc_dir, pid) {
+    let text = match crate::identity::pid_file::read(kernel, &proc_dir, pid, "cgroup") {
         Ok(ReadOutcome::Read(bytes)) => crate::identity::utf8(bytes)?,
         Ok(ReadOutcome::Exited(e) | ReadOutcome::Hidden(e)) => return Err(Error::Io(e)),
         Ok(ReadOutcome::Refused(refusal)) => return Err(refusal.unsupported(format!("reading pid {pid}'s cgroup"))),
@@ -106,21 +106,6 @@ pub(crate) fn proc_names(
     let path = parse_v2_relative_path(&text)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no cgroup v2 `0::` line"))?;
     names_leaf(path, leaf_path, other_id, recorded).map_err(Error::Io)
-}
-
-/// `pid`'s cgroup file through [`pid_file::read`](crate::identity::pid_file::read). A test build
-/// reads through the one kernel that [`fault::hidden_cgroup_of`](super::fault::hidden_cgroup_of) makes
-/// of an armed hook, which hides the file as `hidepid` does.
-fn read_cgroup(
-    kernel: &dyn crate::identity::Kernel,
-    dir: &crate::identity::ProcDir,
-    pid: u32,
-) -> Result<crate::identity::pid_file::ReadOutcome, crate::identity::pid_file::Unreadable> {
-    #[cfg(test)]
-    if let Some(hiding) = super::fault::hidden_cgroup_of(kernel, pid) {
-        return crate::identity::pid_file::read(&hiding, dir, pid, "cgroup");
-    }
-    crate::identity::pid_file::read(kernel, dir, pid, "cgroup")
 }
 
 /// The error of reading `pid`'s cgroup through a `/proc` view that could not be established, `why`:
@@ -1037,7 +1022,7 @@ fn untraceable_cgroup_readable(kernel: &crate::identity::SpawnKernel) -> Result<
             use crate::identity::pid_file::ReadOutcome;
 
             let child = u32::try_from(pid).expect("a forked child's pid is positive");
-            let read = match read_cgroup(&**kernel, &proc_dir, child) {
+            let read = match crate::identity::pid_file::read(&**kernel, &proc_dir, child, "cgroup") {
                 Ok(ReadOutcome::Read(bytes)) => crate::identity::utf8(bytes).map(drop).map_err(Unreadable::Probe),
                 Ok(ReadOutcome::Hidden(e)) => Err(Unreadable::Hidden(e)),
                 Ok(ReadOutcome::Exited(e)) => Err(Unreadable::Probe(e)),

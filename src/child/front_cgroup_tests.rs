@@ -21,13 +21,14 @@ use std::sync::Arc;
 
 use crate::child::front_kill_tests::{
     assert_ends_unsignalled, assert_reaped_unsignalled, assert_refused_by, assert_unkillable_front, cat, spawn_as,
-    sudo_report,
+    spawn_as_over, sudo_report,
 };
 use crate::child::owned::owned_tests::teardown::{fire_on_block, slow_warns_during};
 use crate::child::owned::seams::record_root_teardowns;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::command::Command;
 use crate::elevation::{Backend, ElevatedVia};
+use crate::identity::{FakeKernel, HostKernel};
 use crate::os_process::fake::ReapAnswer;
 use crate::test_groups::{cgroup, pidfd_get_info, Group};
 use crate::{ContainMode, Containment, Stdio};
@@ -1061,7 +1062,7 @@ pub(crate) enum LeafKill {
     /// The front is moved out of its leaf before the leaf's kill, as pam_systemd moves sudo.
     MissesMovedFront,
     /// The front is moved into a cgroup nested under its leaf, which the leaf's kill reaches, and
-    /// `/proc` hides it (`hidepid`).
+    /// `/proc` hides it (`hidepid`): the spawn runs over a kernel that hides every task's cgroup.
     LandsNestedHidden,
     /// The leaf's kill lands on the front, whose place is read through `/proc` alone (no
     /// `PIDFD_GET_INFO`): once the leaf is removed, `/proc` names it with ` (deleted)`.
@@ -1083,13 +1084,11 @@ pub(crate) struct HeldFailure {
     pub(crate) stdin: std::rc::Rc<std::cell::RefCell<Option<PipeWriter>>>,
 }
 
-/// Spawns of a contained `cat` marked as a `sudo` front, through `spawn`, that fail after their
-/// fork: once in the attach, once in the identity check, with the leaf's kill meeting the front
-/// as `kill` says.
-pub(crate) fn failed_held_front_spawns(
-    kill: LeafKill,
-    spawn: impl Fn(&mut Command) -> Result<(), crate::error::Error>,
-) -> [HeldFailure; 2] {
+/// Spawns of a contained `cat` marked as a `sudo` front that fail after their fork: once in the
+/// attach, once in the identity check, with the leaf's kill meeting the front as `kill` says. The
+/// spawn is over a hidden `/proc` ([`spawn_under_hidepid`]) exactly when `kill` says the front is
+/// hidden.
+pub(crate) fn failed_held_front_spawns(kill: LeafKill) -> [HeldFailure; 2] {
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -1161,11 +1160,13 @@ pub(crate) fn failed_held_front_spawns(
         });
         let _missing = matches!(kill, LeafKill::LandsReadThroughProc | LeafKill::MissesIntoNamesake)
             .then(crate::containment::cgroup::fault::miss_pidfd_info);
-        let _hidden = (kill == LeafKill::LandsNestedHidden).then(crate::containment::cgroup::fault::hide_proc);
         let _failing = (kill == LeafKill::Fails)
             .then(|| crate::containment::cgroup::fault::fail_kill_writes_releasing_at_wait(release_front()));
         force_arm(true);
-        let result = spawn(&mut cmd);
+        let result = match kill {
+            LeafKill::LandsNestedHidden => spawn_under_hidepid(&mut cmd),
+            _ => cmd.spawn().map(drop),
+        };
         force_arm(false);
         if let Some(released) = &released_by_the_leaf {
             released.assert_killed();
@@ -1275,7 +1276,7 @@ pub(crate) fn assert_left_running(kill: LeafKill, failures: [HeldFailure; 2], ha
 /// would have returned anyway. The front's stdin stays open, so only the kill ends it.
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
-    let failures = failed_held_front_spawns(LeafKill::Lands, |cmd| cmd.spawn().map(drop));
+    let failures = failed_held_front_spawns(LeafKill::Lands);
     assert_killed_by_the_leaf(&failures);
 }
 
@@ -1284,7 +1285,7 @@ fn cgroup_a_failed_spawn_kills_a_contained_front_and_reaps_it(#[fixture(cgroup)]
 /// removal answers.
 #[skuld::test]
 fn cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it(#[fixture(cgroup)] _group: &Group) {
-    let failures = failed_held_front_spawns(LeafKill::LandsReadThroughProc, |cmd| cmd.spawn().map(drop));
+    let failures = failed_held_front_spawns(LeafKill::LandsReadThroughProc);
     assert_killed_by_the_leaf(&failures);
 }
 
@@ -1296,7 +1297,7 @@ fn cgroup_a_failed_spawn_kills_a_front_read_through_proc_and_reaps_it(#[fixture(
 #[skuld::test]
 fn cgroup_a_failed_spawn_hands_back_a_front_in_a_namesake_of_its_leaf(#[fixture(cgroup)] _group: &Group) {
     let kill = LeafKill::MissesIntoNamesake;
-    assert_left_running(kill, failed_held_front_spawns(kill, |cmd| cmd.spawn().map(drop)), true);
+    assert_left_running(kill, failed_held_front_spawns(kill), true);
 }
 
 /// A failed spawn whose leaf's kill fails hands back its front, running: in its leaf, but reached by
@@ -1304,7 +1305,7 @@ fn cgroup_a_failed_spawn_hands_back_a_front_in_a_namesake_of_its_leaf(#[fixture(
 #[skuld::test]
 fn cgroup_a_failed_spawn_whose_leaf_kill_fails_hands_back_the_front(#[fixture(cgroup)] _group: &Group) {
     let kill = LeafKill::Fails;
-    assert_left_running(kill, failed_held_front_spawns(kill, |cmd| cmd.spawn().map(drop)), true);
+    assert_left_running(kill, failed_held_front_spawns(kill), true);
 }
 
 /// A failed spawn whose front was moved out of its leaf hands it back, running: the leaf's kill did
@@ -1312,7 +1313,7 @@ fn cgroup_a_failed_spawn_whose_leaf_kill_fails_hands_back_the_front(#[fixture(cg
 #[skuld::test]
 fn cgroup_a_failed_spawn_hands_back_a_front_moved_out_of_its_leaf(#[fixture(cgroup)] _group: &Group) {
     let kill = LeafKill::MissesMovedFront;
-    assert_left_running(kill, failed_held_front_spawns(kill, |cmd| cmd.spawn().map(drop)), true);
+    assert_left_running(kill, failed_held_front_spawns(kill), true);
 }
 
 /// A contained front that outlives the grace is killed through its cgroup alone. Its `cat` ignores
@@ -1458,16 +1459,16 @@ fn cgroup_a_killed_front_is_placed_in_its_leaf_by_its_pidfd(
     #[fixture(cgroup)] _group: &Group,
     #[fixture(pidfd_get_info)] _info: &Group,
 ) {
-    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
+    let (child, stdin) = spawn_as_over(in_cgroup(cat()), SUDO, Arc::clone(&kernel));
     let pid = child.pid();
     let release = release_after_cgroup_kill(stdin);
     release.observe(pid);
     child.tree.kill(None).outcome().into_result().expect("cgroup.kill");
     release.assert_killed();
     crate::test_child::wait_until_zombie(pid);
-    let hidden = crate::containment::cgroup::fault::hide_proc();
+    let _hidden = kernel.hide_every_pid_cgroup();
     let names = child.tree.would_reach(pid, child.proc.pidfd());
-    drop(hidden);
     assert!(
         names.expect("PIDFD_GET_INFO reads the place with /proc hidden"),
         "a killed front stays in its leaf"
@@ -1532,12 +1533,12 @@ fn cgroup_a_moved_front_is_placed_outside_its_leaf_by_its_pidfd(
     #[fixture(cgroup)] _group: &Group,
     #[fixture(pidfd_get_info)] _info: &Group,
 ) {
-    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
+    let (child, _stdin) = spawn_as_over(in_cgroup(cat()), SUDO, Arc::clone(&kernel));
     let pid = child.pid();
     move_out_of_its_leaf(pid);
-    let hidden = crate::containment::cgroup::fault::hide_proc();
+    let _hidden = kernel.hide_every_pid_cgroup();
     let names = child.tree.would_reach(pid, child.proc.pidfd());
-    drop(hidden);
     assert!(
         !names.expect("PIDFD_GET_INFO reads the place with /proc hidden"),
         "a moved front is outside its leaf"
@@ -1552,15 +1553,14 @@ fn cgroup_a_front_under_its_leaf_is_placed_by_its_path_and_unplaced_when_proc_hi
 ) {
     // Held first, so that on a kernel with `PIDFD_GET_INFO` too the place is read through `/proc`.
     let _missing = crate::containment::cgroup::fault::miss_pidfd_info();
-    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
+    let (child, _stdin) = spawn_as_over(in_cgroup(cat()), SUDO, Arc::clone(&kernel));
     let pid = child.pid();
     move_under_its_leaf(pid);
     let names = || child.tree.would_reach(pid, child.proc.pidfd());
     assert!(names().expect("/proc is readable here"));
-    {
-        let _hidden = crate::containment::cgroup::fault::hide_proc();
-        names().expect_err("a hidden path places nothing");
-    }
+    let _hidden = kernel.hide_every_pid_cgroup();
+    names().expect_err("a hidden path places nothing");
     // The child's drop kills the leaf, then removes `a/b`, `a` and the leaf.
 }
 
@@ -1571,10 +1571,11 @@ fn cgroup_a_front_under_its_leaf_is_placed_by_the_walk(
     #[fixture(cgroup)] _group: &Group,
     #[fixture(pidfd_get_info)] _info: &Group,
 ) {
-    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
+    let (child, _stdin) = spawn_as_over(in_cgroup(cat()), SUDO, Arc::clone(&kernel));
     let pid = child.pid();
     move_under_its_leaf(pid);
-    let _hidden = crate::containment::cgroup::fault::hide_proc();
+    let _hidden = kernel.hide_every_pid_cgroup();
     assert!(
         child
             .tree
@@ -1592,10 +1593,11 @@ fn cgroup_a_front_nested_under_its_leaf_is_killed_under_hidepid(
     #[fixture(cgroup)] _group: &Group,
     #[fixture(pidfd_get_info)] _info: &Group,
 ) {
-    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
+    let (child, stdin) = spawn_as_over(in_cgroup(cat()), SUDO, Arc::clone(&kernel));
     move_under_its_leaf(child.pid());
     {
-        let _hidden = crate::containment::cgroup::fault::hide_proc();
+        let _hidden = kernel.hide_every_pid_cgroup();
         child.kill().expect("the leaf's kill reaches a front nested under it");
     }
     // Closed first: a front nothing killed then exits 0, and the assertion fails.
@@ -1616,7 +1618,7 @@ fn cgroup_a_failed_spawn_kills_a_front_nested_under_its_leaf_under_hidepid(
     #[fixture(cgroup)] _group: &Group,
     #[fixture(pidfd_get_info)] _info: &Group,
 ) {
-    let failures = failed_held_front_spawns(LeafKill::LandsNestedHidden, |cmd| cmd.spawn().map(drop));
+    let failures = failed_held_front_spawns(LeafKill::LandsNestedHidden);
     assert_killed_by_the_leaf(&failures);
 }
 
@@ -1783,6 +1785,11 @@ pub(crate) fn spawn_front_noting_fork<T>(
     (result, pid.get())
 }
 
+/// Spawns `cmd` over a kernel whose `/proc` hides every task's cgroup (`FakeKernel::hidepid`).
+fn spawn_under_hidepid(cmd: &mut Command) -> Result<(), crate::error::Error> {
+    Ok(crate::child::spawn::spawn_with(cmd, FakeKernel::hidepid(&HostKernel)).map(drop)?)
+}
+
 /// `result` is the refusal of a host that cannot place a front, naming `hidepid`, and nothing was
 /// forked for it: no front exists to kill, wait for or leave.
 #[track_caller]
@@ -1814,12 +1821,11 @@ pub(crate) fn assert_refused_unforked_naming<T: std::fmt::Debug>(
 #[skuld::test]
 fn cgroup_an_unplaceable_front_is_refused_before_its_fork(#[fixture(cgroup)] _group: &Group) {
     let _missing = crate::containment::cgroup::fault::miss_pidfd_info();
-    let _hidden = crate::containment::cgroup::fault::hide_proc();
     let _failing = crate::containment::cgroup::fault::fail_kill_writes();
     let mut cmd = in_cgroup(cat());
     cmd.kill_on_drop(true);
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
-    let (result, forked) = spawn_front_noting_fork(cmd, |cmd| cmd.spawn().map(drop));
+    let (result, forked) = spawn_front_noting_fork(cmd, spawn_under_hidepid);
     assert_refused_unforked(result, forked);
 }
 
@@ -1850,11 +1856,10 @@ fn cgroup_an_unplaceable_front_is_refused_before_its_fork_with_fds_0_and_1_close
         return;
     };
     let _missing = crate::containment::cgroup::fault::miss_pidfd_info();
-    let _hidden = crate::containment::cgroup::fault::hide_proc();
     let mut cmd = in_cgroup(cat());
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     let restore = RestoreStdio::close(&done, &[0, 1]);
-    let (result, forked) = spawn_front_noting_fork(cmd, |cmd| cmd.spawn().map(drop));
+    let (result, forked) = spawn_front_noting_fork(cmd, spawn_under_hidepid);
     drop(restore);
     assert_refused_unforked(result, forked);
 }

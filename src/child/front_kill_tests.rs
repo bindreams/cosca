@@ -28,10 +28,21 @@ pub(crate) fn sudo_report() -> Option<ElevationReport> {
 }
 
 /// Spawns `cmd` with a piped stdin, as the backend `via` launches, and reported so.
-pub(crate) fn spawn_as(mut cmd: Command, via: ElevatedVia) -> (crate::Child, PipeWriter) {
+pub(crate) fn spawn_as(cmd: Command, via: ElevatedVia) -> (crate::Child, PipeWriter) {
+    spawn_as_over(cmd, via, crate::identity::HostKernel)
+}
+
+/// [`spawn_as`] over `kernel`, the one the spawn and every box it builds ask.
+pub(crate) fn spawn_as_over(
+    mut cmd: Command,
+    via: ElevatedVia,
+    kernel: impl crate::identity::Kernel + Send + 'static,
+) -> (crate::Child, PipeWriter) {
     cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
     cmd.set_elevation_report(Some(report(via)));
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = crate::child::spawn::spawn_with(&mut cmd, kernel)
+        .map_err(crate::error::Error::from)
+        .expect("spawn");
     let stdin = child.stdin().expect("stdin pipe");
     (child, stdin)
 }
