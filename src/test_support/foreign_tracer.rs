@@ -296,66 +296,6 @@ impl Tracer {
     }
 }
 
-/// What [`await_blocked_warned_or_finished`] found.
-#[cfg(feature = "tokio")]
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Holder {
-    /// Asleep in a `waitid` that waits.
-    Blocked,
-    /// Not in such a `waitid`, and its wait for the child has warned that it is still waiting: the
-    /// wait is `OwnedChild`'s, which polls a zombie a tracer holds instead of sleeping in `waitid`.
-    Warned,
-    Finished,
-}
-
-/// One read of `/proc/self/task/<tid>/syscall`: `Some(Blocked)` if the thread sleeps in a `waitid`
-/// without `WNOHANG`, `Some(Finished)` if it is gone, `None` otherwise. Any other shape of the file
-/// than `running` or `<nr> ...` panics with its text.
-#[cfg(feature = "tokio")]
-fn thread_state(tid: libc::pid_t) -> Option<Holder> {
-    let path = format!("/proc/self/task/{tid}/syscall");
-    match std::fs::read_to_string(&path) {
-        Ok(text) if text.trim() == "running" => None,
-        // `<nr> <a0> <a1> <a2> <a3> <a4> <a5> <sp> <pc>`, or `-1 <sp> <pc>`.
-        Ok(text) => {
-            let mut fields = text.split_whitespace();
-            let nr: libc::c_long = fields
-                .next()
-                .and_then(|n| n.parse().ok())
-                .unwrap_or_else(|| panic!("{path}: no syscall number in {text:?}"));
-            if nr != libc::SYS_waitid {
-                return None;
-            }
-            // `waitid(idtype, id, infop, options, rusage)`: `options` is argument 4.
-            let options = fields
-                .nth(3)
-                .and_then(|o| u64::from_str_radix(o.trim_start_matches("0x"), 16).ok())
-                .unwrap_or_else(|| panic!("{path}: no waitid options in {text:?}"));
-            (options & libc::WNOHANG as u64 == 0).then_some(Holder::Blocked)
-        }
-        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => Some(Holder::Finished),
-        Err(e) => panic!("read {path}: {e}"),
-    }
-}
-
-/// Re-reads the thread `tid` until it sleeps in a `waitid` without `WNOHANG`, or is gone, or `warned`
-/// says it has said it is still waiting. Each is a condition the thread reaches by itself, so the
-/// only exit is the condition; the pauses between reads are a backoff, not a bound. A thread that
-/// has finished is `Finished` whatever `warned` says.
-#[cfg(feature = "tokio")]
-fn await_blocked_warned_or_finished(tid: libc::pid_t, mut warned: impl FnMut() -> bool) -> Holder {
-    let mut pause = std::time::Duration::from_micros(50);
-    loop {
-        match thread_state(tid) {
-            Some(holder) => return holder,
-            None if warned() => return Holder::Warned,
-            None => {}
-        }
-        std::thread::sleep(pause);
-        pause = (pause * 2).min(std::time::Duration::from_millis(5));
-    }
-}
-
 /// Marks the [`tokio_tracee`] re-exec; the value is the driver's pid.
 #[cfg(feature = "tokio")]
 const TRACEE_MARKER: &str = "COSCA_TESTCFG_FOREIGN_TRACER_TOKIO_TRACEE";
@@ -419,73 +359,189 @@ pub(crate) enum Names {
     Unknown,
 }
 
-/// Runs `teardown` on a thread of its own, on which slow teardowns warn (see
-/// [`crate::tokio::child::fault::warn_slow_teardowns`]), until it has said it is still waiting or
-/// sleeps in a blocking `waitid`; then has the tracer `seized` answers hand the zombie of its child
-/// back. `seized` runs once the thread has started. Asserts that the teardown had not returned by
-/// then, that exactly one warn, naming the child as `names` says, said it was still waiting, and
-/// that the tracee died of a `SIGKILL`, not of its own exit once the test released its stdin.
-/// Answers what `teardown` returned.
+/// The end of the one warn of a teardown's wait for the child it killed. At threshold zero a cgroup
+/// leaf's drain warns too ("still waiting for it to drain"), and is not what these tests count.
+#[cfg(feature = "tokio")]
+const WAITING_FOR_EXIT: &str = "still waiting for it to exit";
+
+/// What the teardown thread of [`assert_warns_once_before_blocking`] was doing when the test looked.
+#[cfg(feature = "tokio")]
+enum TeardownLook {
+    /// It reached its first block or pause; `warned`: the warn of its wait for the child was out.
+    Held { warned: bool },
+    /// It returned (or panicked) with no block or pause: the tracer still held the zombie.
+    Returned,
+}
+
+/// The slow-teardown threshold [`hold_teardown`]'s thread runs under.
+#[cfg(feature = "tokio")]
+#[derive(Clone, Copy)]
+enum Threshold {
+    /// Due at once: the teardown's first bounded look is its last.
+    Zero,
+    /// Due after this long on a clock frozen when the thread starts, whose elapsed time is pinned
+    /// to zero: no time passes unless the test says so, so the warn is never due.
+    Frozen(std::time::Duration),
+}
+
+/// What [`hold_teardown`] found, before any assertion on it.
+#[cfg(feature = "tokio")]
+struct Held<R> {
+    pid: u32,
+    look: TeardownLook,
+    /// Every warn of a wait for a child's exit since the call, whoever it names, and its levels.
+    warns: Vec<String>,
+    levels: Vec<log::Level>,
+    status: i32,
+    done: R,
+}
+
+/// Runs `teardown` on a thread of its own, under `threshold`, until the thread reaches its first
+/// block or recheck pause, or returns; a leaf's drain is neither (the zombie the tracer holds is out
+/// of the leaf). Then the tracer `seized` answers hands the zombie of its child back (`seized` runs
+/// once the thread has started). The hooks only send: a panic in one would leave an armed drop
+/// waiting on the zombie the tracer holds.
+#[cfg(feature = "tokio")]
+fn hold_teardown<R: Send>(
+    threshold: Threshold,
+    teardown: impl FnOnce() -> R + Send,
+    seized: impl FnOnce() -> (u32, Tracer),
+) -> Held<R> {
+    use crate::wait::block_probe::{is_drain_wait, on_each_block, on_pause};
+
+    crate::log_capture::install();
+    let mark = crate::log_capture::mark();
+    let (look_tx, look_rx) = std::sync::mpsc::channel::<bool>();
+
+    // A panic inside the scope drops `tracer` first, and its helper's death hands the zombie back,
+    // so the scope's join of the teardown thread ends.
+    std::thread::scope(|s| {
+        let thread = s.spawn(move || {
+            let (_clock, _zero, _warn);
+            match threshold {
+                Threshold::Zero => _warn = crate::tokio::warn_slow_teardowns_after(std::time::Duration::ZERO),
+                Threshold::Frozen(after) => {
+                    _clock = crate::wait::test_clock::FrozenClockGuard::install();
+                    _zero = crate::wait::test_clock::ZeroElapsedGuard::install();
+                    _warn = crate::tokio::warn_slow_teardowns_after(after);
+                }
+            }
+            // The senders live in the hooks alone, so a teardown that returns without a block or
+            // pause closes the channel.
+            let report = |tx: std::sync::mpsc::Sender<bool>| {
+                move || {
+                    let warned =
+                        !crate::log_capture::records_since_on_current_thread(mark, WAITING_FOR_EXIT).is_empty();
+                    _ = tx.send(warned);
+                }
+            };
+            let at_block = report(look_tx.clone());
+            let at_pause = report(look_tx);
+            let _block = on_each_block(move |block| {
+                if !is_drain_wait(block) {
+                    at_block();
+                }
+            });
+            let _pause = on_pause(at_pause);
+            teardown()
+        });
+        let (pid, mut tracer) = seized();
+        let look = match look_rx.recv() {
+            Ok(warned) => TeardownLook::Held { warned },
+            Err(_) => TeardownLook::Returned,
+        };
+        tracer.send(REAP);
+        let status = tracer.expect_reaped();
+        // A panic of the teardown's own (a contract message) is the test's.
+        let done = thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        Held {
+            pid,
+            look,
+            warns: crate::log_capture::records_since(mark, WAITING_FOR_EXIT),
+            levels: crate::log_capture::levels_since(mark, WAITING_FOR_EXIT),
+            status,
+            done,
+        }
+    })
+}
+
+/// The tracee died of a `SIGKILL`, not of its own exit once the test released its stdin.
+#[cfg(feature = "tokio")]
+fn assert_killed(pid: u32, status: i32) {
+    assert!(
+        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+        "the teardown's kill must end child {pid}, not its own exit once its stdin was released: {status:#x}"
+    );
+}
+
+/// [`hold_teardown`] at threshold zero, which makes the warn due before the teardown's first block
+/// or pause, with no clock involved. Asserts that the teardown did not return before the tracer let
+/// go, that its first block or pause came after the warn, that exactly one warn, naming the child as
+/// `names` says, said it was still waiting, and that the tracee died of a `SIGKILL`. Answers what
+/// `teardown` returned.
 ///
-/// A teardown whose kill sends nothing waits all the same and returns once the tracer has let go, so
-/// it fails an assertion here instead of hanging. A teardown that polls instead of sleeping in
-/// `waitid` (`OwnedChild`'s wait) is waited for until the suite slow-timeout.
+/// A teardown that never warns, or whose kill sends nothing, fails an assertion here instead of
+/// hanging: the tracer lets go at the first block or pause whatever the warn. The threshold is
+/// zero for `teardown` and anything it reads on its thread; a caller that reads it earlier, on its
+/// own thread, sets zero itself ([`crate::tokio::warn_slow_teardowns_after`]).
 #[cfg(feature = "tokio")]
 pub(crate) fn assert_warns_once_before_blocking<R: Send>(
     names: Names,
     teardown: impl FnOnce() -> R + Send,
     seized: impl FnOnce() -> (u32, Tracer),
 ) -> R {
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
-    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let Held {
+        pid,
+        look,
+        warns,
+        levels,
+        status,
+        done,
+    } = hold_teardown(Threshold::Zero, teardown, seized);
+    match look {
+        TeardownLook::Held { warned: true } => {}
+        TeardownLook::Held { warned: false } => {
+            panic!("the teardown blocked or paused before it warned that it was still waiting for child {pid}")
+        }
+        TeardownLook::Returned => panic!("the teardown returned while the tracer still held child {pid}'s zombie"),
+    }
+    assert_killed(pid, status);
+    let who = match names {
+        Names::Pid => format!("child {pid}"),
+        Names::Unknown => "pid unknown".to_owned(),
+    };
+    let named: Vec<_> = warns.iter().filter(|text| text.contains(&who)).collect();
+    assert_eq!(named.len(), 1, "one warn before the blocking wait: {warns:?}");
+    assert_eq!(levels, [log::Level::Warn], "exactly one warn, at warn");
+    done
+}
 
-    // Asserted only after the tracer lets go. A panic inside the scope drops `tracer` first, and its
-    // helper's death hands the zombie back, so the scope's join of the teardown thread ends.
-    let (pid, holder, warns, status, done) = std::thread::scope(|s| {
-        let thread = s.spawn(move || {
-            tid_tx
-                .send(rustix::thread::gettid().as_raw_nonzero().get())
-                .expect("report the tid");
-            let _warn = crate::tokio::warn_slow_teardowns();
-            teardown()
-        });
-        let tid = tid_rx.recv().expect("the teardown's tid");
-        let (pid, mut tracer) = seized();
-        let who = match names {
-            Names::Pid => format!("child {pid}"),
-            Names::Unknown => "pid unknown".to_owned(),
-        };
-        let said_waiting = || {
-            crate::log_capture::records_since(mark, &who)
-                .iter()
-                .any(|text| text.contains("still waiting"))
-        };
-        let holder = await_blocked_warned_or_finished(tid, said_waiting);
-        let warns: Vec<_> = crate::log_capture::records_since(mark, &who)
-            .into_iter()
-            .filter(|text| text.contains("still waiting"))
-            .collect();
-        tracer.send(REAP);
-        let status = tracer.expect_reaped();
-        (pid, holder, warns, status, thread.join().expect("the teardown"))
-    });
-
-    assert_ne!(
-        holder,
-        Holder::Finished,
-        "the teardown returned while the tracer still held child {pid}'s zombie"
-    );
-    assert!(
-        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
-        "the teardown's kill must end child {pid}, not its own exit once its stdin was released: {status:#x}"
-    );
-    assert_eq!(warns.len(), 1, "one warn before the blocking wait: {warns:?}");
-    assert_eq!(
-        crate::log_capture::levels_since(mark, "still waiting"),
-        [log::Level::Warn],
-        "exactly one warn, at warn"
-    );
+/// [`hold_teardown`] at a threshold of `after` on a frozen clock that no one advances, so the
+/// teardown ends before the threshold: the tracer lets go at its first block or pause and the
+/// teardown reaps the child. Asserts that no warn was said, that the first block or pause came
+/// with none out, and that the tracee died of a `SIGKILL`. Answers what `teardown` returned.
+///
+/// A teardown that warns at once fails an assertion here. The frozen clock is the thread's: a
+/// `teardown` that reads its threshold on its own thread, as the handshake's does, sees `after`.
+#[cfg(feature = "tokio")]
+pub(crate) fn assert_no_warn_before_the_threshold<R: Send>(
+    after: std::time::Duration,
+    teardown: impl FnOnce() -> R + Send,
+    seized: impl FnOnce() -> (u32, Tracer),
+) -> R {
+    let Held {
+        pid,
+        look,
+        warns,
+        status,
+        done,
+        ..
+    } = hold_teardown(Threshold::Frozen(after), teardown, seized);
+    if matches!(look, TeardownLook::Returned) {
+        panic!("the teardown returned while the tracer still held child {pid}'s zombie");
+    }
+    assert_killed(pid, status);
+    assert!(warns.is_empty(), "no warn before the threshold passed: {warns:?}");
     done
 }
 

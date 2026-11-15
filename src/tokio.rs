@@ -21,7 +21,7 @@ pub(crate) mod test_runtime;
 pub(crate) mod wait;
 
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) use child::{fault::warn_slow_teardowns, slow_teardown_after};
+pub(crate) use child::{fault::warn_slow_teardowns_after, slow_teardown_after};
 pub use child::{Child, SuspendedChild};
 pub use command::Command;
 pub use process::Process;

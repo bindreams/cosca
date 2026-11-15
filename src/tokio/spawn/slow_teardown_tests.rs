@@ -1,9 +1,10 @@
-//! A failed async spawn's teardown waits for the killed child and warns once, naming it, past 1 s
-//! (principle 2). Each row fails the spawn at one arm and pins that the arm passes `async_policy` to
-//! its wait. The seams are thread-local, so rows call `spawn_uncommitted(cmd, async_policy())` on
-//! the test thread. A foreign tracer holds the killed child's zombie, so the wait cannot end before
-//! the tracer lets go; it lets go only once the spawning thread sleeps in a blocking `waitid`, which
-//! the teardown reaches only after the warn.
+//! A failed async spawn's teardown waits for the killed child and warns once, naming it, once its
+//! wait passes the threshold (principle 2). Each row fails the spawn at one arm and pins that the arm
+//! passes `async_policy` to its wait. The seams are thread-local, so rows call
+//! `spawn_uncommitted(cmd, async_policy())` on the test thread. A foreign tracer holds the killed
+//! child's zombie, so the wait cannot end before the tracer lets go. The threshold is zero, so no
+//! look before the warn blocks or pauses and the warn is out before the wait first does; the
+//! tracer lets go only then.
 //!
 //! The tracee ends only by a kill, or by its stdin closing. The teardown's thread holds the stdin
 //! writer and drops it between the teardown's kill and its wait (`release_between_kill_and_wait`),
@@ -83,7 +84,8 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(fail: FailAt, front
                 Some(fault::release_between_kill_and_wait(held.take()))
             };
             // Kept open until the teardown is done: the tracee's later writes must not stop it on a
-            // `SIGPIPE` that only the tracer, which is released after the teardown blocks, could lift.
+            // `SIGPIPE` that only the tracer, which is released at the teardown's first block or
+            // pause, could lift.
             let out_open = std::rc::Rc::new(std::cell::RefCell::new(None));
             let seizing = {
                 let out_open = std::rc::Rc::clone(&out_open);
@@ -127,7 +129,7 @@ fn assert_front_or_child_teardown_warns_once_before_blocking(fail: FailAt, front
 ///
 /// Mutant: the arm's `HeldTeardown` carries no threshold.
 #[skuld::test]
-fn a_teardown_after_a_failed_attach_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
+fn a_teardown_after_a_failed_attach_warns_once_while_the_child_is_held(#[fixture(tracer_group)] _group: &Group) {
     assert_teardown_warns_once_before_blocking(ATTACH);
 }
 
@@ -135,7 +137,7 @@ fn a_teardown_after_a_failed_attach_warns_once_past_1s(#[fixture(tracer_group)] 
 ///
 /// Mutant: the arm's `HeldTeardown` carries no threshold.
 #[skuld::test]
-fn a_teardown_after_a_vanished_identity_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
+fn a_teardown_after_a_vanished_identity_warns_once_while_the_child_is_held(#[fixture(tracer_group)] _group: &Group) {
     assert_teardown_warns_once_before_blocking(IDENTITY_VANISHED);
 }
 
@@ -145,7 +147,7 @@ fn a_teardown_after_a_vanished_identity_warns_once_past_1s(#[fixture(tracer_grou
 ///
 /// Mutant: the front's wait has no warn.
 #[skuld::test]
-fn a_front_teardown_after_a_failed_attach_warns_once_past_1s(
+fn a_front_teardown_after_a_failed_attach_warns_once_while_the_front_is_held(
     #[fixture(tracer_group)] _tracer: &Group,
     #[fixture(cgroup)] _cgroup: &Group,
 ) {
@@ -154,13 +156,13 @@ fn a_front_teardown_after_a_failed_attach_warns_once_past_1s(
 
 /// The leaf of a failed attach is dropped, which kills it and waits for it to drain
 /// (`CgroupLeaf::drop`). A tracee a foreign tracer holds at its exit stop is a live member of the
-/// leaf whatever the kill, so the drain outlasts the threshold; the tracer lets it on only from the
-/// hook that runs right after the warn (or, for a teardown that never warns, when the wait is about
-/// to block, so a missing warn fails the count below instead of hanging).
+/// leaf whatever the kill, so the drain outlasts the threshold (zero); the tracer lets it on only
+/// from the hook that runs right after the warn (or, for a teardown that never warns, when the wait
+/// is about to block, so a missing warn fails the count below instead of hanging).
 ///
 /// Mutants: the leaf's drop waits with no warn; the async spawn hands `prepare` no threshold.
 #[skuld::test]
-fn a_leaf_drained_past_1s_after_a_failed_attach_warns_once(
+fn a_leaf_drain_after_a_failed_attach_warns_once_before_the_tracee_is_let_on(
     #[fixture(tracer_group)] _tracer: &Group,
     #[fixture(cgroup)] _cgroup: &Group,
 ) {
@@ -171,7 +173,7 @@ fn a_leaf_drained_past_1s_after_a_failed_attach_warns_once(
     let mark = crate::log_capture::mark();
     let (stdin, _stdin_writer) = crate::test_child::held_writer_stdin();
     let (out_reader, out_writer) = std::io::pipe().expect("pipe");
-    let _warn = crate::tokio::child::fault::warn_slow_teardowns();
+    let _warn = crate::tokio::warn_slow_teardowns_after(std::time::Duration::ZERO);
 
     let tracer: Rc<RefCell<Option<Tracer>>> = Rc::default();
     let warns_at_release = Rc::new(Cell::new(None));
@@ -239,9 +241,10 @@ fn a_leaf_drained_past_1s_after_a_failed_attach_warns_once(
 ///
 /// Mutants: `wait_killed_elevated` waits with no warn; the cleanup's root kill sends nothing.
 #[skuld::test]
-async fn a_failed_elevation_writes_cleanup_warns_once_past_1s(#[fixture(tracer_group)] _group: &Group) {
-    // The spawn reads the warn threshold into the child's policy, so it is set before the spawn.
-    let _warn = crate::tokio::warn_slow_teardowns();
+async fn a_failed_elevation_writes_cleanup_warns_once_while_the_root_is_held(#[fixture(tracer_group)] _group: &Group) {
+    // The spawn reads the warn threshold into the child's policy, so it is set, to zero as on the
+    // teardown's thread, before the spawn.
+    let _warn = crate::tokio::warn_slow_teardowns_after(std::time::Duration::ZERO);
     let (child, stdin) = foreign_tracer::spawn_tokio_tracee().await;
     let pid = child.pid();
     let tracer = foreign_tracer::spawn_helper(pid);
