@@ -26,14 +26,15 @@ if [[ "$release" != "$want" && "$release" != "$want".* && "$release" != "$want"-
     exit 1
 fi
 
-# Every group that asks for consent is set explicitly: the unprivileged run opts out of the ones that
-# need root and in to the setuid one, and the root run opts in to exactly the root ones, selected by label.
-groups_unprivileged=(COSCA_TEST_ROOT=0 COSCA_TEST_NAMESPACES=0 COSCA_TEST_TRACER=0 COSCA_TEST_UID_SWITCH=0
-    COSCA_TEST_SETUID=1 COSCA_TEST_SETUID_CONSENT=1 COSCA_TEST_CGROUP=0 COSCA_TEST_ELEVATION=0
-    COSCA_TEST_STRAY_SIGNAL=0)
-groups_root=(COSCA_TEST_ROOT=0 COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
+# The groups that are off by default are off, as in CI: the checkout the guest shares holds
+# `.github/test-group-defaults.env`. Each run then opts in to its own groups: the unprivileged run to the setuid
+# one, the root run to exactly the root ones, selected by label.
+set -a
+. "$(dirname "${BASH_SOURCE[0]}")/../test-group-defaults.env"
+set +a
+groups_unprivileged=(COSCA_TEST_SETUID=1 COSCA_TEST_SETUID_CONSENT=1)
+groups_root=(COSCA_TEST_NAMESPACES=1 COSCA_TEST_NAMESPACES_CONSENT=1
     COSCA_TEST_TRACER=1 COSCA_TEST_TRACER_CONSENT=1 COSCA_TEST_UID_SWITCH=1 COSCA_TEST_UID_SWITCH_CONSENT=1
-    COSCA_TEST_SETUID=0 COSCA_TEST_CGROUP=0 COSCA_TEST_ELEVATION=0 COSCA_TEST_STRAY_SIGNAL=0
     "SKULD_LABELS=namespaces | tracer | uid_switch")
 filter='test(elevation::shim::) | test(child::spawn::fork_exec) | test(child::spawn::fork_spawn)'
 nextest=(cargo nextest run --locked --lib --no-fail-fast --no-tests=fail -E "$filter")
