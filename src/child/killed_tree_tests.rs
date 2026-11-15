@@ -16,7 +16,6 @@ use crate::test_groups::{stray_signal, Group};
 struct Reaped {
     child: crate::Child,
     killed: KillGroupRecorder,
-    _gone: crate::child::fault::ForcedRootReads,
     #[cfg(target_os = "linux")]
     _old_kernel: crate::containment::unix::fault::Refused,
 }
@@ -46,10 +45,10 @@ fn reaped_reading(kill_tree_first: bool, read: Resolved<crate::identity::Process
     drop(stdin);
     let status = child.wait().expect("this handle reaps the root");
     crate::test_child::assert_killed("the session root", status);
+    child.proc.number_reads_always(read);
     Reaped {
         child,
         killed,
-        _gone: crate::child::fault::force_root_reads(read),
         #[cfg(target_os = "linux")]
         _old_kernel,
     }

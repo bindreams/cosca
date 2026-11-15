@@ -382,12 +382,18 @@ fn dropping_a_waited_on_child_whose_number_reads_unknown_still_sends_no_killpg(
     crate::log_capture::install();
     let recorder = record_kill_group();
     let teardowns = record_root_teardowns();
-    let (_, child) = waited_on_blocker_root();
-    let _unknown = super::fault::force_next_root_read(crate::identity::Resolved::Unknown);
+    let (_, mut child) = waited_on_blocker_root();
+    let fake = child.proc.script_over(|f| {
+        f.number_reads([(
+            crate::identity::Resolved::Unknown,
+            crate::identity::UnknownCause::default(),
+        )])
+    });
 
     let mark = crate::log_capture::mark();
     drop(child);
 
+    fake.assert_number_reads_exhausted();
     assert_eq!(
         recorder.killed(),
         Vec::<i32>::new(),
@@ -404,14 +410,20 @@ fn dropping_an_unreaped_child_whose_number_reads_unknown_kills_and_logs_the_fail
     crate::log_capture::install();
     let recorder = record_kill_group();
     let teardowns = record_root_teardowns();
-    let (child, stdin) = session_blocker();
+    let (mut child, stdin) = session_blocker();
     let blocker = release_at_drop_kill(stdin);
     let pid = child.pid();
-    let _unknown = super::fault::force_next_root_read(crate::identity::Resolved::Unknown);
+    let fake = child.proc.script_over(|f| {
+        f.number_reads([(
+            crate::identity::Resolved::Unknown,
+            crate::identity::UnknownCause::default(),
+        )])
+    });
 
     let mark = crate::log_capture::mark();
     drop(child);
 
+    fake.assert_number_reads_exhausted();
     recorder.assert_killed_only(pid as i32);
     blocker.assert_killed();
     assert_eq!(teardowns.count(), 1);

@@ -202,7 +202,7 @@ impl Child {
         // stays running and unreaped, named by the warn; a `HandBack` caller then takes it. The
         // gate comes first, so the look at the root is right before the kill it decides.
         let gate = self.kill_gate();
-        let view = crate::containment::DropView::read(caller, self.pid(), self.id, || self.proc.state(), &self.tree);
+        let view = crate::containment::DropView::read(caller, self.pid(), self.id, &self.proc, &self.tree);
         let cgroup_only = match gate {
             crate::elevation::front::Gate::Closed(unkillable) => {
                 // The leaf stays armed: its teardown kills what it holds, a front among it if it is

@@ -1,5 +1,5 @@
 use super::{look, number_holds, NumberLook, Refusal, Root as _};
-use crate::identity::{ProcessId, Resolved};
+use crate::identity::{ProcessId, Resolved, UnknownCause};
 use crate::signal::RootState;
 use crate::test_support::stated_root::StatedRoot;
 
@@ -20,8 +20,7 @@ enum Answer {
 }
 
 fn answered(state: impl Fn() -> RootState, has_group: bool, read: Resolved<ProcessId>) -> Answer {
-    let _read = crate::child::fault::force_root_reads(read);
-    let root = StatedRoot::with_state(PGID as u32, state);
+    let root = StatedRoot::with_state(PGID as u32, state).holding(move || (read, UnknownCause::default()));
     match look(&root, has_group) {
         NumberLook::Trusted => Answer::Trusted,
         NumberLook::Empty => Answer::Empty,
@@ -120,10 +119,10 @@ fn look_answers_an_unpinned_root_untrusted() {
 /// Mutants: `Seen` answers the root's own state for the look; it answers the look for every read.
 #[skuld::test]
 fn a_seen_root_is_decided_on_its_callers_look_and_checked_on_its_own_state() {
-    let _read = crate::child::fault::force_root_reads(Resolved::Gone);
     let root = StatedRoot::with_state(PGID as u32, || {
         RootState::Unknown(std::sync::Arc::new(std::io::Error::other("forced")))
-    });
+    })
+    .holding(|| (Resolved::Gone, UnknownCause::default()));
     let seen = super::Seen::new(&root, RootState::Reaped { own: false });
 
     assert!(matches!(
@@ -137,13 +136,28 @@ fn a_seen_root_is_decided_on_its_callers_look_and_checked_on_its_own_state() {
     assert!(matches!(seen.state(), RootState::Unknown(_)), "{:?}", seen.state());
 }
 
+/// A seen root's number is read through the root it wraps, for the look its caller took.
+///
+/// Mutant: `Seen` answers no read of its own number (it reads `Unknown`).
+#[skuld::test]
+fn a_seen_roots_number_is_the_wrapped_roots() {
+    let other = ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
+    let root = StatedRoot::with_state(PGID as u32, || RootState::Unreaped)
+        .holding(move || (Resolved::Found(other), UnknownCause::default()));
+    let seen = super::Seen::new(&root, RootState::Reaped { own: true });
+
+    assert!(matches!(look(&seen, true), NumberLook::Empty));
+}
+
 // number_holds -----
 
 /// A send by the group's number is allowed only while the root is unreaped.
 #[skuld::test]
 fn number_holds_only_for_an_unreaped_root() {
-    let own = std::process::id();
-    assert!(number_holds(own, RootState::Unreaped).is_ok());
+    let other = ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
+    let root = StatedRoot::with_state(PGID as u32, || RootState::Unreaped)
+        .holding(move || (Resolved::Found(other), UnknownCause::default()));
+    assert!(number_holds(&root, RootState::Unreaped).is_ok());
     let refused = [
         (RootState::Reaped { own: false }, "reaped elsewhere"),
         (
@@ -151,12 +165,11 @@ fn number_holds_only_for_an_unreaped_root() {
             "could not say whether it",
         ),
         (RootState::Unpinned, "not pinned"),
-        // This process holds its own pid, so the number names another process than the root.
         (RootState::Reaped { own: true }, "another process holds"),
     ];
     for (state, why) in refused {
         let label = format!("{state:?}");
-        let err = number_holds(own, state).expect_err(&label).to_string();
+        let err = number_holds(&root, state).expect_err(&label).to_string();
         assert!(err.contains(why), "{label}: {err}");
     }
 }
@@ -171,7 +184,7 @@ fn an_unsure_refusal_has_the_peeks_error_as_its_source() {
 
     let os_error = std::io::Error::from_raw_os_error(libc::EPERM).to_string();
     let refusal = number_holds(
-        std::process::id(),
+        &StatedRoot::unreaped(),
         RootState::Unknown(std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EPERM))),
     )
     .expect_err("an unsure handle refuses");
@@ -194,22 +207,20 @@ fn an_unsure_refusal_has_the_peeks_error_as_its_source() {
 fn number_holds_reads_own_from_the_state() {
     let other = || ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
     let reads = || [Resolved::Gone, Resolved::Found(other()), Resolved::Unknown];
+    let root = |read| {
+        StatedRoot::with_state(PGID as u32, || RootState::Unreaped).holding(move || (read, UnknownCause::default()))
+    };
     for read in reads() {
-        let _read = crate::child::fault::force_root_reads(read);
-        let err = number_holds(PGID as u32, RootState::Reaped { own: false }).expect_err("reaped elsewhere");
+        let err = number_holds(&root(read), RootState::Reaped { own: false }).expect_err("reaped elsewhere");
         assert!(matches!(err, Refusal::ReapedElsewhere(_)), "{err}");
     }
-    let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
-    let err = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("names no process");
+    let err = number_holds(&root(Resolved::Gone), RootState::Reaped { own: true }).expect_err("names no process");
     assert!(matches!(err, Refusal::ReapedPidGone(_)), "{err}");
     assert!(err.to_string().contains("names no process"), "{err}");
-    drop(_gone);
-    let _found = crate::child::fault::force_root_reads(Resolved::Found(other()));
-    let err = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("another process holds");
+    let err = number_holds(&root(Resolved::Found(other())), RootState::Reaped { own: true })
+        .expect_err("another process holds");
     assert!(matches!(err, Refusal::ReapedPidTaken(_)), "{err}");
-    drop(_found);
-    let _unknown = crate::child::fault::force_root_reads(Resolved::Unknown);
-    let err = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("unreadable");
+    let err = number_holds(&root(Resolved::Unknown), RootState::Reaped { own: true }).expect_err("unreadable");
     assert!(matches!(err, Refusal::ReapedPidUnread(..)), "{err}");
     assert!(err.to_string().contains("could not be read"), "{err}");
 }
@@ -225,13 +236,12 @@ fn an_unread_pid_refusal_has_the_reads_error_as_its_source() {
 
     use crate::containment::unix::send_to_group;
     use crate::error::first_os_code;
-    use crate::identity::FailedCall;
     use crate::test_support::stated_root::StatedRoot;
 
-    let _read = crate::child::fault::force_root_reads_failing(FailedCall::pidfd_open(rustix::io::Errno::MFILE));
-    let refusal = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("an unread pid refuses");
+    let root = StatedRoot::with_state(PGID as u32, || RootState::Reaped { own: true })
+        .holding(|| crate::test_support::emfile_number_read(PGID as u32));
+    let refusal = number_holds(&root, root.state()).expect_err("an unread pid refuses");
     assert_eq!(first_os_code(&refusal), Some(libc::EMFILE), "{refusal:?}");
-    let root = StatedRoot::with_state(PGID as u32, || RootState::Reaped { own: true });
     let sent = send_to_group(PGID, Signal::SIGTERM, Some(&root)).expect_err("the check refuses the send");
     assert_eq!(first_os_code(&sent), Some(libc::EMFILE), "{sent:?}");
 }
@@ -246,8 +256,9 @@ fn an_unread_pid_refusal_has_the_reads_error_as_its_source() {
 fn an_unread_pid_refusal_has_no_cause_on_macos() {
     use crate::containment::NotItsGroup;
 
-    let _read = crate::child::fault::force_root_reads(Resolved::Unknown);
-    let refusal = number_holds(PGID as u32, RootState::Reaped { own: true }).expect_err("an unread pid refuses");
+    let root = StatedRoot::with_state(PGID as u32, || RootState::Reaped { own: true })
+        .holding(|| (Resolved::Unknown, UnknownCause::default()));
+    let refusal = number_holds(&root, root.state()).expect_err("an unread pid refuses");
     assert!(matches!(refusal, Refusal::ReapedPidUnread(_, None)), "{refusal:?}");
     assert!(std::error::Error::source(&refusal).is_none(), "{refusal:?}");
     assert!(refusal.cause().is_none(), "{refusal:?}");

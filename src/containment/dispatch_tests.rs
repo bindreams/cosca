@@ -347,8 +347,10 @@ fn a_marker_without_a_group_answers_a_reaped_roots_unnamed_pid_with_its_holders_
         )
     }
 
-    let reaped = || StatedRoot::with_state(1234, || RootState::Reaped { own: true });
-    let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
+    let reaped = || {
+        StatedRoot::with_state(1234, || RootState::Reaped { own: true })
+            .holding(|| (Resolved::Gone, crate::identity::UnknownCause::default()))
+    };
     let ungrouped = Tree::contained(Mechanism::Marker(marker_with_pgid(None)))
         .kill(Some(&reaped()))
         .outcome();

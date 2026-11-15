@@ -68,17 +68,23 @@ fn kill_tree_after_own_wait_whose_pid_reads_unknown_sends_no_killpg(#[fixture(st
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let recorder = record_kill_group();
-    let child = session_cat().spawn().expect("spawn");
+    let mut child = session_cat().spawn().expect("spawn");
     let pid = child.pid();
     kill_own_child(pid);
     child.wait().expect("this handle reaps the root");
-    let _unknown = crate::child::fault::force_next_root_read(crate::identity::Resolved::Unknown);
+    let fake = child.proc.script_over(|f| {
+        f.number_reads([(
+            crate::identity::Resolved::Unknown,
+            crate::identity::UnknownCause::default(),
+        )])
+    });
 
     let mark = crate::log_capture::mark();
     let err = child
         .kill_tree()
         .expect_err("a group whose root's pid cannot be read is not assessable");
 
+    fake.assert_number_reads_exhausted();
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
     assert_eq!(
         recorder.killed(),
@@ -97,17 +103,23 @@ fn kill_tree_after_own_wait_whose_pid_names_no_process_sends_no_killpg(#[fixture
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let recorder = record_kill_group();
-    let child = session_cat().spawn().expect("spawn");
+    let mut child = session_cat().spawn().expect("spawn");
     let pid = child.pid();
     kill_own_child(pid);
     child.wait().expect("this handle reaps the root");
-    let _gone = crate::child::fault::force_next_root_read(crate::identity::Resolved::Gone);
+    let fake = child.proc.script_over(|f| {
+        f.number_reads([(
+            crate::identity::Resolved::Gone,
+            crate::identity::UnknownCause::default(),
+        )])
+    });
 
     let mark = crate::log_capture::mark();
     let err = child
         .kill_tree()
         .expect_err("a group the pid no longer names is not assessable");
 
+    fake.assert_number_reads_exhausted();
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
     assert!(
         err.to_string()
@@ -376,22 +388,29 @@ fn graceful_shutdown_tree_after_a_foreign_reap_warns_once_and_ends(#[fixture(str
 fn graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send(#[fixture(stray_signal)] _stray: &Group) {
     #[cfg(target_os = "linux")]
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
-    use crate::child::fault::force_next_root_read;
-    use crate::identity::Resolved;
     use crate::test_child::reaped_elsewhere::UNTRUSTED_NUMBER;
     crate::log_capture::install();
     let killed = record_kill_group();
     let termed = record_term_group();
-    let child = session_cat().spawn().expect("spawn");
+    let mut child = session_cat().spawn().expect("spawn");
     let pid = child.pid();
     kill_own_child(pid);
     child.wait().expect("this handle reaps the root");
     let other = child.id().expect(crate::test_child::IDENTITY_READ).with_other_value();
     // The shutdown's look finds another process; the sweep's, after the terminate, cannot read the
-    // pid. This guard clears the second force too, should it go unconsumed.
-    let _reads = force_next_root_read(Resolved::Found(other));
-    let _unreadable = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, || {
-        std::mem::forget(force_next_root_read(Resolved::Unknown))
+    // pid. The terminate states the second read.
+    let fake = child.proc.script_over(|f| {
+        f.number_reads([(
+            crate::identity::Resolved::Found(other),
+            crate::identity::UnknownCause::default(),
+        )])
+    });
+    let hook_fake = fake.clone();
+    let _unreadable = crate::graceful_hooks::at(crate::graceful_hooks::HookPoint::AfterTerminate, move || {
+        let _ = hook_fake.number_reads([(
+            crate::identity::Resolved::Unknown,
+            crate::identity::UnknownCause::default(),
+        )]);
     });
 
     let mark = crate::log_capture::mark();
@@ -399,6 +418,7 @@ fn graceful_shutdown_tree_after_own_wait_claims_no_sigterm_it_did_not_send(#[fix
         .graceful_shutdown_tree(std::time::Duration::ZERO)
         .expect_err("a sweep whose root's pid cannot be read is not assessable");
 
+    fake.assert_number_reads_exhausted();
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
     assert_eq!(
         termed.termed(),
@@ -439,12 +459,15 @@ fn kill_tree_after_own_wait_and_reuse_kills_a_holder_that_left_the_group(#[fixtu
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, mut holder) = escaped_holder_tree(crate::ContainMode::Session, false);
+    let (mut child, mut holder) = escaped_holder_tree(crate::ContainMode::Session, false);
     holder.kill_and_wait(&child);
     let other = child.id().expect(crate::test_child::IDENTITY_READ).with_other_value();
-    let _reused = crate::child::fault::force_next_root_read(Resolved::Found(other));
+    let fake = child
+        .proc
+        .script_over(|f| f.number_reads([(Resolved::Found(other), crate::identity::UnknownCause::default())]));
 
     child.kill_tree().expect("every holder was reached");
+    fake.assert_number_reads_exhausted();
 
     assert_eq!(
         groups.killed(),
@@ -478,9 +501,9 @@ fn kill_tree_after_own_wait_of_a_marker_with_a_group_kills_only_the_holders(#[fi
     let groups = record_kill_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, mut holder) = escaped_holder_tree(crate::ContainMode::Session, false);
+    let (mut child, mut holder) = escaped_holder_tree(crate::ContainMode::Session, false);
     holder.kill_and_wait(&child);
-    let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
+    child.proc.number_reads_always(Resolved::Gone);
 
     let err = child
         .kill_tree()
@@ -529,9 +552,9 @@ fn graceful_shutdown_tree_after_own_wait_of_a_marker_with_a_group_signals_only_t
     let termed = record_term_group();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, mut holder) = escaped_holder_tree(crate::ContainMode::Session, true);
+    let (mut child, mut holder) = escaped_holder_tree(crate::ContainMode::Session, true);
     holder.kill_and_wait(&child);
-    let _gone = crate::child::fault::force_root_reads(Resolved::Gone);
+    child.proc.number_reads_always(Resolved::Gone);
 
     let err = child
         .graceful_shutdown_tree(std::time::Duration::ZERO)
@@ -707,12 +730,15 @@ fn kill_tree_of_a_walk_marker_after_own_wait_and_reuse_walks_nothing_and_kills_t
     crate::log_capture::install();
     let walks = crate::containment::treewalk::fault::record_walks();
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
-    let (child, mut holder) = escaped_holder_tree(crate::ContainMode::TreeWalk, false);
+    let (mut child, mut holder) = escaped_holder_tree(crate::ContainMode::TreeWalk, false);
     holder.kill_and_wait(&child);
     let other = child.id().expect(crate::test_child::IDENTITY_READ).with_other_value();
-    let _reused = crate::child::fault::force_next_root_read(Resolved::Found(other));
+    let fake = child
+        .proc
+        .script_over(|f| f.number_reads([(Resolved::Found(other), crate::identity::UnknownCause::default())]));
 
     let result = child.kill_tree();
+    fake.assert_number_reads_exhausted();
 
     assert_eq!(walks.walked(), Vec::<u32>::new(), "no walk from a reaped root's number");
     result.expect("every holder was reached");

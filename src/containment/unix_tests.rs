@@ -275,7 +275,7 @@ mod group_kill_and_terminate {
     use super::super::{fault, kill_group_tree, term_group_tree};
     use crate::containment::dispatch::TreeKillOutcome;
     use crate::containment::{Refusal, TerminateOutcome, Why};
-    use crate::identity::{ProcessId, Resolved};
+    use crate::identity::{ProcessId, Resolved, UnknownCause};
     use crate::signal::RootState;
     use crate::test_support::stated_root::StatedRoot;
 
@@ -293,25 +293,21 @@ mod group_kill_and_terminate {
         Unknown,
     }
 
+    /// The root, with the pid reading as `root` says after an own reap.
     fn stated(root: Root) -> StatedRoot<'static> {
-        StatedRoot::with_state(PGID as u32, move || match root {
+        let other = ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
+        let stated = StatedRoot::with_state(PGID as u32, move || match root {
             Root::Unreaped => RootState::Unreaped,
             Root::ReapedElsewhere => RootState::Reaped { own: false },
             Root::OwnReapGone | Root::OwnReapTaken | Root::OwnReapUnreadable => RootState::Reaped { own: true },
             Root::Unknown => RootState::Unknown(std::sync::Arc::new(std::io::Error::other("a failed peek"))),
-        })
-    }
-
-    /// Arms what the root's pid reads as for `root`, until the guard drops.
-    fn read(root: Root) -> Option<crate::child::fault::ForcedRootReads> {
-        let other = ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
-        let read = match root {
-            Root::OwnReapGone => Resolved::Gone,
-            Root::OwnReapTaken => Resolved::Found(other),
-            Root::OwnReapUnreadable => Resolved::Unknown,
-            _ => return None,
-        };
-        Some(crate::child::fault::force_root_reads(read))
+        });
+        match root {
+            Root::OwnReapGone => stated.holding(|| (Resolved::Gone, UnknownCause::default())),
+            Root::OwnReapTaken => stated.holding(move || (Resolved::Found(other), UnknownCause::default())),
+            Root::OwnReapUnreadable => stated.holding(|| (Resolved::Unknown, UnknownCause::default())),
+            _ => stated,
+        }
     }
 
     /// What a skipped kill or terminate says it did not do, and why.
@@ -350,7 +346,6 @@ mod group_kill_and_terminate {
             Root::OwnReapUnreadable,
             Root::Unknown,
         ] {
-            let _read = read(root);
             let recorder = fault::record_kill_group();
             let outcome = kill_group_tree(PGID, Some(&stated(root))).outcome();
             let sent = recorder.killed();
@@ -380,7 +375,6 @@ mod group_kill_and_terminate {
             Root::OwnReapUnreadable,
             Root::Unknown,
         ] {
-            let _read = read(root);
             let recorder = fault::record_term_group();
             let outcome = term_group_tree(PGID, Some(&stated(root)));
             let sent = recorder.termed();

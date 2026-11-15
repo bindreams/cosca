@@ -127,10 +127,10 @@ fn kill_tree_below_6_9_sends_nothing_to_the_group_after_this_handles_own_reap() 
 fn kill_tree_after_this_handles_own_reap_kills_the_group_through_the_pidfd_while_it_has_a_member(
     #[fixture(pidfd_group_signal)] _group: &Group,
 ) {
-    let (child, member) = root_with_a_member();
+    let (mut child, member) = root_with_a_member();
     kill_own_child(child.pid());
     child.wait().expect("this handle reaps the root");
-    let _gone = crate::child::fault::force_root_reads(crate::identity::Resolved::Gone);
+    child.proc.number_reads_always(crate::identity::Resolved::Gone);
     let capture = Capture::start();
     let result = child.kill_tree();
     let steps = capture.group_steps();

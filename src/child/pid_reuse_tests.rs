@@ -139,14 +139,12 @@ fn kill_tree_after_a_foreign_reap_and_reuse(same_tick: bool) {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let recorder = crate::containment::unix::fault::record_kill_group();
-    let (child, writer) = spawn_group_blocker();
+    let (mut child, writer) = spawn_group_blocker();
     let pid = child.pid();
     drop(writer);
     let reuser = reap_behind_and_reuse(pid);
-    let _read = crate::child::fault::force_root_reads(reuser_id(
-        child.id().expect(crate::test_child::IDENTITY_READ),
-        same_tick,
-    ));
+    let read = reuser_id(child.id().expect(crate::test_child::IDENTITY_READ), same_tick);
+    child.proc.number_reads_always(read);
 
     let mark = crate::log_capture::mark();
     let err = child
@@ -191,12 +189,12 @@ fn terminate_tree_after_a_foreign_reap_and_reuse_body() {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     crate::log_capture::install();
     let recorder = crate::containment::unix::fault::record_term_group();
-    let (child, writer) = spawn_group_blocker();
+    let (mut child, writer) = spawn_group_blocker();
     let pid = child.pid();
     drop(writer);
     let reuser = reap_behind_and_reuse(pid);
-    let _read =
-        crate::child::fault::force_root_reads(reuser_id(child.id().expect(crate::test_child::IDENTITY_READ), false));
+    let read = reuser_id(child.id().expect(crate::test_child::IDENTITY_READ), false);
+    child.proc.number_reads_always(read);
 
     let mark = crate::log_capture::mark();
     let err = child
@@ -235,13 +233,13 @@ in_fresh_pid_ns!(
 fn kill_tree_after_own_wait_and_reuse(same_tick: bool) {
     crate::log_capture::install();
     let recorder = crate::containment::unix::fault::record_kill_group();
-    let (child, writer) = spawn_group_blocker();
+    let (mut child, writer) = spawn_group_blocker();
     let pid = child.pid();
     let reuser_read = reuser_id(child.id().expect(crate::test_child::IDENTITY_READ), same_tick);
     drop(writer);
     child.wait().expect("this handle reaps the root");
     let reuser = crate::test_child::pid_reuse::reuse(pid);
-    let _read = crate::child::fault::force_root_reads(reuser_read);
+    child.proc.number_reads_always(reuser_read);
 
     let mark = crate::log_capture::mark();
     child
@@ -300,13 +298,13 @@ fn graceful_shutdown_tree_after_own_wait_and_reuse_body() {
     crate::log_capture::install();
     let killed = crate::containment::unix::fault::record_kill_group();
     let termed = crate::containment::unix::fault::record_term_group();
-    let (child, writer) = spawn_group_blocker();
+    let (mut child, writer) = spawn_group_blocker();
     let pid = child.pid();
     let reuser_read = reuser_id(child.id().expect(crate::test_child::IDENTITY_READ), false);
     drop(writer);
     let status = child.wait().expect("this handle reaps the root");
     let reuser = crate::test_child::pid_reuse::reuse(pid);
-    let _read = crate::child::fault::force_root_reads(reuser_read);
+    child.proc.number_reads_always(reuser_read);
 
     let mark = crate::log_capture::mark();
     let shut_down = child
@@ -349,13 +347,13 @@ in_fresh_pid_ns!(
 fn terminate_tree_after_own_wait_and_reuse_body() {
     crate::log_capture::install();
     let termed = crate::containment::unix::fault::record_term_group();
-    let (child, writer) = spawn_group_blocker();
+    let (mut child, writer) = spawn_group_blocker();
     let pid = child.pid();
     let reuser_read = reuser_id(child.id().expect(crate::test_child::IDENTITY_READ), false);
     drop(writer);
     child.wait().expect("this handle reaps the root");
     let reuser = crate::test_child::pid_reuse::reuse(pid);
-    let _read = crate::child::fault::force_root_reads(reuser_read);
+    child.proc.number_reads_always(reuser_read);
 
     let mark = crate::log_capture::mark();
     child
@@ -397,12 +395,12 @@ fn graceful_shutdown_tree_after_a_foreign_reap_and_reuse_body() {
     crate::log_capture::install();
     let killed = crate::containment::unix::fault::record_kill_group();
     let termed = crate::containment::unix::fault::record_term_group();
-    let (child, writer) = spawn_group_blocker();
+    let (mut child, writer) = spawn_group_blocker();
     let pid = child.pid();
     drop(writer);
     let reuser = reap_behind_and_reuse(pid);
-    let _read =
-        crate::child::fault::force_root_reads(reuser_id(child.id().expect(crate::test_child::IDENTITY_READ), false));
+    let read = reuser_id(child.id().expect(crate::test_child::IDENTITY_READ), false);
+    child.proc.number_reads_always(read);
 
     let mark = crate::log_capture::mark();
     let err = child

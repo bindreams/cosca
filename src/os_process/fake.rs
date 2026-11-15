@@ -79,6 +79,14 @@ struct Script {
     peeks_always: Option<Box<dyn FnMut() -> PeekAnswer + Send>>,
     /// What a reap answers once `reaps` is empty.
     reaps_always: Option<ReapAnswer>,
+    /// What [`OsChild::number_holder`] answers, one read each. It answers before
+    /// `number_reads_always`.
+    #[cfg(unix)]
+    number_reads: VecDeque<crate::identity::NumberRead>,
+    /// What a read of the number answers once `number_reads` is empty. `None`: such a read goes to
+    /// the real child's, if there is one and no kernel is stated, else through the kernel.
+    #[cfg(unix)]
+    number_reads_always: Option<crate::identity::Resolved<crate::identity::ProcessId>>,
     /// Calls that the repeated answers took.
     repeats: usize,
     /// `exited` and `try_reap` calls: the looks.
@@ -112,6 +120,10 @@ impl FakeProcess {
                 signals: VecDeque::new(),
                 peeks_always: None,
                 reaps_always: None,
+                #[cfg(unix)]
+                number_reads: VecDeque::new(),
+                #[cfg(unix)]
+                number_reads_always: None,
                 repeats: 0,
                 looks: 0,
                 look_times: Vec::new(),
@@ -132,6 +144,38 @@ impl FakeProcess {
             self.0.kernel.set(kernel).is_ok(),
             "FakeProcess: the kernel is stated once"
         );
+        self
+    }
+
+    /// Answer `reads` to successive [`OsChild::number_holder`] calls, one each. Replaces the queue.
+    /// Past them, see [`number_reads_always`](Self::number_reads_always).
+    #[cfg(unix)]
+    pub(crate) fn number_reads(self, reads: impl IntoIterator<Item = crate::identity::NumberRead>) -> Self {
+        self.script().number_reads = reads.into_iter().collect();
+        self
+    }
+
+    /// How many stated [`number_reads`](Self::number_reads) no call has consumed.
+    #[cfg(unix)]
+    pub(crate) fn number_reads_left(&self) -> usize {
+        self.script().number_reads.len()
+    }
+
+    /// Panics unless every stated number read was consumed: a test that states a read asserts it,
+    /// so a read that stopped happening fails.
+    #[cfg(unix)]
+    #[track_caller]
+    pub(crate) fn assert_number_reads_exhausted(&self) {
+        let left = self.number_reads_left();
+        assert_eq!(left, 0, "{left} stated number read(s) were never consumed");
+    }
+
+    /// Answer every [`OsChild::number_holder`] the [`number_reads`](Self::number_reads) queue has
+    /// nothing left for with `read`, no cause. With nothing stated, the real child's or the
+    /// kernel answers.
+    #[cfg(unix)]
+    pub(crate) fn number_reads_always(self, read: crate::identity::Resolved<crate::identity::ProcessId>) -> Self {
+        self.script().number_reads_always = Some(read);
         self
     }
 
@@ -333,6 +377,22 @@ impl OsChild for FakeProcess {
             (None, Some(real)) => real.kernel(),
             (None, None) => panic!("FakeProcess: the kernel was asked past the stated facts"),
         }
+    }
+
+    #[cfg(unix)]
+    fn number_holder(&self, pid: u32) -> crate::identity::NumberRead {
+        let stated = {
+            let mut script = self.script();
+            let always = script.number_reads_always;
+            script
+                .number_reads
+                .pop_front()
+                .or(always.map(|read| (read, crate::identity::UnknownCause::default())))
+        };
+        stated.unwrap_or_else(|| match (self.0.kernel.get(), &self.0.real) {
+            (None, Some(real)) => real.number_holder(pid),
+            _ => crate::identity::ProcessId::of_with(self.kernel(), pid),
+        })
     }
 
     fn kill_refusal(&self) -> KillRefusal {
