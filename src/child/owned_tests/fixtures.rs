@@ -194,14 +194,16 @@ pub(super) fn assert_handed_off(owned: &OwnedChild, token: u64) {
         })
         .is_some_and(|last| last != lock.state);
     // The writes must form a legal sequence from the initial `N`: a `W` never follows a `W` (a
-    // direct write that took a holder's state over, whoever woke first), and nothing follows `E`.
+    // direct write that took a holder's state over, whoever woke first), and nothing follows `Exited`.
     let mut prev = State::N;
     let mut illegal = false;
     for entry in &lock.log {
         if let Logged::Write(next) = entry {
             illegal |= !matches!(
                 (prev, *next),
-                (State::N, State::W { .. }) | (State::N | State::W { .. }, State::E(_)) | (State::W { .. }, State::N)
+                (State::N, State::W { .. })
+                    | (State::N | State::W { .. }, State::Exited(_))
+                    | (State::W { .. }, State::N)
             );
             prev = *next;
         }

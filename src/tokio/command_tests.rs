@@ -54,9 +54,9 @@ fn a_spawn_outside_a_runtime_did_not_start_the_program() {
 }
 
 /// The graceful futures are `Send`, so a caller can `tokio::spawn` them: neither the look at the
-/// root's group nor the hold that keeps its reaps off is in the future's state.
+/// root's group nor the root handle borrowing the child is in the future's state.
 ///
-/// Mutant: a std lock guard held across the future's awaits (fails to compile).
+/// Mutant: a borrow of the child held across the future's awaits (fails to compile).
 #[skuld::test]
 async fn graceful_futures_are_send() {
     fn assert_send<T: Send>(_: T) {}

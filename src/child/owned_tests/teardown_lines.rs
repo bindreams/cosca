@@ -1,6 +1,6 @@
 //! Every line a teardown can log, in one table.
 //!
-//! A teardown ends in one of sixteen ways: what its kill answered (delivered, found nothing to
+//! A teardown ends in one of thirteen ways: what its kill answered (delivered, found nothing to
 //! signal, refused) times what the wait or look after it found. [`rows`] states, once, the clause
 //! each way is said as, for a caller that leaves the child and for one that hands it back. Each
 //! caller then says it as one line, led by its own name: `<label>: <clause>`, at the clause's level.
@@ -12,11 +12,10 @@
 
 use std::io;
 
-use super::teardown::{child_with_an_unreadable_exit, exit, fake, id};
+use super::teardown::{exit, fake, id};
 use crate::child::owned::teardown::{Disposition, TeardownOutcome};
 pub(crate) use crate::child::owned::teardown::{LEAVING_RUNNING, LEFT};
 use crate::child::owned::OwnedChild;
-use crate::error::Error;
 use crate::os_process::child::Foreign;
 use crate::os_process::fake::ReapAnswer;
 use crate::signal::Sent;
@@ -57,8 +56,6 @@ pub(crate) enum Kill {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Found {
     Exited,
-    /// The reap took the zombie and could not read its exit record.
-    Unreadable,
     /// Someone else reaped it.
     ReapedElsewhere,
     /// Launchd holds its zombie.
@@ -98,7 +95,6 @@ pub(crate) fn rows() -> Vec<Row> {
     // What a clause says of a child: the teardown's, after a kill; the look's, after a refused one.
     let after_a_kill = format!("teardown of child {PID}");
     let after_a_refusal = format!("child {PID} could not be terminated ({})", refusal());
-    let unreadable = "the child's exit record was unreadable (si_code 7)";
     let orphaned = "not ours to reap (launchd holds its zombie, because its tracer died)";
     let failed = format!("the wait failed: {}", wait_error());
     let same = |kill, found, level, clause: String| Row {
@@ -127,12 +123,6 @@ pub(crate) fn rows() -> Vec<Row> {
         ),
         same(
             Kill::Delivered,
-            Found::Unreadable,
-            Warn,
-            format!("{after_a_kill}: reaped it after the kill; {unreadable}"),
-        ),
-        same(
-            Kill::Delivered,
             Found::ReapedElsewhere,
             Debug,
             format!("{after_a_kill}: reaped by someone else"),
@@ -153,12 +143,6 @@ pub(crate) fn rows() -> Vec<Row> {
         ),
         same(
             Kill::Nothing,
-            Found::Unreadable,
-            Warn,
-            format!("{after_a_kill}: reaped it; {unreadable}"),
-        ),
-        same(
-            Kill::Nothing,
             Found::ReapedElsewhere,
             Debug,
             format!("{after_a_kill}: reaped by someone else"),
@@ -176,12 +160,6 @@ pub(crate) fn rows() -> Vec<Row> {
             Found::Exited,
             Debug,
             format!("{after_a_refusal}: reaped it"),
-        ),
-        same(
-            Kill::Refused,
-            Found::Unreadable,
-            Warn,
-            format!("{after_a_refusal}: reaped it; {unreadable}"),
         ),
         same(
             Kill::Refused,
@@ -222,18 +200,6 @@ pub(crate) fn outcome(row: &Row, disposition: Disposition) -> TeardownOutcome {
     };
     // A kill is refused for want of permission: the only refusal a teardown over its own handle expects.
     let refused = || io::Error::new(io::ErrorKind::PermissionDenied, REFUSED);
-    if row.found == Found::Unreadable {
-        // A child whose reap read no exit record answers every wait so, and its handle, having reaped
-        // it, sends every kill nothing: `Kill::Nothing` is the only one `tear_down` can be given for
-        // it, so the other two rows enter below `tear_down`, where the kill's answer is the input.
-        let child = child_with_an_unreadable_exit();
-        return match row.kill {
-            // A kill sent elsewhere reached it: the reap that follows.
-            Kill::Delivered => child.reap_after_tree_kill(&child.teardown_subject(), disposition, None),
-            Kill::Nothing => child.tear_down(Some(id()), kill, None),
-            Kill::Refused => child.look_after_refused_kill(Some(id()), Error::Io(refused()), disposition),
-        };
-    }
     let signal = match row.kill {
         Kill::Delivered => Ok(Sent::Delivered),
         Kill::Nothing => Ok(Sent::Gone),
@@ -249,12 +215,11 @@ pub(crate) fn outcome(row: &Row, disposition: Disposition) -> TeardownOutcome {
 /// What the wait or look of `found` answers.
 fn reap_answer(found: Found) -> ReapAnswer {
     match found {
-        Found::Exited => ReapAnswer::Reaped(exit()),
+        Found::Exited => ReapAnswer::Exited(exit()),
         Found::ReapedElsewhere => ReapAnswer::Foreign(Foreign::Gone),
         Found::Orphaned => ReapAnswer::Foreign(Foreign::Orphaned),
         Found::WaitFailed => ReapAnswer::Err(io::ErrorKind::Other),
         Found::Running => ReapAnswer::Running,
-        Found::Unreadable => unreachable!("the unreadable rows build their own child"),
     }
 }
 
@@ -263,10 +228,7 @@ fn reap_answer(found: Found) -> ReapAnswer {
 /// `subject`. It sends the child nothing: the kill was sent elsewhere.
 pub(crate) fn outcome_after_a_tree_kill(row: &Row, subject: &str, disposition: Disposition) -> TeardownOutcome {
     assert_eq!(row.kill, Kill::Delivered, "a tree kill reached the child");
-    let child = match row.found {
-        Found::Unreadable => child_with_an_unreadable_exit(),
-        found => OwnedChild::new(Box::new(fake().reaps([reap_answer(found)]))),
-    };
+    let child = OwnedChild::new(Box::new(fake().reaps([reap_answer(row.found)])));
     child.reap_after_tree_kill(subject, disposition, None)
 }
 

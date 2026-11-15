@@ -7,22 +7,23 @@ use std::time::{Duration, Instant};
 use super::holder::HolderGuard;
 use super::{ChildWaitOutcome, Guard, OwnedChild, State};
 use crate::error::Error;
-use crate::os_process::child::{PeekOutcome, TryReapOutcome};
+use crate::os_process::child::{PeekOutcome, TryObserveOutcome};
 use crate::os_process::drive::{run, RunOutcome, Step, Waitable};
 
 impl OwnedChild {
-    /// Block until the child has exited and this handle has reaped it, or `deadline` passes
-    /// ([`ChildWaitOutcome::DeadlinePassed`], after one final look; `None`: for ever). Never reports
-    /// `DeadlinePassed` before `crate::wait::now()` reaches `deadline`. A deadline already passed
-    /// is one look: reaping when nobody holds the wait, and a peek that reaps nothing when another
-    /// thread does.
+    /// Block until the child has exited and this handle has seen its exit record, or `deadline`
+    /// passes ([`ChildWaitOutcome::DeadlinePassed`], after one final look; `None`: for ever). Never
+    /// reports `DeadlinePassed` before `crate::wait::now()` reaches `deadline`. A deadline already
+    /// passed is one look, taken by this call when nobody holds the wait and a peek when another
+    /// thread does. **Reaps nothing**: the zombie stays until the handle drops (see
+    /// [`OwnedChild`]'s `Drop`), so the root's number stays pinned.
     pub(crate) fn wait(&self, deadline: Option<Instant>) -> Result<ChildWaitOutcome, Error> {
         let mut lock = self.lock();
         #[cfg(test)]
         let mut check = crate::wait::test_clock::RoundCheck::new("OwnedChild::wait");
         loop {
             match lock.state {
-                State::E(record) => return Ok(ChildWaitOutcome::Exited(record)),
+                State::Exited(record) => return Ok(ChildWaitOutcome::Exited(record)),
                 State::N => return self.hold_and_wait(lock, deadline),
                 // Another thread is the holder: block on the `Condvar`, re-dispatch on every wake.
                 State::W { .. } => {
@@ -80,24 +81,24 @@ impl OwnedChild {
             RunOutcome::DeadlinePassed => ChildWaitOutcome::DeadlinePassed,
         };
         drop(holder);
-        if let ChildWaitOutcome::Exited(record) = outcome {
-            #[cfg(test)]
-            super::seams::park_after_reap_recorded();
-            self.log_unreadable(record);
+        #[cfg(test)]
+        if matches!(outcome, ChildWaitOutcome::Exited(_)) {
+            super::seams::park_after_exit_recorded();
         }
         Ok(outcome)
     }
 
-    /// [`wait`](OwnedChild::wait) with no deadline, awaited: reaps through [`crate::tokio::drive::run`].
-    /// `&mut self` means no other holder or waiter exists, so the state is written through
-    /// `Mutex::get_mut`, with no lock and no wake. A dropped future leaves the state `N`: a record
-    /// is written only by the look that reaps, and the future ends in the same poll.
+    /// [`wait`](OwnedChild::wait) with no deadline, awaited: observes through
+    /// [`crate::tokio::drive::run`]. `&mut self` means no other holder or waiter exists, so the
+    /// state is written through `Mutex::get_mut`, with no lock and no wake. A dropped future leaves
+    /// the state `N`: a record is written only by the look that sees it, and the future ends in the
+    /// same poll.
     #[cfg(feature = "tokio")]
     pub(crate) async fn wait_async(&mut self) -> Result<ChildWaitOutcome, Error> {
-        if let State::E(record) = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner).state {
+        if let State::Exited(record) = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner).state {
             return Ok(ChildWaitOutcome::Exited(record));
         }
-        let outcome = match crate::tokio::drive::run(&mut AsyncReap(self), None).await? {
+        let outcome = match crate::tokio::drive::run(&mut AsyncObserve(self), None).await? {
             RunOutcome::Done(outcome) => outcome,
             RunOutcome::DeadlinePassed => ChildWaitOutcome::DeadlinePassed,
         };
@@ -105,32 +106,32 @@ impl OwnedChild {
             !matches!(outcome, ChildWaitOutcome::DeadlinePassed),
             "an unbounded wait ended with no exit"
         );
-        if let ChildWaitOutcome::Exited(record) = outcome {
-            self.log_unreadable(record);
-        }
         Ok(outcome)
     }
 }
 
-/// What a [`try_reap`](crate::os_process::child::OsChild::try_reap) answer means for the state, and
-/// for the loop: the state to write (`None`: leave it), and the step. Shared by the holder and
-/// [`OwnedChild::wait_async`], which differ in how they write the state.
-fn reap_step(outcome: TryReapOutcome<'_>) -> (Option<State>, Step<'_, ChildWaitOutcome>) {
+/// What a [`try_observe`](crate::os_process::child::OsChild::try_observe) answer means for the
+/// state, and for the loop: the state to write (`None`: leave it), and the step. Shared by the
+/// holder and [`OwnedChild::wait_async`], which differ in how they write the state.
+fn observe_step(outcome: TryObserveOutcome<'_>) -> (Option<State>, Step<'_, ChildWaitOutcome>) {
     match outcome {
-        TryReapOutcome::Reaped(record) => (Some(State::E(record)), Step::Done(ChildWaitOutcome::Exited(record))),
-        TryReapOutcome::Foreign(foreign) => (Some(State::N), Step::Done(ChildWaitOutcome::Foreign(foreign))),
-        TryReapOutcome::Recheck => (None, Step::Recheck),
-        TryReapOutcome::Running(wait_for) => (None, Step::Wait(wait_for)),
+        TryObserveOutcome::Exited(record) => (
+            Some(State::Exited(record)),
+            Step::Done(ChildWaitOutcome::Exited(record)),
+        ),
+        TryObserveOutcome::Foreign(foreign) => (Some(State::N), Step::Done(ChildWaitOutcome::Foreign(foreign))),
+        TryObserveOutcome::Recheck => (None, Step::Recheck),
+        TryObserveOutcome::Running(wait_for) => (None, Step::Wait(wait_for)),
     }
 }
 
-/// The wait loop of [`OwnedChild::wait_async`], for [`crate::tokio::drive::run`]: each look reaps if
-/// there is a record. Nothing is locked.
+/// The wait loop of [`OwnedChild::wait_async`], for [`crate::tokio::drive::run`]: each look
+/// observes the exit record if there is one. Nothing is locked.
 #[cfg(feature = "tokio")]
-struct AsyncReap<'c>(&'c mut OwnedChild);
+struct AsyncObserve<'c>(&'c mut OwnedChild);
 
 #[cfg(feature = "tokio")]
-impl Waitable for AsyncReap<'_> {
+impl Waitable for AsyncObserve<'_> {
     type Output = ChildWaitOutcome;
 
     fn look(&mut self) -> Result<Step<'_, ChildWaitOutcome>, Error> {
@@ -141,7 +142,7 @@ impl Waitable for AsyncReap<'_> {
             "a holder exists though the handle is borrowed mutably: {:?}",
             inner.state
         );
-        let (state, step) = reap_step(os.try_reap()?);
+        let (state, step) = observe_step(os.try_observe()?);
         if let Some(state) = state {
             inner.set(state);
         }
@@ -149,7 +150,7 @@ impl Waitable for AsyncReap<'_> {
     }
 }
 
-/// The holder's wait loop, for [`run`]: each look reaps if there is a record, and the wait it
+/// The holder's wait loop, for [`run`]: each look observes an exit if there is one; the wait it
 /// returns, or the recheck pause, runs with the lock released.
 struct Holder<'c> {
     child: &'c OwnedChild,
@@ -178,8 +179,8 @@ impl<'c> Waitable for Holder<'c> {
         let child: &'c OwnedChild = self.child;
         // Re-read the state before acting on a look.
         self.guard().relock();
-        // Nothing between the reap and the state write may panic.
-        let (state, step) = reap_step(child.os.try_reap()?);
+        // A panic here would lose the record just observed.
+        let (state, step) = observe_step(child.os.try_observe()?);
         match state {
             Some(state) => self.finish(state),
             None => self.guard().unlock(),

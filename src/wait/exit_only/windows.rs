@@ -7,7 +7,7 @@ use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-use super::{Reap, Target};
+use super::Target;
 use crate::os_process::child::{ExitRecord, PeekOutcome};
 
 fn handle<'a>(target: &Target<'a>) -> BorrowedHandle<'a> {
@@ -39,13 +39,5 @@ pub(super) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
             "WaitForSingleObject on our own process handle returned {r:?}: {e}"
         );
         Err(e)
-    }
-}
-
-pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
-    match peek(target)? {
-        PeekOutcome::Exit(record) => Ok(Reap::Reaped(record)),
-        PeekOutcome::Running => Ok(Reap::Running),
-        PeekOutcome::Foreign(f) => Ok(Reap::Foreign(f)),
     }
 }

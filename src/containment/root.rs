@@ -33,20 +33,6 @@ pub(crate) trait Root {
         self.state()
     }
 
-    /// Who holds the root's number now, and why it could not be read when the read knows. Asked only
-    /// when the state is `Reaped { own: true }`; the default is a debug-asserted breach.
-    #[cfg(unix)]
-    fn number_holder(&self) -> crate::identity::NumberRead {
-        debug_assert!(
-            false,
-            "the number of a root that never answers `Reaped {{ own: true }}` was read"
-        );
-        (
-            crate::identity::Resolved::Unknown,
-            crate::identity::UnknownCause::default(),
-        )
-    }
-
     /// Linux: the root's pidfd, if it has one. A send through it with `PIDFD_SIGNAL_PROCESS_GROUP`
     /// names the group exactly: the kernel resolves it from the pidfd's process, never from a number.
     #[cfg(target_os = "linux")]
@@ -85,10 +71,6 @@ impl Root for Seen<'_> {
 
     fn look_state(&self) -> RootState {
         self.look.clone()
-    }
-
-    fn number_holder(&self) -> crate::identity::NumberRead {
-        self.root.number_holder()
     }
 
     #[cfg(target_os = "linux")]
@@ -173,14 +155,6 @@ fn probe_error(errno: i32) -> Error {
 #[derive(Debug)]
 #[cfg_attr(not(unix), allow(dead_code, reason = "only Unix sends by the root's pid"))]
 pub(crate) enum Refusal {
-    /// This handle reaped the root, and its pid names no process: it may be taken, and lead a
-    /// group, once the root's group has no member.
-    ReapedPidGone(RawPid),
-    /// This handle reaped the root, and another process holds its pid.
-    ReapedPidTaken(RawPid),
-    /// This handle reaped the root, and its pid could not be read; carries the read's error when it
-    /// names one.
-    ReapedPidUnread(RawPid, Option<std::sync::Arc<Error>>),
     /// Something else reaped the root.
     ReapedElsewhere(RawPid),
     /// The root's handle could not say whether it was reaped.
@@ -192,16 +166,6 @@ pub(crate) enum Refusal {
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Refusal::ReapedPidGone(pid) => {
-                write!(f, "this handle reaped the root, and its pid ({pid}) names no process")
-            }
-            Refusal::ReapedPidTaken(pid) => write!(
-                f,
-                "this handle reaped the root, and another process holds its pid ({pid})"
-            ),
-            Refusal::ReapedPidUnread(pid, _) => {
-                write!(f, "this handle reaped the root, and its pid ({pid}) could not be read")
-            }
             Refusal::ReapedElsewhere(pid) => write!(f, "the root (pid {pid}) was reaped elsewhere"),
             Refusal::Unsure(pid, _) => write!(
                 f,
@@ -213,11 +177,10 @@ impl std::fmt::Display for Refusal {
 }
 
 impl std::error::Error for Refusal {
-    /// The error of a handle that could not say, or of a pid that could not be read.
+    /// The error of a handle that could not say.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Refusal::Unsure(_, e) => Some(&**e),
-            Refusal::ReapedPidUnread(_, read) => read.as_deref().map(|e| e as &(dyn std::error::Error + 'static)),
             _ => None,
         }
     }
@@ -225,11 +188,10 @@ impl std::error::Error for Refusal {
 
 #[cfg(unix)]
 impl Refusal {
-    /// The handle's error, shared ([`crate::error::shared_io`]), or the pid read's.
+    /// The handle's error, shared ([`crate::error::shared_io`]).
     pub(crate) fn cause(&self) -> Option<std::sync::Arc<crate::error::Error>> {
         match self {
             Refusal::Unsure(_, e) => Some(crate::error::shared_io_cause(e)),
-            Refusal::ReapedPidUnread(_, read) => read.clone(),
             _ => None,
         }
     }
@@ -250,23 +212,14 @@ impl Refusal {
     }
 }
 
-/// Whether `root`'s pid still names its process group, from `state`, the root's own handle's answer,
-/// and for a root this handle reaped, the pid's own read ([`Root::number_holder`]). `Ok` only while
-/// the root is unreaped.
+/// Whether `root`'s pid still names its process group, from `state`, the root's own handle's answer.
+/// `Ok` only while the root is unreaped.
 #[cfg(unix)]
 pub(crate) fn number_holds(root: &dyn Root, state: RootState) -> Result<(), Refusal> {
-    use crate::identity::Resolved;
     let pid = root.pid();
     match state {
         RootState::Unreaped => Ok(()),
-        RootState::Reaped { own: true } => Err(match root.number_holder() {
-            (Resolved::Gone, _) => Refusal::ReapedPidGone(pid),
-            (Resolved::Found(_), _) => Refusal::ReapedPidTaken(pid),
-            (Resolved::Unknown, cause) => {
-                Refusal::ReapedPidUnread(pid, cause.into_error(&format!("pid {pid}")).map(std::sync::Arc::new))
-            }
-        }),
-        RootState::Reaped { own: false } => Err(Refusal::ReapedElsewhere(pid)),
+        RootState::Reaped => Err(Refusal::ReapedElsewhere(pid)),
         RootState::Unknown(e) => Err(Refusal::Unsure(pid, e)),
         RootState::Unpinned => Err(Refusal::Unpinned(pid)),
     }
@@ -281,10 +234,6 @@ pub(crate) enum NumberLook {
     /// macOS: the root is `Unpinned` or `Unknown`, so only what names the tree by identity is sent.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code, reason = "only macOS reports it"))]
     Untrusted(RootState),
-    /// This handle reaped the root, and its group is empty or it had none: another process holds
-    /// the pid, and the kernel does not reissue a pid while it is some group's id, or the pid of a
-    /// group-less fd marker's root names nothing. Only the marker holders, if any, are signalled.
-    Empty,
     /// The pid may name another process, for `refusal`'s reason. `exact_root` (Linux): the root's
     /// handle still reaches the root exactly, if it reaches it at all. `probe` (Linux 6.9+): the errno
     /// of the group probe that failed and left the look to the refusal, a cause beside the refusal's
@@ -300,14 +249,10 @@ pub(crate) enum NumberLook {
     GroupGone,
 }
 
-/// [`NumberLook`] from one read of `root`'s state. `has_group`: the mechanism names a process group
-/// by the number (an fd marker's mode may make none). A pid another process holds, after this
-/// handle's own reap, means the group is empty; a pid that names no process may be taken once the
-/// group has no member, so nothing is sent by it, except that a marker with no group has none to
-/// skip. A group whose root's pid may name another process is decided again by the root's pidfd
-/// on Linux 6.9+ ([`through_the_pidfd`]).
+/// [`NumberLook`] from one read of `root`'s state. A group whose root's pid may name another
+/// process is decided again by the root's pidfd on Linux 6.9+ ([`through_the_pidfd`]).
 #[cfg(unix)]
-pub(crate) fn look(root: &dyn Root, has_group: bool) -> NumberLook {
+pub(crate) fn look(root: &dyn Root) -> NumberLook {
     let state = root.look_state();
     #[cfg(target_os = "macos")]
     if matches!(state, RootState::Unpinned | RootState::Unknown(_)) {
@@ -316,8 +261,6 @@ pub(crate) fn look(root: &dyn Root, has_group: bool) -> NumberLook {
     let handle_unsure = matches!(state, RootState::Unknown(_));
     match number_holds(root, state) {
         Ok(()) => NumberLook::Trusted,
-        Err(Refusal::ReapedPidTaken(_)) => NumberLook::Empty,
-        Err(Refusal::ReapedPidGone(_)) if !has_group => NumberLook::Empty,
         Err(refusal) => {
             debug_assert!(
                 cfg!(target_os = "macos") || !matches!(refusal, Refusal::Unpinned(_)),

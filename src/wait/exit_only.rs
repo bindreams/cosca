@@ -3,7 +3,8 @@
 //!
 //! - [`peek`] looks without consuming: a non-blocking `waitid(WEXITED | WNOHANG | WNOWAIT)` on
 //!   Unix, `WaitForSingleObject(h, 0)` on Windows.
-//! - [`try_reap`] peeks, then consumes only an exit record.
+//! - [`try_reap`] (Unix) peeks, then consumes only an exit record. It is the end of a child's handle:
+//!   a waiter's look is the peek.
 //!
 //! An exit record is an `si_code` of `CLD_EXITED`, `CLD_KILLED` or `CLD_DUMPED`. A ptrace stop
 //! (`CLD_TRAPPED`) reaches the tracer whatever the options say, and a consuming `waitid` clears
@@ -19,6 +20,7 @@ use std::process::ExitStatus;
 
 #[cfg(not(target_os = "linux"))]
 use crate::os_process::child::PeekOutcome;
+#[cfg(unix)]
 use crate::os_process::child::{ExitRecord, Foreign};
 
 #[cfg(target_os = "linux")]
@@ -54,15 +56,12 @@ pub(crate) mod macos_tests;
 pub(crate) mod seams;
 
 /// What [`try_reap`] did.
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reap {
     Reaped(ExitRecord),
     /// Nothing to consume: not exited, or (Linux) a zombie only its tracer sees.
     Running,
-    #[cfg_attr(
-        windows,
-        allow(dead_code, reason = "a process handle pins its process: no foreign reap")
-    )]
     Foreign(Foreign),
 }
 
@@ -142,7 +141,9 @@ pub(crate) fn peek_traced(target: &Target<'_>) -> io::Result<(PeekOutcome, Optio
     backend::peek_holder(target, false)
 }
 
-/// [`peek`], then consume `target`'s exit record if it has one.
+/// [`peek`], then consume `target`'s exit record if it has one. Unix only: Windows has no record to
+/// consume, and the peek is the whole look.
+#[cfg(unix)]
 pub(crate) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     backend::try_reap(target)
 }

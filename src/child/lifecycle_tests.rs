@@ -461,10 +461,6 @@ mod settlement {
         Ok(ChildWaitOutcome::Exited(ExitRecord::Status(ExitStatus::default())))
     }
 
-    fn unreadable() -> Result<ChildWaitOutcome, Error> {
-        Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 }))
-    }
-
     fn foreign(foreign: Foreign) -> Result<ChildWaitOutcome, Error> {
         Ok(ChildWaitOutcome::Foreign(foreign))
     }
@@ -519,31 +515,6 @@ mod settlement {
                     (log::Level::Debug, said.to_owned()),
                     "{killed}"
                 );
-            }
-        }
-    }
-
-    /// An exit whose record was unreadable was reaped, whether or not a kill reached it: the
-    /// consuming reap took the zombie. Only a kill that reached it is "after the kill".
-    ///
-    /// Mutants: the fate is `Killed` after a kill, or `Unknown`; it is uncollected; it is a front
-    /// unaccounted for; the wording says "after the kill" without one.
-    #[skuld::test]
-    fn an_unreadable_exit_is_reaped_and_warned_of() {
-        for (killed, said) in [
-            (
-                false,
-                "S: reaped it; the child's exit record was unreadable (si_code 7)",
-            ),
-            (
-                true,
-                "S: reaped it after the kill; the child's exit record was unreadable (si_code 7)",
-            ),
-        ] {
-            let settlement = Settlement::new(unreadable(), killed);
-            assert_row(&settlement, ChildFate::Reaped, false, FrontFate::Reaped);
-            for disposition in EVERY {
-                assert_eq!(worded(&settlement, disposition), (log::Level::Warn, said.to_owned()));
             }
         }
     }
@@ -667,15 +638,13 @@ mod settlement {
         }
     }
 
-    /// `ended` is every answer but a deadline that passed, and `status` the status of an exit whose
-    /// record was read.
+    /// `ended` is every answer but a deadline that passed, and `status` the status of an exit.
     ///
-    /// Mutants: `ended` reads the fate; an unreadable record has a status.
+    /// Mutant: `ended` reads the fate.
     #[skuld::test]
     fn ended_and_status_state_the_answer() {
         for (settlement, ended, status) in [
             (Settlement::new(exited(), false), true, Some(ExitStatus::default())),
-            (Settlement::new(unreadable(), false), true, None),
             (Settlement::new(foreign(Foreign::Gone), true), true, None),
             (Settlement::new(failed(), false), true, None),
             (Settlement::new(passed(), false), false, None),
@@ -704,7 +673,7 @@ mod settlement {
         assert_eq!(failures.iter().len(), 1, "{failures:?}");
         assert_eq!(crate::error::said(&**failures.first()), step);
 
-        for answer in [passed(), foreign(Foreign::Gone), unreadable()] {
+        for answer in [passed(), foreign(Foreign::Gone)] {
             assert!(Settlement::new(answer, false).failure().is_none());
         }
         assert!(outcome(passed()).remains().failures.is_none());
@@ -762,4 +731,40 @@ mod settlement {
         let built = std::panic::catch_unwind(|| Settlement::new(passed(), true));
         assert!(built.is_err(), "a deadline cannot pass in an unbounded wait");
     }
+}
+
+/// A wait never hands back an unreadable exit record (only the consuming reap at the end of a
+/// handle can meet one), so a debug build asserts it.
+///
+/// Mutant: the arm answers an error in a debug build too.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "which is no exit record")]
+fn an_unreadable_record_from_a_wait_asserts_in_debug() {
+    use super::{status_of_outcome, Orphaned};
+    use crate::child::owned::ChildWaitOutcome;
+    use crate::os_process::child::ExitRecord;
+
+    let outcome = ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 });
+    drop(status_of_outcome(Some(1), outcome, Orphaned::Quiet));
+}
+
+/// The same record in a release build is an `InvalidData` error that names the code, not a panic
+/// in a public call.
+///
+/// Mutant: the arm panics, or answers a status or a different kind.
+#[cfg(not(debug_assertions))]
+#[skuld::test]
+fn an_unreadable_record_from_a_wait_is_invalid_data_in_release() {
+    use super::{status_of_outcome, Orphaned};
+    use crate::child::owned::ChildWaitOutcome;
+    use crate::error::Error;
+    use crate::os_process::child::ExitRecord;
+
+    let outcome = ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 });
+    let Err(Error::Io(e)) = status_of_outcome(Some(1), outcome, Orphaned::Quiet) else {
+        panic!("an unreadable record is an I/O error");
+    };
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    assert!(e.to_string().contains("si_code 7"), "{e}");
 }

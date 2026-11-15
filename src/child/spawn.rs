@@ -189,14 +189,12 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     let mut skipped = None;
     let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
     let kill_tree = || {
-        // The handle owns the child outright here, so no reap can land.
-        let held = child.proc.hold(child.pid());
+        let root_handle = child.proc.hold(child.pid());
         // The cleanup sends only: its waits are the root's and the leaf's own.
         let kill = {
-            let seen = crate::containment::Seen::new(&held, view.look());
+            let seen = crate::containment::Seen::new(&root_handle, view.look());
             child.tree.send_kill(Some(&seen))
         };
-        drop(held);
         kill.log_skip(&view);
         kill
     };
@@ -429,18 +427,15 @@ fn root_after_a_delivered_kill(
 }
 
 /// What [`finish_elevated`] says of a root whose kill was refused, which `refusal` states, once the
-/// one look at it ended as `looked` says (`None`: it did not end). A root the look collected is said as the look showed
-/// it, with an unreadable exit record appended; another answer is worded as [`Settlement::wording`] words it,
+/// one look at it ended as `looked` says (`None`: it did not end). A root the look found exited is said
+/// as the look showed it; another answer is worded as [`Settlement::wording`] words it,
 /// after the refusal; a root still running is the refusal alone. The note says where the root goes:
 /// the clause does not.
 #[cfg(unix)]
 fn root_after_a_refused_kill(refusal: String, looked: Option<&Settlement>) -> String {
     match looked {
         Some(settlement) if matches!(settlement.fate(None), ChildFate::Reaped) => {
-            let unreadable = settlement
-                .unreadable_record()
-                .map_or(String::new(), |why| format!("; {why}"));
-            format!("{refusal}: it has exited, and was reaped{unreadable}")
+            format!("{refusal}: it has exited, and was reaped")
         }
         Some(settlement) => settlement.wording(&refusal, None, None).text().to_owned(),
         None => refusal,

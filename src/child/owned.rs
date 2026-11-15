@@ -1,21 +1,22 @@
 //! The parent's policy over its child, written once: concurrent `wait` and `signal` on one spawned
-//! child from any number of threads, reap once, "already reaped is gone", and holding off reaps across
-//! a check-then-send. The OS part is an [`OsChild`], which states what the OS says now.
+//! child from any number of threads, reap once, and "already reaped is gone". The OS part is an
+//! [`OsChild`], which states what the OS says now.
 //!
-//! **The handle never reaps at adoption, and never blocks in a reap.** Every reap is a look through
-//! [`OsChild::try_reap`], taken by the one waiter that holds the wait, and it never blocks: a
-//! non-blocking `waitid`, only of an exit record, on the pidfd (Linux) or the pid (macOS); on Windows
-//! there is nothing to consume, and the reap reads the signalled process handle's exit code (see
-//! [`crate::wait::exit_only`]). A child that this process traces is therefore never taken for exited
-//! when it merely stops.
+//! **The handle never reaps at adoption, never reaps in a wait, and never blocks in a reap.** A wait
+//! is a look through [`OsChild::try_observe`], taken by the one waiter that holds the wait, and it
+//! never blocks and never consumes (see [`crate::wait::exit_only`]). A child that this
+//! process traces is therefore never taken for exited when it merely stops. The one reap is the
+//! handle's `Drop` (unix), which consumes the exit record with a non-blocking
+//! [`OsChild::try_reap`], so a root whose exit a wait has seen stays a zombie that pins its number
+//! (a process group's, a session's) until the handle ends.
 //!
 //! # States
 //!
 //! `N` (nobody is waiting), `W { token }` (one thread, the *holder*, runs the wait loop) and
-//! `E(record)` (the exit record is cached, the child is reaped). Only the holder looks with
-//! `try_reap` and waits on what the look returned, or pauses for a recheck, with the lock released
-//! for both; every other waiter blocks on the [`Condvar`] and re-dispatches on each wake. While `W`
-//! is held, only the holder reaps.
+//! `Exited(record)` (the exit was observed and the record is cached; the zombie is still this
+//! process's). Only the holder looks with `try_observe` and waits on what the look returned, or
+//! pauses for a recheck, with the lock released for both; every other waiter blocks on the
+//! [`Condvar`] and re-dispatches on each wake. While `W` is held, only the holder looks.
 //!
 //! - Every lock is taken poison-tolerantly (`lock().unwrap_or_else(PoisonError::into_inner)`),
 //!   `Condvar` results included. `Debug` alone uses `try_lock`.
@@ -61,8 +62,9 @@ enum State {
     N,
     /// The thread that drew `token` is the holder, running the wait loop.
     W { token: u64 },
-    /// Reaped: the exit record is cached.
-    E(ExitRecord),
+    /// The exit was observed and the record is cached. The zombie is not consumed: it stays this
+    /// process's, pinning the child's number, until the handle drops.
+    Exited(ExitRecord),
 }
 
 struct Inner {
@@ -131,7 +133,8 @@ impl Drop for Guard<'_> {
 /// How a wait on a child ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChildWaitOutcome {
-    /// The child's exit record: this handle reaped it, now or earlier.
+    /// The child's exit record: this handle's wait saw it, now or earlier; the zombie stays until the
+    /// handle drops.
     Exited(ExitRecord),
     /// The child is not this process's to reap.
     Foreign(Foreign),
@@ -257,14 +260,23 @@ impl OwnedChild {
         None
     }
 
-    /// Whether this handle's own wait has recorded the reap, read under the lock. A reap by
-    /// someone else is not seen here.
-    pub(crate) fn is_reaped(&self) -> bool {
-        matches!(self.lock().state, State::E(_))
+    /// Whether this handle's own wait has recorded the exit, read under the lock. The zombie itself
+    /// is consumed only when the handle drops.
+    pub(crate) fn exit_seen(&self) -> bool {
+        matches!(self.lock().state, State::Exited(_))
     }
 
-    /// What a peek through the child's own handle shows (the exit record once this handle has reaped
-    /// it), without reaping; see [`ReapHold::peek`], which does the same under a hold.
+    /// Whether the handle's end consumes the root's exit as it is now, which [`Drop`] decides by the
+    /// same rule. Windows keeps no zombie to consume.
+    pub(crate) fn consumes_at_drop(&self) -> bool {
+        #[cfg(unix)]
+        return self.drop_consumes(self.exit_seen());
+        #[cfg(not(unix))]
+        true
+    }
+
+    /// What a peek through the child's own handle shows (the exit record once this handle's wait
+    /// has seen it), without reaping.
     pub(crate) fn peek(&self) -> Result<PeekOutcome, Error> {
         self.peek_locked(&self.lock())
     }
@@ -308,33 +320,29 @@ impl OwnedChild {
         })
     }
 
-    /// Whether the root is still this handle's child to act on, from the handle's own evidence; see
-    /// [`ReapHold::state`].
+    /// Whether the root is still this handle's child to act on, from the handle's own evidence: always
+    /// the OS's own answer. A root whose exit this handle saw is an unreaped zombie of ours, which
+    /// reads `Unreaped` as any zombie does, and a reaper elsewhere that took it since reads as a
+    /// foreign reap.
+    ///
+    /// A peek through the handle decides (Linux: the pidfd; macOS: the pid, checked against its
+    /// unique id, with an unreadable id on a running child an error).
     #[cfg(unix)]
     pub(crate) fn state(&self) -> crate::signal::RootState {
-        self.state_locked(&self.lock())
+        crate::signal::RootState::of_peek(self.os.peek().map_err(Error::into_io))
     }
 
-    /// [`state`](Self::state), under `lock`.
+    /// The drop's rule: it consumes where the consume names the child exactly, and otherwise only
+    /// an exit this handle's wait saw (`seen`).
     #[cfg(unix)]
-    fn state_locked(&self, lock: &Guard<'_>) -> crate::signal::RootState {
-        use crate::signal::RootState;
-        if matches!(lock.state, State::E(_)) {
-            return RootState::Reaped { own: true };
-        }
-        RootState::of_peek(self.os.peek().map_err(Error::into_io))
+    fn drop_consumes(&self, seen: bool) -> bool {
+        seen || self.os.exact_consume()
     }
 
     /// See [`OsChild::number_holder`].
     #[cfg(unix)]
     pub(crate) fn number_holder(&self, pid: u32) -> crate::identity::NumberRead {
         self.os.number_holder(pid)
-    }
-
-    /// Whether this thread holds the lock. Tests only.
-    #[cfg(all(unix, test))]
-    pub(crate) fn is_held_by_current_thread(&self) -> bool {
-        *self.owner.lock().unwrap_or_else(PoisonError::into_inner) == Some(std::thread::current().id())
     }
 
     fn lock(&self) -> Guard<'_> {
@@ -348,14 +356,7 @@ impl OwnedChild {
                 "self-deadlock: this thread locked an OwnedChild it already holds"
             );
             drop(owner);
-            let guard = match self.inner.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    seams::lock_contended();
-                    self.inner.lock().unwrap_or_else(PoisonError::into_inner)
-                }
-            };
+            let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
             *self.owner.lock().unwrap_or_else(PoisonError::into_inner) = Some(me);
             Guard {
                 guard: Some(guard),
@@ -419,16 +420,12 @@ impl OwnedChild {
 // Signals and holds =====
 
 impl OwnedChild {
-    /// Send `sig` to the child: [`Sent::Gone`] once this handle has reaped it, and otherwise what
-    /// the OS says, with a refused send's bare errno. Under the lock, so none of our reaps lands
-    /// between the check and the send.
+    /// Send `sig` to the child: [`Sent::Gone`] once this handle has seen it exit (an exit is
+    /// permanent, and a zombie acts on no signal), and otherwise what the OS says, with a refused
+    /// send's bare errno. Under the lock, so the state read and the send are one step.
     pub(crate) fn signal(&self, sig: Sig) -> Result<Sent, Error> {
-        self.signal_locked(&self.lock(), sig)
-    }
-
-    /// [`signal`](Self::signal), under `lock`.
-    fn signal_locked(&self, lock: &Guard<'_>, sig: Sig) -> Result<Sent, Error> {
-        if matches!(lock.state, State::E(_)) {
+        let lock = self.lock();
+        if matches!(lock.state, State::Exited(_)) {
             return Ok(Sent::Gone);
         }
         self.os.signal(sig)
@@ -437,7 +434,7 @@ impl OwnedChild {
     /// The exit record or the foreign verdict a peek sees, without reaping, under `lock`.
     fn peek_locked(&self, lock: &Guard<'_>) -> Result<PeekOutcome, Error> {
         match lock.state {
-            State::E(record) => Ok(PeekOutcome::Exit(record)),
+            State::Exited(record) => Ok(PeekOutcome::Exit(record)),
             State::N | State::W { .. } => self.os.peek(),
         }
     }
@@ -455,115 +452,105 @@ impl OwnedChild {
         crate::os_process::drive::exited_until(&*self.os, deadline)
     }
 
-    /// Hold off this handle's reaps (every reap is taken under its lock) until the result drops:
-    /// what it reads and sends meanwhile is one step to a `wait` on another thread. Nothing that locks the
-    /// handle may be called while it is held.
-    #[cfg(unix)]
-    pub(crate) fn hold(&self, pid: u32) -> ReapHold<'_> {
-        ReapHold {
-            child: self,
-            pid,
-            lock: self.lock(),
-        }
+    /// The root `pid` of a tree call, which reads this handle's evidence and sends through it.
+    pub(crate) fn hold(&self, pid: u32) -> RootHandle<'_> {
+        RootHandle { child: self, pid }
     }
 
-    /// A contract breach after the `E` write: a consuming reap handed back a record that is not
-    /// an exit. The state is already `E`, so this must run with the lock released.
+    /// A contract breach: the drop's consume handed back a record that is not an exit. A look
+    /// never yields one.
+    #[cfg(unix)]
     fn log_unreadable(&self, record: ExitRecord) {
         if let ExitRecord::Unreadable { si_code } = record {
             log::warn!(
                 "{:?}: a consuming waitid returned si_code {si_code}, not an exit record",
                 self.os
             );
-            debug_assert!(false, "a consuming waitid on a zombie returned si_code {si_code}");
+            // The drop calls this: an assert mid-unwind aborts, so `warn` reports.
+            debug_assert!(
+                std::thread::panicking(),
+                "a consuming waitid on a zombie returned si_code {si_code}"
+            );
         }
     }
 }
 
-/// [`OwnedChild::hold`]: the handle's lock, and what may be read and sent under it.
+/// The end of the handle is where the root is reaped, armed or not: one non-blocking consume,
+/// where the consume names the child exactly ([`OsChild::exact_consume`]: Linux) in every state,
+/// and by the child's number (macOS) only for an exit this handle's wait saw, since that consume is
+/// a check and not a pin. A root still running is left, as a disarmed drop leaves it. On macOS the
+/// zombie of a root whose exit no wait of this handle saw is left too, and an armed drop's
+/// teardown has waited by then, so only a disarmed drop meets one. A handle that something forgot
+/// (`mem::forget`) consumes nothing. See [`wait`](OwnedChild::wait) for what the zombie costs until here.
 #[cfg(unix)]
-pub(crate) struct ReapHold<'a> {
-    child: &'a OwnedChild,
-    pid: u32,
-    lock: Guard<'a>,
-}
-
-#[cfg(unix)]
-impl ReapHold<'_> {
-    /// What a peek through the child's own handle shows (the exit record once this handle has reaped
-    /// it), without reaping.
-    pub(crate) fn peek(&self) -> Result<PeekOutcome, Error> {
-        self.child.peek_locked(&self.lock)
-    }
-
-    /// Whether the root is still this handle's child to act on, from the handle's own evidence, read
-    /// under the lock so none of our reaps lands between the state and a send. A `Reaped` is `own`
-    /// when this handle's wait collected it.
-    ///
-    /// A peek through the handle decides (Linux: the pidfd; macOS: the pid, checked against its
-    /// unique id, with an unreadable id on a running child an error).
-    pub(crate) fn state(&self) -> crate::signal::RootState {
-        self.child.state_locked(&self.lock)
-    }
-
-    /// [`OwnedChild::signal`], under this hold.
-    pub(crate) fn signal(&self, sig: Sig) -> Result<Sent, Error> {
-        self.child.signal_locked(&self.lock, sig)
-    }
-}
-
-/// The root for a send by its pid: [`state`](ReapHold::state) reads this hold's own evidence, so
-/// no reap of ours lands between a check and its send. On Linux the root's pidfd names the group
-/// exactly; on macOS there is none.
-#[cfg(unix)]
-impl crate::containment::Root for ReapHold<'_> {
-    fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    fn signal(&self, sig: Sig) -> Result<Sent, Error> {
-        ReapHold::signal(self, sig)
-    }
-
-    fn state(&self) -> crate::signal::RootState {
-        ReapHold::state(self)
-    }
-
-    fn number_holder(&self) -> crate::identity::NumberRead {
-        self.child.number_holder(self.pid)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        self.child.pidfd()
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        use crate::wait::exit_only::Reap;
+        let seen = matches!(
+            self.inner.get_mut().unwrap_or_else(PoisonError::into_inner).state,
+            State::Exited(_)
+        );
+        if !self.drop_consumes(seen) {
+            return;
+        }
+        match self.os.try_reap() {
+            Ok(Reap::Reaped(record)) => self.log_unreadable(record),
+            // Not exited, or a zombie only its tracer can reap: nothing to consume here.
+            Ok(Reap::Running) => {}
+            Ok(Reap::Foreign(foreign)) => {
+                log::debug!(
+                    "{:?}: nothing left to reap at the end of the handle ({foreign:?})",
+                    self.os
+                );
+            }
+            Err(error) => log::warn!(
+                "{:?}: reaping at the end of the handle failed ({}); a zombie may be left",
+                self.os,
+                crate::error::Report(&error)
+            ),
+        }
     }
 }
 
-/// The root of a tree call where nothing is sent by the root's pid (Windows): the call sends the
-/// root its own signal through this handle. It holds no lock and holds off no reap.
-#[cfg(not(unix))]
+/// [`OwnedChild::hold`]: the root of a tree call, through its handle. On Unix a send by the root's
+/// pid is checked against the handle's own [`state`](crate::containment::Root::state) right before
+/// it; on Linux the root's pidfd names the group exactly, and on macOS there is none. On Windows
+/// nothing is sent by the root's pid: the call sends the root its own signal through the handle.
 pub(crate) struct RootHandle<'a> {
     child: &'a OwnedChild,
     pid: u32,
 }
 
-#[cfg(not(unix))]
-impl OwnedChild {
-    /// The root for a tree call, under the name Unix's `hold` has, where it also locks the handle.
-    /// Windows has no reap to hold off, so nothing is locked.
-    pub(crate) fn hold(&self, pid: u32) -> RootHandle<'_> {
-        RootHandle { child: self, pid }
+impl RootHandle<'_> {
+    /// [`OwnedChild::signal`].
+    pub(crate) fn signal(&self, sig: Sig) -> Result<Sent, Error> {
+        self.child.signal(sig)
+    }
+
+    /// [`OwnedChild::state`].
+    #[cfg(unix)]
+    pub(crate) fn state(&self) -> crate::signal::RootState {
+        self.child.state()
     }
 }
 
-#[cfg(not(unix))]
 impl crate::containment::Root for RootHandle<'_> {
     fn pid(&self) -> u32 {
         self.pid
     }
 
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
-        self.child.signal(sig)
+        RootHandle::signal(self, sig)
+    }
+
+    #[cfg(unix)]
+    fn state(&self) -> crate::signal::RootState {
+        RootHandle::state(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.child.pidfd()
     }
 }
 

@@ -1140,7 +1140,7 @@ impl Marker {
         let (Some(_), Some(root)) = (self.root, root) else {
             return None;
         };
-        let look = crate::containment::root::look(root, self.pgid.is_some());
+        let look = crate::containment::root::look(root);
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterRootLook);
         let except = match &look {
@@ -1164,7 +1164,7 @@ impl Marker {
         let why = match look {
             NumberLook::Untrusted(state) => Why::untrusted(&state),
             NumberLook::MayNameAnother { refusal, probe, .. } => Why::MayNameAnother(refusal, probe),
-            NumberLook::Trusted | NumberLook::Empty | NumberLook::GroupGone => {
+            NumberLook::Trusted | NumberLook::GroupGone => {
                 unreachable!("a send that is not skipped has no skip to say")
             }
         };
@@ -1177,10 +1177,9 @@ impl Marker {
     }
 
     /// The marker's kill, decided on one look at `root` (see [`look_at`](Self::look_at)): every channel
-    /// while the root's number names the root; the holders alone, as the whole answer, once this handle
-    /// reaped the root and its group is empty or it had none ([`TreeKillOutcome::Answered`]); and the
-    /// holders alone, with the rest skipped ([`TreeKillOutcome::Skipped`]), when the number may name
-    /// another process or the root is `Unpinned` or `Unknown`.
+    /// while the root's number names the root; the holders alone, with the rest skipped
+    /// ([`TreeKillOutcome::Skipped`]), when the number may name another process or the root is
+    /// `Unpinned` or `Unknown`.
     pub(crate) fn kill_tree<'a>(&self, root: Option<&dyn Root>) -> TreeKill<'a> {
         let ran = |sent: Result<(), Error>| sent.map_err(Unkilled::from);
         let mut killed = Vec::new();
@@ -1199,9 +1198,6 @@ impl Marker {
                 let root_pid = root.map_or(0, Root::pid);
                 match look {
                     NumberLook::Trusted => TreeKillOutcome::Ran(ran(self.hard_kill(root, &mut killed))),
-                    NumberLook::Empty => TreeKillOutcome::Answered(ran(
-                        self.hard_kill_impl(Scope::HoldersOnly { except: None }, &mut killed)
-                    )),
                     look => TreeKillOutcome::Skipped(self.skip(
                         "kill",
                         root_pid,
@@ -1260,7 +1256,6 @@ impl Marker {
         match look {
             NumberLook::Trusted => TerminateOutcome::of(self.terminate(root), earlier),
             NumberLook::Untrusted(_) => TerminateOutcome::of(holders_only(except), earlier),
-            NumberLook::Empty => TerminateOutcome::of(holders_only(None), Some("the SIGTERM to any marker holders")),
             look => match holders_only(None) {
                 Ok(result) => TerminateOutcome::HoldersOnly(self.skip("signal", root_pid, look, result)),
                 Err(not_sent) => TerminateOutcome::NotSent(not_sent),

@@ -266,15 +266,12 @@ impl Child {
     /// through its pidfd, which names it exactly, then the grace, and a kill through the pidfd if
     /// it is still running; nothing goes out by its number, and the call ends the same way, with a
     /// failed signal's `Io` and a failed kill below the `Unassessable`. On 6.9+
-    /// its group is shut down as usual while it has a member. After this handle's own reap, with
-    /// another process at the pid, the group is empty: only the holders get the `SIGTERM`, and the
-    /// call goes on as usual; so it does for a macOS fd marker with no group, whose pid names no
-    /// process, which has no group to skip. With any other pid that names no process, the group's
-    /// number may be taken, so the call ends at once with
-    /// [`Error::Unassessable`](crate::error::Error::Unassessable) and the remedy: call `kill_tree`
-    /// before `wait` to end the descendants, unless this handle already killed the tree, when it goes
-    /// on and returns the status. A macOS marker's holders still get the `SIGTERM`, the grace and the
-    /// kill. The `SIGTERM` and the sweep each decide on a look of their own at the root.
+    /// its group is shut down as usual while it has a member. A root this handle's `wait` saw exit
+    /// is still a zombie that pins its number, so its group is shut down as for a running root; the
+    /// handle consumes it only when it drops. A root another reaper took names no group by its
+    /// number, whatever the pid names now: the call ends as the second case above does, and a tree
+    /// this handle already killed does not change that. The `SIGTERM` and the sweep each decide on a
+    /// look of their own at the root.
     ///
     /// **A `TreeWalk` whose root exits within the grace.** The kernel reparents the root's children
     /// at its exit, so the sweep cannot walk to them from its pid. The `SIGTERM` walk, made while the
@@ -305,13 +302,12 @@ impl Child {
     }
 
     /// `graceful_shutdown_tree`'s cooperative signal, for the sync and the async call alike: the
-    /// mechanism's own, decided on its look at the root ([`Tree::terminate`](crate::containment::Tree::terminate)). This handle's reaps
-    /// are held off from the look until the `SIGTERM` is sent. A plain `fn`: the std-lock hold and the
-    /// root borrowing it must not live in an async caller's state, so paths that send nothing release
-    /// the hold here, before the grace.
+    /// mechanism's own, decided on its look at the root ([`Tree::terminate`](crate::containment::Tree::terminate)). A plain
+    /// `fn`: the root borrowing the handle must not live in an async caller's state, so it is dropped
+    /// here, before the grace.
     pub(crate) fn signal_tree_cooperatively(&self) -> SignalTreeCooperativelyOutcome {
-        let held = self.proc.hold(self.pid());
-        let root: Option<&dyn crate::containment::Root> = Some(&held);
+        let root_handle = self.proc.hold(self.pid());
+        let root: Option<&dyn crate::containment::Root> = Some(&root_handle);
         #[cfg(test)]
         if let Some(forced) = fault::forced_in_place_of_the_signal(root) {
             return forced;
@@ -345,8 +341,7 @@ impl Child {
                 );
                 match call.answer(&self.tree, skip, None).answer {
                     Err(e) => SignalTreeCooperativelyOutcome::End(e),
-                    // The tree is already killed, as this handle's own reap shows: nothing is left to
-                    // signal, and the sweep and the reap go on.
+                    // Already killed: nothing to signal.
                     Ok(()) => SignalTreeCooperativelyOutcome::Sent {
                         result: Ok(()),
                         earlier: None,
@@ -383,13 +378,13 @@ impl Child {
     }
 
     /// The end of a holders-only shutdown ([`shutdown::holders_only`]): the mechanism's kill
-    /// with the same root, taken under a hold of its own, which is not held across the grace. The pending
+    /// with the same root, taken through a root handle of its own, which does not live across the grace. The pending
     /// shutdown is finished by its caller, sync or async, which waits for what that kill reached.
     #[cfg(unix)]
     pub(crate) fn holders_shutdown(&self, call: &SkipCall<'_>, skip: Skip) -> HoldersShutdown<'_> {
         let (kill, mut wait) = {
-            let held = self.proc.hold(self.pid());
-            self.tree.kill(Some(&held)).split()
+            let root_handle = self.proc.hold(self.pid());
+            self.tree.kill(Some(&root_handle)).split()
         };
         let settled = call.holders_settled(&self.tree, skip, kill);
         wait.reaching(settled.killed_again);

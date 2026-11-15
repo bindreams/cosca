@@ -1006,11 +1006,10 @@ fn a_failed_password_write_reports_a_failed_root_reap() {
 }
 
 /// What `finish_elevated` says of a root its delivered kill reached, by how the wait for it ended: the
-/// error's note and the cleanup's warn, led by the root's name. A debug build asserts on the reap
-/// that produces `Unreadable`, so the answers are stated.
+/// error's note and the cleanup's warn, led by the root's name.
 ///
-/// Mutants: `Unreadable` is worded as a failed wait or handed back; a root reaped elsewhere is among
-/// the leftovers; a zombie launchd holds loses the root's name or is not a leftover.
+/// Mutants: a root reaped elsewhere is among the leftovers; a zombie launchd holds loses the root's
+/// name or is not a leftover.
 #[cfg(unix)]
 #[skuld::test]
 fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended() {
@@ -1018,7 +1017,7 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
     use crate::child::owned::owned_tests::teardown_lines::said_of;
     use crate::child::owned::ChildWaitOutcome;
     use crate::error::ChildFate;
-    use crate::os_process::child::{ExitRecord, Foreign};
+    use crate::os_process::child::Foreign;
 
     let id = crate::identity::ProcessId::from_parts_for_test(42, crate::identity::Key::for_test(1));
     for exited_front in [false, true] {
@@ -1027,22 +1026,13 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
         } else {
             "the elevated child pid 42"
         };
-        let rows = [
-            (
-                Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 })),
-                ChildFate::Reaped,
-                Some(format!(
-                    "{who}: reaped it after the kill; the child's exit record was unreadable (si_code 7)"
-                )),
-            ),
-            (
-                Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)),
-                ChildFate::Killed,
-                Some(format!(
-                    "{who}: not ours to reap (launchd holds its zombie, because its tracer died)"
-                )),
-            ),
-        ];
+        let rows = [(
+            Ok(ChildWaitOutcome::Foreign(Foreign::Orphaned)),
+            ChildFate::Killed,
+            Some(format!(
+                "{who}: not ours to reap (launchd holds its zombie, because its tracer died)"
+            )),
+        )];
         for (answer, fate, said) in rows {
             let (note, torn) =
                 super::root_after_a_delivered_kill(42, Some(id), exited_front, &Settlement::new(answer, true));
@@ -1073,13 +1063,12 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
 
 /// What `finish_elevated` says of a root whose kill was refused, by what the one look at it found
 /// (the outcomes `look_after_refused_kill` builds over a child 42): a root the look collected says
-/// what the look showed, "it has exited, and was reaped", whether or not its exit record was
-/// readable (an unreadable one is appended), and the others are worded as `Settlement` words them,
-/// after the refusal. The note is the error's: `Error::MayHaveStarted` detail.
+/// what the look showed, "it has exited, and was reaped", and the others are worded as `Settlement`
+/// words them, after the refusal. The note is the error's: `Error::MayHaveStarted` detail.
 ///
 /// Mutants: a collected root reads "reaped it" after the refusal, with no word of its having
-/// exited; it says it had already exited before the refusal, which nothing shows; an unreadable
-/// record changes the wording; a root still running is worded as one that ended.
+/// exited; it says it had already exited before the refusal, which nothing shows; a root still
+/// running is worded as one that ended.
 #[cfg(unix)]
 #[skuld::test]
 fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() {
@@ -1091,7 +1080,7 @@ fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() 
     let refusal = || "the elevated child could not be terminated (denied)".to_owned();
     let rows = [
         (
-            ReapAnswer::Reaped(ExitRecord::Status(Default::default())),
+            ReapAnswer::Exited(ExitRecord::Status(Default::default())),
             format!("{}: it has exited, and was reaped", refusal()),
         ),
         (
@@ -1107,21 +1096,6 @@ fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() 
         let looked = child.look_after_refused_kill(None, denied, Disposition::HandBack);
         assert_eq!(super::root_after_a_refused_kill(refusal(), looked.refused_look()), said);
     }
-
-    // A record the reap could not read is stated, not built: a debug build asserts on that reap.
-    let unreadable = crate::child::lifecycle::Settlement::new(
-        Ok(crate::child::owned::ChildWaitOutcome::Exited(ExitRecord::Unreadable {
-            si_code: 7,
-        })),
-        false,
-    );
-    assert_eq!(
-        super::root_after_a_refused_kill(refusal(), Some(&unreadable)),
-        format!(
-            "{}: it has exited, and was reaped; the child's exit record was unreadable (si_code 7)",
-            refusal()
-        )
-    );
 }
 
 /// `report_tree_teardown` (shared by both `finish_elevated` variants) reports a failed teardown in

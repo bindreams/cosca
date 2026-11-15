@@ -270,39 +270,26 @@ mod group_kill_and_terminate {
     use super::super::{fault, kill_group_tree, term_group_tree};
     use crate::containment::dispatch::TreeKillOutcome;
     use crate::containment::{Refusal, TerminateOutcome, Why};
-    use crate::identity::{ProcessId, Resolved, UnknownCause};
     use crate::signal::RootState;
     use crate::test_support::stated_root::StatedRoot;
 
     /// A pgid no test process holds: the recorders stand in for the sends.
     const PGID: i32 = 999_999;
 
-    /// How the root's own handle and its pid read, for a row.
+    /// What the root's own handle says, for a row.
     #[derive(Clone, Copy, Debug)]
     enum Root {
         Unreaped,
         ReapedElsewhere,
-        OwnReapGone,
-        OwnReapTaken,
-        OwnReapUnreadable,
         Unknown,
     }
 
-    /// The root, with the pid reading as `root` says after an own reap.
     fn stated(root: Root) -> StatedRoot<'static> {
-        let other = ProcessId::from_parts_for_test(PGID as u32, crate::identity::Key::for_test(1));
-        let stated = StatedRoot::with_state(PGID as u32, move || match root {
+        StatedRoot::with_state(PGID as u32, move || match root {
             Root::Unreaped => RootState::Unreaped,
-            Root::ReapedElsewhere => RootState::Reaped { own: false },
-            Root::OwnReapGone | Root::OwnReapTaken | Root::OwnReapUnreadable => RootState::Reaped { own: true },
+            Root::ReapedElsewhere => RootState::Reaped,
             Root::Unknown => RootState::Unknown(std::sync::Arc::new(std::io::Error::other("a failed peek"))),
-        });
-        match root {
-            Root::OwnReapGone => stated.holding(|| (Resolved::Gone, UnknownCause::default())),
-            Root::OwnReapTaken => stated.holding(move || (Resolved::Found(other), UnknownCause::default())),
-            Root::OwnReapUnreadable => stated.holding(|| (Resolved::Unknown, UnknownCause::default())),
-            _ => stated,
-        }
+        })
     }
 
     /// What a skipped kill or terminate says it did not do, and why.
@@ -314,9 +301,7 @@ mod group_kill_and_terminate {
         );
         assert!(skip.holders.is_none(), "a group has no holders: {root:?}");
         match (&skip.why, root) {
-            (Why::MayNameAnother(Refusal::ReapedElsewhere(_), _), Root::ReapedElsewhere)
-            | (Why::MayNameAnother(Refusal::ReapedPidGone(_), _), Root::OwnReapGone)
-            | (Why::MayNameAnother(Refusal::ReapedPidUnread(..), _), Root::OwnReapUnreadable) => {
+            (Why::MayNameAnother(Refusal::ReapedElsewhere(_), _), Root::ReapedElsewhere) => {
                 assert!(!skip.root_alone, "{root:?}");
             }
             (Why::MayNameAnother(Refusal::Unsure(..), _), Root::Unknown) => {
@@ -328,27 +313,16 @@ mod group_kill_and_terminate {
         }
     }
 
-    /// The kill: sent as usual while the root's number names it; nothing is sent once the group is
-    /// empty ([`TreeKillOutcome::Answered`]); and skipped, nothing sent by the number, when the number
-    /// may name another process.
+    /// The kill: sent as usual while the root's number names it, and skipped, nothing sent by the
+    /// number, when the number may name another process.
     #[skuld::test]
     fn a_group_kill_sends_or_skips_by_the_roots_state() {
-        for root in [
-            Root::Unreaped,
-            Root::ReapedElsewhere,
-            Root::OwnReapGone,
-            Root::OwnReapTaken,
-            Root::OwnReapUnreadable,
-            Root::Unknown,
-        ] {
+        for root in [Root::Unreaped, Root::ReapedElsewhere, Root::Unknown] {
             let recorder = fault::record_kill_group();
             let outcome = kill_group_tree(PGID, Some(&stated(root))).outcome();
             let sent = recorder.killed();
             match (root, outcome) {
                 (Root::Unreaped, TreeKillOutcome::Ran(Ok(()))) => assert_eq!(sent, [PGID], "{root:?}"),
-                (Root::OwnReapTaken, TreeKillOutcome::Answered(Ok(()))) => {
-                    assert_eq!(sent, Vec::<i32>::new(), "{root:?}");
-                }
                 (_, TreeKillOutcome::Skipped(skip)) => {
                     assert_eq!(sent, Vec::<i32>::new(), "{root:?}");
                     assert_skip(&skip, "kill", root);
@@ -362,14 +336,7 @@ mod group_kill_and_terminate {
     /// handle cannot answer for, leaving the root alone to the caller through its handle.
     #[skuld::test]
     fn a_group_terminate_sends_or_skips_by_the_roots_state() {
-        for root in [
-            Root::Unreaped,
-            Root::ReapedElsewhere,
-            Root::OwnReapGone,
-            Root::OwnReapTaken,
-            Root::OwnReapUnreadable,
-            Root::Unknown,
-        ] {
+        for root in [Root::Unreaped, Root::ReapedElsewhere, Root::Unknown] {
             let recorder = fault::record_term_group();
             let outcome = term_group_tree(PGID, Some(&stated(root)));
             let sent = recorder.termed();
@@ -382,14 +349,6 @@ mod group_kill_and_terminate {
                         ..
                     },
                 ) => assert_eq!(sent, [PGID], "{root:?}"),
-                (
-                    Root::OwnReapTaken,
-                    TerminateOutcome::Sent {
-                        result: Ok(()),
-                        earlier: None,
-                        ..
-                    },
-                ) => assert_eq!(sent, Vec::<i32>::new(), "{root:?}"),
                 // Only Linux has a pidfd to name the root with.
                 (Root::Unknown, TerminateOutcome::RootThroughPidfd(skip)) if cfg!(target_os = "linux") => {
                     assert_eq!(sent, Vec::<i32>::new(), "{root:?}");

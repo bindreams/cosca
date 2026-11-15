@@ -201,7 +201,9 @@ fn identity_survives_the_alive_to_zombie_transition() {
         "the pre-exit token must still match the unreaped zombie"
     );
     assert_eq!(id.is_alive(), cosca::identity::Liveness::Dead, "a zombie is not alive");
-    child.wait().expect("reap");
+    child.wait().expect("the exit is seen");
+    // The handle's end consumes the zombie, which a wait leaves.
+    drop(child);
     assert_eq!(
         id.exists(),
         cosca::identity::Existence::Gone,

@@ -1597,10 +1597,9 @@ fn a_walk_is_skipped_by_the_roots_state_only_on_macos() {
 
     /// A state, and whether macOS cannot vouch for a root in it.
     type Case = (&'static str, fn() -> RootState, bool);
-    let states: [Case; 5] = [
+    let states: [Case; 4] = [
         ("unreaped", || RootState::Unreaped, false),
-        ("reaped, own", || RootState::Reaped { own: true }, false),
-        ("reaped elsewhere", || RootState::Reaped { own: false }, false),
+        ("reaped elsewhere", || RootState::Reaped, false),
         (
             "unknown",
             || RootState::Unknown(std::sync::Arc::new(std::io::Error::other("forced"))),

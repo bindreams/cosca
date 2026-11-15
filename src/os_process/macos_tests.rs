@@ -1049,7 +1049,7 @@ fn two_threads_waiting_on_one_process_both_return_after_it_exits() {
 /// Mutant: `ESRCH` at the exit watch's registration fails the adoption, or reads as a running child.
 #[skuld::test]
 fn esrch_at_registration_reads_as_exited_and_rechecks() {
-    use crate::os_process::child::{adopt_std_over, TryReapOutcome};
+    use crate::os_process::child::{adopt_std_over, TryObserveOutcome};
 
     let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
@@ -1068,12 +1068,12 @@ fn esrch_at_registration_reads_as_exited_and_rechecks() {
     )
     .unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     assert!(matches!(os.exited().unwrap(), Exit::Exited));
-    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Recheck));
+    assert!(matches!(os.try_observe().unwrap(), TryObserveOutcome::Recheck));
     assert!(
         kernel.all_rows_taken(),
-        "the adoption's registration was refused, and the first try_reap's peek took its row"
+        "the adoption's registration was refused, and the first try_observe's peek took its row"
     );
-    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
+    assert!(matches!(os.try_observe().unwrap(), TryObserveOutcome::Exited(_)));
 }
 
 /// A running child, a [`MacosChild`] over the kernel `kernel` makes from the child's pid, and the
@@ -1226,7 +1226,7 @@ fn esrch_at_the_reap_registration_adopts_a_running_child() {
 #[skuld::test]
 fn a_child_whose_tracer_is_exiting_at_launchd_is_a_recheck() {
     use crate::identity::{short_info, LAUNCHD};
-    use crate::os_process::child::{OsChild, TryReapOutcome};
+    use crate::os_process::child::{OsChild, TryObserveOutcome};
     use crate::os_process::macos::child::MacosChild;
     use crate::wait::exit_only::macos_tests::echild_yet_resolvable;
 
@@ -1244,9 +1244,9 @@ fn a_child_whose_tracer_is_exiting_at_launchd_is_a_recheck() {
         );
     let mac = MacosChild::new(kernel, pid, unique).expect("watch the stand-in");
 
-    let look = mac.try_reap().expect("look");
+    let look = mac.try_observe().expect("look");
 
-    assert!(matches!(look, TryReapOutcome::Recheck), "{look:?}");
+    assert!(matches!(look, TryObserveOutcome::Recheck), "{look:?}");
     drop(tracer_stdin);
     tracer.wait().expect("reap the stand-in tracer");
 }
@@ -1294,22 +1294,23 @@ fn adoption_fails_when_a_kqueue_cannot_be_made() {
     child.wait().expect("the child is handed back unreaped");
 }
 
-/// A reap of a running child waits on the reap kqueue, a descriptor of its own beside the exit
-/// kqueue a look hands out: the one is drained by the reap's holder, the other is never read.
+/// A look at a running child waits on the reap kqueue, a descriptor of its own beside the exit
+/// kqueue `exited` hands out: the one is drained by the look's holder, the other is never read.
 ///
-/// Mutant: the reap waits on the exit kqueue, which its holder's drain would then empty for every
+/// Mutant: the look waits on the exit kqueue, which its holder's drain would then empty for every
 /// other waiter.
 #[skuld::test]
-fn try_reap_of_a_running_child_waits_on_the_reap_kqueue() {
+fn try_observe_of_a_running_child_waits_on_the_reap_kqueue() {
     use std::os::fd::AsRawFd;
 
-    use crate::os_process::child::{adopted_blocker, TryReapOutcome};
+    use crate::os_process::child::{adopted_blocker, TryObserveOutcome};
     use crate::os_process::WaitFor;
+    use crate::wait::exit_only::Reap;
     let (os, id, stdin) = adopted_blocker();
     let Exit::Running(WaitFor::Readable(exit_fd)) = os.exited().unwrap() else {
         panic!("a live child reads Running");
     };
-    let TryReapOutcome::Running(WaitFor::Readable(reap_fd)) = os.try_reap().unwrap() else {
+    let TryObserveOutcome::Running(WaitFor::Readable(reap_fd)) = os.try_observe().unwrap() else {
         panic!("a running child is waited on its reap kqueue");
     };
     assert_ne!(reap_fd.as_raw_fd(), exit_fd.as_raw_fd());
@@ -1317,10 +1318,8 @@ fn try_reap_of_a_running_child_waits_on_the_reap_kqueue() {
     assert!(exited_held(&*os, None).unwrap());
     // `NOTE_EXIT` can come before XNU shows the zombie to `waitid`.
     wait_until_zombie(id.pid());
-    assert!(matches!(
-        os.try_reap().unwrap(),
-        crate::os_process::child::TryReapOutcome::Reaped(_)
-    ));
+    assert!(matches!(os.try_observe().unwrap(), TryObserveOutcome::Exited(_)));
+    assert!(matches!(os.try_reap().unwrap(), Reap::Reaped(_)));
 }
 
 /// A peek of an exited child sees its record and consumes nothing: the reap that follows has it.
@@ -1328,7 +1327,8 @@ fn try_reap_of_a_running_child_waits_on_the_reap_kqueue() {
 /// Mutant: the peek is a consuming `waitid`.
 #[skuld::test]
 fn peek_of_an_exited_child_consumes_nothing() {
-    use crate::os_process::child::{adopted_blocker, PeekOutcome, TryReapOutcome};
+    use crate::os_process::child::{adopted_blocker, PeekOutcome};
+    use crate::wait::exit_only::Reap;
     let (os, id, stdin) = adopted_blocker();
     drop(stdin);
     assert!(exited_held(&*os, None).unwrap());
@@ -1336,5 +1336,5 @@ fn peek_of_an_exited_child_consumes_nothing() {
     wait_until_zombie(id.pid());
     assert!(matches!(os.peek().unwrap(), PeekOutcome::Exit(_)));
     assert!(matches!(os.peek().unwrap(), PeekOutcome::Exit(_)));
-    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
+    assert!(matches!(os.try_reap().unwrap(), Reap::Reaped(_)));
 }

@@ -118,12 +118,13 @@ async fn async_terminate_tree_soft_kills_the_group(#[fixture(pidfd_group_signal)
     terminate_tree_soft_kills_the_group(common::warn_watch()).await;
 }
 
-/// macOS has no pidfd: the drop of a reaped root cannot vouch for its group, so it warns (#382).
+/// macOS has no pidfd, but `wait` leaves the root a zombie that pins its group's number: the drop
+/// kills the group by it, as for a running root, and says nothing at warn.
 #[cfg(feature = "tokio")]
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn async_terminate_tree_soft_kills_the_group() {
-    terminate_tree_soft_kills_the_group(common::warn_watch().expecting("call kill_tree() before wait()")).await;
+    terminate_tree_soft_kills_the_group(common::warn_watch()).await;
 }
 
 #[cfg(feature = "tokio")]

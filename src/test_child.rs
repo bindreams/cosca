@@ -832,9 +832,34 @@ fn zombie_record(pid: u32) -> libc::siginfo_t {
     }
 }
 
+/// The calling thread has no child, running or zombie. On Linux `__WNOTHREAD` keeps the answer to
+/// this thread's own children, so a concurrent test's child cannot change it.
+#[cfg(unix)]
+pub(crate) fn assert_no_child_of_this_thread(what: &str) {
+    #[cfg(target_os = "linux")]
+    let own_thread = libc::__WNOTHREAD;
+    #[cfg(not(target_os = "linux"))]
+    let own_thread = 0;
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid out-parameter; `WNOHANG` never blocks and `WNOWAIT` consumes nothing.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_ALL,
+            0,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | own_thread,
+        )
+    };
+    let err = std::io::Error::last_os_error();
+    assert!(
+        rc == -1 && err.raw_os_error() == Some(libc::ECHILD),
+        "{what}: this thread must have no child, got rc {rc} ({err})"
+    );
+}
+
 /// Whether `pid` is still this process's unreaped child (running, or a zombie nobody collected):
 /// `waitid` with `WNOHANG | WNOWAIT` consumes nothing. `false` once something reaped it.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub(crate) fn is_unreaped_child(pid: u32) -> bool {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is a valid out-parameter. WNOWAIT leaves the child reapable, WNOHANG never blocks.
@@ -852,6 +877,32 @@ pub(crate) fn is_unreaped_child(pid: u32) -> bool {
     let e = std::io::Error::last_os_error();
     assert_eq!(e.raw_os_error(), Some(libc::ECHILD), "waitid: {e}");
     false
+}
+
+/// Whether `pid`, a child of this test, has not exited: `waitid` finds no exit record, without
+/// consuming one. A zombie still answers `kill(pid, 0)`, so only this tells a signalled child from
+/// an unsignalled one: the blocker exits only when killed or when its stdin closes, and the tests
+/// hold its writer.
+#[cfg(unix)]
+pub(crate) fn has_not_exited(pid: u32) -> bool {
+    // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `pid` is this test's own child; `WNOWAIT` consumes nothing.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
+    #[cfg(target_os = "linux")]
+    // SAFETY: `waitid` returned 0, so the record's fields are set (zero for no exit record).
+    let waited = unsafe { info.si_pid() };
+    #[cfg(not(target_os = "linux"))]
+    let waited = info.si_pid;
+    waited == 0
 }
 
 /// Writes `bytes` to a held blocker stdin whose reader may already be dead: `Ok` and

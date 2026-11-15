@@ -305,7 +305,7 @@ fn a_failed_spawn_teardown_with_a_failed_terminate_of_an_exited_child_is_reaped_
         let mark = crate::log_capture::mark();
         let fake = FakeProcess::new([])
             .with_kill_refusal(KillRefusal::Permission)
-            .reaps([ReapAnswer::Reaped(ExitRecord::Status(
+            .reaps([ReapAnswer::Exited(ExitRecord::Status(
                 std::process::ExitStatus::default(),
             ))])
             .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
@@ -521,7 +521,7 @@ fn a_kill_refused_for_another_reason_than_permission_breaks_the_contract() {
     crate::log_capture::install();
     let fake = FakeProcess::new([])
         .with_kill_refusal(KillRefusal::Permission)
-        .reaps([ReapAnswer::Reaped(ExitRecord::Status(
+        .reaps([ReapAnswer::Exited(ExitRecord::Status(
             std::process::ExitStatus::default(),
         ))])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::Other))]);
@@ -540,7 +540,7 @@ fn a_failed_look_does_not_excuse_a_refusal_of_a_handle_that_is_never_refused() {
     crate::log_capture::install();
     let fake = FakeProcess::new([])
         .with_kill_refusal(KillRefusal::Never)
-        .reaps([ReapAnswer::Reaped(ExitRecord::Status(
+        .reaps([ReapAnswer::Exited(ExitRecord::Status(
             std::process::ExitStatus::default(),
         ))])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
@@ -559,7 +559,7 @@ fn a_failed_look_does_not_excuse_a_refusal_for_another_reason_than_permission() 
     crate::log_capture::install();
     let fake = FakeProcess::new([])
         .with_kill_refusal(KillRefusal::Permission)
-        .reaps([ReapAnswer::Reaped(ExitRecord::Status(
+        .reaps([ReapAnswer::Exited(ExitRecord::Status(
             std::process::ExitStatus::default(),
         ))])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::Other))]);
@@ -710,7 +710,7 @@ fn a_kill_teardown_of_a_child_waits_for_the_exit_it_started() {
         matches!(torn.said(), Some(Wording::Collected(log::Level::Debug, _))),
         "{torn:?}"
     );
-    assert!(handle.is_reaped(), "teardown must wait for the exit it started");
+    assert!(handle.exit_seen(), "teardown must wait for the exit it started");
     let outcome = handle.wait(None).expect("wait after teardown");
     let ChildWaitOutcome::Exited(ExitRecord::Status(status)) = outcome else {
         panic!("the reaped child answers its status: {outcome:?}");

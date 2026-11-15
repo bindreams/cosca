@@ -30,6 +30,8 @@ fn open_after_reap_is_none() {
     let (child, _stdin, id) = blocker();
     child.kill().unwrap();
     child.wait().unwrap();
+    // The handle's end consumes the zombie, which a wait leaves.
+    drop(child);
     assert!(open(id).unwrap().is_none());
 }
 
@@ -62,6 +64,8 @@ fn signal_after_exit_is_gone() {
     let p = open(id).unwrap().expect("a live process opens");
     child.kill().unwrap();
     child.wait().unwrap();
+    // The handle's end consumes the zombie, which a wait leaves.
+    drop(child);
     assert_eq!(p.signal(Sig::Kill).unwrap(), Sent::Gone);
     // A reaped process reads as exited, too (POLLHUP).
     assert!(exited_held(&*p, Some(Duration::ZERO)).unwrap());
@@ -146,21 +150,49 @@ fn refused_signal_keeps_its_raw_errno() {
 
 // OsChild =====
 
-/// A reap of a running child hands out the child's own pidfd to wait on.
+/// A look at a running child hands out the child's own pidfd to wait on.
 #[skuld::test]
-fn try_reap_of_a_running_child_waits_on_its_pidfd() {
+fn try_observe_of_a_running_child_waits_on_its_pidfd() {
     use std::os::fd::AsRawFd;
 
-    use crate::os_process::child::{adopted_blocker, TryReapOutcome};
+    use crate::os_process::child::{adopted_blocker, TryObserveOutcome};
     use crate::os_process::WaitFor;
     let (os, _id, stdin) = adopted_blocker();
-    let TryReapOutcome::Running(WaitFor::Readable(fd)) = os.try_reap().unwrap() else {
+    let TryObserveOutcome::Running(WaitFor::Readable(fd)) = os.try_observe().unwrap() else {
         panic!("a running child is waited on its pidfd");
     };
     assert_eq!(fd.as_raw_fd(), os.os_handle().as_raw_fd());
     drop(stdin);
     assert!(exited_held(&*os, None).unwrap());
-    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
+    assert!(matches!(os.try_observe().unwrap(), TryObserveOutcome::Exited(_)));
+}
+
+/// A look at an exited child sees its record and consumes nothing: it says so again, and the
+/// consuming reap that follows still has the record.
+///
+/// Mutant: the look is a consuming `waitid`.
+#[skuld::test]
+fn try_observe_of_an_exited_child_leaves_the_record_for_the_reap() {
+    use crate::os_process::child::{adopted_blocker, TryObserveOutcome};
+    use crate::wait::exit_only::Reap;
+    let (os, _id, stdin) = adopted_blocker();
+    drop(stdin);
+    assert!(exited_held(&*os, None).unwrap());
+    for _ in 0..2 {
+        assert!(matches!(os.try_observe().unwrap(), TryObserveOutcome::Exited(_)));
+    }
+    assert!(matches!(os.try_reap().unwrap(), Reap::Reaped(_)));
+}
+
+/// A reap of a running child consumes nothing.
+///
+/// Mutant: the reap answers a record for a child that has not exited.
+#[skuld::test]
+fn try_reap_of_a_running_child_has_nothing_to_consume() {
+    use crate::os_process::child::adopted_blocker;
+    use crate::wait::exit_only::Reap;
+    let (os, _id, _stdin) = adopted_blocker();
+    assert!(matches!(os.try_reap().unwrap(), Reap::Running));
 }
 
 /// A reap of an exited child consumes its record once; the child is then foreign.
@@ -168,12 +200,13 @@ fn try_reap_of_a_running_child_waits_on_its_pidfd() {
 /// Mutant: a second reap hands the record out again, or answers `Running`.
 #[skuld::test]
 fn try_reap_of_an_exited_child_reaps_once_then_is_foreign() {
-    use crate::os_process::child::{adopted_blocker, Foreign, TryReapOutcome};
+    use crate::os_process::child::{adopted_blocker, Foreign};
+    use crate::wait::exit_only::Reap;
     let (os, _id, stdin) = adopted_blocker();
     drop(stdin);
     assert!(exited_held(&*os, None).unwrap());
-    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
-    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Foreign(Foreign::Gone)));
+    assert!(matches!(os.try_reap().unwrap(), Reap::Reaped(_)));
+    assert!(matches!(os.try_reap().unwrap(), Reap::Foreign(Foreign::Gone)));
 }
 
 /// A peek of an exited child sees its record and consumes nothing: the reap that follows has it.
@@ -181,25 +214,26 @@ fn try_reap_of_an_exited_child_reaps_once_then_is_foreign() {
 /// Mutant: the peek is a consuming `waitid`.
 #[skuld::test]
 fn peek_of_an_exited_child_consumes_nothing() {
-    use crate::os_process::child::{adopted_blocker, PeekOutcome, TryReapOutcome};
+    use crate::os_process::child::{adopted_blocker, PeekOutcome};
+    use crate::wait::exit_only::Reap;
     let (os, _id, stdin) = adopted_blocker();
     drop(stdin);
     assert!(exited_held(&*os, None).unwrap());
     assert!(matches!(os.peek().unwrap(), PeekOutcome::Exit(_)));
     assert!(matches!(os.peek().unwrap(), PeekOutcome::Exit(_)));
-    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
+    assert!(matches!(os.try_reap().unwrap(), Reap::Reaped(_)));
 }
 
-/// A zombie only its tracer sees has a readable pidfd and no record: a reap asks for a recheck, not
+/// A zombie only its tracer sees has a readable pidfd and no record: a look asks for a recheck, not
 /// for a wait on a pidfd that would return at once for ever. The tracer then hands the zombie back
-/// and the reap has the record.
+/// and the look has the record.
 ///
-/// Mutant: the reap answers `Running(Readable)`, which spins its holder.
+/// Mutant: the look answers `Running(Readable)`, which spins its holder.
 #[skuld::test]
-fn try_reap_of_a_zombie_only_its_tracer_sees_is_recheck(#[fixture(tracer_group)] _group: &Group) {
+fn try_observe_of_a_zombie_only_its_tracer_sees_is_recheck(#[fixture(tracer_group)] _group: &Group) {
     use std::os::fd::AsRawFd as _;
 
-    use crate::os_process::child::{adopt_std, TryReapOutcome};
+    use crate::os_process::child::{adopt_std, TryObserveOutcome};
     use crate::test_child::reaped_elsewhere::kill_own_child;
     use crate::test_support::foreign_tracer::{self, REAP};
 
@@ -227,10 +261,10 @@ fn try_reap_of_a_zombie_only_its_tracer_sees_is_recheck(#[fixture(tracer_group)]
         let e = std::io::Error::last_os_error();
         assert!(r == -1 && e.raw_os_error() == Some(libc::EINTR), "poll: {e}");
     }
-    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Recheck));
+    assert!(matches!(os.try_observe().unwrap(), TryObserveOutcome::Recheck));
     tracer.send(REAP);
     tracer.expect("reaped");
-    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
+    assert!(matches!(os.try_observe().unwrap(), TryObserveOutcome::Exited(_)));
     tracer.finish();
 }
 
@@ -248,8 +282,9 @@ fn a_linux_child_owns_and_lends_the_kernel_it_was_built_with() {
 
     let target = rustix::process::Pid::from_raw(4242).expect("a positive pid");
     let kernel = Arc::new(FakeKernel::new().on_signal_probe(target, Err(rustix::io::Errno::PERM)));
-    // The box never looks through this descriptor.
-    let stand_in: std::os::fd::OwnedFd = std::fs::File::open("/dev/null").expect("/dev/null opens").into();
+    // A pidfd of this process, which is no child of it: the box's end finds nothing to reap through it.
+    let stand_in = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty())
+        .expect("a pidfd of this process");
     let owned = crate::child::owned::OwnedChild::new(Box::new(LinuxProcess::new(Arc::clone(&kernel), None, stand_in)));
     assert_eq!(Arc::strong_count(&kernel), 2, "the box owns a handle on the kernel");
 
@@ -362,7 +397,8 @@ fn adopting_a_pidfd_that_is_not_our_child_is_refused() {
 /// Mutant: the confirming `waitid` refuses an exit record.
 #[skuld::test]
 fn adopting_an_exited_unreaped_child_succeeds_and_reaps_nothing() {
-    use crate::os_process::child::{adopt_std, TryReapOutcome};
+    use crate::os_process::child::adopt_std;
+    use crate::wait::exit_only::Reap;
 
     let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
     let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
@@ -372,5 +408,5 @@ fn adopting_an_exited_unreaped_child_succeeds_and_reaps_nothing() {
         .expect("the live child has an identity");
     wait_until_zombie(id.pid());
     let os = adopt_std(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-    assert!(matches!(os.try_reap().unwrap(), TryReapOutcome::Reaped(_)));
+    assert!(matches!(os.try_reap().unwrap(), Reap::Reaped(_)));
 }

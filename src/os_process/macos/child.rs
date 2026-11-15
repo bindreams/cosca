@@ -5,7 +5,7 @@
 //! Three kinds of kqueue, deliberately, so that a kqueue that is read has one reader. The exit kqueue
 //! ([`ExitWatch`]) is never read, so a look at it is a zero-timeout `poll` that takes nothing from
 //! any waiter. The reap kqueue is drained by the one waiter that holds the reap, inside
-//! [`OsChild::try_reap`], and waited on by it afterwards. Each exit wait ([`OsProcess::exit_wait`])
+//! [`OsChild::try_observe`], and waited on by it afterwards. Each exit wait ([`OsProcess::exit_wait`])
 //! arms and drains one of its own.
 
 use std::os::fd::AsFd;
@@ -14,7 +14,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 use super::{ExitWatch, Kqueue};
 use crate::error::Error;
 use crate::identity::{has_exited, held_by, Held, Kernel, ReadPurpose};
-use crate::os_process::child::{Foreign, KillRefusal, OsChild, PeekOutcome, TryReapOutcome};
+use crate::os_process::child::{Foreign, KillRefusal, OsChild, PeekOutcome, TryObserveOutcome};
 use crate::os_process::drive::{Step, Waitable};
 use crate::os_process::{Exit, ExitWait, OsProcess, WaitFor};
 use crate::signal::{via_audit_token, Sent, Sig};
@@ -28,13 +28,13 @@ pub(crate) struct MacosChild<K> {
     pid: u32,
     /// The child's unique id: never reused, so it tells the child from a process that took its pid.
     unique: u64,
-    /// Armed for the child's exit and never read: [`OsProcess::exited`], and `try_reap`'s "an exit
+    /// Armed for the child's exit and never read: [`OsProcess::exited`], and `try_observe`'s "an exit
     /// was seen".
     exit: ExitWatch,
     /// Armed for the child's exit, its reap and its signals, and for `SIGCHLD`: what the reap waiter
     /// drains and then waits on.
     reap: Kqueue,
-    /// The tracers `reap` also watches. Locked only inside `try_reap`, which has one caller at a time.
+    /// The tracers `reap` also watches. Locked only inside `try_observe`, which has one caller at a time.
     tracer: Mutex<TracerWatch>,
 }
 
@@ -73,14 +73,14 @@ impl<K: Kernel + Send> MacosChild<K> {
         Target::pid(&self.kernel, self.pid, Some(self.unique))
     }
 
-    /// The tracer watch, for the one `try_reap` caller. A second concurrent caller breaks the
+    /// The tracer watch, for the one `try_observe` caller. A second concurrent caller breaks the
     /// contract; in release it waits its turn.
     fn tracer(&self) -> MutexGuard<'_, TracerWatch> {
         match self.tracer.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::Poisoned(e)) => e.into_inner(),
             Err(TryLockError::WouldBlock) => {
-                debug_assert!(false, "try_reap has one caller at a time");
+                debug_assert!(false, "try_observe has one caller at a time");
                 self.tracer.lock().unwrap_or_else(PoisonError::into_inner)
             }
         }
@@ -107,8 +107,8 @@ impl<K: Kernel + Send> OsProcess for MacosChild<K> {
     /// A look reads the parent as of now: a tracer that attaches after it is caught by the wait
     /// ([`exit_wait`](OsProcess::exit_wait)), not by the look.
     ///
-    /// The reap ([`try_reap`](OsChild::try_reap)) does not come through here: it reads the watch raw
-    /// and peeks `waitid` itself, so this adds nothing to it.
+    /// The waiter's look ([`try_observe`](OsChild::try_observe)) does not come through here: it
+    /// reads the watch raw and peeks `waitid` itself, so this adds nothing to it.
     fn exited(&self) -> Result<Exit<'_>, Error> {
         match self.exit.look(&self.kernel, self.pid, self.unique)? {
             Exit::Running(wait_for) => self.exited_past_the_watch(wait_for),
@@ -219,25 +219,18 @@ impl<K: Kernel + Send> OsChild for MacosChild<K> {
         exit_only::peek_verified(&self.target()).map_err(Error::Io)
     }
 
-    /// In this order: drain the reap kqueue (a `NOTE_REAP` is a foreign reap), peek, then consume the
-    /// record, or wait on the tracer chain, or recheck, or wait on the reap kqueue. An event after
-    /// the drain stays queued, so it wakes the wait this returns.
-    fn try_reap(&self) -> Result<TryReapOutcome<'_>, Error> {
+    /// The record is left in place; an event after the drain stays queued, so it wakes the returned
+    /// wait.
+    fn try_observe(&self) -> Result<TryObserveOutcome<'_>, Error> {
         let mut tracer = self.tracer();
         let (reaped, _exited) = drain_exit_events(&self.reap, self.pid, &mut tracer).map_err(Error::Io)?;
         if reaped {
-            return Ok(TryReapOutcome::Foreign(Foreign::Gone));
+            return Ok(TryObserveOutcome::Foreign(Foreign::Gone));
         }
-        let target = self.target();
-        let (peeked, holder) = exit_only::peek_traced(&target).map_err(Error::Io)?;
+        let (peeked, holder) = exit_only::peek_traced(&self.target()).map_err(Error::Io)?;
         match peeked {
-            PeekOutcome::Exit(_) => Ok(match exit_only::try_reap(&target).map_err(Error::Io)? {
-                Reap::Reaped(record) => TryReapOutcome::Reaped(record),
-                Reap::Foreign(foreign) => TryReapOutcome::Foreign(foreign),
-                // The record went between the two looks: a tracer took it, so look again.
-                Reap::Running => TryReapOutcome::Recheck,
-            }),
-            PeekOutcome::Foreign(foreign) => Ok(TryReapOutcome::Foreign(foreign)),
+            PeekOutcome::Exit(record) => Ok(TryObserveOutcome::Exited(record)),
+            PeekOutcome::Foreign(foreign) => Ok(TryObserveOutcome::Foreign(foreign)),
             PeekOutcome::Running => {
                 if let Some(holder) = holder {
                     return Ok(
@@ -245,19 +238,29 @@ impl<K: Kernel + Send> OsChild for MacosChild<K> {
                             .held_by(&self.kernel, &self.reap, holder)
                             .map_err(|e| Error::Io(e.into()))?
                         {
-                            OnTracer::Block => TryReapOutcome::Running(WaitFor::Readable(self.reap.as_fd())),
+                            OnTracer::Block => TryObserveOutcome::Running(WaitFor::Readable(self.reap.as_fd())),
                             // The loop's backoff governs; the watch's own interval is not used.
-                            OnTracer::Recheck(_) => TryReapOutcome::Recheck,
+                            OnTracer::Recheck(_) => TryObserveOutcome::Recheck,
                         },
                     );
                 }
                 // The exit was seen, but nothing is there to consume and no tracer holds it: XNU is
                 // still finishing the exit. The exit kqueue stays readable, so this is read live.
                 if self.exit.exited()? {
-                    return Ok(TryReapOutcome::Recheck);
+                    return Ok(TryObserveOutcome::Recheck);
                 }
-                Ok(TryReapOutcome::Running(WaitFor::Readable(self.reap.as_fd())))
+                Ok(TryObserveOutcome::Running(WaitFor::Readable(self.reap.as_fd())))
             }
         }
+    }
+
+    /// The peek-then-consume of [`exit_only::try_reap`], with `second_reap` for a child this process
+    /// traces. Touches no kqueue: the handle is ending.
+    fn try_reap(&self) -> Result<Reap, Error> {
+        exit_only::try_reap(&self.target()).map_err(Error::Io)
+    }
+
+    fn exact_consume(&self) -> bool {
+        false
     }
 }

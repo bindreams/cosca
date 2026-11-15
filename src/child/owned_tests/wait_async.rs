@@ -42,7 +42,7 @@ pub(super) fn exits_three_on_eof() -> (OwnedChild, ChildStdin) {
 #[cfg(unix)]
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn wait_async_reaps_and_caches_the_record() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Recheck, ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Recheck, ReapAnswer::Exited(exit())]);
     let mut child = OwnedChild::new(Box::new(fake.clone()));
     assert_eq!(child.wait_async().await.unwrap(), ChildWaitOutcome::Exited(exit()));
     assert_eq!(child.wait(None).unwrap(), ChildWaitOutcome::Exited(exit()));
@@ -52,7 +52,7 @@ async fn wait_async_reaps_and_caches_the_record() {
 /// Mutant: `wait_async` looks at the OS though the record is cached.
 #[skuld::test]
 async fn wait_async_after_a_sync_wait_answers_from_the_cache() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
     let mut child = OwnedChild::new(Box::new(fake.clone()));
     child.wait(None).unwrap();
     assert_eq!(child.wait_async().await.unwrap(), ChildWaitOutcome::Exited(exit()));
@@ -64,7 +64,7 @@ async fn wait_async_after_a_sync_wait_answers_from_the_cache() {
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn wait_async_pauses_on_tokio_s_timer_for_a_recheck() {
     crate::wait::block_probe::take();
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Recheck, ReapAnswer::Recheck, ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Recheck, ReapAnswer::Recheck, ReapAnswer::Exited(exit())]);
     let mut child = OwnedChild::new(Box::new(fake));
     child.wait_async().await.unwrap();
     let pauses: Vec<_> = crate::wait::block_probe::take()
@@ -87,7 +87,7 @@ async fn wait_async_waits_for_a_real_exit() {
         wait.await
     };
     assert_eq!(status(outcome).code(), Some(3));
-    assert!(child.is_reaped());
+    assert!(child.exit_seen());
 }
 
 /// A wait dropped while it waits leaves the state `N` and holds nothing: a sync `wait` reaps the
@@ -101,7 +101,7 @@ async fn a_dropped_wait_async_leaves_nobody_waiting() {
         let mut wait = pin!(child.wait_async());
         assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
     }
-    assert!(!child.is_reaped());
+    assert!(!child.exit_seen());
     drop(stdin);
     assert_eq!(status(child.wait(None)).code(), Some(3));
 }

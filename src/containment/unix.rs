@@ -185,14 +185,11 @@ pub(crate) mod fault {
     #[cfg(target_os = "linux")]
     pub(crate) use super::group::fault::{list_instead, set_after_listing};
 
-    type OnSend = Box<dyn FnMut(i32)>;
-
     thread_local! {
         static TERMED: RefCell<Option<Vec<i32>>> = const { RefCell::new(None) };
         static KILLED: RefCell<Option<Vec<i32>>> = const { RefCell::new(None) };
+        #[cfg(target_os = "macos")]
         static FAIL: Cell<bool> = const { Cell::new(false) };
-        static ON_TERM: RefCell<Option<OnSend>> = const { RefCell::new(None) };
-        static ON_KILL: RefCell<Option<OnSend>> = const { RefCell::new(None) };
         static REFUSE_GROUP: Cell<bool> = const { Cell::new(false) };
         static REFUSE_FLAG: Cell<bool> = const { Cell::new(false) };
         static GROUP_PROBE_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
@@ -262,15 +259,6 @@ pub(crate) mod fault {
         REFUSE_FLAG.with(Cell::get)
     }
 
-    /// Runs `slot`'s hook, if any, on `pgid`, with the slot free while it runs.
-    fn fire(slot: &'static std::thread::LocalKey<RefCell<Option<OnSend>>>, pgid: i32) {
-        let Some(mut hook) = slot.with(|h| h.borrow_mut().take()) else {
-            return;
-        };
-        hook(pgid);
-        slot.with(|h| *h.borrow_mut() = Some(hook));
-    }
-
     /// From now on `kill_group` on THIS thread records its group and sends nothing, so a test can
     /// assert a kill was not issued without a real `killpg` ever reaching a recyclable number: a
     /// mutant that sends by a reaped root's number reaches no process. Only that `killpg` is
@@ -295,26 +283,16 @@ pub(crate) mod fault {
         pub(crate) fn termed(&self) -> Vec<i32> {
             TERMED.with(|t| t.borrow().clone().expect("the recorder is live"))
         }
-
-        /// Runs `hook` at each recorded send, given its group.
-        pub(crate) fn on_send(&self, hook: impl FnMut(i32) + 'static) {
-            ON_TERM.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
-        }
     }
 
     impl Drop for TermGroupRecorder {
         fn drop(&mut self) {
             TERMED.with(|t| *t.borrow_mut() = None);
-            ON_TERM.with(|h| *h.borrow_mut() = None);
         }
     }
 
     pub(super) fn intercept_term_group(pgid: i32) -> bool {
-        let recorded = TERMED.with(|t| t.borrow_mut().as_mut().map(|termed| termed.push(pgid)).is_some());
-        if recorded {
-            fire(&ON_TERM, pgid);
-        }
-        recorded
+        TERMED.with(|t| t.borrow_mut().as_mut().map(|termed| termed.push(pgid)).is_some())
     }
 
     #[must_use = "recording stops as soon as the recorder is dropped"]
@@ -323,6 +301,7 @@ pub(crate) mod fault {
     impl KillGroupRecorder {
         /// From now on the intercepted `kill_group` reports the ordinary `Unassessable` refusal of a
         /// group it could not fully assess, as a live member that refuses the signal would cause.
+        #[cfg(target_os = "macos")]
         pub(crate) fn fail_with_unassessable(&self) {
             FAIL.with(|f| f.set(true));
         }
@@ -330,11 +309,6 @@ pub(crate) mod fault {
         /// The groups `kill_group` was asked to kill since the recorder was made.
         pub(crate) fn killed(&self) -> Vec<i32> {
             KILLED.with(|k| k.borrow().clone().expect("the recorder is live"))
-        }
-
-        /// Runs `hook` at each recorded send, given its group.
-        pub(crate) fn on_send(&self, hook: impl FnMut(i32) + 'static) {
-            ON_KILL.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
         }
 
         /// Asserts `pgid` was killed, and nothing else was. More than once is fine: a macOS fd
@@ -352,8 +326,8 @@ pub(crate) mod fault {
     impl Drop for KillGroupRecorder {
         fn drop(&mut self) {
             KILLED.with(|k| *k.borrow_mut() = None);
+            #[cfg(target_os = "macos")]
             FAIL.with(|f| f.set(false));
-            ON_KILL.with(|h| *h.borrow_mut() = None);
         }
     }
 
@@ -362,15 +336,14 @@ pub(crate) mod fault {
         if !recorded {
             return None;
         }
-        fire(&ON_KILL, pgid);
-        Some(if FAIL.with(|f| f.get()) {
-            Err(crate::error::Error::Unassessable {
+        #[cfg(target_os = "macos")]
+        if FAIL.with(|f| f.get()) {
+            return Some(Err(crate::error::Error::Unassessable {
                 detail: "forced by a test".into(),
                 source: None,
-            })
-        } else {
-            Ok(())
-        })
+            }));
+        }
+        Some(Ok(()))
     }
 }
 
@@ -396,7 +369,7 @@ pub(crate) fn term_group_sent(pgid: i32, root: Option<&dyn Root>) -> Result<Resu
 /// ([`look`](crate::containment::root::look)), decided again by the root's pidfd on Linux 6.9+. Each
 /// send by the number after it checks the root again ([`check_number`]).
 fn group_look(root: &dyn Root) -> NumberLook {
-    let look = crate::containment::root::look(root, true);
+    let look = crate::containment::root::look(root);
     #[cfg(target_os = "linux")]
     let look = crate::containment::root::through_the_pidfd(look, root);
     #[cfg(test)]
@@ -413,7 +386,7 @@ fn skipped_group(pgid: i32, verb: &str, look: NumberLook) -> Skip {
             exact_root,
             probe,
         } => (Why::MayNameAnother(refusal, probe), exact_root),
-        NumberLook::Trusted | NumberLook::Empty | NumberLook::GroupGone => {
+        NumberLook::Trusted | NumberLook::GroupGone => {
             unreachable!("a send to a group that is not skipped has no skip to say")
         }
     };
@@ -426,15 +399,10 @@ fn skipped_group(pgid: i32, verb: &str, look: NumberLook) -> Skip {
 }
 
 /// What a group sends once empty: nothing.
-fn log_empty_group(pgid: i32, look: &NumberLook) {
-    match look {
-        NumberLook::GroupGone => log::debug!(
-            "containment::unix: the root is reaped, and its pidfd shows process group {pgid} has no member left, so nothing is sent"
-        ),
-        _ => log::debug!(
-            "containment::unix: this handle reaped the root, so process group {pgid} is empty, and nothing is sent by its number"
-        ),
-    }
+fn log_empty_group(pgid: i32) {
+    log::debug!(
+        "containment::unix: the root is reaped, and its pidfd shows process group {pgid} has no member left, so nothing is sent"
+    );
 }
 
 /// [`kill_group`], decided on one look at `root`: the group is killed as usual while the root's number
@@ -452,8 +420,8 @@ pub(crate) fn kill_group_tree<'a>(pgid: i32, root: Option<&dyn Root>) -> TreeKil
         }
         Some(root) => match group_look(root) {
             NumberLook::Trusted => ran(kill_group(pgid, Some(root), &mut killed)),
-            look @ (NumberLook::Empty | NumberLook::GroupGone) => {
-                log_empty_group(pgid, &look);
+            NumberLook::GroupGone => {
+                log_empty_group(pgid);
                 TreeKillOutcome::Answered(Ok(()))
             }
             look => TreeKillOutcome::Skipped(skipped_group(pgid, "kill", look)),
@@ -474,8 +442,8 @@ pub(crate) fn term_group_tree(pgid: i32, root: Option<&dyn Root>) -> TerminateOu
     };
     match group_look(root) {
         NumberLook::Trusted => sent(Some(root)),
-        look @ (NumberLook::Empty | NumberLook::GroupGone) => {
-            log_empty_group(pgid, &look);
+        NumberLook::GroupGone => {
+            log_empty_group(pgid);
             TerminateOutcome::Sent {
                 result: Ok(()),
                 earlier: None,

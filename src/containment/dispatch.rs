@@ -273,7 +273,7 @@ impl DropView {
         let label = caller.label();
         let (now, unread) = proc.number_holder(root_pid);
         let state = proc.state();
-        let handle_reaped = matches!(state, RootState::Reaped { .. });
+        let handle_reaped = matches!(state, RootState::Reaped);
         let root = if crate::child::root_reaped(handle_reaped, id, now) {
             // The number shows the reap where the handle could not say; say so in the log.
             match &state {
@@ -284,13 +284,9 @@ impl DropView {
                 RootState::Unpinned => log::debug!(
                     "{label}: the root is not pinned by this process, but its number shows it reaped"
                 ),
-                RootState::Unreaped | RootState::Reaped { .. } => {}
+                RootState::Unreaped | RootState::Reaped => {}
             }
-            match state {
-                reaped @ RootState::Reaped { .. } => reaped,
-                // Only the number shows the reap, so no reap of this handle's own.
-                RootState::Unreaped | RootState::Unknown(_) | RootState::Unpinned => RootState::Reaped { own: false },
-            }
+            RootState::Reaped
         } else {
             state
         };
@@ -332,7 +328,7 @@ impl DropView {
     /// Whether the root itself is neither signalled nor waited on: it is reaped, or this process
     /// does not pin it (so its pid is not ours).
     pub(crate) fn leaves_root_alone(&self) -> bool {
-        matches!(self.root, RootState::Reaped { .. } | RootState::Unpinned)
+        matches!(self.root, RootState::Reaped | RootState::Unpinned)
     }
 
     /// The look the mechanism's kill decides on: the one this view is worded from.
@@ -344,7 +340,7 @@ impl DropView {
     /// that could not say after it.
     pub(crate) fn why_number_untrusted(&self) -> String {
         match &self.root {
-            RootState::Reaped { .. } => "the root is already reaped".to_owned(),
+            RootState::Reaped => "the root is already reaped".to_owned(),
             untrusted => crate::signal::why_untrusted_with_cause(untrusted),
         }
     }
@@ -741,7 +737,7 @@ pub(crate) enum TreeKillOutcome {
     /// The kill ran; `Err` is what it left.
     Ran(Result<(), Unkilled>),
     /// The mechanism answered without a kill that goes on to the root's backstop: its tree is empty
-    /// (a Linux process group with no member left, or one this handle's own reap left empty), so
+    /// (a Linux process group with no member left), so
     /// there is nothing to kill, or only the marker holders a macOS fd marker names by identity were.
     /// The call that sent it ends with this answer; a drop goes on to the root. `Err` is what it left.
     #[cfg_attr(
@@ -972,7 +968,7 @@ impl TreeKillOutcome {
         let (label, this, action) = (view.caller.label(), view.caller.this_event(), &skip.action);
         if view.tree_killed {
             log::debug!("{label}: {why} and this handle already killed the tree, so {this} does not {action}");
-        } else if !matches!(view.root, RootState::Reaped { .. }) {
+        } else if !matches!(view.root, RootState::Reaped) {
             log::debug!("{label}: {why}, so {this} does not {action}");
         }
     }

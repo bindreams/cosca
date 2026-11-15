@@ -20,25 +20,7 @@ pub(crate) fn reap_by_pid(pid: u32) {
     assert_eq!(reaped, pid as libc::pid_t, "{}", std::io::Error::last_os_error());
 }
 
-/// Whether `pid`, a child of this test, has not exited: `waitid` finds no exit record, without
-/// consuming one. A zombie still answers `kill(pid, 0)`, so only this tells a signalled child from
-/// an unsignalled one: the blocker exits only when killed or when its stdin closes, and the tests
-/// hold its writer.
-pub(crate) fn has_not_exited(pid: u32) -> bool {
-    // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` writes only into it.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `pid` is this test's own child; `WNOWAIT` consumes nothing.
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
-    info.si_pid == 0
-}
+pub(crate) use crate::test_child::has_not_exited;
 
 /// Ends and reaps `pid`, a child of this test the spawn under test left running, and asserts that
 /// nothing but this test signalled it. The first fatal signal fixes a process's status, and a

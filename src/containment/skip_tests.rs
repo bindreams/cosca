@@ -107,31 +107,16 @@ fn a_sweep_that_skipped_has_the_handles_error_as_its_source_unless_the_holders_f
     );
 }
 
-/// A skip is moot only over a tree this handle killed, and only because its own reap left the pid
-/// naming no process or unreadable, or the root's number cannot be trusted (macOS): a root reaped
-/// elsewhere and a handle that could not say leave the tree's number in doubt for another reason.
+/// A skip is moot only over a tree this handle killed, and only because the root's number cannot be
+/// trusted (macOS): a root reaped elsewhere and a handle that could not say leave the tree's number
+/// in doubt for another reason.
 ///
 /// Mutants: any one of the refusals reads as moot; a skip is moot over a tree never killed.
 #[skuld::test]
-fn a_skip_is_moot_only_over_a_killed_tree_after_the_own_reap() {
+fn a_skip_is_moot_only_over_a_killed_tree_whose_root_is_untrusted() {
     /// A reason, and whether it makes a skip moot over a killed tree.
     type Case = (&'static str, fn() -> Why, bool);
-    let whys: [Case; 6] = [
-        (
-            "own reap, pid gone",
-            || Why::MayNameAnother(Refusal::ReapedPidGone(PID), None),
-            true,
-        ),
-        (
-            "own reap, pid unread",
-            || Why::MayNameAnother(Refusal::ReapedPidUnread(PID, None), None),
-            true,
-        ),
-        (
-            "own reap, pid taken",
-            || Why::MayNameAnother(Refusal::ReapedPidTaken(PID), None),
-            false,
-        ),
+    let whys: [Case; 3] = [
         (
             "reaped elsewhere",
             || Why::MayNameAnother(Refusal::ReapedElsewhere(PID), None),
@@ -466,7 +451,7 @@ fn a_skipped_kill_whose_holders_failed_leaves_the_drop_a_warn_in_either_order() 
 }
 
 /// A skipped call over a tree this handle already killed is moot when its reason is one a kill does
-/// not outlive (an untrusted root, or the own reap's gone pid): a kill and a terminate answer `Ok`
+/// not outlive (an untrusted root): a kill and a terminate answer `Ok`
 /// and warn of nothing. A root reaped elsewhere outlives the kill, so it is the control: it answers
 /// an error and warns.
 ///
@@ -477,15 +462,10 @@ fn a_skipped_call_over_a_killed_tree_is_moot_when_a_kill_does_not_outlive_its_re
     use crate::containment::dispatch::TreeSignal;
     crate::log_capture::install();
     type Case = (&'static str, fn() -> Why, bool);
-    let cases: [Case; 3] = [
+    let cases: [Case; 2] = [
         (
             "untrusted",
             || Why::untrusted(&crate::signal::RootState::Unpinned),
-            true,
-        ),
-        (
-            "own reap, pid gone",
-            || Why::MayNameAnother(Refusal::ReapedPidGone(PID), None),
             true,
         ),
         (
@@ -521,16 +501,12 @@ fn a_skipped_call_over_a_killed_tree_is_moot_when_a_kill_does_not_outlive_its_re
 }
 
 /// A moot skip is decided under the settlement's own lock: over a tree that was killed and then
-/// moved off `Killed` (a later kill left a member), the skip is not moot and answers an error, for
-/// either kind of skip that is moot over a killed tree.
+/// moved off `Killed` (a later kill left a member), the skip is not moot and answers an error.
 ///
 /// Mutant: the skip's moot decision is read before, and apart from, the settlement.
 #[skuld::test]
 fn a_skip_is_not_moot_over_a_tree_moved_off_killed() {
-    let whys: [fn() -> Why; 2] = [
-        || Why::untrusted(&crate::signal::RootState::Unpinned),
-        || Why::MayNameAnother(Refusal::ReapedPidGone(PID), None),
-    ];
+    let whys: [fn() -> Why; 1] = [|| Why::untrusted(&crate::signal::RootState::Unpinned)];
     for why in whys {
         let tree = walking_tree();
         tree.settle(TreeKillOutcome::Ran(Ok(())), true)

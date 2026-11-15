@@ -19,7 +19,7 @@ fn kill_of_a_killable_child_returns_and_reaps() {
     assert_eq!(b.owned.signal(Sig::Kill).expect("kill a live child"), Sent::Delivered);
     b.end_child();
     assert_eq!(wait_status(&b.owned).code(), Some(1));
-    assert!(b.owned.is_reaped());
+    assert!(b.owned.exit_seen());
 }
 
 /// An exit seen on the handle is read once and cached: a second wait answers the same status.
@@ -29,10 +29,10 @@ fn kill_of_a_killable_child_returns_and_reaps() {
 fn an_exit_seen_on_the_handle_is_cached() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
-    assert!(!b.owned.is_reaped(), "an exit nobody waited on is not a reap");
+    assert!(!b.owned.exit_seen(), "an exit nobody waited on is not a reap");
     let first = wait_status(&b.owned);
     assert_eq!(wait_status(&b.owned), first);
-    assert!(b.owned.is_reaped());
+    assert!(b.owned.exit_seen());
 }
 
 /// A kill the OS refuses because the process is already exiting is `Gone`, and the kill makes no

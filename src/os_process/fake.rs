@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use super::child::KillRefusal;
-use super::child::{ExitRecord, Foreign, OsChild, PeekOutcome, TryReapOutcome};
+use super::child::{ExitRecord, Foreign, OsChild, PeekOutcome, TryObserveOutcome};
 use super::{Exit, OsProcess, WaitFor};
 use crate::error::Error;
 use crate::signal::{Sent, Sig};
@@ -25,10 +25,11 @@ pub(crate) enum Answer {
     Err(std::io::ErrorKind),
 }
 
-/// One scripted answer of [`OsChild::try_reap`].
+/// One scripted answer of [`OsChild::try_observe`], the waiter's look.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ReapAnswer {
-    Reaped(ExitRecord),
+    /// The look finds the exit record, and leaves it in place.
+    Exited(ExitRecord),
     Running,
     Recheck,
     Foreign(Foreign),
@@ -39,6 +40,11 @@ pub(crate) enum ReapAnswer {
 /// One scripted answer of [`OsChild::peek`]. A failure is the whole `io::Error`, so a test can name
 /// its message.
 pub(crate) type PeekAnswer = Result<PeekOutcome, std::io::Error>;
+
+/// One scripted answer of [`OsChild::try_reap`], the consume at the end of the handle. A failure is
+/// the whole `io::Error`, as [`PeekAnswer`]'s is.
+#[cfg(unix)]
+pub(crate) type ConsumeAnswer = Result<crate::wait::exit_only::Reap, std::io::Error>;
 
 /// One scripted answer of [`OsProcess::signal`]. A failure is the whole `io::Error`, so a test can
 /// state a raw errno.
@@ -89,8 +95,17 @@ struct Script {
     number_reads_always: Option<crate::identity::Resolved<crate::identity::ProcessId>>,
     /// Calls that the repeated answers took.
     repeats: usize,
-    /// `exited` and `try_reap` calls: the looks.
+    /// `exited` and `try_observe` calls: the looks.
     looks: usize,
+    /// What [`OsChild::try_reap`] answers, one call each.
+    #[cfg(unix)]
+    consumes: VecDeque<ConsumeAnswer>,
+    /// What [`OsChild::exact_consume`] answers. `None`: the real child's, if there is one, else `true`.
+    #[cfg(unix)]
+    exact_consume: Option<bool>,
+    /// [`OsChild::try_reap`] calls.
+    #[cfg(unix)]
+    reap_calls: usize,
     look_times: Vec<Instant>,
     signal_calls: Vec<Sig>,
     on_look: Option<Box<dyn FnMut(usize) + Send>>,
@@ -126,6 +141,12 @@ impl FakeProcess {
                 number_reads_always: None,
                 repeats: 0,
                 looks: 0,
+                #[cfg(unix)]
+                consumes: VecDeque::new(),
+                #[cfg(unix)]
+                exact_consume: None,
+                #[cfg(unix)]
+                reap_calls: 0,
                 look_times: Vec::new(),
                 signal_calls: Vec::new(),
                 on_look: None,
@@ -231,13 +252,13 @@ impl FakeProcess {
         assert_eq!(left, 0, "{left} scripted peek answer(s) were never consumed");
     }
 
-    /// Answer `reaps` to successive [`OsChild::try_reap`] calls.
+    /// Answer `reaps` to successive [`OsChild::try_observe`] calls.
     pub(crate) fn reaps(self, reaps: impl IntoIterator<Item = ReapAnswer>) -> Self {
         self.script().reaps = reaps.into_iter().collect();
         self
     }
 
-    /// Answer every [`OsChild::try_reap`] that the `reaps` table has nothing left for with `answer`,
+    /// Answer every [`OsChild::try_observe`] that the `reaps` table has nothing left for with `answer`,
     /// however many calls there are.
     #[cfg(target_os = "macos")]
     pub(crate) fn reaps_always(self, answer: ReapAnswer) -> Self {
@@ -261,6 +282,22 @@ impl FakeProcess {
         self.script().repeats
     }
 
+    /// Answer `consumes` to successive [`OsChild::try_reap`] calls. A call past them is the real
+    /// child's, if there is one, else answers `Running`.
+    #[cfg(unix)]
+    pub(crate) fn consumes(self, consumes: impl IntoIterator<Item = ConsumeAnswer>) -> Self {
+        self.script().consumes = consumes.into_iter().collect();
+        self
+    }
+
+    /// Answer `exact` to [`OsChild::exact_consume`]. Without it, a fake over a real child answers
+    /// that child's, and any other answers `true`.
+    #[cfg(unix)]
+    pub(crate) fn with_exact_consume(self, exact: bool) -> Self {
+        self.script().exact_consume = Some(exact);
+        self
+    }
+
     /// Answer `signals` to successive [`OsProcess::signal`] calls.
     pub(crate) fn signals(self, signals: impl IntoIterator<Item = SignalAnswer>) -> Self {
         self.script().signals = signals.into_iter().collect();
@@ -268,14 +305,21 @@ impl FakeProcess {
     }
 
     /// Fire the [`WaitFor`] that `Running` answers hand out; it stays fired, except that each
-    /// `Running` answer of [`OsChild::try_reap`] hands out an unfired one.
+    /// `Running` answer of [`OsChild::try_observe`] hands out an unfired one.
     pub(crate) fn wake(&self) {
         self.0.source.fire();
     }
 
-    /// How many looks were made: calls of `exited` and of `try_reap`.
+    /// How many looks were made: calls of `exited` and of `try_observe`.
     pub(crate) fn looks(&self) -> usize {
         self.script().looks
+    }
+
+    /// How many times the end of the handle asked this fake to consume the exit record
+    /// ([`OsChild::try_reap`]).
+    #[cfg(unix)]
+    pub(crate) fn reap_calls(&self) -> usize {
+        self.script().reap_calls
     }
 
     /// The `wait::now()` of each look, taken after its `on_look` hook ran.
@@ -421,7 +465,7 @@ impl OsChild for FakeProcess {
         }
     }
 
-    fn try_reap(&self) -> Result<TryReapOutcome<'_>, Error> {
+    fn try_observe(&self) -> Result<TryObserveOutcome<'_>, Error> {
         self.begin_look();
         let scripted = {
             let mut script = self.script();
@@ -432,17 +476,42 @@ impl OsChild for FakeProcess {
             })
         };
         match (scripted, &self.0.real) {
-            (Some(ReapAnswer::Reaped(record)), _) => Ok(TryReapOutcome::Reaped(record)),
+            (Some(ReapAnswer::Exited(record)), _) => Ok(TryObserveOutcome::Exited(record)),
             (Some(ReapAnswer::Running), _) => {
-                // Each reap that runs is a new wait: one holder's wake is not the next one's.
                 self.0.source.reset();
-                Ok(TryReapOutcome::Running(self.0.source.wait_for()))
+                Ok(TryObserveOutcome::Running(self.0.source.wait_for()))
             }
-            (Some(ReapAnswer::Recheck), _) => Ok(TryReapOutcome::Recheck),
-            (Some(ReapAnswer::Foreign(foreign)), _) => Ok(TryReapOutcome::Foreign(foreign)),
+            (Some(ReapAnswer::Recheck), _) => Ok(TryObserveOutcome::Recheck),
+            (Some(ReapAnswer::Foreign(foreign)), _) => Ok(TryObserveOutcome::Foreign(foreign)),
             (Some(ReapAnswer::Err(kind)), _) => Err(Error::Io(kind.into())),
+            (None, Some(real)) => real.try_observe(),
+            (None, None) => panic!("FakeProcess: a look was made past the scripted answers"),
+        }
+    }
+
+    /// The scripted answer, else the real child's, else `Running`: a fake of stated facts consumes
+    /// nothing. Every call is counted (see [`FakeProcess::reap_calls`]).
+    #[cfg(unix)]
+    fn try_reap(&self) -> Result<crate::wait::exit_only::Reap, Error> {
+        let scripted = {
+            let mut script = self.script();
+            script.reap_calls += 1;
+            script.consumes.pop_front()
+        };
+        match (scripted, &self.0.real) {
+            (Some(answer), _) => answer.map_err(Error::Io),
             (None, Some(real)) => real.try_reap(),
-            (None, None) => panic!("FakeProcess: a reap was made past the scripted answers"),
+            (None, None) => Ok(crate::wait::exit_only::Reap::Running),
+        }
+    }
+
+    #[cfg(unix)]
+    fn exact_consume(&self) -> bool {
+        let stated = self.script().exact_consume;
+        match (stated, &self.0.real) {
+            (Some(exact), _) => exact,
+            (None, Some(real)) => real.exact_consume(),
+            (None, None) => true,
         }
     }
 }

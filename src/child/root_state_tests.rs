@@ -5,28 +5,24 @@ use crate::log_capture::warns_since;
 use crate::signal::RootState;
 use crate::test_child::Console;
 
-/// This handle's own reap is `Reaped`, and nothing around it warns.
+/// After this handle's own wait the root is still a zombie of ours: `Unreaped`, and nothing around
+/// it warns.
 ///
-/// Mutants: `ReapHold::state` reads its own recorded reap as `Unreaped`; it has no check of the
-/// recorded reap (the peek decides).
+/// Mutant: `RootHandle::state` reads a root whose exit was recorded as `Reaped`.
 #[skuld::test]
-fn state_after_own_wait_is_reaped_without_a_warn() {
+fn state_after_own_wait_is_unreaped_without_a_warn() {
     crate::log_capture::install();
-    let mut child = crate::test_child::command(Console::Hidden)
+    let child = crate::test_child::command(Console::Hidden)
         .args(["true"])
         .spawn()
         .expect("spawn");
     child.wait().expect("wait");
 
     let mark = crate::log_capture::mark();
-    // A peek would say `Running`: only the recorded reap says `Reaped`.
-    child
-        .proc
-        .script_over(|f| f.peeks([Ok(crate::os_process::child::PeekOutcome::Running)]));
     let state = child.proc.state();
     drop(child);
 
-    assert!(matches!(state, RootState::Reaped { own: true }), "{state:?}");
+    assert!(matches!(state, RootState::Unreaped), "{state:?}");
     assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 }
 

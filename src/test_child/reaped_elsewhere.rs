@@ -36,6 +36,7 @@ pub(crate) fn assert_one_reaped_elsewhere_walk_warn(mark: usize, pid: u32) {
 }
 
 /// Every record of the tree ops' skip for a root's number they cannot trust contains this.
+#[cfg(target_os = "linux")]
 pub(crate) const UNTRUSTED_NUMBER: &str = "may name another process";
 
 /// Every record of a skip that killed the root through its pidfd instead contains this.
@@ -48,6 +49,7 @@ pub(crate) const ROOT_TERMED_BY_PIDFD: &str = "SIGTERM to the root through its p
 
 /// Asserts the one record since `mark` on this thread says the root's number may name another
 /// process, is a `warn`, and names the group it left unsignalled.
+#[cfg(target_os = "linux")]
 #[track_caller]
 pub(crate) fn assert_one_untrusted_number_warn(mark: usize, pgid: u32) {
     let warns = crate::log_capture::records_since_on_current_thread(mark, UNTRUSTED_NUMBER);
@@ -196,16 +198,6 @@ impl EscapedHolder {
     /// Releases the root's stdin; call only after the kill.
     fn release_root(&mut self) {
         drop(self.root_stdin.take());
-    }
-
-    /// Kills the root and reaps it through `child`'s `wait`; the stdin is released only after the
-    /// kill, so a kill that sent nothing fails `assert_killed` (status 0) instead of hanging.
-    #[track_caller]
-    pub(crate) fn kill_and_wait(&mut self, child: &crate::Child) {
-        child.kill().expect("kill the root");
-        self.release_root();
-        let status = child.wait().expect("this handle reaps the root");
-        super::assert_killed("the root", status);
     }
 
     /// Kills the root and reaps it behind `child`'s back ([`reap_behind_status`]); the stdin is

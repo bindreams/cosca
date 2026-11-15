@@ -31,29 +31,35 @@ fn is_foreign(outcome: &Result<ChildWaitOutcome, crate::error::Error>) -> bool {
 
 // A reap that finds nothing after `Reapable` =====
 
-/// A consuming reap that finds nothing right after the wait saw a zombie means the pid
-/// names something else now. It takes the `ECHILD` path, with no assert in any build, and the
-/// state goes back to `N`.
+/// The wait only observes the exit; the drop's consume is the one that can find nothing, right
+/// after its own peek saw a zombie, which means the pid names something else now. It takes the
+/// `ECHILD` path (nothing to consume, a quiet debug line), with no assert in any build.
 ///
 /// Mutant: a `debug_assert!` on the by-pid target.
 #[skuld::test]
-fn a_reap_that_finds_none_after_reapable_takes_the_echild_path() {
+fn a_drop_whose_consume_finds_none_after_the_wait_saw_the_exit_takes_the_echild_path() {
     let (mut b, kernel) = Blocker::spawn_over(|pid, _| FakeKernel::over(&HostKernel).on_consume(pid, Ok(None)));
     b.end_child_and_confirm_exit();
-    let outcome = b.owned.wait(None);
-    assert!(is_foreign(&outcome), "{outcome:?}");
-    assert!(kernel.all_rows_taken(), "the reap must consume");
-    assert!(format!("{:?}", b.owned).contains("N"), "{:?}", b.owned);
-    // The zombie was never consumed (the one consume found nothing): a real wait reaps it.
-    wait_status(&b.owned);
+    let status = wait_status(&b.owned);
+    assert!(status.success(), "{status:?}");
+    assert!(!kernel.all_rows_taken(), "the wait consumed");
+    let pid = b.pid;
+    drop(b);
+    assert!(kernel.all_rows_taken(), "the drop must consume");
+    // The one consume found nothing, so the zombie was never taken: reap it here.
+    assert!(
+        crate::test_child::is_unreaped_child(pid),
+        "the zombie was taken though the consume found nothing"
+    );
+    crate::test_child::reaped_elsewhere::reap_behind(pid);
 }
 
 // The second peek =====
 
-/// The second peek runs after every first reap, traced or not. For an untraced child it
-/// answers `ECHILD` and is skipped quietly. The first consume states an exit record and takes
-/// nothing, as the consume of a child its tracer reparented to this process does, so only a second
-/// peek and consume can reap the zombie.
+/// The second peek runs after every first reap of the handle's drop, traced or not. For an
+/// untraced child it answers `ECHILD` and is skipped quietly. The first consume states an exit
+/// record and takes nothing, as the consume of a child its tracer reparented to this process does,
+/// so only a second peek and consume can reap the zombie. The wait before it consumes nothing.
 ///
 /// Mutant: a second peek gated on `p_oppid`: the zombie of an untraced child is left.
 #[skuld::test]
@@ -63,8 +69,11 @@ fn a_second_peek_runs_after_every_first_reap() {
     b.end_child_and_confirm_exit();
     let status = wait_status(&b.owned);
     assert!(status.success(), "{status:?}");
+    assert!(!kernel.all_rows_taken(), "the wait consumed");
+    let pid = b.pid;
+    drop(b);
     assert!(kernel.all_rows_taken(), "the first reap must consume");
-    assert_zombie_consumed(b.pid, "the second reap");
+    assert_zombie_consumed(pid, "the second reap");
 }
 
 // The box's kernel =====
@@ -606,28 +615,30 @@ fn a_wait_on_a_zombie_launchd_holds_warns_it_is_not_ours_to_reap() {
 
 // The reap finds no exit record after the peek saw one =====
 
-/// A reap whose own peek finds no exit record right after the look's peek saw one is still our
-/// child (a foreign reap is `Foreign`): the look is `Recheck`, and the holder looks again after a
-/// backoff and gets the exit.
+/// A drop whose own peek finds no exit record right after the wait's peek saw one is still the
+/// child's handle (a foreign reap is `Foreign`): it consumes nothing, and neither loops nor
+/// waits, since the handle is ending.
 ///
-/// Mutant: `Gone` at once: the wait answers `ECHILD`.
+/// Mutant: the drop consumes by the pid without its own peek having found the record.
 #[skuld::test]
-fn a_reap_that_finds_no_exit_record_after_the_peek_saw_one_looks_again() {
-    // The look's peek sees the exit; the reap's own peek then finds none.
+fn a_drop_that_finds_no_exit_record_after_the_wait_saw_one_consumes_nothing() {
+    // The wait's peek sees the exit; the drop's own peek then finds none.
     let (mut b, kernel) = Blocker::spawn_over(|pid, _| {
         FakeKernel::over(&HostKernel)
             .on_peek(pid, Ok(Some(exit_record(0))))
             .on_peek(pid, Ok(None))
     });
     b.end_child_and_confirm_exit();
-    crate::wait::block_probe::take();
     let status = wait_status(&b.owned);
     assert!(status.success(), "{status:?}");
-    assert!(kernel.all_rows_taken(), "the look and the reap must each peek");
+    let pid = b.pid;
+    drop(b);
+    assert!(kernel.all_rows_taken(), "the wait and the drop must each peek");
     assert!(
-        !crate::wait::block_probe::take().is_empty(),
-        "the second look follows a backoff"
+        crate::test_child::is_unreaped_child(pid),
+        "the drop consumed a zombie its own peek did not find"
     );
+    crate::test_child::reaped_elsewhere::reap_behind(pid);
 }
 
 // A child whose identity a same-user read refuses (the `setuid` group) =====
@@ -888,23 +899,4 @@ fn a_refused_confirmation_is_the_refusal_when_the_peek_reads_the_child_running()
         kernel.all_rows_taken(),
         "the adoption's registration was refused, and the confirming read was refused"
     );
-}
-
-// A hold's number read =====
-
-/// A hold reads the number it was taken for, through the kernel its box owns, whatever pid the box
-/// learned: the kernel refuses every record read of the held pid, which the host does not have and
-/// would answer `Gone`, and the box's own pid, which the host reads as `Found`, is not the number
-/// held.
-///
-/// Mutant: `ReapHold::number_holder` reads the box's pid, or a host kernel.
-#[skuld::test]
-fn a_hold_reads_its_own_number_through_the_kernel_its_box_owns() {
-    use crate::containment::Root;
-    use crate::identity::{unreadable, Resolved};
-
-    const HELD: u32 = 2_000_000_000;
-    let (b, _) = Blocker::spawn_over(|_, _| unreadable(HELD));
-    let (read, _) = b.owned.hold(HELD).number_holder();
-    assert!(matches!(read, Resolved::Unknown), "{read:?}");
 }

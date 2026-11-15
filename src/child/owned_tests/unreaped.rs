@@ -37,7 +37,7 @@ fn dropped_when_the_reap_answers(
 #[skuld::test]
 fn wait_blocks_until_the_child_exits_and_returns_its_status() {
     crate::log_capture::install();
-    let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Reaped(exit())]);
+    let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
     let _fire = fire_on_block(&fake);
     let child = unreaped(&fake, Some(id()));
     let mark = crate::log_capture::mark();
@@ -103,7 +103,7 @@ fn a_wait_on_a_zombie_launchd_holds_is_an_error_and_warns_once() {
 /// Mutants: the drop does not wait; it logs nothing, or logs twice, or logs below `warn`.
 #[skuld::test]
 fn dropping_waits_for_the_child_and_logs_one_warn_naming_it() {
-    let (records, blocks) = dropped_when_the_reap_answers(fake(), ReapAnswer::Reaped(exit()));
+    let (records, blocks) = dropped_when_the_reap_answers(fake(), ReapAnswer::Exited(exit()));
     assert_eq!(blocks, [None], "one unbounded block");
     assert!(
         matches!(records.as_slice(), [(log::Level::Warn, text)] if text.contains(&PID.to_string())),
@@ -171,7 +171,7 @@ fn leak_calls_nothing_and_logs_nothing() {
 #[skuld::test]
 fn a_pidless_child_is_named_without_a_number() {
     crate::log_capture::install();
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Reaped(exit())]);
+    let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
     let child = unreaped(&fake, None);
     assert_eq!(child.pid(), None);
     let mark = crate::log_capture::mark();
@@ -413,7 +413,6 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
     use crate::child::owned::teardown::{LEAVING_RUNNING, LEFT};
     use crate::child::owned::unreaped::let_go_line;
     use crate::child::owned::ChildWaitOutcome;
-    use crate::os_process::child::ExitRecord;
     use crate::signal::Sent;
     use log::Level::{Debug, Warn};
 
@@ -471,16 +470,11 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
         ),
     ];
     // A refused kill raises a look's `debug` to `warn`.
-    let looks: [LookCase; 5] = [
+    let looks: [LookCase; 4] = [
         (
             || Ok(ChildWaitOutcome::Exited(exit())),
             Warn,
             vec!["reaped it", &status],
-        ),
-        (
-            || Ok(ChildWaitOutcome::Exited(ExitRecord::Unreadable { si_code: 7 })),
-            Warn,
-            vec!["unreadable"],
         ),
         (
             || Ok(ChildWaitOutcome::Foreign(Foreign::Gone)),

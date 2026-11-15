@@ -351,7 +351,6 @@ impl LateSweeps {
         // A late child's tree is swept alone: nothing here waits for what the sweep killed.
         let held = owned.hold(pid);
         let outcome = tree.send_kill(Some(&held));
-        drop(held);
         match outcome {
             // The root's kill landed and the reason for the skip is one a kill does not outlive: the
             // tree's first sweep stands, and only the holders' failure is an error of this one.
