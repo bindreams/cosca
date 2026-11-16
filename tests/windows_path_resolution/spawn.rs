@@ -337,7 +337,10 @@ pub(crate) fn create_process(program: &str, out_path: &str) -> Result<(u32, Stri
     let options = RawOptions {
         exact_image: true,
         quote_exe: true,
-        stdio: RawStdio::Output(file.as_handle()),
+        stdio: RawStdio::Given {
+            stdin: None,
+            output: file.as_handle(),
+        },
         ..Default::default()
     };
     let child = spawn_locked_raw_with(program, &[] as &[&str], &[], 0, Console::Hidden, options)

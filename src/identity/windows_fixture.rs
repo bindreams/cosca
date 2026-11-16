@@ -22,13 +22,14 @@
 //! test pass for the wrong reason.
 
 use std::mem::size_of;
+use std::os::windows::io::AsRawHandle as _;
 
 use crate::test_own_process::Completion;
+use crate::test_spawn::console_flags::Console;
+use crate::test_spawn::raw_spawn::{spawn_locked_raw_with, RawChild, RawOptions, RawStdio};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::LUID;
-use windows::Win32::Foundation::{
-    CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, STILL_ACTIVE, WAIT_OBJECT_0,
-};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0};
 use windows::Win32::Security::{
     AddAccessAllowedAce, AdjustTokenPrivileges, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
     LookupPrivilegeValueW, SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION, LUID_AND_ATTRIBUTES,
@@ -40,13 +41,10 @@ use windows::Win32::System::JobObjects::{
     JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, QueryFullProcessImageNameW, ResumeThread,
-    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS,
-    EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, QueryFullProcessImageNameW, ResumeThread,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS, INFINITE,
+    PROCESS_CREATION_FLAGS, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
-
-use crate::child::spawn::windows_raw::AttributeList;
 
 /// Remove `SeDebugPrivilege` from THIS process's token.
 ///
@@ -131,25 +129,24 @@ const NO_ACE: u32 = u32::MAX;
 /// A live child whose process object grants us only the mask passed to [`spawn_restricted`].
 /// Terminated and closed on drop.
 pub(crate) struct RestrictedChild {
-    handle: HANDLE,
-    thread: HANDLE,
+    /// Holds the creator's full-access handles and kills the child on drop.
+    child: RawChild,
     /// Kills the whole tree when closed. `TerminateProcess` does NOT cascade, so without
     /// this `spawn_restricted_shell`'s `cmd.exe` would die and leave the `more.com` it
     /// launched behind. `wait_for_child` reads this job's members.
     job: HANDLE,
-    pid: u32,
     /// The write end of the stdin the `more.com` blocks on, held so that only a kill ends it.
     stdin: Option<std::io::PipeWriter>,
 }
 
 impl RestrictedChild {
     pub(crate) fn pid(&self) -> u32 {
-        self.pid
+        self.child.id()
     }
 
     /// The creator's full-access handle — the only way to read this child's identity.
     pub(crate) fn handle(&self) -> HANDLE {
-        self.handle
+        HANDLE(self.child.process().as_raw_handle())
     }
 
     /// `STILL_ACTIVE` while running, else the recorded exit code. Read through the owned
@@ -157,7 +154,7 @@ impl RestrictedChild {
     pub(crate) fn exit_code(&self) -> u32 {
         let mut code = 0u32;
         // SAFETY: `self.handle` is our live, owned, full-access process handle.
-        unsafe { GetExitCodeProcess(self.handle, &mut code) }.expect("GetExitCodeProcess on an owned handle");
+        unsafe { GetExitCodeProcess(self.handle(), &mut code) }.expect("GetExitCodeProcess on an owned handle");
         code
     }
 
@@ -171,11 +168,12 @@ impl RestrictedChild {
     /// exit someone has already requested (`terminate`, or a `kill_by_identity` under test).
     pub(crate) fn await_exit(&self) {
         // SAFETY: `self.handle` is our live, owned process handle.
-        let waited = unsafe { WaitForSingleObject(self.handle, INFINITE) };
+        let waited = unsafe { WaitForSingleObject(self.handle(), INFINITE) };
         assert_eq!(
-            waited, WAIT_OBJECT_0,
+            waited,
+            WAIT_OBJECT_0,
             "fixture: wait on pid {} returned {waited:?}",
-            self.pid
+            self.pid()
         );
     }
 
@@ -197,7 +195,7 @@ impl RestrictedChild {
             let members = crate::containment::windows::query_job_pid_list(self.job).expect("the fixture job's members");
             if let Some(pid) = members
                 .into_iter()
-                .filter(|&pid| pid != self.pid)
+                .filter(|&pid| pid != self.pid())
                 .find(|&pid| is_more_com(pid))
             {
                 return pid;
@@ -223,7 +221,7 @@ impl RestrictedChild {
     /// itself and skipping the handle closes.
     fn try_terminate(&self) -> Result<(), String> {
         // SAFETY: `self.handle` is our live, owned, full-access process handle.
-        if let Err(e) = unsafe { TerminateProcess(self.handle, 1) } {
+        if let Err(e) = unsafe { TerminateProcess(self.handle(), 1) } {
             if !self.is_running() {
                 return Ok(()); // it exited on its own between our read and the call — fine
             }
@@ -231,16 +229,16 @@ impl RestrictedChild {
             // would park forever.
             return Err(format!(
                 "fixture teardown: TerminateProcess(pid {}) failed: {e}",
-                self.pid
+                self.pid()
             ));
         }
         // SAFETY: `self.handle` is live and we just asked the child to exit, so this wait is
         // bounded by that exit.
-        let waited = unsafe { WaitForSingleObject(self.handle, INFINITE) };
+        let waited = unsafe { WaitForSingleObject(self.handle(), INFINITE) };
         if waited != WAIT_OBJECT_0 {
             return Err(format!(
                 "fixture teardown: wait on pid {} returned {waited:?}",
-                self.pid
+                self.pid()
             ));
         }
         Ok(())
@@ -249,23 +247,32 @@ impl RestrictedChild {
 
 impl Drop for RestrictedChild {
     fn drop(&mut self) {
-        // Never let a teardown failure unwind out of `drop` before the closes below: the
-        // child is still ALIVE on that path (that is what makes it a failure), so leaking
-        // its handles would strand a process with no owner.
+        // Never let a teardown failure unwind out of `drop` before the close below: the
+        // child is still ALIVE on that path (that is what makes it a failure), and the `RawChild`
+        // field, dropped after this, kills it and closes its handles.
         let failure = self.try_terminate().err();
-        // The job goes last: closing it is what kills any grandchildren.
-        for (h, what) in [(self.thread, "thread"), (self.handle, "process"), (self.job, "job")] {
-            // SAFETY: all three handles are ours and still open.
-            if let Err(e) = unsafe { CloseHandle(h) } {
-                log::error!(
-                    "fixture teardown: CloseHandle({what}) for pid {} failed: {report}",
-                    self.pid,
-                    report = crate::error::Report(&e)
-                );
-            }
+        // Closing the job is what kills any grandchildren.
+        // SAFETY: the job handle is ours and still open.
+        if let Err(e) = unsafe { CloseHandle(self.job) } {
+            log::error!(
+                "fixture teardown: CloseHandle(job) for pid {} failed: {report}",
+                self.pid(),
+                report = crate::error::Report(&e)
+            );
         }
         if let Some(what) = failure {
             log::error!("{what}");
+            // The `RawChild` field's own kill, run after this, ignores its result. Run it here once
+            // too, so that a child it could not end is reported. A failure on a child that has
+            // exited meanwhile is the ordinary harmless case.
+            if let Err(e) = self.child.kill() {
+                if self.is_running() {
+                    log::error!(
+                        "fixture teardown: the second TerminateProcess(pid {}) failed: {e}",
+                        self.pid()
+                    );
+                }
+            }
             if !std::thread::panicking() {
                 panic!("{what}");
             }
@@ -302,10 +309,11 @@ pub(crate) fn spawn_query_only(alone: &Completion) -> RestrictedChild {
 /// `CREATE_NO_WINDOW`), so the child brings no console host along: for a test that needs the
 /// restricted child to be the only process of the job it is put in.
 pub(crate) fn spawn_query_only_without_console(alone: &Completion) -> RestrictedChild {
-    spawn_with_ace_cmdline(
+    spawn_with_ace_running(
         alone,
         PROCESS_QUERY_LIMITED_INFORMATION.0,
-        &quoted_more(),
+        &crate::test_child::windows_more(),
+        &[],
         DETACHED_PROCESS,
     )
 }
@@ -314,11 +322,12 @@ pub(crate) fn spawn_query_only_without_console(alone: &Completion) -> Restricted
 /// grandchild. A DACL is not inherited, so the grandchild is freely openable while its
 /// parent is not — the only way to build "my parent is access-denied" from a test.
 pub(crate) fn spawn_restricted_shell(alone: &Completion, granted: u32) -> RestrictedChild {
-    let cmd = crate::test_child::system32("cmd.exe");
-    spawn_with_ace_cmdline(
+    let more = crate::test_child::windows_more();
+    spawn_with_ace_running(
         alone,
         granted | PROCESS_TERMINATE.0,
-        &format!("\"{}\" /c {}", cmd.display(), quoted_more()),
+        &crate::test_child::system32("cmd.exe"),
+        &[std::path::Path::new("/c"), &more],
         CREATE_NO_WINDOW,
     )
 }
@@ -333,31 +342,35 @@ pub(crate) fn spawn_restricted_releasable(alone: &Completion, granted: u32) -> (
     (child, writer)
 }
 
-/// `more.com`, quoted for a command line.
-fn quoted_more() -> String {
-    format!("\"{}\"", crate::test_child::windows_more().display())
-}
-
 fn spawn_with_ace(alone: &Completion, granted: u32) -> RestrictedChild {
-    spawn_with_ace_cmdline(alone, granted, &quoted_more(), CREATE_NO_WINDOW)
+    spawn_with_ace_running(
+        alone,
+        granted,
+        &crate::test_child::windows_more(),
+        &[],
+        CREATE_NO_WINDOW,
+    )
 }
 
 /// Panics on any Win32 failure: a fixture that silently degrades would make its consumers
-/// pass vacuously. The child reads a piped stdin whose write end the [`RestrictedChild`] holds, and
-/// writes to `NUL`. The child inherits only its stdin and stdout (a handle list), and both are
-/// inheritable only under [`spawn_lock`](crate::child::spawn::spawn_lock) and closed before it is
-/// released. A spawner outside the lock that inherits with no list can still take them. The caller
-/// must not hold `spawn_lock`.
-fn spawn_with_ace_cmdline(
+/// pass vacuously. Runs `exe` with `args` (`raw_spawn`'s command line, `exe` always quoted). The child
+/// reads a piped stdin whose write end the [`RestrictedChild`] holds, and writes to `NUL`.
+///
+/// `console` is every creation flag but `CREATE_SUSPENDED`, which the spawn adds (`Console::Asked`):
+/// `CREATE_NO_WINDOW` or `DETACHED_PROCESS` for a hidden or absent console; `0` gives the child a
+/// visible console window.
+///
+/// The caller must not hold the spawn lock, which the spawn takes.
+fn spawn_with_ace_running(
     alone: &Completion,
     granted: u32,
-    cmdline: &str,
+    exe: &std::path::Path,
+    args: &[&std::path::Path],
     console: PROCESS_CREATION_FLAGS,
 ) -> RestrictedChild {
-    use std::os::windows::io::AsRawHandle as _;
+    use std::os::windows::io::AsHandle as _;
     let (reader, writer) = std::io::pipe().expect("pipe");
     let null = std::fs::OpenOptions::new().write(true).open("NUL").expect("open NUL");
-    let (stdin, stdout) = (HANDLE(reader.as_raw_handle()), HANDLE(null.as_raw_handle()));
 
     // Before the child is created, so no denial assertion can observe a token that still
     // bypasses DACLs.
@@ -415,53 +428,22 @@ fn spawn_with_ace_cmdline(
         bInheritHandle: false.into(),
     };
 
-    // NUL-terminated HERE, centrally: `CreateProcessW` takes a `PWSTR` and reads until the
-    // terminator, so a caller that forgot one would send it reading past the end of the
-    // allocation. No call site can get this wrong.
-    let mut cmdline: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
-    // Outlives the attribute list, which keeps the pointer to it.
-    let listed = [stdin, stdout];
-    let attributes = AttributeList::build(&listed).expect("the inheritance list of the fixture child");
-    let si = STARTUPINFOEXW {
-        StartupInfo: STARTUPINFOW {
-            cb: size_of::<STARTUPINFOEXW>() as u32,
-            dwFlags: STARTF_USESTDHANDLES,
-            hStdInput: stdin,
-            hStdOutput: stdout,
-            hStdError: stdout,
-            ..Default::default()
+    // `sa` and the DACL it points at are alive for the duration of the call. The child's console
+    // is `console`, the whole flag word (`Console::Asked`), so `CREATE_NO_WINDOW` or
+    // `DETACHED_PROCESS` is the caller's choice.
+    let options = RawOptions {
+        quote_exe: true,
+        stdio: RawStdio::Given {
+            stdin: Some(reader.as_handle()),
+            output: null.as_handle(),
         },
-        lpAttributeList: attributes.as_ptr(),
+        process_security: Some(&sa),
+        ..Default::default()
     };
-    let mut pi = PROCESS_INFORMATION::default();
-    {
-        let _guard = crate::child::spawn::spawn_lock();
-        // Rebound after the guard: locals drop in reverse order, so on success or a panic the
-        // child-side ends close before the lock is released.
-        let (_reader, _null) = (reader, null);
-        for handle in [stdin, stdout] {
-            // SAFETY: `handle` is live and owned by `_reader` or `_null`; the call only sets its flag.
-            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
-                .expect("make the child's stdio inheritable");
-        }
-        // SAFETY: `cmdline` is a NUL-terminated writable UTF-16 buffer; `sa` and the DACL it
-        // points at are alive for the duration of the call.
-        unsafe {
-            CreateProcessW(
-                None,
-                Some(PWSTR(cmdline.as_mut_ptr())),
-                Some(&sa),
-                None,
-                true,
-                console | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
-                None,
-                None,
-                &si.StartupInfo,
-                &mut pi,
-            )
-        }
-        .expect("CreateProcessW for the restricted fixture child");
-    }
+    let child = spawn_locked_raw_with(exe, args, &[], console.0 | CREATE_SUSPENDED.0, Console::Asked, options)
+        .expect("the restricted fixture child");
+    // The child holds its own copies; these ends stay with us only until here.
+    drop((reader, null));
 
     // SAFETY: an unnamed job object has no preconditions; the handle is owned by the
     // RestrictedChild and closed in Drop.
@@ -484,21 +466,20 @@ fn spawn_with_ace_cmdline(
     }
     .expect("SetInformationJobObject");
     // SAFETY: both handles are live and ours.
-    unsafe { AssignProcessToJobObject(job, pi.hProcess) }.expect("AssignProcessToJobObject");
+    unsafe { AssignProcessToJobObject(job, HANDLE(child.process().as_raw_handle())) }
+        .expect("AssignProcessToJobObject");
 
     // Only NOW may the child run. Windows enrols a process-s children in its job only from
     // the moment the parent is already a member, so a child that started running before the
     // assignment could spawn a grandchild permanently outside the job - which is exactly the
     // orphan the job exists to prevent. CREATE_SUSPENDED closes that window by construction.
-    // SAFETY: `pi.hThread` is the freshly created, still-suspended main thread.
-    let prev = unsafe { ResumeThread(pi.hThread) };
+    // SAFETY: the thread is the freshly created, still-suspended main thread.
+    let prev = unsafe { ResumeThread(HANDLE(child.thread().as_raw_handle())) };
     assert_eq!(prev, 1, "the fixture child must resume from exactly one suspend");
 
     let child = RestrictedChild {
-        handle: pi.hProcess,
-        thread: pi.hThread,
+        child,
         job,
-        pid: pi.dwProcessId,
         stdin: Some(writer),
     };
     // A child that died on startup would still keep its kernel object alive through our
