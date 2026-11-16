@@ -5,6 +5,120 @@
 //! [`Process`]. Sync by default; async counterparts live in the `tokio`
 //! module behind the `tokio` feature.
 //!
+//! # Which type do I use?
+//!
+//! With the `tokio` feature, `cosca::tokio::Command`, `cosca::tokio::Child` and
+//! `cosca::tokio::Process` are the async twins of [`Command`], [`Child`] and [`Process`];
+//! [`ProcessId`](identity::ProcessId) is shared.
+//!
+//! ## A process you spawn: [`Command`] and [`Child`]
+//!
+//! [`Command::spawn`] makes a [`Child`], and the caller is its parent: the child's exit status,
+//! its stdio pipes and, with [`contain`](Command::contain), its whole process tree are the handle's.
+//! `contain` takes the strongest mechanism the host offers and fails the spawn when it cannot set
+//! one up; [`contain_with`](Command::contain_with)(`BestEffort`) takes a weaker one instead
+//! ([`ContainMode`]). [`kill_tree`](Child::kill_tree) kills the tree and waits for it. A drop kills
+//! the contained tree, then the child, unless the handle opted out with
+//! [`kill_on_drop(false)`](Command::kill_on_drop).
+//!
+//! ```no_run
+//! fn serve() -> Result<(), cosca::error::Error> {
+//!     let mut cmd = cosca::run(["my-server", "--port", "8080"]);
+//!     let child = cmd.contain().spawn()?;
+//!     // ... later:
+//!     child.kill_tree()?;
+//!     let status = child.wait()?;
+//!     println!("my-server exited: {status}");
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## A process you did not spawn: [`Process`]
+//!
+//! [`Process::open_pid`] and [`Process::open`] hold a running process by identity. Once opened,
+//! [`kill`](Process::kill), the tree acts such as [`kill_tree`](Process::kill_tree), and
+//! [`wait`](Process::wait) reach that process or report it gone, never a later holder of its pid.
+//! `Process::wait` reports no exit status; [`Child::wait`] does. A pid whose identity cannot be
+//! read is an `Err`, not `Ok(None)`: usually [`Error::Unassessable`](error::Error::Unassessable),
+//! and [`Process::open`]'s `# Errors` lists the rest.
+//!
+//! ```no_run
+//! use cosca::error::Report;
+//! use cosca::Process;
+//!
+//! fn stop(pid: u32) {
+//!     match Process::open_pid(pid) {
+//!         Ok(Some(process)) => {
+//!             if let Err(e) = process.kill().and_then(|()| process.wait()) {
+//!                 eprintln!("could not stop pid {pid}: {}", Report::new(&e));
+//!             }
+//!         }
+//!         // No process has this pid.
+//!         Ok(None) => println!("pid {pid} is not running"),
+//!         Err(e) => eprintln!("could not open pid {pid}: {}", Report::new(&e)),
+//!     }
+//! }
+//! ```
+//!
+//! ## Naming a process exactly: [`ProcessId`](identity::ProcessId)
+//!
+//! A `ProcessId` is a pid plus a per-process key from the kernel, compared exactly, so the id of a
+//! process that has exited does not equal the id of a later holder of its pid (except on Linux
+//! below 6.9: see [`ProcessId`](identity::ProcessId)).
+//! [`ProcessId::of`](identity::ProcessId::of) reads the id of a pid and answers
+//! [`Found`](identity::Resolved::Found), [`Gone`](identity::Resolved::Gone) (no such process) or
+//! [`Unknown`](identity::Resolved::Unknown) (the OS refused to say). [`Child::id`] gives a spawned
+//! child's, or `None` when the OS refused to report it at spawn. An id is `Copy`, `Eq` and `Hash`.
+//! It holds nothing and acts on nothing: [`exists`](identity::ProcessId::exists) and
+//! [`is_alive`](identity::ProcessId::is_alive) read the OS at that moment, and [`Process::open`]
+//! turns an id into a handle to act through.
+//!
+//! To keep an id past this process, [`to_record`](identity::ProcessId::to_record) makes an
+//! [`identity::ProcessIdRecord`] (serializable with the `serde` feature), and the only way back is
+//! `ProcessId::try_from`. It refuses a record that cannot be compared on this host, so a record
+//! cannot silently alias onto an unrelated process: [`RecordErrorKind`](error::RecordErrorKind)
+//! lists each refusal. A restored id says nothing about whether its process is still there:
+//! opening it does.
+//!
+//! ```no_run
+//! use cosca::error::Error;
+//! use cosca::identity::{ProcessId, ProcessIdRecord, Resolved};
+//! use cosca::Process;
+//!
+//! // The id of a child this program spawned.
+//! fn save_child(child: &cosca::Child) -> Result<Option<ProcessIdRecord>, Error> {
+//!     match child.id() {
+//!         Some(id) => Ok(Some(id.to_record()?)),
+//!         // The OS refused to report its identity at spawn: there is no id to keep.
+//!         None => Ok(None),
+//!     }
+//! }
+//!
+//! // The id of a process this program did not spawn.
+//! fn save_pid(pid: u32) -> Result<Option<ProcessIdRecord>, Error> {
+//!     match ProcessId::of(pid) {
+//!         Resolved::Found(id) => Ok(Some(id.to_record()?)),
+//!         // No process has this pid.
+//!         Resolved::Gone => Ok(None),
+//!         // The OS refused to say: a process may well be there.
+//!         Resolved::Unknown => {
+//!             eprintln!("could not read the identity of pid {pid}");
+//!             Ok(None)
+//!         }
+//!     }
+//! }
+//!
+//! // Later, possibly in another run of the program, from a stored record.
+//! fn stop(record: &ProcessIdRecord) -> Result<(), Error> {
+//!     let id = ProcessId::try_from(record)?;
+//!     match Process::open(id)? {
+//!         Some(process) => process.kill(),
+//!         // That process is gone, and its pid may name another now.
+//!         None => Ok(()),
+//!     }
+//! }
+//! ```
+//!
 //! # Platform requirements
 //!
 //! **Linux 5.6 or newer**, with `pidfd_open` and `openat2` not blocked by a seccomp profile or an

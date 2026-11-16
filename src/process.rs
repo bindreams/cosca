@@ -5,8 +5,7 @@
 //! `graceful_shutdown_tree`) walk by identity and signal each member, through a handle opened by
 //! its identity: a pidfd proved to name it on Linux, a process handle on Windows, an audit token on
 //! macOS. The tree acts signal the root through this handle instead of a second open of it.
-//! `wait()` is a death-watch yielding no `ExitStatus` (the kernel
-//! hands exit status only to the real parent — contrast `Child::wait`). Its tree is
+//! `wait()` is a death-watch, not an exit-status wait (see `Process::wait`). Its tree is
 //! [`ProcessId::children`] and [`ProcessId::parent`].
 
 use std::time::Duration;
@@ -23,6 +22,9 @@ mod graceful;
 /// a later holder of its pid. The tree acts (`kill_tree`, `terminate_tree`,
 /// `graceful_shutdown_tree`) signal each member through a handle opened by its identity, and the
 /// root through this handle. Not `Clone`: open the [`ProcessId`] again.
+///
+/// For a process you spawn, use a [`Child`](crate::Child); to keep a process's identity for a later
+/// open, use a [`ProcessId`].
 #[derive(Debug)]
 pub struct Process {
     id: ProcessId,
@@ -60,8 +62,9 @@ impl Process {
     }
 
     /// [`open`](Self::open) the process holding `pid` now. `Ok(None)` if no process has the pid;
-    /// an exited but unreaped one opens as for [`open`](Self::open). Errors as for `open`; a pid
-    /// whose identity cannot be read is [`Error::Unassessable`].
+    /// an exited but unreaped one opens as for [`open`](Self::open). Errors as for `open`: a pid
+    /// whose identity cannot be read is an `Err`, not `Ok(None)`; usually [`Error::Unassessable`],
+    /// and on Linux a refused or failed pidfd call is [`Error::Unsupported`] or [`Error::Io`].
     pub fn open_pid(pid: RawPid) -> Result<Option<Process>, Error> {
         Self::open_pid_with(crate::identity::HostKernel, pid)
     }
@@ -116,8 +119,9 @@ impl Process {
         }
     }
 
-    /// Block until the process exits. Death-watch — yields no `ExitStatus` (only the real
-    /// parent gets one). Non-reaping. Returns at once for a process that has already exited. On macOS
+    /// Block until the process exits. Death-watch: returns `()`, not an
+    /// `ExitStatus` ([`Child::wait`](crate::Child::wait) returns one, as the parent). Non-reaping.
+    /// Returns at once for a process that has already exited. On macOS
     /// "exited" is a zombie or gone: once this returns, [`ProcessId::is_alive`] never reads `Alive`.
     /// `Err` only on a wait failure; on Windows, for a handle without `SYNCHRONIZE`, while the
     /// process runs (`ERROR_ACCESS_DENIED`). On macOS the first look at the process (a wait, a
