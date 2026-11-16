@@ -22,10 +22,6 @@ fn is_echild(e: &io::Error) -> bool {
 
 /// The non-consuming look, `kernel`'s peek, with no start check.
 fn peek_raw(kernel: &dyn Kernel, pid: u32) -> io::Result<PeekOutcome> {
-    #[cfg(test)]
-    if let Some(forced) = super::seams::take_forced_peek() {
-        return forced;
-    }
     match kernel.peek(pid) {
         Ok(Some(record)) if is_exit_record(record.si_code) => Ok(PeekOutcome::Exit(exit_record_of(record))),
         Ok(_) => Ok(PeekOutcome::Running),

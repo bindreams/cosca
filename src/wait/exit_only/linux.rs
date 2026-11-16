@@ -1,51 +1,16 @@
 //! Linux `exit_only`: `waitid(P_PIDFD, ...)`, atomic on the pidfd, never by pid.
 
 use std::io;
-use std::os::fd::BorrowedFd;
 
 use rustix::io::Errno;
-use rustix::process::{waitid, WaitId, WaitIdOptions};
 
-use super::{exit_record_of, is_exit_record, Reap, Record, Target};
+use super::{exit_record_of, is_exit_record, Reap, Target};
 use crate::os_process::child::{Foreign, PeekOutcome};
 
-fn pidfd<'a>(target: &Target<'a>) -> BorrowedFd<'a> {
-    match target {
-        Target::PidFd(fd) => *fd,
-    }
-}
-
-/// One `waitid(P_PIDFD, options)`: `Ok(None)` when nothing matched (`si_signo == 0`, rustix
-/// zeroes the `siginfo_t` first). `EINTR` retries.
-///
-/// `options` must carry `NOHANG`: a blocking `waitid` on a zombie its tracer holds sleeps until the
-/// tracer lets go.
-pub(crate) fn waitid_record(fd: BorrowedFd<'_>, options: WaitIdOptions) -> Result<Option<Record>, Errno> {
-    debug_assert!(
-        options.contains(WaitIdOptions::NOHANG),
-        "a blocking waitid on a zombie a tracer holds sleeps until the tracer lets go"
-    );
-    loop {
-        match waitid(WaitId::PidFd(fd), options) {
-            Ok(status) => {
-                return Ok(status.map(|st| Record {
-                    si_code: st.raw_code(),
-                    si_status: st.exit_status().or_else(|| st.terminating_signal()).unwrap_or(0),
-                }))
-            }
-            Err(Errno::INTR) => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// One non-blocking `waitid` look at the target; the test hook is not consulted.
+/// One non-blocking `waitid` look at the target, through the kernel the target carries.
 pub(crate) fn peek(target: &Target<'_>) -> io::Result<PeekOutcome> {
-    let fd = pidfd(target);
-    match waitid_record(
-        fd,
-        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-    ) {
+    let Target::PidFd { fd, kernel } = target;
+    match kernel.peek(*fd) {
         Ok(Some(record)) if is_exit_record(record.si_code) => Ok(PeekOutcome::Exit(exit_record_of(record))),
         // A ptrace stop, which Linux reports to the tracer whatever the options say: not an exit.
         Ok(Some(_)) | Ok(None) => Ok(PeekOutcome::Running),
@@ -67,8 +32,8 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
         PeekOutcome::Running => return Ok(Reap::Running),
         PeekOutcome::Foreign(f) => return Ok(Reap::Foreign(f)),
     }
-    let fd = pidfd(target);
-    match waitid_record(fd, WaitIdOptions::EXITED | WaitIdOptions::NOHANG) {
+    let Target::PidFd { fd, kernel } = target;
+    match kernel.consume(*fd) {
         Ok(Some(record)) => Ok(Reap::Reaped(exit_record_of(record))),
         // Peeked as an exit, then nothing to consume: a zombie only its tracer can reap.
         Ok(None) => Ok(Reap::Running),

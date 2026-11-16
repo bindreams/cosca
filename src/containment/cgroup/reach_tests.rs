@@ -1115,6 +1115,17 @@ impl<F: Fn(libc::pid_t) + Sync> Kernel for AfterCgroupRead<F> {
     fn signal_probe(&self, target: rustix::process::Pid) -> Result<(), rustix::io::Errno> {
         HostKernel.signal_probe(target)
     }
+
+    fn peek(&self, pidfd: std::os::fd::BorrowedFd<'_>) -> Result<Option<crate::identity::Record>, rustix::io::Errno> {
+        HostKernel.peek(pidfd)
+    }
+
+    fn consume(
+        &self,
+        pidfd: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<Option<crate::identity::Record>, rustix::io::Errno> {
+        HostKernel.consume(pidfd)
+    }
 }
 
 /// A probe's child that exits after its cgroup is read, before the probe confirms through its pidfd

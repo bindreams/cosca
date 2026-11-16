@@ -8,9 +8,10 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 
 use rustix::fs::{fstat, fstatfs};
 use rustix::io::Errno;
-use rustix::process::{pidfd_open, test_kill_process, Pid, PidfdFlags};
+use rustix::process::{pidfd_open, test_kill_process, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions};
 
 use super::proc_read::{ProcDir, ProcOpenFailure, ReadFailure};
+use crate::identity::Record;
 
 /// `PIDFD_THREAD`: open a pidfd for a thread that is not a thread-group leader. rustix has no
 /// name for it.
@@ -51,6 +52,16 @@ pub(crate) trait Kernel: Sync {
     /// `kill(target, 0)`. The caller decides what is a kill target (`probe::signal_target`); the
     /// kernel is asked only about one.
     fn signal_probe(&self, target: Pid) -> Result<(), Errno>;
+
+    /// `waitid(P_PIDFD, pidfd, WEXITED | WNOHANG | WNOWAIT)`: the record a peek of our own child
+    /// sees, without consuming it. `Ok(None)`: no record (the child has not exited). Answers only
+    /// `ECHILD` (a foreign reap), or `EBADF`/`EINVAL` for a non-pidfd; a sandbox policy may answer
+    /// more, which is what a test states a row for.
+    fn peek(&self, pidfd: BorrowedFd<'_>) -> Result<Option<Record>, Errno>;
+
+    /// `waitid(P_PIDFD, pidfd, WEXITED | WNOHANG)`: the record this call consumes. `Ok(None)`: nothing
+    /// to consume (not exited, or a zombie only its tracer can reap).
+    fn consume(&self, pidfd: BorrowedFd<'_>) -> Result<Option<Record>, Errno>;
 }
 
 /// The real kernel.
@@ -91,6 +102,41 @@ impl Kernel for HostKernel {
     fn signal_probe(&self, target: Pid) -> Result<(), Errno> {
         test_kill_process(target)
     }
+
+    fn peek(&self, pidfd: BorrowedFd<'_>) -> Result<Option<Record>, Errno> {
+        waitid_record(
+            pidfd,
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        )
+    }
+
+    fn consume(&self, pidfd: BorrowedFd<'_>) -> Result<Option<Record>, Errno> {
+        waitid_record(pidfd, WaitIdOptions::EXITED | WaitIdOptions::NOHANG)
+    }
+}
+
+/// One `waitid(P_PIDFD, options)`: `Ok(None)` when nothing matched (`si_signo == 0`, rustix
+/// zeroes the `siginfo_t` first). `EINTR` retries.
+///
+/// `options` must carry `NOHANG`: a blocking `waitid` on a zombie its tracer holds sleeps until the
+/// tracer lets go.
+fn waitid_record(fd: BorrowedFd<'_>, options: WaitIdOptions) -> Result<Option<Record>, Errno> {
+    debug_assert!(
+        options.contains(WaitIdOptions::NOHANG),
+        "a blocking waitid on a zombie a tracer holds sleeps until the tracer lets go"
+    );
+    loop {
+        match waitid(WaitId::PidFd(fd), options) {
+            Ok(status) => {
+                return Ok(status.map(|st| Record {
+                    si_code: st.raw_code(),
+                    si_status: st.exit_status().or_else(|| st.terminating_signal()).unwrap_or(0),
+                }))
+            }
+            Err(Errno::INTR) => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 forward_kernel! {
@@ -102,6 +148,8 @@ forward_kernel! {
     fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure>;
     fn tids(&self, dir: &ProcDir, pid: u32) -> Result<Vec<u32>, ReadFailure>;
     fn signal_probe(&self, target: Pid) -> Result<(), Errno>;
+    fn peek(&self, pidfd: BorrowedFd<'_>) -> Result<Option<Record>, Errno>;
+    fn consume(&self, pidfd: BorrowedFd<'_>) -> Result<Option<Record>, Errno>;
 }
 
 #[cfg(test)]

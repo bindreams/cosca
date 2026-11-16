@@ -135,22 +135,16 @@ In order:
      kqueue the kernel refused is killed through its unique id, its marker's holders swept, warned
      of and never waited on.
    - Under `MacosChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
-     kernel-view slice): macOS's `Kernel` has its methods and is threaded through. macOS tests
-     state `FakeKernel` rows. Hooks remain only where the code still holds `HostKernel` (the
-     spawn-time code, the fd-marker sweep) or no row can state the answer (`uniq_fault`,
-     `ppid_fault`, `force_parents`, `force_links`, `by_pid_reads`). `HostKernel`'s own `sysctl`
+     kernel-view slice): macOS's `Kernel` has its methods and is threaded through. Tests state
+     `FakeKernel` rows (a spawn-level one via `spawn_with` over `FakeKernel::over(&HostKernel)`; a
+     row for a pid only the spawn knows via `state_peek`). Hooks remain only where no row can state
+     the answer (`uniq_fault`, `ppid_fault`, `force_parents`, `force_links`, `by_pid_reads`). The
+     Linux peek and consume are `Kernel::peek`/`consume` (see their docs). `HostKernel`'s own `sysctl`
      read states no row, so what a sysctl result means (`ESRCH`, `EPERM`/`EACCES` quiet; any other
      errno or a record of another size a `contract_violation`) is the pure `kinfo::classify`,
-     tested directly. The one peek seam, `exit_only::seams` (`force_peek_once`, `force_peeks`),
-     answers a box's peek in the OS's place under `cfg(test)`: on macOS in
-     `exit_only::{peek, peek_verified, peek_traced}`, on Linux in `LinuxProcess::peek`. The tests
-     that need it run a whole spawn, whose box a test cannot reach, and the macOS spawn-time code
-     also holds `HostKernel`. The Linux peek is a `waitid(P_PIDFD, WNOHANG)` on our own child's
-     pidfd, which the kernel (`kernel/exit.c`, `kernel_waitid`, `__do_wait`) answers only with
-     `ECHILD` (a foreign reap, `Foreign::Gone`) or, for a closed or non-pidfd descriptor,
-     `EBADF`/`EINVAL` (debug-asserted); the seam states what a sandbox policy may answer. No
-     Windows test forces a peek. A registration (an exit watch's, a reap waiter's) is a `subscribe`
-     row: refused with `ESRCH`, or made and never firing.
+     tested directly. No Windows test forces a peek. A
+     registration (an exit watch's, a reap waiter's) is a `subscribe` row: refused with `ESRCH`, or
+     made and never firing.
 2. **Elevation backends:** a black box that says what the tracked process is (the program, or a
    wrapper that outlives it) and what may be signalled. `Child` asks it; it stops knowing sudo,
    doas or osascript.

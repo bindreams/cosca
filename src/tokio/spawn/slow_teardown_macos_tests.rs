@@ -3,18 +3,19 @@
 //! here can have no foreign tracer, so the threshold is zero and the first two looks at the child
 //! are forced to find it running.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+use std::sync::Arc;
 
 use crate::test_child::Console;
 use std::rc::Rc;
 
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::error::ChildFate;
-use crate::os_process::child::PeekOutcome;
-use crate::wait::exit_only::seams::{assert_peeks_exhausted, force_peeks};
+use crate::identity::{FakeKernel, HostKernel};
 
-/// Spawns a blocker whose spawn `force` makes fail, with its next two looks forced from `point` on,
-/// and answers the child's fate and the "still waiting" warns naming it.
+/// Spawns a blocker whose spawn `force` makes fail, with its next two looks stated, from `point` on,
+/// as rows of the spawn's kernel that find it running, and answers the child's fate and the "still
+/// waiting" warns naming it.
 fn teardown_with_forced_looks(point: SpawnPoint, force: fn(bool)) -> (ChildFate, Vec<String>) {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -22,13 +23,14 @@ fn teardown_with_forced_looks(point: SpawnPoint, force: fn(bool)) -> (ChildFate,
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
-    let forced = Rc::new(RefCell::new(None));
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
     let pid = Rc::new(Cell::new(None));
     let _hook = fault::set_at(point, {
-        let (forced, pid) = (Rc::clone(&forced), Rc::clone(&pid));
+        let (kernel, pid) = (Arc::clone(&kernel), Rc::clone(&pid));
         move || {
             pid.set(Some(fault::spawn_pid()));
-            *forced.borrow_mut() = Some(force_peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Running)]));
+            kernel.state_peek(fault::spawn_pid(), Ok(None));
+            kernel.state_peek(fault::spawn_pid(), Ok(None));
         }
     });
     let _warn = crate::tokio::child::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
@@ -36,11 +38,11 @@ fn teardown_with_forced_looks(point: SpawnPoint, force: fn(bool)) -> (ChildFate,
     let spawned = crate::child::spawn::spawn_uncommitted(
         cmd.as_sync_mut(),
         crate::tokio::child::async_policy(),
-        crate::identity::HostKernel,
+        Arc::clone(&kernel),
     );
     force(false);
     let failed = spawned.expect_err("the forced failure fails the spawn");
-    assert_peeks_exhausted();
+    assert!(kernel.all_rows_taken(), "both stated looks were made");
     let (_, fate) = failed.expect_may_have_started_with();
     let pid = pid.get().expect("the hook ran");
     let warns = crate::log_capture::records_since(mark, &format!("child {pid}"))

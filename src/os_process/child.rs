@@ -303,7 +303,7 @@ pub(crate) fn adopt_pidfd<K: crate::identity::Kernel + Send + 'static>(
     // Never in a stdio slot: with 0, 1 or 2 closed, the lowest free number is one, and the
     // application may `dup2` its stdio back over it, destroying the pidfd.
     let pidfd = crate::above_stdio::above_stdio(pidfd).map_err(Error::Io)?;
-    match peek(&Target::PidFd(pidfd.as_fd())).map_err(Error::Io)? {
+    match peek(&Target::pidfd(&kernel, pidfd.as_fd())).map_err(Error::Io)? {
         PeekOutcome::Foreign(_) => Err(Error::Io(std::io::Error::from_raw_os_error(libc::ECHILD))),
         PeekOutcome::Exit(_) | PeekOutcome::Running => {
             Ok(Box::new(super::linux::LinuxProcess::new(kernel, Some(id.pid()), pidfd)))

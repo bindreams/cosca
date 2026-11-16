@@ -1897,11 +1897,18 @@ fn resolve_identity_of_a_reaped_child_is_gone() {
     assert!(matches!(read, Resolved::Gone), "a reaped child is gone: {read:?}");
 }
 
+/// The refusals the identity-peek tests state, and what each says. Each is an errno no other call
+/// of a spawn answers, so its text in a log line or an error is the stated peek's own.
+#[cfg(target_os = "linux")]
+const KEPT_REFUSAL: (rustix::io::Errno, &str) = (rustix::io::Errno::KEYREVOKED, "Key has been revoked");
+#[cfg(target_os = "linux")]
+const FATAL_REFUSAL: (rustix::io::Errno, &str) = (rustix::io::Errno::KEYREJECTED, "Key was rejected by service");
+
 /// A failed identity peek (a seccomp or sandbox policy may answer `waitid` with an errno the kernel
-/// never does) cannot show the read named our child, but the pidfd pins the child whatever the peek
-/// said: the spawn keeps the child with no identity, its pid intact. The failed check is logged once
-/// at debug naming its own error, the keep once at debug, and nothing warns: a kept child owes no
-/// failure. The child is killed and waited for through its pidfd like any other.
+/// never does: the kernel's own answers for our own child's pidfd are `ECHILD`, and `EBADF` or
+/// `EINVAL` for a descriptor that is not one) cannot show the read named our child, but the pidfd pins
+/// the child whatever the peek said: the spawn keeps the child with no identity, its pid intact. The
+/// refusal is a peek row of the spawn's kernel, stated once the child exists.
 ///
 /// Mutants: the failed check is taken for `Running` (the child has an identity); it warns though the
 /// child is kept; it is never logged; the spawn fails, or kills the child.
@@ -1910,6 +1917,9 @@ fn resolve_identity_of_a_reaped_child_is_gone() {
 fn a_failed_identity_peek_keeps_the_child_without_an_identity() {
     use std::cell::Cell;
     use std::rc::Rc;
+    use std::sync::Arc;
+
+    use crate::identity::{FakeKernel, HostKernel};
 
     crate::log_capture::install();
     let (stdin, _teardown) = fault::teardown_blocker_stdin();
@@ -1917,18 +1927,19 @@ fn a_failed_identity_peek_keeps_the_child_without_an_identity() {
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     let pid = Rc::new(Cell::new(0));
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
     let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
-        let pid = Rc::clone(&pid);
-        move || pid.set(fault::spawn_pid())
+        let (pid, kernel) = (Rc::clone(&pid), Arc::clone(&kernel));
+        move || {
+            pid.set(fault::spawn_pid());
+            kernel.state_peek(pid.get(), Err(KEPT_REFUSAL.0));
+        }
     });
-    let _forced = crate::wait::exit_only::seams::force_peek_once(Err(std::io::Error::other(
-        "forced identity-check failure 3b7e",
-    )));
     let mark = crate::log_capture::mark();
 
-    let outcome = cmd.spawn();
+    let outcome = super::spawn_with(&mut cmd, Arc::clone(&kernel)).map_err(Error::from);
 
-    crate::wait::exit_only::seams::assert_peeks_exhausted();
+    assert_eq!(kernel.peeks_left(), 0, "the identity check's peek was the refused one");
     let child = outcome.expect("a failed identity peek keeps the child");
     assert_eq!(
         child.id(),
@@ -1943,7 +1954,7 @@ fn a_failed_identity_peek_keeps_the_child_without_an_identity() {
         "a kept child warns of nothing"
     );
     assert_eq!(
-        crate::log_capture::levels_since(mark, "forced identity-check failure 3b7e"),
+        crate::log_capture::levels_since(mark, KEPT_REFUSAL.1),
         [log::Level::Debug],
         "the failed check is logged once, at debug, naming its own error"
     );
@@ -1972,27 +1983,33 @@ fn a_failed_identity_peek_keeps_the_child_without_an_identity() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_failed_identity_peek_fails_a_tree_walk_spawn_and_warns_once_of_the_check() {
+    use std::sync::Arc;
+
+    use crate::identity::{FakeKernel, HostKernel};
+
     crate::log_capture::install();
     let (stdin, _teardown) = fault::teardown_blocker_stdin();
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.contain_with(crate::ContainMode::TreeWalk);
-    let _forced = crate::wait::exit_only::seams::force_peek_once(Err(std::io::Error::other(
-        "forced identity-check failure 8e2f",
-    )));
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
+    let _hook = fault::set_at(fault::SpawnPoint::BeforeIdentity, {
+        let kernel = Arc::clone(&kernel);
+        move || kernel.state_peek(fault::spawn_pid(), Err(FATAL_REFUSAL.0))
+    });
     let mark = crate::log_capture::mark();
 
-    let outcome = cmd.spawn();
+    let outcome = super::spawn_with(&mut cmd, Arc::clone(&kernel)).map_err(Error::from);
 
-    crate::wait::exit_only::seams::assert_peeks_exhausted();
+    assert_eq!(kernel.peeks_left(), 0, "the identity check's peek was the refused one");
     let (err, fate) =
         expect_may_have_started_with(outcome.expect_err("a tree walk without an identity fails the spawn"));
     assert!(
         matches!(
             &err,
             Error::Unassessable { source: Some(source), .. }
-                if crate::error::said(&**source).contains("forced identity-check failure 8e2f")
+                if crate::error::said(&**source).contains(FATAL_REFUSAL.1)
         ),
         "a failed peek is Unassessable with the peek's own error as source, not a vanish: {err:?}"
     );
@@ -2004,7 +2021,7 @@ fn a_failed_identity_peek_fails_a_tree_walk_spawn_and_warns_once_of_the_check() 
     let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(warns.len(), 1, "{warns:?}");
     assert!(
-        warns[0].contains("could not be checked against its handle (forced identity-check failure 8e2f)"),
+        warns[0].contains("could not be checked against its handle (") && warns[0].contains(FATAL_REFUSAL.1),
         "the one warn names the failed check: {warns:?}"
     );
 }

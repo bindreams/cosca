@@ -36,6 +36,10 @@ impl<K: Kernel + Send> LinuxProcess<K> {
     pub(crate) fn new(kernel: K, pid: Option<u32>, pidfd: OwnedFd) -> Self {
         Self { kernel, pid, pidfd }
     }
+
+    fn target(&self) -> Target<'_> {
+        Target::pidfd(&self.kernel, self.pidfd.as_fd())
+    }
 }
 
 impl<K: Kernel + Send> OsProcess for LinuxProcess<K> {
@@ -75,11 +79,7 @@ impl<K: Kernel + Send> OsChild for LinuxProcess<K> {
     }
 
     fn peek(&self) -> Result<PeekOutcome, Error> {
-        #[cfg(test)]
-        if let Some(forced) = exit_only::seams::take_forced_peek() {
-            return forced.map_err(Error::Io);
-        }
-        exit_only::linux::peek(&Target::PidFd(self.pidfd.as_fd())).map_err(Error::Io)
+        exit_only::linux::peek(&self.target()).map_err(Error::Io)
     }
 
     fn try_observe(&self) -> Result<TryObserveOutcome<'_>, Error> {
@@ -88,18 +88,16 @@ impl<K: Kernel + Send> OsChild for LinuxProcess<K> {
         // tracer holds: a pidfd readable before a look that finds no record is that zombie, and
         // `poll` on it would return at once for ever.
         let readable = super::poll::is_readable(pidfd).map_err(Error::Io)?;
-        Ok(
-            match exit_only::linux::peek(&Target::PidFd(pidfd)).map_err(Error::Io)? {
-                PeekOutcome::Exit(record) => TryObserveOutcome::Exited(record),
-                PeekOutcome::Foreign(foreign) => TryObserveOutcome::Foreign(foreign),
-                PeekOutcome::Running if readable => TryObserveOutcome::Recheck,
-                PeekOutcome::Running => TryObserveOutcome::Running(WaitFor::Readable(pidfd)),
-            },
-        )
+        Ok(match exit_only::linux::peek(&self.target()).map_err(Error::Io)? {
+            PeekOutcome::Exit(record) => TryObserveOutcome::Exited(record),
+            PeekOutcome::Foreign(foreign) => TryObserveOutcome::Foreign(foreign),
+            PeekOutcome::Running if readable => TryObserveOutcome::Recheck,
+            PeekOutcome::Running => TryObserveOutcome::Running(WaitFor::Readable(pidfd)),
+        })
     }
 
     fn try_reap(&self) -> Result<Reap, Error> {
-        exit_only::try_reap(&Target::PidFd(self.pidfd.as_fd())).map_err(Error::Io)
+        exit_only::try_reap(&self.target()).map_err(Error::Io)
     }
 
     fn exact_consume(&self) -> bool {

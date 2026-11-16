@@ -1031,16 +1031,22 @@ fn macos_a_front_whose_report_read_fails_is_left_and_noted() {
 /// macOS: a contained spawn whose check of the front's identity is refused (`Unknown`) cannot attach
 /// its marker, which needs the identity, so it fails the attach with the read's error and tears the
 /// front down as every front is: sent nothing, and looked at. The refusal is forced to last into that
-/// look too (it is the one forced peek left), which cannot say whether the front exited, so the front
-/// is handed back, its fate unknown, and the error says so. (An uncontained front is kept, with no
-/// identity.)
+/// look too (a peek row of the spawn's kernel), which cannot say whether the front exited, so the
+/// front is handed back, its fate unknown, and the error says so. (An uncontained front is kept, with
+/// no identity.)
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn macos_a_contained_front_whose_identity_is_refused_is_handed_back_and_noted() {
+    use crate::identity::{FakeKernel, HostKernel};
+    let kernel = std::sync::Arc::new(FakeKernel::over(&HostKernel));
     let (err, detail, id, fate) = fail_a_front_spawn(
         |cmd| _ = cmd.contain(),
-        refuse_the_identity,
-        |cmd| cmd.spawn().map(drop),
+        || refuse_the_identity(&kernel),
+        |cmd| crate::child::spawn::identity_macos_tests::spawn_over(cmd, std::sync::Arc::clone(&kernel)).map(drop),
+    );
+    assert!(
+        kernel.all_rows_taken(),
+        "the teardown's look at the front was the refused one"
     );
     assert!(
         matches!(err, Error::Unassessable { .. }),
@@ -1064,21 +1070,21 @@ pub(crate) fn fail_the_report_read() -> crate::child::spawn::unique_report::seam
 }
 
 /// While it lives, this thread's reads of a spawned child's identity are refused: the spawn's own
-/// check (`Unknown`), and the next peek that reads its unique id.
+/// check (`Unknown`), and, as a row of `kernel` stated once the child has a pid, the next peek of it.
 #[cfg(target_os = "macos")]
-pub(crate) fn refuse_the_identity() -> RefusedIdentity {
+pub(crate) fn refuse_the_identity(kernel: &std::sync::Arc<crate::identity::FakeKernel<'static>>) -> RefusedIdentity {
+    use crate::child::spawn::fault::{set_at, spawn_pid, SpawnPoint};
     crate::child::spawn::fault::set_force_identity_unknown(true);
-    RefusedIdentity(crate::wait::exit_only::seams::force_peek_once(Err(
-        std::io::Error::from_raw_os_error(libc::EPERM),
-    )))
+    let kernel = std::sync::Arc::clone(kernel);
+    RefusedIdentity(set_at(SpawnPoint::BeforeIdentity, move || {
+        kernel.state_peek(spawn_pid(), Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+    }))
 }
 
 /// Refuses identity reads until dropped (see [`refuse_the_identity`]).
 #[cfg(target_os = "macos")]
 #[must_use = "identity reads succeed again as soon as the guard is dropped"]
-pub(crate) struct RefusedIdentity(
-    #[allow(dead_code, reason = "held for its drop")] crate::wait::exit_only::seams::Forced,
-);
+pub(crate) struct RefusedIdentity(#[allow(dead_code, reason = "held for its drop")] crate::oneshot_hook::Armed);
 
 #[cfg(target_os = "macos")]
 impl Drop for RefusedIdentity {

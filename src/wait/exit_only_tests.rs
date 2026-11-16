@@ -58,6 +58,50 @@ mod unix {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::os::fd::AsFd as _;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    use rustix::process::{pidfd_open, Pid, PidfdFlags};
+
+    use crate::identity::{FakeKernel, HostKernel, Record};
+    use crate::os_process::child::ExitRecord;
+    use crate::wait::exit_only::{try_reap, Reap, Target};
+
+    /// A reap consumes through the kernel that peeked, so a peek and its consume answer from one
+    /// authority: a stated exit, peeked and consumed, is reaped as stated, and the real child, which
+    /// no `waitid` was made for, is left running.
+    ///
+    /// Mutant: `try_reap` consumes with a `waitid` of its own, not through the target's kernel (it
+    /// finds the running child unexited, and says `Running`).
+    #[skuld::test]
+    fn a_reap_consumes_through_the_kernel_that_peeked() {
+        let child = crate::test_child::blocker();
+        let pid = child.id();
+        let pidfd = pidfd_open(Pid::from_raw(pid as i32).expect("a positive pid"), PidfdFlags::empty())
+            .expect("the child's pidfd opens");
+        let exited = || {
+            Ok(Some(Record {
+                si_code: libc::CLD_EXITED,
+                si_status: 7,
+            }))
+        };
+        let kernel = FakeKernel::over(&HostKernel)
+            .on_peek(pid, exited())
+            .on_consume(pid, exited());
+
+        let reaped = try_reap(&Target::pidfd(&kernel, pidfd.as_fd())).expect("the reap answers");
+
+        assert_eq!(reaped, Reap::Reaped(ExitRecord::Status(ExitStatus::from_raw(7 << 8))));
+        assert!(
+            kernel.all_rows_taken(),
+            "the look was the stated peek and the reap the stated consume"
+        );
+    }
+}
+
 #[cfg(windows)]
 mod windows {
     use std::os::windows::io::AsHandle as _;
