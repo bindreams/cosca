@@ -3,7 +3,7 @@
 
     sudo python3 unattended-gui-elevation.py --this-machine-is-disposable --user USER   # Linux
     sudo python3 unattended-gui-elevation.py --this-machine-is-disposable               # macOS
-    python3 unattended-gui-elevation.py --this-machine-is-disposable                    # Windows, elevated, CI only
+    python3 unattended-gui-elevation.py --this-machine-is-disposable                    # Windows, elevated
     python3 unattended-gui-elevation.py --this-machine-is-disposable --check-only       # only the guard, no change
     ... --this-machine-is-disposable [--user USER] --revert                              # puts the saved state back
 
@@ -41,7 +41,8 @@ needs `--user` to revert, too). Reverting:
 disposable, which takes both the flag `--this-machine-is-disposable` and a fact about the machine:
 
 - a GitHub-hosted runner (`GITHUB_ACTIONS=true` and `RUNNER_ENVIRONMENT=github-hosted`), or
-- a devvm guest (the marker file `/etc/cosca-devvm-guest`, written by the devvm driver).
+- a devvm guest (the marker file `/etc/cosca-devvm-guest`; Windows: `%ProgramData%\\cosca-devvm-guest`; written by the
+  devvm recipe).
 
 Both are virtual machines. A container is not evidence of disposability, as it is only as isolated as its mounts,
 which a script cannot prove; one passes only on a disposable host (a job `container:` on a hosted runner inherits the
@@ -73,6 +74,7 @@ polkit.addRule(function(action, subject) {{
 """
 USER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
 DEVVM_MARKER = "/etc/cosca-devvm-guest"
+DEVVM_WINDOWS_MARKER = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "cosca-devvm-guest")
 # What the script's subprocesses get: the caller's environment could redirect systemctl or D-Bus to another machine.
 SCRUBBED_ENVIRONMENT_PREFIXES = ("DBUS_", "SYSTEMCTL_", "SYSTEMD_", "XDG_RUNTIME_DIR")
 
@@ -87,10 +89,12 @@ def require_disposable(system, environ=os.environ, exists=os.path.exists):
         return
     if system in ("Linux", "Darwin") and exists(DEVVM_MARKER):
         return
+    if system == "Windows" and exists(DEVVM_WINDOWS_MARKER):
+        return
     refuse(
         "this does not look like a disposable machine. Missing: a GitHub-hosted runner "
         "(GITHUB_ACTIONS=true and RUNNER_ENVIRONMENT=github-hosted) or a devvm guest "
-        f"({DEVVM_MARKER}, written by the devvm driver)"
+        f"({DEVVM_MARKER}, or {DEVVM_WINDOWS_MARKER} on Windows, written by the devvm recipe)"
     )
 
 

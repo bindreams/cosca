@@ -161,6 +161,35 @@
     },
     {
       "customType": "regex",
+      "description": "Git for Windows installer the Windows devvm recipe downloads: full tag and SHA-256 on one line, so the digest moves with the version",
+      "managerFilePatterns": [
+        "/^devvm/[^/]+\\.devvm\\.yaml$/"
+      ],
+      "matchStrings": [
+        "\\$gitTag = \"(?<currentValue>v[^\"]+)\"; \\$gitSha256 = \"(?<currentDigest>[0-9a-f]{64})\""
+      ],
+      "depNameTemplate": "git-for-windows/git",
+      "datasourceTemplate": "github-release-attachments",
+      "depTypeTemplate": "ci-tool",
+      "versioningTemplate": "regex:^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)\\.windows\\.(?<build>\\d+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Python of the Windows devvm recipe: the version only, as python.org has no digest that moves with it",
+      "managerFilePatterns": [
+        "/^devvm/[^/]+\\.devvm\\.yaml$/"
+      ],
+      "matchStrings": [
+        "\\$pythonVersion = \"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "python/cpython",
+      "datasourceTemplate": "github-tags",
+      "depTypeTemplate": "ci-tool",
+      "versioningTemplate": "pep440",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
       "description": "Tart base image of the devvm macos-arm64 guest: repository, tag and digest, pinned by digest so a moved :latest never changes what devvm clones",
       "managerFilePatterns": [
         "/^scripts/devvm_macos\\.py$/"

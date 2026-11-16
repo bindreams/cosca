@@ -12,7 +12,8 @@
 #
 # The account cannot read the runner's profile, so it runs a copy of cargo-nextest and an extraction of the
 # archive under C:\cosca-elevation-lane, and it writes its JUnit file into the workspace's `target\nextest\<profile>`.
-# The script exits with nextest's exit code. It creates an account, so it refuses outside a hosted runner.
+# The script exits with nextest's exit code. It creates an account, so it refuses outside a hosted runner or a devvm
+# guest.
 #
 # Everything it creates it removes, on failure too: the account, its profile, the ACE it was given on the JUnit
 # directory, and `$root`. `$root\account` records the account as "pending" before `New-LocalUser` and as "created" after
@@ -22,8 +23,10 @@
 # timeout ends it without running its `finally`). The `finally` runs the same code.
 $ErrorActionPreference = 'Stop'
 
-if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
-    throw 'refusing: this creates a local administrator; it runs only on a GitHub-hosted runner (GITHUB_ACTIONS=true and RUNNER_ENVIRONMENT=github-hosted)'
+$hostedRunner = $env:GITHUB_ACTIONS -eq 'true' -and $env:RUNNER_ENVIRONMENT -eq 'github-hosted'
+$devvmGuest = Test-Path -LiteralPath (Join-Path $env:ProgramData 'cosca-devvm-guest')
+if (-not ($hostedRunner -or $devvmGuest)) {
+    throw 'refusing: this creates a local administrator; it runs only on a GitHub-hosted runner (GITHUB_ACTIONS=true and RUNNER_ENVIRONMENT=github-hosted) or a devvm guest (the marker file %ProgramData%\cosca-devvm-guest, written by the devvm recipe)'
 }
 
 $account = 'coscaelev'

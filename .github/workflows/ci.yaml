@@ -196,18 +196,11 @@ jobs:
         run: ${{ matrix.nextest }} tests cargo nextest run --locked --target ${{ matrix.target }}
 
       # The Windows tests that map a drive letter (`DefineDosDeviceW`, visible to the whole logon
-      # session) are the `DRIVE_MAPPING` group, off everywhere else.
+      # session) are the `DRIVE_MAPPING` group, off everywhere else; `drive-mapping-lane.ps1` consents.
       - name: Run the drive-mapping test (Windows)
         if: matrix.os == 'windows'
         timeout-minutes: 10
-        env:
-          COSCA_TEST_DRIVE_MAPPING: "1"
-          COSCA_TEST_DRIVE_MAPPING_CONSENT: "1"
-          SKULD_LABELS: drive_mapping
-        run: >-
-          ${{ matrix.nextest }} drive-mapping
-          cargo nextest run --locked --target ${{ matrix.target }}
-          --test windows_process_cwd --no-tests=fail
+        run: ${{ matrix.nextest }} drive-mapping pwsh -NoProfile -File ./.github/scripts/drive-mapping-lane.ps1 ${{ matrix.target }}
 
       # `pty` is an additive feature flag; exercise the feature-gated code paths.
       - name: Build tests (pty feature)
@@ -964,50 +957,17 @@ jobs:
 
       # Elevation (Windows) =====
       #
-      # See elevation-lane-windows.ps1 for why the tests run as a fresh local administrator.
-      # Reverted after the lane: the script removes the administrator account in its own `finally`, and `-Cleanup` does the
-      # same from its record if a step timeout killed the script; then `unattended-gui-elevation.py --revert`.
-      - name: Elevation (Windows) - allow unattended GUI elevation
-        id: win_elev_policy
+      # `.github/scripts/elevation-lane.ps1` has the explanation, and restores the machine on every exit it can. 20 min: a
+      # fire alarm well beyond a slow run; a timeout kills the script before its restore, and the runner is discarded.
+      - name: Elevation (Windows)
+        id: win_elev
         if: ${{ !cancelled() && matrix.os == 'windows' }}
+        timeout-minutes: 20
         shell: pwsh
-        run: python .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable
-
-      - name: Elevation (Windows) - archive the tests
-        id: win_elev_archive
-        if: ${{ !cancelled() && steps.win_elev_policy.outcome == 'success' }}
-        shell: pwsh
-        run: cargo nextest archive --locked --features tokio --target ${{ matrix.target }} --archive-file "$env:RUNNER_TEMP\elevation.tar.zst"
-
-      # Through run-nextest.ps1, which publishes the JUnit file (the `ci-elevation` profile). The throwaway administrator
-      # runs nextest from an archive extracted under C:\cosca-elevation-lane.
-      - name: Elevation (Windows) - run the elevation tests
-        id: win_elev_run
-        if: ${{ !cancelled() && steps.win_elev_archive.outcome == 'success' }}
-        timeout-minutes: 10
-        shell: pwsh
-        env:
-          NEXTEST_PROFILE: ci-elevation
-        run: ./.github/scripts/run-nextest.ps1 elevation pwsh -File ./.github/scripts/elevation-lane-windows.ps1 "$env:RUNNER_TEMP\elevation.tar.zst" (Get-Command cargo-nextest).Source
-
-      - name: Elevation (Windows) - remove the throwaway administrator
-        if: ${{ always() && steps.win_elev_run.outcome != 'skipped' && steps.win_elev_run.outcome != '' }}
-        timeout-minutes: 5
-        shell: pwsh
-        run: ./.github/scripts/elevation-lane-windows.ps1 -Cleanup
-
-      - name: Elevation (Windows) - revert unattended GUI elevation
-        if: ${{ always() && steps.win_elev_policy.outcome != 'skipped' && steps.win_elev_policy.outcome != '' }}
-        shell: pwsh
-        run: python .github/scripts/unattended-gui-elevation.py --this-machine-is-disposable --revert
-
-      - name: Elevation (Windows) - check the JUnit result
-        if: ${{ !cancelled() && steps.win_elev_run.outcome == 'success' }}
-        shell: bash
-        run: python3 .github/scripts/check-junit.py "$RUNNER_TEMP/junit/elevation.xml" --tests 5
+        run: ./.github/scripts/elevation-lane.ps1 ${{ matrix.target }}
 
       - name: Elevation (Windows) - upload JUnit
-        if: ${{ !cancelled() && steps.win_elev_run.outcome != 'skipped' && steps.win_elev_run.outcome != '' }}
+        if: ${{ !cancelled() && steps.win_elev.outcome != 'skipped' && steps.win_elev.outcome != '' }}
         uses: ./.github/actions/upload-junit
         with:
           name: elevation-windows-${{ matrix.arch }}

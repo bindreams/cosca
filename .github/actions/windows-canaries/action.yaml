@@ -43,13 +43,7 @@ runs:
         TARGET: ${{ inputs.target }}
         NEXTEST_PROFILE: ${{ inputs.path_profile }}
         COSCA_CANARY_MARKERS: ${{ runner.temp }}/canary-markers
-        COSCA_TEST_PATH_PROBES: "1"
-        COSCA_TEST_PATH_PROBES_CONSENT: "1"
-        SKULD_LABELS: path_probes
-      run: |
-        New-Item -ItemType Directory $env:COSCA_CANARY_MARKERS | Out-Null
-        $filter = @(if ($env:FILTER) { $env:FILTER })
-        ./.github/scripts/run-nextest.ps1 canary-path cargo nextest run --locked --target $env:TARGET --test windows_path_resolution --no-capture --no-tests=fail @filter
+      run: ./.github/scripts/run-nextest.ps1 canary-path pwsh -NoProfile -File ./.github/scripts/windows-canary-lane.ps1 path $env:TARGET
 
     - name: Windows canaries - check the path-resolution result
       if: ${{ !cancelled() && steps.path.outcome == 'success' && inputs.filter == '' }}
@@ -71,13 +65,7 @@ runs:
         TARGET: ${{ inputs.target }}
         NEXTEST_PROFILE: ${{ inputs.shell_execute_profile }}
         COSCA_CANARY_MARKERS: ${{ runner.temp }}/elevating-markers
-        COSCA_TEST_SHELL_EXECUTE: "1"
-        COSCA_TEST_SHELL_EXECUTE_CONSENT: "1"
-        SKULD_LABELS: shell_execute
-      run: |
-        New-Item -ItemType Directory $env:COSCA_CANARY_MARKERS | Out-Null
-        $filter = @(if ($env:FILTER) { $env:FILTER })
-        ./.github/scripts/run-nextest.ps1 canary-shell-execute cargo nextest run --locked --target $env:TARGET --test windows_shell_execute --no-capture --no-tests=fail @filter
+      run: ./.github/scripts/run-nextest.ps1 canary-shell-execute pwsh -NoProfile -File ./.github/scripts/windows-canary-lane.ps1 shell-execute $env:TARGET
 
     - name: Windows canaries - check the elevating-probe result
       if: ${{ !cancelled() && steps.execute.outcome == 'success' && inputs.filter == '' }}

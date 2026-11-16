@@ -55,14 +55,10 @@ permissions:
   contents: read
 
 env:
-  # The probe groups (principle 9) are off unless a step below opts in; each runner is the sandbox
-  # that consent requires.
-  COSCA_TEST_PATH_PROBES: "0"
-  COSCA_TEST_SHELL_EXECUTE: "0"
-  COSCA_TEST_SHELL_PROBES: "0"
-  COSCA_TEST_ELEVATION_ROUTES: "0"
-  # `.config/nextest.toml`, ci.yaml, the devvm provision scripts and `devvm/cosca-linux.devvm.yaml` carry the same
-  # nextest version; Renovate moves them together (.github/renovate.json).
+  # The probe groups (principle 9) are off in `.github/test-group-defaults.env`, which each job applies; the lane script
+  # of a step opts its group in, as each runner is the sandbox that consent requires.
+  # `.config/nextest.toml`, ci.yaml, the devvm provision scripts and the devvm recipes (`devvm/*.devvm.yaml`) carry the
+  # same nextest version; Renovate moves them together (.github/renovate.json).
   NEXTEST_VERSION: "0.9.151"
 
 jobs:
@@ -83,6 +79,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      - name: Apply the test group defaults
+        shell: bash
+        run: sed -e '/^#/d' -e '/^$/d' .github/test-group-defaults.env >> "$GITHUB_ENV"
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
@@ -116,15 +116,14 @@ jobs:
           - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
-    env:
-      COSCA_TEST_SHELL_PROBES: "1"
-      COSCA_TEST_SHELL_PROBES_CONSENT: "1"
-      COSCA_TEST_ELEVATION_ROUTES: "1"
-      COSCA_TEST_ELEVATION_ROUTES_CONSENT: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      - name: Apply the test group defaults
+        shell: bash
+        run: sed -e '/^#/d' -e '/^$/d' .github/test-group-defaults.env >> "$GITHUB_ENV"
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
@@ -132,40 +131,15 @@ jobs:
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      # Survey probes print what they measured; probes with a specific expectation assert on it and
-      # fail if it doesn't hold. `--no-capture` is the point, and also forces nextest to run every
-      # test in this invocation serially, independent of the `windows-elevation-routes` test group
-      # in `.config/nextest.toml`. Both binaries run in one invocation: nextest fails a run whose
-      # filter matches nothing, so a `probe_filter` naming only an elevation-route test would match
-      # zero tests in `windows_shell_resolution` and, split into its own step, fail before the step
-      # for `windows_elevation_routes` ever ran.
-      #
-      # The three probes that hand `ShellExecuteExW` an EXISTING extensionless target are excluded
-      # here (the `!isolated_*` terms in `SKULD_LABELS`) and run below instead, each in its own nextest invocation, consecutively, after
-      # all other probes: see the module doc in `tests/windows_shell_resolution.rs` for why — a
-      # leftover `OpenWith.exe` from one such probe blocking the next `ShellExecuteExW` call was a
-      # candidate explanation for the intermittent hang; the module doc has what was measured about
-      # it. `--no-tests=warn` covers the edge case that exclusion creates: a `probe_filter` that
-      # narrows this step to exactly one of those three would otherwise match zero tests and fail
-      # here; instead this step warns and exits 0, and the isolated step below for that probe still
-      # runs it (or skips it with its own message, if the filter excludes it too).
-      # Each probe that passes leaves a marker named after itself (`mark_test_passed`); the final
-      # "Require that an executing probe ran" step fails the job if none exists.
+      # `shell-probes-lane.sh` has the explanation. The three isolated probes run below, each in its own nextest invocation,
+      # consecutively, after all the others. Each probe that passes leaves a marker named after itself
+      # (`mark_test_passed`); the final "Require that an executing probe ran" step fails the job if none exists.
       - name: Run executing probes
         shell: bash
         env:
           FILTER: ${{ inputs.probe_filter }}
-          SKULD_LABELS: "(shell_probes | elevation_routes) & !isolated_trailing_dot & !isolated_pathext_precedence & !isolated_existing_extensionless"
-          COSCA_PROBE_ALLOW_ACCOUNTS: "1"
-          COSCA_PROBE_ALLOW_STATE: "1"
           COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
-        run: |
-          mkdir -p "$COSCA_PROBE_MARKERS"
-          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --test windows_elevation_routes --no-capture --no-tests=warn)
-          if [[ -n "${FILTER}" ]]; then
-            args+=("${FILTER}")
-          fi
-          cargo "${args[@]}"
+        run: bash .github/scripts/shell-probes-lane.sh ${{ matrix.target }}
       # Read-only: lists whatever OpenWith.exe instances already exist, without touching any of
       # them. Never kill one — a leftover from an earlier probe is exactly the state under
       # investigation (see the module doc in `tests/windows_shell_resolution.rs`), and the runner VM
@@ -188,18 +162,7 @@ jobs:
         env:
           FILTER: ${{ inputs.probe_filter }}
           COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
-          SKULD_LABELS: isolated_trailing_dot
-        run: |
-          mkdir -p "$COSCA_PROBE_MARKERS"
-          # The label selects the probe; a `probe_filter` that excludes it matches nothing, which warns.
-          none=fail
-          args=()
-          if [[ -n "${FILTER}" ]]; then
-            none=warn
-            args+=("${FILTER}")
-          fi
-          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture "--no-tests=${none}" "${args[@]}")
-          cargo "${args[@]}"
+        run: bash .github/scripts/shell-probes-lane.sh ${{ matrix.target }} isolated_trailing_dot
       - name: OpenWith.exe after trailing-dot probe
         if: ${{ !cancelled() }}
         continue-on-error: true
@@ -216,18 +179,7 @@ jobs:
         env:
           FILTER: ${{ inputs.probe_filter }}
           COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
-          SKULD_LABELS: isolated_pathext_precedence
-        run: |
-          mkdir -p "$COSCA_PROBE_MARKERS"
-          # The label selects the probe; a `probe_filter` that excludes it matches nothing, which warns.
-          none=fail
-          args=()
-          if [[ -n "${FILTER}" ]]; then
-            none=warn
-            args+=("${FILTER}")
-          fi
-          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture "--no-tests=${none}" "${args[@]}")
-          cargo "${args[@]}"
+        run: bash .github/scripts/shell-probes-lane.sh ${{ matrix.target }} isolated_pathext_precedence
       - name: OpenWith.exe after pathext-precedence probe
         if: ${{ !cancelled() }}
         continue-on-error: true
@@ -244,18 +196,7 @@ jobs:
         env:
           FILTER: ${{ inputs.probe_filter }}
           COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
-          SKULD_LABELS: isolated_existing_extensionless
-        run: |
-          mkdir -p "$COSCA_PROBE_MARKERS"
-          # The label selects the probe; a `probe_filter` that excludes it matches nothing, which warns.
-          none=fail
-          args=()
-          if [[ -n "${FILTER}" ]]; then
-            none=warn
-            args+=("${FILTER}")
-          fi
-          args=(nextest run --locked --profile ci --target ${{ matrix.target }} --test windows_shell_resolution --no-capture "--no-tests=${none}" "${args[@]}")
-          cargo "${args[@]}"
+        run: bash .github/scripts/shell-probes-lane.sh ${{ matrix.target }} isolated_existing_extensionless
       - name: OpenWith.exe after existing-extensionless-no-bat probe
         if: ${{ !cancelled() }}
         continue-on-error: true
@@ -273,11 +214,4 @@ jobs:
         shell: bash
         env:
           COSCA_PROBE_MARKERS: ${{ runner.temp }}/probe-markers
-        run: |
-          shopt -s nullglob
-          passed=("$COSCA_PROBE_MARKERS"/*)
-          if ((${#passed[@]} == 0)); then
-            echo "::error::no executing probe ran: the run asserted nothing"
-            exit 1
-          fi
-          printf 'executing probe passed: %s\n' "${passed[@]##*/}"
+        run: bash .github/scripts/shell-probes-check.sh
