@@ -77,10 +77,18 @@ fn a_front_whose_look_failed_is_handed_back_and_the_error_says_so() {
 
 /// A front whose place cannot be read is handed back, and the error says where it is cannot be read.
 ///
-/// Mutant: `PlaceUnreadable` maps to `LeftUnreaped`, which words a front that is not placed.
+/// Mutants: `PlaceUnreadable` maps to `LeftUnreaped`, which words a front that is not placed;
+/// the front reads as not a front, so the teardown kills and waits for it.
 #[skuld::test]
 fn a_front_whose_place_cannot_be_read_is_handed_back_and_the_error_says_so() {
-    let (owned, stdin) = held_front(|f| f.reaps([ReapAnswer::Running]));
+    let record = ExitRecord::Status(std::process::ExitStatus::default());
+    let mut fake = None;
+    let (owned, stdin) = held_front(|f| {
+        fake = Some(f.clone());
+        f.reaps([ReapAnswer::Running, ReapAnswer::Exited(record)])
+    });
+    let pid = owned.pid().expect("the held child has a pid");
+    let _fire = fire_on_block(&fake.expect("the script ran"));
     let subtree = killed_subtree();
 
     let (detail, fate, handed_back) = {
@@ -88,6 +96,11 @@ fn a_front_whose_place_cannot_be_read_is_handed_back_and_the_error_says_so() {
         tear_down_held_holding(owned, None, Some(&subtree), &mut Diagnosis::default(), stdin)
     };
 
+    assert_eq!(
+        crate::wait::block_probe::take(),
+        [],
+        "a front whose place cannot be read is looked at, never waited for"
+    );
     assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
     handed_back.unreaped();
     let detail = detail.expect("the teardown says what it did with the front");
@@ -95,16 +108,24 @@ fn a_front_whose_place_cannot_be_read_is_handed_back_and_the_error_says_so() {
         detail.contains("where it is cannot be read") && detail.contains("handed back to the caller"),
         "{detail}"
     );
+    // The scripted `Exited` ends the wait; the real blocker, released by it, is reaped here.
     handed_back.wait();
+    crate::child::front_kill_tests::reap(pid);
 }
 
 /// A front its leaf's kill reached, whose reap then fails, is `Killed`, uncollected and still ours:
 /// handed back, and the error says it could not be waited on, not that it was reaped.
 ///
-/// Mutant: a wait that failed after the kill reads as `Reaped`, or is not handed back.
+/// Mutants: a wait that failed after the kill reads as `Reaped`, or is not handed back;
+/// the front reads as not a front, so the teardown kills and waits for it.
 #[skuld::test]
 fn a_front_whose_reap_failed_after_the_leaf_kill_is_handed_back_and_the_error_says_so() {
-    let (owned, stdin) = held_front(|f| f.reaps([ReapAnswer::Running, ReapAnswer::Err(io::ErrorKind::Other)]));
+    let mut fake = None;
+    let (owned, stdin) = held_front(|f| {
+        fake = Some(f.clone());
+        f.reaps([ReapAnswer::Running, ReapAnswer::Err(io::ErrorKind::Other)])
+    });
+    let _fire = fire_on_block(&fake.expect("the script ran"));
     let subtree = killed_subtree();
 
     let (detail, fate, handed_back) = {
@@ -112,6 +133,11 @@ fn a_front_whose_reap_failed_after_the_leaf_kill_is_handed_back_and_the_error_sa
         tear_down_held_holding(owned, None, Some(&subtree), &mut Diagnosis::default(), stdin)
     };
 
+    assert_eq!(
+        crate::wait::block_probe::take(),
+        [],
+        "the failed reap ends the wait at its first look, with no block"
+    );
     assert_eq!(fate, ChildFate::Killed);
     handed_back.unreaped();
     let detail = detail.expect("the teardown says what it did with the front");
@@ -168,13 +194,26 @@ fn a_front_reaped_elsewhere_is_noted_without_a_hand_back() {
 /// A front with no leaf subtree to say its kill reached it is left running, so it is handed back, and
 /// the error says so in the words of a front handed back.
 ///
-/// Mutant: the note says the front is left unreaped.
+/// Mutants: the note says the front is left unreaped;
+/// the front reads as not a front, so the teardown kills and waits for it.
 #[skuld::test]
 fn a_running_front_with_no_subtree_is_handed_back_and_the_error_says_so() {
-    let (owned, stdin) = held_front(|f| f.reaps([ReapAnswer::Running]));
+    let record = ExitRecord::Status(std::process::ExitStatus::default());
+    let mut fake = None;
+    let (owned, stdin) = held_front(|f| {
+        fake = Some(f.clone());
+        f.reaps([ReapAnswer::Running, ReapAnswer::Exited(record)])
+    });
+    let pid = owned.pid().expect("the held child has a pid");
+    let _fire = fire_on_block(&fake.expect("the script ran"));
 
     let (detail, fate, handed_back) = tear_down_held_holding(owned, None, None, &mut Diagnosis::default(), stdin);
 
+    assert_eq!(
+        crate::wait::block_probe::take(),
+        [],
+        "a front with no subtree is looked at, never waited for"
+    );
     assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
     handed_back.unreaped();
     let detail = detail.expect("the teardown says what it did with the front");
@@ -182,7 +221,9 @@ fn a_running_front_with_no_subtree_is_handed_back_and_the_error_says_so() {
         detail.contains("the elevated program may be running; handed back to the caller in the error"),
         "{detail}"
     );
+    // The scripted `Exited` ends the wait; the real blocker, released by it, is reaped here.
     handed_back.wait();
+    crate::child::front_kill_tests::reap(pid);
 }
 
 /// The check that failed the spawn leads the teardown's one warn, for a child killed and for a front
@@ -284,16 +325,28 @@ fn a_refused_kill_under_leave_is_left_running_and_warned_and_nothing_is_handed_b
 /// A front still running, under a caller that leaves it, is noted as left unreaped, and nothing is
 /// handed back.
 ///
-/// Mutants: the note says it is handed back; the front is handed back.
+/// Mutants: the note says it is handed back; the front is handed back;
+/// the front reads as not a front, so the teardown kills and waits for it.
 #[skuld::test]
 fn a_running_front_under_leave_is_noted_as_left_unreaped_and_nothing_is_handed_back() {
     crate::log_capture::install();
-    let (owned, stdin) = held_front(|f| f.reaps([ReapAnswer::Running]));
+    let record = ExitRecord::Status(std::process::ExitStatus::default());
+    let mut fake = None;
+    let (owned, stdin) = held_front(|f| {
+        fake = Some(f.clone());
+        f.reaps([ReapAnswer::Running, ReapAnswer::Exited(record)])
+    });
     let blocker = ReapsBlocker::new(&owned, stdin);
+    let _fire = fire_on_block(&fake.expect("the script ran"));
     let mark = crate::log_capture::mark();
 
     let (detail, fate, unreaped) = tear_down_leaving(owned, &mut Diagnosis::default());
 
+    assert_eq!(
+        crate::wait::block_probe::take(),
+        [],
+        "a front under a caller that leaves it is looked at, never waited for"
+    );
     assert_eq!(fate, ChildFate::Running { id: None });
     assert!(unreaped.is_none());
     let detail = detail.expect("the teardown says what it did with the front");
@@ -568,14 +621,25 @@ fn the_wait_for_a_front_its_leafs_kill_reached_warns_past_its_policys_threshold(
 /// dropped: under `LetGo` it looks once and gives the front up, and does not wait for it. The look
 /// after the teardown's own is the scripted `Reaped`, which a `Wait` drop's wait finds as well.
 ///
-/// Mutant: `tear_down_held` hands the front's `Unreaped` the sync drop kind.
+/// Mutants: `tear_down_held` hands the front's `Unreaped` the sync drop kind;
+/// the front reads as not a front, so the teardown kills and waits for it.
 #[skuld::test]
 fn the_unreaped_a_failed_spawn_hands_back_for_a_front_does_what_its_policy_says_on_drop() {
     crate::log_capture::install();
     let record = ExitRecord::Status(std::process::ExitStatus::default());
-    let (owned, stdin) = held_front(|f| f.reaps([ReapAnswer::Running, ReapAnswer::Exited(record)]));
+    let mut fake = None;
+    let (owned, stdin) = held_front(|f| {
+        fake = Some(f.clone());
+        f.reaps([ReapAnswer::Running, ReapAnswer::Exited(record)])
+    });
     let _blocker = ReapsBlocker::new(&owned, stdin);
+    let _fire = fire_on_block(&fake.expect("the script ran"));
     let (_, _, handed_back) = tear_down_front_under(owned, None, SpawnPolicy::LET_GO);
+    assert_eq!(
+        crate::wait::block_probe::take(),
+        [],
+        "the teardown looks at the front once and does not wait for it"
+    );
     let handed_back = handed_back.expect("a front left running is handed back");
     let mark = crate::log_capture::mark();
 
