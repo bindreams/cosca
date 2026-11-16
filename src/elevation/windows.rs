@@ -241,7 +241,7 @@ use crate::child::owned::OwnedChild;
 use crate::child::spawn::held_teardown::tear_down_failed_spawn;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::windows_raw::resolve::ensure_no_nul_wide;
-use crate::child::spawn::{Classify, Diagnosis, SpawnFailure};
+use crate::child::spawn::{resolve_identity, windows_identity_or_keep, Classify, Diagnosis, SpawnFailure};
 use crate::containment::Attachment;
 use crate::elevation::plan::Transition;
 use crate::elevation::shell_file;
@@ -317,12 +317,12 @@ fn wide_nul(what: &str, s: &OsStr) -> Result<Vec<u16>, Error> {
 }
 
 /// The outcome of a runas launch. `Launched` carries the box over the process handle, the child's
-/// stable identity, and the report.
+/// stable identity (`None` when the OS refused to report it), and the report.
 pub(crate) enum RunasOutcome {
     AlreadyElevated,
     Launched {
         owned: OwnedChild,
-        id: ProcessId,
+        id: Option<ProcessId>,
         report: ElevationReport,
     },
 }
@@ -509,14 +509,14 @@ pub(crate) fn plan_runas(cmd: &Command, host: &Host) -> Result<RunasStep, Error>
     })))
 }
 
-/// What could not be read of a launched child: the error of `GetProcessId` when the pid could not
-/// be, else the pid whose identity could not be resolved, with the identity read's error.
-pub(crate) type Unread = Result<(u32, windows::core::Error), windows::core::Error>;
-
-/// Ends the launched child `owned`, which could not be tracked (`unread` says what could not be
-/// read), as any failed spawn ends its child: killed and waited for; one it could not end comes
-/// back in the failure.
-pub(crate) fn end_untracked(owned: OwnedChild, unread: Unread, policy: SpawnPolicy) -> SpawnFailure {
+/// Ends the launched child `owned`, whose pid could not be read (`read_failure` is the error of
+/// `GetProcessId`), as any failed spawn ends its child: killed and waited for; one it could not end
+/// comes back in the failure. A `Child` has a pid, so a child without one cannot be returned.
+pub(crate) fn end_untracked(
+    owned: OwnedChild,
+    read_failure: windows::core::Error,
+    policy: SpawnPolicy,
+) -> SpawnFailure {
     let torn = tear_down_failed_spawn(
         owned,
         None,
@@ -525,26 +525,14 @@ pub(crate) fn end_untracked(owned: OwnedChild, unread: Unread, policy: SpawnPoli
         policy,
         &mut Diagnosis::default(),
     );
-    untracked_failure(unread, torn)
+    untracked_failure(read_failure, torn)
 }
 
-/// The failure of a launched child that could not be tracked, after `torn`, the teardown of it.
+/// The failure of a launched child whose pid could not be read, after `torn`, the teardown of it.
 ///
 /// The detail says what was done. The failed read is the cause (the `source`), and a failure of the
 /// teardown, which is not a failure of what the call was doing, is the cleanup.
-fn untracked_failure(unread: Unread, torn: Torn) -> SpawnFailure {
-    let (who, why, read_failure) = match unread {
-        Ok((pid, e)) => (
-            format!("the elevated child (pid {pid})"),
-            "its identity could not be resolved".to_string(),
-            e,
-        ),
-        Err(e) => (
-            "the elevated child".to_string(),
-            "its pid could not be read (GetProcessId)".to_string(),
-            e,
-        ),
-    };
+fn untracked_failure(read_failure: windows::core::Error, torn: Torn) -> SpawnFailure {
     let Torn {
         fate,
         unreaped,
@@ -559,7 +547,7 @@ fn untracked_failure(unread: Unread, torn: Torn) -> SpawnFailure {
     SpawnFailure::started(
         Error::Elevation {
             kind: ElevationErrorKind::Untracked,
-            detail: format!("{who} launched but {why}{done}"),
+            detail: format!("the elevated child launched but its pid could not be read (GetProcessId){done}"),
             source: Some(Error::io_cause(crate::error::win32_io_error(read_failure))),
         },
         fate,
@@ -625,6 +613,16 @@ pub(crate) fn launch_runas_with_host(
     };
     drop(com);
 
+    adopt_launched(proc, policy, kernel)
+}
+
+/// The child a UAC launch started, taken from the process handle `ShellExecuteEx` returned: its pid
+/// and identity read, the elevation report it carries, and the box over the handle.
+pub(crate) fn adopt_launched(
+    proc: OwnedHandle,
+    policy: SpawnPolicy,
+    kernel: crate::identity::SpawnKernel,
+) -> Result<RunasOutcome, SpawnFailure> {
     // SAFETY: `proc` is our live, owned process handle.
     let pid = match unsafe { GetProcessId(HANDLE(proc.as_raw_handle())) } {
         0 => Err(windows::core::Error::from_thread()),
@@ -640,23 +638,17 @@ pub(crate) fn launch_runas_with_host(
         Box::new(WindowsProcess::for_uac(kernel, proc, pid.as_ref().ok().copied())),
         report.tracked(),
     );
-    // Identity from the OWNED handle — no second OpenProcess.
-    let handle = HANDLE(owned.os_handle().as_raw_handle());
-    // What could not be read: the pid's error, or the pid with the identity read's.
-    let tracked = match pid {
-        Ok(pid) => crate::identity::windows_identity_from_handle_result(handle, pid)
-            .map(|id| (pid, id))
-            .map_err(|e| Ok((pid, e))),
-        Err(e) => Err(Err(e)),
+    // A `Child` has a pid. Auth SUCCEEDED, so the child runs: end it and wait for it, and report what
+    // became of it in the detail — the kind stays neutral.
+    let pid = match pid {
+        Ok(pid) => pid,
+        Err(read_failure) => return Err(end_untracked(owned, read_failure, policy)),
     };
-    let id = match tracked {
-        Ok((_, id)) => id,
-        Err(unread) => {
-            // Auth SUCCEEDED but we cannot track the child. Terminate it and wait for it, and
-            // report what became of it in the detail — the kind stays neutral.
-            return Err(end_untracked(owned, unread, policy));
-        }
-    };
+    // The identity is read by the spawn's one read, from the box's handle: a second open of the pid
+    // can be refused for an elevated child.
+    let (resolved, cause, mut why) = resolve_identity(owned.kernel(), pid, &owned);
+    // Kept with no identity, as every spawn keeps one (see `Child::id`).
+    let id = windows_identity_or_keep(pid, resolved, cause, &mut why).ok();
 
     Ok(RunasOutcome::Launched { owned, id, report })
 }
@@ -671,7 +663,7 @@ pub(crate) fn spawn_elevated(
         RunasOutcome::AlreadyElevated => spawn_already_elevated(cmd, kill_on_drop, policy, kernel),
         RunasOutcome::Launched { owned, id, report } => Ok(crate::child::Child::from_parts(
             owned,
-            Some(id),
+            id,
             BTreeMap::new(),
             kill_on_drop,
             Attachment::uac_elevated(),

@@ -58,9 +58,11 @@ pub enum ElevationErrorKind {
     /// the child is still running.
     #[error("could not signal or stop an elevated child")]
     Unkillable,
-    /// The elevated child launched, but the parent could not resolve its identity to
-    /// manage it. Whether it was terminated is reported in the error `detail`. A spawn returns it
-    /// inside [`Error::MayHaveStarted`].
+    /// The elevated child launched, but the parent could not read its process id
+    /// (`GetProcessId`), which a [`Child`](crate::Child) needs. Whether it was terminated is
+    /// reported in the error `detail`. A spawn returns it inside [`Error::MayHaveStarted`]. A child
+    /// whose identity cannot be read is not this: it is returned with no
+    /// [`id`](crate::Child::id).
     ///
     /// The spawn terminates the child and waits for it. A UAC handle may be granted no right to
     /// terminate: the refused kill hands the child back in the error's `unreaped`
@@ -442,7 +444,7 @@ pub enum Error {
     /// least two of this process's descriptors 0 to 2 were closed at its spawn), on every Unix,
     /// when the elevation backend's password write fails, and on Windows, when a
     /// `kill_on_drop(false)` child's job refuses the disarm and the kill that follows is refused
-    /// too, or when a UAC child that could not be tracked ([`ElevationErrorKind::Untracked`]) is
+    /// too, or when a UAC child whose pid could not be read ([`ElevationErrorKind::Untracked`]) is
     /// refused its kill. Dropping such an error blocks until the child exits (see
     /// [`Unreaped`](crate::Unreaped)).
     ///

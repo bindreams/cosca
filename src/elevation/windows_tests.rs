@@ -1107,15 +1107,14 @@ fn an_hresult_cause_keeps_its_hex_unless_it_is_a_win32_code() {
     assert!(text.contains("HRESULT 0x80004005"), "{text}");
 }
 
-/// `untracked_failure` is the failure of the arm of `launch_runas_with_host` that ends a child whose
-/// identity could not be read; that arm needs a UAC prompt to reach, so the wording and the
-/// placement of each failure are tested here, from the teardown's [`Torn`]. How the child is ended
-/// is tested by `an_untracked_uac_child_is_waited_for_and_a_refused_kill_hands_it_back`.
+/// `untracked_failure` is the failure of the arm of `adopt_launched` that ends a child whose pid
+/// could not be read; its wording and the placement of each failure are tested here, from the
+/// teardown's [`Torn`]. How the child is ended is tested by
+/// `a_uac_child_whose_pid_cannot_be_read_is_waited_for_and_a_refused_kill_hands_it_back`.
 ///
-/// Mutants: a reaped child worded as running, or a refused one as killed; the pid left out of the
-/// detail; an unreadable pid shown as a pid or worded as an identity failure; a failure's text in
-/// the detail; the teardown's failure or a failed read missing from where it goes (the teardown's
-/// is the `cleanup`, the read the `source`).
+/// Mutants: a reaped child worded as running, or a refused one as killed; a pid shown in the
+/// detail; a failure's text in the detail; the teardown's failure or the failed read missing from
+/// where it goes (the teardown's is the `cleanup`, the read the `source`).
 #[skuld::test]
 fn an_untracked_childs_failure_follows_how_its_teardown_ended() {
     use super::untracked_failure;
@@ -1147,22 +1146,27 @@ fn an_untracked_childs_failure_follows_how_its_teardown_ended() {
         }
         other => panic!("expected `may have started`, got {other:?}"),
     };
-    // The pid was read and its identity was not: the identity read's failure is the cause.
-    let unresolved = || Ok((4242, win(1)));
+    let refusal = || {
+        Failures::collect([Error::io_cause(crate::error::io_context(
+            "terminating the elevated child",
+            crate::error::win32_io_error(win(5)),
+        ))])
+    };
 
-    let (detail, source, cleanup, fate) = taken(untracked_failure(unresolved(), torn(ChildFate::Reaped, None)));
+    let (detail, source, cleanup, fate) = taken(untracked_failure(win(6), torn(ChildFate::Reaped, None)));
     assert_eq!(fate, ChildFate::Reaped);
     assert!(cleanup.is_none(), "{cleanup:?}");
+    assert!(detail.contains("pid could not be read (GetProcessId)"), "{detail}");
     assert!(
         detail.ends_with("it was terminated or had exited, and its exit was collected"),
         "{detail}"
     );
     assert_eq!(
-        crate::error::first_os_code(&*source.expect("the identity read's failure is the cause")),
-        Some(1)
+        crate::error::first_os_code(&*source.expect("the failed read is the cause")),
+        Some(6)
     );
 
-    let (detail, _, cleanup, fate) = taken(untracked_failure(unresolved(), torn(ChildFate::Killed, None)));
+    let (detail, _, cleanup, fate) = taken(untracked_failure(win(6), torn(ChildFate::Killed, None)));
     assert_eq!(fate, ChildFate::Killed);
     assert!(cleanup.is_none(), "{cleanup:?}");
     assert!(
@@ -1170,46 +1174,12 @@ fn an_untracked_childs_failure_follows_how_its_teardown_ended() {
         "{detail}"
     );
 
-    let refusal = || {
-        Failures::collect([Error::io_cause(crate::error::io_context(
-            "terminating the elevated child",
-            crate::error::win32_io_error(win(5)),
-        ))])
-    };
     let (detail, source, cleanup, fate) = taken(untracked_failure(
-        unresolved(),
-        torn(ChildFate::Running { id: None }, refusal()),
-    ));
-    assert_eq!(fate, ChildFate::Running { id: None });
-    assert!(detail.contains("pid 4242"), "{detail}");
-    assert!(detail.contains("identity could not be resolved"), "{detail}");
-    assert!(
-        detail.ends_with("and could not be terminated; it may still be running"),
-        "{detail}"
-    );
-    assert_eq!(
-        crate::error::first_os_code(&*source.expect("the identity read's failure is the cause")),
-        Some(1)
-    );
-    let cleanup = cleanup.expect("the teardown's failure is the cleanup");
-    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
-    assert_eq!(crate::error::first_os_code(&**cleanup.first()), Some(5), "{cleanup:?}");
-    assert!(
-        crate::error::said(&**cleanup.first()).starts_with(&crate::error::io_said("terminating the elevated child: ")),
-        "the refusal names its step: {cleanup:?}"
-    );
-
-    // A failed `GetProcessId` has no pid to show, and is not an identity failure. Its failure, and
-    // the teardown's, are told apart by where they are: the read is the source, the teardown's the cleanup.
-    let no_pid = || Err(win(6));
-    let (detail, source, cleanup, fate) = taken(untracked_failure(
-        no_pid(),
+        win(6),
         torn(ChildFate::Running { id: None }, refusal()),
     ));
     assert_eq!(fate, ChildFate::Running { id: None });
     assert!(!detail.contains("pid 0"), "{detail}");
-    assert!(detail.contains("pid could not be read (GetProcessId)"), "{detail}");
-    assert!(!detail.contains("identity could not be resolved"), "{detail}");
     assert!(
         detail.ends_with("and could not be terminated; it may still be running"),
         "{detail}"
@@ -1223,19 +1193,11 @@ fn an_untracked_childs_failure_follows_how_its_teardown_ended() {
         Some(6)
     );
     let cleanup = cleanup.expect("the teardown's failure is the cleanup");
+    assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
     assert_eq!(crate::error::first_os_code(&**cleanup.first()), Some(5), "{cleanup:?}");
-
-    let (detail, source, cleanup, fate) = taken(untracked_failure(no_pid(), torn(ChildFate::Reaped, None)));
-    assert_eq!(fate, ChildFate::Reaped);
-    assert!(cleanup.is_none(), "{cleanup:?}");
-    assert!(detail.contains("pid could not be read (GetProcessId)"), "{detail}");
     assert!(
-        detail.ends_with("it was terminated or had exited, and its exit was collected"),
-        "{detail}"
-    );
-    assert_eq!(
-        crate::error::first_os_code(&*source.expect("the failed read is the cause")),
-        Some(6)
+        crate::error::said(&**cleanup.first()).starts_with(&crate::error::io_said("terminating the elevated child: ")),
+        "the refusal names its step: {cleanup:?}"
     );
 }
 

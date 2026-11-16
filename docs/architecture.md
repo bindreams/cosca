@@ -39,8 +39,9 @@ A question about a _pid_ and a question about a _process you hold_ go to differe
 The identity module asks the kernel through one interface, `Kernel` (`HostKernel` makes the calls;
 tests pass a `FakeKernel` of stated answers). The trait exists on every platform, so shared code
 takes `&dyn Kernel` with no `#[cfg]`; Linux's and macOS's have the methods, and Windows's has
-`terminate` (`TerminateProcess`). A method enters with its first caller. A read that a test answers
-takes `&dyn Kernel`; code that runs between fork and exec never does, and stays raw.
+`terminate` (`TerminateProcess`) and `creation_token` (`GetProcessTimes` of a handle the caller
+holds). A method enters with its first caller. A read that a test answers takes `&dyn Kernel`; code
+that runs between fork and exec never does, and stays raw.
 
 The OS layer owns the kernel it asks, on every platform. `os_process::open_with(kernel, id)` checks
 `id` through `&kernel` and moves the same kernel into the process it returns (`LinuxProcess<K>`,
@@ -107,10 +108,14 @@ In order:
      wrote on the spawn core's status channel, which `fork_spawn` reads and records on the leaf. On
      macOS the identity and attach arms tear down through `held_teardown` as Linux's do (a refused
      kill, or a front still running, comes back as an `Unreaped`). On Windows `held_teardown::tear_down_failed_spawn`
-     ends every failure of the std and raw spawns; a refused kill comes back in the spawn's
-     failure as an `Unreaped`, and so does a UAC child whose pid or identity cannot be read (ended
-     by the same teardown and waited for). An identity read the OS refuses fails no spawn: the
-     child is kept with no identity, and only a containment that needs one fails the attach. A
+     ends every failure of the std and raw spawns after their identity read; a refused kill comes back
+     in the spawn's failure as an `Unreaped`, and so does a UAC child whose pid cannot be read (ended by the same
+     teardown and waited for: a `Child` has a pid). An identity read the OS refuses fails no spawn,
+     a UAC launch's included: the child is kept with no identity, `id()` is `None`, and only a
+     containment that needs one fails the attach. A Windows spawn reads the identity of the handle
+     its box holds, through the one `resolve_identity` and `Kernel::creation_token` (the UAC launch
+     too, which a by-pid open could not read, as an elevated child's can be refused); that read
+     finds the child or cannot say, so no Windows spawn fails on it. A
      teardown over a handle
      (`held_teardown::tear_down_expecting`) is told once what its caller knows became of the handle
      (`Past`, in `child::owned::teardown`); what the handle allows is its constructor's

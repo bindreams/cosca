@@ -135,8 +135,9 @@ fn kill_of_an_access_denied_live_process_is_an_error() {
         return;
     };
     let child = crate::identity::windows_fixture::spawn_unkillable(&done);
-    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
-        .expect("the owned handle always yields an identity");
+    let id =
+        crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, child.handle(), child.pid())
+            .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
     let err = crate::os_process::open(id).expect_err("a process we may not open must not read as gone");
     let crate::error::Error::Unassessable { source, .. } = err else {
@@ -161,8 +162,9 @@ fn waiting_on_an_access_denied_live_process_is_an_error() {
         return;
     };
     let child = crate::identity::windows_fixture::spawn_unkillable(&done);
-    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
-        .expect("the owned handle always yields an identity");
+    let id =
+        crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, child.handle(), child.pid())
+            .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
     let err = exited_now(id).expect_err("an unopenable live process must not be reported as exited");
     let crate::error::Error::Unassessable { source, .. } = err else {
@@ -188,8 +190,9 @@ fn wait_of_a_synchronize_denied_but_exited_process_reports_exited() {
         return;
     };
     let child = spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
-    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
-        .expect("the owned handle always yields an identity");
+    let id =
+        crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, child.handle(), child.pid())
+            .expect("the owned handle always yields an identity");
     child.terminate();
     assert!(!child.is_running(), "precondition: the subject must have exited");
     assert_eq!(id.is_alive(), Liveness::Dead, "precondition: provably dead");
@@ -206,8 +209,9 @@ fn kill_of_a_terminate_denied_but_exited_process_reports_success() {
     };
     use windows::Win32::System::Threading::PROCESS_TERMINATE;
     let child = crate::identity::windows_fixture::spawn_query_only(&done);
-    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
-        .expect("the owned handle always yields an identity");
+    let id =
+        crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, child.handle(), child.pid())
+            .expect("the owned handle always yields an identity");
     // Precondition: the terminate right must actually be refused, or this exercises the
     // Opened::Found path and never reaches the arm under test.
     assert!(
@@ -346,8 +350,9 @@ fn wait_on_a_stale_identity_over_a_readable_pid_reports_exited() {
         return;
     };
     let child = spawn_restricted(&done, PROCESS_QUERY_LIMITED_INFORMATION.0);
-    let real = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
-        .expect("the owned handle always yields an identity");
+    let real =
+        crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, child.handle(), child.pid())
+            .expect("the owned handle always yields an identity");
     let stale = real.with_other_value();
     assert!(child.is_running(), "precondition: the pid's occupant is live");
     assert!(exited_now(stale).expect("a readable stranger on the pid proves the stale identity is gone"));
@@ -364,8 +369,9 @@ fn wait_on_a_stale_identity_over_an_unreadable_pid_is_an_error() {
         return;
     };
     let child = crate::identity::windows_fixture::spawn_unkillable(&done);
-    let real = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
-        .expect("the owned handle always yields an identity");
+    let real =
+        crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, child.handle(), child.pid())
+            .expect("the owned handle always yields an identity");
     let stale = real.with_other_value();
     assert!(
         child.is_running(),
@@ -881,4 +887,33 @@ fn a_refused_creator_query_does_not_displace_a_refused_sequence_number_in_the_er
         Some(REFUSED_CODE),
         "the sequence status, not the creator's"
     );
+}
+
+/// A held handle whose creation time the kernel refuses to give reads `Unknown`, and the cause
+/// carries the Win32 error of the refusal, so the error a caller builds from it has the OS code as its
+/// source. The handle is the process's own pseudo-handle, which names `pid`.
+///
+/// Mutant: `of_held_with` drops the failed read's error from the cause.
+#[skuld::test]
+fn a_held_handle_whose_creation_time_is_refused_reads_unknown_with_the_os_error() {
+    use std::os::windows::io::{BorrowedHandle, RawHandle};
+    use windows::core::HRESULT;
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    use crate::identity::{FakeKernel, ProcessId};
+
+    let kernel = FakeKernel::new().on_creation_token(Err(HRESULT::from_win32(ERROR_ACCESS_DENIED.0)));
+    // SAFETY: the pseudo-handle is valid for the life of the process and is never closed.
+    let own = unsafe { BorrowedHandle::borrow_raw(GetCurrentProcess().0 as RawHandle) };
+
+    let (read, cause) = ProcessId::of_held_with(&kernel, std::process::id(), own);
+
+    assert!(matches!(read, Resolved::Unknown), "{read:?}");
+    let error = crate::child::spawn::spawn_identity_error(read, cause);
+    assert_eq!(
+        crate::error::first_os_code(&error),
+        Some(ERROR_ACCESS_DENIED.0 as i32),
+        "the refusal is the error's source: {error:?}"
+    );
+    assert!(kernel.all_rows_taken());
 }

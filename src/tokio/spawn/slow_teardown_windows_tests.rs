@@ -21,10 +21,10 @@ enum Backend {
     Raw,
 }
 
-/// Fails a spawn of a blocker through `backend` with `force` (a fault seam that fails the attach or
-/// the identity read), with a zero threshold and the kill refused as an exit under way, so the child
-/// is still running when the teardown first looks and nothing but its stdin closing ends it: closed
-/// once the wait blocks, which is after the warn. Answers the teardown's fate and warns.
+/// Fails a spawn of a blocker through `backend` with `force` (a fault seam that fails the attach), with
+/// a zero threshold and the kill refused as an exit under way, so the child is still running when the
+/// teardown first looks and nothing but its stdin closing ends it: closed once the wait blocks, which is
+/// after the warn. The identity read answers a stated row. Answers the teardown's fate and warns.
 fn teardown_with_an_exit_under_way(backend: Backend, force: fn(bool)) -> (ChildFate, Vec<String>) {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
@@ -38,7 +38,8 @@ fn teardown_with_an_exit_under_way(backend: Backend, force: fn(bool)) -> (ChildF
     cmd.stdout(crate::stdio::Stdio::null()).expect("set stdout");
     let _warn = crate::tokio::child::fault::warn_slow_teardowns_after(std::time::Duration::ZERO);
     let _end = crate::wait::block_probe::on_blocking(move || drop(writer));
-    let kernel = std::sync::Arc::new(refusing_the_next_terminate());
+    let kernel =
+        std::sync::Arc::new(refusing_the_next_terminate().on_creation_token(Ok(crate::identity::Key::from_raw(1))));
     force(true);
     let spawned = crate::child::spawn::spawn_uncommitted(
         cmd.as_sync_mut(),
@@ -69,31 +70,11 @@ async fn a_std_teardown_after_a_failed_attach_warns_once_past_its_threshold() {
     ));
 }
 
-/// The identity read fails, so no identity is known.
-///
-/// Mutant: the async std spawn hands the identity-failure teardown no threshold.
-#[skuld::test]
-async fn a_std_teardown_after_a_failed_identity_read_warns_once_past_its_threshold() {
-    assert_warns_once_and_waits_on(teardown_with_an_exit_under_way(
-        Backend::Std,
-        fault::set_force_identity_vanished,
-    ));
-}
-
 /// Mutants: the raw teardown waits with no warn; the async raw spawn hands it no threshold.
 #[skuld::test]
 async fn a_raw_teardown_after_a_failed_attach_warns_once_past_its_threshold() {
     assert_warns_once_and_waits_on(teardown_with_an_exit_under_way(
         Backend::Raw,
         fault::set_force_attach_failure,
-    ));
-}
-
-/// Mutant: the async raw spawn hands the identity-failure teardown no threshold.
-#[skuld::test]
-async fn a_raw_teardown_after_a_failed_identity_read_warns_once_past_its_threshold() {
-    assert_warns_once_and_waits_on(teardown_with_an_exit_under_way(
-        Backend::Raw,
-        fault::set_force_identity_vanished,
     ));
 }

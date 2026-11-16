@@ -596,36 +596,6 @@ fn raw_blocker() -> (Command, crate::child::spawn::fault::TeardownBlocker) {
     (c, guard)
 }
 
-/// A raw spawn reads and checks the child's identity before it attaches the containment: with the
-/// attach and the identity read both forced to fail, the identity's error is the one answered.
-///
-/// Mutant: the raw spawn attaches first, so the attach's `Containment` is answered; or the teardown
-/// sends no kill (the child then exits 0 on its released stdin).
-#[skuld::test]
-fn a_raw_spawn_reads_the_identity_before_it_attaches() {
-    use crate::child::spawn::fault;
-    let (mut c, teardown) = raw_blocker();
-    fault::set_force_identity_vanished(true);
-    fault::set_force_attach_failure(true);
-    let result = c.spawn();
-    fault::set_force_attach_failure(false);
-    fault::set_force_identity_vanished(false);
-    let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
-        result.expect_err("a forced failure fails the spawn"),
-    );
-    assert!(
-        matches!(&err, Error::Io(e) if e.to_string().contains("reaped by another party")),
-        "the identity check comes first: {err:?}"
-    );
-    assert_eq!(
-        fate,
-        crate::error::ChildFate::Reaped,
-        "the raw teardown kills and reaps the child"
-    );
-    teardown.assert_killed();
-    fault::assert_child_reaped(fault::take_captured().expect("the seam captured the child"));
-}
-
 /// A raw spawn whose attach fails kills and reaps its child, and answers the attach's error.
 ///
 /// Mutant: the raw teardown is skipped, leaving the child running; or it sends no kill (the child

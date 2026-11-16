@@ -156,8 +156,9 @@ fn open_of_a_denied_identity_is_unassessable_not_none() {
     };
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
-    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
-        .expect("the owned handle always yields an identity");
+    let id =
+        crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, child.handle(), child.pid())
+            .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
     let result = Process::open(id);
     assert!(
@@ -184,8 +185,9 @@ fn a_query_only_handle_is_unknown_while_running_and_dead_after_termination() {
         return;
     };
     let child = crate::identity::windows_fixture::spawn_query_only(&done);
-    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
-        .expect("the owned handle always yields an identity");
+    let id =
+        crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, child.handle(), child.pid())
+            .expect("the owned handle always yields an identity");
     let p = Process::open(id)
         .expect("QUERY alone opens")
         .expect("a live process opens");

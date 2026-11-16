@@ -397,71 +397,97 @@ fn a_failed_wait_on_a_handle_the_spawn_expected_to_wait_on_breaks_the_contract()
 
 // A UAC child that could not be tracked =====
 
-/// A launched UAC child whose pid or identity could not be read is ended as any failed spawn ends
-/// its child: its kill is waited for (`Reaped`, not `Killed`: the exit is collected), and one whose
-/// kill is refused, which a UAC handle without `PROCESS_TERMINATE` is, comes back in the failure as
-/// an `Unreaped`, not left running with nothing to name it. A child whose pid could not be read
-/// (`GetProcessId` failed: a box with no pid) is ended the same, and its error and detail name no pid.
-///
-/// Mutants: the child is killed and not waited for; the refused child is not handed back; the error of
-/// a child with no pid names the process's pid.
+/// A UAC child whose pid cannot be read is killed and waited for (`Reaped`); a refused kill comes
+/// back as `Unreaped`. Error and detail name no pid.
 #[skuld::test]
-fn an_untracked_uac_child_is_waited_for_and_a_refused_kill_hands_it_back() {
-    use crate::elevation::windows::{end_untracked, Unread};
+fn a_uac_child_whose_pid_cannot_be_read_is_waited_for_and_a_refused_kill_hands_it_back() {
+    use crate::elevation::windows::end_untracked;
 
     let read_failure = || windows::core::Error::from_hresult(HRESULT::from_win32(6));
-    // The rows: the identity could not be resolved (the box has its pid), or the pid could not be read.
-    for pid_read in [true, false] {
-        let unread = |pid: u32| -> Unread {
-            if pid_read {
-                Ok((pid, read_failure()))
-            } else {
-                Err(read_failure())
-            }
-        };
-        let process = |handle, pid: u32| WindowsProcess::for_uac(HostKernel, handle, pid_read.then_some(pid));
-        let ended = |child, pid| {
-            crate::child::spawn::failure::error_parts(end_untracked(child, unread(pid), SpawnPolicy::SYNC).into())
-        };
+    let process = |handle| WindowsProcess::for_uac(HostKernel, handle, None);
+    let ended = |child| {
+        crate::child::spawn::failure::error_parts(end_untracked(child, read_failure(), SpawnPolicy::SYNC).into())
+    };
 
-        let owner = Suspended::spawn();
-        let child = OwnedChild::new(
-            Box::new(process(owner.duplicate(), owner.pid)),
-            TrackedKind::AnotherUser,
-        );
-        let (cause, fate, unreaped) = ended(child, owner.pid);
-        assert_eq!(
-            fate,
-            ChildFate::Reaped,
-            "the kill was waited for (pid read: {pid_read})"
-        );
-        assert!(unreaped.is_none(), "a collected child is handed back by none");
-        assert!(
-            !owner.wait_for_exit().success(),
-            "the process was terminated, not left to run"
-        );
-        if !pid_read {
-            assert!(
-                !format!("{cause:?}").contains(&owner.pid.to_string()),
-                "a child with no pid is named by none: {cause:?}"
-            );
-        }
+    let owner = Suspended::spawn();
+    let child = OwnedChild::new(Box::new(process(owner.duplicate())), TrackedKind::AnotherUser);
+    let (cause, fate, unreaped) = ended(child);
+    assert_eq!(fate, ChildFate::Reaped, "the kill was waited for");
+    assert!(unreaped.is_none(), "a collected child is handed back by none");
+    assert!(
+        !owner.wait_for_exit().success(),
+        "the process was terminated, not left to run"
+    );
+    assert!(
+        !format!("{cause:?}").contains(&owner.pid.to_string()),
+        "a child with no pid is named by none: {cause:?}"
+    );
 
-        let owner = Suspended::spawn();
-        let child = OwnedChild::new(
-            Box::new(process(owner.without_terminate_right(), owner.pid)),
-            TrackedKind::AnotherUser,
-        );
-        let (cause, fate, unreaped) = ended(child, owner.pid);
-        assert_eq!(fate, ChildFate::Running { id: None }, "(pid read: {pid_read})");
-        if !pid_read {
-            assert!(
-                !format!("{cause:?}").contains(&owner.pid.to_string()),
-                "a refused child with no pid is named by none: {cause:?}"
-            );
-        }
-        unreaped.expect("a child whose kill was refused is handed back").leak();
-    }
+    let owner = Suspended::spawn();
+    let child = OwnedChild::new(
+        Box::new(process(owner.without_terminate_right())),
+        TrackedKind::AnotherUser,
+    );
+    let (cause, fate, unreaped) = ended(child);
+    assert_eq!(fate, ChildFate::Running { id: None });
+    assert!(
+        !format!("{cause:?}").contains(&owner.pid.to_string()),
+        "a refused child with no pid is named by none: {cause:?}"
+    );
+    unreaped.expect("a child whose kill was refused is handed back").leak();
+}
+
+/// A launched UAC child whose identity cannot be read is kept without one, as every spawn keeps a
+/// child whose identity the OS refuses ([`Child::id`](crate::Child::id)): it keeps running and is
+/// returned with no identity. The refusal is a `FakeKernel` row for the creation-time read, and the
+/// kernel states no `terminate` row, so a `TerminateProcess` of the child would panic.
+///
+/// Mutants: the arm terminates the child and fails the spawn; the arm reads the identity by another
+/// route than the kernel; the kept child's pid is not the launched one.
+#[skuld::test]
+fn a_uac_child_whose_identity_cannot_be_read_is_kept_without_one() {
+    use crate::elevation::windows::{adopt_launched, RunasOutcome};
+    use crate::identity::{spawn_kernel, FakeKernel};
+    use crate::os_process::child::PeekOutcome;
+
+    let owner = Suspended::spawn();
+    let kernel = FakeKernel::new().on_creation_token(Err(HRESULT::from_win32(ERROR_ACCESS_DENIED.0)));
+    let adopted = adopt_launched(owner.duplicate(), SpawnPolicy::SYNC, spawn_kernel(kernel));
+
+    let Ok(RunasOutcome::Launched { owned, id, .. }) = adopted else {
+        panic!("a UAC child whose identity cannot be read is kept")
+    };
+    assert_eq!(id, None, "no identity was read");
+    assert_eq!(owned.pid(), Some(owner.pid), "the kept child is the launched one");
+    assert!(
+        matches!(owned.peek(), Ok(PeekOutcome::Running)),
+        "the child keeps running"
+    );
+}
+
+/// A UAC child's identity is read through the handle `ShellExecuteEx` returned, by the spawn's shared
+/// read: the identity is the process's, and the read's own `AfterIdentityRead` point runs in the arm.
+///
+/// Mutants: the arm reads no identity; the arm skips the read's `AfterIdentityRead`.
+#[skuld::test]
+fn a_uac_childs_identity_is_read_by_the_shared_read() {
+    use crate::child::spawn::fault::{set_at, SpawnPoint};
+    use crate::elevation::windows::{adopt_launched, RunasOutcome};
+    use crate::identity::spawn_kernel;
+
+    let owner = Suspended::spawn();
+    let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+    let _after = {
+        let reached = std::rc::Rc::clone(&reached);
+        set_at(SpawnPoint::AfterIdentityRead, move || reached.set(true))
+    };
+    let adopted = adopt_launched(owner.duplicate(), SpawnPolicy::SYNC, spawn_kernel(HostKernel));
+
+    let Ok(RunasOutcome::Launched { id, .. }) = adopted else {
+        panic!("a UAC child is adopted")
+    };
+    assert_eq!(id, Some(owner.id()));
+    assert!(reached.get(), "the shared read's check point ran");
 }
 
 // What each handle kind allows: the contract of a kill's refusal =====
