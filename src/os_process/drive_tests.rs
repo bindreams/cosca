@@ -406,8 +406,7 @@ fn looks_and_a_signal_on_one_process_run_from_two_threads() {
     use crate::os_process::{open, OsProcess};
     use crate::signal::{Sent, Sig};
 
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn blocker");
+    let child = crate::test_child::blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of a live child");
     let process = open(id).unwrap().expect("a live process opens");
     let p: &dyn OsProcess = &*process;
@@ -418,7 +417,6 @@ fn looks_and_a_signal_on_one_process_run_from_two_threads() {
         let sent = killer.join().unwrap().unwrap();
         assert!(matches!(sent, Sent::Delivered | Sent::Gone), "{sent:?}");
     });
-    child.wait().expect("reap the blocker");
 }
 
 #[cfg(windows)]

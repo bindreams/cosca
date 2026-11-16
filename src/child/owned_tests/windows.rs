@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::fixtures::{wait_status, Blocker};
 use crate::child::owned::OwnedChild;
 use crate::identity::refusing_the_next_terminate;
-use crate::os_process::child::{adopt_std_over, spawned_blocker};
+use crate::os_process::child::adopt_std_over;
 use crate::os_process::fake::FakeProcess;
 use crate::signal::{Sent, Sig};
 
@@ -42,7 +42,8 @@ fn an_exit_seen_on_the_handle_is_cached() {
 /// Mutant: `signal` waits for the exit after a refusal that finds it under way.
 #[skuld::test]
 fn kill_never_waits() {
-    let (blocker, id, stdin) = spawned_blocker();
+    let (blocker, stdin) = crate::test_child::blocker().into_parts();
+    let id = super::fixtures::identity_of(&blocker);
     let kernel = Arc::new(refusing_the_next_terminate());
     let fake = FakeProcess::over(adopt_std_over(Arc::clone(&kernel), blocker, id));
     let child = OwnedChild::new(Box::new(fake.clone()));

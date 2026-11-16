@@ -887,7 +887,8 @@ fn abandon(
 #[skuld::test]
 fn macos_late_teardown_returns_a_refused_kill_for_the_cleanup() {
     crate::log_capture::install();
-    let (child, _stdin, unique) = std_blocker_with_unique();
+    let (blocker, unique) = std_blocker_with_unique();
+    let (child, _stdin) = blocker.into_parts();
     let pid = child.id();
     let uncontained = crate::containment::Prepared {
         mode: None,
@@ -916,7 +917,8 @@ fn only(warns: &[String]) -> &str {
 /// Mutant: the sentence is built from the fate alone, so a refusal or a no-send reads as a kill.
 #[skuld::test]
 fn macos_late_teardown_of_a_live_child_is_reaped() {
-    let (child, stdin, unique) = std_blocker_with_unique();
+    let (blocker, unique) = std_blocker_with_unique();
+    let (child, stdin) = blocker.into_parts();
     let pid = child.id();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| vec![]);
@@ -932,7 +934,8 @@ fn macos_late_teardown_of_a_live_child_is_reaped() {
 /// Mutants: a refused kill is worded as a sent one; the hand-back is not said.
 #[skuld::test]
 fn macos_late_teardown_with_a_refused_kill_hands_it_back_and_says_so() {
-    let (child, stdin, unique) = std_blocker_with_unique();
+    let (blocker, unique) = std_blocker_with_unique();
+    let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| vec![Box::new(refuse_the_kill())]);
@@ -957,7 +960,8 @@ fn macos_late_teardown_with_a_refused_kill_hands_it_back_and_says_so() {
 /// Mutant: the teardown drops the attach's identity (`Running { id: None }`).
 #[skuld::test]
 fn macos_late_teardown_of_a_contained_child_with_a_refused_kill_names_it_running() {
-    let (child, stdin, unique) = std_blocker_with_unique();
+    let (blocker, unique) = std_blocker_with_unique();
+    let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let walked = crate::containment::Prepared {
@@ -985,7 +989,8 @@ fn macos_late_teardown_of_a_contained_child_with_a_refused_kill_names_it_running
 /// Mutant: the no-send is worded as a sent kill.
 #[skuld::test]
 fn macos_late_teardown_of_a_child_reaped_before_the_teardown_sends_nothing_and_is_gone() {
-    let (child, stdin, unique) = std_blocker_with_unique();
+    let (blocker, unique) = std_blocker_with_unique();
+    let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |pid| {
@@ -1011,7 +1016,8 @@ fn macos_late_teardown_of_a_child_reaped_before_the_teardown_sends_nothing_and_i
 /// Mutant: the arm answers `Running` or `Reaped`.
 #[skuld::test]
 fn macos_late_teardown_with_a_refused_kill_and_a_failed_peek_is_unknown() {
-    let (child, stdin, unique) = std_blocker_with_unique();
+    let (blocker, unique) = std_blocker_with_unique();
+    let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
@@ -1039,7 +1045,8 @@ fn macos_late_teardown_with_a_refused_kill_and_a_failed_peek_is_unknown() {
 #[skuld::test]
 fn macos_late_teardown_of_a_child_reaped_elsewhere_after_the_kill_is_killed() {
     use crate::os_process::child::Foreign;
-    let (child, stdin, unique) = std_blocker_with_unique();
+    let (blocker, unique) = std_blocker_with_unique();
+    let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
@@ -1060,7 +1067,8 @@ fn macos_late_teardown_of_a_child_reaped_elsewhere_after_the_kill_is_killed() {
 #[skuld::test]
 fn macos_late_teardown_of_an_orphaned_zombie_after_the_kill_is_killed_and_says_so() {
     use crate::os_process::child::Foreign;
-    let (child, stdin, unique) = std_blocker_with_unique();
+    let (blocker, unique) = std_blocker_with_unique();
+    let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
@@ -1082,7 +1090,8 @@ fn macos_late_teardown_of_an_orphaned_zombie_after_the_kill_is_killed_and_says_s
 /// Mutant: the arm says the child was reaped.
 #[skuld::test]
 fn macos_late_teardown_with_a_failed_wait_is_killed() {
-    let (child, stdin, unique) = std_blocker_with_unique();
+    let (blocker, unique) = std_blocker_with_unique();
+    let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
@@ -1297,7 +1306,8 @@ fn force(set: fn(bool)) -> Box<dyn std::any::Any> {
 /// Mutants: the note is dropped; it calls the child gone.
 #[skuld::test]
 fn macos_late_teardown_of_an_unreadable_child_without_a_marker_says_its_tree_was_not_killed() {
-    let (child, stdin, unique) = std_blocker_with_unique();
+    let (blocker, unique) = std_blocker_with_unique();
+    let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let walked = crate::containment::Prepared {
@@ -1367,7 +1377,8 @@ fn macos_late_teardown_of_an_unreadable_marked_child_sweeps_its_holders() {
 /// Mutant: the attach's note is dropped.
 #[skuld::test]
 fn macos_late_teardown_whose_tree_attach_fails_says_its_tree_was_not_killed() {
-    let (child, stdin, unique) = std_blocker_with_unique();
+    let (blocker, unique) = std_blocker_with_unique();
+    let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let walked = crate::containment::Prepared {

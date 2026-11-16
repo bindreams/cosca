@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use crate::test_child::Console;
+use crate::test_child::{blocker, Console};
 use std::time::{Duration, Instant};
 
-use super::fixtures::{spawn_std_blocker, status, try_wait, wait_status, Blocker};
+use super::fixtures::{status, try_wait, wait_status, Blocker};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::error::Error;
 use crate::identity::{exit_record, ppid_fault, FakeKernel, HostKernel, UniqRead, LAUNCHD};
@@ -128,19 +128,20 @@ fn no_block_after_the_kernel_reaps(pid: u32) -> crate::wait::block_probe::Armed 
 fn ignoring_sigchld_with_a_sibling() -> (
     OwnedChild,
     std::process::Child,
-    std::process::ChildStdin,
     (crate::wait::block_probe::Armed, crate::wait::block_probe::Armed),
 ) {
     crate::test_child::set_signal_ignored(libc::SIGCHLD, true);
-    let (sibling, sibling_stdin) = spawn_std_blocker();
-    let (root, root_stdin) = spawn_std_blocker();
+    // Under `SIG_IGN` the kernel reaps the sibling itself when it ends, so a guard's `wait` would
+    // fail with `ECHILD`: the child is taken out of its guard, and dropping it closes its stdin.
+    let sibling = blocker().into_inner();
+    let (root, root_stdin) = blocker().into_parts();
     let root_pid = root.id();
     let id = super::fixtures::identity_of(&root);
     let owned = OwnedChild::adopt(root, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     let mut root_stdin = Some(root_stdin);
     let end = crate::wait::block_probe::on_blocking(move || drop(root_stdin.take()));
     let reaped = no_block_after_the_kernel_reaps(root_pid);
-    (owned, sibling, sibling_stdin, (end, reaped))
+    (owned, sibling, (end, reaped))
 }
 
 /// A `wait` on a child the kernel reaped returns `ECHILD` while a sibling lives. (A blocking
@@ -158,7 +159,7 @@ fn a_wait_on_a_child_the_kernel_reaped_returns_while_a_sibling_lives() {
             "",
         );
     }
-    let (owned, _sibling, _stdin, _end) = ignoring_sigchld_with_a_sibling();
+    let (owned, _sibling, _end) = ignoring_sigchld_with_a_sibling();
     let outcome = owned.wait(None);
     assert!(is_foreign(&outcome), "the kernel reaped the root: {outcome:?}");
 }
@@ -176,7 +177,7 @@ fn a_wait_timeout_far_past_the_bound_returns_echild() {
             "",
         );
     }
-    let (owned, _sibling, _stdin, _end) = ignoring_sigchld_with_a_sibling();
+    let (owned, _sibling, _end) = ignoring_sigchld_with_a_sibling();
     let outcome = owned.wait(Some(far()));
     assert!(is_foreign(&outcome), "the kernel reaped the root: {outcome:?}");
 }
@@ -196,7 +197,9 @@ fn a_sync_drop_of_a_child_the_kernel_reaped_returns() {
         );
     }
     crate::test_child::set_signal_ignored(libc::SIGCHLD, true);
-    let (_sibling, _sibling_stdin) = spawn_std_blocker();
+    // Taken out of its guard: the kernel reaps it (see `ignoring_sigchld_with_a_sibling`).
+    #[allow(clippy::zombie_processes, reason = "the kernel reaps it: SIGCHLD is ignored")]
+    let _sibling = blocker().into_inner();
     use std::io::Read as _;
     let mut cmd = crate::test_child::command(Console::Hidden);
     // Prints `eof` only if `cat` ends of its own accord, as it does on EOF once the writer is
@@ -329,7 +332,8 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
 
     let (pid, unique) = echild_yet_resolvable();
     let owned = watch(pid, unique);
-    let (mut tracer, tracer_stdin) = spawn_std_blocker();
+    let mut tracer = blocker();
+    let tracer_stdin = tracer.stdin.take().expect("piped stdin");
     let tracer_pid = tracer.id();
     let exited = Rc::new(Cell::new(false));
     let _parent = ppid_fault::force_ppid_with({
@@ -351,7 +355,6 @@ fn a_wait_on_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_e
         "the tracer's exit must wake the wait: {events:?}"
     );
     assert_eq!(outcome, ChildWaitOutcome::Foreign(Foreign::Orphaned));
-    tracer.wait().expect("reap the stand-in tracer");
 }
 
 /// For each round whose hook staged a wake: its index and whether the wait's kqueue held an event at
@@ -418,7 +421,8 @@ fn a_wait_on_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
     use std::rc::Rc;
 
     let (pid, unique) = echild_yet_resolvable();
-    let (mut tracer, tracer_stdin) = spawn_std_blocker();
+    let mut tracer = blocker();
+    let tracer_stdin = tracer.stdin.take().expect("piped stdin");
     let tracer_pid = tracer.id();
     let holder = Rc::new(Cell::new(pid));
     let _parent = ppid_fault::force_ppid_with({
@@ -448,7 +452,6 @@ fn a_wait_on_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
         "the attach's SIGCONT, then the tracer's exit, must each leave the wait an event to wake on"
     );
     assert_eq!(outcome.expect("wait"), ChildWaitOutcome::Foreign(Foreign::Orphaned));
-    tracer.wait().expect("reap the stand-in tracer");
 }
 
 /// The parents a `kinfo_proc` read reports for a process this one started, held by `tracer`:
@@ -476,8 +479,8 @@ fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
     use std::rc::Rc;
 
     let (pid, unique) = echild_yet_resolvable();
-    let (tracer, tracer_stdin) = spawn_std_blocker();
-    let (outer, outer_stdin) = spawn_std_blocker();
+    let tracer = blocker();
+    let outer = blocker();
     let (tracer_pid, outer_pid) = (tracer.id(), outer.id());
     let holder = Rc::new(Cell::new(tracer_pid));
     let _parent = ppid_fault::force_ppid_with({
@@ -501,10 +504,6 @@ fn a_wait_on_a_child_whose_tracer_is_traced_is_woken_by_that_tracers_exit() {
         "the SIGCHLD to the tracer's tracer must leave the wait an event to wake on"
     );
     assert_eq!(outcome.expect("wait"), ChildWaitOutcome::Foreign(Foreign::Orphaned));
-    for (mut child, stdin) in [(tracer, tracer_stdin), (outer, outer_stdin)] {
-        drop(stdin);
-        child.wait().expect("reap a stand-in tracer");
-    }
 }
 
 /// A tracer that began its exit, then lost its own tracer: XNU gives it to launchd and keeps its
@@ -524,7 +523,7 @@ fn a_wait_on_a_child_whose_tracer_is_exiting_at_launchd_peeks_again_on_a_backoff
     use std::rc::Rc;
 
     let (pid, unique) = echild_yet_resolvable();
-    let (mut tracer, tracer_stdin) = spawn_std_blocker();
+    let tracer = blocker();
     let tracer_pid = tracer.id();
     let holder = Rc::new(Cell::new(tracer_pid));
     let _parent = ppid_fault::force_ppid_with({
@@ -551,8 +550,6 @@ fn a_wait_on_a_child_whose_tracer_is_exiting_at_launchd_peeks_again_on_a_backoff
         "the first block must be a timed pause, to look again: {armed:?}"
     );
     assert_eq!(outcome, ChildWaitOutcome::Foreign(Foreign::Orphaned));
-    drop(tracer_stdin);
-    tracer.wait().expect("reap the stand-in tracer");
 }
 
 /// A `Running` peek names a child of ours; if the pid now reads as another process, it is a reuse.

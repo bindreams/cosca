@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::graceful_hooks::{at, release_at, HookPoint};
 use crate::send_log::Capture;
-use crate::test_child::blocker;
 use crate::test_child::foreign::{self, survivor_tree, tree_of};
+use crate::test_child::{blocker, StdChild};
 use crate::wait::fault;
 
 /// A std child that ignores `SIGTERM` (`trap '' TERM` before `exec`; an ignored disposition
@@ -23,17 +23,16 @@ use crate::wait::fault;
 /// A test that never sends `SIGKILL` cannot hang on it: `std::process::Child::wait` closes that
 /// stdin before waiting, so the stranded `cat` exits 0 at once and fails the `SIGKILL` assertion.
 /// Taking the stdin out of the `Child`, or reaping through another handle, would lose that EOF.
-fn spawn_term_ignoring_blocker() -> std::process::Child {
+fn spawn_term_ignoring_blocker() -> StdChild {
     // Held for the fork itself: a fork landing while a `fdmarker_tests.rs` test's marker write
     // end is transiently open would inherit it into this not-yet-`exec`'d process, and a
     // concurrent sweep could then find and SIGKILL it — see that module's docs.
-    let mut child = crate::test_spawn::spawn(
+    let mut child = StdChild::spawn(
         std::process::Command::new("sh")
             .args(["-c", "trap '' TERM; echo r; exec cat"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped()),
-    )
-    .expect("spawn");
+    );
     let mut buf = [0u8; 1];
     child
         .stdout
@@ -180,7 +179,7 @@ fn foreign_graceful_shutdown_tree_kills_a_member_that_ignores_the_sigterm_after_
 #[skuld::test]
 fn foreign_graceful_sweep_whose_walk_is_not_made_kills_the_members_its_sigterm_walk_held() {
     use crate::identity::{FakeKernel, HostKernel};
-    let mut tree = survivor_tree();
+    let tree = survivor_tree();
     let settling = tree.process.begin_graceful().expect("the SIGTERM walk");
     crate::test_child::wait_until_zombie(tree.child.id());
     let unlistable = FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO));
@@ -198,7 +197,6 @@ fn foreign_graceful_sweep_whose_walk_is_not_made_kills_the_members_its_sigterm_w
             "{member:?} was held by the SIGTERM walk and is killed by identity"
         );
     }
-    tree.child.wait().expect("reap the root");
 }
 
 // A sweep whose walk cannot be made over a root that
@@ -211,7 +209,7 @@ fn foreign_graceful_sweep_whose_walk_is_not_made_kills_the_members_its_sigterm_w
 #[skuld::test]
 fn foreign_graceful_sweep_whose_walk_is_not_made_over_a_live_root_kills_the_held_member_and_leaves_the_root() {
     use crate::identity::{FakeKernel, HostKernel, Liveness};
-    let mut tree = tree_of(crate::test_child::ROOT_OUTLIVING_THE_GRACE_ARGV);
+    let tree = tree_of(crate::test_child::ROOT_OUTLIVING_THE_GRACE_ARGV);
     let middle = tree
         .process
         .id()
@@ -246,7 +244,6 @@ fn foreign_graceful_sweep_whose_walk_is_not_made_over_a_live_root_kills_the_held
     );
     assert_eq!(tree.process.id().is_alive(), Liveness::Alive, "the root is not killed");
     tree.process.kill().expect("end the root");
-    tree.child.wait().expect("reap the root");
 }
 
 // A root that ignores the `SIGTERM` outlives the grace, and the `SIGTERM` ends its child, which
@@ -300,7 +297,6 @@ fn foreign_kill_tree_over_an_exited_unreaped_root_is_unassessable() {
         .expect_err("a walk from an exited root finds no member");
 
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
-    tree.child.wait().expect("reap the root");
 }
 
 // `terminate_tree` over an exited root whose walk finds no member is `Unassessable` and sends nothing.
@@ -320,5 +316,4 @@ fn foreign_terminate_tree_over_an_exited_root_with_an_empty_walk_is_unassessable
 
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
     assert_eq!(sends.entries(), vec![], "nothing was sent");
-    child.wait().expect("reap the root");
 }

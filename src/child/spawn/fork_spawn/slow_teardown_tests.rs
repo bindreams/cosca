@@ -36,8 +36,9 @@ fn dead_child() -> (
     let (seized_tx, seized_rx) = std::sync::mpsc::channel();
     (
         move || {
-            let mut child = foreign_tracer::blocker();
-            let blocker = release_between_kill_and_wait(child.stdin.take().expect("piped stdin"));
+            // Out of its guard: the failed spawn's teardown kills and reaps it.
+            let (child, stdin) = crate::test_child::blocker_with(foreign_tracer::allow_any_tracer).into_parts();
+            let blocker = release_between_kill_and_wait(stdin);
             let pid = child.id();
             HANDED_OVER.with(|handed| {
                 *handed.borrow_mut() = Some(NewChild {

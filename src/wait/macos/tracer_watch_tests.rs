@@ -12,21 +12,16 @@ use crate::os_process::macos::kqueue::test_hooks::send_signal;
 use crate::os_process::macos::kqueue::{Event, Kqueue};
 use crate::wait::exit_only::macos_tests::found;
 
-/// A live blocker on a held stdin, and its unique id. Dropping it ends and reaps the blocker.
+/// A live blocker and its unique id. Dropping it kills and reaps the blocker.
 struct Live {
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
+    child: crate::test_child::StdChild,
     unique: u64,
 }
 
 impl Live {
     fn new() -> Live {
-        let (child, stdin, unique) = std_blocker_with_unique();
-        Live {
-            child,
-            stdin: Some(stdin),
-            unique,
-        }
+        let (child, unique) = std_blocker_with_unique();
+        Live { child, unique }
     }
 
     fn pid(&self) -> u32 {
@@ -42,13 +37,6 @@ impl Live {
     /// tracer attached is this process.
     fn traced_by(&self, tracer: u32) -> kinfo_proc {
         kinfo_proc::of_host_held_by(self.pid(), std::process::id() as libc::pid_t, tracer as libc::pid_t)
-    }
-}
-
-impl Drop for Live {
-    fn drop(&mut self) {
-        drop(self.stdin.take());
-        self.child.wait().expect("reap the blocker");
     }
 }
 

@@ -14,6 +14,7 @@ use rustix::event::{PollFd, PollFlags};
 use rustix::process::{pidfd_open, waitid, Pid, PidfdFlags, WaitId, WaitIdOptions};
 
 use super::namespaces as ns;
+use super::StdChild;
 
 /// Runs `$body` as pid 1 of a fresh pid namespace with its own procfs. Defines the `#[test]`
 /// `$test` (the entry, in the `NAMESPACES` group) and its two fixtures. The caller imports
@@ -86,7 +87,7 @@ pub(crate) fn wait_pollin(pidfd: BorrowedFd<'_>) {
 /// behind its owner's back, and starts a `std` child that takes the same pid.
 ///
 /// `pid` must be an unreaped child of this process that has been told to exit.
-pub(crate) fn reap_behind_and_reuse(pid: u32) -> Child {
+pub(crate) fn reap_behind_and_reuse(pid: u32) -> StdChild {
     let pidfd = pidfd_open(pid_of(pid), PidfdFlags::empty()).expect("pidfd_open the child");
     wait_pollin(pidfd.as_fd());
     let reaped = waitid(WaitId::Pid(pid_of(pid)), WaitIdOptions::EXITED).expect("raw reap");
@@ -96,11 +97,10 @@ pub(crate) fn reap_behind_and_reuse(pid: u32) -> Child {
 }
 
 /// Starts a `std` child that takes `pid`, which must name no process now. It blocks on its piped
-/// stdin, which its `Child` holds: only a signal ends it before the `Child` drops.
-pub(crate) fn reuse(pid: u32) -> Child {
+/// stdin, which its `Child` holds: only a signal ends it before the guard drops.
+pub(crate) fn reuse(pid: u32) -> StdChild {
     ns::set_last_pid(pid - 1);
-    let mut cmd = super::held_std_blocker(std::process::Stdio::null());
-    let reuser = crate::test_spawn::spawn(&mut cmd).expect("spawn the reuser");
+    let reuser = super::blocker();
     assert_eq!(
         reuser.id(),
         pid,
@@ -123,7 +123,7 @@ pub(crate) fn reuser_id(
 
 /// Sends `SIGUSR1` to `reuser` and returns the signal it died of. The first fatal signal fixes the
 /// status, so anything that signalled it earlier shows here.
-pub(crate) fn sigusr1_and_wait(mut reuser: Child) -> Option<i32> {
+pub(crate) fn sigusr1_and_wait(mut reuser: StdChild) -> Option<i32> {
     signal_usr1(&reuser);
     std::os::unix::process::ExitStatusExt::signal(&reuser.wait().expect("wait for the reuser"))
 }

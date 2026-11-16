@@ -22,17 +22,16 @@ use crate::wait::fault;
 /// stdin before waiting, so the stranded `cat` exits 0 at once and fails the `SIGKILL` assertion.
 /// Taking the stdin out of the `Child`, or reaping through another handle, would lose that EOF.
 /// Identical to the sync twin's helper in `src/process/graceful_tests.rs`.
-fn spawn_term_ignoring_blocker() -> std::process::Child {
+fn spawn_term_ignoring_blocker() -> crate::test_child::StdChild {
     // Held for the fork itself: a fork landing while a `fdmarker_tests.rs` test's marker write
     // end is transiently open would inherit it into this not-yet-`exec`'d process, and a
     // concurrent sweep could then find and SIGKILL it — see that module's docs.
-    let mut child = crate::test_spawn::spawn(
+    let mut child = crate::test_child::StdChild::spawn(
         std::process::Command::new("sh")
             .args(["-c", "trap '' TERM; echo r; exec cat"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped()),
-    )
-    .expect("spawn");
+    );
     let mut buf = [0u8; 1];
     child
         .stdout

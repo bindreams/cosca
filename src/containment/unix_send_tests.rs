@@ -5,26 +5,26 @@ use std::os::unix::process::ExitStatusExt as _;
 
 use super::kill_group;
 use crate::send_log::{GroupStep, OrderedStep, Route};
+use crate::test_child::StdChild;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{pidfd_group_signal, Group};
 use crate::test_support::stated_root::StatedRoot;
 
 /// A leader in a group of its own with two members, all blocked on reads of the test's pipe, the
 /// write end that ends them once dropped, and the members' pids. Returns once both members exist.
-fn group_of_three() -> (std::process::Child, std::process::ChildStdin, [u32; 2]) {
+fn group_of_three() -> (StdChild, std::process::ChildStdin, [u32; 2]) {
     use std::io::BufRead as _;
     use std::os::unix::process::CommandExt;
     // Through fd 3: an asynchronous list's stdin is `/dev/null`, and dash points it there before a
     // `<&0` would apply.
-    let mut child = crate::test_spawn::spawn(
+    let mut child = StdChild::spawn(
         std::process::Command::new("sh")
             .arg("-c")
             .arg(r#"exec 3<&0; cat <&3 & a=$!; cat <&3 & echo "$a $!"; wait"#)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .process_group(0),
-    )
-    .expect("spawn the leader");
+    );
     let stdin = child.stdin.take().expect("piped stdin");
     let mut line = String::new();
     std::io::BufReader::new(child.stdout.take().expect("piped stdout"))

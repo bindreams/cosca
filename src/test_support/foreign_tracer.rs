@@ -18,8 +18,7 @@ use crate::test_child::Console;
 use std::os::unix::process::CommandExt as _;
 use std::process::{ChildStdin, ChildStdout};
 
-use crate::containment::cgroup::test_support::KillOnDrop;
-use crate::test_child::{fixture_command, fixture_path, is_marked_fixture_reexec};
+use crate::test_child::{fixture_command, fixture_path, is_marked_fixture_reexec, StdChild};
 
 /// Marks the helper re-exec; the value is the driver's pid.
 const MARKER: &str = "COSCA_TESTCFG_SHARED_FOREIGN_TRACER";
@@ -154,16 +153,6 @@ pub(crate) fn allow_any_tracer(cmd: &mut std::process::Command) {
     }
 }
 
-/// A [`BLOCKER_ARGV`](crate::test_child::BLOCKER_ARGV) child that any tracer may seize, its stdin held
-/// open by the returned `Child`, which a test keeps until the child is gone. Spawned under
-/// `spawn_lock`.
-#[cfg(feature = "tokio")]
-pub(crate) fn blocker() -> std::process::Child {
-    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
-    allow_any_tracer(&mut cmd);
-    crate::test_spawn::spawn(&mut cmd).expect("spawn the tracee")
-}
-
 /// Lets any process trace this one (`PR_SET_PTRACER`), which Yama's scope 1 requires of a tracer
 /// that is no ancestor. For a tracee that cannot take [`allow_any_tracer`], such as one spawned by
 /// `cosca::tokio::Command`, which has no `pre_exec`. Until it returns, [`spawn_helper`]'s seize
@@ -178,9 +167,8 @@ pub(crate) fn allow_any_tracer_now() -> std::io::Result<()> {
 
 /// A running foreign tracer.
 pub(crate) struct Tracer {
-    helper: std::process::Child,
-    /// Ends the helper when the driver leaves, whatever the way.
-    ends_helper: KillOnDrop,
+    /// Killed and reaped when the driver leaves, whatever the way.
+    helper: StdChild,
     go: Option<ChildStdin>,
     lines: std::io::Lines<BufReader<ChildStdout>>,
 }
@@ -225,13 +213,11 @@ fn start_helper(pid: Option<u32>, hold_exit: bool) -> Tracer {
     if hold_exit {
         cmd.env(HOLD_EXIT_ENV, "1");
     }
-    let mut helper = crate::test_spawn::spawn(&mut cmd).expect("spawn the foreign tracer");
-    let ends_helper = KillOnDrop::of(&helper);
+    let mut helper = StdChild::spawn(&mut cmd);
     let go = helper.stdin.take().expect("piped stdin");
     let lines = BufReader::new(helper.stdout.take().expect("piped stdout")).lines();
     Tracer {
         helper,
-        ends_helper,
         go: Some(go),
         lines,
     }
@@ -290,8 +276,6 @@ impl Tracer {
     pub(crate) fn finish(mut self) {
         drop(self.go.take());
         let status = self.helper.wait().expect("the helper exits");
-        // Reaped: the guard's pidfd would refuse a kill of it.
-        _ = self.ends_helper.defuse();
         assert!(status.success(), "{status:?}");
     }
 }

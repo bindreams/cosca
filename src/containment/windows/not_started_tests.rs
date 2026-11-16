@@ -8,11 +8,6 @@ use crate::test_frozen::{inject_suspended_thread_into_std_child, raw, spawn_susp
 
 const ERROR_ACCESS_DENIED: u32 = 5;
 
-fn dispose(mut child: std::process::Child) {
-    child.kill().expect("kill the test child");
-    child.wait().expect("reap the test child");
-}
-
 /// A root nothing touched is proved not started, and the proof keeps its suspend: the initial
 /// thread is at count 2 (the creator's and the proof's) while the proof is held and after it is
 /// dropped, which resumes nothing.
@@ -28,7 +23,6 @@ fn an_untouched_suspended_root_is_proved_not_started_and_stays_suspended() {
     assert_eq!(thread.suspend_count(), 2, "the proof holds its own suspend");
     drop(proven);
     assert_eq!(thread.suspend_count(), 2, "dropping the proof resumes nothing");
-    dispose(child);
 }
 
 /// A root whose thread something resumed is not proved, and nothing the read suspended stays
@@ -45,7 +39,6 @@ fn a_root_whose_initial_thread_was_resumed_is_not_proved_and_is_left_as_found() 
     prove_not_started(raw(&child)).expect_err("a running root is not proved");
 
     assert_eq!(thread.suspend_count(), 0, "the read's suspend was undone");
-    dispose(child);
 }
 
 /// A second thread in the root (started by an EDR agent or a debugger, here suspended at birth)
@@ -62,7 +55,6 @@ fn a_root_with_a_second_thread_is_not_proved() {
 
     assert!(why.contains("2 threads"), "{why}");
     assert_eq!(thread.suspend_count(), 1, "nothing was suspended by the read");
-    dispose(child);
 }
 
 /// The loader's state reads as set once the root's thread has run, and not before.
@@ -82,7 +74,6 @@ fn the_loader_state_reads_unset_in_a_suspended_root_and_set_once_it_ran() {
     while !loader_started(process).expect("read a running root") {
         std::thread::yield_now();
     }
-    dispose(child);
 }
 
 /// What the proof makes of the reads it took after its suspend: a thread that was running, a
@@ -124,5 +115,4 @@ fn a_root_whose_state_cannot_be_read_is_not_proved() {
     let why = prove_not_started(raw(&child)).expect_err("an unopenable thread proves nothing");
     assert!(why.contains("OpenThread"), "{why}");
     assert_eq!(thread.suspend_count(), 1, "nothing was suspended");
-    dispose(child);
 }

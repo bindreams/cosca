@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use rustix::event::{PollFd, PollFlags};
 use rustix::fs::{mknodat, open, FileType, Mode, OFlags, CWD};
@@ -19,6 +19,7 @@ use rustix::fs::{mknodat, open, FileType, Mode, OFlags, CWD};
 use crate::elevation::shim::hooks::{Gate, Inject};
 use crate::elevation::shim::link::fake_shim::{my_euid, Rig};
 use crate::elevation::shim::protocol::ShimArgs;
+use crate::test_child::StdChild;
 
 /// What a test asks of one shim run.
 pub(super) struct Spec {
@@ -301,7 +302,7 @@ impl ShimRig {
                 Ok(())
             });
         }
-        let mut child = crate::test_spawn::spawn(&mut command).expect("the shim starts");
+        let mut child = StdChild::spawn(&mut command);
         let stdin = child.stdin.take();
         let pidfd = rustix::process::pidfd_open(
             rustix::process::Pid::from_raw(child.id() as i32).expect("a pid"),
@@ -375,7 +376,7 @@ impl LogTail {
 
 /// One shim process.
 pub(super) struct Run {
-    child: Option<Child>,
+    child: Option<StdChild>,
     stdin: Option<std::process::ChildStdin>,
     pidfd: rustix::fd::OwnedFd,
     log: LogTail,
@@ -684,7 +685,7 @@ impl Run {
 
     /// Waits for the shim's exit and collects it. The shim's own stdout and stderr are returned.
     pub(super) fn finish(mut self) -> Finished {
-        let child = self.child.take().expect("not yet waited");
+        let child = self.child.take().expect("not yet waited").into_inner();
         let output = child.wait_with_output().expect("the shim's exit");
         self.log.drain();
         Finished {
@@ -702,17 +703,6 @@ impl Run {
     /// Sends `signal` to the shim through its pidfd.
     pub(super) fn signal(&self, signal: rustix::process::Signal) {
         rustix::process::pidfd_send_signal(&self.pidfd, signal).expect("the shim is alive");
-    }
-}
-
-impl Drop for Run {
-    /// A test that failed before it finished the shim must not leave it behind: its own child, killed
-    /// through the handle `std` holds.
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            _ = child.kill();
-            _ = child.wait();
-        }
     }
 }
 
@@ -749,7 +739,7 @@ fn open_for_release(fifo: &Path) {
 
 /// The shim's owner as a process of its own, so that a test can end it: see `owner_helper`.
 pub(super) struct Owner {
-    child: Child,
+    child: StdChild,
     stdin: Option<std::process::ChildStdin>,
     out: std::io::BufReader<std::process::ChildStdout>,
     pub(super) dir: PathBuf,
@@ -783,7 +773,7 @@ impl Owner {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        let mut child = crate::test_spawn::spawn(&mut command).expect("the owner starts");
+        let mut child = StdChild::spawn(&mut command);
         let stdin = child.stdin.take();
         let mut out = std::io::BufReader::new(child.stdout.take().expect("piped"));
         let (mut dir, mut pid) = (None, None);
@@ -893,13 +883,5 @@ impl Owner {
     /// Closes the owner's stdin: it exits, and so does any copy of it that waits on it.
     pub(super) fn close_stdin(&mut self) {
         self.stdin = None;
-    }
-}
-
-impl Drop for Owner {
-    fn drop(&mut self) {
-        self.stdin = None;
-        _ = self.child.kill();
-        _ = self.child.wait();
     }
 }

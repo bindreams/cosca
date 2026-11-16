@@ -49,15 +49,10 @@ fn assert_no_console() {
 
 /// A blocker that leads a console process group of its own, which the test made and so may signal.
 /// It is `CREATE_NO_WINDOW` through the test spawn helpers.
-fn spawn_group_leader() -> std::process::Child {
+fn spawn_group_leader() -> crate::test_child::StdChild {
     use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
-    crate::test_spawn::spawn_with(
-        &mut crate::test_child::held_std_blocker(std::process::Stdio::null()),
-        CREATE_NEW_PROCESS_GROUP.0,
-        crate::test_spawn::console_flags::Console::Hidden,
-    )
-    .expect("spawn the group leader")
+    crate::test_child::blocker_with_flags(CREATE_NEW_PROCESS_GROUP.0, crate::test_child::Console::Hidden, |_| {})
 }
 
 /// The sends beneath the ops, to a group this process made and leads: with no console the OS
@@ -68,9 +63,9 @@ fn spawn_group_leader() -> std::process::Child {
 fn assert_refused_sends_are_not_sent() {
     use crate::containment::{Contains as _, TerminateOutcome};
 
-    let mut leader = spawn_group_leader();
+    let leader = spawn_group_leader();
     let job = crate::containment::windows::assign_to_kill_on_close_job(
-        std::os::windows::io::AsRawHandle::as_raw_handle(&leader),
+        std::os::windows::io::AsRawHandle::as_raw_handle(&*leader),
     )
     .expect("assign the group leader to a job");
     let (outcome, _) = job.send_terminate(leader.id(), None);
@@ -80,9 +75,8 @@ fn assert_refused_sends_are_not_sent() {
     );
     assert_no_break_sent();
     job.hard_kill().expect("end the group leader");
-    leader.wait().expect("reap the group leader");
 
-    let mut leader = spawn_group_leader();
+    let leader = spawn_group_leader();
     let id = crate::identity::ProcessId::of(leader.id())
         .found()
         .expect("the live group leader resolves");
@@ -92,8 +86,6 @@ fn assert_refused_sends_are_not_sent() {
         "a walker's refused break must be NotSent, got {outcome:?}"
     );
     assert_no_break_sent();
-    leader.kill().expect("end the group leader");
-    leader.wait().expect("reap the group leader");
 }
 
 /// Runs the tree ops and then the lone ops against a contained member that cannot be signalled, from

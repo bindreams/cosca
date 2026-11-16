@@ -3542,7 +3542,6 @@ mod frozen_attach {
         let attachment = attach(Err(refused_identity()), raw(&child), prepared).expect("attach");
 
         assert_eq!(attachment.tree.containment(), Containment::JobObject);
-        dispose(child);
         drop(attachment);
     }
 
@@ -3563,12 +3562,6 @@ mod frozen_attach {
         .cause;
 
         assert!(matches!(err, Error::Unassessable { source: None, .. }), "got {err:?}");
-        dispose(child);
-    }
-
-    fn dispose(mut child: std::process::Child) {
-        child.kill().expect("kill the test child");
-        child.wait().expect("reap the test child");
     }
 
     /// A frozen Strongest root is assigned its containment job and stays suspended.
@@ -3617,7 +3610,6 @@ mod frozen_attach {
         );
         let os_text = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32).to_string();
         assert!(!detail.contains(&os_text), "{detail}");
-        dispose(child);
     }
 
     /// A frozen root whose initial thread cannot be resumed fails the attach with the OS error as the
@@ -3641,7 +3633,6 @@ mod frozen_attach {
         );
         let os_text = std::io::Error::from_raw_os_error(ERROR_INVALID_HANDLE as i32).to_string();
         assert!(!detail.contains(&os_text), "{detail}");
-        dispose(child);
     }
 
     /// The attach of `child`, whose failure is returned whole.
@@ -3703,7 +3694,6 @@ mod frozen_attach {
                 2,
                 "{mode:?}: dropping the failure resumes nothing"
             );
-            dispose(child);
         }
     }
 
@@ -3727,7 +3717,6 @@ mod frozen_attach {
         };
         assert!(!detail.contains("did not run"), "{detail}");
         assert_eq!(thread.suspend_count(), 0, "the read's suspend was undone");
-        dispose(child);
     }
 
     /// `BestEffort` is the ordinary attach: it resumes, a failed assignment degrades to `TreeWalk`,
@@ -3751,7 +3740,6 @@ mod frozen_attach {
         assert_eq!(warns.len(), 1, "{warns:?}");
         let os_text = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32).to_string();
         assert!(warns[0].contains(&os_text), "the warn names the OS error: {warns:?}");
-        dispose(child);
     }
 
     /// Every shape without a cosca job of its own (`TreeWalk` root, nested member, uncontained) is
@@ -3790,7 +3778,6 @@ mod frozen_attach {
             assert!(attachment.tree.job_for_test().is_none(), "{name}: no job of its own");
             assert_eq!(thread.suspend_count(), 1, "{name}: a frozen attach must not resume");
             drop(attachment);
-            dispose(child);
         }
     }
 }

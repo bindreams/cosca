@@ -428,7 +428,6 @@ mod windows {
                 },
             );
         });
-        member.wait().expect("reap the member");
         parked.wait().expect("reap the parked child");
         pool_blocks.assert_none();
     }
@@ -502,12 +501,11 @@ mod windows {
         let rt = ::tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("build a runtime with no drivers");
-        let (member, job) = spawn_job_member();
+        let (_member, job) = spawn_job_member();
         rt.block_on(async {
             let deadline = crate::wait::deadline_from(Duration::from_millis(50)).expect("a finite deadline");
             assert_eq!(drain(&job, Some(deadline)).await, TreeDrain::MembersRemain);
         });
-        let_member_exit(member);
     }
 
     /// A child that exits after a pipe write is seen exited on a runtime whose clock is paused: a
@@ -557,7 +555,6 @@ mod windows {
         go.send(()).expect("the writer waits");
         assert_eq!(wait.await, TreeDrain::AllMembersExited);
         writer.join().expect("the writer ended");
-        member.wait().expect("reap the member");
     }
 
     /// The async wait over `job`'s members, until `deadline` (on tokio's clock).
@@ -578,7 +575,6 @@ mod windows {
         );
         drop(member.stdin.take());
         assert_eq!(wait.await, TreeDrain::AllMembersExited);
-        member.wait().expect("reap the member");
     }
 
     /// An empty job is drained at once, as in the sync wait.
@@ -594,10 +590,9 @@ mod windows {
     /// Mutant: the round registers its handles and waits out the member.
     #[skuld::test]
     async fn a_drain_with_a_deadline_already_past_polls_once() {
-        let (member, job) = spawn_job_member();
+        let (_member, job) = spawn_job_member();
         let past = crate::tokio::wait::deadline_from(Duration::ZERO);
         assert_eq!(drain(&job, past).await, TreeDrain::MembersRemain);
-        let_member_exit(member);
     }
 
     /// A deadline already past on a job whose members have all gone: the last round lists and sees
@@ -611,7 +606,6 @@ mod windows {
         let (mut member, job) = spawn_job_member();
         drop(member.stdin.take());
         assert_eq!(drain(&job, None).await, TreeDrain::AllMembersExited);
-        member.wait().expect("reap the member");
         let past = crate::tokio::wait::deadline_from(Duration::ZERO);
         assert_eq!(drain(&job, past).await, TreeDrain::AllMembersExited);
     }
@@ -629,7 +623,7 @@ mod windows {
     /// at the first timeout without looking at the clock (no re-arm).
     #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
     async fn a_drain_reports_members_remaining_at_its_deadline() {
-        let (member, job) = spawn_job_gui_member();
+        let (_member, job) = spawn_job_gui_member();
         let (_clock, _now) = FrozenClockGuard::install();
         let timeout = Duration::from_millis(50);
         let left = Duration::from_millis(10);
@@ -639,14 +633,12 @@ mod windows {
         let first = wait.as_mut().poll(&mut Context::from_waker(Waker::noop()));
         let arms = wait_ms_probe::take();
         if first.is_ready() || arms.is_empty() || arms.iter().any(|arm| arm.requested != timeout) {
-            member.exit();
             panic!("a running member is waited for under the deadline: first poll {first:?}, arms {arms:?}");
         }
         crate::wait::test_clock::advance(timeout - left);
         wait_ms_probe::on_second_arm(move || crate::wait::test_clock::advance(left));
         let verdict = wait.await;
         let re_arms = wait_ms_probe::take();
-        member.exit();
         assert_eq!(verdict, TreeDrain::MembersRemain);
         let requested: Vec<_> = re_arms.iter().map(|arm| arm.requested).collect();
         assert_eq!(
@@ -666,10 +658,9 @@ mod windows {
     async fn a_drain_does_not_answer_an_empty_first_listing_while_a_member_runs() {
         use crate::containment::windows::fault::force_job_pid_list;
 
-        let (member, job) = spawn_job_member();
+        let (_member, job) = spawn_job_member();
         let _forced = force_job_pid_list(Vec::new());
         let verdict = drain(&job, crate::tokio::wait::deadline_from(Duration::ZERO)).await;
-        let_member_exit(member);
         assert_eq!(
             verdict,
             TreeDrain::MembersRemain,
@@ -695,7 +686,6 @@ mod windows {
         );
         drop(member.stdin.take());
         assert_eq!(wait.await, TreeDrain::AllMembersExited);
-        member.wait().expect("reap the member");
     }
 
     /// A drain that moves from watching its round's members to confirming an empty listing waits for
@@ -741,7 +731,6 @@ mod windows {
             drop(stdin);
             assert_eq!(wait.await, TreeDrain::AllMembersExited);
         });
-        second.wait().expect("reap the second member");
     }
 
     /// A process that joins the job after a confirmed drain is confirmed too, as in the sync wait: the
@@ -764,7 +753,6 @@ mod windows {
         let _forced = force_job_pid_list(Vec::new());
         let verdict = drain(&job, crate::tokio::wait::deadline_from(Duration::ZERO)).await;
         job.hard_kill().expect("end the member");
-        let_member_exit(second);
         assert_eq!(
             verdict,
             TreeDrain::MembersRemain,
@@ -863,7 +851,6 @@ mod windows {
         let _forced = force_job_pid_lists([vec![first.id(), second.id()], vec![first.id()], Vec::new()]);
         let deadline = crate::tokio::wait::deadline_from(Duration::from_millis(50));
         let verdict = drain(&job, deadline).await;
-        let_member_exit(second);
         assert_eq!(
             verdict,
             TreeDrain::MembersRemain,
@@ -886,7 +873,7 @@ mod windows {
 
         use crate::containment::Contains as _;
 
-        let (mut members, job) = crate::test_child::spawn_job_with_members(3);
+        let (members, job) = crate::test_child::spawn_job_with_members(3);
         let pids = crate::containment::windows::query_job_pid_list(HANDLE(job.handle().as_raw_handle()))
             .expect("list the job's members");
         assert!(pids.len() >= members.len(), "the job holds its members: {pids:?}");
@@ -912,9 +899,6 @@ mod windows {
                 "pid {pid} is a member the drain answered before it was signalled"
             );
         }
-        for member in &mut members {
-            member.wait().expect("reap a member");
-        }
     }
 
     /// A drain dropped while it waits unregisters its waits and leaves the job waitable: the next
@@ -931,7 +915,6 @@ mod windows {
         }
         drop(member.stdin.take());
         assert_eq!(drain(&job, None).await, TreeDrain::AllMembersExited);
-        member.wait().expect("reap the member");
     }
 }
 

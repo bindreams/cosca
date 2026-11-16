@@ -142,20 +142,20 @@ mod pidfd {
 
     use crate::containment::{check_number, NotItsGroup};
     use crate::signal::RootState;
-    use crate::test_child::{await_member_ready, member_command};
+    use crate::test_child::{await_member_ready, member_command, StdChild};
     use crate::test_groups::{pidfd_group_signal, Group};
     use crate::test_support::stated_root::StatedRoot;
 
     /// A leader in a group of its own, blocked on its stdin, and its pidfd.
-    fn leader() -> (std::process::Child, std::os::fd::OwnedFd) {
-        let mut leader = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn the leader");
+    fn leader() -> (StdChild, std::os::fd::OwnedFd) {
+        let mut leader = StdChild::spawn(&mut member_command(0));
         await_member_ready(&mut leader);
         let pidfd = crate::containment::cgroup::test_support::pidfd_of(leader.id());
         (leader, pidfd)
     }
 
     /// Kills and reaps `leader`, which leaves its group's number free once no member is left.
-    fn kill_and_reap(mut leader: std::process::Child) {
+    fn kill_and_reap(mut leader: StdChild) {
         leader.kill().expect("kill the leader");
         let status = leader.wait().expect("reap the leader");
         assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
@@ -214,21 +214,18 @@ mod pidfd {
     #[skuld::test]
     fn check_passes_while_the_group_has_a_member(#[fixture(pidfd_group_signal)] _group: &Group) {
         let (leader, pidfd) = leader();
-        let mut member = crate::test_spawn::spawn(&mut member_command(leader.id() as i32)).expect("spawn the member");
+        let mut member = StdChild::spawn(&mut member_command(leader.id() as i32));
         await_member_ready(&mut member);
         let root = reaped_elsewhere(leader.id(), pidfd.as_fd());
         kill_and_reap(leader);
-        let checked = check_number(Some(&root));
-        member.kill().expect("kill the member");
-        member.wait().expect("reap the member");
-        checked.expect("a group with a member left");
+        check_number(Some(&root)).expect("a group with a member left");
     }
 
     /// A kernel that refuses `PIDFD_SIGNAL_PROCESS_GROUP` leaves the answer to the root's state,
     /// even for a group with a member.
     #[skuld::test]
     fn check_asks_the_roots_state_when_the_kernel_refuses_the_flag() {
-        let (mut leader, pidfd) = leader();
+        let (leader, pidfd) = leader();
         let pid = leader.id();
         let reaped = reaped_elsewhere(pid, pidfd.as_fd());
         let refused = crate::containment::unix::fault::refuse_pidfd_group_flag();
@@ -236,8 +233,6 @@ mod pidfd {
         let unreaped = StatedRoot::unreaped().with_pidfd(pidfd.as_fd());
         let passed = check_number(Some(&unreaped));
         drop(refused);
-        leader.kill().expect("kill the leader");
-        leader.wait().expect("reap the leader");
         assert_eq!(
             failed.expect_err("reaped elsewhere").to_string(),
             reaped_elsewhere_text(pid)
@@ -249,14 +244,12 @@ mod pidfd {
     /// number another group took) says nothing about the group: the root's state answers.
     #[skuld::test]
     fn check_asks_the_roots_state_when_the_group_probe_answers_eperm() {
-        let (mut leader, pidfd) = leader();
+        let (leader, pidfd) = leader();
         let pid = leader.id();
         let reaped = reaped_elsewhere(pid, pidfd.as_fd());
         let answered = crate::containment::unix::fault::answer_group_probes_with(libc::EPERM);
         let checked = check_number(Some(&reaped));
         drop(answered);
-        leader.kill().expect("kill the leader");
-        leader.wait().expect("reap the leader");
         assert_eq!(
             checked.expect_err("reaped elsewhere").to_string(),
             reaped_elsewhere_text(pid)

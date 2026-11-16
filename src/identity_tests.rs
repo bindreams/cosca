@@ -51,8 +51,7 @@ fn current_process_resolves_exists_and_is_alive() {
 /// Mutant: "the non-Linux entry ignores the pid".
 #[skuld::test]
 fn the_host_kernel_resolves_a_live_child_through_of_with_and_exists_with() {
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn the child");
+    let child = crate::test_child::blocker();
     let live = ProcessId::of(child.id()).found().expect("the live child resolves");
     assert_eq!(
         ProcessId::of_with(&super::HostKernel, child.id()).0,
@@ -67,8 +66,6 @@ fn the_host_kernel_resolves_a_live_child_through_of_with_and_exists_with() {
         stale.exists_with(&super::HostKernel).0,
         crate::identity::Existence::Gone
     );
-    child.kill().expect("kill the child");
-    child.wait().expect("reap the child");
 }
 
 #[skuld::test]

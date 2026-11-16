@@ -276,8 +276,7 @@ fn a_reused_pid_is_dead_to_the_id_it_does_not_hold() {
 /// `Dead`; once reaped it is `Gone` and `Dead`.
 #[skuld::test]
 fn a_real_child_is_alive_then_a_zombie_then_gone(#[fixture(pidfd_group_signal)] _group: &Group) {
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn the child");
+    let mut child = crate::test_child::blocker();
     let pid = child.id();
     let pidfd = HostKernel
         .pidfd_open(
@@ -308,10 +307,8 @@ fn a_real_child_is_alive_then_a_zombie_then_gone(#[fixture(pidfd_group_signal)] 
 /// Mutant: "the inode is the pid's, not the process's": another process's pidfd has another inode.
 #[skuld::test]
 fn two_pidfds_of_one_process_share_an_inode_and_two_processes_do_not(#[fixture(pidfd_group_signal)] _group: &Group) {
-    let mut first = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn the child");
-    let mut second = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn the child");
+    let first = crate::test_child::blocker();
+    let second = crate::test_child::blocker();
     let ino = |pid: u32| {
         let target = rustix::process::Pid::from_raw(pid as i32).expect("a pid");
         let one = HostKernel.pidfd_open(target, PidfdFlags::empty()).expect("pidfd_open");
@@ -324,8 +321,4 @@ fn two_pidfds_of_one_process_share_an_inode_and_two_processes_do_not(#[fixture(p
         a
     };
     assert_ne!(ino(first.id()), ino(second.id()));
-    for child in [&mut first, &mut second] {
-        child.kill().expect("kill the child");
-        child.wait().expect("reap the child");
-    }
 }

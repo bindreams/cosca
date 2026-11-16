@@ -55,13 +55,13 @@ fn await_zombie(pid: u32) {
     }
 }
 
-use crate::test_child::{await_member_ready, member_command};
+use crate::test_child::{await_member_ready, member_command, StdChild};
 
 /// A group we lead lists the member we put in it, with a token that resolves to Alive.
 #[skuld::test]
 fn members_lists_a_live_owned_group() {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    let mut child = StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
@@ -71,9 +71,6 @@ fn members_lists_a_live_owned_group() {
         .find(|m| m.id.pid() == child.id())
         .unwrap_or_else(|| panic!("leader {} missing from {listed:?}", child.id()));
     assert!(is_alive(leader), "a running leader's token must resolve to Alive");
-
-    _ = child.kill();
-    _ = child.wait();
 }
 
 /// Once the leader has exited unreaped, the kernel still lists it in the group,
@@ -122,7 +119,7 @@ fn members_of_an_absent_group_is_empty() {
 #[skuld::test]
 fn members_id_matches_a_live_read_of_the_same_pid() {
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    let mut child = StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
 
@@ -130,9 +127,6 @@ fn members_id_matches_a_live_read_of_the_same_pid() {
     let leader = listed.iter().find(|m| m.id.pid() == child.id()).expect("leader listed");
     let live = ProcessId::of(child.id()).found().expect("resolve the live leader");
     assert_eq!(leader.id, live, "listing id must match a fresh live read");
-
-    _ = child.kill();
-    _ = child.wait();
 }
 
 /// A group we own holds no refusers once SIGKILLed — and `state` really did deliver the
@@ -142,7 +136,7 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
     use std::os::unix::process::ExitStatusExt;
 
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    let mut child = StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
     assert!(
@@ -177,7 +171,7 @@ fn a_group_kill_names_no_root_among_the_members_it_reached() {
     use std::os::unix::process::ExitStatusExt;
 
     // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    let mut child = StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let pgid = child.id() as i32;
     let root =
@@ -482,7 +476,7 @@ fn a_member_whose_pidfd_cannot_be_opened_is_unassessable_and_nothing_is_sent() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn converge_re_verifies_a_member_through_its_kernel() {
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    let mut child = StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let pid = child.id();
 
@@ -501,8 +495,6 @@ fn converge_re_verifies_a_member_through_its_kernel() {
             && first_os_code(&members[0].1).is_none()),
         "got {state:?}"
     );
-    _ = child.kill();
-    _ = child.wait();
 }
 
 /// A member the kernel shows as another process (its pid's new owner) is not alive, so the pass
@@ -512,7 +504,7 @@ fn converge_re_verifies_a_member_through_its_kernel() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn converge_looks_at_a_members_liveness_through_its_kernel() {
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    let mut child = StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let pid = child.id();
 
@@ -530,8 +522,6 @@ fn converge_looks_at_a_members_liveness_through_its_kernel() {
 
     assert!(matches!(state, Ok(GroupState::Cleared)), "got {state:?}");
     assert_eq!(checks.get(), 0, "nothing was attempted on a member that is not alive");
-    _ = child.kill();
-    _ = child.wait();
 }
 
 /// A member that refused the probe (`EPERM`) is looked at once more before it counts as a survivor,
@@ -542,7 +532,7 @@ fn converge_looks_at_a_members_liveness_through_its_kernel() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn converge_looks_again_at_a_refusing_member_through_its_kernel() {
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    let mut child = StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let pid = child.id();
 
@@ -562,8 +552,6 @@ fn converge_looks_again_at_a_refusing_member_through_its_kernel() {
     drop(refusing);
 
     assert!(matches!(state, Ok(GroupState::Cleared)), "got {state:?}");
-    _ = child.kill();
-    _ = child.wait();
 }
 
 /// A pass lists the group through the kernel it is given, and a member's identity is made by
@@ -575,7 +563,7 @@ fn converge_looks_again_at_a_refusing_member_through_its_kernel() {
 fn converge_sigkill_lists_through_its_kernel_and_sends_nothing_when_a_pidfd_cannot_be_opened() {
     use crate::send_log::Capture;
 
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    let mut child = StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let pid = child.id();
 
@@ -593,8 +581,6 @@ fn converge_sigkill_lists_through_its_kernel_and_sends_nothing_when_a_pidfd_cann
 
     assert!(state.is_err(), "the group cannot be listed: {state:?}");
     assert!(sent.0.is_empty() && sent.1.is_empty(), "nothing was sent: {sent:?}");
-    _ = child.kill();
-    _ = child.wait();
 }
 
 /// macOS: the `SIGKILL` resend to a member whose exit has begun (`killpg` just killed it) can be
@@ -605,7 +591,7 @@ fn converge_sigkill_lists_through_its_kernel_and_sends_nothing_when_a_pidfd_cann
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn converge_clears_a_member_whose_exit_began_when_the_resend_was_refused() {
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    let mut child = StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let pid = child.id();
 
@@ -625,8 +611,6 @@ fn converge_clears_a_member_whose_exit_began_when_the_resend_was_refused() {
     assert!(matches!(state, Ok(GroupState::Cleared)), "got {state:?}");
     assert_eq!(killed.iter().map(|id| id.pid()).collect::<Vec<_>>(), [pid]);
     assert!(kernel.all_rows_taken(), "the exit was read");
-    _ = child.kill();
-    _ = child.wait();
 }
 
 /// The same refusal from a member whose exit has not begun is a live refuser: the group is `Refused`.
@@ -635,7 +619,7 @@ fn converge_clears_a_member_whose_exit_began_when_the_resend_was_refused() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn converge_refuses_a_member_whose_resend_was_refused_with_no_exit_begun() {
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn leader");
+    let mut child = StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let pid = child.id();
 
@@ -658,8 +642,6 @@ fn converge_refuses_a_member_whose_resend_was_refused_with_no_exit_begun() {
     );
     assert!(killed.is_empty(), "nothing was delivered: {killed:?}");
     assert!(kernel.all_rows_taken(), "the exit was read, and found running");
-    _ = child.kill();
-    _ = child.wait();
 }
 
 /// A member that is a live non-leader thread is `Unknown`, with a warn naming that cause, and is
@@ -711,7 +693,7 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
 /// What `resend_sigkill` answers for a live member whose send the kernel answers as `errno` (`None`:
 /// a real send, which ends the member).
 fn resend_answer(errno: Option<i32>) -> super::Reached {
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn the member");
+    let mut child = StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let id = ProcessId::of(child.id()).found().expect("the live member resolves");
     let answering = errno.map(crate::signal::seams::fail_kills_with);
@@ -721,8 +703,6 @@ fn resend_answer(errno: Option<i32>) -> super::Reached {
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
     );
     drop(answering);
-    _ = child.kill();
-    _ = child.wait();
     reached
 }
 

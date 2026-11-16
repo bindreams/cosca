@@ -4,7 +4,7 @@
 use crate::containment::TreeDrain;
 use crate::error::Error;
 use crate::identity::windows_fixture::spawn_query_only_without_console;
-use crate::test_child::{let_member_exit, spawn_more_blocker};
+use crate::test_child::spawn_more_blocker;
 use crate::test_own_process::Completion;
 
 // The step core =====
@@ -291,7 +291,6 @@ fn drain_over(
     let exited = running.try_wait().expect("look at the running member").is_some();
     drop(released);
     job.hard_kill().expect("end the members");
-    let_member_exit(running);
     (verdict, pid, exited)
 }
 

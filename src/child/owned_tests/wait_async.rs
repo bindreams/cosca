@@ -4,7 +4,7 @@
 use std::pin::pin;
 use std::process::{ChildStdin, ExitStatus};
 
-use super::fixtures::{identity_of, spawn_std_blocker_with, status};
+use super::fixtures::{identity_of, status};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::os_process::child::ExitRecord;
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
@@ -16,20 +16,18 @@ fn exit() -> ExitRecord {
 
 /// A child that exits 3 once its stdin closes, and the write end of that stdin.
 pub(super) fn exits_three_on_eof() -> (OwnedChild, ChildStdin) {
-    let (child, stdin) = spawn_std_blocker_with(|cmd| {
-        #[cfg(unix)]
-        let mut command = std::process::Command::new("sh");
-        #[cfg(unix)]
-        command.args(["-c", "read x; exit 3"]);
-        #[cfg(windows)]
-        let mut command = std::process::Command::new("cmd");
-        #[cfg(windows)]
-        command.args(["/D", "/C", "more >nul & exit 3"]);
-        command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null());
-        *cmd = command;
-    });
+    #[cfg(unix)]
+    let mut command = std::process::Command::new("sh");
+    #[cfg(unix)]
+    command.args(["-c", "read x; exit 3"]);
+    #[cfg(windows)]
+    let mut command = std::process::Command::new("cmd");
+    #[cfg(windows)]
+    command.args(["/D", "/C", "more >nul & exit 3"]);
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null());
+    let (child, stdin) = crate::test_child::StdChild::spawn(&mut command).into_parts();
     let id = identity_of(&child);
     let owned = OwnedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     (owned, stdin)

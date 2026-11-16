@@ -213,12 +213,12 @@ fn dropping_an_unreaped_while_panicking_gives_the_child_up_without_waiting() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::rc::Rc;
 
-    use super::fixtures::{identity_of, spawn_std_blocker};
+    use super::fixtures::identity_of;
     use crate::child::owned::OwnedChild;
     use crate::identity::Liveness;
 
     crate::log_capture::install();
-    let (child, stdin) = spawn_std_blocker();
+    let (child, stdin) = crate::test_child::blocker().into_parts();
     let blocker_id = identity_of(&child);
     let owned = OwnedChild::adopt(child, blocker_id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     let unreaped = Unreaped::new(owned, Some(blocker_id), false, DropKind::Wait);
@@ -256,10 +256,10 @@ fn dropping_an_unreaped_while_panicking_gives_the_child_up_without_waiting() {
 /// Mutant: the drop leaves the child a zombie (Unix), or does not wait for it.
 #[skuld::test]
 fn dropping_an_unreaped_blocker_waits_for_it_and_reaps_it() {
-    use super::fixtures::{identity_of, spawn_std_blocker};
+    use super::fixtures::identity_of;
     use crate::child::owned::OwnedChild;
 
-    let (child, stdin) = spawn_std_blocker();
+    let (child, stdin) = crate::test_child::blocker().into_parts();
     let blocker_id = identity_of(&child);
     let owned = OwnedChild::adopt(child, blocker_id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     let unreaped = Unreaped::new(owned, Some(blocker_id), false, DropKind::Wait);

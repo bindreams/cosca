@@ -8,6 +8,7 @@ use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 use crate::test_child::Console;
+use crate::test_child::{blocker, blocker_with};
 
 // This module is declared INSIDE src/tokio/wait.rs, so `super` is `tokio::wait` itself.
 #[cfg(unix)]
@@ -23,23 +24,7 @@ async fn exited_by_id(id: ProcessId, timeout: Option<Duration>) -> Result<bool, 
     crate::tokio::drive::exited_held(&*process, timeout).await
 }
 
-// A long-lived std child (leak-proof: killed + reaped by each test) that only a kill or a closed
-// stdin ends; see `test_child::BLOCKER_ARGV`. Each test calls `wait()` (which closes the piped
-// stdin) only as its last step, after an explicit `kill()`.
-fn std_blocker() -> std::process::Child {
-    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn std blocker")
-}
-
-/// Like `std_blocker`, with stdout piped for the echo round trip in [`assert_child_still_alive`].
-/// Local to the tests that call `assert_child_still_alive`.
-fn std_blocker_with_stdout() -> std::process::Child {
-    crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::piped()))
-        .expect("spawn std blocker")
-}
-
-/// Proves `child` (a [`std_blocker_with_stdout`]) is genuinely still alive: `is_alive()` alone
+/// Proves `child` (a [`blocker_with`] whose stdout is piped) is genuinely still alive: `is_alive()` alone
 /// races the asynchronous `SIGKILL`/`TerminateProcess`. On Unix, round-trips a byte through the
 /// piped stdout. On Windows, closes stdin and requires a clean exit and
 /// the echoed line, as `child::graceful_tests::assert_still_running` does, which reaps `child`.
@@ -75,21 +60,6 @@ fn assert_child_still_alive(child: &mut std::process::Child) {
     }
 }
 
-/// Kills and reaps `child`. Windows discards errors: `assert_child_still_alive` already reaped it
-/// there, so a second kill or wait has nothing to act on.
-fn kill_and_reap(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        child.kill().expect("kill");
-        child.wait().expect("reap");
-    }
-    #[cfg(windows)]
-    {
-        _ = child.kill();
-        _ = child.wait();
-    }
-}
-
 /// Polls `fut` once: all code up to the first suspension (including the seam) runs inside that poll.
 #[cfg(unix)]
 fn poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
@@ -98,7 +68,7 @@ fn poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> std::task::P
 
 #[skuld::test]
 async fn exited_by_id_true_for_exited_unreaped_child() {
-    let mut child = std_blocker();
+    let mut child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
     // NOT reaped yet (no wait): on Unix the child is a zombie — the watch must still see the
@@ -107,22 +77,19 @@ async fn exited_by_id_true_for_exited_unreaped_child() {
         .await
         .expect("exited_by_id");
     assert!(exited, "an exited (unreaped) child must report exited");
-    child.wait().expect("reap");
 }
 
 #[skuld::test]
 async fn exited_by_id_false_for_live_child_at_zero_grace() {
-    let mut child = std_blocker();
+    let child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     let exited = exited_by_id(id, Some(Duration::ZERO)).await.expect("exited_by_id");
     assert!(!exited, "a live child at ZERO grace must report still-alive");
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
 }
 
 #[skuld::test]
 async fn exited_by_id_true_for_stale_identity() {
-    let mut child = std_blocker();
+    let mut child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
     child.wait().expect("reap"); // fully gone; the pid may even be recycled
@@ -137,13 +104,12 @@ async fn exited_by_id_true_when_child_dies_mid_wait() {
     // The live-then-exits path: the watch arms on a LIVE child and must resolve on the real
     // exit event (our own kill). Whether the kill lands before or after arming, the result
     // must be `true`.
-    let mut child = std_blocker();
+    let mut child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     let watch = ::tokio::spawn(exited_by_id(id, Some(Duration::from_secs(30))));
     child.kill().expect("kill mid-wait");
     let exited = watch.await.expect("join").expect("exited_by_id");
     assert!(exited, "the watch must resolve on the child's exit");
-    child.wait().expect("reap");
 }
 
 // Drive the REAL macOS watch loop through its clear_ready + re-await cycle with genuine
@@ -154,8 +120,8 @@ async fn exited_by_id_true_when_child_dies_mid_wait() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 async fn death_watch_loop_survives_a_non_exit_drain_cycle() {
-    let mut decoy = std_blocker();
-    let target = std_blocker();
+    let mut decoy = blocker();
+    let target = blocker();
     let target_id = ProcessId::of(target.id()).found().expect("identity of live target");
     let kq = crate::os_process::macos::kqueue::arm_proc_exit(target_id)
         .expect("arm target")
@@ -184,12 +150,10 @@ async fn death_watch_loop_survives_a_non_exit_drain_cycle() {
         Ok(drained)
     });
     watch.await.expect("watch");
-    let mut target = target_cell
+    let _target = target_cell
         .borrow_mut()
         .take()
         .expect("target stored by the first cycle");
-    target.wait().expect("reap target");
-    decoy.wait().expect("reap decoy");
 }
 
 // The POLLERR branch and the readiness contract, via synthetic `Ready` values: they pin the branch
@@ -225,23 +189,21 @@ mod classify {
 
 #[skuld::test]
 async fn exited_by_id_unbounded_resolves_for_exited_unreaped_child() {
-    let mut child = std_blocker();
+    let mut child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
     // NOT reaped: the exit event precedes the call, so the unbounded watch must resolve.
     exited_by_id(id, None).await.expect("exited_by_id");
-    child.wait().expect("reap");
 }
 
 #[skuld::test]
 async fn exited_by_id_unbounded_resolves_when_child_dies_mid_wait() {
     // Arm on a LIVE child; our own kill is the real exit event. Race-tolerant either side.
-    let mut child = std_blocker();
+    let mut child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     let watch = ::tokio::spawn(exited_by_id(id, None));
     child.kill().expect("kill mid-wait");
     watch.await.expect("join").expect("exited_by_id");
-    child.wait().expect("reap");
 }
 
 #[skuld::test]
@@ -249,7 +211,7 @@ async fn exited_by_id_zero_reports_an_observed_exit() {
     // The ZERO one-shot probe must see an already-exited (zombie) child — the sync/async
     // parity case a plain timeout(ZERO, ..) gets wrong (the AsyncFd readiness of a zombie
     // needs a reactor round-trip the zero timer would win against).
-    let mut child = std_blocker();
+    let mut child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
     // Observe the exit as a real event WITHOUT reaping: wait for it via the unbounded watch
@@ -259,7 +221,6 @@ async fn exited_by_id_zero_reports_an_observed_exit() {
         exited_by_id(id, Some(Duration::ZERO)).await.expect("zero probe"),
         "an observed-exited child must report exited at ZERO grace"
     );
-    child.wait().expect("reap");
 }
 
 #[skuld::test]
@@ -267,7 +228,9 @@ async fn exited_by_id_unbounded_cancel_leaves_child_untouched() {
     use std::future::Future;
     // Poll the unbounded watch exactly once (arms it), then drop — the watch is signal-free,
     // so the child must still be alive; it dies only by the test's own kill.
-    let mut child = std_blocker_with_stdout();
+    let mut child = blocker_with(|cmd| {
+        cmd.stdout(std::process::Stdio::piped());
+    });
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     {
         let mut fut = std::pin::pin!(exited_by_id(id, None));
@@ -277,7 +240,6 @@ async fn exited_by_id_unbounded_cancel_leaves_child_untouched() {
         }
     }
     assert_child_still_alive(&mut child); // a cancelled watch must not affect the child
-    kill_and_reap(&mut child);
 }
 
 // A live child watched under an identity naming its pid but a wrong start token is `Opened::Found`
@@ -286,7 +248,9 @@ async fn exited_by_id_unbounded_cancel_leaves_child_untouched() {
 #[cfg(windows)]
 #[skuld::test]
 async fn exited_by_id_resolves_immediately_on_an_identity_mismatch() {
-    let mut child = std_blocker_with_stdout();
+    let mut child = blocker_with(|cmd| {
+        cmd.stdout(std::process::Stdio::piped());
+    });
     let real = ProcessId::of(child.id()).found().expect("identity of live child");
     let stale = real.with_other_value();
 
@@ -304,8 +268,6 @@ async fn exited_by_id_resolves_immediately_on_an_identity_mismatch() {
 
     // The watch resolved on the STALE identity, so it must not have touched this live child.
     assert_child_still_alive(&mut child);
-    // A `std` `Child` neither kills nor reaps on drop.
-    kill_and_reap(&mut child);
 }
 
 /// The async cgroup drain wait wakes when the leaf is removed, even with no event on
@@ -443,7 +405,7 @@ async fn exited_by_id_arms_deadline_froms_instant() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
     let t0 = super::tokio_now();
-    let mut child = std_blocker();
+    let child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     let grace = Duration::from_secs(3600);
 
@@ -459,9 +421,6 @@ async fn exited_by_id_arms_deadline_froms_instant() {
         Armed::At(t0 + grace)
     );
     assert!(rx.try_recv().is_err(), "armed exactly once");
-
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
 }
 
 /// Polls `exited_by_id(id, Some(grace))` once on a live child and returns what the seam saw.
@@ -469,7 +428,7 @@ async fn exited_by_id_arms_deadline_froms_instant() {
 async fn armed_by_one_poll_of_exited_by_id(grace: Duration) -> Vec<Armed> {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
-    let mut child = std_blocker();
+    let child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     {
         let mut fut = std::pin::pin!(exited_by_id(id, Some(grace)));
@@ -478,8 +437,6 @@ async fn armed_by_one_poll_of_exited_by_id(grace: Duration) -> Vec<Armed> {
             "a live child must not resolve exited_by_id on its first poll (grace {grace:?})"
         );
     }
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
     rx.try_iter().collect()
 }
 
@@ -529,7 +486,7 @@ async fn tokio_arms_the_extreme_instant_arm_at_accepts_without_panicking() {
 async fn exited_by_id_never_answers_before_its_deadline_on_a_paused_clock() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
-    let mut child = std_blocker();
+    let child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     let grace = Duration::from_secs(600);
     let t0 = ::tokio::time::Instant::now();
@@ -557,9 +514,6 @@ async fn exited_by_id_never_answers_before_its_deadline_on_a_paused_clock() {
         now <= t0 + grace + crate::wait::TOKIO_TIMER_ROUNDING_MARGIN,
         "exited_by_id answered later than the timer's own round-up after t0 + grace"
     );
-
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
 }
 
 /// An unbounded grace on the paused clock: virtual time can pass a year and `exited_by_id` is still
@@ -569,7 +523,7 @@ async fn exited_by_id_never_answers_before_its_deadline_on_a_paused_clock() {
 async fn exited_by_id_with_an_overflowing_grace_stays_pending_across_a_virtual_year() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _seam = super::armed_deadline_seam::install(tx);
-    let mut child = std_blocker();
+    let child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
 
     let mut fut = std::pin::pin!(exited_by_id(id, Some(Duration::MAX)));
@@ -579,9 +533,6 @@ async fn exited_by_id_with_an_overflowing_grace_stays_pending_across_a_virtual_y
         panic!("an unbounded exited_by_id answered {r:?}");
     }
     assert!(rx.try_recv().is_err(), "no timer may be armed for an unbounded grace");
-
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
 }
 
 // A timer that wins the first poll still answers from a final probe -----
@@ -595,7 +546,7 @@ async fn exited_by_id_with_an_overflowing_grace_stays_pending_across_a_virtual_y
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn exited_by_id_reports_an_exit_pending_when_the_timer_wins_the_first_poll() {
-    let mut child = std_blocker();
+    let mut child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     child.kill().expect("kill");
     // `kill` only signals: block (non-reaping) until the exit has really happened.
@@ -609,7 +560,6 @@ async fn exited_by_id_reports_an_exit_pending_when_the_timer_wins_the_first_poll
         .await
         .expect("exited_by_id");
     assert!(exited, "an exit that preceded the call must be reported, not Ok(false)");
-    child.wait().expect("reap");
 }
 
 /// Site 2: every holder of the marker's write end exited before the call.
@@ -737,7 +687,7 @@ fn to_real_clock_makes_a_deadline_inside_the_timer_margin_unbounded() {
 #[cfg(unix)]
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn exited_by_id_serves_its_full_grace_on_tokios_clock_after_an_advance() {
-    let mut child = std_blocker();
+    let child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     ::tokio::time::advance(Duration::from_secs(3600)).await;
     let t0 = ::tokio::time::Instant::now();
@@ -749,9 +699,6 @@ async fn exited_by_id_serves_its_full_grace_on_tokios_clock_after_an_advance() {
         ::tokio::time::Instant::now() >= t0 + grace,
         "exited_by_id answered before t0 + grace on tokio's clock"
     );
-
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
 }
 
 /// Site 3 reads tokio's clock for "already expired": with virtual time far ahead of the real

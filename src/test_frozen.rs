@@ -21,19 +21,17 @@ use windows::Win32::System::Threading::{
     THREAD_SUSPEND_RESUME,
 };
 
+use crate::test_child::{blocker_with_flags, StdChild};
 use crate::test_spawn::console_flags::Console;
 
 use crate::containment::windows::JobHandle;
 
 /// A blocker child created `CREATE_SUSPENDED` through std, with piped stdin; closing it lets the
 /// child exit once it runs.
-pub(crate) fn spawn_suspended_blocker() -> std::process::Child {
-    let mut cmd = std::process::Command::new(crate::test_child::BLOCKER_ARGV[0]);
-    cmd.args(&crate::test_child::BLOCKER_ARGV[1..])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    crate::test_spawn::spawn_with(&mut cmd, CREATE_SUSPENDED.0, Console::Hidden).expect("spawn a suspended blocker")
+pub(crate) fn spawn_suspended_blocker() -> StdChild {
+    blocker_with_flags(CREATE_SUSPENDED.0, Console::Hidden, |cmd| {
+        _ = cmd.stderr(std::process::Stdio::null());
+    })
 }
 
 /// What [`spawn_suspended_releasable`]'s child exits with when it runs to its end. No kill leaves
@@ -45,21 +43,20 @@ pub(crate) const RELEASED_EXIT_CODE: i32 = 77;
 /// then has to end without it: once released (see [`release`]) it reads its stdin to EOF and exits
 /// with [`RELEASED_EXIT_CODE`]. A kill that sent nothing fails [`assert_not_released`] instead of
 /// leaving a wait on a child that never runs.
-pub(crate) fn spawn_suspended_releasable() -> std::process::Child {
+pub(crate) fn spawn_suspended_releasable() -> StdChild {
     let mut cmd = std::process::Command::new("cmd.exe");
     cmd.args(["/d", "/c"])
         .arg(format!("more >nul & exit {RELEASED_EXIT_CODE}"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    crate::test_spawn::spawn_with(&mut cmd, CREATE_SUSPENDED.0, Console::Hidden)
-        .expect("spawn a suspended releasable child")
+    StdChild::spawn_with(&mut cmd, CREATE_SUSPENDED.0, Console::Hidden)
 }
 
 /// Lets a [`spawn_suspended_releasable`] child run to its end by itself: closes its stdin and
 /// resumes its initial thread. Call it after the kill under test. A killed child's thread is gone
 /// and the resume's outcome is ignored.
-pub(crate) fn release(child: &mut std::process::Child, thread: &InitialThread) {
+pub(crate) fn release(child: &mut StdChild, thread: &InitialThread) {
     drop(child.stdin.take());
     thread.resume_whatever_the_outcome();
 }

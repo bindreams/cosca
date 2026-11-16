@@ -4,21 +4,18 @@ use std::os::fd::AsRawFd as _;
 
 use super::{Event, Kqueue, Subscription, WaitOutcome};
 use crate::identity::ProcessId;
+use crate::test_child::blocker;
 
 #[skuld::test]
 fn poll_reports_nothing_while_the_process_lives() {
-    // Held for the fork itself — see `fdmarker_tests.rs`'s module docs.
-    // Alive until this test kills it: the arm-then-poll checks below need that.
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn blocker");
+    // Alive until the test ends: the arm-then-poll checks below need that.
+    let child = blocker();
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
     let kq = super::arm_proc_exit(id).expect("arm").expect("a live child arms");
     assert!(
         kq.poll().expect("poll").is_empty(),
         "no exit event yet must poll to nothing (spurious-readiness input)"
     );
-    child.kill().expect("cleanup");
-    child.wait().expect("reap");
 }
 
 /// `kevent_timeout` at the limit's edges, on the real `KEVENT_MAX_SECS`.
@@ -120,11 +117,6 @@ fn exited(seen: &[Event], pid: u32) -> bool {
         .any(|e| matches!(e, Event::Process { pid: p, exited: true, .. } if *p == pid))
 }
 
-fn spawn_blocker() -> std::process::Child {
-    crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn blocker")
-}
-
 fn no_events() -> Vec<Event> {
     Vec::new()
 }
@@ -162,7 +154,7 @@ fn a_readable_subscription_on_an_fd_that_is_not_open_is_refused_with_ebadf() {
 
 #[skuld::test]
 fn a_process_subscription_reports_the_exit() {
-    let mut child = spawn_blocker();
+    let mut child = blocker();
     let pid = child.id();
     let kq = Kqueue::new().expect("kqueue");
     let sub = Subscription::Process {
@@ -173,12 +165,11 @@ fn a_process_subscription_reports_the_exit() {
     kq.subscribe(sub).expect("subscribe");
     child.kill().expect("kill");
     poll_until(&kq, |seen| exited(seen, pid));
-    child.wait().expect("reap");
 }
 
 #[skuld::test]
 fn a_signals_subscription_reports_a_signal_before_the_exit() {
-    let mut child = spawn_blocker();
+    let child = blocker();
     let pid = child.id();
     let kq = Kqueue::new().expect("kqueue");
     let sub = Subscription::Process {
@@ -195,12 +186,11 @@ fn a_signals_subscription_reports_a_signal_before_the_exit() {
         seen.iter().any(|e| matches!(e, Event::Process { signalled: true, .. })),
         "{seen:?}"
     );
-    child.wait().expect("reap");
 }
 
 #[skuld::test]
 fn a_reap_subscription_reports_the_reap() {
-    let mut child = spawn_blocker();
+    let mut child = blocker();
     let pid = child.id();
     let kq = Kqueue::new().expect("kqueue");
     let sub = Subscription::Process {
@@ -327,7 +317,7 @@ fn unsubscribe_stops_the_reports() {
 #[skuld::test]
 fn unsubscribing_a_delivered_exit_fails_with_enoent() {
     let kq = Kqueue::new().expect("kqueue");
-    let mut child = spawn_blocker();
+    let mut child = blocker();
     let pid = child.id();
     let process = Subscription::Process {
         pid,
@@ -517,7 +507,7 @@ fn wait_terminates_under_a_frozen_clock() {
 
 #[skuld::test]
 fn wait_reports_a_process_exit() {
-    let mut child = spawn_blocker();
+    let mut child = blocker();
     let pid = child.id();
     let kq = Kqueue::new().expect("kqueue");
     kq.subscribe(Subscription::Process {
@@ -531,7 +521,6 @@ fn wait_reports_a_process_exit() {
     while !exited(&seen, pid) {
         seen.extend(wait_events(&kq));
     }
-    child.wait().expect("reap");
 }
 
 /// Pipes written in turn: `poll` returns their events in that order, unsorted.

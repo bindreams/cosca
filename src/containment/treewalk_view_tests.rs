@@ -13,7 +13,7 @@ use crate::identity::{
     ticks_host, ticks_id, unreadable, FakeKernel, HostKernel, Kernel, Key, ProcessId, UNREADABLE_STATUS_REASON,
 };
 use crate::test_child::{
-    live_exiting_member as live_member, open_live, release_unsignalled as release, stat_of_a_new_owner,
+    live_exiting_member as live_member, open_live, release_unsignalled as release, stat_of_a_new_owner, StdChild,
 };
 use crate::test_groups::{pidfd_group_signal, Group};
 use crate::Recursive;
@@ -497,13 +497,13 @@ fn every_walk_re_verifies_its_kill_through_its_kernel() {
 /// A live root `sh` that has announced its pid, its identity, and the identity of the `sh` it
 /// forked. That descendant prints `released` and exits at the EOF of its stdin, which the test
 /// holds the write end of; the root waits for it.
-pub(super) fn live_member_with_descendant() -> (std::process::Child, ProcessId, ProcessId) {
+pub(super) fn live_member_with_descendant() -> (StdChild, ProcessId, ProcessId) {
     let mut cmd = std::process::Command::new("/bin/sh");
     cmd.arg("-c")
         .arg("exec 3<&0; sh -c 'read _ignored; echo released' <&3 3<&- & echo $$; wait")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the root");
+    let mut child = StdChild::spawn(&mut cmd);
     crate::test_child::await_member_ready(&mut child);
     let root = ProcessId::of(child.id()).found().expect("the live root resolves");
     let descendants = root
@@ -517,7 +517,7 @@ pub(super) fn live_member_with_descendant() -> (std::process::Child, ProcessId, 
 
 /// The root was signalled with `signo` and the descendant was not: released by EOF, it still
 /// prints. A signalled descendant has nothing to print, and the read ends at EOF without it.
-fn release_with_a_signalled_root(who: &str, mut child: std::process::Child, signo: i32) {
+fn release_with_a_signalled_root(who: &str, mut child: StdChild, signo: i32) {
     use std::io::Read as _;
     use std::os::unix::process::ExitStatusExt as _;
     drop(child.stdin.take());
@@ -594,14 +594,14 @@ fn every_id_walk_re_verifies_a_descendants_kill_through_its_kernel() {
 
 /// A live root with one live descendant, and a kernel in which the descendant's identity cannot be
 /// read (`EMFILE` on its pidfd). The `/proc` path: the root's id is a `starttime` id.
-fn root_with_an_unreadable_descendant() -> (std::process::Child, ProcessId, ProcessId, FakeKernel<'static>) {
+fn root_with_an_unreadable_descendant() -> (StdChild, ProcessId, ProcessId, FakeKernel<'static>) {
     root_whose_descendants_pidfd_open_answers(rustix::io::Errno::MFILE)
 }
 
 /// [`root_with_an_unreadable_descendant`], where the descendant's `pidfd_open` answers `errno`.
 fn root_whose_descendants_pidfd_open_answers(
     errno: rustix::io::Errno,
-) -> (std::process::Child, ProcessId, ProcessId, FakeKernel<'static>) {
+) -> (StdChild, ProcessId, ProcessId, FakeKernel<'static>) {
     let (child, root, descendant) = live_member_with_descendant();
     let root = ticks_id(root.pid());
     let kernel = FakeKernel::over(&HostKernel)

@@ -4,14 +4,15 @@
 
 use std::io::Read;
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 
+use super::StdChild;
 use crate::send_log::Capture;
 
 /// A root (see [`blocked_tree_root`](super::blocked_tree_root), which defines what it reports) with
 /// a `cat` grandchild blocked on the stdin held in `grandchild_stdin`.
 pub(crate) struct BlockedTree {
-    pub(crate) root: Child,
+    pub(crate) root: StdChild,
     pub(crate) grandchild: u32,
     grandchild_stdin: ChildStdin,
     stdout: ChildStdout,
@@ -22,13 +23,12 @@ pub(crate) struct BlockedTree {
 /// The root shares its stdout with the grandchild, so that reaches EOF only when the whole tree is
 /// gone. The grandchild's stdin is kept out of `root.stdin`, so `Child::wait` does not release it.
 pub(crate) fn blocked_tree() -> BlockedTree {
-    let mut root = crate::test_spawn::spawn(
+    let mut root = StdChild::spawn(
         crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
             .args(super::blocked_tree_root::argv())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped()),
-    )
-    .expect("spawn the tree");
+    );
     let grandchild_stdin = root.stdin.take().expect("piped stdin");
     let mut stdout = root.stdout.take().expect("piped stdout");
     let mut line = Vec::new();
@@ -92,7 +92,7 @@ impl BlockedTree {
 /// that ignore `SIGTERM`. Its descendants exist once the readiness line is read. The `Process` is open
 /// on the root, and `members` are the descendants' identities.
 pub(crate) struct SurvivorTree {
-    pub(crate) child: Child,
+    pub(crate) child: StdChild,
     _stdout: ChildStdout,
     pub(crate) process: crate::Process,
     pub(crate) members: Vec<crate::identity::ProcessId>,
@@ -104,13 +104,12 @@ pub(crate) fn survivor_tree() -> SurvivorTree {
 
 /// [`survivor_tree`] over `argv`, which prints `r\n` once its descendants exist.
 pub(crate) fn tree_of(argv: &[&str]) -> SurvivorTree {
-    let mut child = crate::test_spawn::spawn(
+    let mut child = StdChild::spawn(
         Command::new(argv[0])
             .args(&argv[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped()),
-    )
-    .expect("spawn");
+    );
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut ready = [0u8; 2];
     stdout.read_exact(&mut ready).expect("the readiness line");

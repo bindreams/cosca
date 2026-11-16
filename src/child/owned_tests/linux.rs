@@ -1,6 +1,6 @@
 //! Linux-only `OwnedChild` test: the adopted pidfd never sits in a stdio slot.
 
-use super::fixtures::{identity_of, spawn_std_blocker};
+use super::fixtures::identity_of;
 use crate::child::owned::OwnedChild;
 
 // The pidfd's number =====
@@ -27,7 +27,7 @@ fn an_adopted_pidfd_never_sits_in_a_stdio_slot() {
         return;
     }
     let slot: i32 = std::env::var(SLOT_CASE_ENV).expect("case").parse().expect("slot");
-    let (child, stdin) = spawn_std_blocker();
+    let (child, stdin) = crate::test_child::blocker().into_parts();
     let id = identity_of(&child);
     // SAFETY: fd juggling on the standard descriptors of this throwaway re-exec; `saved` is above
     // 2, and the slot is restored below, as an application restoring its stdio would.
