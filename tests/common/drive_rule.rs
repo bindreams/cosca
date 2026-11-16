@@ -4,10 +4,10 @@
 //! does the same for a long-path-aware child.
 //!
 //! D1, the drive rule (`complete` plus `HostOs::drive_base`), completes `X:rest` onto, in order: the
-//! cwd E, when E is drive-absolute on drive X (`Base`); the child's first `=X:` entry, when it is
-//! fully qualified and an existing directory (`Value`); else `X:\` (`Root`). A row prints the
-//! predicted arm, the arm observed, the prediction, what the child reported, and whether they
-//! agree. It asserts only its preconditions: the child ran in the row's cwd and, where the row
+//! cwd E, when E is drive-absolute on drive X (`Base`); the child's first `=X:` entry, when it is the
+//! drive's directory by `DriveDirs`' rule (`Value`); else `X:\` (`Root`). A row prints the predicted
+//! arm, the arm observed, the prediction, what the child reported, and whether they agree, and
+//! asserts that they do, after its preconditions: the child ran in the row's cwd and, where the row
 //! says so, saw the row's `=X:` value.
 #![cfg(windows)]
 
@@ -45,6 +45,8 @@ pub enum Arm {
     Value(String),
     /// The name's drive root.
     Root,
+    /// This exact answer, for a row D1 does not predict.
+    Answer(String),
 }
 
 impl Arm {
@@ -53,6 +55,7 @@ impl Arm {
             Arm::Base => "Base",
             Arm::Value(_) => "Value",
             Arm::Root => "Root",
+            Arm::Answer(_) => "Answer",
         }
     }
 }
@@ -72,6 +75,9 @@ impl Row {
     /// D1's result for the name: its arm's directory joined with the name past its drive, `.` and
     /// `..` resolved without going above the root, trailing dots of a component dropped.
     fn predicted(&self) -> String {
+        if let Arm::Answer(answer) = &self.arm {
+            return answer.clone();
+        }
         let mut chars = self.name.chars();
         let drive = chars.next().expect("a drive-relative name");
         assert_eq!(chars.next(), Some(':'), "{}: a drive-relative name", self.key);
@@ -79,6 +85,7 @@ impl Row {
             Arm::Base => self.cwd.path().to_owned(),
             Arm::Value(value) => value.clone(),
             Arm::Root => format!(r"{drive}:\"),
+            Arm::Answer(_) => unreachable!("returned above"),
         };
         let (root, tail) = base.split_at(root_len(&base));
         let mut parts: Vec<&str> = tail.split('\\').filter(|c| !c.is_empty()).collect();
@@ -146,8 +153,8 @@ fn replace_ignore_case(s: &str, from: &str, to: &str) -> String {
 }
 
 /// [`run_in`] for M7: the child has no `longPathAware` manifest.
-pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
-    run_in("M7", crate::common::testbin(), false, row, render, drives);
+pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) -> String {
+    run_in("M7", crate::common::testbin(), false, row, render, drives)
 }
 
 /// Runs `row` and prints it as `<id> <key> <field>=<value>` lines, rendered by `render` and then
@@ -155,8 +162,9 @@ pub fn run(row: &Row, render: &Render, drives: &[(char, char)]) {
 /// lowercase letter, so two drives never print alike and a lowercase one stays visible.
 ///
 /// `bin` both launches and is the child (`with-env-block` starts its own image). The child's
-/// `RtlAreLongPathsEnabled` must equal `long_paths`.
-pub fn run_in(id: &str, bin: &str, long_paths: bool, row: &Row, render: &Render, drives: &[(char, char)]) {
+/// `RtlAreLongPathsEnabled` must equal `long_paths`. Returns the child's `GetFullPathNameW` of the
+/// name, as it reported it.
+pub fn run_in(id: &str, bin: &str, long_paths: bool, row: &Row, render: &Render, drives: &[(char, char)]) -> String {
     let mut cmd = Command::new(bin);
     cmd.arg("with-env-block");
     match &row.cwd {
@@ -237,6 +245,14 @@ pub fn run_in(id: &str, bin: &str, long_paths: bool, row: &Row, render: &Render,
     println!("{id} {k} var_units={}", units(var, var != "<unset>"));
     println!("{id} {k} full_units={}", units(full, !full.starts_with("err=")));
     println!("{id} {k} agrees={}", full == predicted);
+    assert_eq!(
+        full,
+        predicted,
+        "{id} {k}: the child's GetFullPathNameW of {:?} against the {} arm",
+        row.name,
+        row.arm.name()
+    );
+    full.to_owned()
 }
 
 /// Prints each `letter:` of `drives` as its placeholder, in one pass so a placeholder is never
@@ -270,9 +286,10 @@ fn render_drives(s: &str, drives: &[(char, char)]) -> String {
 
 /// The arm the child's result took, from its report: `Error` when `GetFullPathNameW` failed;
 /// `Base` when the name's drive is the drive of a drive-absolute `cwd` and `full` is under the cwd;
-/// `Value` when `var` is fully qualified, an existing directory, and `full` is under it or is it (a
-/// bare `X:`); `Root` when `full` is not under the cwd and starts with the name's drive root; else
-/// `Other`. Case-insensitive for ASCII only.
+/// `Value` when `var` is drive-absolute and an existing directory, and `full` is under it or is it
+/// (a bare `X:`); `Root` when `full` is not under the cwd and starts with the name's drive root; else
+/// `Other`. It classifies the answer's place and does not ask whether `DriveDirs`' rule accepts
+/// `var`: the row's arm is that claim. Case-insensitive for ASCII only.
 fn observed_arm(cwd: &str, name: &str, var: &str, full: &str) -> &'static str {
     let under = |path: &str, dir: &str| starts_with_ignore_case(path, &format!("{}\\", dir.trim_end_matches('\\')));
     if full.starts_with("err=") {
@@ -283,10 +300,10 @@ fn observed_arm(cwd: &str, name: &str, var: &str, full: &str) -> &'static str {
         Some(c) if c.is_ascii_alphabetic() && drive_root_len(cwd) > 0 => Some(c),
         _ => None,
     };
-    let fully_qualified = drive_root_len(var) > 0 || (var.starts_with(r"\\") && !var.starts_with(r"\\.\"));
+    let drive_absolute = drive_root_len(var) > 0;
     if cwd_drive.is_some_and(|c| c.eq_ignore_ascii_case(&name_drive)) && under(full, cwd) {
         "Base"
-    } else if fully_qualified && is_dir(var) && (under(full, var) || full.eq_ignore_ascii_case(var)) {
+    } else if drive_absolute && is_dir(var) && (under(full, var) || full.eq_ignore_ascii_case(var)) {
         "Value"
     } else if !under(full, cwd) && starts_with_ignore_case(full, &format!("{name_drive}:\\")) {
         "Root"

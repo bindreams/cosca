@@ -239,6 +239,42 @@ fn an_exe_named_like_a_batch_still_runs_on_the_raw_backend() {
 }
 
 #[cfg(windows)]
+/// A drive-relative `executable("X:tool")` on the working directory's own drive loads
+/// `<cwd>\tool.exe` and the child runs it; a name whose completed file is absent is `NotFound`, the
+/// filesystem's answer. The working directory is the command's `current_dir`, so no process state
+/// is changed.
+#[skuld::test]
+fn a_drive_relative_executable_is_completed_against_the_working_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(common::testbin(), dir.path().join("tool.exe")).unwrap();
+    let drive = dir.path().to_str().unwrap()[..2].to_owned();
+
+    let mut c = common::command(common::Console::Hidden);
+    c.executable(format!("{drive}tool"))
+        .commandline("pretend-name argv0-report")
+        .current_dir(dir.path())
+        .stdout(cosca::Stdio::pipe())
+        .unwrap();
+    let mut child = c.spawn().expect("a drive-relative name is completed, not refused");
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.stdout().unwrap(), &mut out).unwrap();
+    child.wait().unwrap();
+    let image = dir.path().join("tool.exe").to_string_lossy().to_lowercase();
+    assert!(out.to_lowercase().contains(&format!("image={image}")), "{out}");
+
+    let e = common::command(common::Console::Hidden)
+        .executable(format!("{drive}missing"))
+        .commandline("x")
+        .current_dir(dir.path())
+        .spawn()
+        .unwrap_err();
+    match e {
+        cosca::error::Error::Io(ref io) => assert_eq!(io.kind(), std::io::ErrorKind::NotFound, "{e:?}"),
+        other => panic!("an absent completed file is NotFound, got {other:?}"),
+    }
+}
+
+#[cfg(windows)]
 /// End-to-end proof of the gate's ORDERING, through `spawn()` rather than the gate alone. A token
 /// carrying an interior NUL must come back as the NUL whichever side of the batch rule it falls:
 ///

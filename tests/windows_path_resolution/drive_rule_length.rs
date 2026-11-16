@@ -9,7 +9,8 @@ use crate::test_groups::{path_probes, Group};
 /// M7b: an `=X:` value naming an existing directory, of exactly 259, 260 and 261 UTF-16 units, and
 /// one spelled `\\.\<T>:\…`, for the names `X:tool` and `X:` (X unmapped, printed `<X>:`). With the
 /// bare name the result is the value, so its length is the value's; with `X:tool` it is five units
-/// more, which tells a limit on the value from a limit on the result.
+/// more, which tells a limit on the value from a limit on the result. Asserted: a value of 259 units
+/// is used, one of 260 or 261 is ignored in both children, and so is the device-spelled one.
 ///
 /// Each row runs twice, in a child without a `longPathAware` manifest (`cosca_testbin`, lines
 /// labelled `M7b unaware`) and in one with it (`cosca_testbin_cwd`, `M7b aware`). Awareness takes
@@ -41,12 +42,12 @@ fn m7b_the_length_and_form_of_a_childs_drive_directory_value(#[fixture(path_prob
 
     let sized = |units: usize| dir_of_len(&format!(r"{d}\v{units}"), units);
     let values = [
-        ("units259", sized(259)),
-        ("units260", sized(260)),
-        ("units261", sized(261)),
-        ("device", format!(r"\\.\{e}")),
+        ("units259", sized(259), true),
+        ("units260", sized(260), false),
+        ("units261", sized(261), false),
+        ("device", format!(r"\\.\{e}"), false),
     ];
-    for (key, value) in &values {
+    for (key, value, used) in &values {
         for (suffix, name) in [("tool", format!("{q}tool")), ("bare", q.clone())] {
             for (half, bin, long_paths) in &children {
                 let row = Row {
@@ -54,7 +55,7 @@ fn m7b_the_length_and_form_of_a_childs_drive_directory_value(#[fixture(path_prob
                     cwd: Cwd::Given(e.clone()),
                     block: vec![sr.clone(), format!("={q}={value}")],
                     name: name.clone(),
-                    arm: Arm::Value(value.clone()),
+                    arm: if *used { Arm::Value(value.clone()) } else { Arm::Root },
                     var: Var::Is(Some(value.clone())),
                 };
                 run_in(&format!("M7b {half}"), bin, *long_paths, &row, &render, &drives);

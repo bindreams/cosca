@@ -53,16 +53,20 @@
 //!
 //! The operational test for a new rule is **could a different filesystem make this input
 //! succeed?** No — the refusal is a property of the string, not of the disk — means
-//! `InvalidInput`. Yes means `NotFound`. So `C:tool` (relative to a drive's own current
-//! directory, which cosca does not track) and `C:\` (a directory, whatever is on the disk) are
-//! refusals, while a missing `tool` or `C:\abs\missing.exe` is a miss. A refusal must be stated
+//! `InvalidInput`. Yes means `NotFound`. So `C:\` (a directory, whatever is on the disk) is a
+//! refusal, while a missing `tool` or `C:\abs\missing.exe` is a miss. A refusal must be stated
 //! explicitly and early, never left to fall out of candidate filtering: that reports the right
 //! kind by accident and changes it silently when the filtering does.
+//!
+//! A drive-relative name (`C:tool`) is completed onto a directory by [`drive_relative::drive_base`]
+//! and is from there exactly a relative located name: its candidates, error kinds and normalisation
+//! are that name's.
 
 use crate::error::Error;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod drive_relative;
 pub(crate) mod exact;
 pub(crate) mod join;
 #[cfg(unix)]
@@ -76,9 +80,9 @@ pub(crate) struct ResolveInput<'a> {
     /// The directory the CHILD will run in, the base a relative located name is read against.
     ///
     /// On the Windows grammar it must be fully qualified: the caller completes it as Win32 does
-    /// (`windows_raw::resolve::complete_on`), since that needs this process's cwd and a drive's own
-    /// directory, which this module does not read. On the POSIX grammar a relative base is probed
-    /// as given and `None` is the inherited directory: see `posix::lookup`.
+    /// (`windows_raw::resolve::complete_on`), since that needs this process's cwd, which this module
+    /// does not read. On the POSIX grammar a relative base is probed as given and `None` is the
+    /// inherited directory: see `posix::lookup`.
     ///
     /// On the Windows grammar `None` is allowed only for a name [`needs_base`] says needs none,
     /// which then reads nothing; for any other name it is a contract violation and panics.
@@ -164,6 +168,28 @@ pub(crate) struct ResolveInput<'a> {
     /// verbatim, one joined onto a non-verbatim cwd, and every candidate of a `PATH` or system
     /// directory search, whose directories are written verbatim by whoever set them. Windows only.
     pub normalise: &'a dyn Fn(&Path) -> std::io::Result<PathBuf>,
+    /// The CHILD's own current directory on a drive, by the drive's prefix (`E:`): the directory
+    /// `E:tool` is completed onto when `E:` is not the drive of [`cwd`](Self::cwd). `None` for none,
+    /// which completes onto the drive's root. The caller decides what counts as one (on Windows,
+    /// `windows_raw::resolve::DriveDirs`); an answer is fully qualified. Called lazily, at most
+    /// once, and only for a drive-relative name that names a file. Ignored on the POSIX grammar.
+    pub child_drive_dir: &'a dyn Fn(&OsStr) -> Option<OsString>,
+    /// Whether two drive prefixes (`C:`, any one unit and `:`) name one drive. The OS-bound caller
+    /// states the OS's comparison (on Windows, as `RtlGetFullPathName_U` upcases both units, the
+    /// table of an environment key: `é:` and `É:` are one).
+    /// Ignored on the POSIX grammar.
+    pub same_drive: &'a dyn Fn(&OsStr, &OsStr) -> bool,
+}
+
+#[cfg(test)]
+pub(crate) fn no_drive_dir(_: &OsStr) -> Option<OsString> {
+    None
+}
+
+/// [`ResolveInput::same_drive`] for a test that compares drives by ASCII case alone.
+#[cfg(test)]
+pub(crate) fn ascii_same_drive(a: &OsStr, b: &OsStr) -> bool {
+    a.eq_ignore_ascii_case(b)
 }
 
 /// [`ResolveInput::normalise`] for a test that probes every candidate as joined.
@@ -239,9 +265,7 @@ pub(crate) fn drive_len(bytes: &[u8]) -> Option<usize> {
 }
 
 /// `program` split after its drive (`C:`, any one unit and `:`), for a drive-absolute or
-/// drive-relative path; `None` for any other type. Windows only: its one consumer is the raw
-/// backend's completion.
-#[cfg(windows)]
+/// drive-relative path; `None` for any other type.
 pub(crate) fn split_drive(program: &OsStr) -> Option<(&OsStr, &OsStr)> {
     if !matches!(path_type(program), PathType::DriveAbsolute | PathType::DriveRelative) {
         return None;
@@ -273,13 +297,16 @@ pub(crate) fn classify(program: &OsStr, windows: bool) -> Shape {
 }
 
 /// Whether [`resolve`] reads [`ResolveInput::cwd`] for `program`: exactly for a relative located
-/// name. A bare name is searched, an absolute one is its own location, and a drive-relative or
-/// share-less UNC-shaped name is refused before any base is read. A caller that supplies the base
-/// itself asks this to know whether it must.
+/// name, and a drive-relative one. A bare name is searched, an absolute one is its own location,
+/// and a share-less UNC-shaped one is refused before any base is read. A caller that supplies the
+/// base itself asks this to know whether it must.
 pub(crate) fn needs_base(program: &OsStr, windows: bool) -> bool {
     if windows {
         return classify(program, true) == Shape::Located
-            && matches!(path_type(program), PathType::Rooted | PathType::Relative);
+            && matches!(
+                path_type(program),
+                PathType::Rooted | PathType::Relative | PathType::DriveRelative
+            );
     }
     classify(program, false) == Shape::Located && !is_absolute_name(program, false)
 }
@@ -339,9 +366,7 @@ fn has_ascii_drive(bytes: &[u8]) -> bool {
 }
 
 /// Whether `program` is DRIVE-RELATIVE: a drive prefix not followed by a separator, as in
-/// `C:tool` or `D:sub\x`. Such a name is relative to that drive's own current directory — state
-/// cosca does not track, so no filesystem can make it resolve. Refused, never searched; see the
-/// module doc's error-kind rule.
+/// `C:tool` or `D:sub\x`; see the module doc.
 fn is_drive_relative(program: &OsStr, windows: bool) -> bool {
     windows && path_type(program) == PathType::DriveRelative
 }
@@ -818,15 +843,20 @@ fn is_absence(e: &std::io::Error) -> bool {
 
 /// `candidate` under `dir`: on the Windows grammar by [`join::join`], the one Windows join, with
 /// the host's separator since the result is probed on this host; otherwise `PathBuf::join`. An empty
-/// `dir` is an absolute name's own location.
-fn join_candidate(dir: &Path, candidate: &OsStr, windows: bool) -> PathBuf {
+/// `dir` is an absolute name's own location. With `as_units` (a completed drive-relative name) the
+/// candidate is [`join::append`]ed as units, whatever it parses to.
+fn join_candidate(dir: &Path, candidate: &OsStr, windows: bool, as_units: bool) -> PathBuf {
     if !windows {
         return dir.join(candidate);
     }
     if dir.as_os_str().is_empty() {
         return PathBuf::from(candidate);
     }
-    PathBuf::from(join::join(dir.as_os_str(), candidate, std::path::MAIN_SEPARATOR_STR))
+    let sep = std::path::MAIN_SEPARATOR_STR;
+    if as_units {
+        return PathBuf::from(join::append(dir.as_os_str(), candidate, sep));
+    }
+    PathBuf::from(join::join(dir.as_os_str(), candidate, sep))
 }
 
 /// Whether a joined candidate is fully qualified, so no current directory, the process's or a
@@ -895,19 +925,6 @@ pub(crate) fn search(input: ResolveInput<'_>) -> Result<(PathBuf, Vec<PathBuf>),
     if names_no_file(name, input.windows) {
         return Err(names_no_file_refusal(input.program));
     }
-    // Refused EXPLICITLY, and before any search. `C:tool` did report `NotFound`, but only as a
-    // side effect of candidate filtering — `PathBuf::push` clears for a prefixed path, so every
-    // candidate failed the `is_absolute()` check below and the loop fell through to the trailing
-    // error. Nothing stated the intent, and the kind would have changed silently with that check.
-    if is_drive_relative(name, input.windows) {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "program is relative to a drive's own current directory, which cosca does not track: {:?}",
-                input.program
-            ),
-        )));
-    }
     // `PathBuf::join` would read such a name as rooted and keep the base's own drive, loading a
     // local file where Win32 reads a UNC path the caller named.
     if is_unc_without_share(name, input.windows) {
@@ -925,9 +942,29 @@ pub(crate) fn search(input: ResolveInput<'_>) -> Result<(PathBuf, Vec<PathBuf>),
     if input.windows && is_rooted_on_verbatim(name, input.cwd.map(Path::as_os_str)) {
         return Err(rooted_on_verbatim(input.program));
     }
+    // From here on a drive-relative name is the located name it completes to, based on
+    // `drive_base`'s directory.
+    let drive_based = if is_drive_relative(name, input.windows) {
+        let cwd = input
+            .cwd
+            .unwrap_or_else(|| unreachable!("{name:?} needs a base, and none was given"));
+        Some(drive_relative::drive_base(name, cwd, input.same_drive, |drive| {
+            Ok((input.child_drive_dir)(drive))
+        })?)
+    } else {
+        None
+    };
+    let (name, base) = match &drive_based {
+        Some((base, rest)) => (*rest, Some(base.path())),
+        None => (name, input.cwd),
+    };
     // Classify FIRST: the candidate filenames depend on the shape (a located name also tries the
     // exact name the caller wrote, a searched one does not — see `filename_candidates`).
-    let shape = classify(name, input.windows);
+    let shape = if drive_based.is_some() {
+        Shape::Located
+    } else {
+        classify(name, input.windows)
+    };
     let mut candidates = filename_candidates(name, input.windows, shape);
     debug_assert!(
         input.windows || !input.loadable_only,
@@ -946,8 +983,8 @@ pub(crate) fn search(input: ResolveInput<'_>) -> Result<(PathBuf, Vec<PathBuf>),
     let dirs: Vec<PathBuf> = match shape {
         // An absolute name is its own location: joining it onto any directory yields it again, so
         // no cwd is read for it.
-        Shape::Located if !needs_base(name, input.windows) => vec![PathBuf::new()],
-        Shape::Located => vec![match input.cwd {
+        Shape::Located if drive_based.is_none() && !needs_base(name, input.windows) => vec![PathBuf::new()],
+        Shape::Located => vec![match base {
             // Either reading counts: `std` knows only the host's grammar (and on Windows, only
             // letter drives), this module's classifier only the simulated one.
             Some(cwd) if accepted(cwd, input.windows) => cwd.to_path_buf(),
@@ -997,16 +1034,18 @@ pub(crate) fn search(input: ResolveInput<'_>) -> Result<(PathBuf, Vec<PathBuf>),
             let joined = if made_verbatim {
                 PathBuf::from(join::concat(dir.as_os_str(), candidate, "\\"))
             } else {
-                join_candidate(dir, candidate, input.windows)
+                // A drive-relative name is appended as units: `D:\x` after `C:` is a file in the
+                // directory, not drive D's root, which a join would make it.
+                join_candidate(dir, candidate, input.windows, drive_based.is_some())
             };
             // Only a fully qualified `joined` is accepted — this is what actually keeps a relative
             // or empty `PATH` element from resolving through the current directory (an empty
             // element means "the current directory", and a relative one such as `.`/`tools`
             // resolves against it just as surely). A drive-relative element (`C:` or `C:tools`)
-            // joins to a drive-relative path, which would resolve through drive C's own current
-            // directory, which cosca does not track. This single check is also what keeps the
-            // contract every backend relies on: the answer is always absolute, except a POSIX
-            // located name, which is read against the inherited directory and is no search.
+            // joins to a drive-relative path, which would resolve through a drive's own current
+            // directory. This single check is also what keeps the contract every backend relies on:
+            // the answer is always absolute, except a POSIX located name, which is read against the
+            // inherited directory and is no search.
             if !accepted(&joined, input.windows) && (input.windows || shape != Shape::Located) {
                 continue;
             }
@@ -1036,7 +1075,7 @@ pub(crate) fn search(input: ResolveInput<'_>) -> Result<(PathBuf, Vec<PathBuf>),
                     let later = if !input.windows && shape == Shape::BareName {
                         dirs[at + 1..]
                             .iter()
-                            .flat_map(|dir| candidates.iter().map(move |c| join_candidate(dir, c, false)))
+                            .flat_map(|dir| candidates.iter().map(move |c| join_candidate(dir, c, false, false)))
                             .filter(|joined| accepted(joined, false))
                             .collect()
                     } else {
@@ -1080,7 +1119,7 @@ pub(crate) fn search(input: ResolveInput<'_>) -> Result<(PathBuf, Vec<PathBuf>),
 
 #[cfg(test)]
 #[path = "resolve_tests.rs"]
-mod resolve_tests;
+pub(crate) mod resolve_tests;
 
 #[cfg(test)]
 #[path = "resolve_loadable_tests.rs"]

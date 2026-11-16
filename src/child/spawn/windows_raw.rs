@@ -185,7 +185,7 @@ pub(crate) fn spawn_raw(
             &app_name,
             &mut cmdline,
             &mut startup.si,
-            &spawn_env.block,
+            spawn_env.child.block(),
             &cwd_w,
             flags,
             *cmd.flags_request(),
@@ -283,11 +283,10 @@ pub(crate) fn build_fd_table(child_ends: &BTreeMap<Fd, ChildEnd>) -> Result<crt_
 pub(crate) struct SpawnEnv {
     /// This process's environment as read for this spawn.
     pub(crate) snapshot: env_snapshot::EnvSnapshot,
-    /// The child's `PATH`, which resolution searches.
-    pub(crate) path: Option<OsString>,
-    /// The child's finished block. Built here, so a refused environment (an embedded NUL) is
-    /// refused before the spawn mutates anything.
-    pub(crate) block: Vec<u16>,
+    /// The child's own environment, built here so a refused one (an embedded NUL) is refused before
+    /// the spawn mutates anything. A snapshot, so a read is the child's: the first entry of a name,
+    /// as `GetEnvironmentVariableW` reads it.
+    pub(crate) child: env_snapshot::EnvSnapshot,
     pub(crate) is_root: bool,
     pub(crate) marker_env: bool,
 }
@@ -310,9 +309,8 @@ pub(crate) fn spawn_env(cmd: &Command) -> Result<SpawnEnv, Error> {
         resolve::ChildEnv::capture(&snapshot, &ops)
     };
     Ok(SpawnEnv {
-        path: child_env.path().map(OsStr::to_os_string),
         snapshot,
-        block: child_env.into_block()?,
+        child: env_snapshot::EnvSnapshot::from_block(child_env.into_block()?),
         is_root,
         marker_env,
     })
@@ -404,8 +402,8 @@ pub(crate) fn target(cmd: &Command, env: &SpawnEnv) -> Result<Target, Error> {
 ///   `lpApplicationName` non-NULL. See [`app_name_wide`] for why NULL is a security boundary.
 ///
 /// No arm is batch-checked here: [`reject_batch_program`] has judged the token by the name Win32
-/// normalises it to, and resolution only prefixes a directory and may append `.exe`, so it never
-/// turns a name the gate accepted into a `.bat`/`.cmd`.
+/// normalises it to; resolution only adds a directory (and may append `.exe`), and Win32 normalises
+/// a verbatim result as it did the name, so it never turns an accepted name into a `.bat`/`.cmd`.
 pub(crate) fn target_with(
     cmd: &Command,
     env: &SpawnEnv,
@@ -428,9 +426,12 @@ pub(crate) fn target_with(
     // Each drive's own directory, probed at most once and shared likewise.
     let drive_dirs = resolve::DriveDirs::new(&env.snapshot);
     let cwd = resolve::effective_cwd(cmd.cwd(), &drive_dirs, &mut process_cwd)?;
-    let path = env.path.as_deref();
+    let path = env.child.var(OsStr::new("PATH"));
+    let path = path.as_deref();
+    let child_drive_dirs = drive_dirs.over(&env.child);
+    let child_drive_dir = |drive: &OsStr| child_drive_dirs.get(drive);
     let image = match cmd.executable_spec() {
-        Some(ExecutableSpec::Search(p)) => Some(resolve::resolve_executable(p, Some(&cwd), path)?),
+        Some(ExecutableSpec::Search(p)) => Some(resolve::resolve_executable(p, Some(&cwd), &child_drive_dir, path)?),
         // Against this process's cwd, not `current_dir`: that is what `CreateProcessW` completes a
         // relative `lpApplicationName` against (see `Command::raw_executable`), from the same read.
         Some(ExecutableSpec::Exact(p)) => {
@@ -438,7 +439,7 @@ pub(crate) fn target_with(
             Some(resolve::absolutise_exact_on(p, &mut process_cwd, drive_cwd)?.path)
         }
         None => program_token(cmd)
-            .map(|t| resolve::resolve_executable(&t, Some(&cwd), path))
+            .map(|t| resolve::resolve_executable(&t, Some(&cwd), &child_drive_dir, path))
             .transpose()?,
     };
     Ok(Target { image, cwd })

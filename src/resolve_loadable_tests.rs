@@ -23,6 +23,8 @@ fn go(program: &str, cwd: &Path, path_var: Option<&OsStr>, loadable_only: bool) 
         windows: true,
         loadable_only,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     })
 }
 

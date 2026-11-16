@@ -220,6 +220,24 @@ impl Command {
     /// A `current_dir` that is empty is [`std::io::ErrorKind::NotFound`]; one starting with two
     /// separators that names no share (`\\server`) is [`std::io::ErrorKind::InvalidInput`].
     ///
+    /// A drive-relative name such as `C:tool` is completed, then resolved as the pathed name it
+    /// becomes: no `PATH`, one directory. Any one character before the `:` is a drive (`1:tool` too).
+    /// On the drive of the directory the child runs in, the rest is appended to that directory; on
+    /// another, to the child's own `=C:` variable (as left by [`env`](Self::env), `env_remove` and
+    /// `env_clear`) when it is an existing directory written as a plain drive path (`D:\work`: not
+    /// UNC, verbatim or relative, not one Win32 would rewrite such as `D:/work` or `D:\work\.`, and
+    /// under 260 UTF-16 units, a limit a long-path-aware child has too), else to the drive's root.
+    /// This rule stands in for Win32's own test, which opens the value as a directory, so some
+    /// values come out differently. Among them, with `C:\` the root of the name's drive: for a bare
+    /// drive (`D:`), Win32 opens no file, while cosca completes onto `C:\`; for a trailing
+    /// separator on a directory that is no root (`D:\work\`), Win32 opens no file, while cosca
+    /// completes onto `D:\work`; a directory whose name ends in a dot or a space (`D:\work.`, which
+    /// only `\\?\` paths can create) Win32 uses, while cosca completes onto `C:\`; a directory this
+    /// process can see but is denied opening, such as `C:\Windows\System32\config` for a process
+    /// that is not elevated, Win32 passes over for `C:\`, while cosca completes onto it. Whatever
+    /// the value, cosca completes onto the directory it names or onto the root of the name's
+    /// drive, nowhere else. A missing file is [`std::io::ErrorKind::NotFound`].
+    ///
     /// The `.exe` rule is a property of names that get SEARCHED, not of files that get
     /// LOADED, so it differs by shape. If the name's final path component already ends
     /// in `.exe` or `.com` (case-insensitively — `TOOL.EXE` is left alone, never doubled
@@ -296,12 +314,9 @@ impl Command {
     ///
     /// - [`std::io::ErrorKind::InvalidInput`] — the name was NOT ACCEPTED. It was refused on
     ///   its shape and nothing was searched for, so no filesystem result is being reported.
-    ///   A drive-relative name such as `C:tool` is refused this way rather than loaded from
-    ///   the working directory: resolving it would need drive C's own current directory,
-    ///   which cosca does not track. As in Win32, any one character before the `:` is a drive,
-    ///   so `1:tool` is refused too. So is a name that names no file at all (`C:\`, `.`,
-    ///   `tools\dir\`, `\\server\share`), and one starting with two separators that names no
-    ///   share (`\\tool.exe`), which Win32 reads as a UNC path rather than a file on this drive.
+    ///   A name that names no file at all (`C:`, `C:\`, `.`, `tools\dir\`, `\\server\share`)
+    ///   is refused this way, and so is one starting with two separators that names no share
+    ///   (`\\tool.exe`), which Win32 reads as a UNC path rather than a file on this drive.
     ///   On Windows, a rooted name (`\bin\tool.exe`) resolved against a verbatim (`\\?\`)
     ///   working directory is refused too: Win32 completes it to `\\bin\tool.exe`, off that
     ///   directory's volume (measured). So is a relative one whose `..` Win32 completes past a
@@ -364,9 +379,10 @@ impl Command {
     /// The divergence is inherited from the platform primitives, not chosen here.
     ///
     /// A drive-relative name (`C:tool`) is honoured rather than refused: it names a file relative
-    /// to drive C's own current directory, which Windows tracks and this crate does not.
-    /// [`executable`](Self::executable) fails such a name closed for exactly that reason; here
-    /// the platform answers it.
+    /// to drive C's own current directory: this process's working directory when that is on C,
+    /// else this process's own `=C:` variable by the rule [`executable`](Self::executable) states,
+    /// including where that rule differs from Win32; [`executable`](Self::executable) reads the
+    /// child's.
     ///
     /// A name that names no file — empty, separator-terminated, or a final `.`/`..` — is refused
     /// with [`std::io::ErrorKind::InvalidInput`] on every platform. On Windows so is a rooted name

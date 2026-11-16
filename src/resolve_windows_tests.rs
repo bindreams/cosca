@@ -83,6 +83,8 @@ fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> 
         windows: true,
         loadable_only,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     })
 }
 
@@ -616,6 +618,8 @@ fn an_undeterminable_located_candidate_names_no_entry() {
         windows: true,
         loadable_only: true,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     });
     match found {
         Err(e @ Error::Io(_)) => {
