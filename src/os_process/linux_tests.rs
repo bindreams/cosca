@@ -237,10 +237,7 @@ fn try_observe_of_a_zombie_only_its_tracer_sees_is_recheck(#[fixture(tracer_grou
     use crate::test_child::reaped_elsewhere::kill_own_child;
     use crate::test_support::foreign_tracer::{self, REAP};
 
-    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
-    foreign_tracer::allow_any_tracer(&mut cmd);
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
-    let _stdin = child.stdin.take().expect("piped stdin");
+    let (child, _stdin) = crate::test_child::blocker_with(foreign_tracer::allow_any_tracer).into_parts();
     let id = ProcessId::of(child.id()).found().expect("identity");
     let os = adopt_std(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     let mut tracer = foreign_tracer::spawn_helper(id.pid());
@@ -305,8 +302,7 @@ fn a_pidless_linux_child_is_signalled_and_reaped_through_its_pidfd() {
     use crate::error::ChildFate;
     use crate::os_process::linux::LinuxProcess;
 
-    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
-    let child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
+    let child = crate::test_child::blocker().into_inner();
     let id = ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");
@@ -338,8 +334,7 @@ fn a_signal_to_a_reaped_pidless_linux_child_is_named_without_a_number() {
     use crate::os_process::OsProcess as _;
 
     crate::log_capture::install();
-    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
+    let mut child = crate::test_child::blocker();
     let id = ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");
@@ -368,9 +363,7 @@ fn adopting_a_pidfd_that_is_not_our_child_is_refused() {
     use crate::identity::{FakeKernel, HostKernel};
     use crate::os_process::child::adopt_pidfd;
 
-    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
-    let stdin = child.stdin.take().expect("piped stdin");
+    let child = crate::test_child::blocker();
     let id = ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");
@@ -386,10 +379,6 @@ fn adopting_a_pidfd_that_is_not_our_child_is_refused() {
         panic!("a pidfd that is not our child is an io error: {error:?}")
     };
     assert_eq!(e.raw_os_error(), Some(libc::ECHILD), "{e:?}");
-    drop(stdin);
-    child
-        .wait()
-        .expect("the child was never adopted, so it is still ours to reap");
 }
 
 /// A child that has exited and not been reaped is still ours: it is adopted, and left unreaped.
@@ -400,8 +389,7 @@ fn adopting_an_exited_unreaped_child_succeeds_and_reaps_nothing() {
     use crate::os_process::child::adopt_std;
     use crate::wait::exit_only::Reap;
 
-    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
+    let mut child = crate::test_child::blocker().into_inner();
     drop(child.stdin.take());
     let id = ProcessId::of(child.id())
         .found()

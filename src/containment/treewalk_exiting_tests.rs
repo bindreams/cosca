@@ -8,7 +8,7 @@ use std::os::unix::process::ExitStatusExt as _;
 
 use crate::containment::dispatch::{TreeKillOutcome, TreeKilled};
 use crate::identity::{FakeKernel, HostKernel, ProcessId};
-use crate::test_child::{live_exiting_member as live_member, release_unsignalled as release};
+use crate::test_child::{live_exiting_member as live_member, release_unsignalled as release, StdChild};
 
 use super::treewalk_view_tests::{assert_unassessable_naming, live_member_with_descendant, walks};
 
@@ -33,7 +33,7 @@ pub(super) fn with_exiting_root(kernel: FakeKernel<'static>, root: ProcessId) ->
 /// `signo`. The stdin is released first, so a descendant that was not signalled prints and fails the
 /// assertion instead of blocking the read.
 #[track_caller]
-fn assert_both_signalled(who: &str, mut child: std::process::Child, signo: i32) {
+fn assert_both_signalled(who: &str, mut child: StdChild, signo: i32) {
     drop(child.stdin.take());
     let mut printed = String::new();
     child
@@ -196,7 +196,7 @@ fn a_kill_of_a_root_that_has_begun_to_exit_with_only_unread_candidates_says_so()
 
 /// The root of `live_member_with_descendant`, killed, and the descendant released by the EOF of its
 /// stdin: it prints, so it was not signalled.
-fn release_candidate(mut child: std::process::Child) {
+fn release_candidate(mut child: StdChild) {
     use std::os::unix::process::ExitStatusExt as _;
     let mut printed = String::new();
     drop(child.stdin.take());

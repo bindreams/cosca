@@ -5,7 +5,7 @@ use super::group_tests::failed;
 use super::members;
 use crate::identity::HostKernel;
 use crate::test_child::namespaces as ns;
-use crate::test_child::{await_member_ready, fixture_path, member_command};
+use crate::test_child::{await_member_ready, fixture_path, member_command, StdChild};
 use crate::test_groups::{namespaces, Group};
 
 /// pid 1 of a new pid namespace whose `/proc` is still the outer one: its listing names the
@@ -47,7 +47,7 @@ fn fixture_group_stat_overmount() {
     if !ns::is_child() {
         return;
     }
-    let (mut child, pid, _scratch) = overmounted_member();
+    let (_child, pid, _scratch) = overmounted_member();
 
     let err = failed(
         members(&HostKernel, pid as i32),
@@ -55,16 +55,13 @@ fn fixture_group_stat_overmount() {
     );
     let text = crate::error::said(&err);
     assert!(text.contains("mount"), "{text}");
-
-    _ = child.kill();
-    _ = child.wait();
 }
 
 /// A group member, in a private mount namespace, with a file mounted over its `stat`, and the scratch
 /// directory that holds the file.
-fn overmounted_member() -> (std::process::Child, u32, tempfile::TempDir) {
+fn overmounted_member() -> (StdChild, u32, tempfile::TempDir) {
     ns::enter_private_mount_ns();
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn the member");
+    let mut child = StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let pid = child.id();
     let scratch = tempfile::tempdir().expect("tempdir");

@@ -4,7 +4,7 @@
 
 use std::io::Read as _;
 
-use crate::test_child::Console;
+use crate::test_child::{Console, StdChild};
 
 use crate::send_log::{Capture, GroupStep, Route};
 use crate::test_child::member::{await_started, Member, RELEASE_FD, ROOT_WITH_A_MEMBER};
@@ -175,7 +175,7 @@ pub(crate) struct EmptiedGroup {
     stdin: crate::PipeWriter,
     stdout: crate::PipeReader,
     stderr: crate::PipeReader,
-    other: std::process::Child,
+    other: StdChild,
 }
 
 impl EmptiedGroup {
@@ -203,7 +203,7 @@ impl EmptiedGroup {
         let pid = root.pid();
         kill_own_child(pid);
         reap_behind(pid);
-        let mut other = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn the other group's leader");
+        let mut other = StdChild::spawn(&mut member_command(0));
         await_member_ready(&mut other);
         EmptiedGroup {
             root,
@@ -249,7 +249,7 @@ pub(crate) struct Armed {
     guard: Box<dyn std::any::Any>,
     stdin: crate::PipeWriter,
     stderr: crate::PipeReader,
-    other: std::process::Child,
+    other: StdChild,
 }
 
 impl Armed {
@@ -261,10 +261,11 @@ impl Armed {
             guard,
             stdin,
             mut stderr,
-            mut other,
+            other,
         } = self;
         drop(guard);
         // It exits at its stdin's EOF, so a signal that ended it shows in its status.
+        let mut other = other;
         drop(other.stdin.take());
         let status = other.wait().expect("reap the other group's leader");
         drop(stdin);

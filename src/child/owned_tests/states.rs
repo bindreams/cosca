@@ -759,7 +759,7 @@ fn adopt_never_reaps() {
 #[cfg(unix)]
 #[skuld::test]
 fn adopt_never_reaps_a_zombie() {
-    let (child, stdin) = super::fixtures::spawn_std_blocker();
+    let (child, stdin) = crate::test_child::blocker().into_parts();
     let id = super::fixtures::identity_of(&child);
     drop(stdin);
     // The exit, seen without consuming it.

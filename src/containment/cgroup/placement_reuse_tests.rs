@@ -21,8 +21,7 @@ fn silent_leaf(dir: &tempfile::TempDir) -> CgroupLeaf {
 /// its pidfd and reaps it itself, behind the leaf's back. The forgotten `Child` keeps the write end
 /// of its stdin open, so only that kill ends it.
 fn spawn_blocker() -> u32 {
-    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
-    let child = crate::test_spawn::spawn(&mut cmd).expect("spawn the child");
+    let child = crate::test_child::blocker().into_inner();
     let pid = child.id();
     std::mem::forget(child);
     pid

@@ -1093,14 +1093,13 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
 
     // The std `Child` holds the root's process handle until it is dropped, at the end of the row.
     let more = crate::test_child::windows_more();
-    let mut shell = crate::test_spawn::spawn(
+    let mut shell = crate::test_child::StdChild::spawn(
         std::process::Command::new("cmd.exe")
             .arg("/c")
             .arg(&more)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped()),
-    )
-    .expect("spawn the root");
+    );
     let root = ProcessId::of(shell.id()).found().expect("the live root resolves");
     // `more` inherits the root's pipes. It echoes a line as it reads it, so the first byte read
     // back says it exists. Both pipes stay open: `std`'s `wait` would close the stdin, which ends
@@ -1173,14 +1172,13 @@ fn a_walk_kills_each_descendant_through_its_kernel_on_windows() {
     use crate::Recursive;
 
     let more = crate::test_child::windows_more();
-    let mut shell = crate::test_spawn::spawn(
+    let mut shell = crate::test_child::StdChild::spawn(
         std::process::Command::new("cmd.exe")
             .arg("/c")
             .arg(&more)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped()),
-    )
-    .expect("spawn the root");
+    );
     let root = ProcessId::of(shell.id()).found().expect("the live root resolves");
     // The first byte read back says `more` exists; both pipes stay open so it keeps running.
     let mut stdin = shell.stdin.take().expect("piped stdin");
@@ -1197,9 +1195,6 @@ fn a_walk_kills_each_descendant_through_its_kernel_on_windows() {
     let outcome = super::hard_kill(&kernel, root, &super::ByIdentity::new(&HostKernel, root))
         .outcome()
         .into_result();
-    // The rows sent nothing: end the fixture before asserting.
-    drop(stdin);
-    shell.wait().expect("the root's exit is recorded");
 
     outcome.expect("every descendant's kill was answered");
     assert!(
@@ -1555,14 +1550,7 @@ fn kill_by_identity_reports_a_member_that_exits_before_the_terminate_as_gone() {
 #[skuld::test]
 fn kill_by_identity_reports_a_member_that_is_exiting_but_not_signalled_as_gone() {
     use std::os::windows::io::AsRawHandle;
-    let mut child = crate::test_spawn::spawn(
-        std::process::Command::new("cmd")
-            .args(["/C", "more"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()),
-    )
-    .expect("spawn cmd /C more");
+    let child = crate::test_child::spawn_more_blocker();
     let id = crate::identity::windows_identity_from_handle_result(
         windows::Win32::Foundation::HANDLE(child.as_raw_handle()),
         child.id(),
@@ -1570,9 +1558,6 @@ fn kill_by_identity_reports_a_member_that_is_exiting_but_not_signalled_as_gone()
     .expect("the owned handle always yields an identity");
     let kernel = crate::identity::refusing_the_next_terminate();
     let outcome = super::kill_by_identity(&kernel, id);
-    // The row sent no terminate: end the fixture before asserting.
-    child.kill().expect("end the fixture");
-    child.wait().expect("reap the fixture");
 
     assert!(
         kernel.all_rows_taken(),

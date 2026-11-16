@@ -127,15 +127,14 @@ fn kill_group_dooms_the_group_before_it_is_listed() {
     use std::os::unix::process::CommandExt;
     use std::os::unix::process::ExitStatusExt as _;
 
-    let mut child = crate::test_spawn::spawn(
+    let mut child = crate::test_child::StdChild::spawn(
         std::process::Command::new("sh")
             .arg("-c")
             .arg("while read x; do (echo spawned; exec cat) & done")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .process_group(0),
-    )
-    .expect("spawn the leader");
+    );
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
     let pgid = child.id() as i32;

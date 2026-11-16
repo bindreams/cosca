@@ -100,19 +100,18 @@ fn the_toolhelp_snapshot_lists_unrelated_processes_in_creation_order() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let script = dir.path().join("a.bat");
     std::fs::write(&script, "@echo off\r\nset /p go=\r\ncmd /C \"echo ready&more\"\r\n").expect("write a.bat");
-    let mut a = crate::test_spawn::spawn(
+    let mut a = crate::test_child::StdChild::spawn(
         std::process::Command::new("cmd")
             .arg("/C")
             .arg(&script)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null()),
-    )
-    .expect("spawn A");
+    );
     let mut a_stdin = a.stdin.take().expect("A's stdin");
     let mut a_stdout = BufReader::new(a.stdout.take().expect("A's stdout"));
 
-    let mut b = crate::test_child::spawn_more_blocker();
+    let b = crate::test_child::spawn_more_blocker();
 
     a_stdin.write_all(b"go\r\n").expect("send A its go-ahead");
     a_stdin.flush().expect("flush A's stdin");
@@ -142,9 +141,4 @@ fn the_toolhelp_snapshot_lists_unrelated_processes_in_creation_order() {
             "B (row {b_row}, spawned before A1) is listed after A1 (row {a1_row}, A's child)"
         );
     }
-
-    drop(a_stdin);
-    drop(b.stdin.take());
-    a.wait().expect("reap A");
-    b.wait().expect("reap B");
 }

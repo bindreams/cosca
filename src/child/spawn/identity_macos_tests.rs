@@ -532,20 +532,14 @@ fn macos_fdmarker_attach_reads_nothing_by_pid() {
 // `owned_tests` and `held_teardown_tests` state through their rows; what is left here is what the
 // spawn decides.
 
-/// A `std` blocker, its stdin writer, and its unique id.
-pub(crate) fn std_blocker_with_unique() -> (std::process::Child, std::process::ChildStdin, u64) {
-    let mut cmd = std::process::Command::new(crate::test_child::BLOCKER_ARGV[0]);
-    cmd.args(&crate::test_child::BLOCKER_ARGV[1..])
-        .stdin(std::process::Stdio::piped());
-    let guard = crate::child::spawn::spawn_lock();
-    #[allow(clippy::disallowed_methods, reason = "spawn_lock is held by `guard`")]
-    let mut child = cmd.spawn().expect("spawn the blocker");
-    drop(guard);
-    let stdin = child.stdin.take().expect("piped stdin");
+/// A `std` blocker and its unique id. A test that hands the child to the code under test takes it
+/// out of its guard with `StdChild::into_parts`.
+pub(crate) fn std_blocker_with_unique() -> (crate::test_child::StdChild, u64) {
+    let child = crate::test_child::blocker();
     let Ok(Some(unique)) = crate::signal::read_identity(&HostKernel, child.id()) else {
         panic!("the blocker's unique id must be readable")
     };
-    (child, stdin, unique)
+    (child, unique)
 }
 
 /// Whether `pid` is still an exit record this process can reap (`ECHILD` once something took it).

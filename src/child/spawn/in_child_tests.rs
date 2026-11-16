@@ -68,7 +68,7 @@ fn every_in_child_step_takes_effect() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
     steps.register(&mut cmd);
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn");
+    let mut child = crate::test_child::StdChild::spawn(&mut cmd);
     // The parent's copies: each pipe reads EOF once the child is done with its own.
     drop(cmd);
 

@@ -104,15 +104,9 @@ pub(crate) fn testbin(name: &str) -> std::path::PathBuf {
 // Blocker fixtures =====
 
 mod std_child;
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(unused_imports, reason = "only Linux tests name the guard's type")
-)]
+#[cfg(windows)]
+pub(crate) use std_child::blocker_with_flags;
 pub(crate) use std_child::StdChild;
-#[cfg_attr(
-    windows,
-    allow(unused_imports, reason = "its held-child callers are not converted yet")
-)]
 pub(crate) use std_child::{blocker, blocker_with};
 
 /// The argv of a child that does nothing until its stdin reaches EOF or it is killed: `cat`, or
@@ -122,10 +116,13 @@ pub(crate) use std_child::{blocker, blocker_with};
 /// child on its own and let a mutant that skips the kill under test pass for the wrong reason.
 /// Stdin is what decides the child's fate, so the writer's lifetime is the fixture's lifetime:
 ///
-/// - [`held_std_blocker`], [`held_contained_blocker`] and [`held_contained_blocker_async`]: the
-///   caller holds the write end and must keep it for exactly as long as the child must stay
-///   alive. Dropping it (or `std::process::Child::wait()`, which closes the piped stdin before
-///   it waits) is a deliberate EOF release.
+/// - [`held_contained_blocker`] and [`held_contained_blocker_async`]: the caller holds the write
+///   end and must keep it for exactly as long as the child must stay alive. Dropping it is a
+///   deliberate EOF release.
+/// - [`blocker`]: the guard's `Child` holds the write end, so the child stays alive until the
+///   guard is dropped. A test that must hold it apart takes it with `stdin.take()` (or
+///   [`StdChild::into_parts`]); dropping that, or `Child::wait()`, which closes a piped stdin
+///   before it waits, is a deliberate EOF release.
 ///
 /// A `cat` backgrounded inside an `sh -c` script gets `/dev/null` as stdin (POSIX, for a
 /// non-interactive shell) unless it is redirected explicitly, and would exit at once. Write it
@@ -241,17 +238,6 @@ pub(crate) fn held_writer_stdin() -> (crate::stdio::Stdio, crate::PipeWriter) {
     (crate::stdio::Stdio::from_file(file), writer.into())
 }
 
-/// A [`BLOCKER_ARGV`] `std::process::Command` with piped stdin (held by the spawned `Child`'s
-/// own `stdin` field) and the given stdout. The caller spawns it under `spawn_lock()`. `more` echoes,
-/// so a Windows caller nulls the stdout.
-pub(crate) fn held_std_blocker(stdout: std::process::Stdio) -> std::process::Command {
-    let mut cmd = std::process::Command::new(BLOCKER_ARGV[0]);
-    cmd.args(&BLOCKER_ARGV[1..])
-        .stdin(std::process::Stdio::piped())
-        .stdout(stdout);
-    cmd
-}
-
 /// `.contain()`, except that on Linux it asks for [`ContainMode::Session`](crate::ContainMode::Session)
 /// (a process group, torn down with `killpg`), which never looks for a cgroup. `.contain()` makes a
 /// cgroup leaf where the host offers a delegated cgroup and gives a process group where it does not,
@@ -308,21 +294,22 @@ pub(crate) fn live_blocker() -> (crate::Child, crate::PipeWriter, crate::identit
 }
 
 /// `cmd /C more`, blocked reading its own piped stdin until EOF: a blocker every Windows host has.
+/// Not a [`blocker`]: the job tests count on `cmd` starting `more.com` and a `conhost.exe` into its
+/// job.
 #[cfg(windows)]
-pub(crate) fn spawn_more_blocker() -> std::process::Child {
-    crate::test_spawn::spawn(
+pub(crate) fn spawn_more_blocker() -> StdChild {
+    StdChild::spawn(
         std::process::Command::new("cmd")
             .args(["/C", "more"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
     )
-    .expect("spawn cmd /C more")
 }
 
 /// A live job with one still-running member: [`spawn_more_blocker`], assigned to a new job.
 #[cfg(windows)]
-pub(crate) fn spawn_job_member() -> (std::process::Child, crate::containment::windows::JobHandle) {
+pub(crate) fn spawn_job_member() -> (StdChild, crate::containment::windows::JobHandle) {
     use std::os::windows::io::AsRawHandle as _;
 
     let child = spawn_more_blocker();
@@ -333,18 +320,8 @@ pub(crate) fn spawn_job_member() -> (std::process::Child, crate::containment::wi
 /// The one member of a [`spawn_job_gui_member`] job, and the control socket that keeps it running.
 #[cfg(all(windows, feature = "tokio"))]
 pub(crate) struct GuiMember {
-    child: std::process::Child,
-    sock: std::net::TcpStream,
-}
-
-#[cfg(all(windows, feature = "tokio"))]
-impl GuiMember {
-    /// Ends the member (its socket closes) and reaps it.
-    pub(crate) fn exit(self) {
-        let GuiMember { mut child, sock } = self;
-        drop(sock);
-        child.wait().expect("wait for the GUI member to exit");
-    }
+    _child: StdChild,
+    _sock: std::net::TcpStream,
 }
 
 /// A live job whose only member is the GUI-subsystem testbin, after its handshake. Unlike
@@ -363,22 +340,26 @@ pub(crate) fn spawn_job_gui_member() -> (GuiMember, crate::containment::windows:
         .stderr(std::process::Stdio::null());
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     cmd.env(ack::ACK_ENV, "1");
-    let child = crate::test_spawn::spawn(&mut cmd).expect("spawn the GUI-subsystem member");
+    let child = StdChild::spawn(&mut cmd);
     let job = crate::containment::windows::assign_to_kill_on_close_job(child.as_raw_handle()).expect("assign to job");
     let id = crate::identity::ProcessId::of(child.id())
         .found()
         .expect("the member's identity");
     let sock = ctrl_break::accept_tagged(&listener, id, b'G');
-    (GuiMember { child, sock }, job)
+    (
+        GuiMember {
+            _child: child,
+            _sock: sock,
+        },
+        job,
+    )
 }
 
 /// A live job with `count` (at least one) running members, each a [`spawn_more_blocker`]:
 /// [`spawn_job_member`]'s, and the rest assigned to the same job. A test that ends some holds the
 /// others alive through their stdin.
 #[cfg(windows)]
-pub(crate) fn spawn_job_with_members(
-    count: usize,
-) -> (Vec<std::process::Child>, crate::containment::windows::JobHandle) {
+pub(crate) fn spawn_job_with_members(count: usize) -> (Vec<StdChild>, crate::containment::windows::JobHandle) {
     use std::os::windows::io::AsRawHandle as _;
 
     let (first, job) = spawn_job_member();
@@ -394,11 +375,7 @@ pub(crate) fn spawn_job_with_members(
 
 /// [`spawn_job_with_members`] for two.
 #[cfg(windows)]
-pub(crate) fn spawn_job_with_two_members() -> (
-    std::process::Child,
-    std::process::Child,
-    crate::containment::windows::JobHandle,
-) {
+pub(crate) fn spawn_job_with_two_members() -> (StdChild, StdChild, crate::containment::windows::JobHandle) {
     let (mut members, job) = spawn_job_with_members(2);
     let second = members.pop().expect("two members");
     let first = members.pop().expect("two members");
@@ -407,7 +384,7 @@ pub(crate) fn spawn_job_with_two_members() -> (
 
 /// End a [`spawn_job_member`]'s member: EOF on its stdin, and reaped once it has exited.
 #[cfg(windows)]
-pub(crate) fn let_member_exit(mut child: std::process::Child) {
+pub(crate) fn let_member_exit(mut child: StdChild) {
     drop(child.stdin.take());
     child.wait().expect("wait for cmd /C more to exit");
 }
@@ -708,8 +685,8 @@ pub(crate) fn open_live(id: crate::identity::ProcessId) -> crate::Process {
 
 /// A live [`exiting_member_command`] child that has announced itself, and its identity.
 #[cfg(unix)]
-pub(crate) fn live_exiting_member() -> (std::process::Child, crate::identity::ProcessId) {
-    let mut child = crate::test_spawn::spawn(&mut exiting_member_command()).expect("spawn the member");
+pub(crate) fn live_exiting_member() -> (StdChild, crate::identity::ProcessId) {
+    let mut child = StdChild::spawn(&mut exiting_member_command());
     await_member_ready(&mut child);
     let id = crate::identity::ProcessId::of(child.id())
         .found()
@@ -720,7 +697,7 @@ pub(crate) fn live_exiting_member() -> (std::process::Child, crate::identity::Pr
 /// End a [`live_exiting_member`] by EOF and assert it was never signalled: only a clean exit
 /// proves no `SIGKILL`/`SIGTERM` arrived, which a `try_wait` straight after a signal cannot.
 #[cfg(unix)]
-pub(crate) fn release_unsignalled(mut child: std::process::Child) {
+pub(crate) fn release_unsignalled(mut child: StdChild) {
     use std::os::unix::process::ExitStatusExt;
     drop(child.stdin.take());
     let status = child.wait().expect("reap the member");
@@ -745,14 +722,13 @@ pub(crate) fn stat_of_a_new_owner(pid: u32) -> Vec<u8> {
 /// [`BLOCKER_ARGV`] child: its tests tell a kill from a release by the match it echoes, not by the
 /// exit code.
 #[cfg(windows)]
-pub(crate) fn live_findstr_blocker() -> (std::process::Child, crate::identity::ProcessId) {
-    let child = crate::test_spawn::spawn(
+pub(crate) fn live_findstr_blocker() -> (StdChild, crate::identity::ProcessId) {
+    let child = StdChild::spawn(
         std::process::Command::new("findstr")
             .arg("x")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped()),
-    )
-    .expect("spawn the blocker");
+    );
     let id = crate::identity::ProcessId::of(child.id())
         .found()
         .expect("the live blocker resolves");
@@ -762,7 +738,7 @@ pub(crate) fn live_findstr_blocker() -> (std::process::Child, crate::identity::P
 /// Finish a [`live_findstr_blocker`] and assert it was never terminated: fed a matching line and
 /// EOF it exits `0` and echoes the match, and `TerminateProcess` gives neither.
 #[cfg(windows)]
-pub(crate) fn release_findstr_unterminated(mut child: std::process::Child) {
+pub(crate) fn release_findstr_unterminated(mut child: StdChild) {
     use std::io::{Read as _, Write as _};
     let mut stdin = child.stdin.take().expect("piped stdin");
     stdin.write_all(b"x\r\n").expect("write to the blocker");

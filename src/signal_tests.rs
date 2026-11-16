@@ -1,17 +1,12 @@
 //! The signal helpers: what each answers for a live, gone and unverifiable child, and that a
 //! send is recorded only when the OS was asked.
 
-use std::process::{Child, ChildStdin};
+#[cfg(target_os = "linux")]
+use std::process::Child;
 
 use crate::send_log::{Capture, Via};
 use crate::signal::{Sent, Sig};
-
-fn spawn() -> (Child, ChildStdin) {
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn the blocker");
-    let stdin = child.stdin.take().expect("piped stdin");
-    (child, stdin)
-}
+use crate::test_child::blocker;
 
 // Linux =====
 
@@ -30,7 +25,7 @@ mod linux {
     /// Mutant: the send is not recorded, or recorded under another address.
     #[skuld::test]
     fn a_live_child_is_signalled_through_its_pidfd_and_recorded() {
-        let (mut child, stdin) = spawn();
+        let mut child = blocker();
         let pidfd = pidfd_of(&child);
         let log = Capture::start();
         assert_eq!(
@@ -38,8 +33,7 @@ mod linux {
             Sent::Delivered
         );
         assert_eq!(log.entries(), [(child.id(), Sig::Kill, Via::Pidfd)]);
-        // Released after the kill: a kill that sent nothing exits 0.
-        drop(stdin);
+        // `wait` releases the stdin after the kill: a kill that sent nothing exits 0.
         let status = child.wait().expect("reap");
         assert_eq!(
             std::os::unix::process::ExitStatusExt::signal(&status),
@@ -50,9 +44,8 @@ mod linux {
     /// Mutant: `ESRCH` returned as an error.
     #[skuld::test]
     fn a_reaped_child_is_gone_but_the_attempt_is_recorded() {
-        let (mut child, stdin) = spawn();
+        let mut child = blocker();
         let pidfd = pidfd_of(&child);
-        drop(stdin);
         child.wait().expect("reap");
         let log = Capture::start();
         assert_eq!(
@@ -96,9 +89,9 @@ mod macos {
     /// Mutant: `arg = 0`, which does not look for zombies.
     #[skuld::test]
     fn uniq_info_reads_a_zombie() {
-        let (mut child, stdin) = spawn();
+        let mut child = blocker();
         let live = unique_id_of(child.id());
-        drop(stdin);
+        drop(child.stdin.take());
         // The exit, seen without consuming it: the child is a zombie.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let r = unsafe {
@@ -111,7 +104,6 @@ mod macos {
         };
         assert_eq!(r, 0, "waitid(WNOWAIT): {}", io::Error::last_os_error());
         assert_eq!(unique_id_of(child.id()), live);
-        child.wait().expect("reap");
     }
 
     /// Mutant: `ESRCH` classified as refused.
@@ -145,7 +137,7 @@ mod macos {
     /// Mutant: the id is not compared, so a reused pid is signalled.
     #[skuld::test]
     fn a_pid_with_another_unique_id_is_gone_and_sends_nothing() {
-        let (mut child, stdin) = spawn();
+        let mut child = blocker();
         let other = Some(unique_id_of(child.id()) ^ 1);
         let log = Capture::start();
         assert_eq!(
@@ -154,8 +146,6 @@ mod macos {
         );
         assert_eq!(log.entries(), []);
         assert!(child.try_wait().expect("try_wait").is_none(), "the child was signalled");
-        drop(stdin);
-        child.wait().expect("reap");
     }
 
     /// A child that holds no unique id has nothing to verify its pid against: nothing is sent, and it is
@@ -178,7 +168,7 @@ mod macos {
     /// Mutant: `Refused` taken for a match, or turned into `ErrorKind::Other`.
     #[skuld::test]
     fn a_refused_identity_reread_keeps_its_errno_and_sends_nothing() {
-        let (mut child, stdin) = spawn();
+        let child = blocker();
         let known = Some(unique_id_of(child.id()));
         let log = Capture::start();
         let kernel = FakeKernel::over(&HostKernel).on_unique_info(child.id(), UniqRead::Refused(libc::EPERM));
@@ -187,8 +177,6 @@ mod macos {
         assert_eq!(err.raw_os_error(), None);
         assert!(err.to_string().contains("identity could not be read"), "{err}");
         assert_eq!(log.entries(), []);
-        drop(stdin);
-        child.wait().expect("reap");
     }
 
     /// Mutant: `ESRCH` returned as an error.
@@ -215,9 +203,9 @@ mod macos {
     /// Mutant: an exited-but-unreaped child is mapped to `Gone`.
     #[skuld::test]
     fn an_exited_unreaped_child_is_delivered() {
-        let (mut child, stdin) = spawn();
+        let mut child = blocker();
         let identity = read_identity(&HostKernel, child.id()).expect("readable");
-        drop(stdin);
+        drop(child.stdin.take());
         // The exit, seen without consuming it: the child is a zombie.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let r = unsafe {
@@ -233,7 +221,6 @@ mod macos {
             via_audit_token(&HostKernel, child.id(), identity, Sig::Kill).expect("send"),
             Sent::Delivered
         );
-        child.wait().expect("reap");
     }
 
     /// A refused send is the bare errno: `Child::kill` promises a raw `EPERM`.
@@ -241,14 +228,12 @@ mod macos {
     /// Mutant: the errno is wrapped with context, which drops `raw_os_error`.
     #[skuld::test]
     fn a_refused_send_keeps_its_raw_errno() {
-        let (mut child, stdin) = spawn();
+        let child = blocker();
         let identity = read_identity(&HostKernel, child.id()).expect("readable");
         let refused = crate::signal::seams::refuse_kills();
         let err = via_audit_token(&HostKernel, child.id(), identity, Sig::Kill).expect_err("refused");
         drop(refused);
         assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
-        drop(stdin);
-        child.wait().expect("reap");
     }
 
     /// A child whose exit has begun and that is not yet a zombie answers the token send `EPERM`; it is
@@ -257,7 +242,7 @@ mod macos {
     /// Mutant: the `EPERM` is surfaced raw, so `Child::kill` of a child that is exiting is an error.
     #[skuld::test]
     fn a_child_whose_exit_began_is_delivered() {
-        let (mut child, stdin) = spawn();
+        let child = blocker();
         let identity = read_identity(&HostKernel, child.id()).expect("readable");
         let kernel = FakeKernel::over(&HostKernel).on_kinfo(
             child.id(),
@@ -267,14 +252,12 @@ mod macos {
         let sent = via_audit_token(&kernel, child.id(), identity, Sig::Kill);
         drop(refused);
         assert_eq!(sent.expect("an exiting child is no refuser"), Sent::Delivered);
-        drop(stdin);
-        child.wait().expect("reap");
     }
 
     /// Mutant: the send is not recorded, or nothing is sent.
     #[skuld::test]
     fn a_verified_live_child_is_signalled_and_recorded() {
-        let (mut child, _stdin) = spawn();
+        let mut child = blocker();
         let identity = read_identity(&HostKernel, child.id()).expect("readable");
         let log = Capture::start();
         assert_eq!(

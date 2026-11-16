@@ -52,7 +52,7 @@ fn fixture_enumerate_stat_overmount() {
         return;
     }
     ns::enter_private_mount_ns();
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn the member");
+    let mut child = crate::test_child::StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let pid = child.id();
     let scratch = tempfile::tempdir().expect("tempdir");
@@ -71,7 +71,4 @@ fn fixture_enumerate_stat_overmount() {
         }
         other => panic!("a stat behind a mount must fail the snapshot, got {other:?}"),
     }
-
-    _ = child.kill();
-    _ = child.wait();
 }

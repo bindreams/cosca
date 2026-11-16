@@ -36,7 +36,7 @@ fn after_the_job_kill_the_drain_answers_only_once_every_member_is_signalled() {
 
     use crate::containment::Contains as _;
 
-    let (mut members, job) = crate::test_child::spawn_job_with_members(3);
+    let (members, job) = crate::test_child::spawn_job_with_members(3);
     let pids = super::query_job_pid_list(HANDLE(job.handle().as_raw_handle())).expect("list the job's members");
     assert!(pids.len() >= members.len(), "the job holds its members: {pids:?}");
     let held: Vec<(u32, OwnedHandle)> = pids
@@ -61,9 +61,6 @@ fn after_the_job_kill_the_drain_answers_only_once_every_member_is_signalled() {
             "pid {pid} is a member the drain answered before it was signalled"
         );
     }
-    for member in &mut members {
-        member.wait().expect("reap a member");
-    }
 }
 
 /// A kill the OS refuses names no member to wait for: its `Err` is returned, where a wait over members
@@ -80,7 +77,7 @@ fn a_job_kill_the_os_refuses_waits_for_no_member() {
 
     use crate::containment::Contains as _;
 
-    let (mut child, job) = spawn_job_member();
+    let (_child, job) = spawn_job_member();
     let refused = job.duplicate_with_access_for_test(JOB_OBJECT_QUERY);
 
     let (sent, wait) = refused.kill(None).split();
@@ -101,7 +98,6 @@ fn a_job_kill_the_os_refuses_waits_for_no_member() {
 
     assert!(!blocked.get(), "the wait blocked on a member the kill did not reach");
     job.hard_kill().expect("end the member");
-    _ = child.wait();
 }
 
 /// The members are listed before `TerminateJobObject`, not after it: a member that has left the job's
@@ -150,7 +146,7 @@ fn a_job_lists_its_members_before_it_terminates_them() {
 fn only_a_job_kill_that_waits_reads_the_members_list() {
     use crate::containment::Contains as _;
 
-    let (mut child, job) = spawn_job_member();
+    let (_child, job) = spawn_job_member();
     {
         let _forced = super::fault::force_job_pid_list(Vec::new());
         _ = job.kill(None).split();
@@ -160,7 +156,7 @@ fn only_a_job_kill_that_waits_reads_the_members_list() {
             "a kill that waits lists the job once, before it terminates it"
         );
     }
-    let (mut child2, job2) = spawn_job_member();
+    let (_child2, job2) = spawn_job_member();
     let _forced = super::fault::force_job_pid_list(Vec::new());
     job2.send_kill(None).into_result().expect("the job's kill");
     assert_eq!(
@@ -168,7 +164,6 @@ fn only_a_job_kill_that_waits_reads_the_members_list() {
         0,
         "a kill that only sends reads no list"
     );
-    _ = (child.wait(), child2.wait());
 }
 
 /// `query_job_pid_list` on a freshly created, unpopulated job reports no members — the fast
@@ -250,7 +245,7 @@ fn wait_drained_raw_with_an_elapsed_deadline_answers_drained_when_the_one_more_l
 /// Mutant: a non-empty final listing is answered `AllMembersExited`.
 #[skuld::test]
 fn wait_drained_raw_with_an_elapsed_deadline_answers_members_remain_when_the_one_more_listing_is_not_empty() {
-    let (child, job) = spawn_job_member();
+    let (_child, job) = spawn_job_member();
     let forced = super::fault::force_job_pid_list(vec![1]);
     let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
 
@@ -260,7 +255,6 @@ fn wait_drained_raw_with_an_elapsed_deadline_answers_members_remain_when_the_one
     assert_eq!(super::fault::job_pid_list_queries(), 2, "the listing, and one more");
     drop(forced);
     job.hard_kill().expect("end the member");
-    let_member_exit(child);
 }
 
 /// Live members that the zero-ms poll finds unsignalled answer `MembersRemain` off the round's own
@@ -269,7 +263,7 @@ fn wait_drained_raw_with_an_elapsed_deadline_answers_members_remain_when_the_one
 /// Mutant: that branch takes the final listing, which is a second query.
 #[skuld::test]
 fn wait_drained_raw_with_an_elapsed_deadline_answers_members_remain_off_its_own_listing_for_live_members() {
-    let (child, job) = spawn_job_member();
+    let (_child, job) = spawn_job_member();
     let forced = super::fault::force_job_pid_lists([]);
     let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
 
@@ -279,7 +273,6 @@ fn wait_drained_raw_with_an_elapsed_deadline_answers_members_remain_off_its_own_
     assert_eq!(super::fault::job_pid_list_queries(), 1, "the round's own listing only");
     drop(forced);
     job.hard_kill().expect("end the member");
-    let_member_exit(child);
 }
 
 /// The final listing is the last: when it too names only stale pids, the answer is `MembersRemain` and
@@ -328,7 +321,6 @@ fn wait_drained_raw_with_an_elapsed_deadline_takes_the_listing_that_settles_unpr
     );
     drop(forced);
     job.hard_kill().expect("end the member");
-    let_member_exit(member);
 }
 
 /// A listed member whose handle the zero-ms poll finds signalled (it has exited, and its process object
@@ -394,7 +386,7 @@ fn wait_drained_raw_with_an_elapsed_deadline_answers_drained_for_an_empty_listin
 /// Mutant: an empty first listing answers `AllMembersExited` off the list alone.
 #[skuld::test]
 fn wait_drained_raw_does_not_answer_an_empty_first_listing_while_a_member_runs() {
-    let (child, job) = spawn_job_member();
+    let (_child, job) = spawn_job_member();
     let forced = super::fault::force_job_pid_list(Vec::new());
     let zero = crate::wait::deadline_from(std::time::Duration::ZERO);
 
@@ -402,7 +394,6 @@ fn wait_drained_raw_does_not_answer_an_empty_first_listing_while_a_member_runs()
 
     drop(forced);
     job.hard_kill().expect("end the member");
-    let_member_exit(child);
     assert_eq!(
         verdict.expect("wait_drained_raw"),
         crate::containment::TreeDrain::MembersRemain,
@@ -421,7 +412,7 @@ fn wait_drained_raw_waits_for_a_member_it_never_opened_past_the_wait_set() {
 
     let (mut members, job) = spawn_job_with_members(super::MAXIMUM_WAIT_OBJECTS);
     let unopened = members.pop().expect("a last member");
-    let mut listed: Vec<u32> = members.iter().map(std::process::Child::id).collect();
+    let mut listed: Vec<u32> = members.iter().map(|member| member.id()).collect();
     listed.push(unopened.id());
     // Reaped, but each handle stays open, so each pid still opens as a signalled member.
     for member in &mut members {
@@ -435,7 +426,6 @@ fn wait_drained_raw_waits_for_a_member_it_never_opened_past_the_wait_set() {
 
     drop(forced);
     job.hard_kill().expect("end the member");
-    let_member_exit(unopened);
     assert_eq!(
         verdict.expect("wait_drained_raw"),
         crate::containment::TreeDrain::MembersRemain,
@@ -447,7 +437,7 @@ fn wait_drained_raw_waits_for_a_member_it_never_opened_past_the_wait_set() {
 /// of a job that has had a process is never answered `AllMembersExited` without it.
 #[skuld::test]
 fn wait_drained_raw_fails_when_the_snapshot_for_an_empty_listing_cannot_be_taken() {
-    let (child, job) = spawn_job_member();
+    let (_child, job) = spawn_job_member();
     let _snapshot = crate::containment::enumerate::backend_fault::force_snapshot_failure();
     let forced = super::fault::force_job_pid_list(Vec::new());
 
@@ -455,7 +445,6 @@ fn wait_drained_raw_fails_when_the_snapshot_for_an_empty_listing_cannot_be_taken
 
     drop(forced);
     job.hard_kill().expect("end the member");
-    let_member_exit(child);
     let error = verdict.expect_err("an empty listing with no snapshot is not a drain");
     assert!(
         matches!(&error, crate::error::Error::Unassessable { source: Some(_), .. }),
@@ -530,7 +519,6 @@ fn a_member_assigned_after_a_confirmed_drain_is_confirmed_too() {
 
     drop(forced);
     job.hard_kill().expect("end the member");
-    let_member_exit(second);
     assert_eq!(
         verdict.expect("wait_drained"),
         crate::containment::TreeDrain::MembersRemain,
@@ -845,7 +833,6 @@ fn a_member_whose_identity_cannot_be_read_is_reported_though_another_still_runs_
 
     drop(forced);
     job.hard_kill().expect("end the members");
-    let_member_exit(running);
     let error = verdict.expect_err("a member whose identity cannot be read is not a drain, nor remaining");
     assert!(
         matches!(&error, crate::error::Error::Unassessable { detail, .. } if detail.contains(&pid.to_string())),
@@ -1160,7 +1147,6 @@ fn drain_round_watches_a_pid_the_second_look_proves_a_member() {
     let watched = matches!(&round, Ok(super::Round::Watch(watch)) if watch.handles.len() == 1);
     drop(round);
     job.hard_kill().expect("end the member");
-    let_member_exit(child);
     assert!(watched, "the proved member is watched");
 }
 
@@ -1183,7 +1169,6 @@ fn a_refused_wait_open_of_a_pid_a_waitable_member_holds_now_is_that_member() {
     let watched = matches!(&round, Ok(super::Round::Watch(watch)) if watch.handles.len() == 1);
     drop(round);
     job.hard_kill().expect("end the member");
-    let_member_exit(child);
     assert!(watched, "a member the caller can wait on is watched");
 }
 
@@ -1388,7 +1373,6 @@ fn list_members_names_a_pid_the_second_look_proves_a_member() {
     drop(forced);
     drop(first_look);
     job.hard_kill().expect("end the member");
-    let_member_exit(child);
     assert_eq!(members.iter().filter(|id| id.pid() == pid).count(), 1, "{members:?}");
     assert!(unobserved.is_empty(), "{unobserved:?}");
 }
@@ -1434,7 +1418,6 @@ fn list_members_reports_a_member_the_second_look_cannot_identify() {
     drop(first_look);
     drop(identity);
     job.hard_kill().expect("end the member");
-    let_member_exit(child);
     assert!(members.is_empty(), "{members:?}");
     assert_eq!(
         unobserved.iter().filter(|unnamed| unnamed.pid == Some(pid)).count(),
@@ -1597,8 +1580,6 @@ fn wait_drained_raw_waits_for_the_members_the_snapshot_names_when_the_listing_em
     crate::wait::wait_ms_probe::take();
     drop(forced);
     let ended = released.get();
-    // The member ends either way: on a failure the hook never ran.
-    let_member_exit(second);
     assert!(
         ended,
         "the drain was answered by the empty listing while a member's process object was unsignalled"
@@ -1628,7 +1609,6 @@ fn wait_drained_raw_keeps_waiting_for_a_member_that_left_the_listing_in_an_earli
     let verdict = super::wait_drained_raw(&job, deadline);
 
     drop(forced);
-    let_member_exit(second);
     assert_eq!(
         verdict.expect("wait_drained_raw"),
         crate::containment::TreeDrain::MembersRemain,
@@ -1652,7 +1632,6 @@ fn wait_drained_raw_with_an_elapsed_deadline_polls_the_members_its_empty_final_l
 
     assert_eq!(super::fault::job_pid_list_queries(), 2, "the listing, and one more");
     drop(forced);
-    let_member_exit(second);
     assert_eq!(
         verdict.expect("wait_drained_raw"),
         crate::containment::TreeDrain::MembersRemain,
@@ -1720,7 +1699,7 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
 #[skuld::test]
 fn wait_drained_raw_arms_the_ceiling_of_the_remaining_duration() {
     use std::time::{Duration, Instant};
-    let (child, job) = spawn_job_member();
+    let (_child, job) = spawn_job_member();
     let (_clock, at) = crate::wait::test_clock::FrozenClockGuard::install();
     crate::wait::wait_ms_probe::take();
     let _override = crate::wait::remaining_override_seam::set(Duration::from_micros(500));
@@ -1728,7 +1707,6 @@ fn wait_drained_raw_arms_the_ceiling_of_the_remaining_duration() {
     let verdict = super::wait_drained_raw(&job, Some(deadline));
     let reached = Instant::now() >= deadline;
     let arms = crate::wait::wait_ms_probe::take();
-    let_member_exit(child);
     assert_eq!(
         verdict.expect("a live never-exiting member must not report a wait failure"),
         crate::containment::TreeDrain::MembersRemain
@@ -1759,7 +1737,6 @@ fn wait_drained_raw_never_reports_members_remain_before_the_deadline() {
     let deadline = Instant::now() + Duration::from_secs(3600);
     let verdict = super::wait_drained_raw(&job, Some(deadline));
     let arms = crate::wait::wait_ms_probe::take();
-    child.wait().expect("reap the member after it exits");
     assert_eq!(
         verdict.expect("a genuinely-drained job must not report a wait failure"),
         crate::containment::TreeDrain::AllMembersExited
@@ -1782,7 +1759,6 @@ fn wait_drained_raw_re_arms_past_a_clamped_timeout() {
     let deadline = Instant::now() + Duration::from_secs(3600);
     let verdict = super::wait_drained_raw(&job, Some(deadline));
     let arms = crate::wait::wait_ms_probe::take();
-    child.wait().expect("reap the member after it exits");
     assert_eq!(
         verdict.expect("a genuinely-drained job must not report a wait failure"),
         crate::containment::TreeDrain::AllMembersExited
@@ -2414,12 +2390,6 @@ fn resume_initial_threads_reports_a_broken_handle_contract_in_release() {
 
 // ===== frozen release =====
 
-/// Kill and reap a std child these tests left suspended or running.
-fn dispose(mut child: std::process::Child) {
-    child.kill().expect("kill the test child");
-    child.wait().expect("reap the test child");
-}
-
 /// `resume_initial_threads` brings a frozen child's initial thread from suspend count 1 to 0: it runs.
 #[skuld::test]
 fn resume_initial_threads_leaves_no_thread_suspended() {
@@ -2456,7 +2426,6 @@ fn resume_initial_threads_fails_when_the_initial_thread_was_suspended_twice() {
         1,
         "the walk resumed once; the foreign suspend is still held, and the failure says so"
     );
-    dispose(child);
 }
 
 /// Something already ran the child (its count was 0): "ran no instruction" no longer holds, so a
@@ -2475,7 +2444,6 @@ fn resume_initial_threads_fails_when_the_initial_thread_was_already_running() {
         text.contains("previous suspend count was 0"),
         "the error must name the count it found: {text}"
     );
-    dispose(child);
 }
 
 /// Another party (an EDR agent, a debugger) started a thread in the frozen child, and it runs: the
@@ -2562,7 +2530,6 @@ fn resume_initial_threads_resumes_nothing_when_a_childs_creation_time_cannot_be_
         1,
         "nothing may be resumed when the initial thread is unknown"
     );
-    dispose(child);
 }
 
 /// Two threads created at the same clock reading: which came first is unknowable (thread ids carry
@@ -2595,7 +2562,6 @@ fn resume_initial_threads_resumes_nothing_when_the_earliest_creation_times_are_e
         1,
         "nothing may be resumed when the initial thread is unknown"
     );
-    dispose(child);
 }
 
 /// `earliest_created`: the earliest time wins wherever it is listed; a tie for the earliest is a
@@ -2645,7 +2611,6 @@ fn resume_initial_threads_names_the_initial_thread_when_it_was_already_running()
         text.contains(&format!("thread {} of pid", initial.tid())) && text.contains("previous suspend count was 0"),
         "the error must name the initial thread and its count: {text}"
     );
-    dispose(child);
 }
 
 /// The initial thread was suspended twice while a second thread exists: still a failure naming the
@@ -2665,7 +2630,6 @@ fn resume_initial_threads_names_the_initial_thread_when_it_was_suspended_twice()
         text.contains(&format!("thread {} of pid", initial.tid())) && text.contains("previous suspend count was 2"),
         "the error must name the initial thread and its count: {text}"
     );
-    dispose(child);
 }
 
 /// The initial thread is the earliest created, wherever the snapshot lists it: a list that puts the
@@ -2682,7 +2646,6 @@ fn initial_thread_id_picks_the_earliest_created_thread_whatever_the_list_order()
         assert_eq!(picked, Some(initial.tid()), "list {tids:?}");
         assert!(walk.last_err.is_none(), "{:?}", walk.last_err);
     }
-    dispose(child);
 }
 
 /// A listed thread that is another process's, or gone, is nobody's initial thread, even when it is
@@ -2704,8 +2667,6 @@ fn initial_thread_id_ignores_a_thread_that_is_not_the_childs() {
         "a foreign or vanished thread is a skip: {:?}",
         walk.last_err
     );
-    dispose(older);
-    dispose(child);
 }
 
 /// The ordinary spawn's resume does not ask that the child was suspended exactly once: a thread
@@ -2719,8 +2680,6 @@ fn resume_initial_threads_with_any_count_accepts_a_thread_that_was_already_runni
 
     super::resume_initial_threads(crate::test_frozen::raw(&child), super::SuspendCount::Any)
         .expect("the ordinary resume accepts a running thread");
-
-    dispose(child);
 }
 
 /// The ordinary `contain()` attach, end to end: the same tolerance as above, through `attach_job`.
@@ -2793,7 +2752,6 @@ fn attach_job_whose_resume_and_job_kill_both_fail_returns_the_kill_as_cleanup() 
         "the cleanup member names its step: {cleanup:?}"
     );
     drop(kill_failure);
-    dispose(child);
 }
 
 /// A spawn whose attach fails in its resume, and whose job kill after it fails too, returns the
@@ -3037,7 +2995,7 @@ fn disarm_of_an_empty_job_is_ok() {
 /// Mutant: `disarm` does nothing.
 #[skuld::test]
 fn disarm_after_hard_kill_clears_the_flag() {
-    let (child, job) = spawn_job_member();
+    let (_child, job) = spawn_job_member();
     assert!(
         super::job_kills_on_close(&job),
         "the create path sets KILL_ON_JOB_CLOSE"
@@ -3045,5 +3003,4 @@ fn disarm_after_hard_kill_clears_the_flag() {
     job.hard_kill().expect("hard_kill on a live job");
     job.disarm().expect("disarm after hard_kill");
     assert_eq!(crate::test_frozen::limit_flags(&job).0, 0);
-    let_member_exit(child);
 }

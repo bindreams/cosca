@@ -6,23 +6,11 @@
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle};
 
 use super::Job;
-
-/// `cmd /C more`: blocks reading its stdin until EOF, then exits. No new external dependency —
-/// this is the OS shell, exactly like `windows_tests.rs`'s fixture.
-fn spawn_blocker() -> std::process::Child {
-    crate::test_spawn::spawn(
-        std::process::Command::new("cmd")
-            .args(["/C", "more"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()),
-    )
-    .expect("spawn cmd /C more")
-}
+use crate::test_child::spawn_more_blocker;
 
 #[skuld::test]
 fn assign_then_kill_tree_terminates_the_process() {
-    let mut child = spawn_blocker();
+    let mut child = spawn_more_blocker();
     let raw = child.as_raw_handle();
     // SAFETY: `child` outlives this borrow.
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
@@ -40,7 +28,7 @@ fn assign_then_kill_tree_terminates_the_process() {
 /// the call returns, before any wait of the test's own.
 #[skuld::test]
 fn kill_tree_returns_with_the_member_exited() {
-    let mut child = spawn_blocker();
+    let child = spawn_more_blocker();
     let id = crate::identity::ProcessId::of(child.id())
         .found()
         .expect("the member's identity");
@@ -55,7 +43,6 @@ fn kill_tree_returns_with_the_member_exited() {
         crate::identity::Liveness::Dead,
         "the member has exited when kill_tree returns"
     );
-    _ = child.wait();
 }
 
 /// The wait over a job's listed members blocks on a member that is running, and ends once it has exited
@@ -70,7 +57,7 @@ fn the_wait_over_a_jobs_listed_members_blocks_on_a_running_member() {
     use crate::containment::drain_edge::DrainEdge;
     use crate::containment::TreeKill;
 
-    let mut child = spawn_blocker();
+    let mut child = spawn_more_blocker();
     let id = crate::identity::ProcessId::of(child.id())
         .found()
         .expect("the member's identity");
@@ -99,7 +86,6 @@ fn the_wait_over_a_jobs_listed_members_blocks_on_a_running_member() {
     wait.wait().expect("the member exited and the job drained");
 
     assert!(blocked.get(), "the wait did not block on a member that was running");
-    _ = child.wait();
 }
 
 /// `send_kill_tree` terminates the member and returns without waiting for it: nothing blocks in the
@@ -111,7 +97,7 @@ fn send_kill_tree_terminates_the_member_and_waits_for_nothing() {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    let mut child = spawn_blocker();
+    let mut child = spawn_more_blocker();
     let raw = child.as_raw_handle();
     // SAFETY: `child` outlives this borrow.
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
@@ -133,7 +119,7 @@ fn send_kill_tree_terminates_the_member_and_waits_for_nothing() {
 
 #[skuld::test]
 fn disarm_clears_kill_on_job_close() {
-    let mut child = spawn_blocker();
+    let child = spawn_more_blocker();
     let raw = child.as_raw_handle();
     // SAFETY: `child` outlives this borrow.
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
@@ -145,16 +131,11 @@ fn disarm_clears_kill_on_job_close() {
         0,
         "disarm() must clear every limit flag, including KILL_ON_JOB_CLOSE"
     );
-
-    // Cleanup: disarm() means dropping `job` will NOT kill this real process.
-    drop(job);
-    _ = child.kill();
-    _ = child.wait();
 }
 
 #[skuld::test]
 fn wait_tree_reports_members_remain_then_all_exited() {
-    let mut child = spawn_blocker();
+    let mut child = spawn_more_blocker();
     let raw = child.as_raw_handle();
     // SAFETY: `child` outlives this borrow.
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
@@ -180,7 +161,7 @@ fn wait_tree_reports_members_remain_then_all_exited() {
 /// `wait_tree` after `kill_tree` reports the drain once the killed member has exited.
 #[skuld::test]
 fn wait_tree_after_kill_tree_reports_the_drain() {
-    let mut child = spawn_blocker();
+    let mut child = spawn_more_blocker();
     let raw = child.as_raw_handle();
     // SAFETY: `child` outlives this borrow.
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
@@ -218,7 +199,7 @@ fn job_is_send_and_sync() {
 /// `disarm` after `kill_tree` really clears `KILL_ON_JOB_CLOSE`.
 #[skuld::test]
 fn disarm_after_kill_tree_clears_kill_on_job_close() {
-    let mut child = spawn_blocker();
+    let child = spawn_more_blocker();
     let raw = child.as_raw_handle();
     // SAFETY: `child` outlives the borrow.
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
@@ -227,8 +208,6 @@ fn disarm_after_kill_tree_clears_kill_on_job_close() {
     job.disarm().expect("disarm after kill_tree");
 
     assert_eq!(crate::test_frozen::limit_flags(&job.0).0, 0);
-
-    _ = child.wait();
 }
 
 /// A `disarm` the OS refuses is the caller's error: the public `Job::disarm` returns it as
@@ -256,7 +235,7 @@ fn a_refused_disarm_is_returned_as_an_io_error() {
 /// A zero timeout on a live tree reports `MembersRemain` rather than blocking or guessing.
 #[skuld::test]
 fn wait_tree_timeout_zero_reports_members_remain() {
-    let mut child = spawn_blocker();
+    let child = spawn_more_blocker();
     let raw = child.as_raw_handle();
     // SAFETY: `child` outlives the borrow.
     let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
@@ -271,5 +250,4 @@ fn wait_tree_timeout_zero_reports_members_remain() {
     );
 
     job.kill_tree().expect("kill_tree");
-    _ = child.wait();
 }

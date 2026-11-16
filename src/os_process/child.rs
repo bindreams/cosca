@@ -311,27 +311,14 @@ pub(crate) fn adopt_pidfd<K: crate::identity::Kernel + Send + 'static>(
     }
 }
 
-/// A running blocker child (see [`crate::test_child::held_std_blocker`]), its identity, and the
-/// write end of its stdin: closing it ends the child.
+/// A running blocker child (see [`crate::test_child::blocker`]) adopted by [`adopt_std`], its
+/// identity, and the write end of its stdin: closing it ends the child.
 #[cfg(test)]
-pub(crate) fn spawned_blocker() -> (
-    std::process::Child,
-    crate::identity::ProcessId,
-    std::process::ChildStdin,
-) {
-    let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the blocker");
-    let stdin = child.stdin.take().expect("piped stdin");
+pub(crate) fn adopted_blocker() -> (Box<dyn OsChild>, crate::identity::ProcessId, std::process::ChildStdin) {
+    let (child, stdin) = crate::test_child::blocker().into_parts();
     let id = crate::identity::ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");
-    (child, id, stdin)
-}
-
-/// [`spawned_blocker`]'s child adopted by [`adopt_std`], its identity, and the write end of its stdin.
-#[cfg(test)]
-pub(crate) fn adopted_blocker() -> (Box<dyn OsChild>, crate::identity::ProcessId, std::process::ChildStdin) {
-    let (child, id, stdin) = spawned_blocker();
     let os = adopt_std(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {}", crate::error::Report(&e)));
     (os, id, stdin)
 }

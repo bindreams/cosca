@@ -1,10 +1,10 @@
 //! `proc_state` reads a child's state only through the checked `/proc` view.
 
 use super::{proc_state, read_proc_state, StateUnknown};
-use crate::containment::cgroup::test_support::{handle_of, pidfd_of, KillOnDrop};
+use crate::containment::cgroup::test_support::{handle_of, pidfd_of};
 use crate::identity::{FakeKernel, HostKernel, DIVERGED_REASON, UNREADABLE_STATUS_REASON};
 use crate::test_child::namespaces as ns;
-use crate::test_child::{fixture_path, member_command};
+use crate::test_child::{fixture_path, member_command, StdChild};
 use crate::test_groups::{namespaces, pidfd_group_signal, Group};
 
 #[skuld::test]
@@ -272,8 +272,7 @@ fn fixture_state_overmount() {
         return;
     }
     ns::enter_private_mount_ns();
-    let mut child = crate::test_spawn::spawn(&mut member_command(0)).expect("spawn the member");
-    let _guard = KillOnDrop::of(&child);
+    let mut child = StdChild::spawn(&mut member_command(0));
     crate::test_child::await_member_ready(&mut child);
     let pid = child.id();
     assert!(
@@ -339,7 +338,7 @@ fn a_thread_group_whose_leader_exited_has_no_state() {
 
     let mut cmd = crate::test_child::fixture_command(fixture_path!(fixture_leader_exits));
     cmd.stdin(std::process::Stdio::piped());
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the fixture");
+    let mut child = StdChild::spawn(&mut cmd);
     let pid = child.id();
     let pidfd = pidfd_of(pid);
     // The fixture announces once its leader is a zombie: its first stderr line is the gate's.
@@ -361,10 +360,6 @@ fn a_thread_group_whose_leader_exited_has_no_state() {
         "control: /proc shows the leader's state"
     );
     assert_eq!(proc_state(&HostKernel, handle_of(pid, &pidfd)), None);
-
-    // Ends the group: the thread reads EOF and exits the process.
-    drop(child.stdin.take());
-    child.wait().expect("reap the fixture");
 }
 
 /// The same group, asked of its identity: `/proc` shows the leader `Z`, but the process has not
@@ -383,7 +378,7 @@ fn a_thread_group_whose_leader_exited_is_alive_to_its_pidfs_identity(
 
     let mut cmd = crate::test_child::fixture_command(fixture_path!(fixture_leader_exits));
     cmd.stdin(std::process::Stdio::piped());
-    let mut child = crate::test_spawn::spawn(&mut cmd).expect("spawn the fixture");
+    let mut child = StdChild::spawn(&mut cmd);
     let pid = child.id();
     let mut stderr = std::io::BufReader::new(child.stderr.take().expect("piped stderr"));
     let mut seen = String::new();
@@ -408,9 +403,6 @@ fn a_thread_group_whose_leader_exited_is_alive_to_its_pidfs_identity(
     assert!(id.pidfs_ino().is_some(), "a pidfs host makes pidfs ids");
     assert_eq!(id.exists(), Existence::Present);
     assert_eq!(id.is_alive(), Liveness::Alive);
-
-    drop(child.stdin.take());
-    child.wait().expect("reap the fixture");
 }
 
 const LEADER_EXITED: &str = "COSCA_LEADER_EXITED";

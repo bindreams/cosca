@@ -15,14 +15,14 @@ use crate::Recursive;
 /// Mutants: a `Z` record is dead whatever its thread count; the walk from such a process finds no child.
 #[skuld::test]
 fn a_process_whose_leader_thread_exited_is_alive_and_keeps_its_children() {
-    let mut root = crate::test_spawn::spawn(
+    let mut root = crate::test_child::StdChild::spawn(
         crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
             .args(crate::test_child::zombie_leader_root::argv())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped()),
-    )
-    .expect("spawn the root");
-    let stdin = root.stdin.take().expect("piped stdin");
+    );
+    // Held until the test ends, so the thread and the cat run until then.
+    let _stdin = root.stdin.take().expect("piped stdin");
     let mut stdout = std::io::BufReader::new(root.stdout.take().expect("piped stdout"));
     let mut line = String::new();
     stdout.read_line(&mut line).expect("the cat's pid");
@@ -78,8 +78,4 @@ fn a_process_whose_leader_thread_exited_is_alive_and_keeps_its_children() {
         vec![cat],
         "the cat's parent is still the root's pid"
     );
-
-    // The thread and the cat end on the EOF, and with them the process.
-    drop(stdin);
-    root.wait().expect("reap the root");
 }

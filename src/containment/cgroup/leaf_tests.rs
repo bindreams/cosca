@@ -1634,11 +1634,11 @@ fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak(#[fix
     use std::io::Read as _;
 
     crate::log_capture::install();
-    let mut cmd = std::process::Command::new("sh");
-    cmd.args(["-c", "trap '' TERM; echo r; exec cat"])
+    let mut sh = std::process::Command::new("sh");
+    sh.args(["-c", "trap '' TERM; echo r; exec cat"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
-    let (leaf, mut member, stdin) = entered_real_leaf_of(cmd);
+    let (leaf, mut member) = entered_real_leaf_of(Some(sh));
     let pid = member.id();
     let leaf_path = leaf.path().to_owned();
     let leaf_name = leaf_path
@@ -1668,8 +1668,8 @@ fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak(#[fix
     drop(leaf);
     let levels = crate::log_capture::levels_since(mark, &leaf_name);
     let records = crate::log_capture::records_since(mark, &leaf_name);
-    // The member lives until its stdin closes: the leaf's `Drop` has run with it alive.
-    drop(stdin);
+    // The member lives until its stdin closes: the leaf's `Drop` has run with it alive. `wait`
+    // closes it.
     member.wait().expect("reap the member");
     // The disarmed leaf was left for its tree; the tree is gone, and the leaf is empty.
     std::fs::remove_dir(&leaf_path).expect("remove the emptied leaf");
@@ -2163,48 +2163,45 @@ fn sweeping_a_leaf_that_is_already_gone_removes_nothing() {
 
 /// A real leaf whose one member, a `cat` blocked on a piped stdin, entered it. For the lane tests.
 ///
-/// Returns the member's `ChildStdin` separately so a caller cannot forget it: the member's only
-/// job is to keep the leaf populated until a signal under test ends it, which needs the writer held
-/// for exactly that long. Dropping it, or `member.wait()` (which closes a piped stdin before
-/// waiting), is an EOF that ends the member without any signal, so every caller either releases it
-/// from a seam that fires after the signal under test ([`drop_under_a_mount`]), or asserts the exit
-/// status carries the signal it expects, or asserts none.
+/// The member's stdin is its `Child`'s own: its only job is to keep the leaf populated until a
+/// signal under test ends it. `member.wait()` closes a piped stdin before waiting, an EOF that ends
+/// the member without any signal, so every caller either releases it from a seam that fires after
+/// the signal under test ([`drop_under_a_mount`], which takes the stdin out), or asserts the exit
+/// status carries the signal it expects, or asserts none. Declare the member after the leaf, so it
+/// is killed and reaped before the leaf is removed.
 #[cfg(target_os = "linux")]
-fn entered_real_leaf() -> (
-    crate::containment::cgroup::CgroupLeaf,
-    std::process::Child,
-    std::process::ChildStdin,
-) {
-    entered_real_leaf_of(crate::test_child::held_std_blocker(std::process::Stdio::null()))
+fn entered_real_leaf() -> (crate::containment::cgroup::CgroupLeaf, StdChild) {
+    entered_real_leaf_of(None)
 }
 
-/// [`entered_real_leaf`] with `cmd` as the member: it must have a piped stdin.
+/// [`entered_real_leaf`] with `command` as the member (it must have a piped stdin) when given.
 #[cfg(target_os = "linux")]
-fn entered_real_leaf_of(
-    mut cmd: std::process::Command,
-) -> (
-    crate::containment::cgroup::CgroupLeaf,
-    std::process::Child,
-    std::process::ChildStdin,
-) {
+fn entered_real_leaf_of(command: Option<std::process::Command>) -> (crate::containment::cgroup::CgroupLeaf, StdChild) {
     use std::os::unix::process::CommandExt;
 
     let mut leaf =
         crate::containment::cgroup::try_create_leaf(&crate::identity::spawn_kernel(crate::identity::HostKernel), None)
             .expect("create a real leaf");
     let procs_fd = leaf.procs_fd();
-    // SAFETY: as `cgroup_wait_drained_tracks_two_real_members_through_exit`'s member spawn: the
-    // closure runs between fork and exec, and `leaf` outlives the spawn.
-    unsafe {
-        cmd.pre_exec(move || crate::containment::cgroup::test_support::place_in_pre_exec(procs_fd));
-    }
-    let mut member = crate::test_spawn::spawn(&mut cmd).expect("spawn a member");
-    let stdin = member.stdin.take().expect("piped stdin");
+    let place = move |cmd: &mut std::process::Command| {
+        // SAFETY: as `cgroup_wait_drained_tracks_two_real_members_through_exit`'s member spawn: the
+        // closure runs between fork and exec, and `leaf` outlives the spawn.
+        unsafe {
+            cmd.pre_exec(move || crate::containment::cgroup::test_support::place_in_pre_exec(procs_fd));
+        }
+    };
+    let member = match command {
+        None => blocker_with(place),
+        Some(mut cmd) => {
+            place(&mut cmd);
+            StdChild::spawn(&mut cmd)
+        }
+    };
     // std's spawn returned after the `exec`: the member placed itself.
     leaf.record_placement(PlacementReport::Placed);
     leaf.take_placement(handle_of(member.id(), &pidfd_of(member.id())))
         .expect("the member entered the leaf");
-    (leaf, member, stdin)
+    (leaf, member)
 }
 
 /// Give the calling thread alone a mount namespace, private, so that every mount it makes stays in
@@ -2289,7 +2286,8 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_leaf_kills_the_tree_and_reports_t
 ) {
     use std::os::unix::process::ExitStatusExt as _;
 
-    let (leaf, mut member, stdin) = entered_real_leaf();
+    let (leaf, mut member) = entered_real_leaf();
+    let stdin = member.stdin.take().expect("piped stdin");
     let leaf_path = leaf.leaf_path.clone();
     let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
 
@@ -2320,7 +2318,8 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_t
     crate::log_capture::install();
     let (leaf_path, mut member, levels, records) = std::thread::spawn(|| {
         enter_a_private_mount_namespace();
-        let (leaf, member, stdin) = entered_real_leaf();
+        let (leaf, mut member) = entered_real_leaf();
+        let stdin = member.stdin.take().expect("piped stdin");
         let leaf_path = leaf.leaf_path.clone();
         let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
         mount_a_tmpfs_over(&leaf_path);
@@ -2362,7 +2361,8 @@ fn cgroup_an_armed_drop_under_a_mount_over_its_name_in_its_own_namespace_kills_t
 fn cgroup_an_armed_drop_under_a_mount_over_its_parent_still_removes_the_leaf(#[fixture(cgroup)] _group: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
 
-    let (leaf, mut member, stdin) = entered_real_leaf();
+    let (leaf, mut member) = entered_real_leaf();
+    let stdin = member.stdin.take().expect("piped stdin");
     let leaf_path = leaf.leaf_path.clone();
     let parent = leaf_path.parent().expect("a parent").to_path_buf();
     let name = leaf_path.file_name().expect("a name").to_string_lossy().into_owned();
@@ -3572,7 +3572,7 @@ fn terminate_reports_a_member_it_could_not_signal(how: Unsignalled) {
 
     use crate::containment::cgroup::fault::{fail_terminate, take_member_terms, TerminateStep};
     crate::log_capture::install();
-    let (leaf, mut member, stdin) = entered_real_leaf();
+    let (leaf, mut member) = entered_real_leaf();
     let kernel = std::sync::Arc::new(crate::identity::FakeKernel::over(&crate::identity::HostKernel));
     let leaf = match how {
         Unsignalled::Unplaced => leaf.asking_for_test(crate::identity::spawn_kernel(std::sync::Arc::clone(&kernel))),
@@ -3601,7 +3601,6 @@ fn terminate_reports_a_member_it_could_not_signal(how: Unsignalled) {
     // No send was made, so none is noted, a refused one included.
     assert_eq!(take_member_terms(), []);
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
-    drop(stdin);
     let status = member.wait().expect("reap the member");
     drop(leaf);
     assert_eq!(status.signal(), None, "the member got no SIGTERM: {status:?}");
@@ -3655,7 +3654,7 @@ fn cgroup_terminate_reports_a_member_whose_sigterm_failed(#[fixture(cgroup)] _gr
 #[skuld::test]
 fn cgroup_terminate_leaves_alone_a_member_that_left_after_the_listing(#[fixture(cgroup)] _group: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
-    let (leaf, mut member, stdin) = entered_real_leaf();
+    let (leaf, mut member) = entered_real_leaf();
     let pid = member.id();
     let _armed = crate::containment::cgroup::fault::set_after_procs_read(move || {
         crate::child::front_cgroup_tests::move_out_of_its_leaf(pid);
@@ -3663,7 +3662,6 @@ fn cgroup_terminate_leaves_alone_a_member_that_left_after_the_listing(#[fixture(
     crate::containment::cgroup::fault::take_member_terms();
     leaf.terminate().expect("cgroup.procs is readable").expect("terminate");
     assert_eq!(crate::containment::cgroup::fault::take_member_terms(), []);
-    drop(stdin);
     let status = member.wait().expect("reap the member");
     assert_eq!(status.signal(), None, "the member exited on its own EOF: {status:?}");
     drop(leaf);
@@ -3676,12 +3674,11 @@ fn cgroup_terminate_leaves_alone_a_member_that_left_after_the_listing(#[fixture(
 #[skuld::test]
 fn cgroup_terminate_sends_a_member_its_sigterm(#[fixture(cgroup)] _group: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
-    let (leaf, mut member, stdin) = entered_real_leaf();
+    let (leaf, mut member) = entered_real_leaf();
     let pid = member.id();
     crate::containment::cgroup::fault::take_member_terms();
     let result = leaf.terminate().expect("cgroup.procs is readable");
     let noted = crate::containment::cgroup::fault::take_member_terms();
-    drop(stdin);
     let status = member.wait().expect("reap the member");
     drop(leaf);
     assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status:?}");
@@ -3697,7 +3694,9 @@ fn cgroup_terminate_sends_a_member_its_sigterm(#[fixture(cgroup)] _group: &Group
 #[skuld::test]
 fn cgroup_terminate_counts_a_member_reaped_after_its_pin_as_gone(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
-    let (leaf, member, _stdin) = entered_real_leaf();
+    let (leaf, member) = entered_real_leaf();
+    #[allow(clippy::zombie_processes, reason = "reaped behind std, by pid, in the pin's seam")]
+    let member = member.into_inner();
     let pid = member.id();
     let leaf_name = leaf
         .path()
@@ -3742,7 +3741,7 @@ fn cgroup_terminate_counts_a_member_reaped_after_its_pin_as_gone(#[fixture(cgrou
 fn cgroup_terminate_signals_a_member_when_the_leafs_id_cannot_be_read(#[fixture(cgroup)] _group: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
-    let (leaf, mut member, stdin) = entered_real_leaf();
+    let (leaf, mut member) = entered_real_leaf();
     let pid = member.id();
     let leaf_name = leaf_name_of(&leaf);
     let _no_id = crate::containment::cgroup::fault::fail_cgroup_id(libc::EPERM);
@@ -3751,7 +3750,6 @@ fn cgroup_terminate_signals_a_member_when_the_leafs_id_cannot_be_read(#[fixture(
     let result = leaf.terminate().expect("cgroup.procs is readable");
     let noted = crate::containment::cgroup::fault::take_member_terms();
     let records = crate::log_capture::records_since_on_current_thread(mark, &leaf_name);
-    drop(stdin);
     let status = member.wait().expect("reap the member");
     drop(_no_id);
     drop(leaf);
@@ -3801,15 +3799,9 @@ fn leaf_name_of(leaf: &crate::containment::cgroup::CgroupLeaf) -> String {
         .into_owned()
 }
 
-/// A real leaf with `n` members, each a blocker on a piped stdin it holds open, and those pipes'
-/// write ends: dropping one ends its member.
+/// A real leaf with `n` members, each a blocker on its own piped stdin: `member.wait()` closes it.
 #[cfg(target_os = "linux")]
-fn real_leaf_with_members(
-    n: usize,
-) -> (
-    crate::containment::cgroup::CgroupLeaf,
-    Vec<(std::process::Child, std::process::ChildStdin)>,
-) {
+fn real_leaf_with_members(n: usize) -> (crate::containment::cgroup::CgroupLeaf, Vec<StdChild>) {
     use std::os::unix::process::CommandExt;
 
     let leaf =
@@ -3817,17 +3809,15 @@ fn real_leaf_with_members(
             .expect("create a real leaf");
     let members = (0..n)
         .map(|_| {
-            let mut cmd = crate::test_child::held_std_blocker(std::process::Stdio::null());
             let procs_fd = leaf.procs_fd();
-            // SAFETY: as `entered_real_leaf_of`'s member spawn: the closure runs between fork and
-            // exec, and `leaf` outlives the spawn.
-            unsafe {
-                cmd.pre_exec(move || crate::containment::cgroup::test_support::place_in_pre_exec(procs_fd));
-            }
             // std's spawn returns after the `exec`: a member whose placement write failed is no member.
-            let mut member = crate::test_spawn::spawn(&mut cmd).expect("spawn a member that entered the leaf");
-            let stdin = member.stdin.take().expect("piped stdin");
-            (member, stdin)
+            blocker_with(|cmd| {
+                // SAFETY: as `entered_real_leaf_of`'s member spawn: the closure runs between fork and
+                // exec, and `leaf` outlives the spawn.
+                unsafe {
+                    cmd.pre_exec(move || crate::containment::cgroup::test_support::place_in_pre_exec(procs_fd));
+                }
+            })
         })
         .collect();
     (leaf, members)
@@ -3843,7 +3833,7 @@ fn real_leaf_with_members(
 fn cgroup_terminate_reports_a_listed_pid_zero_as_unassessable(#[fixture(cgroup)] _group: &Group) {
     use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
-    let (leaf, mut member, stdin) = entered_real_leaf();
+    let (leaf, mut member) = entered_real_leaf();
     let pid = member.id();
     let leaf_name = leaf
         .path()
@@ -3859,7 +3849,6 @@ fn cgroup_terminate_reports_a_listed_pid_zero_as_unassessable(#[fixture(cgroup)]
 "
     ));
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
-    drop(stdin);
     let status = member.wait().expect("reap the member");
     drop(leaf);
     assert_eq!(
@@ -3953,7 +3942,7 @@ fn cgroup_terminate_reports_a_member_whose_exit_could_not_be_read(#[fixture(cgro
 
     use crate::containment::cgroup::fault::{fail_terminate, take_member_terms, TerminateStep};
     crate::log_capture::install();
-    let (leaf, mut member, stdin) = entered_real_leaf();
+    let (leaf, mut member) = entered_real_leaf();
     let pid = member.id();
     let leaf_name = leaf_name_of(&leaf);
     take_member_terms();
@@ -3963,7 +3952,6 @@ fn cgroup_terminate_reports_a_member_whose_exit_could_not_be_read(#[fixture(cgro
     drop(guard);
     let noted = take_member_terms();
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
-    drop(stdin);
     let status = member.wait().expect("reap the member");
     drop(leaf);
     assert_eq!(status.signal(), None, "the member got no SIGTERM: {status:?}");
@@ -3991,7 +3979,7 @@ fn cgroup_terminate_reports_a_member_whose_place_and_exit_cannot_be_read(#[fixtu
     use std::os::unix::process::ExitStatusExt as _;
 
     use crate::containment::cgroup::fault::{fail_terminate, take_member_terms, TerminateStep};
-    let (leaf, mut member, stdin) = entered_real_leaf();
+    let (leaf, mut member) = entered_real_leaf();
     // Neither route can place the member (`/proc` hides it, and no pidfd gives its cgroup), and its
     // exit cannot be read either.
     let kernel = std::sync::Arc::new(crate::identity::FakeKernel::over(&crate::identity::HostKernel));
@@ -4006,7 +3994,6 @@ fn cgroup_terminate_reports_a_member_whose_place_and_exit_cannot_be_read(#[fixtu
     drop(hidden);
     drop(guard);
     let noted = take_member_terms();
-    drop(stdin);
     let status = member.wait().expect("reap the member");
     drop(leaf);
     assert_eq!(status.signal(), None, "the member got no SIGTERM: {status:?}");
@@ -4174,7 +4161,7 @@ fn a_member_whose_placement_fails_is_named_with_the_os_text_once() {
 fn cgroup_terminate_does_not_signal_a_member_that_exited_unreaped(#[fixture(cgroup)] _group: &Group) {
     use crate::containment::cgroup::fault::take_member_terms;
     crate::log_capture::install();
-    let (leaf, mut member, stdin) = entered_real_leaf();
+    let (leaf, mut member) = entered_real_leaf();
     let pid = member.id();
     let leaf_name = leaf_name_of(&leaf);
     // SAFETY: `pid` is this test's own unreaped child.
@@ -4189,7 +4176,6 @@ fn cgroup_terminate_does_not_signal_a_member_that_exited_unreaped(#[fixture(cgro
     let result = leaf.terminate_listed(&format!("{pid}\n"));
     let noted = take_member_terms();
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
-    drop(stdin);
     member.wait().expect("reap the member");
     drop(leaf);
     result.expect("a member that exited is not a failure");
@@ -4204,10 +4190,9 @@ fn cgroup_terminate_does_not_signal_a_member_that_exited_unreaped(#[fixture(cgro
 fn cgroup_terminate_counts_a_member_gone_before_its_pin_as_gone(#[fixture(cgroup)] _group: &Group) {
     use crate::containment::cgroup::fault::take_member_terms;
     crate::log_capture::install();
-    let (leaf, mut member, stdin) = entered_real_leaf();
+    let (leaf, mut member) = entered_real_leaf();
     let pid = member.id();
     let leaf_name = leaf_name_of(&leaf);
-    drop(stdin);
     member.wait().expect("reap the member");
     take_member_terms();
     let mark = crate::log_capture::mark();
@@ -4232,7 +4217,7 @@ fn cgroup_terminate_counts_a_member_gone_at_its_send_as_gone(#[fixture(cgroup)] 
 
     use crate::containment::cgroup::fault::{fail_terminate, take_member_terms, TerminateStep};
     crate::log_capture::install();
-    let (leaf, mut member, stdin) = entered_real_leaf();
+    let (leaf, mut member) = entered_real_leaf();
     let pid = member.id();
     let leaf_name = leaf_name_of(&leaf);
     take_member_terms();
@@ -4244,7 +4229,6 @@ fn cgroup_terminate_counts_a_member_gone_at_its_send_as_gone(#[fixture(cgroup)] 
     let exited =
         crate::log_capture::records_since_on_current_thread(mark, &format!("pid {pid} exited before its SIGTERM"));
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
-    drop(stdin);
     let status = member.wait().expect("reap the member");
     drop(leaf);
     assert_eq!(status.signal(), None, "the seam refused the send: {status:?}");
@@ -4262,7 +4246,9 @@ fn cgroup_terminate_counts_a_member_gone_at_its_send_as_gone(#[fixture(cgroup)] 
 #[skuld::test]
 fn cgroup_terminate_counts_a_member_reaped_after_its_pin_as_gone_through_proc(#[fixture(cgroup)] _group: &Group) {
     crate::log_capture::install();
-    let (leaf, member, _stdin) = entered_real_leaf();
+    let (leaf, member) = entered_real_leaf();
+    #[allow(clippy::zombie_processes, reason = "reaped behind std, by pid, in the pin's seam")]
+    let member = member.into_inner();
     let pid = member.id();
     let leaf_name = leaf_name_of(&leaf);
     let _armed = crate::containment::cgroup::fault::set_after_terminate_pin(move || {
@@ -4303,7 +4289,7 @@ fn cgroup_terminate_tries_every_member_after_one_fails(#[fixture(cgroup)] _group
 
     use crate::containment::cgroup::fault::{fail_terminate_once, take_member_terms, TerminateStep};
     let (leaf, mut members) = real_leaf_with_members(2);
-    let pids: Vec<u32> = members.iter().map(|(m, _)| m.id()).collect();
+    let pids: Vec<u32> = members.iter().map(|m| m.id()).collect();
     take_member_terms();
     let guard = fail_terminate_once(TerminateStep::Pin, libc::EMFILE);
     let result = leaf.terminate_listed(&format!("{}\n{}\n", pids[0], pids[1]));
@@ -4311,10 +4297,7 @@ fn cgroup_terminate_tries_every_member_after_one_fails(#[fixture(cgroup)] _group
     let noted = take_member_terms();
     let statuses: Vec<_> = members
         .drain(..)
-        .map(|(mut member, stdin)| {
-            drop(stdin);
-            member.wait().expect("reap the member")
-        })
+        .map(|mut member| member.wait().expect("reap the member"))
         .collect();
     drop(leaf);
     assert_eq!(statuses[0].signal(), None, "the unpinned member got no SIGTERM");
@@ -4344,7 +4327,7 @@ fn cgroup_terminate_reports_every_member_that_got_no_sigterm_in_one_error_and_wa
     use crate::containment::cgroup::fault::{fail_terminate, take_member_terms, TerminateStep};
     crate::log_capture::install();
     let (leaf, mut members) = real_leaf_with_members(2);
-    let pids: Vec<u32> = members.iter().map(|(m, _)| m.id()).collect();
+    let pids: Vec<u32> = members.iter().map(|m| m.id()).collect();
     let leaf_name = leaf_name_of(&leaf);
     take_member_terms();
     let mark = crate::log_capture::mark();
@@ -4354,8 +4337,7 @@ fn cgroup_terminate_reports_every_member_that_got_no_sigterm_in_one_error_and_wa
     drop(guard);
     let noted = take_member_terms();
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
-    for (mut member, stdin) in members.drain(..) {
-        drop(stdin);
+    for mut member in members.drain(..) {
         member.wait().expect("reap the member");
     }
     drop(leaf);

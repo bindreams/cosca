@@ -1755,8 +1755,7 @@ fn resolve_identity_of_a_reaped_child_whose_pid_a_same_tick_reuser_holds_is_gone
         clippy::zombie_processes,
         reason = "reaped through its pidfd; waiting by its number could reach a reused pid"
     )]
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn the child");
+    let mut child = crate::test_child::blocker().into_inner();
     let pid = child.id();
     let raw = Pid::from_raw(pid as i32).expect("a child's pid is nonzero");
     let pidfd = pidfd_open(raw, PidfdFlags::empty()).expect("pidfd_open the child");
@@ -1795,20 +1794,11 @@ fn held_through(kernel: &crate::identity::FakeKernel<'_>, pid: u32) -> std::os::
 
 /// A live child, and a pidfd to it that the test holds.
 #[cfg(target_os = "linux")]
-fn live_child_with_pidfd() -> (std::process::Child, std::os::fd::OwnedFd) {
-    #[allow(clippy::zombie_processes, reason = "the test reaps it with `release`")]
-    let child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn the child");
+fn live_child_with_pidfd() -> (crate::test_child::StdChild, std::os::fd::OwnedFd) {
+    let child = crate::test_child::blocker();
     let raw = rustix::process::Pid::from_raw(child.id() as i32).expect("a child's pid is nonzero");
     let pidfd = rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()).expect("pidfd_open the child");
     (child, pidfd)
-}
-
-/// Let the child of [`live_child_with_pidfd`] exit and reap it.
-#[cfg(target_os = "linux")]
-fn release(mut child: std::process::Child) {
-    drop(child.stdin.take());
-    child.wait().expect("reap the child");
 }
 
 /// The spawn reads its child's identity from the pidfd it holds: a `pidfd_open` of the pid that
@@ -1833,7 +1823,6 @@ fn resolve_identity_reads_the_held_pidfd_and_needs_no_second_open() {
         Some(id),
         "the key read from the held pidfd is the one the by-pid read gives"
     );
-    release(child);
 }
 
 /// A held pidfd whose `fstat` fails says nothing about the child: `Unknown`, as a by-pid read that
@@ -1851,7 +1840,6 @@ fn resolve_identity_with_a_failing_fstat_on_the_held_pidfd_is_unknown() {
     let held = OwnedChild::over_pidfd(HostKernel, Some(pid), held_through(&kernel, pid));
     let (read, _, _) = super::resolve_identity(&kernel, pid, &held);
     assert!(matches!(read, Resolved::Unknown), "{read:?}");
-    release(child);
 }
 
 /// Where the held pidfd has no inode of its own (before Linux 6.9), the identity is the `/proc`
@@ -1873,7 +1861,6 @@ fn resolve_identity_with_a_held_pidfd_that_has_no_inode_reads_proc() {
         Resolved::Found(id) => assert_eq!(id, crate::identity::ticks_id(pid)),
         other => panic!("{other:?}"),
     }
-    release(child);
 }
 
 /// The held pidfd of a reaped child still names it: its inode reads as a key (the row states one, so
@@ -1892,8 +1879,7 @@ fn resolve_identity_of_a_reaped_child_is_gone() {
         clippy::zombie_processes,
         reason = "reaped through its pidfd; waiting by its number could reach a reused pid"
     )]
-    let mut child = crate::test_spawn::spawn(&mut crate::test_child::held_std_blocker(std::process::Stdio::null()))
-        .expect("spawn the child");
+    let mut child = crate::test_child::blocker().into_inner();
     let pid = child.id();
     let raw = Pid::from_raw(pid as i32).expect("a child's pid is nonzero");
     let pidfd = pidfd_open(raw, PidfdFlags::empty()).expect("pidfd_open the child");
