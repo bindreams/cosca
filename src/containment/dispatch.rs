@@ -1492,10 +1492,10 @@ pub(crate) fn prepare(
     )]
     teardown_warn_after: Option<std::time::Duration>,
     #[cfg_attr(
-        not(target_os = "linux"),
+        not(any(target_os = "linux", target_os = "macos")),
         allow(
             unused_variables,
-            reason = "only a Linux cgroup leaf owns a clone of the spawn's kernel"
+            reason = "only a Linux cgroup leaf and a macOS fd marker own a clone of the spawn's kernel"
         )
     )]
     kernel: &crate::identity::SpawnKernel,
@@ -1656,7 +1656,7 @@ pub(crate) fn prepare(
     // `Strongest` spawn; every other mode degrades to the mechanism the marker outranks.
     #[cfg(target_os = "macos")]
     let marker = if crate::containment::fdmarker::marker_wanted(mode, is_root, marker_suppressed) {
-        match crate::containment::fdmarker::install(steps, reserved_fds) {
+        match crate::containment::fdmarker::install(steps, reserved_fds, kernel) {
             Ok(marker) => Some(marker),
             Err(e) if mode.is_some_and(ContainMode::is_strict) => return Err(e),
             Err(e) => {

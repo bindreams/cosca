@@ -601,6 +601,14 @@ impl Ready {
 /// tracee), and waits until it is set up. Its handlers and signal mask are then final: the test
 /// may read them and attach.
 pub(crate) fn spawn_tracee(kind: Tracee) -> (crate::Child, Ready) {
+    spawn_tracee_over(kind, crate::identity::HostKernel)
+}
+
+/// [`spawn_tracee`] over `kernel`, the one the spawn and its box ask.
+pub(crate) fn spawn_tracee_over(
+    kind: Tracee,
+    kernel: impl crate::identity::Kernel + Send + 'static,
+) -> (crate::Child, Ready) {
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.executable(&exe)
@@ -613,7 +621,9 @@ pub(crate) fn spawn_tracee(kind: Tracee) -> (crate::Child, Ready) {
     cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
     cmd.stderr(crate::Stdio::null()).expect("stderr null");
-    let mut tracee = cmd.spawn().expect("spawn the tracee fixture");
+    let mut tracee = crate::child::spawn::spawn_with(&mut cmd, kernel)
+        .map_err(crate::error::Error::from)
+        .expect("spawn the tracee fixture");
     let ready = await_ready(&mut tracee);
     (tracee, ready)
 }

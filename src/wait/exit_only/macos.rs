@@ -5,7 +5,7 @@
 
 use std::io;
 
-use crate::identity::{held_by, uniq_info, Held, Kernel, ReadPurpose, UniqRead, LAUNCHD};
+use crate::identity::{held_by, Held, Kernel, UniqRead, LAUNCHD};
 
 use super::{exit_record_of, is_exit_record, Reap, Target};
 use crate::os_process::child::{Foreign, PeekOutcome};
@@ -30,7 +30,7 @@ fn peek_raw(kernel: &dyn Kernel, pid: u32) -> io::Result<PeekOutcome> {
     }
 }
 
-/// Whether `pid`'s unique id, read for `purpose`, is `unique`.
+/// Whether `pid`'s unique id is `unique`.
 enum IdCheck {
     Matches,
     Other,
@@ -39,8 +39,8 @@ enum IdCheck {
     Unreadable(i32),
 }
 
-fn check_unique(kernel: &dyn Kernel, pid: u32, unique: u64, purpose: ReadPurpose) -> IdCheck {
-    match uniq_info(kernel, pid, purpose) {
+fn check_unique(kernel: &dyn Kernel, pid: u32, unique: u64) -> IdCheck {
+    match kernel.unique_info(pid) {
         UniqRead::Found(now) if now.unique_id == unique => IdCheck::Matches,
         UniqRead::Found(_) => IdCheck::Other,
         UniqRead::Gone => IdCheck::Gone,
@@ -66,7 +66,7 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
         return Ok((peeked, None));
     };
     match peeked {
-        PeekOutcome::Exit(_) => match check_unique(kernel, pid, unique, ReadPurpose::Peek) {
+        PeekOutcome::Exit(_) => match check_unique(kernel, pid, unique) {
             IdCheck::Matches => Ok((peeked, None)),
             IdCheck::Other => Ok((PeekOutcome::Foreign(Foreign::Other), None)),
             IdCheck::Gone => Ok((PeekOutcome::Foreign(Foreign::Gone), None)),
@@ -80,7 +80,7 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
         },
         // `waitid` found a child of ours that has not exited. A foreign reap followed by a reuse
         // of the pid by another child of ours also looks like this, so the id decides.
-        PeekOutcome::Running => match check_unique(kernel, pid, unique, ReadPurpose::Running) {
+        PeekOutcome::Running => match check_unique(kernel, pid, unique) {
             IdCheck::Other => Ok((PeekOutcome::Foreign(Foreign::Other), None)),
             // `waitid` found the child running and the id read finds no such process: it was
             // reaped in between, so nothing is left to call running.
@@ -106,7 +106,7 @@ pub(super) fn peek_holder(target: &Target<'_>, verified: bool) -> io::Result<(Pe
         // (see `Foreign::fate`). The sync child's later `wait` or `try_wait` still reaps the zombie
         // if that hand-back ever comes. A spawn that meets it fails with its child `Gone`, and its
         // child (dropped) is not reaped by pid, so a hand-back leaves the zombie.
-        PeekOutcome::Foreign(Foreign::Gone) => match held_by(kernel, pid, unique, ReadPurpose::Echild) {
+        PeekOutcome::Foreign(Foreign::Gone) => match held_by(kernel, pid, unique) {
             Held::Other => Ok((PeekOutcome::Foreign(Foreign::Other), None)),
             Held::Parent(ppid) if ppid == LAUNCHD => Ok((PeekOutcome::Foreign(Foreign::Orphaned), None)),
             // A tracer detached between the two reads: our child again.
@@ -141,7 +141,7 @@ pub(super) fn try_reap(target: &Target<'_>) -> io::Result<Reap> {
     // Our own zombie's unique id, read before the first reap: the first reap does not change it
     // (`proc_reparentlocked` returns early when the parent is unchanged, `kern_exit.c:3411`),
     // and the second peek checks it.
-    let second_unique = unique.or_else(|| match uniq_info(kernel, pid, ReadPurpose::PreReap) {
+    let second_unique = unique.or_else(|| match kernel.unique_info(pid) {
         UniqRead::Found(now) => Some(now.unique_id),
         UniqRead::Gone | UniqRead::Refused(_) => None,
     });
@@ -194,7 +194,7 @@ pub(crate) fn second_reap(kernel: &dyn Kernel, pid: u32, unique: Option<u64>) {
         log::warn!("second reap of pid {pid}: no identity to check it against; a zombie may be left");
         return;
     };
-    match check_unique(kernel, pid, unique, ReadPurpose::SecondPeek) {
+    match check_unique(kernel, pid, unique) {
         IdCheck::Matches => {}
         IdCheck::Other | IdCheck::Gone => {
             log::debug!("second reap of pid {pid}: the pid names another process now");

@@ -8,6 +8,7 @@
 //! and the token-vs-libproc / ppid-vs-libproc oracles (kinfo_tests.rs).
 
 use super::super::{RawPid, Resolved};
+#[cfg(test)]
 use super::kernel::Kernel;
 
 /// `struct kinfo_proc` (LP64): `extern_proc` head + opaque `eproc` tail.
@@ -209,63 +210,6 @@ pub(crate) fn exit_state(p_stat: libc::c_char, p_flag: libc::c_int) -> ExitState
 /// Whether the exit has begun: [`ExitState::Exiting`] or [`ExitState::Zombie`].
 pub(crate) fn exit_begun(p_stat: libc::c_char, p_flag: libc::c_int) -> bool {
     exit_state(p_stat, p_flag) != ExitState::Running
-}
-
-/// Read one `kinfo_proc` for `pid`. `None` means "not resolvable" — the EXPECTED miss is
-/// a nonexistent pid (sysctl SUCCESS with `size == 0`); a real sysctl failure or a
-/// wrong-sized record is a contract violation and leaves a trace before the same `None`.
-/// EINTR retries, per the codebase convention.
-pub(crate) fn kinfo(kernel: &dyn Kernel, pid: RawPid) -> Resolved<kinfo_proc> {
-    #[cfg(test)]
-    if let Some((oppid, ppid)) = fault::forced_parents(pid) {
-        return match kernel.kinfo(pid).0 {
-            Resolved::Found(mut info) => {
-                info.kp_proc.p_oppid = oppid;
-                info.set_e_ppid(ppid);
-                Resolved::Found(info)
-            }
-            other => other,
-        };
-    }
-    kernel.kinfo(pid).0
-}
-
-/// Forces the parents of a [`kinfo`] read.
-#[cfg(test)]
-pub(crate) mod fault {
-    /// What [`force_parents`] answers: `(p_oppid, e_ppid)`.
-    type Parents = Box<dyn FnMut() -> (libc::pid_t, libc::pid_t)>;
-
-    thread_local! {
-        static PARENTS: std::cell::RefCell<Option<(crate::identity::RawPid, Parents)>> = const { std::cell::RefCell::new(None) };
-    }
-
-    /// While the guard lives, every [`kinfo`](super::kinfo) of `pid` on this thread that finds its
-    /// process reports the `(p_oppid, e_ppid)` that `parents` answers at that read: the parent at a
-    /// tracer's attach, and the parent now.
-    pub(crate) fn force_parents(
-        pid: crate::identity::RawPid,
-        parents: impl FnMut() -> (libc::pid_t, libc::pid_t) + 'static,
-    ) -> ForcedParents {
-        PARENTS.with(|p| *p.borrow_mut() = Some((pid, Box::new(parents))));
-        ForcedParents(())
-    }
-
-    #[must_use = "the reads are real again as soon as the guard is dropped"]
-    pub(crate) struct ForcedParents(());
-
-    impl Drop for ForcedParents {
-        fn drop(&mut self) {
-            PARENTS.with(|p| p.borrow_mut().take());
-        }
-    }
-
-    pub(super) fn forced_parents(pid: crate::identity::RawPid) -> Option<(libc::pid_t, libc::pid_t)> {
-        PARENTS.with(|p| match p.borrow_mut().as_mut() {
-            Some((forced, parents)) if *forced == pid => Some(parents()),
-            _ => None,
-        })
-    }
 }
 
 /// [`Kernel::kinfo`] as the host kernel answers it: the `sysctl` itself, with the failure that left

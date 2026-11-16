@@ -58,7 +58,7 @@ fn contract_violation_traces_then_trips() {
 fn sysctl_token_matches_libproc_for_a_live_process() {
     let pid = std::process::id() as libc::c_int;
 
-    let crate::identity::Resolved::Found(ours) = kinfo(&HostKernel, pid as super::super::RawPid) else {
+    let (crate::identity::Resolved::Found(ours), _) = HostKernel.kinfo(pid as super::super::RawPid) else {
         panic!("self resolves via sysctl");
     };
     let ours = {
@@ -166,7 +166,7 @@ fn sysctl_e_ppid_matches_libproc_across_the_live_process_table() {
         };
         let libproc_ppid = (n == size).then_some(info.pbi_ppid);
 
-        let sysctl_ppid = match kinfo(&HostKernel, pid_raw) {
+        let sysctl_ppid = match HostKernel.kinfo(pid_raw).0 {
             crate::identity::Resolved::Found(k) => Some(k.e_ppid() as super::super::RawPid),
             crate::identity::Resolved::Gone | crate::identity::Resolved::Unknown => None,
         };
@@ -219,7 +219,7 @@ fn sysctl_e_ppid_matches_libproc_across_the_live_process_table() {
 // root-owned pid measured here (pid 0 or pid 1): it fails to resolve a foreign-uid process
 // without root, the same as it fails for pid 0. The positive case (pid 0) is instead
 // cross-checked against a second, independently-issued sysctl call reading the WHOLE process
-// table (`KERN_PROC_ALL`, a different selector/code path from `kinfo()`'s own `KERN_PROC_PID`)
+// table (`KERN_PROC_ALL`, a different selector/code path from `Kernel::kinfo`'s own `KERN_PROC_PID`)
 // rather than trusting one query alone. The negative case is checked for both pid 1 (sysctl
 // only) and this test's own process — the latter additionally cross-checked against
 // `proc_pidinfo`'s independently-defined `PROC_FLAG_SYSTEM` (`sys/proc_info.h`, no `libc`
@@ -228,8 +228,8 @@ fn sysctl_e_ppid_matches_libproc_across_the_live_process_table() {
 fn p_flag_system_bit_matches_a_second_sysctl_query_and_libproc_disagrees_for_non_system() {
     const PROC_FLAG_SYSTEM: u32 = 1;
 
-    // Positive: kernproc (pid 0), read via `kinfo()` (production code path, KERN_PROC_PID).
-    let crate::identity::Resolved::Found(k) = kinfo(&HostKernel, 0) else {
+    // Positive: kernproc (pid 0), read via `Kernel::kinfo` (production code path, KERN_PROC_PID).
+    let (crate::identity::Resolved::Found(k), _) = HostKernel.kinfo(0) else {
         panic!("pid 0 (kernproc) resolves via sysctl KERN_PROC_PID");
     };
     assert!(
@@ -289,7 +289,7 @@ fn p_flag_system_bit_matches_a_second_sysctl_query_and_libproc_disagrees_for_non
     // fails to resolve a foreign-uid pid without root, same as it fails for pid 0 above — so
     // only this test's own pid gets the `proc_pidinfo` cross-check, right below.
     for pid in [1, std::process::id() as libc::c_int] {
-        let crate::identity::Resolved::Found(k) = kinfo(&HostKernel, pid as super::super::RawPid) else {
+        let (crate::identity::Resolved::Found(k), _) = HostKernel.kinfo(pid as super::super::RawPid) else {
             panic!("pid {pid} resolves via sysctl");
         };
         assert!(
@@ -336,7 +336,9 @@ fn exit_begun_is_p_wexit_or_a_zombie_and_no_other_flag() {
     assert_eq!(exit_state(zombie, 0), ExitState::Zombie);
     assert_eq!(exit_state(zombie, P_WEXIT), ExitState::Zombie);
 
-    let me = kinfo(&HostKernel, std::process::id())
+    let me = HostKernel
+        .kinfo(std::process::id())
+        .0
         .found()
         .expect("this process resolves");
     assert!(

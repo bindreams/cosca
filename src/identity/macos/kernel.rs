@@ -20,7 +20,8 @@ pub(crate) trait Kernel: Sync {
     /// `waitid(P_PID, pid, WEXITED | WNOHANG)`: the record this call consumes.
     fn consume(&self, pid: u32) -> io::Result<Option<Record>>;
 
-    /// `proc_pidinfo(PROC_PIDUNIQIDENTIFIERINFO, 1)`.
+    /// `proc_pidinfo(PROC_PIDUNIQIDENTIFIERINFO, 1)`: a process's unique id, unprivileged for any
+    /// user's process, and it sees zombies.
     fn unique_info(&self, pid: RawPid) -> UniqRead;
 
     /// `proc_pidinfo(PROC_PIDT_SHORTBSDINFO, 1)`.

@@ -83,7 +83,7 @@ fn assert_job_control_reaches(pid: u32, ready: &super::Ready, signal: i32) {
         ready.pgrp, pid as libc::pid_t,
         "precondition: the tracee does not lead its own process group. Spawn it as Tracee::OwnGroup"
     );
-    let jobc = match crate::identity::kinfo::kinfo(&crate::identity::HostKernel, pid as _) {
+    let jobc = match crate::identity::Kernel::kinfo(&crate::identity::HostKernel, pid as _).0 {
         crate::identity::Resolved::Found(info) => info.e_jobc(),
         crate::identity::Resolved::Gone => panic!("precondition: the tracee {pid} is gone"),
         crate::identity::Resolved::Unknown => panic!("precondition: kinfo refused to read the tracee {pid}"),

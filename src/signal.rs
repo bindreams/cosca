@@ -229,8 +229,8 @@ pub(crate) fn send_pidfd(
 /// report (`child::spawn::unique_report`).
 #[cfg(all(target_os = "macos", test))]
 pub(crate) fn read_identity(kernel: &dyn crate::identity::Kernel, pid: u32) -> Result<Option<u64>, i32> {
-    use crate::identity::{uniq_info, ReadPurpose, UniqRead};
-    match uniq_info(kernel, pid, ReadPurpose::Adopt) {
+    use crate::identity::UniqRead;
+    match kernel.unique_info(pid) {
         UniqRead::Found(info) => Ok(Some(info.unique_id)),
         UniqRead::Gone => Ok(None),
         UniqRead::Refused(errno) => Err(errno),

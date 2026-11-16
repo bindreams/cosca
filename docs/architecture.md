@@ -48,11 +48,11 @@ The OS layer owns the kernel it asks, on every platform. `os_process::open_with(
 lends it through `OsChild::kernel()`. A spawn starts with one kernel (`spawn_with(cmd, kernel)`;
 production passes `HostKernel`), erased once at its entry into a `SpawnKernel`, an `Arc<dyn Kernel +
 Send>`, so the spawn body below the entry is not generic. The child's box owns it, and the cgroup
-leaf and the placement probe's box each own a clone of the `Arc`; the spawn's own reads ask it as
-`&dyn Kernel`. A borrow, a `Box` and an `Arc` of a kernel are kernels, so the walks, which open one
-process per member from one borrowed kernel, pass `&dyn Kernel`, and tests move a `FakeKernel` in.
-`Process` and `OwnedChild` hold a `Box<dyn OsProcess>` or `Box<dyn OsChild>`: the kernel's type stops
-at the OS layer.
+leaf, the placement probe's box and the macOS fd marker each own a clone of the `Arc`; the spawn's
+own reads ask it as `&dyn Kernel`. A borrow, a `Box` and an `Arc` of a kernel are kernels, so the
+walks, which open one process per member from one borrowed kernel, pass `&dyn Kernel`, and tests
+move a `FakeKernel` in. `Process` and `OwnedChild` hold a `Box<dyn OsProcess>` or
+`Box<dyn OsChild>`: the kernel's type stops at the OS layer.
 
 The public types follow the same line:
 
@@ -135,16 +135,17 @@ In order:
      kqueue the kernel refused is killed through its unique id, its marker's holders swept, warned
      of and never waited on.
    - Under `MacosChild` ([#877](https://github.com/bindreams/cosca/issues/877), the macOS
-     kernel-view slice): macOS's `Kernel` has its methods and is threaded through. Tests state
-     `FakeKernel` rows (a spawn-level one via `spawn_with` over `FakeKernel::over(&HostKernel)`; a
-     row for a pid only the spawn knows via `state_peek`). Hooks remain only where no row can state
-     the answer (`uniq_fault`, `ppid_fault`, `force_parents`, `force_links`, `by_pid_reads`). The
-     Linux peek and consume are `Kernel::peek`/`consume` (see their docs). `HostKernel`'s own `sysctl`
-     read states no row, so what a sysctl result means (`ESRCH`, `EPERM`/`EACCES` quiet; any other
-     errno or a record of another size a `contract_violation`) is the pure `kinfo::classify`,
-     tested directly. No Windows test forces a peek. A
-     registration (an exit watch's, a reap waiter's) is a `subscribe` row: refused with `ESRCH`, or
-     made and never firing.
+     kernel-view slice): macOS's `Kernel` is threaded through the spawn: the box and the fd
+     marker's sweeps ask the kernel the spawn started with.
+     Tests state `FakeKernel` rows, a whole spawn's too (`spawn_with` over
+     `FakeKernel::over(&HostKernel)`; a row about a pid no test knows before the spawn is stated
+     from a spawn hook, `FakeKernel::state_*`). No test hook answers a read in the kernel's place.
+     The Linux peek and consume are `Kernel::peek`/`consume` (see their docs). `HostKernel`'s own
+     `sysctl` read states no row, so what a sysctl result means (`ESRCH`, `EPERM`/`EACCES` quiet;
+     any other errno or a record of another size a `contract_violation`) is the pure
+     `kinfo::classify`, tested directly. No Windows test forces a peek. A registration (an exit
+     watch's, a reap waiter's) is a `subscribe` row: refused with `ESRCH`, or made and never
+     firing.
 2. **Elevation backends:** a black box that says what the tracked process is (the program, or a
    wrapper that outlives it) and what may be signalled. `Child` asks it; it stops knowing sudo,
    doas or osascript.

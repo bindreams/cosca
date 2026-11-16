@@ -47,39 +47,6 @@ fn token_of_kinfo(info: &kinfo::kinfo_proc) -> Key {
     Key::from_raw(start.tv_sec as u64 * 1_000_000 + start.tv_usec as u64)
 }
 
-/// Which identity read a [`uniq_info`] or [`held_by`] call is, so a test can inject a result into
-/// one read without touching the others.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadPurpose {
-    /// The child's identity, read by pid at adoption (test-only).
-    #[cfg_attr(not(test), allow(dead_code, reason = "only the test-only by-pid read uses it"))]
-    Adopt,
-    /// The re-read just before a signal.
-    Kill,
-    /// The read of `os_process::open`, and the one that follows the arming of its exit watch.
-    Open,
-    /// A peek that found an exit record, just before its consume.
-    Peek,
-    /// A peek that found the child running, and the reads of a child's look whose exit watch has not
-    /// fired (its parent, then whether it is a zombie).
-    Running,
-    /// The look that confirms a fired exit watch is a zombie or a reaped process
-    /// ([`ExitWatch::look`](crate::os_process::macos::ExitWatch::look)): its own purpose, so a
-    /// forced read there does not collide with the `Running` reads of the peek and of a child's
-    /// unfired watch.
-    Exit,
-    /// A peek that got `ECHILD`: does the pid still name our child, and who holds it?
-    Echild,
-    /// The own-zombie read before the first reap, for the second peek.
-    PreReap,
-    /// The second peek's.
-    SecondPeek,
-    /// Whether a pid whose unique id is not known yet was forked by this process.
-    Origin,
-    /// A tracer on the chain that holds a child: which process it is, and who holds it.
-    Link,
-}
-
 /// The pid launchd runs as, the parent of every orphan.
 pub(crate) const LAUNCHD: RawPid = 1;
 
@@ -160,20 +127,6 @@ fn warn_partial(pid: RawPid, flavor: libc::c_int, err: &ReadErr) {
     }
 }
 
-/// `pid`'s unique id through `proc_pidinfo(PROC_PIDUNIQIDENTIFIERINFO)`. Unprivileged for any
-/// user's process, and it sees zombies.
-pub(crate) fn uniq_info(kernel: &dyn Kernel, pid: RawPid, purpose: ReadPurpose) -> UniqRead {
-    #[cfg(test)]
-    uniq_fault::note(purpose);
-    #[cfg(test)]
-    if let Some(forced) = uniq_fault::take(purpose) {
-        return forced;
-    }
-    #[cfg(not(test))]
-    let _ = purpose;
-    kernel.unique_info(pid)
-}
-
 /// The calling process's own unique id, for a child to report before `exec`. **Async-signal-safe**:
 /// no allocation, lock or logging. `Err` is the errno.
 pub(crate) fn own_unique_id() -> Result<u64, i32> {
@@ -215,8 +168,8 @@ pub(crate) enum Held {
 /// The parent pid of the process whose unique id is `expected`. The parent is read through
 /// `PROC_PIDT_SHORTBSDINFO`, between two unique-id reads: the same id before and after proves the
 /// parent read was of that process, because a unique id is never reused.
-pub(crate) fn held_by(kernel: &dyn Kernel, pid: RawPid, expected: u64, purpose: ReadPurpose) -> Held {
-    match short_read(kernel, pid, expected, purpose, |pid| short_ppid(kernel, pid)) {
+pub(crate) fn held_by(kernel: &dyn Kernel, pid: RawPid, expected: u64) -> Held {
+    match short_read(kernel, pid, expected, |pid| short_ppid(kernel, pid)) {
         Ok(ppid) => Held::Parent(ppid),
         Err(Mismatch::Other) => Held::Other,
         Err(Mismatch::Gone) => Held::Gone,
@@ -228,8 +181,8 @@ pub(crate) fn held_by(kernel: &dyn Kernel, pid: RawPid, expected: u64, purpose: 
 /// (`PROC_PIDT_SHORTBSDINFO`'s `SZOMB`) between two unique-id reads, as in [`held_by`]. A pid that
 /// names another process now, or none, has had its process reaped: exited. `Err` is the errno of a
 /// refused read.
-pub(crate) fn has_exited(kernel: &dyn Kernel, pid: RawPid, expected: u64, purpose: ReadPurpose) -> Result<bool, i32> {
-    match short_read(kernel, pid, expected, purpose, |pid| short_status(kernel, pid)) {
+pub(crate) fn has_exited(kernel: &dyn Kernel, pid: RawPid, expected: u64) -> Result<bool, i32> {
+    match short_read(kernel, pid, expected, |pid| short_status(kernel, pid)) {
         Ok(status) => Ok(status == libc::SZOMB),
         Err(Mismatch::Other | Mismatch::Gone) => Ok(true),
         Err(Mismatch::Refused(errno)) => Err(errno),
@@ -242,14 +195,9 @@ pub(crate) fn has_exited(kernel: &dyn Kernel, pid: RawPid, expected: u64, purpos
 ///
 /// The bracket is the unique id, not [`exit_begun`]'s start key, because the token send that asks
 /// holds only the unique id.
-pub(crate) fn exit_state_of(
-    kernel: &dyn Kernel,
-    pid: RawPid,
-    expected: u64,
-    purpose: ReadPurpose,
-) -> Resolved<kinfo::ExitState> {
-    let read = short_read(kernel, pid, expected, purpose, |pid| {
-        Ok(match kinfo::kinfo(kernel, pid) {
+pub(crate) fn exit_state_of(kernel: &dyn Kernel, pid: RawPid, expected: u64) -> Resolved<kinfo::ExitState> {
+    let read = short_read(kernel, pid, expected, |pid| {
+        Ok(match kernel.kinfo(pid).0 {
             Resolved::Found(info) => Resolved::Found(kinfo::exit_state(info.kp_proc.p_stat, info.kp_proc.p_flag)),
             // Both id reads matched, so the process was in the pid hash at both ends, and a miss
             // here is `sysctl` and `proc_pidinfo` disagreeing: nothing is known of its exit.
@@ -283,7 +231,6 @@ fn short_read<T>(
     kernel: &dyn Kernel,
     pid: RawPid,
     expected: u64,
-    purpose: ReadPurpose,
     read: impl FnOnce(RawPid) -> Result<T, ReadErr>,
 ) -> Result<T, Mismatch> {
     let same = |read: UniqRead| match read {
@@ -292,9 +239,9 @@ fn short_read<T>(
         UniqRead::Gone => Err(Mismatch::Gone),
         UniqRead::Refused(errno) => Err(Mismatch::Refused(errno)),
     };
-    same(uniq_info(kernel, pid, purpose))?;
+    same(kernel.unique_info(pid))?;
     let read = read(pid);
-    same(uniq_info(kernel, pid, purpose))?;
+    same(kernel.unique_info(pid))?;
     match read {
         Ok(read) => Ok(read),
         // The id matched before and after this read, so the process was in the pid hash at both
@@ -339,17 +286,17 @@ pub(crate) fn origin(kernel: &dyn Kernel, pid: RawPid) -> Origin {
         Ok(own) => own,
         Err(errno) => return Origin::Refused(errno),
     };
-    let unique = match uniq_info(kernel, pid, ReadPurpose::Origin) {
+    let unique = match kernel.unique_info(pid) {
         UniqRead::Found(info) => info.unique_id,
         UniqRead::Gone => return Origin::Gone,
         UniqRead::Refused(errno) => return Origin::Refused(errno),
     };
-    let info = match kinfo::kinfo(kernel, pid) {
+    let info = match kernel.kinfo(pid).0 {
         Resolved::Found(info) => info,
         Resolved::Gone => return Origin::Gone,
         Resolved::Unknown => return Origin::Unreadable,
     };
-    match uniq_info(kernel, pid, ReadPurpose::Origin) {
+    match kernel.unique_info(pid) {
         UniqRead::Found(again) if again.unique_id == unique => {}
         UniqRead::Found(_) => return Origin::NotOurs,
         UniqRead::Gone => return Origin::Gone,
@@ -387,17 +334,17 @@ pub(crate) enum Link {
 /// it when a tracer attached. The `kinfo_proc` read is between two unique-id reads, as in
 /// [`held_by`].
 pub(crate) fn link(kernel: &dyn Kernel, pid: RawPid) -> Link {
-    let unique = match uniq_info(kernel, pid, ReadPurpose::Link) {
+    let unique = match kernel.unique_info(pid) {
         UniqRead::Found(info) => info.unique_id,
         UniqRead::Gone => return Link::Gone,
         UniqRead::Refused(errno) => return Link::Refused(errno),
     };
-    let info = match kinfo::kinfo(kernel, pid) {
+    let info = match kernel.kinfo(pid).0 {
         Resolved::Found(info) => info,
         Resolved::Gone => return Link::Gone,
         Resolved::Unknown => return Link::Unreadable,
     };
-    match uniq_info(kernel, pid, ReadPurpose::Link) {
+    match kernel.unique_info(pid) {
         UniqRead::Found(again) if again.unique_id == unique => Link::Found {
             unique,
             parent: info.e_ppid() as RawPid,
@@ -421,139 +368,11 @@ pub(crate) enum ReadErr {
 }
 
 fn short_ppid(kernel: &dyn Kernel, pid: RawPid) -> Result<u32, ReadErr> {
-    #[cfg(test)]
-    if let Some(forced) = ppid_fault::take() {
-        return forced;
-    }
     kernel.short_bsd(pid).map(|info| info.pbsi_ppid)
 }
 
 fn short_status(kernel: &dyn Kernel, pid: RawPid) -> Result<u32, ReadErr> {
     kernel.short_bsd(pid).map(|info| info.pbsi_status)
-}
-
-/// Forces [`uniq_info`] of a purpose below the syscall.
-#[cfg(test)]
-pub(crate) mod uniq_fault {
-    use std::cell::RefCell;
-
-    use super::{ReadPurpose, UniqRead};
-
-    thread_local! {
-        static FORCED: RefCell<Vec<(ReadPurpose, UniqRead)>> = const { RefCell::new(Vec::new()) };
-    }
-
-    #[must_use = "dropping this immediately disarms the force; bind it for the probe's duration"]
-    pub(crate) struct Forced(());
-
-    /// The next `uniq_info` for `purpose` on this thread answers `read`. Forces queue.
-    pub(crate) fn force_uniq_read_once(purpose: ReadPurpose, read: UniqRead) -> Forced {
-        FORCED.with(|f| f.borrow_mut().push((purpose, read)));
-        Forced(())
-    }
-
-    impl Drop for Forced {
-        fn drop(&mut self) {
-            FORCED.with(|f| f.borrow_mut().clear());
-        }
-    }
-
-    thread_local! {
-        static RECORDED: RefCell<Option<Vec<ReadPurpose>>> = const { RefCell::new(None) };
-    }
-
-    /// Records the purpose of every by-pid unique-id read on this thread until the guard drops.
-    pub(crate) fn record() -> Recorder {
-        RECORDED.with(|r| *r.borrow_mut() = Some(Vec::new()));
-        Recorder(())
-    }
-
-    #[must_use = "recording stops as soon as the recorder is dropped"]
-    pub(crate) struct Recorder(());
-
-    impl Recorder {
-        /// The purposes recorded so far, in order.
-        pub(crate) fn purposes(&self) -> Vec<ReadPurpose> {
-            RECORDED.with(|r| r.borrow().clone().unwrap_or_default())
-        }
-    }
-
-    impl Drop for Recorder {
-        fn drop(&mut self) {
-            RECORDED.with(|r| *r.borrow_mut() = None);
-        }
-    }
-
-    pub(super) fn note(purpose: ReadPurpose) {
-        RECORDED.with(|r| {
-            if let Some(recorded) = r.borrow_mut().as_mut() {
-                recorded.push(purpose);
-            }
-        });
-    }
-
-    pub(super) fn take(purpose: ReadPurpose) -> Option<UniqRead> {
-        FORCED.with(|f| {
-            let mut forced = f.borrow_mut();
-            let at = forced.iter().position(|(p, _)| *p == purpose)?;
-            Some(forced.remove(at).1)
-        })
-    }
-}
-
-/// Forces the parent read of [`held_by`] below the syscall.
-#[cfg(test)]
-pub(crate) mod ppid_fault {
-    use std::cell::RefCell;
-
-    use super::ReadErr;
-
-    /// What [`force_ppid_with`] answers.
-    type Reads = Box<dyn FnMut() -> Result<u32, ReadErr>>;
-
-    thread_local! {
-        static FORCED: RefCell<Vec<Result<u32, ReadErr>>> = const { RefCell::new(Vec::new()) };
-        static READS: RefCell<Option<Reads>> = const { RefCell::new(None) };
-    }
-
-    #[must_use = "dropping this immediately disarms the force; bind it for the probe's duration"]
-    pub(crate) struct Forced(());
-
-    /// The next parent read on this thread answers `read`. Forces queue.
-    pub(crate) fn force_ppid_once(read: Result<u32, ReadErr>) -> Forced {
-        FORCED.with(|f| f.borrow_mut().push(read));
-        Forced(())
-    }
-
-    /// While the guard lives, every parent read on this thread that no queued force answers
-    /// answers what `reads` does at that read.
-    pub(crate) fn force_ppid_with(reads: impl FnMut() -> Result<u32, ReadErr> + 'static) -> ForcedReads {
-        READS.with(|r| *r.borrow_mut() = Some(Box::new(reads)));
-        ForcedReads(())
-    }
-
-    impl Drop for Forced {
-        fn drop(&mut self) {
-            FORCED.with(|f| f.borrow_mut().clear());
-        }
-    }
-
-    #[must_use = "the reads are real again as soon as the guard is dropped"]
-    pub(crate) struct ForcedReads(());
-
-    impl Drop for ForcedReads {
-        fn drop(&mut self) {
-            READS.with(|r| r.borrow_mut().take());
-        }
-    }
-
-    pub(super) fn take() -> Option<Result<u32, ReadErr>> {
-        let queued = FORCED.with(|f| {
-            let mut forced = f.borrow_mut();
-            (!forced.is_empty()).then(|| forced.remove(0))
-        });
-        queued.or_else(|| READS.with(|r| r.borrow_mut().as_mut().map(|reads| reads())))
-    }
 }
 
 /// What one read of a process's record says: its start key, and its parent pid as the record has
@@ -606,25 +425,14 @@ fn read_record(kernel: &dyn Kernel, pid: RawPid) -> Resolved<Record> {
             raw_ppid: info.pbi_ppid,
         });
     }
-    kinfo::kinfo(kernel, pid).map(|info| Record {
+    kernel.kinfo(pid).0.map(|info| Record {
         key: token_of_kinfo(&info),
         raw_ppid: info.e_ppid() as RawPid,
     })
 }
 
-/// A by-pid identity read of `pid`: `read`, unless a test forces the OS's refusal.
-fn by_pid<T>(pid: RawPid, read: impl FnOnce() -> Resolved<T>) -> Resolved<T> {
-    #[cfg(test)]
-    if fault::is_unknown(pid) {
-        return Resolved::Unknown;
-    }
-    #[cfg(not(test))]
-    let _ = pid;
-    read()
-}
-
 pub(super) fn start_token(kernel: &dyn Kernel, pid: RawPid) -> Resolved<Key> {
-    by_pid(pid, || read_record(kernel, pid).map(|record| record.key))
+    read_record(kernel, pid).map(|record| record.key)
 }
 
 /// The key, with no order key, and, when `ask_parent`, the parent pid of `pid`, from one record.
@@ -633,9 +441,9 @@ pub(super) fn start_token(kernel: &dyn Kernel, pid: RawPid) -> Resolved<Key> {
 /// [`ProcessId::of_ordered_with`](super::ProcessId::of_ordered_with).
 pub(super) fn ordered_read(kernel: &dyn Kernel, pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
     let read = if ask_parent {
-        by_pid(pid, || ppid_and_key(kernel, pid)).map(|(ppid, key)| (key, ParentRead::Is(ppid)))
+        ppid_and_key(kernel, pid).map(|(ppid, key)| (key, ParentRead::Is(ppid)))
     } else {
-        by_pid(pid, || read_record(kernel, pid)).map(|record| (record.key, ParentRead::NotAsked))
+        read_record(kernel, pid).map(|record| (record.key, ParentRead::NotAsked))
     };
     match read {
         Resolved::Found((key, parent)) => OrderedRead {
@@ -781,7 +589,7 @@ pub(super) fn is_running(kernel: &dyn Kernel, pid: RawPid, start: Key) -> Livene
     // reads it with `arg = 1`, and the check above answers `Dead` for it.
     // The fallback keeps the same shape — token-guarded, zombie-EXCLUSIVE via `p_stat` —
     // and a kinfo layout drift fails safe to the pre-fix answer (token mismatch => false).
-    match kinfo::kinfo(kernel, pid) {
+    match kernel.kinfo(pid).0 {
         Resolved::Found(info) => {
             // A reused PID names a different process; SZOMB is exited-but-unreaped. Both
             // are "not running", and neither is an unassessable read.
@@ -818,36 +626,6 @@ pub(super) fn created_at(start: Key) -> Option<SystemTime> {
 /// recorded once at creation, so it survives a reboot unchanged and needs no scope.
 pub(super) fn session_scope() -> Result<super::persist::Scope, super::persist::ScopeReadError> {
     Ok(super::persist::Scope::none())
-}
-
-/// Test-only seam: a by-pid identity read answers `Unknown`, as an OS refusal would.
-#[cfg(test)]
-pub(crate) mod fault {
-    use std::cell::RefCell;
-
-    thread_local! {
-        static UNKNOWN: RefCell<Vec<super::RawPid>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// Disarms [`force_unknown`] on drop.
-    #[must_use = "dropping this immediately disarms the forced read"]
-    pub(crate) struct Forced(());
-
-    impl Drop for Forced {
-        fn drop(&mut self) {
-            UNKNOWN.with(|u| u.borrow_mut().clear());
-        }
-    }
-
-    /// Make every by-pid identity read of `pid` on THIS thread answer `Resolved::Unknown`.
-    pub(crate) fn force_unknown(pid: super::RawPid) -> Forced {
-        UNKNOWN.with(|u| u.borrow_mut().push(pid));
-        Forced(())
-    }
-
-    pub(super) fn is_unknown(pid: super::RawPid) -> bool {
-        UNKNOWN.with(|u| u.borrow().contains(&pid))
-    }
 }
 
 #[cfg(test)]

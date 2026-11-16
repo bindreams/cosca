@@ -527,6 +527,9 @@ pub(crate) struct PreparedMarker {
     /// renumber, so it is the parent's number too).
     #[cfg_attr(not(test), allow(dead_code, reason = "read only by tests"))]
     pub fd: RawFd,
+    /// The kernel the spawn started with: the marker's sweeps read the identity of the root and of
+    /// every member they signal through it.
+    pub kernel: crate::identity::SpawnKernel,
 }
 
 /// Create the marker pipe and hand its write end to `steps`. `reserved` is every child fd
@@ -545,6 +548,7 @@ pub(crate) struct PreparedMarker {
 pub(crate) fn install(
     steps: &mut crate::child::spawn::in_child::InChild,
     reserved: &[RawFd],
+    kernel: &crate::identity::SpawnKernel,
 ) -> Result<PreparedMarker, Error> {
     let failed = |detail: &str, source: Option<std::io::Error>| Error::Containment {
         detail: detail.to_owned(),
@@ -647,6 +651,7 @@ pub(crate) fn install(
         handle,
         read_handle: read_handle_value,
         fd,
+        kernel: std::sync::Arc::clone(kernel),
     })
 }
 
@@ -913,6 +918,8 @@ pub(crate) struct Marker {
     /// Held for the mechanism's whole life. See the module docs: this is what stops `handle`
     /// from being re-issued to an unrelated pipe once the tree drains.
     read: OwnedFd,
+    /// See `PreparedMarker::kernel`.
+    kernel: crate::identity::SpawnKernel,
     handle: u64,
     /// `read`'s OWN handle, captured at `install()` time — see `PreparedMarker::read_handle`'s
     /// doc comment. What `sweep`'s entry contract re-checks against `read` at signal time.
@@ -1028,6 +1035,7 @@ impl Marker {
     pub(crate) fn new(prepared: PreparedMarker, root: ProcessId, pgid: Option<i32>) -> Marker {
         Marker {
             read: prepared.read,
+            kernel: prepared.kernel,
             handle: prepared.handle,
             read_handle: prepared.read_handle,
             root: Some(root),
@@ -1042,6 +1050,7 @@ impl Marker {
     pub(crate) fn without_root(prepared: PreparedMarker) -> Marker {
         Marker {
             read: prepared.read,
+            kernel: prepared.kernel,
             handle: prepared.handle,
             read_handle: prepared.read_handle,
             root: None,
@@ -1514,8 +1523,7 @@ impl Marker {
                 new_walk.push(root);
             }
             if !blind {
-                let kernel = &crate::identity::HostKernel;
-                match crate::containment::treewalk::walk_from(kernel, root, &parents, crate::Recursive::Yes) {
+                match crate::containment::treewalk::walk_from(&*self.kernel, root, &parents, crate::Recursive::Yes) {
                     Ok(Some(walk)) => {
                         // A walk ran: the root held its pid, as `hard_kill` and `terminate` record.
                         #[cfg(test)]
@@ -1574,7 +1582,7 @@ impl Marker {
                 );
                 continue;
             }
-            let id = match ProcessId::of(h.pid) {
+            let id = match ProcessId::of_with(&*self.kernel, h.pid).0 {
                 Resolved::Found(id) => id,
                 Resolved::Gone => continue,
                 Resolved::Unknown => {
@@ -1678,7 +1686,7 @@ impl Marker {
             if Some(id) == self.root && fault::take_force_root_kill_noop() {
                 continue;
             }
-            let outcome = crate::containment::treewalk::kill_by_identity(&crate::identity::HostKernel, id, signal);
+            let outcome = crate::containment::treewalk::kill_by_identity(&*self.kernel, id, signal);
             crate::containment::treewalk::warn_if_not_attempted(id, signal, &outcome);
             // The root's owner waits for the root.
             state.record(id, signal, &outcome, Some(id) != self.root);
@@ -1780,7 +1788,7 @@ impl Marker {
                 Some(KillOutcome::NotAttempted(Error::Unassessable { detail, source: None }))
             }
             MarkerQuery::Held => {
-                let outcome = crate::containment::treewalk::kill_by_identity(&crate::identity::HostKernel, id, signal);
+                let outcome = crate::containment::treewalk::kill_by_identity(&*self.kernel, id, signal);
                 crate::containment::treewalk::warn_if_not_attempted(id, signal, &outcome);
                 // From the outcome, after the call: a kill that re-verified a different process, or
                 // sent nothing, leaves no record of a holder killed.

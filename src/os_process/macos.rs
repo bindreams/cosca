@@ -18,9 +18,7 @@ use mach2::message::audit_token_t;
 use super::{Exit, OsProcess, WaitFor, EXIT_CONSEQUENCE, OPEN_CONSEQUENCE};
 use crate::error::{io_context, Error};
 use crate::identity::kinfo::ExitState;
-use crate::identity::{
-    exit_state_of, has_exited, uniq_info, Existence, Kernel, ProcessId, ReadPurpose, Resolved, UniqInfo, UniqRead,
-};
+use crate::identity::{exit_state_of, has_exited, Existence, Kernel, ProcessId, Resolved, UniqInfo, UniqRead};
 use crate::signal::{Sent, Sig};
 use kqueue::{Kqueue, Subscription};
 
@@ -104,7 +102,7 @@ impl<K: Kernel + Send> MacosProcess<K> {
 /// errno as its source; the caller names what its refusal leaves undone (`consequence`), since what
 /// was already sent differs by caller. It logs nothing.
 pub(crate) fn read_for_open(kernel: &dyn Kernel, pid: u32, consequence: &str) -> Result<Option<UniqInfo>, Error> {
-    match uniq_info(kernel, pid, ReadPurpose::Open) {
+    match kernel.unique_info(pid) {
         UniqRead::Found(info) => Ok(Some(info)),
         UniqRead::Gone => Ok(None),
         UniqRead::Refused(errno) => Err(Error::Unassessable {
@@ -167,7 +165,7 @@ pub(crate) enum SignalByTokenOutcome {
 /// The `p_idversion` of the process `unique` names, if `pid` still names it. `Ok(None)`: the pid is
 /// gone or names another process. A refusal is an error that keeps its errno.
 pub(crate) fn read_version(kernel: &dyn Kernel, pid: u32, unique: u64, sig: Sig) -> io::Result<Option<i32>> {
-    match uniq_info(kernel, pid, ReadPurpose::Kill) {
+    match kernel.unique_info(pid) {
         UniqRead::Found(now) if now.unique_id == unique => Ok(Some(now.id_version)),
         UniqRead::Found(_) | UniqRead::Gone => Ok(None),
         UniqRead::Refused(errno) => Err(io_context(
@@ -205,7 +203,7 @@ pub(crate) fn signal_by_token(
             Err(libc::ESRCH) => {}
             // `P_WEXIT` is never cleared, so an `EPERM` that came from the exit shows it at this read.
             Err(libc::EPERM) if sig == Sig::Kill => {
-                return match exit_state_of(kernel, pid, unique, ReadPurpose::Kill) {
+                return match exit_state_of(kernel, pid, unique) {
                     Resolved::Found(ExitState::Exiting) => {
                         log::debug!("{sig:?} to pid {pid}: refused with EPERM, its exit has begun");
                         Ok(SignalByTokenOutcome::Exiting)
@@ -365,7 +363,7 @@ impl ExitWatch {
         if !self.exited()? {
             return Ok(Exit::Running(WaitFor::Readable(self.as_fd())));
         }
-        match has_exited(kernel, pid, unique, ReadPurpose::Exit) {
+        match has_exited(kernel, pid, unique) {
             Ok(true) => {
                 self.confirm();
                 Ok(Exit::Exited)

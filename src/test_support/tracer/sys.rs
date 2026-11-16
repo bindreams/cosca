@@ -121,7 +121,7 @@ pub(super) struct ProcState {
 
 /// The [`ProcState`] of `pid`, an unreaped child of this process.
 pub(super) fn proc_state(pid: u32) -> ProcState {
-    match crate::identity::kinfo::kinfo(&crate::identity::HostKernel, pid as _) {
+    match crate::identity::Kernel::kinfo(&crate::identity::HostKernel, pid as _).0 {
         crate::identity::Resolved::Found(info) => ProcState {
             p_stat: info.kp_proc.p_stat as u32,
             p_flag: info.kp_proc.p_flag,
