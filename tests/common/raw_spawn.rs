@@ -14,12 +14,14 @@ use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::{AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle};
 
 use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::System::Threading::PROCESS_INFORMATION;
 
 use super::console_flags;
 
 /// A process made by [`spawn_locked_raw`]: what a test needs of a `std::process::Child`, plus the
 /// initial thread's handle. Dropping it kills the process, so a panicking test leaves no child.
+/// A `CREATE_SUSPENDED` child starts when its [`thread`](Self::thread) is resumed.
 pub struct RawChild {
     process: OwnedHandle,
     thread: OwnedHandle,
@@ -116,9 +118,12 @@ pub enum RawStdio<'a> {
     Inherit,
     /// None: the child gets null handles and inherits nothing else either.
     Null,
-    /// Stdout and stderr both go to this handle (one inheritable duplicate of it), stdin is null.
-    #[allow(dead_code, reason = "tests/ construct it; the library's tests do not")]
-    Output(BorrowedHandle<'a>),
+    /// Stdout and stderr both go to `output`, and stdin comes from `stdin` (null when `None`): one
+    /// inheritable duplicate of each handle.
+    Given {
+        stdin: Option<BorrowedHandle<'a>>,
+        output: BorrowedHandle<'a>,
+    },
 }
 
 /// What [`spawn_locked_raw_with`] adds to [`spawn_locked_raw`]'s defaults.
@@ -135,6 +140,9 @@ pub struct RawOptions<'a> {
     /// with a blank. For a probe whose recorded input is a quoted argv[0].
     pub quote_exe: bool,
     pub stdio: RawStdio<'a>,
+    /// The security attributes of the new process object (`lpProcessAttributes`): its DACL, for a
+    /// process the creator may not open by pid. `None` is the default security.
+    pub process_security: Option<&'a SECURITY_ATTRIBUTES>,
 }
 
 /// [`spawn_locked_raw_with`] with [`RawOptions::default()`].
@@ -258,10 +266,17 @@ pub fn spawn_locked_raw_with(
             (dups.into_iter().flatten().collect(), handles)
         }
         RawStdio::Null => (Vec::new(), [null; 3]),
-        RawStdio::Output(out) => {
-            let dup = inheritable(HANDLE(out.as_raw_handle()))?;
-            let handle = HANDLE(dup.as_raw_handle());
-            (vec![dup], [null, handle, handle])
+        RawStdio::Given { stdin, output } => {
+            let stdin = stdin
+                .map(|stdin| inheritable(HANDLE(stdin.as_raw_handle())))
+                .transpose()?;
+            let output = inheritable(HANDLE(output.as_raw_handle()))?;
+            let handles = [
+                stdin.as_ref().map_or(null, |dup| HANDLE(dup.as_raw_handle())),
+                HANDLE(output.as_raw_handle()),
+                HANDLE(output.as_raw_handle()),
+            ];
+            (stdin.into_iter().chain([output]).collect(), handles)
         }
     };
     let si = STARTUPINFOW {
@@ -279,13 +294,15 @@ pub fn spawn_locked_raw_with(
     };
     // SAFETY: `cmdline`, when present, is a NUL-terminated, writable UTF-16 buffer; `block` is a
     // sorted, double-NUL-terminated UTF-16 block (`CREATE_UNICODE_ENVIRONMENT`); `si` and `pi` are
-    // valid, correctly-sized in/out parameters; each std handle is a live inheritable duplicate or
-    // NULL (the process has none); `image` is a NUL-terminated UTF-16 buffer that outlives the call.
+    // valid, correctly-sized in/out parameters; `options.process_security`, when set, is a live
+    // `SECURITY_ATTRIBUTES` whose descriptor the caller keeps alive across the call; each std handle
+    // is a live inheritable duplicate or NULL (the process has none); `image` is a NUL-terminated
+    // UTF-16 buffer that outlives the call.
     unsafe {
         CreateProcessW(
             image.as_ref().map_or(PCWSTR::null(), |image| PCWSTR(image.as_ptr())),
             cmdline.as_mut().map(|cmdline| PWSTR(cmdline.as_mut_ptr())),
-            None,
+            options.process_security.map(std::ptr::from_ref),
             None,
             !matches!(options.stdio, RawStdio::Null),
             windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(
