@@ -284,12 +284,13 @@ pub enum Error {
     /// refusing errno is the `source`, and the failure of the pid it was met beside, if any, a
     /// second cause.
     ///
-    /// `spawn` (sync and `tokio`) needs a pidfd for its child too, and gets it before the
-    /// program can run. It first calls `pidfd_open` on its own process: a refusal is this
-    /// variant with `op` `spawn`, and no child was forked. The child then opens a pidfd on itself
-    /// before `exec` and sends it to the parent; if its `pidfd_open` fails the child never runs
-    /// the program and the failure is this variant (a refusal) or [`Error::Io`] (a transient
-    /// failure).
+    /// `spawn` (sync and `tokio`) needs a pidfd for its child too, and takes it from the clone that
+    /// makes the child (`clone3`, or `clone` with `CLONE_PIDFD` where `clone3` is refused), so it calls
+    /// no `pidfd_open`. When both clones are refused with `ENOSYS` or `EPERM` (a seccomp filter that
+    /// blocks them), the spawn is this variant with `op` `spawn`, the refusing errno as its `source`,
+    /// and no child was made: the program did not run. A kernel before 5.2 ignores `CLONE_PIDFD`, so
+    /// its `clone` makes a child with no pidfd: the spawn is the same variant, but that child exists
+    /// and is left, since cosca never reaps by pid; such kernels are below the 5.6 floor.
     ///
     /// A process that is gone (`ESRCH`, or `EINVAL`/`ENOENT`
     /// for a non-leader thread) is not an error: the operation reports it as exited.
@@ -332,11 +333,11 @@ pub enum Error {
     /// known to have gone wrong with the target — the caller was not allowed to look.
     ///
     /// **From a spawn, this variant comes inside [`Error::MayHaveStarted`] when the program may have
-    /// started.** On macOS an identity that becomes unreadable after the program started leaves the
-    /// child running (a warning names its pid), so retrying may start a second instance. Elsewhere
-    /// the child is torn down, unless its kill is refused. A spawn returns it bare only for a macOS
-    /// child that could not read its own unique id: it is stopped before `exec`, and the program did
-    /// not start.
+    /// started.** On macOS a child whose unique-id report could not be read is left running (a
+    /// warning names its pid), so retrying may start a second instance. Otherwise the child is torn
+    /// down, unless its kill is refused, when it is handed back. A spawn returns it bare only for a
+    /// macOS child that could not read its own unique id: it is stopped before `exec`, and the
+    /// program did not start.
     ///
     /// Typically an unprivileged caller querying a service, or a parent that cannot open
     /// its own elevated child. Also covers the crate's own refusal to act on a target it
@@ -436,12 +437,22 @@ pub enum Error {
     ///
     /// A failed spawn, sync or tokio, hands back the child when the spawn or run could not end it:
     /// on Linux, when the identity read or the attach fails after the clone (an attach failure
-    /// that proves the program never ran hands nothing back: it is not this variant), on every Unix,
+    /// that proves the program never ran hands nothing back: it is not this variant), on macOS,
+    /// when the identity read or the attach fails, or when the child's unique id arrived late (at
+    /// least two of this process's descriptors 0 to 2 were closed at its spawn), on every Unix,
     /// when the elevation backend's password write fails, and on Windows, when a
     /// `kill_on_drop(false)` child's job refuses the disarm and the kill that follows is refused
     /// too, or when a UAC child that could not be tracked ([`ElevationErrorKind::Untracked`]) is
     /// refused its kill. Dropping such an error blocks until the child exits (see
-    /// [`Unreaped`](crate::Unreaped)). The other failed spawns leave a child they could not end running and warn.
+    /// [`Unreaped`](crate::Unreaped)).
+    ///
+    /// Two failed macOS spawns hand back no child (`unreaped` is `None`) and leave it, with a `warn`
+    /// naming its pid. A child whose unique-id report could not be read, or is malformed, cannot be
+    /// shown to be ours: it is not signalled or waited for, and may still be running (`fate`
+    /// `Running`). A child whose exit watch (its kqueue) the kernel refused is sent `SIGKILL`
+    /// through its unique id (an elevation front is sent nothing), and the holders of its fd marker,
+    /// if it has one, are killed; it is never waited for, so it stays a zombie until this process
+    /// exits.
     ///
     /// On Windows, a failed `ShellExecuteEx` launch is classified by its error (see `runas_failure`).
     MayHaveStarted {
