@@ -15,7 +15,7 @@
 //! reliably tears down *cooperative* trees and reports the achieved guarantee.
 //!
 //! [`Containment`] answers "who tears this tree down". What cooperative signal `terminate()`
-//! sends the child is an independent axis — see [`crate::graceful`].
+//! sends the child is an independent axis — see [`stop`](crate::stop).
 
 use std::fmt;
 
@@ -96,9 +96,9 @@ pub enum Containment {
     /// tree the outermost root owns, so it drives no teardown itself (`can_teardown()`
     /// is `false`) and its `_tree` ops return `Unsupported`. The root tears the tree down.
     ///
-    /// It is still independently signallable through its own handle wherever
-    /// [`Child::graceful_mechanism`](crate::Child::graceful_mechanism) says so — owning no tree
-    /// is not the same as having no cooperative shutdown.
+    /// It is still independently signallable through its own handle, by its child's stop action
+    /// ([`Child::terminate`](crate::Child::terminate)) — owning no tree is not the same as having no
+    /// cooperative shutdown.
     Delegated,
     /// No containment — `kill`/drop act on the lone process.
     None,
@@ -396,7 +396,9 @@ pub(crate) use root::Root;
 pub(crate) use root::Seen;
 #[cfg(unix)]
 pub(crate) use root::{check_number, NotItsGroup};
-pub(crate) use skip::{Skip, TerminateOutcome, TreeStop};
+#[cfg(windows)]
+pub(crate) use skip::CTRL_BREAK;
+pub(crate) use skip::{earlier_of, Skip, TerminateOutcome, TreeStop};
 #[cfg(unix)]
 pub(crate) use skip::{SkipCall, Why};
 pub(crate) use tree::Tree;

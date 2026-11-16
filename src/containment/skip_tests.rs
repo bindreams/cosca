@@ -849,18 +849,12 @@ fn a_pidfd_shutdown_that_failed_takes_the_reason_as_a_peer() {
     use crate::child::graceful::PidfdShutdown;
     use crate::error::Error;
     let failed = |term: Error, signal| {
-        let child = crate::child::owned::OwnedChild::new(
-            Box::new(crate::os_process::fake::FakeProcess::new([]).with_exact_consume(false)),
-            crate::elevation::front::TrackedKind::Own,
-        );
-        PidfdShutdown::start(&child, || Err(term))
-            .expect("the rule let the SIGTERM through")
-            .finish(
-                &graceful_call("skip_peers_probe_d1", signal),
-                &skip(unsure(libc::EACCES)),
-                None,
-                || Ok(crate::signal::Sent::Delivered),
-            )
+        PidfdShutdown::new(Err(term)).finish(
+            &graceful_call("skip_peers_probe_d1", signal),
+            &skip(unsure(libc::EACCES)),
+            None,
+            || Ok(crate::signal::Sent::Delivered),
+        )
     };
 
     let answer = failed(

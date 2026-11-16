@@ -214,10 +214,11 @@ compile_error!("cosca does not support 32-bit Linux (see \"Platform requirements
 pub mod containment;
 pub mod elevation;
 pub mod error;
-pub mod graceful;
+mod graceful;
 pub mod identity;
 pub mod quote;
 pub mod stdio;
+pub mod stop;
 #[cfg(windows)]
 pub use containment::Job;
 pub use containment::{ContainMode, Containment};
@@ -225,8 +226,10 @@ pub use containment::{ContainMode, Containment};
 #[cfg(unix)]
 pub use elevation::shim::{Gate, Inject, ShimTestHooks};
 pub use elevation::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, EnvSanitizer, Privilege, Secret};
-pub use graceful::GracefulMechanism;
+#[cfg(unix)]
+pub use signal::Signal;
 pub use stdio::{Fd, Stdio};
+pub use stop::StopTarget;
 
 mod init;
 mod role;
@@ -236,8 +239,6 @@ pub use init::ctrl_proxy_main;
 #[cfg(unix)]
 pub use init::init_with_test_hooks;
 pub use init::{init, installed};
-
-mod stop;
 
 mod child;
 pub use child::{Child, SuspendedChild, Unreaped};

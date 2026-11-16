@@ -8,7 +8,6 @@ use crate::child::spawn::policy::SpawnPolicy;
 use crate::containment::fake::FakeContains;
 use crate::containment::{Attachment, Containment, Mechanism, Tree};
 use crate::elevation::front::TrackedKind;
-use crate::graceful::GracefulMechanism;
 use crate::identity::{Key, ProcessId};
 use crate::os_process::child::ExitRecord;
 use crate::os_process::fake::{Answer, FakeProcess, ReapAnswer};
@@ -29,15 +28,27 @@ pub(crate) fn child_over(fake: &FakeProcess) -> Child {
         false,
         Attachment {
             tree: Tree::none(),
-            graceful: if cfg!(windows) {
-                GracefulMechanism::None
-            } else {
-                GracefulMechanism::Process
-            },
+            #[cfg(windows)]
+            console: Default::default(),
         },
         None,
         SpawnPolicy::SYNC,
+        stop_over_a_fake(),
     )
+}
+
+/// The stop of a child over a fake. Unix: the default, which sends through the fake's tables. Windows: the
+/// default would send a `CTRL_BREAK` to a pid no process has, through the OS, so the action states a break
+/// that went out: a tree target hands the fake mechanism the answer of that send, and a root target
+/// sends nothing.
+fn stop_over_a_fake() -> crate::stop::StopAction {
+    #[cfg(unix)]
+    return crate::stop::StopAction::default();
+    #[cfg(windows)]
+    return crate::stop::StopAction::Sync(std::sync::Arc::new(|target| match target.scope() {
+        crate::stop::Scope::Root => Ok(()),
+        crate::stop::Scope::Tree(call) => target.send_tree(call, crate::containment::TreeStop::of_break(Ok(()))),
+    }));
 }
 
 /// A root of stated answers: its kill is delivered, and its looks answer `exits`.

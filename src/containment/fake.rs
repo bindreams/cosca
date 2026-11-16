@@ -39,6 +39,9 @@ pub(crate) struct FakeContains {
     /// What each [`send_kill`](Contains::send_kill) answers, in order, once; a send past them is the
     /// kill that leaves nothing running.
     kill_answers: Mutex<VecDeque<TreeKillOutcome>>,
+    /// What each [`send_terminate`](Contains::send_terminate) answers, in order, once; a send past them
+    /// is the signal that went out and found nothing wrong.
+    terminate_answers: Mutex<VecDeque<TerminateOutcome>>,
     sends: Sends,
 }
 
@@ -56,6 +59,7 @@ impl FakeContains {
             unobserved: Vec::new(),
             unwalked: false,
             kill_answers: Mutex::default(),
+            terminate_answers: Mutex::default(),
             sends: sends.clone(),
         };
         (fake, sends)
@@ -70,6 +74,20 @@ impl FakeContains {
     pub(crate) fn answering_kills(self, outcomes: impl IntoIterator<Item = TreeKillOutcome>) -> FakeContains {
         *self
             .kill_answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = outcomes.into_iter().collect();
+        self
+    }
+
+    /// A mechanism whose successive [`send_terminate`](Contains::send_terminate)s answer `outcomes`, as
+    /// a tree whose cooperative route went one way or another (a skipped root, say).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only a Linux row states what the cooperative route answered")
+    )]
+    pub(crate) fn answering_terminates(self, outcomes: impl IntoIterator<Item = TerminateOutcome>) -> FakeContains {
+        *self
+            .terminate_answers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = outcomes.into_iter().collect();
         self
@@ -163,10 +181,15 @@ impl Contains for FakeContains {
         how: TreeStop,
     ) -> (TerminateOutcome, Option<Listing>) {
         self.record("terminate");
-        let sent = TerminateOutcome::Sent {
+        let stated = self
+            .terminate_answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front();
+        let sent = stated.unwrap_or_else(|| TerminateOutcome::Sent {
             result: Ok(()),
             earlier: Some(how.earlier()),
-        };
+        });
         (sent, None)
     }
 

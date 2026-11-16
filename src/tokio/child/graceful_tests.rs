@@ -191,7 +191,9 @@ async fn async_the_reap_of_a_running_root_awaits_its_exit() {
 async fn async_the_root_through_its_pidfd_awaits_the_grace() {
     use std::os::unix::process::ExitStatusExt;
 
-    use crate::containment::{Refusal, Skip, Why};
+    use crate::child::graceful::SignalTreeCooperativelyOutcome;
+    use crate::containment::fake::FakeContains;
+    use crate::containment::{Containment, Mechanism, Refusal, Skip, TerminateOutcome, Tree, Why};
 
     crate::tokio::test_runtime::assert_current_thread();
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
@@ -205,10 +207,23 @@ async fn async_the_root_through_its_pidfd_awaits_the_grace() {
         holders: None,
     };
 
+    // The mechanism names no tree but the root's pidfd: the child's default stop, run as the call runs it,
+    // sends the `SIGTERM` through the pidfd and records the outcome for the call.
+    let (tree, _) = FakeContains::new(Containment::Session, false);
+    child.inner.tree = Tree::contained(Mechanism::Fake(
+        tree.answering_terminates([TerminateOutcome::RootThroughPidfd(skip)]),
+    ));
+    let SignalTreeCooperativelyOutcome::RootThroughPidfd(skip, started, _, acted) =
+        child.inner.signal_tree_cooperatively()
+    else {
+        panic!("the default stop did not end on the root's pidfd");
+    };
+    assert!(acted.is_none(), "the default action answered Ok: {acted:?}");
     let error = never_blocking(crate::child::graceful::shutdown::root_through_pidfd(
         &child,
         &skip,
-        crate::containment::TreeStop::default(),
+        started,
+        crate::signal::Sig::Graceful(crate::signal::Signal::Term),
         Duration::from_secs(30),
     ))
     .await;
@@ -694,7 +709,7 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_wa
 }
 
 // A refusal that never addresses a pid survives the reap. An uncontained Windows child records
-// `GracefulMechanism::None` — permanent and pid-independent — so it keeps answering `Unsupported`
+// no group — permanent and pid-independent — so it keeps answering `Unsupported`
 // (what its own doc promises, and what the sync mirror returns for the identical child) after the
 // reap, not `Unassessable`, which is documented as a transient could-not-determine condition a
 // caller may retry.
@@ -703,9 +718,8 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_wa
 async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_reap() {
     // Uncontained: leads no group of its own.
     let (mut child, stdin) = crate::test_child::held_blocker_async(crate::Stdio::null(), Console::Asked, |_| {}).await;
-    assert_eq!(
-        child.graceful_mechanism(),
-        crate::graceful::GracefulMechanism::None,
+    assert!(
+        !child.inner.console.group,
         "the subject must be a child whose refusal is permanent, not pid-dependent"
     );
     child.kill().expect("kill");
@@ -757,7 +771,7 @@ async fn a_holders_only_escalation_awaits_each_member_its_kill_reached() {
             let error = crate::child::graceful::shutdown::holders_only(
                 &child,
                 skip,
-                crate::containment::TreeStop::default(),
+                crate::signal::Sig::Graceful(crate::signal::Signal::Term),
                 Duration::ZERO,
             )
             .await;

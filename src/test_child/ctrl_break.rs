@@ -280,7 +280,7 @@ pub(crate) fn accept_tagged(listener: &TcpListener, root: crate::identity::Proce
 /// which keeps it running while held, after its handshake. Such an image never attaches to its
 /// spawner's console, so it has none to detach: no break reaches it, with no console host
 /// bookkeeping to wait for, and only a kill ends it. Its creation flags are the ordinary contained
-/// ones, so [`GracefulMechanism::ConsoleGroup`](crate::GracefulMechanism) is what the child reports.
+/// ones, so the child records a group the flags do not put in a console of its own.
 pub(crate) fn spawn_consoleless_root() -> (crate::Child, TcpStream) {
     spawn_gui_root(|_| {})
 }

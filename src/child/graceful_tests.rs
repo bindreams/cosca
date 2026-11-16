@@ -1295,7 +1295,7 @@ fn a_holders_only_escalation_whose_wait_fails_answers_the_holders_only_error() {
     let error = super::shutdown::run_ready(super::shutdown::holders_only(
         &super::shutdown::BlockingDriver(&child),
         skip,
-        crate::containment::TreeStop::default(),
+        crate::signal::Sig::Graceful(crate::signal::Signal::Term),
         std::time::Duration::ZERO,
     ));
 

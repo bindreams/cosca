@@ -22,11 +22,11 @@ pub(crate) struct Prepared {
     /// (which degrades to the process group, or the tree walk for `TreeWalk`).
     #[cfg(target_os = "macos")]
     pub marker: Option<crate::containment::fdmarker::PreparedMarker>,
-    /// The cooperative-signal mechanism implied by the creation-flag word this spawn passed to
-    /// `CreateProcessW`. Set by whichever backend chose that word, so the derivation reads what
-    /// the OS was actually given.
+    /// What the creation-flag word this spawn passed to `CreateProcessW` says about the child's console,
+    /// and whether this process had one. Set by whichever backend chose that word, so the derivation reads
+    /// what the OS was actually given.
     #[cfg(windows)]
-    pub graceful: crate::graceful::GracefulMechanism,
+    pub console: crate::containment::windows::ConsoleFacts,
     /// Whether the child is created suspended and `attach` must leave it so (see
     /// [`Command::spawn_suspended`](crate::Command::spawn_suspended)).
     #[cfg(windows)]
@@ -63,16 +63,6 @@ pub(crate) fn kill_group_through_pidfd(
 }
 
 impl Prepared {
-    /// The cooperative-signal mechanism for a child spawned from this decision. The `cfg` lives
-    /// here, once, so no spawn path carries one for it: every non-Windows child cosca owns can
-    /// be sent an identity-bound `SIGTERM`, whatever its containment.
-    pub(crate) fn graceful_mechanism(&self) -> crate::graceful::GracefulMechanism {
-        #[cfg(windows)]
-        return self.graceful;
-        #[cfg(not(windows))]
-        return crate::graceful::GracefulMechanism::Process;
-    }
-
     /// Linux: the cgroup leaf this spawn made, if it made one, for the spawn to record the child's
     /// placement report on.
     #[cfg(target_os = "linux")]
@@ -162,15 +152,16 @@ impl Prepared {
     }
 }
 
-/// What a spawn achieved, beyond the child handle itself: the tree it owns and the
-/// cooperative-signal mechanism, which are independent axes (see [`crate::graceful`]).
+/// What a spawn achieved, beyond the child handle itself: the tree it owns and, on Windows, what it
+/// recorded about the child's console, which are independent axes.
 ///
 /// Bundled rather than threaded as separate positional arguments so the spawn constructors do
 /// not grow an argument per spawn fact, and so a new fact is a compile error at every
 /// construction site rather than a silently diverging path.
 pub(crate) struct Attachment {
     pub tree: Tree,
-    pub graceful: crate::graceful::GracefulMechanism,
+    #[cfg(windows)]
+    pub console: crate::containment::windows::ConsoleFacts,
 }
 
 #[cfg(windows)]
@@ -178,14 +169,14 @@ impl Attachment {
     /// The attachment for a UAC-elevated spawn, which `ShellExecuteEx("runas")` creates through
     /// a system service with creation flags this process never sees and never chose.
     ///
-    /// The mechanism is `Unknown`, so [`crate::graceful::signal`] refuses this child rather than
-    /// addressing a console control event to its pid. `OtherConsoleGroup` would claim a route to
-    /// a group known to exist, and `None` that no cooperative signal exists from any process
-    /// ever; cosca can make neither claim about a child it did not create.
+    /// Its facts say `elevated`, so `stop::send_ctrl_break_to_group`
+    /// refuses this child rather than addressing a console control event to its pid: cosca can claim
+    /// neither a route to a group known to exist nor that no cooperative signal exists from any process,
+    /// about a child it did not create.
     pub(crate) fn uac_elevated() -> Attachment {
         Attachment {
             tree: Tree::none(),
-            graceful: crate::graceful::GracefulMechanism::Unknown,
+            console: crate::containment::windows::ConsoleFacts::uac_elevated(),
         }
     }
 }
@@ -1512,16 +1503,17 @@ pub(crate) fn prepare(
     let is_root = !is_nested(marker_present);
 
     #[cfg(windows)]
-    let graceful = {
+    let console = {
         use std::os::windows::process::CommandExt;
         let spawn =
             crate::command::flags::windows_spawn(req, *flags, is_root, crate::command::flags::SpawnBackend::Std)?;
         std_cmd.creation_flags(spawn.creation_flags);
-        // Sound for THIS derivation and no other: `mechanism_from_flags` reads only
+        // Sound for THIS derivation and no other: `ConsoleFacts::of` reads only
         // CREATE_NEW_PROCESS_GROUP / DETACHED_PROCESS / CREATE_NEW_CONSOLE / CREATE_NO_WINDOW,
         // and std adds and removes none of them. The word is what cosca supplies, never what
-        // `CreateProcessW` receives — see `crate::command::flags`.
-        crate::containment::windows::mechanism_from_flags(spawn.creation_flags)
+        // `CreateProcessW` receives — see `crate::command::flags`. This process's console is read
+        // here, once, before the create.
+        crate::containment::windows::ConsoleFacts::at_spawn(spawn.creation_flags)
     };
 
     if mode.is_none() {
@@ -1533,7 +1525,7 @@ pub(crate) fn prepare(
             #[cfg(target_os = "macos")]
             marker: None,
             #[cfg(windows)]
-            graceful,
+            console,
             #[cfg(windows)]
             frozen: flags.suspended,
         });
@@ -1685,7 +1677,7 @@ pub(crate) fn prepare(
         #[cfg(target_os = "macos")]
         marker,
         #[cfg(windows)]
-        graceful,
+        console,
         #[cfg(windows)]
         frozen: flags.suspended,
     })
@@ -1810,7 +1802,7 @@ impl From<Error> for AttachFailure {
 /// Phase 2 (after spawn, before the `OwnedChild` adopts): attach the mechanism and bundle it with the
 /// spawn's other achieved facts. Consumes `prepared` so Linux cgroup leaf ownership transfers
 /// cleanly to the cgroup mechanism without requiring interior mutability — hence the
-/// cooperative-signal mechanism is read off it first.
+/// console facts are read off it first.
 ///
 /// `id` is the identity the spawn read of the root, or the error of the read that failed. A
 /// mechanism that names the tree by the root's identity (a tree walk, the macOS fd marker) fails the
@@ -1823,7 +1815,8 @@ pub(crate) fn attach(
     #[cfg(windows)] proc_handle: std::os::windows::io::RawHandle,
     prepared: Prepared,
 ) -> Result<Attachment, AttachFailure> {
-    let graceful = prepared.graceful_mechanism();
+    #[cfg(windows)]
+    let console = prepared.console;
     let tree = attach_tree(
         #[cfg(unix)]
         pid,
@@ -1834,7 +1827,11 @@ pub(crate) fn attach(
         proc_handle,
         prepared,
     )?;
-    Ok(Attachment { tree, graceful })
+    Ok(Attachment {
+        tree,
+        #[cfg(windows)]
+        console,
+    })
 }
 
 /// The tree-teardown half of [`attach`]: which mechanism owns this child's tree.

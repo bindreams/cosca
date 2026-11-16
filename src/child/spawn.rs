@@ -998,6 +998,7 @@ fn spawn_reported(
         attachment,
         elevation,
         policy,
+        cmd.stop_action(),
     ))
 }
 

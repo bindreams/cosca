@@ -1773,6 +1773,30 @@ pub(crate) const SIGNAL_REPORTING_TREE_ARGV: &[&str] = &[
      cat <&3 3<&- & wait; echo 'root eof'",
 ];
 
+/// [`SIGNAL_REPORTING_TREE_ARGV`] where `SIGUSR1` is only reported and the process goes on, so a stop
+/// can send a second signal: `SIGTERM` is reported and ends it, as there. Each process prints
+/// `<root|leaf> SIGUSR1` and `<root|leaf> SIGTERM` in the order its shell runs the traps of signals
+/// pending together, which is ascending signal number (dash and bash), not arrival order. The two are the
+/// same only when the first report has been read before the second signal is sent.
+///
+/// Every member handles the first signal and keeps running, whichever of them the signal reaches: the
+/// shells by their traps, and the two `cat`s by ignoring it (an ignored signal stays ignored across
+/// `exec`, and is set before the `cat` is forked, so there is no window in which it would kill one).
+/// A shell waits for its `cat` and goes back to waiting while the `cat` still lives, so a trap's
+/// interruption of `wait` neither ends the shell nor makes it spin, in any `sh`. The leaf prints `r`
+/// once everything is in place.
+#[cfg(unix)]
+pub(crate) const SIGNAL_THEN_TERM_TREE_ARGV: &[&str] = &[
+    "sh",
+    "-c",
+    "exec 3<&0; \
+     traps() { trap \"echo $1 SIGUSR1\" USR1; trap \"echo $1 SIGTERM; exit 0\" TERM; }; \
+     hold() { while :; do wait $1; kill -0 $1 2>/dev/null || break; done; }; \
+     trap '' USR1; cat <&3 3<&- & c=$!; traps root; \
+     { trap '' USR1; cat <&3 3<&- & d=$!; traps leaf; echo r; hold $d; echo 'leaf eof'; } & \
+     hold $c; echo 'root eof'",
+];
+
 /// A tree of `argv` contained as `contain` asks, once it has printed `r\n`: the child, the write end
 /// of its stdin and its stdout, from which the readiness line has been read.
 #[cfg(unix)]

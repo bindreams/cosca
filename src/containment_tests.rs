@@ -1,21 +1,32 @@
 use super::{ContainMode, Containment, Nesting, TreeStop};
 
-/// The default tree stop is the platform's: `SIGTERM`, on Windows the `CTRL_BREAK`.
+/// The default tree stop is `SIGTERM`.
+#[cfg(unix)]
 #[skuld::test]
 fn the_default_tree_stop_names_the_platforms_graceful_signal() {
     let stop = TreeStop::default();
-    #[cfg(unix)]
-    {
-        assert_eq!(stop.name(), "SIGTERM");
-        assert_eq!(stop.earlier(), "the SIGTERM");
-        assert_eq!(stop.signal(), crate::signal::Signal::Term);
-        assert_eq!(stop.sig(), crate::signal::Sig::Graceful(crate::signal::Signal::Term));
-    }
-    #[cfg(windows)]
-    {
-        assert_eq!(stop.name(), "CTRL_BREAK");
-        assert_eq!(stop.earlier(), "the CTRL_BREAK");
-    }
+    assert_eq!(stop.name(), "SIGTERM");
+    assert_eq!(stop.earlier(), "the SIGTERM");
+    assert_eq!(stop.signal(), crate::signal::Signal::Term);
+    assert_eq!(stop.sig(), crate::signal::Sig::Graceful(crate::signal::Signal::Term));
+}
+
+/// Windows: a tree stop is the `CTRL_BREAK` its caller sent, and hands back what that send answered.
+#[cfg(windows)]
+#[skuld::test]
+fn a_tree_stop_carries_the_answer_of_the_break_its_caller_sent() {
+    let stop = TreeStop::of_break(Ok(()));
+    assert_eq!(stop.name(), "CTRL_BREAK");
+    assert_eq!(stop.earlier(), "the CTRL_BREAK");
+    stop.into_sent().expect("the send went out");
+
+    let refused = TreeStop::of_break(Err(crate::error::Error::NoConsole {
+        detail: "the caller had none".into(),
+    }));
+    assert!(matches!(
+        refused.into_sent(),
+        Err(crate::error::Error::NoConsole { .. })
+    ));
 }
 
 /// A stop made of a signal carries and names that signal, not the default's.

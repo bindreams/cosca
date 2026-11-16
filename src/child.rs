@@ -8,7 +8,7 @@ use crate::child::spawn::policy::SpawnPolicy;
 use crate::command::Command;
 use crate::containment::dispatch::{Keeping, SweepFailure, Swept, TeardownCaller, TreeKillOutcome};
 use crate::containment::treewalk::WalkToken;
-use crate::containment::{Containment, TerminateOutcome, TreeStop};
+use crate::containment::Containment;
 use crate::elevation::front::{AloneStep, KillNeed, KillRootOutcome, RootStep};
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -181,7 +181,11 @@ pub struct Child {
     pub(crate) kill_on_drop: bool,
     /// The tree this handle owns, and where it stands after its kills; see [`crate::containment::Tree`].
     pub(crate) tree: crate::containment::Tree,
-    graceful: crate::graceful::GracefulMechanism,
+    /// What the child's cooperative stop does: the caller's own, or [`stop::default`](crate::stop::default).
+    pub(crate) stop: crate::stop::StopAction,
+    /// What the spawn recorded about the child's console, which the Windows stop functions read.
+    #[cfg(windows)]
+    pub(crate) console: crate::containment::windows::ConsoleFacts,
     /// What the spawn achieved; the box holds who the tracked process is
     /// ([`OwnedChild::tracked_kind`]).
     elevation: Option<crate::elevation::ElevationReport>,
@@ -206,6 +210,10 @@ pub(crate) fn refused_commit(
 }
 
 impl Child {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the one construction of a child: each fact a spawn leaves is a parameter, as at every spawn route"
+    )]
     pub(crate) fn from_parts(
         proc: OwnedChild,
         id: Option<ProcessId>,
@@ -214,6 +222,7 @@ impl Child {
         attachment: crate::containment::Attachment,
         elevation: Option<crate::elevation::ElevationReport>,
         policy: SpawnPolicy,
+        stop: crate::stop::StopAction,
     ) -> Child {
         debug_assert!(proc.pid().is_some(), "a child's process has the pid its spawn learned");
         debug_assert!(
@@ -234,7 +243,9 @@ impl Child {
             pipes,
             kill_on_drop,
             tree: attachment.tree,
-            graceful: attachment.graceful,
+            stop,
+            #[cfg(windows)]
+            console: attachment.console,
             elevation,
             #[cfg(unix)]
             reported: Vec::new(),
@@ -296,23 +307,6 @@ impl Child {
     /// act or return `Unsupported`.
     pub fn containment(&self) -> Containment {
         self.tree.containment()
-    }
-
-    /// Which cooperative signal [`terminate`](Child::terminate) sends this child, how far it
-    /// reaches, and whether this process has a route to deliver it. A spawn-time fact, so it is
-    /// stable for the child's whole life and costs no syscall.
-    ///
-    /// Independent of [`containment`](Child::containment): that answers who tears this child's
-    /// *tree* down, this answers what a polite signal to the child itself is.
-    ///
-    /// **Not a delivery guarantee.** [`ConsoleGroup`](crate::GracefulMechanism::ConsoleGroup)
-    /// means only that the
-    /// creation flags do not exclude delivery from this process — Windows reports success for a
-    /// console control event aimed at a group in another console and delivers nothing, and no
-    /// spawn-time fact can predict a child that leaves or joins a console after it starts.
-    /// Each such call also leaves a dead entry in the caller's console process list.
-    pub fn graceful_mechanism(&self) -> crate::graceful::GracefulMechanism {
-        self.graceful
     }
 
     /// Guard for the `_tree` operations (single-sourced with the async `Child`).
@@ -893,14 +887,21 @@ impl Child {
         }
     }
 
-    /// Send the graceful termination signal to the contained group — `SIGTERM` via
-    /// `killpg`/cgroup, or `CTRL_BREAK` to the job/console group. **Signal-only:** does
-    /// not wait or reap. Requires an actionable containment mechanism (errors
-    /// `Unsupported` otherwise). Cooperative best-effort: on the `TreeWalk` mechanism a
+    /// Runs the child's stop action ([`Command::graceful_stop`](crate::Command::graceful_stop);
+    /// [`stop::default`](crate::stop::default) when none was set) on the contained tree, to ask the
+    /// group to stop. The action is given a [`StopTarget`](crate::StopTarget) that
+    /// [covers the tree](crate::StopTarget::covers_tree), and what the call answers is what the action
+    /// answers. By default that is `SIGTERM` via `killpg`/cgroup, or `CTRL_BREAK` to the job/console
+    /// group. **Signal-only:** does not wait or reap. Requires an actionable containment mechanism
+    /// (errors `Unsupported` otherwise). Cooperative best-effort: on the `TreeWalk` mechanism a
     /// descendant whose identity transiently fails to resolve is intentionally left
     /// unsignaled; `kill_tree` is the guaranteed hard teardown.
     ///
-    /// **Windows: what this actually signals.** `CTRL_BREAK` is delivered to the root's
+    /// What the rest of this documentation says of "the signal" is what the default action does, and
+    /// what `stop::send_signal` does on a tree target with its signal. An
+    /// action of the caller's own answers as it chooses: the call does nothing else.
+    ///
+    /// **Windows: what the default actually signals.** `CTRL_BREAK` is delivered to the root's
     /// **process group**, not to the tree. A nested contained descendant leads its own
     /// group and never receives it, so from THIS handle only
     /// [`kill_tree`](Child::kill_tree) reaches every member. The layers this skips are not
@@ -913,12 +914,12 @@ impl Child {
     /// **And success here does not prove the event was delivered.** A root that shares no
     /// console with the caller is reported as success and reaches nobody — including a root
     /// spawned with [`no_window`](crate::Command::no_window) or
-    /// `detached()`, which gets a console of its own. Such a root is
-    /// reported as [`GracefulMechanism::OtherConsoleGroup`](crate::GracefulMechanism::OtherConsoleGroup)
-    /// by [`graceful_mechanism`](Child::graceful_mechanism): that is what cosca recorded about
-    /// the *route* from this process, never an authority on whether a signal will arrive. It is
-    /// also not "this child cannot be shut down politely" — a process attached to the child's own
-    /// console can deliver the event. The cooperative op returns `Ok` and delivers nothing; the
+    /// `detached()`, which gets a console of its own. Whether the spawn recorded the child as leading
+    /// its group on this process's console is
+    /// `StopTarget::leads_group_on_our_console`: what
+    /// cosca recorded about the *route* from this process, never an authority on whether a signal will
+    /// arrive. It is also not "this child cannot be shut down politely" — a process attached to the
+    /// child's own console can deliver the event. The cooperative op returns `Ok` and delivers nothing; the
     /// forced ops ([`kill`](Child::kill) / [`kill_tree`](Child::kill_tree), and the escalation
     /// half of [`graceful_shutdown_tree`](Child::graceful_shutdown_tree)) are unaffected.
     ///
@@ -978,35 +979,9 @@ impl Child {
     /// identity.
     pub fn terminate_tree(&self) -> Result<(), Error> {
         self.require_contained()?;
-        // The mechanism looks at the root as for `kill_tree`.
-        let root_handle = self.proc.hold(self.pid());
-        let root: Option<&dyn crate::containment::Root> = Some(&root_handle);
         // A separate `terminate_tree` is no call that sweeps: it holds its members for the next kill.
-        let how = TreeStop::default();
-        let (outcome, _) = self.tree.terminate(self.pid(), root, None, how);
-        #[cfg(unix)]
-        {
-            let sig = how.sig();
-            let call = self.skip_call("terminate_tree", sig, None);
-            match outcome {
-                TerminateOutcome::Sent { result, .. } => result,
-                TerminateOutcome::NotSent(not_sent) | TerminateOutcome::RootExited(not_sent) => Err(not_sent),
-                // A `SIGTERM` settles nothing, so nothing is killed again and nothing waited for.
-                TerminateOutcome::End(skip) | TerminateOutcome::HoldersOnly(skip) => {
-                    call.answer(&self.tree, skip, None).answer
-                }
-                TerminateOutcome::RootThroughPidfd(skip) => {
-                    let sent = root_handle.signal(sig);
-                    call.answer(&self.tree, skip, Some(sent)).answer
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        match outcome {
-            TerminateOutcome::Sent { result, .. } => result,
-            TerminateOutcome::NotSent(not_sent) => Err(not_sent),
-            _ => unreachable!("only a Unix mechanism skips by the root's number or finds its root exited"),
-        }
+        self.stop
+            .run(&crate::stop::StopTarget::tree(self, crate::stop::TreeCall::SignalOnly))
     }
 
     /// A tree call on this child's tree that skipped what the root's number names ([`SkipCall`]).

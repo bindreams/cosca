@@ -370,31 +370,29 @@ fn a_plain_cosca_child_still_joins_the_callers_console() {
 }
 
 #[cfg(windows)]
-/// `graceful_mechanism()` must be derived from the word cosca actually composed, not from the
-/// containment half of it: a hidden child has no in-process route, and reporting `ConsoleGroup`
-/// for it tells the caller the opposite.
+/// The recorded route (`leads_group_on_our_console`) must be derived from the word cosca actually
+/// composed, not from the containment half of it: a hidden child has no in-process route, and
+/// reporting one for it tells the caller the opposite.
 ///
 /// The two children are what make this discriminate. A derivation reading only the containment
-/// half reports `ConsoleGroup` for both, so the second assertion fails; a hardcoded
-/// `OtherConsoleGroup` fails the first.
+/// half reports a route for both, so the second assertion fails; a hardcoded `false` fails the
+/// first.
 #[skuld::test]
 fn a_no_window_contained_child_reports_no_in_process_route() {
-    use cosca::GracefulMechanism;
+    use cosca::StopTarget;
 
     let plain = probe_cosca(|c| {
         c.contain();
     });
-    assert_eq!(
-        plain.child.graceful_mechanism(),
-        GracefulMechanism::ConsoleGroup,
+    assert!(
+        StopTarget::from(&plain.child).leads_group_on_our_console(),
         "a contained child leads a group in OUR console"
     );
     let hidden = probe_cosca(|c| {
         c.contain().no_window();
     });
-    assert_eq!(
-        hidden.child.graceful_mechanism(),
-        GracefulMechanism::OtherConsoleGroup,
+    assert!(
+        !StopTarget::from(&hidden.child).leads_group_on_our_console(),
         "a hidden child's group is in a console of its own"
     );
     plain.end();

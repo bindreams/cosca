@@ -27,15 +27,10 @@ fn child_terminate_sends_sigterm() {
 #[skuld::test]
 fn child_terminate_unsupported_for_an_uncontained_child_on_windows() {
     let (child, sock) = common::spawn_blocker();
-    assert_eq!(
-        child.graceful_mechanism(),
-        cosca::GracefulMechanism::None,
-        "the refusal follows from the recorded fact, not from the platform"
-    );
     let err = child
         .terminate()
         .expect_err("a child that leads no group cannot be addressed");
-    assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
+    common::assert_refused_for_no_group(&err);
     common::kill_release_reap(&child, sock);
 }
 
@@ -44,15 +39,10 @@ fn child_terminate_unsupported_for_an_uncontained_child_on_windows() {
 fn child_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
     use std::time::Duration;
     let (child, sock) = common::spawn_blocker();
-    assert_eq!(
-        child.graceful_mechanism(),
-        cosca::GracefulMechanism::None,
-        "the refusal follows from the recorded fact, not from the platform"
-    );
     let err = child
         .graceful_shutdown(Duration::from_secs(1))
         .expect_err("a child that leads no group cannot be addressed");
-    assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
+    common::assert_refused_for_no_group(&err);
     common::kill_release_reap(&child, sock);
 }
 
@@ -135,37 +125,21 @@ fn process_soft_tree_unsupported_on_windows() {
     common::kill_release_reap(&child, sock);
 }
 
-// GracefulMechanism =====
-
-/// Unix is uniformly `Process`: every child cosca owns there can be sent an identity-bound
-/// `SIGTERM`, whatever its containment. A `cfg`-confused implementation that reported the
-/// contained child's group instead fails here.
-#[cfg(unix)]
-#[skuld::test]
-fn graceful_mechanism_is_process_on_unix() {
-    let _warns = common::warn_watch();
-    use cosca::GracefulMechanism;
-
-    let (uncontained, s1) = common::spawn_blocker();
-    let (contained, s2) = common::spawn_control("control-block", &["R"], true);
-    assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::Process);
-    assert_eq!(contained.graceful_mechanism(), GracefulMechanism::Process);
-    common::kill_release_reap_all(vec![(uncontained, s1), (contained, s2)]);
-}
+// The recorded console route =====
 
 /// On Windows the two must DISAGREE: containment is what sets `CREATE_NEW_PROCESS_GROUP`, so an
-/// uncontained child leads no group while a contained one does. A hardcoded return value fails
-/// one of the two.
+/// uncontained child leads no group while a contained one does, on our console. A hardcoded return
+/// value fails one of the two.
 #[cfg(windows)]
 #[skuld::test]
-fn graceful_mechanism_distinguishes_contained_from_uncontained_on_windows() {
+fn the_recorded_route_distinguishes_contained_from_uncontained_on_windows() {
     let _warns = common::warn_watch();
-    use cosca::GracefulMechanism;
+    use cosca::StopTarget;
 
     let (uncontained, s1) = common::spawn_blocker();
     let (contained, s2) = common::spawn_control_on_console("control-block", &["R"], true);
-    assert_eq!(uncontained.graceful_mechanism(), GracefulMechanism::None);
-    assert_eq!(contained.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
+    assert!(!StopTarget::from(&uncontained).leads_group_on_our_console());
+    assert!(StopTarget::from(&contained).leads_group_on_our_console());
     common::kill_release_reap_all(vec![(uncontained, s1), (contained, s2)]);
 }
 

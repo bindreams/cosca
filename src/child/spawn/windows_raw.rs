@@ -165,6 +165,8 @@ pub(crate) fn spawn_raw(
     // The complete word, composed above by the ONE function all three backends share — the two
     // structural bits this backend cannot spawn without included. Nothing ORs into it here.
     let flags = plan.creation_flags;
+    // This process's console is read once, before the create.
+    let console = crate::containment::windows::ConsoleFacts::at_spawn(flags);
 
     // Nothing above is refused after this point.
     if req.mode.is_some() {
@@ -201,7 +203,7 @@ pub(crate) fn spawn_raw(
         // From the COMPOSED word, which carries the caller's flags as well as the containment
         // decision: a derivation reading only the containment half would report an in-process
         // route for a child this spawn deliberately put in another console.
-        graceful: crate::containment::windows::mechanism_from_flags(flags),
+        console,
         frozen: cmd.flags_request().suspended,
     };
     let tracked = cmd
@@ -231,6 +233,7 @@ pub(crate) fn spawn_raw(
         attachment,
         cmd.elevation_report().cloned(),
         policy,
+        cmd.stop_action(),
     ))
 }
 

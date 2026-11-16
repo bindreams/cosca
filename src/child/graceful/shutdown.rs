@@ -118,7 +118,9 @@ fn graceful_status_of_reap(pid: u32, op: &str, outcome: Result<ChildWaitOutcome,
 /// [`Child::graceful_shutdown`](crate::Child::graceful_shutdown), for any [`Waits`]: the signal, the
 /// grace, the kill unless the root exited, and the reap.
 pub(crate) async fn shutdown_lone<W: Waits>(w: &mut W, grace: Duration) -> Result<ExitStatus, Error> {
-    w.child().terminate()?;
+    // What the stop sent is what a refused kill after it says was sent.
+    let (stopped, earlier) = w.child().stop_root();
+    stopped?;
     #[cfg(test)]
     fault::run_hook(fault::HookPoint::AfterTerminate);
 
@@ -130,7 +132,7 @@ pub(crate) async fn shutdown_lone<W: Waits>(w: &mut W, grace: Duration) -> Resul
     let watch = crate::graceful::after_grace(call, watch, || {
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeEscalation);
-        w.child().kill_after(Some("the SIGTERM"))
+        w.child().kill_after(Some(&earlier))
     })?;
     #[cfg(test)]
     fault::run_hook(fault::HookPoint::BeforeReap);
@@ -151,12 +153,14 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
         SignalTreeCooperativelyOutcome::Sent { result, earlier, walk } => (result, earlier, walk),
         SignalTreeCooperativelyOutcome::End(e) => return Err(e),
         #[cfg(target_os = "linux")]
-        SignalTreeCooperativelyOutcome::RootThroughPidfd(skip, how) => {
-            return Err(root_through_pidfd(w, &skip, how, grace).await);
+        SignalTreeCooperativelyOutcome::RootThroughPidfd(skip, started, sig, acted) => {
+            let ended = root_through_pidfd(w, &skip, started, sig, grace).await;
+            return Err(ended_with(w, ended, acted));
         }
         #[cfg(unix)]
-        SignalTreeCooperativelyOutcome::HoldersOnly(skip, how) => {
-            return Err(holders_only(w, skip, how, grace).await);
+        SignalTreeCooperativelyOutcome::HoldersOnly(skip, sig, acted) => {
+            let ended = holders_only(w, skip, sig, grace).await;
+            return Err(ended_with(w, ended, acted));
         }
     };
 
@@ -242,23 +246,27 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
     crate::graceful::after_reap(call, waited, term.err(), watch_err)
 }
 
+/// The error of a shutdown that ended on a skipped outcome, with the error of the action that sent
+/// (`acted`) joined to it.
+#[cfg(unix)]
+fn ended_with<W: Waits>(w: &W, ended: Error, acted: Option<Error>) -> Error {
+    crate::graceful::joined(&format!("graceful_shutdown_tree({})", w.child().pid()), ended, acted)
+}
+
 /// [`TerminateOutcome::RootThroughPidfd`](crate::containment::TerminateOutcome::RootThroughPidfd),
-/// `skip` what it skipped: the stop `how`'s signal through the root's handle, the grace, then a kill through it if
-/// the root outlived it. Nothing goes out by the number. A front that may not be signalled is refused,
-/// as for the tree paths.
+/// `skip` what it skipped: the signal `sig` went to the root through its handle (`shutdown`, the
+/// send a prepared function made); the grace, then a kill through it if the root outlived it. Nothing
+/// goes out by the number.
 #[cfg(target_os = "linux")]
 pub(crate) async fn root_through_pidfd<W: Waits>(
     w: &W,
     skip: &crate::containment::Skip,
-    how: crate::containment::TreeStop,
+    shutdown: super::PidfdShutdown,
+    sig: crate::signal::Sig,
     grace: Duration,
 ) -> Error {
     let child = w.child();
-    let call = child.skip_call("graceful_shutdown_tree", how.sig(), None);
-    let shutdown = match super::PidfdShutdown::start(&child.proc, || child.proc.signal(how.sig())) {
-        Ok(shutdown) => shutdown,
-        Err(unkillable) => return unkillable,
-    };
+    let call = child.skip_call("graceful_shutdown_tree", sig, None);
     #[cfg(test)]
     fault::run_hook(fault::HookPoint::AfterTerminate);
     let exited = if shutdown.needs_grace() {
@@ -270,16 +278,16 @@ pub(crate) async fn root_through_pidfd<W: Waits>(
 }
 
 /// [`TerminateOutcome::HoldersOnly`](crate::containment::TerminateOutcome::HoldersOnly), `skip` what it
-/// skipped: the holders were sent the stop `how`'s signal; the grace, then the mechanism's own kill of any left.
+/// skipped: the holders were sent the signal `sig`; the grace, then the mechanism's own kill of any left.
 #[cfg(unix)]
 pub(crate) async fn holders_only<W: Waits>(
     w: &W,
     skip: crate::containment::Skip,
-    how: crate::containment::TreeStop,
+    sig: crate::signal::Sig,
     grace: Duration,
 ) -> Error {
     let child = w.child();
-    let call = child.skip_call("graceful_shutdown_tree", how.sig(), None);
+    let call = child.skip_call("graceful_shutdown_tree", sig, None);
     // A failed grace wait means the holders are killed now.
     let watch = w.tree_drained(grace).await.err();
     let label = format!("graceful_shutdown_tree({})", child.pid());

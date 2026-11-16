@@ -17,7 +17,7 @@ use std::time::Duration;
 use super::{assert_no_break_sent, connect_reporter, kill_release_reap, report_done, spawn_consoleless_root};
 use crate::error::Error;
 use crate::identity::Liveness;
-use crate::{Containment, GracefulMechanism};
+use crate::{Containment, StopTarget};
 
 /// The fully-qualified libtest path of [`fixture_console_less_reporter`].
 pub(crate) const REPORTER_TEST: &str = "test_child::ctrl_break::console_less::fixture_console_less_reporter";
@@ -55,11 +55,11 @@ fn spawn_group_leader() -> crate::test_child::StdChild {
     crate::test_child::blocker_with_flags(CREATE_NEW_PROCESS_GROUP.0, crate::test_child::Console::Hidden, |_| {})
 }
 
-/// The sends beneath the ops, to a group this process made and leads: with no console the OS
-/// refuses the `CTRL_BREAK`, so each is `NotSent` with nothing sent. A job's send and the walker's
-/// are both checked.
+/// The routes beneath the ops, given the refused send of a group this process made and leads: with no
+/// console the OS refuses the `CTRL_BREAK`, so each is `NotSent` with nothing sent. A job's route and
+/// the walker's are both checked.
 ///
-/// Mutant: a send folds the refusal into `Sent { result: Err(..) }`.
+/// Mutant: a route folds the refusal into `Sent { result: Err(..) }`.
 fn assert_refused_sends_are_not_sent() {
     use crate::containment::{Contains as _, TerminateOutcome, TreeStop};
 
@@ -68,7 +68,8 @@ fn assert_refused_sends_are_not_sent() {
         std::os::windows::io::AsRawHandle::as_raw_handle(&*leader),
     )
     .expect("assign the group leader to a job");
-    let (outcome, _) = job.send_terminate(leader.id(), None, TreeStop::default());
+    let broken = TreeStop::of_break(crate::containment::windows::terminate(leader.id()));
+    let (outcome, _) = job.send_terminate(leader.id(), None, broken);
     assert!(
         matches!(outcome, TerminateOutcome::NotSent(_)),
         "a job's refused break must be NotSent, got {outcome:?}"
@@ -80,8 +81,8 @@ fn assert_refused_sends_are_not_sent() {
     let id = crate::identity::ProcessId::of(leader.id())
         .found()
         .expect("the live group leader resolves");
-    let (outcome, _) =
-        crate::containment::treewalk::terminate_tree(&crate::identity::HostKernel, id, None, TreeStop::default());
+    let broken = TreeStop::of_break(crate::containment::windows::terminate(leader.id()));
+    let (outcome, _) = crate::containment::treewalk::terminate_tree(&crate::identity::HostKernel, id, None, broken);
     assert!(
         matches!(outcome, TerminateOutcome::NotSent(_)),
         "a walker's refused break must be NotSent, got {outcome:?}"
@@ -131,7 +132,15 @@ fn fixture_console_less_reporter() {
 
     // The lone ops. The child's own flags do not exclude delivery; it is the caller that cannot send.
     let (child, sock) = spawn_consoleless_root();
-    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
+    let console = child.console;
+    assert!(
+        console.group && !console.own_console_flags,
+        "the flags do not exclude delivery: {console:?}"
+    );
+    assert!(
+        !StopTarget::from(&child).leads_group_on_our_console(),
+        "the caller had no console at the spawn, so there is no route from it"
+    );
     assert!(
         matches!(child.terminate(), Err(Error::NoConsole { .. })),
         "terminate must report NoConsole"
