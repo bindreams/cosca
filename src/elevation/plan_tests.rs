@@ -1,4 +1,4 @@
-use super::{BackendSet, Host, Os, Transition};
+use super::{BackendSet, FrontState, Host, Os, Transition};
 use crate::elevation::{Auth, Backend, Privilege};
 use crate::error::{ElevationErrorKind, Error};
 use std::path::PathBuf;
@@ -33,11 +33,16 @@ fn win_host(elevated: bool) -> Host {
 
 fn all_backends() -> BackendSet {
     BackendSet {
-        sudo: Some(PathBuf::from("/usr/bin/sudo")),
-        doas: Some(PathBuf::from("/usr/bin/doas")),
-        pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
-        osascript: None,
+        sudo: FrontState::Found(PathBuf::from("/usr/bin/sudo")),
+        doas: FrontState::Found(PathBuf::from("/usr/bin/doas")),
+        pkexec: FrontState::Found(PathBuf::from("/usr/bin/pkexec")),
+        osascript: FrontState::Absent,
     }
+}
+
+/// A front whose search stopped on an entry that could not be examined, `ELOOP`.
+fn unexamined() -> FrontState {
+    FrontState::Unexamined(std::sync::Arc::new(Error::Io(std::io::Error::from_raw_os_error(40))))
 }
 
 fn unix_host(available: BackendSet, elevated: bool, has_tty: bool) -> Host {
@@ -83,10 +88,10 @@ fn auto_prefers_sudo_then_doas() {
     // only doas -> doas
     let h = unix_host(
         BackendSet {
-            sudo: None,
-            doas: Some(PathBuf::from("/usr/bin/doas")),
-            pkexec: None,
-            osascript: None,
+            sudo: FrontState::Absent,
+            doas: FrontState::Found(PathBuf::from("/usr/bin/doas")),
+            pkexec: FrontState::Absent,
+            osascript: FrontState::Absent,
         },
         false,
         true,
@@ -105,10 +110,10 @@ fn auto_never_selects_pkexec() {
     // Only pkexec available: Auto must reject (BackendUnavailable), not pick it.
     let h = unix_host(
         BackendSet {
-            sudo: None,
-            doas: None,
-            pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
-            osascript: None,
+            sudo: FrontState::Absent,
+            doas: FrontState::Absent,
+            pkexec: FrontState::Found(PathBuf::from("/usr/bin/pkexec")),
+            osascript: FrontState::Absent,
         },
         false,
         true,
@@ -248,10 +253,10 @@ fn auto_resolving_to_doas_rejects_stdin() {
     for elevated in [false, true] {
         let h = unix_host(
             BackendSet {
-                sudo: None,
-                doas: Some(PathBuf::from("/usr/bin/doas")),
-                pkexec: None,
-                osascript: None,
+                sudo: FrontState::Absent,
+                doas: FrontState::Found(PathBuf::from("/usr/bin/doas")),
+                pkexec: FrontState::Absent,
+                osascript: FrontState::Absent,
             },
             elevated,
             true,
@@ -298,40 +303,91 @@ fn pkexec_off_linux_is_refused_naming_linux() {
     }
 }
 
-/// A pkexec found on PATH whose real file could not be found is reported as that, not as missing.
+/// `Backend::Auto` goes to `sudo` first, then `doas`, and takes the first whose search did not end
+/// in a miss. If that front could not be looked up, whether it is there is unknown: the plan reports
+/// it, with the cause, and takes no later one, found or not. Under `Auth::Stdin` and `Askpass`,
+/// which only `sudo` serves, that verdict is the same for a root caller as for one who is not, as
+/// the structural matrix is run first. (Under `Interactive` a root caller runs as is, before the
+/// front is looked at, as it does for a clean miss.) A `Backend::Doas` named is `Unsupported` under
+/// those two auths whatever its search found, and under `Interactive` fails as `Auto` does.
+///
+/// Mutants: `Auto` falls through to the later front when the first's search failed, or skips an
+/// unexamined `doas` for "no sudo/doas"; the structural matrix lets an unexamined `sudo` or `doas`
+/// through, so root is `RunAsIs`, or checks only the `sudo`.
 #[skuld::test]
-fn an_unresolvable_pkexec_says_so_rather_than_not_on_path() {
-    let mut h = unix_host(
+fn auto_reports_a_front_that_could_not_be_looked_up_instead_of_taking_the_next() {
+    let found = || all_backends().doas;
+    for (sudo, doas, backend) in [
+        (unexamined(), found(), Backend::Auto),
+        (unexamined(), FrontState::Absent, Backend::Auto),
+        (FrontState::Absent, unexamined(), Backend::Auto),
+        (FrontState::Absent, unexamined(), Backend::Doas),
+    ] {
+        for elevated in [true, false] {
+            let h = unix_host(
+                BackendSet {
+                    sudo: sudo.clone(),
+                    doas: doas.clone(),
+                    ..all_backends()
+                },
+                elevated,
+                true,
+            );
+            let mut auths = vec![
+                Auth::Stdin(crate::elevation::Secret::new("p")),
+                Auth::Askpass("/usr/bin/ssh-askpass".into()),
+            ];
+            if !elevated {
+                auths.push(Auth::Interactive);
+            }
+            for auth in auths {
+                let case = format!("{backend:?}, elevated {elevated}, {auth:?}");
+                let doas_needs_sudo = backend == Backend::Doas && !matches!(auth, Auth::Interactive);
+                let error = reject_error(h.plan(Privilege::Elevated, backend, auth));
+                if doas_needs_sudo {
+                    assert!(matches!(error, Error::Unsupported { .. }), "{case}: {error:?}");
+                } else {
+                    assert_eq!(crate::error::first_os_code(&error), Some(40), "{case}: {error:?}");
+                    assert!(
+                        matches!(
+                            error,
+                            Error::Elevation {
+                                kind: ElevationErrorKind::BackendUnavailable,
+                                ..
+                            }
+                        ),
+                        "{case}: {error:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A front's lookup error is read only when the plan needs that front: a `sudo` found makes the
+/// `doas` error nothing, and so does a request that names another backend.
+#[skuld::test]
+fn a_lookup_error_for_a_front_the_plan_does_not_use_changes_nothing() {
+    let h = unix_host(
         BackendSet {
-            pkexec: None,
+            doas: unexamined(),
+            pkexec: unexamined(),
             ..all_backends()
         },
         false,
         true,
     );
-    let refusal = std::io::Error::from_raw_os_error(40);
-    let text = refusal.to_string();
-    h.pkexec_version = crate::elevation::pkexec::PkexecVersion::Unresolved {
-        path: "/opt/bin/pkexec".into(),
-        error: std::sync::Arc::new(refusal),
-    };
-    let error = reject_error(h.plan(Privilege::Elevated, Backend::Pkexec, Auth::Gui));
-    assert_eq!(
-        crate::error::first_os_code(&error),
-        Some(40),
-        "the failed resolution is the cause: {error:?}"
-    );
-    match error {
-        Error::Elevation {
-            kind: ElevationErrorKind::BackendUnavailable,
-            detail,
-            ..
-        } => {
-            assert!(detail.contains("/opt/bin/pkexec"), "{detail}");
-            assert!(!detail.contains(&text), "the cause is in the text: {detail}");
-            assert!(!detail.contains("not on PATH"), "{detail}");
-        }
-        other => panic!("expected BackendUnavailable, got {other:?}"),
+    for backend in [Backend::Auto, Backend::Sudo] {
+        assert!(
+            matches!(
+                h.plan(Privilege::Elevated, backend, Auth::Interactive),
+                Transition::ElevatePosix {
+                    backend: Backend::Sudo,
+                    ..
+                }
+            ),
+            "{backend:?}"
+        );
     }
 }
 
@@ -341,10 +397,10 @@ fn macos_host(elevated: bool, has_tty: bool) -> Host {
         elevated,
         has_tty,
         available: BackendSet {
-            sudo: Some(PathBuf::from("/usr/bin/sudo")),
-            doas: None,
-            pkexec: None,
-            osascript: Some(PathBuf::from("/usr/bin/osascript")),
+            sudo: FrontState::Found(PathBuf::from("/usr/bin/sudo")),
+            doas: FrontState::Absent,
+            pkexec: FrontState::Absent,
+            osascript: FrontState::Found(PathBuf::from("/usr/bin/osascript")),
         },
         os: Os::MacOs,
         arg_max: Some(1_048_576),
@@ -366,7 +422,7 @@ fn macos_pkexec_is_unsupported_not_backend_unavailable() {
     // wrongly invite installing it. Even with a fabricated pkexec path present,
     // the verdict must be a platform Unsupported.
     let mut h = macos_host(false, true);
-    h.available.pkexec = Some(PathBuf::from("/usr/bin/pkexec"));
+    h.available.pkexec = FrontState::Found(PathBuf::from("/usr/bin/pkexec"));
     assert_eq!(
         unsupported_platform(h.plan(Privilege::Elevated, Backend::Pkexec, Auth::Gui)),
         "macos"
@@ -378,7 +434,7 @@ fn macos_keeps_the_backends_that_really_do_run_there() {
     // sudo and doas are portable and DO exist on macOS, so they must not be swept
     // into the impossible-backend guard alongside pkexec.
     let mut h = macos_host(false, true);
-    h.available.doas = Some(PathBuf::from("/usr/local/bin/doas"));
+    h.available.doas = FrontState::Found(PathBuf::from("/usr/local/bin/doas"));
     for backend in [Backend::Sudo, Backend::Doas] {
         assert!(
             matches!(
@@ -463,19 +519,36 @@ fn macos_gui_with_a_non_auto_backend_is_still_unsupported() {
     }
 }
 
+/// A missing `/usr/bin/osascript` and one that cannot be examined are both `BackendUnavailable`, not
+/// a platform verdict: the first says it is missing, the second has the examination's error as its
+/// cause.
+///
+/// Mutant: an osascript that cannot be examined is reported as missing.
 #[skuld::test]
 fn macos_gui_without_osascript_is_a_backend_problem_not_a_platform_one() {
-    // Here BackendUnavailable is honest: /usr/bin/osascript really can be absent
-    // or non-executable on a stripped system.
     let mut h = macos_host(false, true);
-    h.available.osascript = None;
-    assert!(matches!(
-        reject_error(h.plan(Privilege::Elevated, Backend::Auto, Auth::Gui)),
+    h.available.osascript = FrontState::Absent;
+    match reject_error(h.plan(Privilege::Elevated, Backend::Auto, Auth::Gui)) {
         Error::Elevation {
             kind: ElevationErrorKind::BackendUnavailable,
-            ..
-        }
-    ));
+            detail,
+            source: None,
+        } => assert!(detail.contains("missing") && !detail.contains("executable"), "{detail}"),
+        other => panic!("expected BackendUnavailable, got {other:?}"),
+    }
+    h.available.osascript = unexamined();
+    let error = reject_error(h.plan(Privilege::Elevated, Backend::Auto, Auth::Gui));
+    assert_eq!(crate::error::first_os_code(&error), Some(40), "{error:?}");
+    assert!(
+        matches!(
+            error,
+            Error::Elevation {
+                kind: ElevationErrorKind::BackendUnavailable,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
 }
 
 #[skuld::test]

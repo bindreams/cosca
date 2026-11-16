@@ -2,7 +2,7 @@
 //! [`Host::plan`]. A Linux test constructs a Windows-shaped `Host` and asserts
 //! the Windows decision — the `Containment` host-testing pattern.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::{Auth, Backend, Privilege};
 use crate::error::{ElevationErrorKind, Error};
@@ -41,29 +41,51 @@ pub(crate) fn is_macos_gui_auto(os: Os, backend: Backend, auth: &Auth) -> bool {
     os == Os::MacOs && matches!(auth, Auth::Gui) && backend == Backend::Auto
 }
 
-/// The resolved absolute path of each CLI backend on PATH (`None` = absent),
-/// filled by `detect` (checking the exec bit, skipping empty PATH elements) and
-/// faked in tests. Carrying the ABSOLUTE path is what closes the CWD-hijack hole:
-/// the validated path is exactly the one argv[0] emits.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// What the search for one elevation front found: its absolute path, nothing, or an entry it could
+/// not examine.
+#[derive(Debug, Clone, Default)]
+pub enum FrontState {
+    /// Not there: the search ended without a candidate.
+    #[default]
+    Absent,
+    /// The file the search found. Carrying the ABSOLUTE path is what closes the CWD-hijack hole:
+    /// the validated path is exactly the one argv[0] emits.
+    Found(PathBuf),
+    /// The search stopped on an entry it could not examine (`error`), so whether the front is there
+    /// is unknown. The planner reports it, as the cause of `BackendUnavailable`, only if it needs
+    /// the front.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the POSIX detection finds a front it cannot examine")
+    )]
+    Unexamined(std::sync::Arc<Error>),
+}
+
+/// What the search for each elevation front found, filled by `detect` (the one POSIX program lookup,
+/// [`crate::resolve::posix::lookup`]) and faked in tests.
+#[derive(Debug, Clone, Default)]
 pub struct BackendSet {
-    pub sudo: Option<PathBuf>,
-    pub doas: Option<PathBuf>,
-    pub pkexec: Option<PathBuf>,
-    /// macOS only: the absolute path of `/usr/bin/osascript`, the graphical
-    /// elevation front-end. Not a [`Backend`]: it does not wrap the child, it asks
-    /// Authorization Services to run the command as root.
-    pub osascript: Option<PathBuf>,
+    pub sudo: FrontState,
+    pub doas: FrontState,
+    pub pkexec: FrontState,
+    /// macOS only: `/usr/bin/osascript`, the graphical elevation front-end. Not a [`Backend`]: it
+    /// does not wrap the child, it asks Authorization Services to run the command as root.
+    pub osascript: FrontState,
 }
 
 impl BackendSet {
-    /// The resolved absolute path for `backend`; `Auto` maps to sudo-then-doas.
-    pub(crate) fn path(&self, backend: Backend) -> Option<&Path> {
+    /// The front `backend` runs: the backend itself, its program name and its state. `Backend::Auto`
+    /// runs the first of `sudo`, `doas` not absent (an unexamined `sudo` is taken, so `doas` never
+    /// replaces it), and `None` when neither is on `PATH`.
+    pub(crate) fn resolve(&self, backend: Backend) -> Option<(Backend, &'static str, &FrontState)> {
         match backend {
-            Backend::Sudo => self.sudo.as_deref(),
-            Backend::Doas => self.doas.as_deref(),
-            Backend::Pkexec => self.pkexec.as_deref(),
-            Backend::Auto => self.sudo.as_deref().or(self.doas.as_deref()),
+            Backend::Sudo => Some((Backend::Sudo, "sudo", &self.sudo)),
+            Backend::Doas => Some((Backend::Doas, "doas", &self.doas)),
+            Backend::Pkexec => Some((Backend::Pkexec, "pkexec", &self.pkexec)),
+            Backend::Auto => [Backend::Sudo, Backend::Doas]
+                .into_iter()
+                .filter_map(|front| self.resolve(front))
+                .find(|(_, _, state)| !matches!(state, FrontState::Absent)),
         }
     }
 }
@@ -82,9 +104,10 @@ pub struct Host {
     /// Only the macOS graphical path reads it; it lives here because the planner
     /// is plain data.
     pub arg_max: Option<usize>,
-    /// What [`BackendSet::pkexec`]'s `--version` said, or why a pkexec on `PATH` was not stored
-    /// ([`super::pkexec::PkexecVersion::Unresolved`], [`super::pkexec::PkexecVersion::Unpinned`]); asked only for a request that launches pkexec
+    /// What [`BackendSet::pkexec`]'s `--version` said; asked only for a request that launches pkexec
     /// — `Backend::Pkexec` with `Auth::Gui`, from a non-root caller, on Linux.
+    // Read only by the POSIX rewrite.
+    #[cfg_attr(not(unix), allow(dead_code, reason = "read only by the POSIX rewrite"))]
     pub pkexec_version: super::pkexec::PkexecVersion,
     /// [`BackendSet::pkexec`], opened by detection: the version probe and the launch both exec this
     /// descriptor's file (`/proc/self/fd/N`), so a file renamed over the path between them is
@@ -172,7 +195,7 @@ impl Host {
         // short-circuit, so an impossible combo never passes under root.
         let structural = match self.os {
             Os::Windows => structural_windows(backend, &auth),
-            os => structural_posix(os, backend, &auth, &self.available),
+            os => structural_posix(os, backend, &auth, self),
         };
         if let Some(error) = structural {
             return Transition::Reject { error };
@@ -183,16 +206,17 @@ impl Host {
         match self.os {
             Os::Windows => Transition::ElevateWindows { auth },
             Os::MacOs if is_macos_gui_auto(self.os, backend, &auth) => {
-                match self.available.osascript.as_deref() {
-                    Some(p) => Transition::ElevateMacosGui {
+                match &self.available.osascript {
+                    FrontState::Found(p) => Transition::ElevateMacosGui {
                         osascript: p.to_path_buf(),
                         arg_max: self.arg_max,
                     },
-                    // Honest here, unlike the pkexec verdict: /usr/bin/osascript
-                    // can genuinely be missing or non-executable.
-                    None => reject_backend_unavailable(
-                        "/usr/bin/osascript is missing or not executable; \
-                         macOS graphical elevation needs it",
+                    FrontState::Unexamined(error) => Transition::Reject {
+                        error: unexamined("/usr/bin/osascript", error),
+                    },
+                    // /usr/bin/osascript can genuinely be missing.
+                    FrontState::Absent => reject_backend_unavailable(
+                        "/usr/bin/osascript is missing; macOS graphical elevation needs it",
                         None,
                     ),
                 }
@@ -202,30 +226,19 @@ impl Host {
     }
 
     fn resolve_posix(&self, backend: Backend, auth: Auth) -> Transition {
-        let (resolved, path) = match backend {
-            Backend::Auto => {
-                if let Some(p) = self.available.sudo.as_deref() {
-                    (Backend::Sudo, p.to_path_buf())
-                } else if let Some(p) = self.available.doas.as_deref() {
-                    (Backend::Doas, p.to_path_buf())
-                } else {
-                    return reject_backend_unavailable("no sudo/doas on PATH for Backend::Auto", None);
+        let Some((resolved, program, state)) = self.available.resolve(backend) else {
+            return reject_backend_unavailable("no sudo/doas on PATH for Backend::Auto", None);
+        };
+        let path = match state {
+            FrontState::Found(p) => p.to_path_buf(),
+            FrontState::Unexamined(error) => {
+                return Transition::Reject {
+                    error: unexamined(program, error),
                 }
             }
-            explicit => match self.available.path(explicit) {
-                Some(p) => (explicit, p.to_path_buf()),
-                None => {
-                    let unresolved = (explicit == Backend::Pkexec)
-                        .then(|| self.pkexec_version.not_stored())
-                        .flatten();
-                    return match unresolved {
-                        Some(why) => reject_backend_unavailable(&why, self.pkexec_version.cause()),
-                        None => {
-                            reject_backend_unavailable(&format!("forced backend {explicit:?} is not on PATH"), None)
-                        }
-                    };
-                }
-            },
+            FrontState::Absent => {
+                return reject_backend_unavailable(&format!("forced backend {resolved:?} is not on PATH"), None)
+            }
         };
         // Environmental, not structural: whether a TTY is attached is a fact about
         // this run, not the (backend, auth) config, so it stays here rather than in
@@ -259,7 +272,7 @@ pub(crate) fn launches_pkexec(os: Os, backend: Backend, auth: &Auth, elevated: b
         elevated,
         has_tty: true,
         available: BackendSet {
-            pkexec: Some(PathBuf::from("pkexec")),
+            pkexec: FrontState::Found(PathBuf::from("pkexec")),
             ..BackendSet::default()
         },
         os,
@@ -276,13 +289,26 @@ pub(crate) fn launches_pkexec(os: Os, backend: Backend, auth: &Auth, elevated: b
     )
 }
 
+/// `BackendUnavailable` for the front `program`, which could not be examined (a `PATH` entry, or the
+/// real file of the one found): `error` is the cause.
+fn unexamined(program: &str, error: &std::sync::Arc<Error>) -> Error {
+    backend_unavailable(
+        &format!("{program} could not be found or opened: a file on the way to it could not be examined"),
+        Some(std::sync::Arc::clone(error)),
+    )
+}
+
+fn backend_unavailable(detail: &str, source: Option<std::sync::Arc<Error>>) -> Error {
+    Error::Elevation {
+        kind: ElevationErrorKind::BackendUnavailable,
+        detail: detail.into(),
+        source,
+    }
+}
+
 fn reject_backend_unavailable(detail: &str, source: Option<std::sync::Arc<Error>>) -> Transition {
     Transition::Reject {
-        error: Error::Elevation {
-            kind: ElevationErrorKind::BackendUnavailable,
-            detail: detail.into(),
-            source,
-        },
+        error: backend_unavailable(detail, source),
     }
 }
 
@@ -290,11 +316,11 @@ fn reject_backend_unavailable(detail: &str, source: Option<std::sync::Arc<Error>
 /// already-elevated short-circuit so an impossible combo never passes under root.
 ///
 /// The Askpass/Stdin-needs-sudo check is evaluated against the backend `Auto` WOULD
-/// resolve to (via `available`), not against ambient privilege — otherwise
+/// resolve to (via `host`), not against ambient privilege — otherwise
 /// `Backend::Auto` + `Auth::Stdin` on a doas-only host would return `Unsupported`
 /// unprivileged but `RunAsIs` once already root, a verdict that flips on ambient
 /// privilege instead of staying a property of the request.
-fn structural_posix(os: Os, backend: Backend, auth: &Auth, available: &BackendSet) -> Option<Error> {
+fn structural_posix(os: Os, backend: Backend, auth: &Auth, host: &Host) -> Option<Error> {
     let platform = if os == Os::MacOs { "macos" } else { "unix" };
     let unsupported = |op: String, detail: &str| {
         Some(Error::Unsupported {
@@ -349,21 +375,14 @@ fn structural_posix(os: Os, backend: Backend, auth: &Auth, available: &BackendSe
         );
     }
     if matches!(auth, Auth::Askpass(_) | Auth::Stdin(_)) {
-        // `Auto` with neither sudo nor doas on PATH is left to resolution's
-        // `BackendUnavailable`, not reported as a config mismatch here.
-        let effective = match backend {
-            Backend::Auto => {
-                if available.sudo.is_some() {
-                    Some(Backend::Sudo)
-                } else if available.doas.is_some() {
-                    Some(Backend::Doas)
-                } else {
-                    None
-                }
-            }
-            explicit => Some(explicit),
-        };
-        if let Some(eff) = effective.filter(|eff| *eff != Backend::Sudo) {
+        // `Auto` with neither sudo nor doas on PATH is left to resolution's `BackendUnavailable`,
+        // not reported as a config mismatch here. One whose search could not be completed is that
+        // same `BackendUnavailable` here, so the verdict does not depend on the caller's privilege.
+        let effective = host.available.resolve(backend);
+        if let (Backend::Auto, Some((_, program, FrontState::Unexamined(error)))) = (backend, effective) {
+            return Some(unexamined(program, error));
+        }
+        if let Some(eff) = effective.map(|(eff, ..)| eff).filter(|eff| *eff != Backend::Sudo) {
             let (kind, detail) = if matches!(auth, Auth::Askpass(_)) {
                 (
                     "Askpass",

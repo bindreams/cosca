@@ -1,8 +1,12 @@
 use super::{parse, PkexecVersion, KEEP_CWD_SINCE};
-use crate::error::Error;
+use crate::error::{ElevationErrorKind, Error};
+use std::path::Path;
 use std::sync::Arc;
 
 const OS_CODE: i32 = 2;
+
+/// A path that exists on no host, which is an unusable front.
+const MISSING: &str = "/nonexistent/pkexec";
 
 /// `pkexec --version`'s stdout, verbatim (exit 0, empty stderr), measured per image.
 const UBUNTU_22_04: &[u8] = b"pkexec version 0.105\n";
@@ -47,7 +51,7 @@ fn only_121_and_later_is_runnable() {
         (FEDORA_44, true),
     ] {
         let v = parse(out);
-        assert_eq!(v.refusal().is_none(), ok, "{v:?}");
+        assert_eq!(v.refusal(Path::new(MISSING)).is_none(), ok, "{v:?}");
     }
 }
 
@@ -91,7 +95,7 @@ fn non_utf8_output_is_its_own_case() {
 }
 
 fn refusal_detail(v: PkexecVersion) -> String {
-    match v.refusal() {
+    match v.refusal(Path::new(MISSING)) {
         Some(Error::Unsupported { op, detail, .. }) => {
             assert!(op.contains("pkexec"), "{op}");
             detail
@@ -110,10 +114,6 @@ fn each_refusal_names_its_case_and_the_raw_text() {
         (parse(b"polkit 122\n"), "\"polkit 122\\n\""),
         (parse(b"pkexec version \xff\n"), "non-UTF-8"),
         (
-            PkexecVersion::SpawnFailed(Arc::new(std::io::Error::from_raw_os_error(OS_CODE))),
-            "`pkexec --version` could not be run;",
-        ),
-        (
             PkexecVersion::Failed {
                 status: "exit status: 3".into(),
                 stdout: "oops".into(),
@@ -122,20 +122,6 @@ fn each_refusal_names_its_case_and_the_raw_text() {
             "exited with exit status: 3",
         ),
         (PkexecVersion::NotProbed, "was not checked"),
-        (
-            PkexecVersion::Unresolved {
-                path: "/opt/bin/pkexec".into(),
-                error: Arc::new(std::io::Error::from_raw_os_error(OS_CODE)),
-            },
-            "/opt/bin/pkexec could not be resolved to its real file;",
-        ),
-        (
-            PkexecVersion::Unpinned {
-                path: "/opt/bin/pkexec".into(),
-                error: Arc::new(std::io::Error::from_raw_os_error(OS_CODE)),
-            },
-            "pkexec at /opt/bin/pkexec could not be opened as its real file;",
-        ),
     ];
     for (v, needle) in cases {
         let detail = refusal_detail(v.clone());
@@ -151,29 +137,57 @@ fn each_refusal_names_its_case_and_the_raw_text() {
     assert!(failed.contains("\"oops\"") && failed.contains("\"boom\""), "{failed}");
 }
 
+/// A pkexec that could not be started is no polkit verdict: its error is the one a launch of it
+/// gives, which is `BackendUnavailable` with the launch's error as its cause only for a
+/// `NotFound` or `PermissionDenied` of a file that is unusable.
+///
+/// Mutants: the refusal is the `Unsupported` that tells the caller to upgrade polkit; every start
+/// failure is `BackendUnavailable`, so a resource failure blames the front; a usable file's
+/// failure is `BackendUnavailable`.
 #[skuld::test]
-fn a_refusal_that_follows_a_failed_read_has_it_as_its_cause() {
-    let os = || std::io::Error::from_raw_os_error(OS_CODE);
-    for v in [
-        PkexecVersion::SpawnFailed(Arc::new(os())),
-        PkexecVersion::Unresolved {
-            path: "/opt/bin/pkexec".into(),
-            error: Arc::new(os()),
-        },
-        PkexecVersion::Unpinned {
-            path: "/opt/bin/pkexec".into(),
-            error: Arc::new(os()),
-        },
+fn a_pkexec_that_could_not_be_started_fails_as_its_launch_does() {
+    let me = std::env::current_exe().expect("this test's own executable");
+    let start_failed = |e: std::io::Error, path: &Path| PkexecVersion::SpawnFailed(Arc::new(e)).refusal(path);
+
+    match start_failed(std::io::Error::from_raw_os_error(OS_CODE), Path::new(MISSING)) {
+        Some(Error::Elevation {
+            kind: ElevationErrorKind::BackendUnavailable,
+            source: Some(cause),
+            ..
+        }) => assert_eq!(crate::error::first_os_code(&cause), Some(OS_CODE)),
+        other => panic!("expected BackendUnavailable with a cause, got {other:?}"),
+    }
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(matches!(
+        start_failed(denied, Path::new(MISSING)),
+        Some(Error::Elevation {
+            kind: ElevationErrorKind::BackendUnavailable,
+            ..
+        })
+    ));
+    // The front is fine, or the failure says nothing of it: the error stays what the launch gives.
+    for (error, path) in [
+        (std::io::Error::from_raw_os_error(OS_CODE), me.as_path()),
+        (std::io::Error::from(std::io::ErrorKind::WouldBlock), Path::new(MISSING)),
+        (std::io::Error::from(std::io::ErrorKind::OutOfMemory), me.as_path()),
     ] {
-        let refusal = v.refusal().expect("a failed read refuses");
-        assert_eq!(
-            crate::error::first_os_code(&refusal),
-            Some(OS_CODE),
-            "{v:?}: {refusal:?}"
-        );
-        let Error::Unsupported { detail, .. } = &refusal else {
-            panic!("{v:?}: expected Unsupported, got {refusal:?}");
-        };
-        assert!(!detail.contains(&os().to_string()), "{v:?}: {detail}");
+        let kind = error.kind();
+        match start_failed(error, path) {
+            Some(Error::Io(e)) => assert_eq!(e.kind(), kind),
+            other => panic!("{kind:?} at {path:?}: expected the bare I/O error, got {other:?}"),
+        }
+    }
+}
+
+/// A pkexec that started and ran but could not be waited for is no polkit verdict and no failed
+/// start: its error stays an I/O error.
+///
+/// Mutant: the failed wait is `BackendUnavailable`, or `Unsupported`.
+#[skuld::test]
+fn a_pkexec_whose_run_failed_keeps_its_io_error() {
+    let v = PkexecVersion::RunFailed(Arc::new(std::io::Error::from_raw_os_error(OS_CODE)));
+    match v.refusal(Path::new(MISSING)) {
+        Some(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(OS_CODE)),
+        other => panic!("expected the bare I/O error, got {other:?}"),
     }
 }

@@ -171,6 +171,16 @@ pub fn is_elevated() -> bool {
 /// Which elevation program runs. `Auto` (default) detects among the CLI backends
 /// only — order `sudo` > `doas`. `pkexec`/graphical elevation is explicit-only (a
 /// library must not pop a polkit dialog unbidden).
+///
+/// On unix the `sudo`, `doas` or `pkexec` run is found on this process's `PATH` by the search
+/// every unix spawn makes. The first file of that name, whatever its mode, is the front: one
+/// without the execute bit is still the match, and fails at launch. A miss is an absent backend. An
+/// entry that cannot be examined ends the search, as does a found `pkexec` whose real file cannot
+/// be resolved or opened: if the plan needs that backend it fails with
+/// [`crate::error::ElevationErrorKind::BackendUnavailable`] (source: the error), otherwise nothing
+/// fails. `Auto` fails the same way when its `sudo` search could not be completed, even if a `doas`
+/// was found, and does so for a root and a non-root caller alike under `Auth::Stdin` and `Askpass`.
+/// On macOS `/usr/bin/osascript` follows the same rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
     #[default]
@@ -180,7 +190,10 @@ pub enum Backend {
     /// Requires Linux and polkit 121 or later (`pkexec --keep-cwd`); an older pkexec takes the flag
     /// for the program name. A spawn that would launch pkexec — `Auth::Gui`, not already root —
     /// first runs `pkexec --version` and refuses one it cannot show to be 121 or later with
-    /// [`crate::error::Error::Unsupported`]. The pkexec on `PATH` is opened once, and both that
+    /// [`crate::error::Error::Unsupported`]. One it cannot start fails as a launch of it does: with
+    /// [`crate::error::ElevationErrorKind::BackendUnavailable`] (source: the launch's error) when the
+    /// file is unusable, else with the error itself.
+    /// The pkexec on `PATH` is opened once, and both that
     /// check and the launch exec the opened file (`/proc/self/fd/N`), so a pkexec replaced in
     /// between is never run.
     Pkexec,

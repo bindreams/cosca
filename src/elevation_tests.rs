@@ -203,7 +203,7 @@ fn detect_finds_backends_on_the_path_it_is_given() {
         Some(dir.path().as_os_str()),
         false,
     );
-    assert_eq!(h.available.sudo.as_deref(), Some(sudo.as_path()));
+    assert!(matches!(&h.available.sudo, super::plan::FrontState::Found(p) if *p == sudo));
 }
 
 /// Detection reports the privilege it is handed, not this process's.
@@ -261,15 +261,18 @@ fn detect_without_a_path_finds_no_backend_on_the_process_path() {
     let process_path = std::env::var_os("PATH").expect("the outer test sets PATH");
     for program in ["sudo", "doas", "pkexec"] {
         assert!(
-            super::posix::resolve_in_path_var(&process_path, program).is_some(),
+            crate::resolve::posix::lookup(std::path::Path::new(program), None, Some(&process_path)).is_ok(),
             "the process PATH must hold a {program}, or this test proves nothing"
         );
     }
     for backend in [super::Backend::Auto, super::Backend::Pkexec] {
         let h = super::plan::Host::detect(backend, &super::Auth::Interactive, None, false);
-        assert_eq!(h.available.sudo, None, "{backend:?}");
-        assert_eq!(h.available.doas, None, "{backend:?}");
-        assert_eq!(h.available.pkexec, None, "{backend:?}");
+        for front in [&h.available.sudo, &h.available.doas, &h.available.pkexec] {
+            assert!(
+                matches!(front, super::plan::FrontState::Absent),
+                "{backend:?}: {front:?}"
+            );
+        }
     }
 }
 
@@ -295,8 +298,9 @@ fn detect_reports_macos() {
     let h = super::plan::Host::detect(super::Backend::Auto, &super::Auth::Interactive, None, false);
     assert_eq!(h.os, super::plan::Os::MacOs);
     assert!(
-        h.available.osascript.is_some(),
-        "a macOS host must resolve /usr/bin/osascript"
+        matches!(h.available.osascript, super::plan::FrontState::Found(_)),
+        "a macOS host must resolve /usr/bin/osascript: {:?}",
+        h.available.osascript
     );
     assert!(h.arg_max.is_some(), "kern.argmax must be readable on macOS");
 }

@@ -4,7 +4,7 @@ use super::super::rewrite_with_host;
 use super::rewrite_tests::{derived_argv, elevated_sudo_host, sudo_host};
 use crate::command::Command;
 use crate::elevation::pkexec::PkexecVersion;
-use crate::elevation::plan::{BackendSet, Host, Os};
+use crate::elevation::plan::{BackendSet, FrontState, Host, Os};
 use crate::elevation::{Auth, Backend, ElevatedVia};
 use crate::error::Error;
 use crate::test_child::Console;
@@ -39,10 +39,10 @@ fn under(mut c: Command, backend: Backend) -> Command {
 pub(super) fn every_backend_host() -> Host {
     Host {
         available: BackendSet {
-            sudo: Some(PathBuf::from("/usr/bin/sudo")),
-            doas: Some(PathBuf::from("/usr/bin/doas")),
-            pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
-            osascript: None,
+            sudo: FrontState::Found(PathBuf::from("/usr/bin/sudo")),
+            doas: FrontState::Found(PathBuf::from("/usr/bin/doas")),
+            pkexec: FrontState::Found(PathBuf::from("/usr/bin/pkexec")),
+            osascript: FrontState::Absent,
         },
         pkexec_version: PkexecVersion::Parsed {
             version: "121".into(),
@@ -174,7 +174,6 @@ fn a_pkexec_older_than_121_is_refused() {
             release: Some(120),
         },
         PkexecVersion::Unparsed("polkit 122\n".into()),
-        PkexecVersion::SpawnFailed(std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::ENOENT))),
     ] {
         let host = Host {
             pkexec_version: version.clone(),

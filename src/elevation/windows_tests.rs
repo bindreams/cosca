@@ -27,7 +27,7 @@ fn detect_reports_the_elevation_it_is_given() {
     }
 }
 
-/// Windows has no backend to find: a `path_var` holding programs leaves `available` at its default.
+/// Windows has no backend to find: a `path_var` holding programs leaves every front of `available` absent.
 #[skuld::test]
 fn detect_ignores_the_path_it_is_given() {
     let h = crate::elevation::plan::Host::detect(
@@ -36,7 +36,10 @@ fn detect_ignores_the_path_it_is_given() {
         Some(std::ffi::OsStr::new(r"C:\Windows\System32")),
         false,
     );
-    assert_eq!(h.available, crate::elevation::plan::BackendSet::default());
+    let a = &h.available;
+    for front in [&a.sudo, &a.doas, &a.pkexec, &a.osascript] {
+        assert!(matches!(front, crate::elevation::plan::FrontState::Absent), "{front:?}");
+    }
 }
 
 #[skuld::test]

@@ -196,9 +196,12 @@ In order:
    S2): a clone kind (vfork without `CLONE_VM`, or plain), the env block built in the parent, the
    caller's async-signal-safe steps, and a status channel of errno, ready and report records read
    without blocking. The elevation shim uses it, and so does the ordinary spawn
-   (`child::spawn::fork_spawn`, the vfork kind): its outcome is the core's records alone. Every unix spawn finds its program in the
-   parent, by the one search `resolve::posix::lookup` (the POSIX grammar of `crate::resolve`: the
-   child's `PATH` only, the first file that exists, an entry that cannot be examined ends the search);
-   the Linux child only `execve`s the path it is given (and the `PATH` entries after it that are
-   files, if that file is gone at the `execve`), and macOS hands std the path. macOS still
+   (`child::spawn::fork_spawn`, the vfork kind): its outcome is the core's records alone. Every unix
+   spawn finds its program in the parent, by the one search `resolve::posix::lookup` (the POSIX
+   grammar of `crate::resolve`: the child's `PATH` only, the first file that exists, an entry that
+   cannot be examined ends the search). So does elevation's detection of its front (`sudo`, `doas`,
+   `pkexec`) on this process's `PATH`: a miss is an absent front, and an entry that cannot be examined
+   is kept as the cause of the `BackendUnavailable` for a front the plan picks. The Linux child only
+   `execve`s the path it is given (and the `PATH` entries after it that are files, if that file is
+   gone at the `execve`), and macOS hands std the path. macOS still
    launches through std, whose `execvp` gives a file with no `#!` to `/bin/sh` until macOS forks itself.
