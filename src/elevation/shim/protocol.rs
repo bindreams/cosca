@@ -7,6 +7,8 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+use crate::role::decimal;
+
 /// `argv[1]` of a plain invocation.
 const FLAG: &[u8] = b"--cosca-elevation-shim=1";
 /// `argv[1]` of a hex invocation: every argument after it except [`SEPARATOR`] is lowercase hex, so
@@ -214,14 +216,6 @@ fn from_hex(a: &OsStr) -> Result<OsString, ShimArgsError> {
         .map(|[hi, lo]| Ok(nibble(*hi)? << 4 | nibble(*lo)?))
         .collect::<Result<Vec<u8>, _>>()?;
     Ok(OsString::from_vec(out))
-}
-
-/// Decimal digits only: no sign, no whitespace, no leading zero, so a number has one encoding.
-fn decimal<T: std::str::FromStr>(a: &[u8]) -> Option<T> {
-    if a.is_empty() || !a.iter().all(u8::is_ascii_digit) || (a.len() > 1 && a[0] == b'0') {
-        return None;
-    }
-    std::str::from_utf8(a).ok()?.parse().ok()
 }
 
 fn decimal_u32(a: &OsStr) -> Result<u32, ShimArgsError> {

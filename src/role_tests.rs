@@ -48,7 +48,7 @@ fn a_closed_stderr_raises_no_sigpipe() {
     let plain = rustix::io::write(std::io::stderr().as_fd(), b"x");
     let plain_raised = DELIVERED.swap(false, Ordering::Relaxed);
 
-    super::line(format_args!("a line for a closed pipe"));
+    super::line(super::PROXY, format_args!("a line for a closed pipe"));
     let line_raised = DELIVERED.load(Ordering::Relaxed);
     unblock_sigpipe();
     let line_raised_on_unblock = DELIVERED.load(Ordering::Relaxed);
@@ -62,7 +62,7 @@ fn a_closed_stderr_raises_no_sigpipe() {
 
 #[skuld::test]
 fn a_line_to_a_working_stderr_is_written() {
-    // The shim's stderr lines are the front's only report of a refusal before hello.
+    // A role's stderr lines are the front's only report of a refusal before hello.
     let Some(_done) = crate::test_own_process::own_process(
         crate::test_own_process::test_path!(a_line_to_a_working_stderr_is_written),
         crate::test_spawn::spawn,
@@ -72,7 +72,7 @@ fn a_line_to_a_working_stderr_is_written() {
     let (reader, writer) = std::io::pipe().expect("a pipe");
     let original = rustix::io::dup(std::io::stderr().as_fd()).expect("a copy of stderr");
     rustix::stdio::dup2_stderr(&writer).expect("stderr is the pipe");
-    super::line(format_args!("exit {}", 7));
+    super::line(super::SHIM, format_args!("exit {}", 7));
     rustix::stdio::dup2_stderr(&original).expect("stderr is back");
     drop(writer);
     let mut text = String::new();

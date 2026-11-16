@@ -270,6 +270,11 @@ path = "tests/macos_fdmarker.rs"
 harness = false
 
 [[test]]
+name = "ctrl_proxy_bin"
+path = "tests/ctrl_proxy_bin.rs"
+harness = false
+
+[[test]]
 name = "windows_breakaway"
 path = "tests/windows_breakaway.rs"
 harness = false
@@ -378,6 +383,12 @@ harness = false
 name = "posix_path_resolution"
 path = "tests/posix_path_resolution.rs"
 harness = false
+
+# The console-event proxy for a host that does not call `cosca::init()` (see `src/init.rs`).
+[[bin]]
+name = "cosca-ctrl-proxy"
+path = "src/bin/cosca-ctrl-proxy.rs"
+test = false
 
 [[bin]]
 name = "cosca_testbin"

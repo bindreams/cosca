@@ -14,6 +14,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use super::{accept_or_die, ack, fixture_argv, Console, IDENTITY_READ};
+use crate::stop::proxy::protocol::CtrlEvent;
 
 pub(crate) mod console_less;
 pub(crate) mod nested;
@@ -38,6 +39,10 @@ pub(crate) enum Handler {
     Default,
     /// Writes `B` to its control socket on `CTRL_BREAK` and keeps running.
     Ack,
+    /// [`Ack`](Handler::Ack), and writes `C` on `CTRL_C`, so the ack says which event arrived. It
+    /// clears "Ctrl+C is ignored" for itself, which a process inherits from a parent that has it
+    /// set and a group's leader is created with, so a `CTRL_C` always reaches its handler.
+    AckEvent,
     /// Handles every event and keeps running, so only a kill ends it.
     Ignore,
 }
@@ -47,6 +52,7 @@ impl Handler {
         match self {
             Handler::Default => "default",
             Handler::Ack => "ack",
+            Handler::AckEvent => "ack-event",
             Handler::Ignore => "ignore",
         }
     }
@@ -98,7 +104,8 @@ fn fixture_ctrl_break_member() {
     let handler = std::env::var(HANDLER_ENV).expect("the member's handler");
     match handler.as_str() {
         "default" => {}
-        "ack" => install_ack(&sock),
+        "ack" => install_ack(&sock, false),
+        "ack-event" => install_ack(&sock, true),
         "ignore" => install_ignore(),
         other => panic!("unknown handler {other:?}"),
     }
@@ -125,33 +132,43 @@ fn fixture_ctrl_break_member() {
     _ = sock.read(&mut sink);
 }
 
-/// Acks a `CTRL_BREAK` by writing `B` through a clone of `sock`, and keeps the process running.
-/// Only `CTRL_BREAK` is acked, so a stray `CTRL_C` or `CTRL_CLOSE` cannot pass for it.
-fn install_ack(sock: &TcpStream) {
+/// Acks a `CTRL_BREAK` by writing `B` through a clone of `sock`, and keeps the process running. Only
+/// `CTRL_BREAK` is acked, so a stray `CTRL_C` or `CTRL_CLOSE` cannot pass for it. With `names_event`
+/// a `CTRL_C` is acked too, by `C`, and "Ctrl+C is ignored" is cleared for this process.
+fn install_ack(sock: &TcpStream, names_event: bool) {
     use std::sync::{Mutex, OnceLock};
 
     use windows::core::BOOL;
-    use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT};
+    use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
 
     // The handler runs on a thread the OS creates, not in signal context, so allocating I/O is
     // fine. Nothing in it may panic: unwinding out of an `extern "system"` fn aborts.
-    static ACK: OnceLock<Mutex<TcpStream>> = OnceLock::new();
+    static ACK: OnceLock<(Mutex<TcpStream>, bool)> = OnceLock::new();
     unsafe extern "system" fn ack(event: u32) -> BOOL {
-        if event != CTRL_BREAK_EVENT {
-            return BOOL(0); // not handled: the default disposition applies
-        }
-        let Some(Ok(mut sock)) = ACK.get().map(Mutex::lock) else {
+        let byte = match event {
+            CTRL_BREAK_EVENT => b'B',
+            CTRL_C_EVENT if ACK.get().is_some_and(|(_, names_event)| *names_event) => b'C',
+            _ => return BOOL(0), // not handled: the default disposition applies
+        };
+        let Some(Ok(mut sock)) = ACK.get().map(|(sock, _)| sock.lock()) else {
             return BOOL(0);
         };
-        match sock.write_all(b"B").and_then(|()| sock.flush()) {
+        match sock.write_all(&[byte]).and_then(|()| sock.flush()) {
             Ok(()) => BOOL(1), // handled: keep running
             Err(_) => BOOL(0),
         }
     }
-    ACK.set(Mutex::new(sock.try_clone().expect("clone the control socket")))
-        .expect("one handler per process");
+    ACK.set((
+        Mutex::new(sock.try_clone().expect("clone the control socket")),
+        names_event,
+    ))
+    .expect("one handler per process");
     // SAFETY: installing a console ctrl handler has no preconditions.
     unsafe { SetConsoleCtrlHandler(Some(ack), true) }.expect("install the ctrl handler");
+    if names_event {
+        // SAFETY: as above; a null routine with `false` clears this process's "ignore Ctrl+C".
+        unsafe { SetConsoleCtrlHandler(None, false) }.expect("clear the Ctrl+C ignore");
+    }
 }
 
 /// Handles every console control event, so the process keeps running.
@@ -178,6 +195,25 @@ pub(crate) fn spawn_member(
     mode: crate::ContainMode,
     configure: impl FnOnce(&mut crate::Command),
 ) -> (crate::Child, TcpStream, Option<Grandchild>) {
+    spawn_member_with(handler, grandchild, Some(mode), configure)
+}
+
+/// [`spawn_member`] for a member that is not contained.
+pub(crate) fn spawn_uncontained_member(
+    handler: Handler,
+    configure: impl FnOnce(&mut crate::Command),
+) -> (crate::Child, TcpStream) {
+    let (child, sock, _) = spawn_member_with(handler, None, None, configure);
+    (child, sock)
+}
+
+/// [`spawn_member`] with `mode` as the containment, or none.
+fn spawn_member_with(
+    handler: Handler,
+    grandchild: Option<Handler>,
+    mode: Option<crate::ContainMode>,
+    configure: impl FnOnce(&mut crate::Command),
+) -> (crate::Child, TcpStream, Option<Grandchild>) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
     let mut cmd = crate::test_child::command(Console::Asked);
     cmd.executable(std::env::current_exe().expect("current_exe"))
@@ -186,7 +222,9 @@ pub(crate) fn spawn_member(
     for (key, value) in member_env(&addr, handler, grandchild) {
         cmd.env(key, value);
     }
-    cmd.contain_with(mode);
+    if let Some(mode) = mode {
+        cmd.contain_with(mode);
+    }
     configure(&mut cmd);
     let child = cmd.spawn().expect("spawn the root");
     let mut sock = accept_root(&listener, child.id().expect(IDENTITY_READ));
@@ -207,10 +245,21 @@ pub(crate) fn assert_in_our_console(pid: u32, who: &str) {
 /// Read the `B` an acking member writes when its handler receives the break. Call it only after
 /// [`assert_break_sent_to`]: the read has no deadline.
 pub(crate) fn assert_acked(sock: &mut TcpStream, who: &str) {
+    assert_acked_event(sock, who, CtrlEvent::CtrlBreak);
+}
+
+/// Read the byte an acking member writes when its handler receives `event` (`B` for a break, `C` for
+/// Ctrl+C), and require that it is the one for `event`. The read has no deadline: call it only after
+/// the call that sent the event has answered that it did.
+pub(crate) fn assert_acked_event(sock: &mut TcpStream, who: &str, event: CtrlEvent) {
+    let (byte, name) = match event {
+        CtrlEvent::CtrlBreak => (b'B', "CTRL_BREAK"),
+        CtrlEvent::CtrlC => (b'C', "CTRL_C"),
+    };
     let mut ack = [0u8; 1];
     sock.read_exact(&mut ack)
-        .unwrap_or_else(|e| panic!("{who} must acknowledge the break: {e}"));
-    assert_eq!(&ack, b"B", "{who} acked something other than CTRL_BREAK");
+        .unwrap_or_else(|e| panic!("{who} must acknowledge the {name}: {e}"));
+    assert_eq!(ack, [byte], "{who} acked something other than {name}");
 }
 
 /// Accepts the root member `root` (death-watched) and reads its tag.
@@ -233,6 +282,11 @@ pub(crate) fn accept_tagged(listener: &TcpListener, root: crate::identity::Proce
 /// bookkeeping to wait for, and only a kill ends it. Its creation flags are the ordinary contained
 /// ones, so [`GracefulMechanism::ConsoleGroup`](crate::GracefulMechanism) is what the child reports.
 pub(crate) fn spawn_consoleless_root() -> (crate::Child, TcpStream) {
+    spawn_gui_root(|_| {})
+}
+
+/// [`spawn_consoleless_root`], with `configure` applied to the command last.
+pub(crate) fn spawn_gui_root(configure: impl FnOnce(&mut crate::Command)) -> (crate::Child, TcpStream) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
     let mut cmd = crate::test_child::command(Console::Asked);
     // `args` is the whole argv, program name included.
@@ -241,6 +295,7 @@ pub(crate) fn spawn_consoleless_root() -> (crate::Child, TcpStream) {
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     cmd.env(ack::ACK_ENV, "1");
     cmd.contain();
+    configure(&mut cmd);
     let child = cmd.spawn().expect("spawn the GUI-subsystem root");
     let sock = accept_tagged(&listener, child.id().expect(IDENTITY_READ), b'G');
     (child, sock)
@@ -396,21 +451,7 @@ pub(crate) fn drive_reporter(test: &str, addr_env: &str, configure: impl FnOnce(
 /// group outside our console is accepted and delivered to no one, so a test that waits for a
 /// delivered break first requires `Some(true)`, after the member's handshake.
 pub(crate) fn in_our_console(pid: u32) -> Option<bool> {
-    use windows::Win32::System::Console::GetConsoleProcessList;
-
-    // Grown to the count the API reports: a buffer too small gets the required count back unfilled.
-    let mut list = vec![0u32; 16];
-    loop {
-        // SAFETY: `list` is a valid writable slice.
-        let n = unsafe { GetConsoleProcessList(&mut list) } as usize;
-        if n == 0 {
-            return None;
-        }
-        if n <= list.len() {
-            return Some(list[..n].contains(&pid));
-        }
-        list.resize(n, 0);
-    }
+    crate::stop::proxy::run::console_holds(pid).ok()
 }
 
 /// A handle on a process that can wait for its exit and read its exit code. Dropping it terminates

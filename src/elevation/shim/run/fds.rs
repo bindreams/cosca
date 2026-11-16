@@ -54,9 +54,10 @@ pub(super) fn replace_stdio(log: &Log) {
             log.warn(format_args!(
                 "cannot open /dev/null: {report}; the shim keeps its standard descriptors"
             ));
-            crate::elevation::shim::stderr::line(format_args!(
-                "cannot open /dev/null: {report}; the shim keeps its standard descriptors"
-            ));
+            crate::role::line(
+                crate::role::SHIM,
+                format_args!("cannot open /dev/null: {report}; the shim keeps its standard descriptors"),
+            );
             return;
         }
     };

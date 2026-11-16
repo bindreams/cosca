@@ -145,7 +145,10 @@ impl Shim {
     }
 
     fn say_refused(&self, code: i32, why: &str) {
-        super::stderr::line(format_args!("{why}; the program was not started (exit {code})"));
+        crate::role::line(
+            crate::role::SHIM,
+            format_args!("{why}; the program was not started (exit {code})"),
+        );
         self.log.line(format_args!("refused {code}: {why}"));
     }
 
@@ -154,10 +157,13 @@ impl Shim {
         let said = crate::error::Report(e);
         self.log
             .line(format_args!("refused {}: {what}: {said}", codes::NOT_EXECUTED));
-        super::stderr::line(format_args!(
-            "{what}: {said}; the program was not started (exit {})",
-            codes::NOT_EXECUTED
-        ));
+        crate::role::line(
+            crate::role::SHIM,
+            format_args!(
+                "{what}: {said}; the program was not started (exit {})",
+                codes::NOT_EXECUTED
+            ),
+        );
         self.send(Frame::NotExecuted(report));
         Exit(codes::NOT_EXECUTED)
     }

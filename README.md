@@ -91,6 +91,10 @@ state and restores it with `--revert` (same guard and root check as enabling; on
 It needs `COSCA_TEST_STRAY_SIGNAL_CONSENT=1`, which CI sets; on your own machine set
 `COSCA_TEST_STRAY_SIGNAL=0` to skip it, or run it in a container or VM.
 
+`CTRL_PROXY` (`COSCA_TEST_CTRL_PROXY`, Windows) holds the tests that run the console-event proxy, which sends Ctrl+C or
+Ctrl+Break to every process on a console. It needs `COSCA_TEST_CTRL_PROXY_CONSENT=1`, which CI's Windows job sets;
+on your own machine set `COSCA_TEST_CTRL_PROXY=0` to skip it.
+
 `PIDFD_GET_INFO` (`COSCA_TEST_PIDFD_GET_INFO`) holds the cgroup tests that read a task's cgroup id through its
 pidfd, which needs Linux 6.13+. The library supports older kernels, which read it through `/proc`. Its
 precondition asks the kernel, so on an older one the tests fail naming the switch; set

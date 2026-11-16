@@ -21,7 +21,6 @@ pub(crate) mod private_dir;
 pub(crate) mod protocol;
 #[cfg(target_os = "linux")]
 pub(crate) mod run;
-pub(crate) mod stderr;
 pub(crate) mod step;
 
 #[allow(unused_imports, reason = "nothing outside the tests of this module uses it")]
@@ -29,47 +28,25 @@ pub(crate) use choice::ShimChoice;
 
 pub use hooks::{Gate, Inject, ShimTestHooks};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ffi::OsString;
 
 use protocol::ShimArgs;
 
-static INSTALLED: AtomicBool = AtomicBool::new(false);
-
-/// Makes this process able to be the elevation shim. Call it first in `main`, before anything else
-/// reads arguments, starts threads or changes signal dispositions.
-///
-/// When the process was started as the shim (its arguments say so), `init` runs the shim to its end
-/// and exits the process; it does not return. Otherwise it returns at once and does nothing else.
-///
-/// The shim runs on Linux. Other platforms have no shim; `init` reports that and does not start the
-/// program (exit 120).
-pub fn init() {
-    install(None);
-}
-
-/// Whether [`init`] has run in this process.
-pub fn installed() -> bool {
-    INSTALLED.load(Ordering::Relaxed)
-}
-
-/// [`init`] with test seams. Not public API.
-#[doc(hidden)]
-pub fn init_with_test_hooks(hooks: &'static dyn ShimTestHooks) {
-    install(Some(hooks));
-}
-
-fn install(hooks: Option<&'static dyn ShimTestHooks>) {
-    INSTALLED.store(true, Ordering::Relaxed);
-    let argv: Vec<_> = std::env::args_os().collect();
-    match ShimArgs::parse(&argv) {
+/// Runs the shim to its end and exits the process when `argv` is a shim invocation, valid or not;
+/// returns otherwise. [`init`](crate::init) calls it.
+pub(crate) fn run_if_invoked(argv: &[OsString], hooks: Option<&'static dyn ShimTestHooks>) {
+    match ShimArgs::parse(argv) {
         Ok(None) => {}
         Ok(Some(args)) => std::process::exit(run_shim(&args, hooks)),
         Err(e) => {
-            stderr::line(format_args!(
-                "{}; the program was not started (exit {})",
-                crate::error::Report(&e),
-                codes::INVOCATION
-            ));
+            crate::role::line(
+                crate::role::SHIM,
+                format_args!(
+                    "{}; the program was not started (exit {})",
+                    crate::error::Report(&e),
+                    codes::INVOCATION
+                ),
+            );
             std::process::exit(codes::INVOCATION);
         }
     }
@@ -83,13 +60,12 @@ fn run_shim(args: &ShimArgs, hooks: Option<&'static dyn ShimTestHooks>) -> i32 {
 /// Other platforms have no shim; it reports that and does not start the program.
 #[cfg(not(target_os = "linux"))]
 fn run_shim(_: &ShimArgs, _: Option<&'static dyn ShimTestHooks>) -> i32 {
-    stderr::line(format_args!(
-        "this platform has no shim; the program was not started (exit {})",
-        codes::INVOCATION
-    ));
+    crate::role::line(
+        crate::role::SHIM,
+        format_args!(
+            "this platform has no shim; the program was not started (exit {})",
+            codes::INVOCATION
+        ),
+    );
     codes::INVOCATION
 }
-
-#[cfg(test)]
-#[path = "shim/init_tests.rs"]
-mod init_tests;
