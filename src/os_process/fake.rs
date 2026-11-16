@@ -231,7 +231,7 @@ impl FakeProcess {
 
     /// Answer every [`OsChild::peek`] that the `peeks` table has nothing left for with `answer()`,
     /// however many calls there are.
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     pub(crate) fn peeks_always(self, answer: impl FnMut() -> PeekAnswer + Send + 'static) -> Self {
         self.script().peeks_always = Some(Box::new(answer));
         self

@@ -169,8 +169,8 @@ In order:
    `_for_test` accessors. A release ends only what a mechanism owns (the cgroup leaf, which its
    `Release` takes, and the fd marker's read end, which the release closes); any other mechanism is given back and stays in
    the tree, so a walk's settlement after a release still has its identities. A released tree is
-   sent nothing and has no drain edge, whichever mechanism stays. The two `debug_assert`s on the `CgroupOnly` gate
-   (`kill_sent_gated`, `graceful_shutdown`) state a contract there, not a branch. The per-OS async drivers of the drain waits live in the drain edge
+   sent nothing and has no drain edge, whichever mechanism stays. The `debug_assert` on a front the kill rule leaves
+   to its cgroup (`Child::kill_sent`) states a contract there, not a branch. The per-OS async drivers of the drain waits live in the drain edge
    (`containment/drain_edge.rs`), beside `DrainEdge::wait_async`, which calls them; they use the
    async waits' primitives in `tokio/wait.rs` (the clock, the armed deadline, the readiness loop).
 4. **The `Child` core:** the sync and async `Child` are one policy and two drivers: the async

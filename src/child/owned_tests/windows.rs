@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use super::fixtures::{wait_status, Blocker};
 use crate::child::owned::OwnedChild;
+use crate::elevation::front::TrackedKind;
 use crate::identity::refusing_the_next_terminate;
 use crate::os_process::child::adopt_std_over;
 use crate::os_process::fake::FakeProcess;
@@ -46,7 +47,7 @@ fn kill_never_waits() {
     let id = super::fixtures::identity_of(&blocker);
     let kernel = Arc::new(refusing_the_next_terminate());
     let fake = FakeProcess::over(adopt_std_over(Arc::clone(&kernel), blocker, id));
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     drop(stdin);
     assert_eq!(
         child.signal(Sig::Kill).expect("a refusal under way is no error"),

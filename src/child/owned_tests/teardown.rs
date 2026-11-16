@@ -8,6 +8,7 @@ use super::teardown_look::FakeReach;
 use crate::child::lifecycle::Wording;
 use crate::child::owned::teardown::{BeginOutcome, Disposition, Kill, TeardownOutcome};
 use crate::child::owned::OwnedChild;
+use crate::elevation::front::TrackedKind;
 use crate::error::ChildFate;
 use crate::identity::ProcessId;
 use crate::os_process::child::{ExitRecord, Foreign};
@@ -45,7 +46,7 @@ fn tear_down_logged(
     warn_after: Option<Duration>,
 ) -> (TeardownOutcome, Vec<(log::Level, String)>) {
     crate::log_capture::install();
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     let mark = crate::log_capture::mark();
     let torn = child.tear_down(
         id,
@@ -152,7 +153,7 @@ fn a_reap_after_a_delivered_kill_that_meets_launchd_returns_the_note_and_logs_no
 #[skuld::test]
 fn a_reap_after_a_delivered_tree_kill_that_meets_a_foreign_reap_is_killed() {
     let fake = fake().reaps([ReapAnswer::Foreign(Foreign::Gone)]);
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     let torn = child.reap_after_tree_kill(&child.teardown_subject(), Disposition::Leave, None);
     assert_eq!(torn.fate(), ChildFate::Killed);
     assert_eq!(
@@ -172,7 +173,7 @@ fn a_reap_after_a_delivered_tree_kill_that_meets_a_foreign_reap_is_killed() {
 fn a_reap_after_a_tree_kill_waits_for_the_exit() {
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
     let _fire = fire_on_block(&fake);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     let torn = child.reap_after_tree_kill(&child.teardown_subject(), Disposition::Leave, None);
     assert_eq!(torn.fate(), ChildFate::Reaped);
     assert_eq!(warn_of(&torn), None);
@@ -236,7 +237,7 @@ fn left_of_a_refused_kill_of_a_running_child(disposition: Disposition) -> String
     let fake = fake()
         .reaps([ReapAnswer::Running])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     let torn = child.tear_down(
         Some(id()),
         Kill {
@@ -258,7 +259,7 @@ fn refused_kill_with_a_tree_kill(tree: &FakeReach) -> (TeardownOutcome, FakeProc
     let fake = fake()
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     let torn = child.tear_down(
         Some(id()),
         Kill {
@@ -283,7 +284,7 @@ fn a_refused_kill_of_a_child_the_tree_kill_reached_is_waited_for_and_reaped() {
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let _fire = fire_on_block(&fake);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
 
     let torn = child.tear_down(
         Some(id()),
@@ -318,7 +319,7 @@ fn a_refusal_is_classified_by_what_it_is() {
     ];
     for (refused, kind) in kinds {
         let described = refused.to_string();
-        let child = OwnedChild::new(Box::new(fake().reaps([ReapAnswer::Exited(exit())])));
+        let child = OwnedChild::new(Box::new(fake().reaps([ReapAnswer::Exited(exit())])), TrackedKind::Own);
         let torn = child.look_after_refused_kill(Some(id()), refused, Disposition::Leave);
         assert_eq!(torn.remains().refused, Some(kind), "{described}");
     }
@@ -682,7 +683,7 @@ fn a_failed_bounded_wait_is_the_result_and_is_not_repeated() {
 #[skuld::test]
 fn the_first_half_of_a_teardown_of_a_reaped_child_is_done() {
     let fake = fake().reaps([ReapAnswer::Exited(exit())]);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     child.wait(None).expect("the fake reaps the child");
     let looks = fake.looks();
     let begun = child.begin_tear_down(
@@ -721,7 +722,7 @@ fn fake_slow_to_exit() -> FakeProcess {
 fn a_wait_left_by_a_delivered_kill_warns_past_the_threshold_it_was_begun_with() {
     let fake = fake_slow_to_exit().signals([Ok(Sent::Delivered)]);
     let _fire = fire_on_block(&fake);
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     let kill = Kill {
         disposition: Disposition::Leave,
         tree: None,
@@ -746,7 +747,12 @@ fn a_wait_left_by_a_delivered_kill_warns_past_the_threshold_it_was_begun_with() 
     should_panic(expected = "a wait is settled on the child it began on")
 )]
 fn a_wait_settled_on_another_child_is_a_breach_even_for_children_without_a_pid() {
-    let pidless = || OwnedChild::new(Box::new(FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())])));
+    let pidless = || {
+        OwnedChild::new(
+            Box::new(FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())])),
+            TrackedKind::Own,
+        )
+    };
     let (began_on, other) = (pidless(), pidless());
     let wait = began_on.begin_reap_after_tree_kill(None, "the child".to_owned(), Disposition::Leave, None);
 
@@ -762,7 +768,7 @@ fn the_wait_after_a_refused_kill_a_tree_kill_reached_warns_past_the_threshold() 
     let fake = fake_slow_to_exit().signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let _fire = fire_on_block(&fake);
     let reach = FakeReach::answering(Ok(true));
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     let kill = Kill {
         disposition: Disposition::Leave,
         tree: Some(&reach),
@@ -792,7 +798,7 @@ fn the_hook_is_told_a_refused_root_a_tree_kill_reached_was_refused_though_its_re
         .reaps([ReapAnswer::Exited(exit())])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
     let reach = FakeReach::answering(Ok(true));
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     let fired = Rc::new(Cell::new(0));
     let _armed = crate::child::spawn::fault::set_between_kill_and_wait({
         let fired = fired.clone();
@@ -825,7 +831,7 @@ fn the_hook_is_told_a_refused_root_a_tree_kill_reached_was_refused_though_its_re
 fn the_reap_after_a_tree_kill_warns_past_the_threshold() {
     let fake = fake_slow_to_exit();
     let _fire = fire_on_block(&fake);
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     let mut torn = None;
     let warns = slow_warns_during(|| {
         torn = Some(child.reap_after_tree_kill(&child.teardown_subject(), Disposition::Leave, Some(due_now())));
@@ -843,7 +849,7 @@ fn the_reap_after_a_tree_kill_warns_past_the_threshold() {
 fn the_wait_for_a_front_a_kill_reached_warns_past_the_threshold_the_look_was_given() {
     let fake = fake_slow_to_exit();
     let _fire = fire_on_block(&fake);
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     let reach = FakeReach::answering(Ok(true));
     let begun = child.begin_look_at_front(Some(id()), Ok(Some(&reach)), Some(due_now()));
     let BeginOutcome::Wait(wait) = begun else {
@@ -854,7 +860,7 @@ fn the_wait_for_a_front_a_kill_reached_warns_past_the_threshold_the_look_was_giv
     assert_eq!(look.expect("settled").fate, ChildFate::Reaped);
     assert_eq!(warns, 1);
 
-    let child = OwnedChild::new(Box::new(fake_slow_to_exit()));
+    let child = OwnedChild::new(Box::new(fake_slow_to_exit()), TrackedKind::Own);
     let reach = FakeReach::answering(Ok(false));
     let begun = child.begin_look_at_front(Some(id()), Ok(Some(&reach)), Some(due_now()));
     assert!(

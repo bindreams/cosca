@@ -407,7 +407,7 @@ mod on_windows {
     /// The failed resume of a frozen child reported as a launch that leaves no front does not say it
     /// is a front's.
     ///
-    /// Mutants: `resume` sets the flag from `report.is_some()` or from `may_run_as_another_user()`.
+    /// Mutants: `resume` sets the flag from `report.is_some()` or from `TrackedKind::runs_as_another_user`.
     #[skuld::test]
     fn a_failed_resume_of_a_child_without_a_front_sets_no_wrapper_flag() {
         use crate::elevation::elevation_tests::{report, VIAS_WITHOUT_A_FRONT};

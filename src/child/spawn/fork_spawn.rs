@@ -40,7 +40,7 @@ use crate::child::drop_teardown::Torn;
 use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
 use crate::containment::cgroup::{CgroupLeaf, PlacementReport};
-use crate::elevation::front::Front;
+use crate::elevation::front::TrackedKind;
 use crate::error::Error;
 use crate::identity::SpawnKernel;
 use crate::os_process::linux::fork::{fork_with_pidfd, CloneKind, ForkFn, NewChild};
@@ -64,8 +64,8 @@ pub(super) struct Started {
 pub(super) struct OnFailure<'a> {
     /// The spawn's: when the wait for a child it killed warns, and what an `Unreaped` it hands back does.
     pub(super) policy: SpawnPolicy,
-    /// The elevation front the child is, if it is one: a teardown sends it nothing.
-    pub(super) front: Option<Front>,
+    /// Who the process the child tracks is: the box holds it, and a front is sent nothing.
+    pub(super) tracked: TrackedKind,
     /// The cgroup leaf the child is placed in, if it has one: the child's placement report is recorded
     /// on it, whatever becomes of the child.
     pub(super) placement: Option<&'a mut CgroupLeaf>,
@@ -295,7 +295,7 @@ fn conclude(
             },
         }
     };
-    let owned = OwnedChild::over_pidfd(kernel, Some(pid), pidfd);
+    let owned = OwnedChild::over_pidfd(kernel, Some(pid), pidfd, on_failure.tracked);
     match did_not_start {
         Some(cause) => {
             let torn = held_teardown::tear_down_unexecuted(
@@ -314,9 +314,9 @@ fn conclude(
 /// The failed spawn of the child `pid`, whose pidfd `e` kept from moving above stdio: the child may be
 /// running, so it is torn down through the box over the pidfd as it is, as any other failure of a held child.
 fn unmovable(pid: u32, pidfd: OwnedFd, e: io::Error, kernel: SpawnKernel, on_failure: OnFailure<'_>) -> SpawnFailure {
-    let owned = OwnedChild::over_pidfd(kernel, Some(pid), pidfd);
+    let owned = OwnedChild::over_pidfd(kernel, Some(pid), pidfd, on_failure.tracked);
     let how = held_teardown::HeldTeardown {
-        front: on_failure.front,
+        front: on_failure.tracked.front(),
         id: None,
         reach: None,
         disposition: Disposition::HandBack,

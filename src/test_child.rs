@@ -417,11 +417,21 @@ pub(crate) fn held_treewalk_blocker_leaving(
 /// A live [`BLOCKER_ARGV`] child with no containment, and the write end of its stdin, which the
 /// test holds. `kill_on_drop` is the command's.
 pub(crate) fn held_uncontained_blocker(kill_on_drop: bool) -> (crate::Child, crate::PipeWriter) {
+    held_uncontained_blocker_reporting(kill_on_drop, None)
+}
+
+/// [`held_uncontained_blocker`] spawned as the launch `report` describes, so its box tracks who the
+/// report says (as a real elevated spawn's does).
+pub(crate) fn held_uncontained_blocker_reporting(
+    kill_on_drop: bool,
+    report: Option<crate::elevation::ElevationReport>,
+) -> (crate::Child, crate::PipeWriter) {
     let (stdin, writer) = held_writer_stdin();
     let mut cmd = command(Console::Hidden);
     cmd.args(BLOCKER_ARGV.iter().copied());
     cmd.stdin(stdin).expect("set stdin");
     cmd.kill_on_drop(kill_on_drop);
+    cmd.set_elevation_report(report);
     (cmd.spawn().expect("spawn"), writer)
 }
 

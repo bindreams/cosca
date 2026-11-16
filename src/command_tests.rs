@@ -593,7 +593,7 @@ fn output_status_and_read_fail_as_may_have_started_after_the_spawn() {
 /// already-elevated parent track it) fails after its spawn without the wrapper flag, and its error
 /// has no note that an elevated program may still run.
 ///
-/// Mutants: a helper sets the flag from `report.is_some()` or from `may_run_as_another_user()`.
+/// Mutants: a helper sets the flag from `report.is_some()` or from `TrackedKind::runs_as_another_user`.
 #[skuld::test]
 fn a_failure_after_the_spawn_of_a_child_reported_without_a_front_sets_no_wrapper_flag() {
     use crate::child::spawn::failure::seams;

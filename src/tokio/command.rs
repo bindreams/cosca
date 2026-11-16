@@ -322,7 +322,7 @@ impl Command {
             crate::child::spawn::after_the_spawn(
                 Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                 crate::child::drop_teardown::Torn::left(crate::error::ChildFate::Reaped),
-                child.inner.front().is_some(),
+                child.inner.proc.tracked_kind().front().is_some(),
             )
         })
     }
@@ -332,7 +332,7 @@ impl Command {
 /// started, and `child` is torn down now as its drop would, awaiting what the drop would block on.
 /// The teardown says what became of the child, and hands it back if it could not end it.
 pub(super) async fn after_the_spawn(error: Error, child: Child) -> Error {
-    let behind_front = child.inner.front().is_some();
+    let behind_front = child.inner.proc.tracked_kind().front().is_some();
     let torn = child.tear_down_awaiting().await;
     crate::child::spawn::after_the_spawn(error, torn, behind_front)
 }

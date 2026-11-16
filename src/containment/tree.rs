@@ -416,6 +416,16 @@ impl crate::child::owned::teardown::Reach for Tree {
             Holder::Contained(mechanism) => mechanism.reached(child),
         }
     }
+
+    /// Where `child` is, as [`Tree::would_reach`] reads it, through the child's own pidfd.
+    fn would_reach(&self, child: &crate::child::owned::OwnedChild) -> Result<bool, crate::error::Error> {
+        match child.pid() {
+            Some(pid) => Tree::would_reach(self, pid, child.pidfd()),
+            None => Err(crate::error::Error::Io(std::io::Error::other(
+                "the child's pid is not known, so it cannot be placed",
+            ))),
+        }
+    }
 }
 
 // Test accessors -----

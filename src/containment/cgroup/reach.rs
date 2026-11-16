@@ -355,7 +355,9 @@ impl Subtree {
     /// Whether a kill through the leaf landed and reached the task `pid` (see [`holds`](Self::holds)):
     /// only then does the task's exit follow, so only then may it be waited for. `seen` is as in
     /// [`holds_seen`](Self::holds_seen): the pidfd route answers from it when the leaf's id is
-    /// unknown. This is the one check that a kill reached a task.
+    /// unknown. `holds` alone says where the task is; this adds that the kill landed. It reads
+    /// `false` for a kill that did not land and for a task that left the leaf, so a caller cannot tell
+    /// them apart.
     pub(crate) fn reached_by(
         &self,
         kernel: &dyn crate::identity::Kernel,
@@ -377,6 +379,16 @@ impl Reach for Subtree {
     fn reached(&self, child: &crate::child::owned::OwnedChild) -> Result<bool, Error> {
         match child.pid() {
             Some(pid) => self.reached_by(child.kernel(), pid, child.pidfd(), None),
+            None => Err(Error::Io(io::Error::other(
+                "the child's pid is not known, so it cannot be placed",
+            ))),
+        }
+    }
+
+    /// [`Subtree::holds`], asked with the child's pid and pidfd, through the child's kernel.
+    fn would_reach(&self, child: &crate::child::owned::OwnedChild) -> Result<bool, Error> {
+        match child.pid() {
+            Some(pid) => self.holds(child.kernel(), pid, child.pidfd()),
             None => Err(Error::Io(io::Error::other(
                 "the child's pid is not known, so it cannot be placed",
             ))),
@@ -610,6 +622,7 @@ fn fork_probe(
             kernel,
             Some(u32::try_from(new.pid).expect("a forked child's pid is positive")),
             new.pidfd,
+            crate::elevation::front::TrackedKind::Own,
         ),
         channel: Some(channel),
     })

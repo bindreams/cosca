@@ -874,7 +874,7 @@ fn abandon(
         child,
         unique,
         error,
-        None,
+        crate::elevation::front::TrackedKind::Own,
         prepared,
         SpawnPolicy::SYNC,
         crate::identity::spawn_kernel(kernel),

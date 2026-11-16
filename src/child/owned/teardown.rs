@@ -115,6 +115,11 @@ pub(crate) trait Reach {
     /// `Ok(true)`: the kill landed and reached `child`, so its exit follows. `Err`: where `child` is
     /// could not be read, so whether the kill reached it is not known.
     fn reached(&self, child: &OwnedChild) -> Result<bool, Error>;
+
+    /// `Ok(true)`: a kill through the containment would reach `child` whatever its credentials,
+    /// whether or not one was sent: where `child` is, not what a kill did. `Err`: where `child` is
+    /// could not be read.
+    fn would_reach(&self, child: &OwnedChild) -> Result<bool, Error>;
 }
 
 /// How the look at an elevation front went ([`OwnedChild::look_at_front`]). The policy words none

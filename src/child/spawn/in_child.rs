@@ -269,7 +269,7 @@ pub(super) fn spawn_sh_placed(
         crate::identity::spawn_kernel(crate::identity::HostKernel),
         super::fork_spawn::OnFailure {
             policy: super::policy::SpawnPolicy::SYNC,
-            front: None,
+            tracked: crate::elevation::front::TrackedKind::Own,
             placement: leaf,
             refusing_placement: false,
         },

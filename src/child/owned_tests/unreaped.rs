@@ -3,6 +3,7 @@
 
 use super::teardown::{exit, fake, fire_on_block, id, PID};
 use crate::child::owned::unreaped::{DropKind, Unreaped};
+use crate::elevation::front::TrackedKind;
 use crate::error::Error;
 use crate::os_process::child::Foreign;
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
@@ -220,7 +221,7 @@ fn dropping_an_unreaped_while_panicking_gives_the_child_up_without_waiting() {
     crate::log_capture::install();
     let (child, stdin) = crate::test_child::blocker().into_parts();
     let blocker_id = identity_of(&child);
-    let owned = OwnedChild::adopt(child, blocker_id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let owned = OwnedChild::adopt(child, blocker_id, TrackedKind::Own).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     let unreaped = Unreaped::new(owned, Some(blocker_id), false, DropKind::Wait);
     let stdin = Rc::new(RefCell::new(Some(stdin)));
     crate::wait::block_probe::take();
@@ -261,7 +262,7 @@ fn dropping_an_unreaped_blocker_waits_for_it_and_reaps_it() {
 
     let (child, stdin) = crate::test_child::blocker().into_parts();
     let blocker_id = identity_of(&child);
-    let owned = OwnedChild::adopt(child, blocker_id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let owned = OwnedChild::adopt(child, blocker_id, TrackedKind::Own).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     let unreaped = Unreaped::new(owned, Some(blocker_id), false, DropKind::Wait);
     crate::wait::block_probe::take();
     let _end = crate::wait::block_probe::on_blocking(move || drop(stdin));
@@ -360,7 +361,7 @@ async fn a_cancelled_wait_async_lets_a_real_child_go_without_blocking() {
     let (os, blocker_id, stdin) = adopted_blocker();
     let fake = FakeProcess::over(os);
     let child = Unreaped::new(
-        OwnedChild::new(Box::new(fake.clone())),
+        OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own),
         Some(blocker_id),
         false,
         DropKind::Wait,
@@ -540,7 +541,7 @@ fn let_go(fake: &FakeProcess, front: bool, polls: usize) -> Vec<(log::Level, Str
 
     crate::log_capture::install();
     let child = Unreaped::new(
-        OwnedChild::new(Box::new(fake.clone())),
+        OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own),
         Some(id()),
         front,
         DropKind::Wait,

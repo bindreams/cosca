@@ -53,18 +53,19 @@ pub(super) fn abandon_late_child(
     child: std::process::Child,
     unique: u64,
     error: Error,
-    front: Option<crate::elevation::front::Front>,
+    tracked: crate::elevation::front::TrackedKind,
     prepared: crate::containment::Prepared,
     policy: SpawnPolicy,
     kernel: crate::identity::SpawnKernel,
 ) -> SpawnFailure {
+    let front = tracked.front();
     let pid = child.id();
     #[cfg(test)]
     super::fault::capture(ProcessId::of(pid));
     let owned = match MacosChild::new(std::sync::Arc::clone(&kernel), pid, unique) {
         Ok(os) => {
             drop(child);
-            OwnedChild::new(Box::new(os))
+            OwnedChild::new(Box::new(os), tracked)
         }
         Err(refusal) => {
             return super::leave_unwatched_child(

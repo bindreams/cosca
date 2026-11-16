@@ -13,6 +13,8 @@ use crate::child::Child;
 use crate::containment::dispatch::{TeardownCaller, TreeKillOutcome};
 #[cfg(unix)]
 use crate::containment::mechanism::{FrontReach, Release};
+#[cfg(unix)]
+use crate::elevation::front::{AloneStep, KillRootOutcome, RootStep};
 
 /// What a failed spawn's or run's teardown left of its child: its fate, the child itself if it could
 /// not be ended, and the teardown's failures (the error's `cleanup`).
@@ -103,7 +105,8 @@ impl Child {
     pub(super) fn into_unreaped(mut self) -> Unreaped {
         debug_assert!(!self.kill_on_drop, "a handed-back child is no longer killed on drop");
         let root = self.proc.take().expect("a child handed back still holds its root");
-        Unreaped::new(root, self.id, self.front().is_some(), self.policy.unreaped_drop)
+        let behind_front = root.tracked_kind().front().is_some();
+        Unreaped::new(root, self.id, behind_front, self.policy.unreaped_drop)
     }
 
     /// The kill-on-drop teardown, answering what became of the child. `caller` prefixes the event's
@@ -215,13 +218,46 @@ impl Child {
 
         // A live elevation front gets no signal of its own: outside a cgroup it is sent nothing and
         // stays running and unreaped, named by the warn; a `HandBack` caller then takes it. The
-        // gate comes first, so the look at the root is right before the kill it decides.
-        let gate = self.kill_gate();
-        let view = crate::containment::DropView::read(caller, self.pid(), self.id, &self.proc, &self.tree);
-        let cgroup_only = match gate {
-            crate::elevation::front::Gate::Closed(unkillable) => {
+        // rule reads first, so the look at the root is right before the kill it decides. The drop's
+        // own root kill is `begin_tear_down`'s, so the step never asks the rule for it.
+        let kill_tree = || {
+            let view = crate::containment::DropView::read(caller, self.pid(), self.id, &self.proc, &self.tree);
+            // The root handle names the root's group.
+            let root_handle = self.proc.hold(self.pid());
+            // The kill decides on the view's look, the one its report is worded from.
+            // The drop sends alone: the wait for what it killed is the root's reap and the leaf's drain.
+            let kill = {
+                let seen = crate::containment::Seen::new(&root_handle, view.look());
+                self.tree.send_kill(Some(&seen))
+            };
+            kill.log_skip(&view);
+            // A live member refused, or couldn't be confirmed — visible, not silently discarded. A
+            // mechanism failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
+            // reported, never asserted on.
+            let skipped = kill.left_undone(&view);
+            (view, kill, skipped)
+        };
+        let killed = self.proc.kill_root(
+            Some(&self.tree),
+            |_| {
+                let torn = kill_tree();
+                if torn.1.completed() {
+                    AloneStep::Killed {
+                        result: Ok(()),
+                        carry: torn,
+                    }
+                } else {
+                    AloneStep::NotKilled(torn)
+                }
+            },
+            |_| RootStep::<std::convert::Infallible, _>::Answered(kill_tree()),
+        );
+        // `reached`: the rule's answer for a front its cgroup kill is the only kill of.
+        let (reached, (view, kill, skipped)) = match killed {
+            KillRootOutcome::Refused(unkillable) => {
                 // The leaf stays armed: its teardown kills what it holds, a front among it if it is
                 // in it. Run now, not at field drop, so the look at the front comes after it.
+                let view = crate::containment::DropView::read(caller, self.pid(), self.id, &self.proc, &self.tree);
                 let parts = DropParts {
                     view,
                     skipped: None,
@@ -230,23 +266,10 @@ impl Child {
                 };
                 return self.begin_leaf_and_front(NotKilled::by(unkillable), parts);
             }
-            crate::elevation::front::Gate::CgroupOnly(front) => Some(front),
-            _ => None,
+            KillRootOutcome::Contained { reached, carry } => (Some(reached), carry),
+            KillRootOutcome::Answered(torn) => (None, torn),
+            KillRootOutcome::Root { carry, .. } => match carry {},
         };
-        // The root handle names the root's group.
-        let root_handle = self.proc.hold(self.pid());
-        // The kill decides on the view's look, the one its report is worded from.
-        // The drop sends alone: the wait for what it killed is the root's reap and the leaf's drain.
-        let kill = {
-            let seen = crate::containment::Seen::new(&root_handle, view.look());
-            self.tree.send_kill(Some(&seen))
-        };
-        kill.log_skip(&view);
-        // A live member refused, or couldn't be confirmed — visible, not silently
-        // discarded, on the RAII teardown path most callers actually hit. A mechanism
-        // failure (e.g. `EACCES`/`EIO` on `cgroup.kill`) is a real OS outcome, so it is
-        // reported, never asserted on.
-        let skipped = kill.left_undone(&view);
         // A reaped root is neither killed nor waited for: its number may name another child by now.
         // Neither is a root this process does not pin (macOS: launchd holds its zombie). The view says
         // the root is another's to have reaped, never this handle's (it consumes at its drop), and
@@ -261,11 +284,14 @@ impl Child {
             };
             return BeginOutcome::Done(parts.finish(self, torn));
         }
-        if let Some(front) = cgroup_only {
+        if let Some(reached) = reached {
             // The tree kill's failure is the tree's, settled in `DropParts::finish`.
-            let not_reached = match kill.incomplete() {
-                None => self.cgroup_kill_reached(front).err().map(NotKilled::by),
-                Some(failure) => Some(NotKilled::in_words(failure)),
+            let not_reached = match reached {
+                Ok(()) => None,
+                Err(unreached) => Some(match kill.incomplete() {
+                    Some(failure) => NotKilled::in_words(failure),
+                    None => NotKilled::by(unreached),
+                }),
             };
             let parts = DropParts {
                 view,

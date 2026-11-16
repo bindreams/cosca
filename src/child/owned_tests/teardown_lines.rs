@@ -16,6 +16,7 @@ use super::teardown::{exit, fake, id};
 use crate::child::owned::teardown::{Disposition, TeardownOutcome};
 pub(crate) use crate::child::owned::teardown::{LEAVING_RUNNING, LEFT};
 use crate::child::owned::OwnedChild;
+use crate::elevation::front::TrackedKind;
 use crate::os_process::child::Foreign;
 use crate::os_process::fake::ReapAnswer;
 use crate::signal::Sent;
@@ -205,11 +206,11 @@ pub(crate) fn outcome(row: &Row, disposition: Disposition) -> TeardownOutcome {
         Kill::Nothing => Ok(Sent::Gone),
         Kill::Refused => Err(refused()),
     };
-    OwnedChild::new(Box::new(fake().reaps([reap_answer(row.found)]).signals([signal]))).tear_down(
-        Some(id()),
-        kill,
-        None,
+    OwnedChild::new(
+        Box::new(fake().reaps([reap_answer(row.found)]).signals([signal])),
+        TrackedKind::Own,
     )
+    .tear_down(Some(id()), kill, None)
 }
 
 /// What the wait or look of `found` answers.
@@ -228,7 +229,7 @@ fn reap_answer(found: Found) -> ReapAnswer {
 /// `subject`. It sends the child nothing: the kill was sent elsewhere.
 pub(crate) fn outcome_after_a_tree_kill(row: &Row, subject: &str, disposition: Disposition) -> TeardownOutcome {
     assert_eq!(row.kill, Kill::Delivered, "a tree kill reached the child");
-    let child = OwnedChild::new(Box::new(fake().reaps([reap_answer(row.found)])));
+    let child = OwnedChild::new(Box::new(fake().reaps([reap_answer(row.found)])), TrackedKind::Own);
     child.reap_after_tree_kill(subject, disposition, None)
 }
 

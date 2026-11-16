@@ -287,7 +287,10 @@ fn a_linux_child_owns_and_lends_the_kernel_it_was_built_with() {
     );
     let stand_in = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty())
         .expect("a pidfd of this process");
-    let owned = crate::child::owned::OwnedChild::new(Box::new(LinuxProcess::new(Arc::clone(&kernel), None, stand_in)));
+    let owned = crate::child::owned::OwnedChild::new(
+        Box::new(LinuxProcess::new(Arc::clone(&kernel), None, stand_in)),
+        crate::elevation::front::TrackedKind::Own,
+    );
     assert_eq!(Arc::strong_count(&kernel), 2, "the box owns a handle on the kernel");
 
     assert_eq!(owned.kernel().signal_probe(target), Err(rustix::io::Errno::PERM));
@@ -315,8 +318,10 @@ fn a_pidless_linux_child_is_signalled_and_reaped_through_its_pidfd() {
     let pidfd = crate::child::front_cgroup_tests::pidfd_of(id.pid());
     // std's `Child` neither kills nor reaps on drop; the pidfd is all that is left of it.
     drop(child);
-    let owned =
-        crate::child::owned::OwnedChild::new(Box::new(LinuxProcess::new(crate::identity::HostKernel, None, pidfd)));
+    let owned = crate::child::owned::OwnedChild::new(
+        Box::new(LinuxProcess::new(crate::identity::HostKernel, None, pidfd)),
+        crate::elevation::front::TrackedKind::Own,
+    );
     assert_eq!(owned.pid(), None);
     let torn = owned.tear_down(
         None,

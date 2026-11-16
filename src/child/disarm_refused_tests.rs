@@ -9,11 +9,19 @@ use crate::containment::windows::JobHandle;
 use crate::containment::{Mechanism, Tree};
 use crate::error::{ChildFate, Error};
 use crate::identity::{Liveness, ProcessId};
-use crate::test_child::{expect_may_have_started_parts, held_uncontained_blocker};
+use crate::test_child::{expect_may_have_started_parts, held_uncontained_blocker_reporting};
 
 /// A live blocker whose containment is a job that refuses `disarm`; `kill_on_drop` is the command's.
 fn refusing_child(kill_on_drop: bool) -> (Child, crate::PipeWriter, ProcessId) {
-    let (mut child, stdin) = held_uncontained_blocker(kill_on_drop);
+    refusing_child_reporting(kill_on_drop, None)
+}
+
+/// [`refusing_child`] spawned as the launch `report` describes.
+fn refusing_child_reporting(
+    kill_on_drop: bool,
+    report: Option<crate::elevation::ElevationReport>,
+) -> (Child, crate::PipeWriter, ProcessId) {
+    let (mut child, stdin) = held_uncontained_blocker_reporting(kill_on_drop, report);
     child.tree = Tree::contained(Mechanism::Job(JobHandle::create_without_set_access_for_test()));
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     (child, stdin, id)
@@ -92,13 +100,12 @@ fn a_refused_disarm_fails_a_kill_on_drop_false_spawn_and_kills_the_child() {
 /// front's.
 ///
 /// Mutants: `commit_kill_on_drop` sets the flag from `report.is_some()` or from
-/// `may_run_as_another_user()`.
+/// `TrackedKind::runs_as_another_user`.
 #[skuld::test]
 fn a_refused_disarm_of_a_child_without_a_front_sets_no_wrapper_flag() {
     use crate::elevation::elevation_tests::{report, VIAS_WITHOUT_A_FRONT};
     for via in VIAS_WITHOUT_A_FRONT {
-        let (mut child, stdin, _id) = refusing_child(false);
-        child.elevation = Some(report(via.clone()));
+        let (child, stdin, _id) = refusing_child_reporting(false, Some(report(via.clone())));
 
         let error = Error::from(child.commit_kill_on_drop().expect_err("the disarm was refused"));
 

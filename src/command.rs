@@ -1039,7 +1039,7 @@ impl Command {
             crate::child::spawn::after_the_spawn(
                 Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                 crate::child::drop_teardown::Torn::left(crate::error::ChildFate::Reaped),
-                child.front().is_some(),
+                child.proc.tracked_kind().front().is_some(),
             )
         })
     }
@@ -1049,7 +1049,7 @@ impl Command {
 /// started, and `child` is torn down now as its drop would. The error says what became of it, and
 /// carries it when its teardown could not end it.
 fn after_the_spawn(error: Error, child: crate::Child) -> Error {
-    let behind_front = child.front().is_some();
+    let behind_front = child.proc.tracked_kind().front().is_some();
     let torn = child.tear_down_or_hand_back(crate::child::owned::teardown::Disposition::HandBack);
     crate::child::spawn::after_the_spawn(error, torn, behind_front)
 }

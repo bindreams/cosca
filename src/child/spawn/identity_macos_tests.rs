@@ -311,7 +311,10 @@ fn macos_sync_spawn_identity_failure_of_a_nested_root_notes_no_group() {
 #[skuld::test]
 fn macos_sync_spawn_identity_failure_of_a_front_notes_no_group() {
     let sudo = crate::child::front_kill_tests::sudo_report();
-    assert!(sudo.as_ref().and_then(|r| r.front()).is_some(), "sudo launches a front");
+    assert!(
+        sudo.as_ref().and_then(|r| r.tracked().front()).is_some(),
+        "sudo launches a front"
+    );
     let (_, warns) = foreign_reread_warns(crate::ContainMode::Session, sudo);
     assert!(!notes_a_group(&warns), "{warns:?}");
 }

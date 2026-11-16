@@ -518,6 +518,9 @@ struct FrontDrop {
     policy: SpawnPolicy,
     /// The scripted answers to the drop's reaps, before the real front's own.
     reaps: Vec<ReapAnswer>,
+    /// How many of the drop's first peeks of the front read it running, whatever the kill did to it
+    /// (a front just killed may or may not have exited by its reads): the box's stated peek rows.
+    reads_running: usize,
     at_the_look: AtTheLook,
 }
 
@@ -527,22 +530,27 @@ impl FrontDrop {
         FrontDrop {
             policy: SpawnPolicy::SYNC,
             reaps: Vec::new(),
+            reads_running: 0,
             at_the_look: AtTheLook::AwaitsTheFront,
         }
     }
 }
 
+/// How many of a drop's first peeks of a front [`fail_the_place_read_from_the_kill`] needs read as
+/// running, for the rule's check of whether the leaf's kill reached it to find it neither exited nor
+/// placed: the rule's own first read, the look at the root that precedes the kill, and the check's two
+/// exit reads (the second after its place read failed).
+const PEEKS_TO_THE_REACH_CHECK: usize = 4;
+
 /// The failure of the place read from the leaf's kill write on, for a drop that cannot tell from
-/// it whether the kill reached the front, and an exit read that says the front is running.
+/// it whether the kill reached the front. The front reads as running ([`FrontDrop::reads_running`]).
 fn fail_the_place_read_from_the_kill(unreadable: &Unreadable) -> Box<dyn std::any::Any> {
     use crate::containment::cgroup::fault;
 
-    let arming = fault::set_before_kill_write({
+    Box::new(fault::set_before_kill_write({
         let unreadable = unreadable.clone();
         move || unreadable.hold(fault::fail_pidfd_info())
-    });
-    let running = crate::elevation::front::seams::read_front_running_at_every_reach_read();
-    Box::new((arming, running))
+    }))
 }
 
 /// What a drop that keeps its leaf armed does with a front in the leaf: the leaf's kill ends the
@@ -572,7 +580,11 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(
     let awaited = Arc::new(AtomicBool::new(false));
     let unreadable = Unreadable::default();
     crate::containment::cgroup::fault::record_leaf_steps();
-    child.proc.script_over(|fake| fake.reaps(drop_of.reaps)).on_look({
+    let fake = child.proc.script_over(|fake| {
+        fake.reaps(drop_of.reaps)
+            .peeks((0..drop_of.reads_running).map(|_| Ok(crate::os_process::child::PeekOutcome::Running)))
+    });
+    fake.on_look({
         let awaited = Arc::clone(&awaited);
         let unreadable = unreadable.clone();
         let at_the_look = drop_of.at_the_look;
@@ -598,6 +610,7 @@ fn assert_drop_kills_the_leaf_and_reaps_the_front(
         drop(child);
         unreadable.release();
     });
+    fake.assert_peeks_exhausted();
     let steps = crate::containment::cgroup::fault::take_leaf_steps();
     release.assert_killed();
     if matches!(drop_of.at_the_look, AtTheLook::AwaitsTheFront) {
@@ -633,7 +646,13 @@ fn cgroup_a_drop_whose_placement_read_fails_kills_the_leaf_and_reaps_the_front(#
 /// looking".
 #[skuld::test]
 fn cgroup_a_drop_whose_post_kill_read_fails_reaps_the_front_the_kill_ended(#[fixture(cgroup)] _group: &Group) {
-    assert_drop_kills_the_leaf_and_reaps_the_front(FrontDrop::awaiting_the_front(), fail_the_place_read_from_the_kill);
+    assert_drop_kills_the_leaf_and_reaps_the_front(
+        FrontDrop {
+            reads_running: PEEKS_TO_THE_REACH_CHECK,
+            ..FrontDrop::awaiting_the_front()
+        },
+        fail_the_place_read_from_the_kill,
+    );
 }
 
 /// What a drop does with a front its leaf's kill ended, when the look at its exit still reads it as
@@ -653,6 +672,7 @@ fn cgroup_a_drop_places_a_front_that_reads_as_running_and_reaps_it(#[fixture(cgr
         FrontDrop {
             policy: SpawnPolicy::SYNC,
             reaps: vec![ReapAnswer::Running],
+            reads_running: PEEKS_TO_THE_REACH_CHECK,
             at_the_look: AtTheLook::ReadsThePlaceAgain,
         },
         fail_the_place_read_from_the_kill,
@@ -699,6 +719,7 @@ fn cgroup_a_drops_look_at_a_front_its_leaf_killed_warns_past_its_spawns_threshol
         FrontDrop {
             policy: SpawnPolicy::WARNS_AT_ONCE,
             reaps: vec![ReapAnswer::Running, ReapAnswer::Running],
+            reads_running: PEEKS_TO_THE_REACH_CHECK,
             at_the_look: AtTheLook::ReadsThePlaceAgain,
         },
         fail_the_place_read_from_the_kill,
@@ -973,7 +994,7 @@ fn cgroup_kill_of_an_exited_front_that_refuses_signals_is_ok(#[fixture(cgroup)] 
     assert!(child.wait().expect("wait").success());
 }
 
-/// A front that a session manager moves out of its leaf between the gate and the `cgroup.kill`
+/// A front that a session manager moves out of its leaf between the rule's read and the `cgroup.kill`
 /// write was not killed: the kill answers `Unkillable`, read after the write, and the front is sent
 /// nothing.
 #[skuld::test]
@@ -1010,26 +1031,38 @@ fn cgroup_drop_of_a_front_moved_out_during_its_kill_leaves_it_unreaped(#[fixture
     assert_reaped_unsignalled(pid);
 }
 
-/// `kill_tree` asks the gate once: after the cgroup kill a killed front can read as neither exited
-/// nor in its cgroup.
-#[skuld::test]
-fn cgroup_kill_tree_of_a_front_asks_the_gate_once(#[fixture(cgroup)] _group: &Group) {
-    let (child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
-    let gates = crate::elevation::front::seams::count_kill_gates();
-    child.kill_tree().expect("kill_tree is accepted");
-    assert_eq!(gates.count(), 1);
+/// A front the rule reads running at every read, whatever the kill did to it: its answer to a kill
+/// is the rule's read of where it is, never of whether it exited.
+fn read_running_at_every_read(child: &mut crate::Child) {
+    child
+        .proc
+        .script_over(|fake| fake.peeks_always(|| Ok(crate::os_process::child::PeekOutcome::Running)));
 }
 
-/// A failed password write's teardown asks the gate once, for the same reason. The handle opts out
-/// of the drop, whose own teardown would ask again.
+/// `kill_tree` of a front in its cgroup is accepted: after the cgroup kill a killed front can read
+/// as neither exited nor in its cgroup, and that is not a refusal. The front reads running at every
+/// read, so the kill is accepted on the front's place and not on its exit winning the race with the
+/// rule's read.
+///
+/// Mutant: the rule accepts a killed front only when it reads it exited, and ignores where it is.
 #[skuld::test]
-fn cgroup_a_failed_password_write_asks_the_gate_once(#[fixture(cgroup)] _group: &Group) {
+fn cgroup_kill_tree_of_a_front_in_its_cgroup_is_accepted(#[fixture(cgroup)] _group: &Group) {
+    let (mut child, _stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    read_running_at_every_read(&mut child);
+    child.kill_tree().expect("kill_tree is accepted");
+}
+
+/// A failed password write's teardown kills a front in its cgroup through the cgroup and reaps it,
+/// for the same reason, and the front reads running at every read as above. The handle opts out of
+/// the drop, whose own teardown would kill again.
+#[skuld::test]
+fn cgroup_a_failed_password_write_kills_a_front_through_its_cgroup(#[fixture(cgroup)] _group: &Group) {
     let mut cmd = in_cgroup(cat());
     cmd.kill_on_drop(false);
-    let (child, stdin) = spawn_as(cmd, SUDO);
+    let (mut child, stdin) = spawn_as(cmd, SUDO);
+    read_running_at_every_read(&mut child);
     let release = release_after_cgroup_kill(stdin);
     release.observe(child.pid());
-    let gates = crate::elevation::front::seams::count_kill_gates();
     let err = crate::child::spawn::finish_elevated(
         child,
         Err(crate::error::Error::Elevation {
@@ -1049,7 +1082,6 @@ fn cgroup_a_failed_password_write_asks_the_gate_once(#[fixture(cgroup)] _group: 
     );
     assert!(detail.contains("the elevated child was terminated"), "{detail}");
     release.assert_killed();
-    assert_eq!(gates.count(), 1);
 }
 
 /// How a failed spawn's leaf meets its front (see [`failed_held_front_spawns`]).
@@ -1370,15 +1402,68 @@ fn cgroup_a_failed_escalation_of_a_front_is_unkillable(#[fixture(cgroup)] _group
     assert!(status.success(), "the front was signalled: {status:?}");
 }
 
-/// A front that exits, and that another thread's `wait` reaps, between the kill gate's read of
-/// whether it runs and its read of its cgroup, has exited: `kill` is `Ok`, and sends nothing. The
-/// hook between the reads closes the front's stdin, then lets the waiter reap it.
+/// A [`Reach`] over the real `tree` that runs `hook` at its `hook_at`th read of where the front is,
+/// and answers that read with what the hook returns: what the rule's reads of the front have between
+/// them, and the place read of a front that is gone. A test states it as the `reach` it gives
+/// [`kill_root`](crate::child::owned::OwnedChild::kill_root). Every other read is the tree's own.
+struct ReachWithHook<'a> {
+    tree: &'a crate::containment::Tree,
+    hook_at: usize,
+    reads: Cell<usize>,
+    hook: RefCell<Option<Hook<'a>>>,
+}
+
+/// What a [`ReachWithHook`] runs at its read, and the read's answer.
+type Hook<'a> = Box<dyn FnOnce() -> Result<bool, crate::error::Error> + 'a>;
+
+impl<'a> ReachWithHook<'a> {
+    fn new(
+        tree: &'a crate::containment::Tree,
+        hook_at: usize,
+        hook: impl FnOnce() -> Result<bool, crate::error::Error> + 'a,
+    ) -> Self {
+        ReachWithHook {
+            tree,
+            hook_at,
+            reads: Cell::new(0),
+            hook: RefCell::new(Some(Box::new(hook))),
+        }
+    }
+}
+
+impl crate::child::owned::teardown::Reach for ReachWithHook<'_> {
+    fn reached(&self, _child: &crate::child::owned::OwnedChild) -> Result<bool, crate::error::Error> {
+        panic!("the rule reads where the front is, not whether a kill landed");
+    }
+
+    fn would_reach(&self, child: &crate::child::owned::OwnedChild) -> Result<bool, crate::error::Error> {
+        self.reads.set(self.reads.get() + 1);
+        if self.reads.get() == self.hook_at {
+            if let Some(hook) = self.hook.borrow_mut().take() {
+                return hook();
+            }
+        }
+        crate::child::owned::teardown::Reach::would_reach(self.tree, child)
+    }
+}
+
+/// The failure of a read of where a front is, once it has been reaped: its task has no cgroup left to
+/// read.
+fn reaped_front_has_no_place() -> Result<bool, crate::error::Error> {
+    Err(crate::error::Error::Io(std::io::Error::from_raw_os_error(libc::ESRCH)))
+}
+
+/// A front that exits, and that another thread's `wait` reaps, between the rule's read of whether it
+/// runs and its read of its cgroup, has exited: the kill sends nothing and is `Ok`. The hook between
+/// the reads closes the front's stdin, then lets the waiter reap it.
 #[skuld::test]
 fn cgroup_a_front_reaped_by_a_concurrent_wait_inside_the_gate_has_exited(#[fixture(cgroup)] _group: &Group) {
+    use crate::elevation::front::{AloneStep, KillNeed, KillRootOutcome, RootStep};
+
     let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
-    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+    let fired = Cell::new(false);
     std::thread::scope(|scope| {
         let child = &child;
         scope.spawn(move || {
@@ -1388,32 +1473,57 @@ fn cgroup_a_front_reaped_by_a_concurrent_wait_inside_the_gate_has_exited(#[fixtu
                     .expect("report the reap");
             }
         });
-        let _between = crate::elevation::front::seams::set_between_gate_reads({
-            let fired = std::rc::Rc::clone(&fired);
-            move || {
-                fired.set(true);
-                drop(stdin);
-                go_tx.send(()).expect("start the waiter");
-                let status = reaped_rx.recv().expect("the waiter reaps").expect("wait");
-                assert!(status.success(), "the front ended on its stdin: {status:?}");
-            }
+        let reach = ReachWithHook::new(&child.tree, 1, || {
+            fired.set(true);
+            drop(stdin);
+            go_tx.send(()).expect("start the waiter");
+            let status = reaped_rx.recv().expect("the waiter reaps").expect("wait");
+            assert!(status.success(), "the front ended on its stdin: {status:?}");
+            reaped_front_has_no_place()
         });
         let sent = crate::send_log::Capture::start();
-        child.kill().expect("a front that exited is not refused");
+        let killed = child.proc.kill_root(
+            Some(&reach),
+            |_| -> AloneStep<(), ()> { panic!("the rule found the front exited, not in a cgroup") },
+            |need| {
+                assert_eq!(need, KillNeed::Exited, "the rule found the front exited");
+                RootStep::<(), ()>::ThenRoot(())
+            },
+        );
+        assert!(
+            matches!(
+                killed,
+                KillRootOutcome::Root {
+                    sent: Ok(crate::signal::Sent::Gone),
+                    ..
+                }
+            ),
+            "a front that exited is not refused"
+        );
         assert_eq!(sent.entries(), [], "nothing is signalled to a reaped front");
         drop(sent);
     });
-    assert!(fired.get(), "the hook between the gate's reads ran");
+    assert!(fired.get(), "the hook between the rule's reads ran");
 }
 
 /// A front its cgroup kill ended, and that another thread's `wait` reaped before its cgroup is
-/// read, was reached: `kill` is `Ok`. The hook after the kill's write lets the waiter reap it.
+/// read, was reached: the kill is `Ok`. The hook between the check's reads lets the waiter reap it.
 #[skuld::test]
 fn cgroup_a_front_reaped_by_a_concurrent_wait_after_its_kill_was_reached(#[fixture(cgroup)] _group: &Group) {
-    let (child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    use crate::elevation::front::{AloneStep, KillRootOutcome, RootStep};
+
+    let (mut child, stdin) = spawn_as(in_cgroup(cat()), SUDO);
+    // The rule's first read, and the check's first, find the front running, whether or not the kill
+    // has ended it by then, so the hook below always runs between the check's reads.
+    let fake = child.proc.script_over(|fake| {
+        fake.peeks([
+            Ok(crate::os_process::child::PeekOutcome::Running),
+            Ok(crate::os_process::child::PeekOutcome::Running),
+        ])
+    });
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
-    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+    let fired = Cell::new(false);
     std::thread::scope(|scope| {
         let child = &child;
         scope.spawn(move || {
@@ -1423,25 +1533,31 @@ fn cgroup_a_front_reaped_by_a_concurrent_wait_after_its_kill_was_reached(#[fixtu
                     .expect("report the reap");
             }
         });
-        // The check's first read finds the front running, whether or not the kill has ended it by
-        // then, so the hook below always runs between the check's reads.
-        let _running = crate::elevation::front::seams::read_front_running_at_the_first_reach_read();
-        let _between = crate::elevation::front::seams::set_between_reach_reads({
-            let fired = std::rc::Rc::clone(&fired);
-            move || {
-                fired.set(true);
-                // The kill was written, so the front dies of it; one the kill missed exits 0 here.
-                drop(stdin);
-                go_tx.send(()).expect("start the waiter");
-                let status = reaped_rx.recv().expect("the waiter reaps").expect("wait");
-                assert_eq!(status.signal(), Some(libc::SIGKILL), "the cgroup kill ended the front");
-            }
+        // The first read of where the front is is the rule's, before the kill; the second is the check's.
+        let reach = ReachWithHook::new(&child.tree, 2, || {
+            fired.set(true);
+            // The kill was written, so the front dies of it; one the kill missed exits 0 here.
+            drop(stdin);
+            go_tx.send(()).expect("start the waiter");
+            let status = reaped_rx.recv().expect("the waiter reaps").expect("wait");
+            assert_eq!(status.signal(), Some(libc::SIGKILL), "the cgroup kill ended the front");
+            reaped_front_has_no_place()
         });
-        child
-            .kill()
-            .expect("a front its kill ended is reached, whoever reaped it");
+        let killed = child.proc.kill_root(
+            Some(&reach),
+            |_| AloneStep::<(), ()>::Killed {
+                result: child.tree.kill_settled(None),
+                carry: (),
+            },
+            |_| -> RootStep<(), ()> { panic!("the rule left the front to its cgroup") },
+        );
+        assert!(
+            matches!(killed, KillRootOutcome::Contained { reached: Ok(()), .. }),
+            "a front its kill ended is reached, whoever reaped it"
+        );
     });
     assert!(fired.get(), "the hook between the check's reads ran");
+    fake.assert_peeks_exhausted();
 }
 
 /// The leaf `child` is contained in.

@@ -12,6 +12,7 @@ use std::io::{ErrorKind, Read, Write};
 use crate::child::owned::OwnedChild;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::containment::{Attachment, Tree};
+use crate::elevation::front::TrackedKind;
 use crate::os_process::fake::FakeProcess;
 use crate::pipe::ParentEnd;
 use crate::stdio::Fd;
@@ -27,7 +28,7 @@ fn a_child_without_a_process() -> Child {
         graceful: crate::graceful::GracefulMechanism::Process,
     };
     Child::from_sync(crate::Child::from_parts(
-        OwnedChild::new(Box::new(FakeProcess::new([]).with_pid(1))),
+        OwnedChild::new(Box::new(FakeProcess::new([]).with_pid(1)), TrackedKind::Own),
         None,
         Default::default(),
         false,

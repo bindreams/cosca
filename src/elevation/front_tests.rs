@@ -1,37 +1,90 @@
 use std::cell::Cell;
 use std::io;
 
-use super::{kill_gate, terminate_gate, Front, Gate};
-use crate::elevation::elevation_tests::report;
+use super::{kill_gate, terminate_gate, Front, Gate, TrackedKind};
+use crate::elevation::elevation_tests::{report, OS_CODE};
 use crate::elevation::{Backend, ElevatedVia, ElevationReport};
 use crate::error::{ElevationErrorKind, Error};
 
 const PID: u32 = 4242;
 
 /// The fronts a report names, and no other: pkexec execs the program, and UAC and an already-elevated
-/// parent track it. Mutant: a backend's arm of `ElevationReport::front` answers another's.
+/// parent track it. Mutant: a backend's arm of `ElevationReport::tracked` answers another's.
 #[skuld::test]
 fn a_report_names_the_front_its_via_leaves_tracked() {
     for (via, name) in FRONTS {
-        assert_eq!(report(via.clone()).front().map(Front::name), Some(name), "{via:?}");
+        assert_eq!(
+            report(via.clone()).tracked().front().map(Front::name),
+            Some(name),
+            "{via:?}"
+        );
     }
     for via in NOT_FRONTS.iter().flatten() {
-        assert_eq!(report(via.clone()).front(), None, "{via:?}");
+        assert_eq!(report(via.clone()).tracked().front(), None, "{via:?}");
     }
 }
 
 /// Sudo, doas, pkexec and UAC may run the tracked process as another user; osascript's front runs
 /// as this user, and an already-elevated child is the caller's own. Mutant: an arm of
-/// `ElevationReport::may_run_as_another_user` flips.
+/// `ElevationReport::tracked` flips.
 #[skuld::test]
 fn a_report_says_whether_the_tracked_process_may_run_as_another_user() {
-    let runs_as_another_user = |via: ElevatedVia| report(via).may_run_as_another_user();
+    let runs_as_another_user = |via: ElevatedVia| report(via).tracked().runs_as_another_user();
     for backend in [Backend::Sudo, Backend::Doas, Backend::Pkexec] {
         assert!(runs_as_another_user(ElevatedVia::Wrapped(backend)), "{backend:?}");
     }
     assert!(runs_as_another_user(ElevatedVia::WindowsUac));
     assert!(!runs_as_another_user(ElevatedVia::MacosOsascript));
     assert!(!runs_as_another_user(ElevatedVia::AlreadyElevated));
+}
+
+#[skuld::test]
+fn an_unkillable_error_has_the_refusal_as_its_cause() {
+    let refusal = io::Error::from_raw_os_error(OS_CODE);
+    assert_eq!(
+        refusal.kind(),
+        io::ErrorKind::PermissionDenied,
+        "the test's code is a refusal"
+    );
+    let text = refusal.to_string();
+    let e = TrackedKind::AnotherUser.refusal(refusal);
+    assert_eq!(crate::error::first_os_code(&e), Some(OS_CODE), "{e:?}");
+    match e {
+        Error::Elevation {
+            kind: ElevationErrorKind::Unkillable,
+            detail,
+            ..
+        } => assert!(!detail.contains(&text), "the cause is in the detail: {detail}"),
+        other => panic!("expected Unkillable, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn kill_error_on_an_elevated_wrapper_is_unkillable() {
+    let eperm = io::Error::from(io::ErrorKind::PermissionDenied);
+    let e = TrackedKind::Front(Front::Sudo).refusal(eperm);
+    assert!(
+        matches!(
+            e,
+            Error::Elevation {
+                kind: ElevationErrorKind::Unkillable,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+#[skuld::test]
+fn kill_error_on_a_plain_child_stays_io() {
+    let eperm = io::Error::from(io::ErrorKind::PermissionDenied);
+    assert!(matches!(TrackedKind::Own.refusal(eperm), Error::Io(_)));
+}
+
+#[skuld::test]
+fn non_permission_kill_error_stays_io_even_when_elevated() {
+    let other = io::Error::from(io::ErrorKind::NotFound);
+    assert!(matches!(TrackedKind::AnotherUser.refusal(other), Error::Io(_)));
 }
 
 const FRONTS: [(ElevatedVia, &str); 3] = [
@@ -84,7 +137,7 @@ fn kill_gate_asking_in_turn(
     };
     let running = in_turn(running);
     let g = kill_gate(
-        report.and_then(|report| report.front()),
+        report.and_then(|report| report.tracked().front()),
         PID,
         || {
             note('r');
@@ -152,7 +205,7 @@ fn a_live_front_in_its_cgroup_is_killed_through_the_cgroup_only() {
             let (g, asked) = kill_gate_asking(Some(report(via.clone())), running, Ok(true));
             assert_eq!(asked, "rc", "{via:?}");
             assert!(
-                matches!(&g, Gate::CgroupOnly(f) if Some(*f) == report(via.clone()).front()),
+                matches!(&g, Gate::CgroupOnly(f) if Some(*f) == report(via.clone()).tracked().front()),
                 "{via:?}: {g:?}"
             );
         }
@@ -303,7 +356,7 @@ fn a_child_that_is_not_a_front_is_open_whatever_its_containment() {
             let (g, asked) = kill_gate_asking(reported.clone(), Ok(true), Ok(in_cgroup));
             assert_eq!(asked, "", "{via:?}");
             assert!(matches!(g, Gate::Open), "{via:?}: {g:?}");
-            let g = terminate_gate(reported.and_then(|reported| reported.front()), PID, || {
+            let g = terminate_gate(reported.and_then(|reported| reported.tracked().front()), PID, || {
                 panic!("not asked")
             });
             assert!(matches!(g, Gate::Open), "{via:?}: {g:?}");
@@ -315,7 +368,7 @@ fn a_child_that_is_not_a_front_is_open_whatever_its_containment() {
 #[skuld::test]
 fn a_sigterm_to_a_relaying_front_is_open() {
     for via in [ElevatedVia::Wrapped(Backend::Sudo), ElevatedVia::Wrapped(Backend::Doas)] {
-        let g = terminate_gate(report(via.clone()).front(), PID, || panic!("not asked"));
+        let g = terminate_gate(report(via.clone()).tracked().front(), PID, || panic!("not asked"));
         assert!(matches!(g, Gate::Open), "{via:?}: {g:?}");
     }
 }
@@ -324,7 +377,7 @@ fn a_sigterm_to_a_relaying_front_is_open() {
 /// it has exited.
 #[skuld::test]
 fn a_sigterm_to_a_live_osascript_is_closed() {
-    let osascript = report(ElevatedVia::MacosOsascript).front();
+    let osascript = report(ElevatedVia::MacosOsascript).tracked().front();
     let detail = refusal_detail(terminate_gate(osascript, PID, || Ok(true)));
     assert!(detail.contains(&format!("pid {PID} is osascript")), "{detail}");
     assert!(detail.contains("no SIGTERM was sent"), "{detail}");

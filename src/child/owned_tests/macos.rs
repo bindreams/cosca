@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use super::fixtures::{status, try_wait, wait_status, Blocker};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
+use crate::elevation::front::TrackedKind;
 use crate::error::Error;
 use crate::identity::kinfo::kinfo_proc;
 use crate::identity::{exit_record, short_info_held_by, FakeKernel, HostKernel, Kernel, UniqRead, LAUNCHD};
@@ -139,7 +140,7 @@ fn ignoring_sigchld_with_a_sibling() -> (
     let (root, root_stdin) = blocker().into_parts();
     let root_pid = root.id();
     let id = super::fixtures::identity_of(&root);
-    let owned = OwnedChild::adopt(root, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let owned = OwnedChild::adopt(root, id, TrackedKind::Own).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     let mut root_stdin = Some(root_stdin);
     let end = crate::wait::block_probe::on_blocking(move || drop(root_stdin.take()));
     let reaped = no_block_after_the_kernel_reaps(root_pid);
@@ -315,7 +316,7 @@ fn kill_on_an_own_unreaped_zombie_is_delivered() {
 /// `kernel`: an `OwnedChild` over it, which reaps the child.
 pub(super) fn watch(kernel: impl Kernel + Send + 'static, pid: u32, unique: u64) -> OwnedChild {
     let mac = MacosChild::new(kernel, pid, unique).expect("watch the child");
-    OwnedChild::new(Box::new(mac))
+    OwnedChild::new(Box::new(mac), TrackedKind::Own)
 }
 
 /// `pid`'s parent reads as `holder` says at each read, and its state as the host's: who holds the
@@ -657,7 +658,7 @@ fn setuid_kill_of_a_root_child_is_permission_denied(#[fixture(setuid)] _group: &
     let id = super::fixtures::identity_of(&child);
     // The identity of another user's process is readable.
     unique_of(id.pid());
-    let owned = OwnedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let owned = OwnedChild::adopt(child, id, TrackedKind::Own).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     let err = owned
         .signal(Sig::Kill)
         .expect_err("this caller may not signal a root process")

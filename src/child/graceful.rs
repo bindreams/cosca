@@ -105,15 +105,13 @@ impl Child {
     /// **macOS, a root launchd holds** is refused with nothing sent, and an `Unknown` root is signalled
     /// through the handle, as for [`kill`](Child::kill).
     pub fn terminate(&self) -> Result<(), Error> {
-        #[cfg(unix)]
-        {
-            // A front's refusal outranks a root launchd holds, as for `kill`.
-            if let crate::elevation::front::Gate::Closed(unkillable) = self.terminate_gate() {
-                return Err(unkillable);
-            }
+        // A front's refusal outranks a root launchd holds, as for `kill`: the send runs only once
+        // the rule has let it.
+        self.proc.terminate_by(|| {
+            #[cfg(unix)]
             self.refuse_unpinned("terminate", None)?;
-        }
-        crate::graceful::signal(self.graceful, self.pid(), |sig| self.proc.signal(sig).map(drop))
+            crate::graceful::signal(self.graceful, self.pid(), |sig| self.proc.signal(sig).map(drop))
+        })
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
@@ -265,7 +263,9 @@ impl Child {
     /// On Linux, a root whose handle cannot say whether it was reaped still gets the `SIGTERM`
     /// through its pidfd, which names it exactly, then the grace, and a kill through the pidfd if
     /// it is still running; nothing goes out by its number, and the call ends the same way, with a
-    /// failed signal's `Io` and a failed kill below the `Unassessable`. On 6.9+
+    /// failed signal's `Io` and a failed kill below the `Unassessable`. An elevated child behind a
+    /// front is refused there as for [`kill`](Child::kill): this path has no cgroup to kill through, so
+    /// a live front is sent no kill, and a live osascript no `SIGTERM`. On 6.9+
     /// its group is shut down as usual while it has a member. A root this handle's `wait` saw exit
     /// is still a zombie that pins its number, so its group is shut down as for a running root; the
     /// handle consumes it only when it drops. A root another reaper took names no group by its
@@ -445,15 +445,15 @@ pub(crate) struct PidfdShutdown {
 
 #[cfg(target_os = "linux")]
 impl PidfdShutdown {
-    /// The `SIGTERM`, sent by `term` unless `gate` refuses it; a refusal is the call's error.
+    /// The `SIGTERM` `send` makes, unless `child`'s rule refuses it
+    /// ([`OwnedChild::terminate_by`](crate::child::owned::OwnedChild::terminate_by)): the refusal is
+    /// the call's error, and the outcome of the send it let through is kept, so a refusal and a failed
+    /// `SIGTERM` stay distinct.
     pub(crate) fn start(
-        gate: crate::elevation::front::Gate,
-        term: impl FnOnce() -> Result<crate::signal::Sent, Error>,
+        child: &crate::child::owned::OwnedChild,
+        send: impl FnOnce() -> Result<crate::signal::Sent, Error>,
     ) -> Result<PidfdShutdown, Error> {
-        if let crate::elevation::front::Gate::Closed(unkillable) = gate {
-            return Err(unkillable);
-        }
-        Ok(PidfdShutdown { term: term() })
+        child.terminate_by(|| Ok(send())).map(|term| PidfdShutdown { term })
     }
 
     /// Whether the `SIGTERM` reached the root, so the grace is waited.
@@ -462,8 +462,9 @@ impl PidfdShutdown {
     }
 
     /// The call's error, after `exited`, the grace wait's outcome (`None`: not waited): a root
-    /// that did not exit within it, or whose wait failed, is killed by `kill` unless `kill_gate`
-    /// refuses it. One `warn` names what was skipped and what was sent. The error is an `Unassessable`
+    /// that did not exit within it, or whose wait failed, is killed by `kill`, which applies the
+    /// rule for a front ([`OwnedChild::kill_root`](crate::child::owned::OwnedChild::kill_root)).
+    /// One `warn` names what was skipped and what was sent. The error is an `Unassessable`
     /// with the refusal's cause, and below it the failed signal's `Io` (a leaf: it takes no peers), the
     /// failed grace wait and the failed kill; a failed signal that is no `Io` keeps its variant, with the
     /// wait, the kill and the refusal's cause as peers. The call's own failure comes first, then the
@@ -473,10 +474,8 @@ impl PidfdShutdown {
         call: &SkipCall<'_>,
         skip: &Skip,
         exited: Option<Result<bool, Error>>,
-        kill_gate: impl FnOnce() -> crate::elevation::front::Gate,
         kill: impl FnOnce() -> Result<crate::signal::Sent, Error>,
     ) -> Error {
-        use crate::elevation::front::Gate;
         use crate::signal::Sent;
         // A grace wait that failed means the root is killed now.
         let mut watch = None;
@@ -484,10 +483,7 @@ impl PidfdShutdown {
             None | Some(Ok(true)) => None,
             Some(outcome) => {
                 watch = outcome.err().map(std::sync::Arc::new);
-                Some(match kill_gate() {
-                    Gate::Closed(unkillable) => Err(unkillable),
-                    _ => kill(),
-                })
+                Some(kill())
             }
         };
         let termed = "sent the SIGTERM to the root through its pidfd, which names it exactly";

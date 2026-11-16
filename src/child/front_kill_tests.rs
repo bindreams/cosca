@@ -131,6 +131,45 @@ fn kill_tree_of_an_exited_front_is_ok() {
     assert!(child.wait().expect("wait").success());
 }
 
+/// An exited front's tree whose group the sweep skips (the root's own handle cannot say whether the root
+/// was reaped, so the group's number is not trusted, below 6.9) is left to the root's own kill. That
+/// kill, refused as an exited front's is, counts as made (`Ok`): the answer is the skip's
+/// `Unassessable`, not the refusal's `Unkillable` or `Io`.
+///
+/// Mutant: `OwnedChild::send_kill` maps a refused kill of an exited front as a live front's.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn kill_tree_of_an_exited_front_whose_group_is_skipped_counts_its_refused_kill_as_made() {
+    use crate::os_process::child::{ExitRecord, PeekOutcome};
+
+    let mut cmd = cat();
+    cmd.contain_with(ContainMode::Session);
+    let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
+    drop(stdin);
+    crate::test_child::wait_until_zombie(child.pid());
+    // The rule reads the front as exited; the sweep's look at the root's handle then fails.
+    let fake = child.proc.script_over(|f| {
+        f.peeks([
+            Ok(PeekOutcome::Exit(ExitRecord::Status(Default::default()))),
+            Err(std::io::Error::other("the handle cannot say")),
+        ])
+        .signals([failed_signal(libc::EPERM)])
+    });
+    let old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
+    let result = child.kill_tree();
+    drop(old_kernel);
+    assert_eq!(fake.signal_calls(), [Sig::Kill], "the sweep left the root its own kill");
+    match result {
+        Err(Error::Unassessable { detail, .. }) => assert!(
+            detail.contains("it did not kill its process group")
+                && detail.ends_with("and killed the root through its pidfd, which names it exactly"),
+            "{detail}"
+        ),
+        other => panic!("expected the skip's Unassessable, got {other:?}"),
+    }
+    assert!(child.wait().expect("wait").success());
+}
+
 /// The drop of an exited front tears it down as any child's, reaping it, and warns of nothing.
 #[skuld::test]
 fn drop_of_an_exited_front_reaps_it_and_warns_of_nothing() {
@@ -350,7 +389,7 @@ fn kill_tree_of_a_live_front_outside_a_cgroup_is_unkillable_and_sends_nothing() 
     assert_ends_unsignalled(&child, stdin);
 }
 
-/// The escalation is the gated kill. A `cat` that ignores `SIGTERM` outlives the grace.
+/// The escalation is the kill the rule decides. A `cat` that ignores `SIGTERM` outlives the grace.
 #[skuld::test]
 fn graceful_shutdown_of_a_front_that_outlives_the_grace_is_unkillable() {
     let mut cmd = crate::test_child::command(Console::Hidden);
@@ -578,18 +617,17 @@ fn a_live_front_reaped_elsewhere_after_the_refused_kill_is_gone() {
 }
 
 /// A failed password write whose front had already exited says so, not that it terminated the
-/// front, and asks the gate once. With direct exec the front is the root program, which refuses
-/// this process's signal even as a zombie: a scripted `EPERM` stands in for that refusal.
+/// front. With direct exec the front is the root program, which refuses this process's signal even
+/// as a zombie: a scripted `EPERM` stands in for that refusal, and it is the kill's alone.
 #[skuld::test]
 fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
     let mut cmd = cat();
-    // The drop, whose own teardown would ask the gate again, is opted out of.
+    // The drop, whose own teardown would send its own kill, is opted out of.
     cmd.kill_on_drop(false);
     let (mut child, stdin) = spawn_as(cmd, ElevatedVia::Wrapped(Backend::Sudo));
     drop(stdin);
     crate::test_child::wait_until_zombie(child.pid());
     let fake = child.proc.script_over(|f| f.signals([failed_signal(libc::EPERM)]));
-    let gates = crate::elevation::front::seams::count_kill_gates();
     let err = Error::from(
         crate::child::spawn::finish_elevated(
             child,
@@ -608,8 +646,7 @@ fn a_failed_password_write_to_a_front_that_had_exited_says_so() {
         crate::error::ChildFate::Reaped,
         "the non-blocking look reaps the exited front"
     );
-    assert_eq!(gates.count(), 1, "{detail}");
-    assert_eq!(fake.signal_calls(), [Sig::Kill], "the refusal was the kill's");
+    assert_eq!(fake.signal_calls(), [Sig::Kill], "the refusal was the kill's: {detail}");
     assert!(detail.contains("the elevated child had already exited"), "{detail}");
     assert!(!detail.contains("terminated"), "{detail}");
 }

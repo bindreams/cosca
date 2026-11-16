@@ -4,11 +4,14 @@
 use std::cell::RefCell;
 
 use super::PidfdShutdown;
+use crate::child::owned::OwnedChild;
 use crate::containment::dispatch::TreeSignal;
 use crate::containment::{Refusal, Skip, SkipCall, Why};
-use crate::elevation::front::Gate;
-use crate::error::Error;
+use crate::elevation::front::{Front, TrackedKind};
+use crate::error::{ElevationErrorKind, Error};
 use crate::log_capture::warns_since;
+use crate::os_process::child::PeekOutcome;
+use crate::os_process::fake::FakeProcess;
 use crate::signal::Sent;
 use crate::test_child::reaped_elsewhere::{ROOT_KILLED_BY_PIDFD, ROOT_TERMED_BY_PIDFD};
 
@@ -51,28 +54,49 @@ fn assert_names_the_skip(err: &Error) {
     assert!(crate::error::said(err).contains("forced"), "{err:?}");
 }
 
-fn unkillable(what: &str) -> Error {
-    Error::Elevation {
-        kind: crate::error::ElevationErrorKind::Unkillable,
-        detail: what.into(),
-        source: None,
-    }
+/// A box over a fake that reads running at every read, tracked as `kind`. Its end consumes nothing.
+fn running_as(kind: TrackedKind) -> OwnedChild {
+    OwnedChild::new(
+        Box::new(
+            FakeProcess::new([])
+                .peeks_always(|| Ok(PeekOutcome::Running))
+                .with_exact_consume(false),
+        ),
+        kind,
+    )
 }
 
-/// One run: `term` answers the `SIGTERM`, `exited` the grace (`None`: the grace is not asked),
-/// `kill_gate` and `kill` the escalation. Returns the error, what was sent, and the warns.
+/// What the box of a [`run`] is: the rule's answer to a `SIGTERM` or a kill follows from it.
+#[derive(Clone, Copy)]
+enum LiveBox {
+    /// Not a front: its `SIGTERM` and its kill go as `run`'s rows say.
+    Own,
+    /// A live osascript front: the rule refuses its `SIGTERM`, and nothing is sent.
+    Osascript,
+    /// A live sudo front in no cgroup: the rule lets its `SIGTERM` through and refuses the escalation's
+    /// kill, which goes through the box's [`kill_root_only`](OwnedChild::kill_root_only).
+    SudoOutsideACgroup,
+}
+
+/// One run over the box `kind`: `term` answers the `SIGTERM` (unless the rule refuses it), `exited` the
+/// grace (`None`: the grace is not asked), `kill` the escalation (unless the rule refuses it). Returns
+/// the error, what was sent, and the warns.
 fn run(
-    gate: Gate,
+    kind: LiveBox,
     term: Result<Sent, Error>,
     exited: Option<Result<bool, std::io::Error>>,
-    kill_gate: Gate,
     kill: Result<Sent, Error>,
 ) -> (Error, Vec<&'static str>, Vec<String>) {
     crate::log_capture::install();
     let call = graceful_call();
     let sent = RefCell::new(Vec::new());
     let mark = crate::log_capture::mark();
-    let shutdown = match PidfdShutdown::start(gate, || {
+    let child = running_as(match kind {
+        LiveBox::Own => TrackedKind::Own,
+        LiveBox::Osascript => TrackedKind::Front(Front::Osascript),
+        LiveBox::SudoOutsideACgroup => TrackedKind::Front(Front::Sudo),
+    });
+    let shutdown = match PidfdShutdown::start(&child, || {
         sent.borrow_mut().push("term");
         term
     }) {
@@ -84,30 +108,27 @@ fn run(
         sent.borrow_mut().push("grace");
         exited.unwrap_or(Ok(true)).map_err(Error::Io)
     });
-    let err = shutdown.finish(
-        &call,
-        &skip(),
-        waited,
-        || kill_gate,
-        || {
+    let err = shutdown.finish(&call, &skip(), waited, || match kind {
+        LiveBox::SudoOutsideACgroup => child.kill_root_only(None),
+        LiveBox::Own | LiveBox::Osascript => {
             sent.borrow_mut().push("kill");
             kill
-        },
-    );
+        }
+    });
     (err, sent.into_inner(), warns_since(mark, ""))
 }
 
 #[skuld::test]
 fn a_front_the_sigterm_may_not_reach_is_refused_with_nothing_sent() {
     let (err, sent, warns) = run(
-        Gate::Closed(unkillable("osascript")),
+        LiveBox::Osascript,
         Ok(Sent::Delivered),
         Some(Ok(true)),
-        Gate::Open,
         Ok(Sent::Delivered),
     );
     assert!(
-        matches!(&err, Error::Elevation { detail, .. } if detail == "osascript"),
+        matches!(&err, Error::Elevation { kind: ElevationErrorKind::Unkillable, detail, .. }
+            if detail.contains("is osascript") && detail.contains("no SIGTERM was sent")),
         "{err:?}"
     );
     assert_eq!(sent, Vec::<&str>::new());
@@ -121,10 +142,9 @@ fn a_front_the_sigterm_may_not_reach_is_refused_with_nothing_sent() {
 #[skuld::test]
 fn a_failed_grace_wait_kills_the_root_at_once_and_is_in_the_answer() {
     let (err, sent, warns) = run(
-        Gate::Open,
+        LiveBox::Own,
         Ok(Sent::Delivered),
         Some(Err(std::io::Error::other("forced wait failure"))),
-        Gate::Open,
         Ok(Sent::Delivered),
     );
     assert_names_the_skip(&err);
@@ -147,10 +167,9 @@ fn a_failed_grace_wait_kills_the_root_at_once_and_is_in_the_answer() {
 #[skuld::test]
 fn a_failed_grace_wait_and_a_failed_kill_are_both_in_the_answer_in_order() {
     let (err, sent, _) = run(
-        Gate::Open,
+        LiveBox::Own,
         Ok(Sent::Delivered),
         Some(Err(std::io::Error::other("forced wait failure"))),
-        Gate::Open,
         Err(Error::Io(std::io::Error::other("forced kill failure"))),
     );
     assert_eq!(sent, ["term", "grace", "kill"]);
@@ -171,17 +190,23 @@ fn a_failed_grace_wait_and_a_failed_kill_are_both_in_the_answer_in_order() {
     assert_eq!(below[2], crate::error::io_said("forced wait failure"), "{below:?}");
 }
 
+/// The escalation's kill of a live front outside a cgroup goes through the box's rule, which refuses
+/// it and sends nothing.
+///
+/// Mutant: the escalation's kill bypasses the rule and sends the front its kill.
 #[skuld::test]
 fn a_front_the_kill_may_not_reach_is_refused_after_the_grace() {
     let (err, sent, warns) = run(
-        Gate::Open,
+        LiveBox::SudoOutsideACgroup,
         Ok(Sent::Delivered),
         Some(Ok(false)),
-        Gate::Closed(unkillable("sudo")),
         Ok(Sent::Delivered),
     );
     assert!(
-        matches!(&err, Error::Elevation { detail, .. } if detail == "sudo"),
+        matches!(&err, Error::Elevation { kind: ElevationErrorKind::Unkillable, detail, .. }
+            if detail.contains("sudo")
+                && detail.contains("no kill was sent.")
+                && detail.contains("Only a cgroup (Linux containment) that holds it reaches the program.")),
         "{err:?}"
     );
     assert_eq!(sent, ["term", "grace"]);
@@ -195,7 +220,7 @@ fn a_front_the_kill_may_not_reach_is_refused_after_the_grace() {
 #[skuld::test]
 fn a_failed_sigterm_waits_no_grace_and_is_the_error() {
     let forced = || Error::Io(std::io::Error::other("forced term failure"));
-    let (err, sent, warns) = run(Gate::Open, Err(forced()), None, Gate::Open, Ok(Sent::Delivered));
+    let (err, sent, warns) = run(LiveBox::Own, Err(forced()), None, Ok(Sent::Delivered));
     // An `Io` is a leaf with no slot for peers: the call's `Unassessable` holds it, after the refusal's cause.
     assert!(
         matches!(&err, Error::Unassessable { detail, .. }
@@ -224,7 +249,7 @@ fn a_sigterm_that_reached_nothing_waits_no_grace() {
         (Sent::Gone, "sent nothing: the root's pidfd shows it is gone"),
         (Sent::Unverified, "sent nothing: the root's handle no longer reaches it"),
     ] {
-        let (err, sent, warns) = run(Gate::Open, Ok(term), None, Gate::Open, Ok(Sent::Delivered));
+        let (err, sent, warns) = run(LiveBox::Own, Ok(term), None, Ok(Sent::Delivered));
         assert_names_the_skip(&err);
         assert_eq!(sent, ["term"], "{says}");
         assert_eq!(warns.len(), 1, "{says}: {warns:?}");
@@ -235,13 +260,7 @@ fn a_sigterm_that_reached_nothing_waits_no_grace() {
 
 #[skuld::test]
 fn a_kill_that_finds_the_root_gone_says_so() {
-    let (err, sent, warns) = run(
-        Gate::Open,
-        Ok(Sent::Delivered),
-        Some(Ok(false)),
-        Gate::Open,
-        Ok(Sent::Gone),
-    );
+    let (err, sent, warns) = run(LiveBox::Own, Ok(Sent::Delivered), Some(Ok(false)), Ok(Sent::Gone));
     assert_names_the_skip(&err);
     assert_eq!(sent, ["term", "grace", "kill"]);
     assert_eq!(warns.len(), 1, "{warns:?}");

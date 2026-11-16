@@ -89,6 +89,7 @@ use crate::child::spawn::{
 };
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
+use crate::elevation::front::TrackedKind;
 use crate::error::{win32_io_error, Error};
 use crate::os_process::windows::WindowsProcess;
 use crate::stdio::{Fd, ResolvedStdio};
@@ -205,7 +206,10 @@ pub(crate) fn spawn_raw(
         graceful: crate::containment::windows::mechanism_from_flags(flags),
         frozen: cmd.flags_request().suspended,
     };
-    let owned = OwnedChild::new(Box::new(WindowsProcess::for_child(kernel, proc, pid)));
+    let tracked = cmd
+        .elevation_report()
+        .map_or(TrackedKind::Own, crate::elevation::ElevationReport::tracked);
+    let owned = OwnedChild::new(Box::new(WindowsProcess::for_child(kernel, proc, pid)), tracked);
     let raw_handle = owned.os_handle().as_raw_handle();
     let (resolved, cause, mut why) = resolve_identity(owned.kernel(), pid);
     let id = match resolved {

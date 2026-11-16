@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
+use crate::elevation::front::TrackedKind;
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::os_process::child::ExitRecord;
@@ -36,7 +37,7 @@ impl Blocker {
     pub(super) fn spawn_with(configure: impl FnOnce(&mut std::process::Command)) -> Blocker {
         let (child, stdin) = crate::test_child::blocker_with(configure).into_parts();
         let id = identity_of(&child);
-        let owned = OwnedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+        let owned = OwnedChild::adopt(child, id, TrackedKind::Own).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
         Blocker {
             owned: Arc::new(owned),
             pid: id.pid(),
@@ -63,6 +64,7 @@ impl Blocker {
             },
             child,
             id,
+            TrackedKind::Own,
         )
         .unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
         let blocker = Blocker {
@@ -210,7 +212,7 @@ pub(super) fn assert_handed_off(owned: &OwnedChild, token: u64) {
 /// An `OwnedChild` over `fake`, shared across threads. The test keeps `fake` (or a clone) to fire
 /// its wait and to read what it was asked.
 pub(super) fn owned_over(fake: &FakeProcess) -> Arc<OwnedChild> {
-    Arc::new(OwnedChild::new(Box::new(fake.clone())))
+    Arc::new(OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own))
 }
 
 /// A thread that is blocked on its `fake`'s wait, as a holder.

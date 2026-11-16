@@ -1727,16 +1727,24 @@ fn the_ranges_around_two_descriptors_cover_every_other_number() {
     assert_eq!(ranges_around(MAX, 0), [None, Some((1, MAX - 1)), None]);
 }
 
-/// A subtree asked about a child with no pid cannot place it, though its kill landed: it has no
-/// number to ask `/proc` with, so whether the kill reached it is unknown, not "no".
+/// A subtree or a tree asked about a child with no pid cannot place it, though its kill landed: it has
+/// no number to ask `/proc` with, so where the child is, and whether the kill reached it, is unknown,
+/// not "no".
 ///
-/// Mutant: the pid-less child is taken for not reached, or asked as pid 0.
+/// Mutant: the pid-less child is taken for not reached or not held, or asked as pid 0.
 #[skuld::test]
 fn a_subtree_asked_about_a_pidless_child_cannot_place_it() {
     use crate::child::owned::teardown::Reach;
 
-    let child = crate::child::owned::OwnedChild::new(Box::new(crate::os_process::fake::FakeProcess::new([])));
-    assert!(subtree(HIGH, true).reached(&child).is_err());
+    let child = crate::child::owned::OwnedChild::new(
+        Box::new(crate::os_process::fake::FakeProcess::new([])),
+        crate::elevation::front::TrackedKind::Own,
+    );
+    let subtree = subtree(HIGH, true);
+    assert!(subtree.reached(&child).is_err());
+    assert!(subtree.would_reach(&child).is_err());
+    let tree = crate::containment::Tree::none();
+    assert!(Reach::would_reach(&tree, &child).is_err());
 }
 
 /// What the probe makes of its child's pidfd peek, which decides whether its cgroup read stands. A
@@ -1801,6 +1809,6 @@ fn probe_end_of_an_unreadable_record() -> ProbeEnd {
     use crate::os_process::fake::{FakeProcess, ReapAnswer};
 
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(ExitRecord::Unreadable { si_code: 7 })]);
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), crate::elevation::front::TrackedKind::Own);
     super::reap_through(1, &child).expect("the reap answers")
 }

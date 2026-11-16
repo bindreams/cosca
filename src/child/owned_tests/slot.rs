@@ -3,9 +3,10 @@
 use super::teardown::{fake, PID};
 use crate::child::owned::slot::ChildSlot;
 use crate::child::owned::OwnedChild;
+use crate::elevation::front::TrackedKind;
 
 fn slot() -> ChildSlot {
-    ChildSlot::new(OwnedChild::new(Box::new(fake())))
+    ChildSlot::new(OwnedChild::new(Box::new(fake()), TrackedKind::Own))
 }
 
 /// Mutant: `take` clones or keeps the child.
