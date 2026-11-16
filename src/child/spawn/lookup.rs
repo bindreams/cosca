@@ -19,8 +19,9 @@ impl Invocation {
     /// no path of this process's own directory is needed: `enter` is set for a child that has one.
     ///
     /// Does nothing, and returns no candidates, for an exactly named program. `NotFound` for a miss,
-    /// `InvalidInput` for a name that cannot name a file, the candidate's own error for one that could
-    /// not be examined, the directory's own for a located name whose directory cannot be entered; see
+    /// `InvalidInput` for a name that cannot name a file, the candidate's error (naming the entry, with
+    /// the OS code down its `source()` chain) for one that could not be examined, the directory's own
+    /// for a located name whose directory cannot be entered; see
     /// [`crate::resolve::posix`].
     pub(crate) fn find(&mut self, env: &[(OsString, OsString)]) -> Result<Vec<PathBuf>, Error> {
         if !self.searched {

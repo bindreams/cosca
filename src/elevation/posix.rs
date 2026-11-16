@@ -305,9 +305,15 @@ pub(crate) fn run_version_probe(mut probe: std::process::Command) -> PkexecVersi
 /// whatever its mode, and no later candidate. A miss is [`FrontState::Absent`]; an entry that could
 /// not be examined is the lookup's own error, which is no answer to whether the front is there.
 fn find_front(path_var: Option<&OsStr>, program: &str) -> FrontState {
-    match crate::resolve::posix::lookup(Path::new(program), None, path_var) {
+    front_of(crate::resolve::posix::lookup(Path::new(program), None, path_var))
+}
+
+/// The front a [`lookup`](crate::resolve::posix::lookup) answer is. Absent is decided as `lookup`
+/// decides a miss ([`is_miss`](crate::resolve::posix::is_miss)), not by the error's kind.
+fn front_of(found: Result<crate::resolve::posix::Found, Error>) -> FrontState {
+    match found {
         Ok(found) => FrontState::Found(found.path),
-        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => FrontState::Absent,
+        Err(miss) if crate::resolve::posix::is_miss(&miss) => FrontState::Absent,
         Err(other) => FrontState::Unexamined(std::sync::Arc::new(other)),
     }
 }
@@ -323,7 +329,7 @@ pub(crate) fn find_fixed_front(path: &Path) -> FrontState {
     match crate::resolve::is_file(path, false) {
         Ok(true) => FrontState::Found(path.to_path_buf()),
         Ok(false) => FrontState::Absent,
-        Err(e) => FrontState::Unexamined(Error::io_cause(e)),
+        Err(e) => unexamined_io(format!("could not tell whether {path:?} is a file"), e),
     }
 }
 

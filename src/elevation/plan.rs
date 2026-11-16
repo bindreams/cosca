@@ -290,10 +290,10 @@ pub(crate) fn launches_pkexec(os: Os, backend: Backend, auth: &Auth, elevated: b
 }
 
 /// `BackendUnavailable` for the front `program`, which could not be examined (a `PATH` entry, or the
-/// real file of the one found): `error` is the cause.
+/// real file of the one found): `error` is the cause, and says which file and what failed.
 fn unexamined(program: &str, error: &std::sync::Arc<Error>) -> Error {
     backend_unavailable(
-        &format!("{program} could not be found or opened: a file on the way to it could not be examined"),
+        &format!("{program} could not be found or opened"),
         Some(std::sync::Arc::clone(error)),
     )
 }

@@ -155,7 +155,7 @@ pub(crate) struct ResolveInput<'a> {
     ///
     /// It also makes the search fail closed on a candidate whose existence cannot be determined,
     /// where an ordinary Windows search skips it with a warning (a POSIX search never does: it stops
-    /// with the entry's own error): see [`resolve`].
+    /// with an error that names the entry): see [`resolve`].
     pub loadable_only: bool,
     /// How Win32 completes a located name that is verbatim (`\\?\`) only because the cwd base is:
     /// `GetFullPathNameW`, which the raw backend passes. Win32 normalises a name it completes
@@ -1048,14 +1048,20 @@ pub(crate) fn search(input: ResolveInput<'_>) -> Result<(PathBuf, Vec<PathBuf>),
                 // A `loadable_only` search fails closed: skipping a candidate it could not check
                 // would let a later directory, perhaps one on `PATH` an attacker can write, supply
                 // the image. So does every POSIX search: an entry that cannot be examined means the
-                // search cannot be carried out as written. It answers with the entry's own error,
-                // bare: a spawn's caller branches on the errno.
-                Err(e) if !input.windows => return Err(Error::Io(e)),
-                Err(e) if input.loadable_only => {
-                    return Err(Error::Io(crate::error::io_context(
-                        format!("could not tell whether {joined:?} exists, so the search stops"),
-                        e,
-                    )))
+                // search cannot be carried out as written. The error names the candidate and the
+                // entry; the OS code is down its `source()` chain, as the `Error` docs say.
+                //
+                // A POSIX located name is no search: its error is the OS's own, bare, for a spawn's
+                // caller to branch on.
+                Err(e) if !input.windows && shape == Shape::Located => return Err(Error::Io(e)),
+                Err(e) if !input.windows || input.loadable_only => {
+                    // `dir` is the cwd, or empty, for a located name: only a bare name has an entry to name.
+                    let context = if shape == Shape::BareName {
+                        format!("could not tell whether {joined:?} exists in {dir:?}, so the search stops")
+                    } else {
+                        format!("could not tell whether {joined:?} exists, so the search stops")
+                    };
+                    return Err(Error::Io(crate::error::io_context(context, e)));
                 }
                 // An ordinary Windows spawn goes on, so one unreadable `PATH` directory does not
                 // break every search, as `CreateProcessW`'s own does not.

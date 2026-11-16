@@ -22,6 +22,13 @@ fn path_of(dirs: &[&Path]) -> OsString {
     std::env::join_paths(dirs).unwrap()
 }
 
+/// A directory entry that cannot be examined, `ELOOP` for every uid: a symlink to itself.
+fn looping_entry(root: &Path) -> PathBuf {
+    let entry = root.join("loop");
+    std::os::unix::fs::symlink("loop", &entry).unwrap();
+    entry
+}
+
 fn kind_of(result: Result<PathBuf, Error>) -> std::io::ErrorKind {
     match result {
         Err(Error::Io(e)) => e.kind(),
@@ -96,30 +103,102 @@ fn empty_and_relative_path_elements_are_skipped() {
     }
 }
 
-/// An entry that cannot be examined stops the search with its own error: `ELOOP` here, the one
-/// failure no uid is exempt from.
+/// An entry that cannot be examined stops the search with an error that names the entry and the
+/// candidate, and carries the OS code (`ELOOP` here, the one failure no uid is exempt from) down its
+/// `source()` chain, with the cause's kind kept.
 ///
-/// Mutant: the entry is skipped with a warning.
+/// Mutants: the entry is skipped with a warning; the error is the bare OS error, which names no entry.
 #[skuld::test]
-fn an_unexaminable_entry_stops_the_search_with_its_own_error() {
+fn an_unexaminable_entry_stops_the_search_with_an_error_naming_it() {
     let root = tempfile::tempdir().unwrap();
-    let looping = root.path().join("loop");
-    std::os::unix::fs::symlink("loop", &looping).unwrap();
+    let looping = looping_entry(root.path());
     let open = root.path().join("open");
     std::fs::create_dir(&open).unwrap();
     plant(&open, "tool", 0o755);
-    let e = std::fs::metadata(looping.join("tool")).unwrap_err();
+    let cause = std::fs::metadata(looping.join("tool")).unwrap_err();
     assert_eq!(
-        e.raw_os_error(),
+        cause.raw_os_error(),
         Some(libc::ELOOP),
         "precondition: the entry cannot be examined"
     );
 
     let path = path_of(&[&looping, &open]);
     match lookup(Path::new("tool"), Some(root.path()), Some(&path)) {
-        // Bare, so that a spawn's caller finds the errno.
-        Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e:?}"),
+        Err(error @ Error::Io(_)) => {
+            let Error::Io(e) = &error else { unreachable!() };
+            assert_eq!(e.kind(), cause.kind(), "{error:?}");
+            assert_eq!(crate::error::first_os_code(&error), Some(libc::ELOOP), "{error:?}");
+            let report = crate::error::Report(&error).to_string();
+            for named in [&looping, &looping.join("tool")] {
+                assert!(
+                    report.contains(&format!("{named:?}")),
+                    "{named:?} is not named: {report}"
+                );
+            }
+        }
         other => panic!("the entry must stop the search: {other:?}"),
+    }
+}
+
+/// A located name whose file cannot be examined has no `PATH` entry to name: the OS's own error
+/// stops it, bare, with the code on the error and no cause below it, for a spawn's caller to branch on.
+///
+/// Mutant: a located name's error is wrapped as a searched name's is (no code on the error).
+#[skuld::test]
+fn an_unexaminable_located_name_keeps_the_os_error_bare() {
+    let root = tempfile::tempdir().unwrap();
+    looping_entry(root.path());
+    match lookup(Path::new("loop/tool"), Some(root.path()), None) {
+        Err(Error::Io(e)) => {
+            assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e:?}");
+            assert!(std::error::Error::source(&e).is_none(), "{e:?}");
+        }
+        other => panic!("the located name must stop with the OS's error: {other:?}"),
+    }
+}
+
+/// The errno of each kind of [`lookup`] error, as the elevation shim puts it on its wire: a stop's
+/// down its `source()` chain, a located name's own, a miss's `ENOENT`, `EINVAL` for a name that names
+/// no file.
+///
+/// Mutants: the code is read from the top error only (a stop has none); a miss or a refused name is
+/// given another code.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn the_errno_of_a_lookup_error_is_its_code_down_the_chain_or_einval() {
+    let root = tempfile::tempdir().unwrap();
+    let looping = looping_entry(root.path());
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    let cwd = Some(root.path());
+    let stop = super::lookup(Path::new("tool"), cwd, Some(&path_of(&[&looping, &open]))).unwrap_err();
+    let located = super::lookup(Path::new("loop/tool"), cwd, None).unwrap_err();
+    let miss = super::lookup(Path::new("tool"), cwd, Some(&path_of(&[&open]))).unwrap_err();
+    let refused = super::lookup(Path::new("bin/"), cwd, None).unwrap_err();
+    for (what, error, errno) in [
+        ("a stop", &stop, libc::ELOOP),
+        ("a located name's own error", &located, libc::ELOOP),
+        ("a miss", &miss, libc::ENOENT),
+        ("a name that names no file", &refused, libc::EINVAL),
+    ] {
+        assert_eq!(errno_of(error), errno, "{what}: {error:?}");
+    }
+}
+
+/// A stop is no miss, whatever its cause's kind: only the search's own `NotFound`, which has no cause,
+/// becomes `ENOENT`.
+///
+/// Mutant: any code-less `NotFound` is taken for a miss.
+#[skuld::test]
+fn a_stop_whose_cause_is_not_found_is_not_a_miss() {
+    let cause = std::io::Error::new(std::io::ErrorKind::NotFound, "a cause that reads as a miss");
+    let stop = Error::Io(crate::error::io_context("could not tell, so the search stops", cause));
+    match miss_as_enoent(stop) {
+        Error::Io(e) => {
+            assert_eq!(e.raw_os_error(), None, "{e:?}");
+            assert!(std::error::Error::source(&e).is_some(), "the cause was dropped: {e:?}");
+        }
+        other => panic!("expected the stop as it was, got {other:?}"),
     }
 }
 
