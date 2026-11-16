@@ -56,8 +56,8 @@ pub(super) fn abandon_late_child(
     tracked: crate::elevation::front::TrackedKind,
     prepared: crate::containment::Prepared,
     policy: SpawnPolicy,
-    kernel: crate::identity::SpawnKernel,
 ) -> SpawnFailure {
+    let kernel = std::sync::Arc::clone(&prepared.kernel);
     let front = tracked.front();
     let pid = child.id();
     #[cfg(test)]
@@ -69,7 +69,6 @@ pub(super) fn abandon_late_child(
         }
         Err(refusal) => {
             return super::leave_unwatched_child(
-                &*kernel,
                 super::UnwatchedChild { child, pid, unique },
                 super::UnwatchedReport {
                     front,

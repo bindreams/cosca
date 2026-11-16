@@ -504,6 +504,33 @@ fn a_spawn_hands_its_kernel_to_the_boxes_it_makes_and_keeps_nothing_after() {
     assert!(kernel.all_rows_taken(), "each backend's spawn consumed its stated rows");
 }
 
+/// A tree-walk spawn's tree walks through the kernel the spawn was started with: its `kill_tree` asks
+/// that kernel for the process table, and the row refuses it, so no walk is made and the answer is the
+/// refusal.
+///
+/// Mutants: `prepare` (any of its returns) or an `attach_tree` arm gives the `Walker` a host kernel.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_tree_walk_spawns_tree_walks_through_the_kernel_the_spawn_was_started_with() {
+    use std::sync::Arc;
+
+    use crate::identity::{FakeKernel, HostKernel};
+
+    let (mut cmd, writer) = blocker_with_held_stdin();
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
+    let child = super::spawn_with(&mut cmd, Arc::clone(&kernel)).expect("spawn");
+    kernel.state_pids(Err(libc::EIO));
+
+    let err = child.kill_tree().expect_err("the process table cannot be read");
+
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
+    // The walk was not made, so only the root's own end is left to do.
+    child.kill().expect("end the root");
+    drop(writer);
+    child.wait().expect("reap the root");
+}
+
 #[skuld::test]
 fn spawn_unelevated_runs_a_plain_child() {
     let mut c = crate::test_child::command(Console::Hidden);

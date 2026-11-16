@@ -7,7 +7,8 @@
 //! status.
 
 use crate::child::front_cgroup_tests::pidfd_of;
-use crate::containment::dispatch::Unkilled;
+use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
+use crate::containment::mechanism::Contains;
 use crate::error::Error;
 use crate::identity::{
     ticks_host, ticks_id, unreadable, FakeKernel, HostKernel, Kernel, Key, ProcessId, UNREADABLE_STATUS_REASON,
@@ -140,12 +141,37 @@ fn every_walk_over_an_untrusted_view_errors_and_signals_nothing() {
 fn a_walkers_terminate_over_an_untrusted_view_says_nothing_was_sent() {
     for view in VIEWS {
         let (child, id) = live_member();
-        let kernel = view.fail(FakeKernel::over(&HostKernel), 0);
-        match super::terminate_tree(&kernel, id, None, crate::containment::TreeStop::default()).0 {
+        let walker = super::Walker::over(id, view.fail(FakeKernel::over(&HostKernel), 0));
+        match walker
+            .send_terminate(id.pid(), None, crate::containment::TreeStop::default())
+            .0
+        {
             crate::containment::TerminateOutcome::NotSent(Error::Unassessable { detail, .. })
                 if detail.contains(view.cause()) => {}
             other => panic!("expected NotSent(Unassessable) naming {}, got {other:?}", view.cause()),
         }
+        release(child);
+    }
+}
+
+/// The walker's kill reads the process table through the kernel it holds, as `terminate` does.
+///
+/// Mutant: the walker's kill reads the host's table, finds the root, and kills it.
+#[skuld::test]
+fn a_walkers_kill_over_an_untrusted_view_walks_nothing_and_kills_nothing() {
+    for view in VIEWS {
+        let (child, id) = live_member();
+        let walker = super::Walker::over(id, view.fail(FakeKernel::over(&HostKernel), 0));
+        match walker.kill(None).outcome() {
+            TreeKillOutcome::Unwalked(Error::Unassessable { detail, .. }) if detail.contains(view.cause()) => {}
+            other => panic!("expected Unwalked(Unassessable) naming {}, got {other:?}", view.cause()),
+        }
+        assert_eq!(
+            id.is_alive(),
+            crate::identity::Liveness::Alive,
+            "the walker killed the root over {}",
+            view.cause()
+        );
         release(child);
     }
 }

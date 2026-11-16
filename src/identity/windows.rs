@@ -474,7 +474,7 @@ pub(super) fn created_at(start: Key) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::new(secs, nanos as u32))
 }
 
-pub(super) fn is_running(pid: RawPid, start: Key) -> Liveness {
+pub(super) fn is_running(kernel: &dyn super::Kernel, pid: RawPid, start: Key) -> Liveness {
     // `SYNCHRONIZE` is asked for and dropped when refused: `QUERY_LIMITED` alone still rejects a
     // reused pid and still lets `GetExitCodeProcess` prove an exit.
     let (opened, granted) = open_dropping_refused(pid, &[PROCESS_SYNCHRONIZE]);
@@ -485,7 +485,7 @@ pub(super) fn is_running(pid: RawPid, start: Key) -> Liveness {
     };
     // The identity check runs on the HELD handle, which pins the kernel object, so no recycle can
     // slip between the check and the look.
-    let verdict = match creation_token_result(handle) {
+    let verdict = match kernel.creation_token(handle) {
         Ok(t) if t == start => match exit_look(handle, granted.0 & PROCESS_SYNCHRONIZE.0 != 0) {
             Ok(Look::Running) => Liveness::Alive,
             Ok(Look::Exited) => Liveness::Dead,

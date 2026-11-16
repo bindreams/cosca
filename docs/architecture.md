@@ -49,11 +49,13 @@ The OS layer owns the kernel it asks, on every platform. `os_process::open_with(
 lends it through `OsChild::kernel()`. A spawn starts with one kernel (`spawn_with(cmd, kernel)`;
 production passes `HostKernel`), erased once at its entry into a `SpawnKernel`, an `Arc<dyn Kernel +
 Send>`, so the spawn body below the entry is not generic. The child's box owns it, and the cgroup
-leaf, the placement probe's box and the macOS fd marker each own a clone of the `Arc`; the spawn's
-own reads ask it as `&dyn Kernel`. A borrow, a `Box` and an `Arc` of a kernel are kernels, so the
-walks, which open one process per member from one borrowed kernel, pass `&dyn Kernel`, and tests
-move a `FakeKernel` in. `Process` and `OwnedChild` hold a `Box<dyn OsProcess>` or
-`Box<dyn OsChild>`: the kernel's type stops at the OS layer.
+leaf, the placement probe's box, the macOS fd marker and the tree walk (`Walker`) each own a clone of
+the `Arc`: a tree outlives the box, and still reads through the spawn's kernel. The spawn's own reads
+ask it as `&dyn Kernel`. A foreign `Process`'s graceful call makes one kernel for the call and every
+read of it goes through that. A borrow, a `Box` and an `Arc` of a kernel are kernels, so the walks,
+which open one process per member from one borrowed kernel, pass `&dyn Kernel`, and tests move a
+`FakeKernel` in. `Process` and `OwnedChild` hold a `Box<dyn OsProcess>` or `Box<dyn OsChild>`: the
+kernel's type stops at the OS layer.
 
 The public types follow the same line:
 

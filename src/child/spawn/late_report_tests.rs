@@ -795,20 +795,26 @@ fn tear_down(
     unique: u64,
     arm: impl FnOnce(u32) -> Vec<Box<dyn std::any::Any>>,
 ) -> (ChildFate, Vec<String>, Vec<crate::send_log::Entry>) {
-    tear_down_with(uncontained(), child, stdin, unique, arm)
+    tear_down_with(None, child, stdin, unique, arm)
 }
 
-fn uncontained() -> crate::containment::Prepared {
+/// The decision a spawn that chose `mode` leaves its late child's teardown, for a root and with no
+/// marker, over the one `kernel` the teardown reads through.
+fn prepared_over(
+    mode: Option<crate::containment::ContainMode>,
+    kernel: &Arc<FakeKernel<'static>>,
+) -> crate::containment::Prepared {
     crate::containment::Prepared {
-        mode: None,
+        mode,
         is_root: true,
         marker: None,
+        kernel: crate::identity::spawn_kernel(Arc::clone(kernel)),
     }
 }
 
-/// [`tear_down`] of a child contained by `prepared`.
+/// [`tear_down`] of a child contained as `mode` says.
 fn tear_down_with(
-    prepared: crate::containment::Prepared,
+    mode: Option<crate::containment::ContainMode>,
     child: std::process::Child,
     stdin: &Rc<Cell<Option<std::process::ChildStdin>>>,
     unique: u64,
@@ -816,7 +822,7 @@ fn tear_down_with(
 ) -> (ChildFate, Vec<String>, Vec<crate::send_log::Entry>) {
     tear_down_over(
         Arc::new(FakeKernel::over(&HostKernel)),
-        prepared,
+        mode,
         child,
         stdin,
         unique,
@@ -830,7 +836,7 @@ fn tear_down_with(
 /// it stopped making fails here, and not as an answer that was never given.
 fn tear_down_over(
     kernel: Arc<FakeKernel<'static>>,
-    prepared: crate::containment::Prepared,
+    mode: Option<crate::containment::ContainMode>,
     child: std::process::Child,
     stdin: &Rc<Cell<Option<std::process::ChildStdin>>>,
     unique: u64,
@@ -849,7 +855,7 @@ fn tear_down_over(
     });
     let mark = crate::log_capture::mark();
     let _armed = arm(pid);
-    let (fate, _cleanup) = abandon(prepared, child, unique, Arc::clone(&kernel));
+    let (fate, _cleanup) = abandon(mode, child, unique, Arc::clone(&kernel));
     assert!(
         kernel.all_rows_taken(),
         "a look the teardown was stated to make was not made"
@@ -857,11 +863,11 @@ fn tear_down_over(
     (fate, warns_of(pid, mark), sent.entries())
 }
 
-/// The teardown of a late child (a real blocker with the id `unique`) as the spawn makes it, asking
-/// `kernel`: its fate, and what failed in it. A child the teardown hands back is given up unreaped,
-/// still running if its kill was refused, for the test to end.
+/// The teardown of a late child (a real blocker with the id `unique`) as the spawn makes it, contained
+/// as `mode` says and asking `kernel`: its fate, and what failed in it. A child the teardown hands
+/// back is given up unreaped, still running if its kill was refused, for the test to end.
 fn abandon(
-    prepared: crate::containment::Prepared,
+    mode: Option<crate::containment::ContainMode>,
     child: std::process::Child,
     unique: u64,
     kernel: Arc<FakeKernel<'static>>,
@@ -875,9 +881,8 @@ fn abandon(
         unique,
         error,
         crate::elevation::front::TrackedKind::Own,
-        prepared,
+        prepared_over(mode, &kernel),
         SpawnPolicy::SYNC,
-        crate::identity::spawn_kernel(kernel),
     );
     let SpawnFailure::MayHaveStarted {
         fate,
@@ -907,7 +912,7 @@ fn macos_late_teardown_returns_a_refused_kill_for_the_cleanup() {
 
     let (kernel, _refused) = refused_kill(pid);
 
-    let (fate, failures) = abandon(uncontained(), child, unique, Arc::clone(&kernel));
+    let (fate, failures) = abandon(None, child, unique, Arc::clone(&kernel));
 
     assert!(kernel.all_rows_taken(), "the kill made its id read");
     assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
@@ -963,7 +968,7 @@ fn macos_late_teardown_with_a_refused_kill_hands_it_back_and_says_so() {
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
     let (kernel, _refused) = refused_kill(pid);
-    let (fate, warns, sent) = tear_down_over(kernel, uncontained(), child, &stdin, unique, || {}, |_| vec![]);
+    let (fate, warns, sent) = tear_down_over(kernel, None, child, &stdin, unique, || {}, |_| vec![]);
     assert_eq!(fate, ChildFate::Running { id: None });
     let warn = only(&warns);
     assert_eq!(sent, [], "a refused kill sends nothing");
@@ -989,16 +994,11 @@ fn macos_late_teardown_of_a_contained_child_with_a_refused_kill_names_it_running
     let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
-    let walked = crate::containment::Prepared {
-        mode: Some(crate::containment::ContainMode::TreeWalk),
-        is_root: true,
-        marker: None,
-    };
     // The tree's reads of the root come before the kill's, and how many is the walk's business.
     let (kernel, _refused) = refused_kill(pid);
     let (fate, _warns, sent) = tear_down_over(
         kernel,
-        walked,
+        Some(crate::containment::ContainMode::TreeWalk),
         child,
         &stdin,
         unique,
@@ -1057,7 +1057,7 @@ fn macos_late_teardown_with_a_refused_kill_and_a_failed_peek_is_unknown() {
     let pid = child.id();
     let (kernel, _refused) = refused_kill(pid);
     kernel.state_peek(pid, Err(std::io::Error::from_raw_os_error(libc::EPERM)));
-    let (fate, warns, sent) = tear_down_over(kernel, uncontained(), child, &stdin, unique, || {}, |_| vec![]);
+    let (fate, warns, sent) = tear_down_over(kernel, None, child, &stdin, unique, || {}, |_| vec![]);
     assert_eq!(fate, ChildFate::Unknown);
     let warn = only(&warns);
     assert_eq!(sent, [], "a refused kill sends nothing");
@@ -1080,7 +1080,7 @@ fn macos_late_teardown_of_a_child_reaped_elsewhere_after_the_kill_is_killed() {
     let pid = child.id();
     let (fate, warns, sent) = tear_down_over(
         Arc::new(FakeKernel::over(&HostKernel)),
-        uncontained(),
+        None,
         child,
         &stdin,
         unique,
@@ -1112,7 +1112,7 @@ fn macos_late_teardown_of_an_orphaned_zombie_after_the_kill_is_killed_and_says_s
     let pid = child.id();
     let kernel = Arc::new(FakeKernel::over(&HostKernel));
     state_launchd_holds_the_zombie(&kernel, pid);
-    let (fate, warns, sent) = tear_down_over(kernel, uncontained(), child, &stdin, unique, || {}, |_| vec![]);
+    let (fate, warns, sent) = tear_down_over(kernel, None, child, &stdin, unique, || {}, |_| vec![]);
     assert_eq!(fate, ChildFate::Killed);
     assert_kill_sent(pid, &sent);
     let warn = only(&warns);
@@ -1135,7 +1135,7 @@ fn macos_late_teardown_with_a_failed_wait_is_killed() {
             .on_peek(pid, Ok(None))
             .on_peek(pid, Err(std::io::Error::other("forced wait failure"))),
     );
-    let (fate, warns, sent) = tear_down_over(kernel, uncontained(), child, &stdin, unique, || {}, |_| vec![]);
+    let (fate, warns, sent) = tear_down_over(kernel, None, child, &stdin, unique, || {}, |_| vec![]);
     assert_eq!(fate, ChildFate::Killed);
     assert_kill_sent(pid, &sent);
     let warn = only(&warns);
@@ -1373,14 +1373,13 @@ fn macos_late_teardown_of_an_unreadable_child_without_a_marker_says_its_tree_was
     let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
-    let walked = crate::containment::Prepared {
-        mode: Some(crate::containment::ContainMode::TreeWalk),
-        is_root: true,
-        marker: None,
-    };
-    let (fate, warns, sent) = tear_down_with(walked, child, &stdin, unique, |_| {
-        vec![force(crate::child::spawn::fault::set_force_identity_unknown)]
-    });
+    let (fate, warns, sent) = tear_down_with(
+        Some(crate::containment::ContainMode::TreeWalk),
+        child,
+        &stdin,
+        unique,
+        |_| vec![force(crate::child::spawn::fault::set_force_identity_unknown)],
+    );
     assert_eq!(fate, ChildFate::Reaped);
     assert_kill_sent(pid, &sent);
     let warn = only(&warns);
@@ -1444,14 +1443,13 @@ fn macos_late_teardown_whose_tree_attach_fails_says_its_tree_was_not_killed() {
     let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
-    let walked = crate::containment::Prepared {
-        mode: Some(crate::containment::ContainMode::TreeWalk),
-        is_root: true,
-        marker: None,
-    };
-    let (fate, warns, sent) = tear_down_with(walked, child, &stdin, unique, |_| {
-        vec![force(crate::child::spawn::fault::set_force_attach_failure)]
-    });
+    let (fate, warns, sent) = tear_down_with(
+        Some(crate::containment::ContainMode::TreeWalk),
+        child,
+        &stdin,
+        unique,
+        |_| vec![force(crate::child::spawn::fault::set_force_attach_failure)],
+    );
     assert_eq!(fate, ChildFate::Reaped);
     assert_kill_sent(pid, &sent);
     let warn = only(&warns);

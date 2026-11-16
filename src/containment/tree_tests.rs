@@ -17,7 +17,10 @@ use crate::test_groups::cgroup;
 fn a_tree_reports_the_containment_of_what_holds_it() {
     assert_eq!(Tree::none().containment(), Containment::None);
     assert_eq!(Tree::delegated().containment(), Containment::Delegated);
-    let walk = Tree::contained(Mechanism::Walk(Walker::new(crate::identity::ProcessId::current())));
+    let walk = Tree::contained(Mechanism::Walk(Walker::over(
+        crate::identity::ProcessId::current(),
+        crate::identity::HostKernel,
+    )));
     assert_eq!(walk.containment(), Containment::TreeWalk);
     #[cfg(unix)]
     {
@@ -56,7 +59,10 @@ fn only_a_cgroup_leaf_has_awaitable_release_steps() {
     use crate::containment::unix::Group;
     let (fake, _) = FakeContains::new(Containment::ProcessGroup, false);
     let others = [
-        Mechanism::Walk(Walker::new(crate::identity::ProcessId::current())),
+        Mechanism::Walk(Walker::over(
+            crate::identity::ProcessId::current(),
+            crate::identity::HostKernel,
+        )),
         Mechanism::Group(Group::process_group(1)),
         Mechanism::Fake(fake),
     ];
@@ -131,7 +137,7 @@ fn a_teardown_names_its_tree_as_it_always_did() {
     assert_eq!(Tree::none().teardown_subject(), "None");
     assert_eq!(Tree::delegated().teardown_subject(), "Delegated");
     let id = crate::identity::ProcessId::current();
-    let walk = Tree::contained(Mechanism::Walk(Walker::new(id)));
+    let walk = Tree::contained(Mechanism::Walk(Walker::over(id, crate::identity::HostKernel)));
     assert_eq!(walk.teardown_subject(), format!("TreeWalk({id:?})"));
     {
         use crate::containment::unix::Group;
@@ -194,7 +200,10 @@ fn a_released_tree_keeps_its_kind() {
             .expect("a kill that left nothing");
     }
 
-    let mut walk = Tree::contained(Mechanism::Walk(Walker::new(crate::identity::ProcessId::current())));
+    let mut walk = Tree::contained(Mechanism::Walk(Walker::over(
+        crate::identity::ProcessId::current(),
+        crate::identity::HostKernel,
+    )));
     let left_running = || {
         TreeKillOutcome::Ran(Err(Unkilled {
             members: vec![Error::MemberNotKilled {
@@ -230,7 +239,10 @@ fn a_released_tree_is_not_actionable_and_has_no_drain_edge() {
 
     let trees = [
         Tree::contained(Mechanism::Group(Group::process_group(1))),
-        Tree::contained(Mechanism::Walk(Walker::new(crate::identity::ProcessId::current()))),
+        Tree::contained(Mechanism::Walk(Walker::over(
+            crate::identity::ProcessId::current(),
+            crate::identity::HostKernel,
+        ))),
     ];
     for mut tree in trees {
         tree.release().wait();

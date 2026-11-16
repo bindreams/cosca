@@ -92,6 +92,17 @@ pub(crate) trait Contains: fmt::Debug {
         nothing_held(result)
     }
 
+    /// What a call that kills nothing still owes of the members an earlier kill left (`held`, which
+    /// only a tree walk holds), read through the mechanism's own kernel
+    /// ([`refused_still`](crate::containment::treewalk::refused_still)).
+    fn refused_still(&self, held: &[Left]) -> Vec<Error> {
+        debug_assert!(
+            !held.iter().any(Left::is_refused),
+            "only a tree walk holds a member an earlier kill refused"
+        );
+        Vec::new()
+    }
+
     /// What a failed handle backstop, the kill of the root through its own handle, makes of a
     /// `kill_tree`'s error when the kill left nothing else: for `root`, the root's `MemberNotKilled`,
     /// a `MembersLeft` of it alone on a walk and an [`Error::Containment`] over it elsewhere. The
@@ -251,6 +262,22 @@ impl Contains for Mechanism {
             Mechanism::Walk(m) => m.kill_left(result, left),
             #[cfg(test)]
             Mechanism::Fake(m) => m.kill_left(result, left),
+        }
+    }
+
+    fn refused_still(&self, held: &[Left]) -> Vec<Error> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Mechanism::Cgroup(m) => m.refused_still(held),
+            #[cfg(windows)]
+            Mechanism::Job(m) => m.refused_still(held),
+            #[cfg(unix)]
+            Mechanism::Group(m) => m.refused_still(held),
+            #[cfg(target_os = "macos")]
+            Mechanism::Marker(m) => m.refused_still(held),
+            Mechanism::Walk(m) => m.refused_still(held),
+            #[cfg(test)]
+            Mechanism::Fake(m) => m.refused_still(held),
         }
     }
 

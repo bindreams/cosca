@@ -22,11 +22,16 @@ fn exiting_root(root: ProcessId) -> FakeKernel<'static> {
 
 /// `kernel`, in which `root`, whose only thread is its own, has begun to exit.
 pub(super) fn with_exiting_root(kernel: FakeKernel<'static>, root: ProcessId) -> FakeKernel<'static> {
+    state_exiting_root(&kernel, root);
+    kernel
+}
+
+/// [`with_exiting_root`] after the kernel is shared.
+fn state_exiting_root(kernel: &FakeKernel<'static>, root: ProcessId) {
     let pid = root.pid();
     let stat = format!("{pid} (sh) S 1 {pid} {pid} 0 -1 {EXITING} 0 0 0 0 0 0 0 0 20 0 1 0 1 0 0");
-    kernel
-        .on_tids(pid, Ok(&[pid]))
-        .on_read(&format!("{pid}/task/{pid}/stat"), Ok(stat.as_bytes()))
+    kernel.state_tids(pid, Ok(&[pid]));
+    kernel.state_read(&format!("{pid}/task/{pid}/stat"), Ok(stat.as_bytes()));
 }
 
 /// What a signalled root and descendant leave: the descendant printed nothing, and the root died of
@@ -252,7 +257,7 @@ fn release_candidate(mut child: StdChild) {
 
 /// The tree-walk mechanism of a tree rooted at `root`.
 fn walker(root: ProcessId) -> crate::containment::mechanism::Mechanism {
-    crate::containment::mechanism::Mechanism::Walk(super::Walker::new(root))
+    crate::containment::mechanism::Mechanism::Walk(super::Walker::over(root, crate::identity::HostKernel))
 }
 
 /// What `entries` hold of the root's begun exit: the entry that names it.
@@ -349,11 +354,14 @@ fn a_graceful_sweep_over_a_root_caught_exiting_stands_on_its_own_listing() {
         members,
         ..
     } = tree;
-    let settling = process.begin_graceful().expect("the SIGTERM walk");
-    let kernel = with_exiting_root(FakeKernel::over(&HostKernel), process.id());
+    let kernel = std::sync::Arc::new(FakeKernel::over(&HostKernel));
+    let settling = process
+        .begin_graceful(&crate::identity::spawn_kernel(std::sync::Arc::clone(&kernel)))
+        .expect("the SIGTERM walk");
+    state_exiting_root(&kernel, process.id());
 
     process
-        .kill_tree_settling("graceful_shutdown_tree", &kernel, Some(&settling))
+        .kill_tree_settling("graceful_shutdown_tree", &settling)
         .expect("every member the call's own listing reached is killed");
 
     for member in &members {

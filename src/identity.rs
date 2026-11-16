@@ -653,8 +653,7 @@ impl ProcessId {
         }
         #[cfg(windows)]
         {
-            let _ = kernel;
-            backend::is_running(self.pid, self.key)
+            backend::is_running(kernel, self.pid, self.key)
         }
     }
 

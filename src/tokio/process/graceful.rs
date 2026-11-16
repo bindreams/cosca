@@ -40,13 +40,14 @@ impl Process {
     /// future mid-grace cancels the watch and performs no further signalling. Runtime
     /// requirements as on [`graceful_shutdown`](Process::graceful_shutdown).
     pub async fn graceful_shutdown_tree(&self, grace: Duration) -> Result<(), Error> {
-        let settling = self.inner.begin_graceful()?;
+        let kernel = crate::identity::spawn_kernel(crate::identity::HostKernel);
+        let settling = self.inner.begin_graceful(&kernel)?;
         #[cfg(test)]
         crate::graceful_hooks::run_hook(crate::graceful_hooks::HookPoint::AfterTerminate);
         let watch = self.wait_timeout(grace).await;
         let swept = self
             .inner
-            .kill_tree_settling_async("graceful_shutdown_tree", &crate::identity::HostKernel, Some(&settling))
+            .kill_tree_settling_async("graceful_shutdown_tree", &settling)
             .await;
         let call = format!("graceful_shutdown_tree({})", self.id().pid());
         crate::graceful::after_sweep(&call, swept, watch)
