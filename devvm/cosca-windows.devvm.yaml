@@ -1,0 +1,103 @@
+# The Windows guest for cosca's sandbox lanes (`devvm/README.md`): Windows from the ISO named in the untracked
+# `windows-iso.local.devvm.yaml`, the MSVC linker, the toolchain CI uses, and the git-tracked tree at ~/cosca. The tree
+# comes last, so an edit to a tracked file rebuilds nothing above it.
+from: windows-iso.local.devvm.yaml
+resources:
+  cpus: 4
+  memory: 8GiB
+  disk: 80GiB
+steps:
+  # The linker and the Windows SDK, the two components of the Visual Studio 2022 install on CI's runner that building
+  # Rust needs. The 2022 channel is the runner's major version. The bootstrapper's URL has no fixed digest: this
+  # layer is what pins the install.
+  - elevated: true
+    shell: pwsh
+    run: |
+      $ErrorActionPreference = 'Stop'
+      $installer = Join-Path $env:TEMP 'vs_buildtools.exe'
+      Invoke-WebRequest -Uri https://aka.ms/vs/17/release/vs_buildtools.exe -OutFile $installer
+      $process = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
+        '--quiet', '--wait', '--norestart', '--nocache',
+        '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+        '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.26100')
+      # 3010: installed, restart pending. The next step starts a fresh guest of this layer.
+      if ($process.ExitCode -notin 0, 3010) { throw "vs_buildtools.exe ended with exit code $($process.ExitCode)" }
+      Remove-Item -LiteralPath $installer
+  # The version of `.github/ci-toolchain`; Renovate moves both (`.github/renovate.json`).
+  - shell: pwsh
+    run: |
+      $ErrorActionPreference = 'Stop'
+      $installer = Join-Path $env:TEMP 'rustup-init.exe'
+      Invoke-WebRequest -Uri https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe -OutFile $installer
+      & $installer -y --profile minimal --default-host x86_64-pc-windows-msvc --default-toolchain 1.99.1
+      if ($LASTEXITCODE -ne 0) { throw "rustup-init ended with exit code $LASTEXITCODE" }
+      Remove-Item -LiteralPath $installer
+  # cargo-nextest's release zip, checked before it is unpacked. The tag and digest share a line so Renovate moves them
+  # together.
+  - shell: pwsh
+    run: |
+      $ErrorActionPreference = 'Stop'
+      $nextestTag = "cargo-nextest-0.9.151"; $nextestSha256 = "ba35ee0ce14ace65cd8c7aaa9613adb7d2644b0fe3866e85131eb4c269786efb"
+      $zip = Join-Path $env:TEMP 'cargo-nextest.zip'
+      Invoke-WebRequest -Uri "https://github.com/nextest-rs/nextest/releases/download/$nextestTag/$nextestTag-x86_64-pc-windows-msvc.zip" -OutFile $zip
+      $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash
+      if ($actual -ine $nextestSha256) { throw "cargo-nextest zip: expected sha256 $nextestSha256, got $actual" }
+      Expand-Archive -LiteralPath $zip -DestinationPath "$env:USERPROFILE\.cargo\bin" -Force
+      Remove-Item -LiteralPath $zip
+      & "$env:USERPROFILE\.cargo\bin\cargo.exe" nextest --version
+      if ($LASTEXITCODE -ne 0) { throw "cargo nextest --version ended with exit code $LASTEXITCODE" }
+  # Git Bash, which runs the probe lane scripts that CI's steps run under `shell: bash`. The runner image has it. The
+  # tag and digest share a line so Renovate moves them together; `Git\bin` puts `bash` on the machine's PATH.
+  - elevated: true
+    shell: pwsh
+    run: |
+      $ErrorActionPreference = 'Stop'
+      $gitTag = "v2.56.1.windows.1"; $gitSha256 = "c330c72e10b408cc39994bfefdb63542b0d93d21699325c3e0bd874af8a5a559"
+      # The asset name has the tag's version, with the build number after it from the second build on.
+      $gitVersion = ($gitTag -replace '^v', '') -replace '\.windows\.1$', '' -replace '\.windows\.', '.'
+      $installer = Join-Path $env:TEMP 'git-installer.exe'
+      Invoke-WebRequest -Uri "https://github.com/git-for-windows/git/releases/download/$gitTag/Git-$gitVersion-64-bit.exe" -OutFile $installer
+      $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash
+      if ($actual -ine $gitSha256) { throw "Git installer: expected sha256 $gitSha256, got $actual" }
+      $process = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList '/VERYSILENT', '/NORESTART', '/SUPPRESSMSGBOXES'
+      if ($process.ExitCode -ne 0) { throw "the Git installer ended with exit code $($process.ExitCode)" }
+      Remove-Item -LiteralPath $installer
+      $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+      [Environment]::SetEnvironmentVariable('Path', "$machinePath;$env:ProgramFiles\Git\bin", 'Machine')
+  # `python3`, which the lane scripts and `check-junit.py` call; the runner image has it. The embeddable package from
+  # python.org, by version only: Renovate moves the version (`.github/renovate.json`) and the download is not checked
+  # against a digest, as no source of one moves with the version.
+  - elevated: true
+    shell: pwsh
+    run: |
+      $ErrorActionPreference = 'Stop'
+      $pythonVersion = "3.14.10"
+      $zip = Join-Path $env:TEMP 'python-embed.zip'
+      Invoke-WebRequest -Uri "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-embed-amd64.zip" -OutFile $zip
+      $dir = 'C:\Python'
+      Expand-Archive -LiteralPath $zip -DestinationPath $dir
+      Copy-Item -LiteralPath "$dir\python.exe" -Destination "$dir\python3.exe"
+      Remove-Item -LiteralPath $zip
+      $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+      [Environment]::SetEnvironmentVariable('Path', "$machinePath;$dir", 'Machine')
+  # `windows_path_resolution` needs the machine policy that CI's runner image has: paths over 259 characters.
+  - elevated: true
+    shell: pwsh
+    run: Set-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -Type DWord -Value 1
+  # `.github/scripts/unattended-gui-elevation.py` and `elevation-lane-windows.ps1` weaken a machine only where this file
+  # exists. It is written here, never by a script that could be run on a host.
+  - elevated: true
+    shell: pwsh
+    run: Set-Content -LiteralPath "$env:ProgramData\cosca-devvm-guest" -Value 'devvm guest'
+  # An administrator's elevation is approved without a prompt, as on CI's runner image.
+  - set: { uac: auto-approve }
+  # `elevation-lane-windows.ps1` runs the tests as a second local administrator, which must read the tree's
+  # `Cargo.toml`; a profile folder is closed to other accounts. The copy inherits the grant.
+  - shell: pwsh
+    run: |
+      $ErrorActionPreference = 'Stop'
+      $tree = Join-Path $env:USERPROFILE 'cosca'
+      New-Item -ItemType Directory -Force $tree | Out-Null
+      icacls $tree /grant '*S-1-5-11:(OI)(CI)RX'
+      if ($LASTEXITCODE -ne 0) { throw "icacls ended with exit code $LASTEXITCODE" }
+  - copy: { from: git-tracked, to: ~/cosca, read-only: true }

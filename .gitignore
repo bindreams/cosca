@@ -24,3 +24,6 @@ CLAUDE.local.md
 # devvm.py and its VAGRANT_DOTFILE_PATH redirect), which would otherwise leave Vagrant's
 # default per-machine state directory tracked in the repo.
 .vagrant/
+
+# The per-machine path of the Windows ISO, read by devvm/cosca-windows.devvm.yaml.
+/devvm/windows-iso.local.devvm.yaml
