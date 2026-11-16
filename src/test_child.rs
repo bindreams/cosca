@@ -556,14 +556,12 @@ pub(crate) fn expect_handed_back<R>(
 #[cfg(target_os = "linux")]
 pub(crate) fn tear_down_held_holding<R>(
     child: crate::child::owned::OwnedChild,
-    front: Option<crate::elevation::front::Front>,
     id: Option<crate::identity::ProcessId>,
     subtree: Option<&crate::containment::cgroup::Subtree>,
     why: &mut crate::child::spawn::Diagnosis,
     release: R,
 ) -> (Option<String>, crate::error::ChildFate, HandedBack<R>) {
     let how = crate::child::spawn::held_teardown::HeldTeardown {
-        front,
         id,
         reach: subtree.map(|subtree| subtree as &dyn crate::child::owned::teardown::Reach),
         disposition: crate::child::owned::teardown::Disposition::HandBack,

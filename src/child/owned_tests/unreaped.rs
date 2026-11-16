@@ -222,7 +222,7 @@ fn dropping_an_unreaped_while_panicking_gives_the_child_up_without_waiting() {
     let (child, stdin) = crate::test_child::blocker().into_parts();
     let blocker_id = identity_of(&child);
     let owned = OwnedChild::adopt(child, blocker_id, TrackedKind::Own).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-    let unreaped = Unreaped::new(owned, Some(blocker_id), false, DropKind::Wait);
+    let unreaped = Unreaped::new(owned, Some(blocker_id), DropKind::Wait);
     let stdin = Rc::new(RefCell::new(Some(stdin)));
     crate::wait::block_probe::take();
     let _end = crate::wait::block_probe::on_blocking({
@@ -263,7 +263,7 @@ fn dropping_an_unreaped_blocker_waits_for_it_and_reaps_it() {
     let (child, stdin) = crate::test_child::blocker().into_parts();
     let blocker_id = identity_of(&child);
     let owned = OwnedChild::adopt(child, blocker_id, TrackedKind::Own).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
-    let unreaped = Unreaped::new(owned, Some(blocker_id), false, DropKind::Wait);
+    let unreaped = Unreaped::new(owned, Some(blocker_id), DropKind::Wait);
     crate::wait::block_probe::take();
     let _end = crate::wait::block_probe::on_blocking(move || drop(stdin));
     drop(unreaped);
@@ -306,7 +306,7 @@ async fn wait_async_returns_the_status_wait_would() {
 
     crate::log_capture::install();
     let (owned, stdin) = exits_three_on_eof();
-    let child = Unreaped::new(owned, None, false, DropKind::Wait);
+    let child = Unreaped::new(owned, None, DropKind::Wait);
     let mark = crate::log_capture::mark();
     let mut wait = std::pin::pin!(child.wait_async());
     assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
@@ -363,7 +363,6 @@ async fn a_cancelled_wait_async_lets_a_real_child_go_without_blocking() {
     let child = Unreaped::new(
         OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own),
         Some(blocker_id),
-        false,
         DropKind::Wait,
     );
     let mark = crate::log_capture::mark();
@@ -540,10 +539,14 @@ fn let_go(fake: &FakeProcess, front: bool, polls: usize) -> Vec<(log::Level, Str
     use crate::tokio::drive::drive_tests::poll_once;
 
     crate::log_capture::install();
+    let kind = if front {
+        TrackedKind::Front(crate::elevation::front::Front::Sudo)
+    } else {
+        TrackedKind::Own
+    };
     let child = Unreaped::new(
-        OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own),
+        OwnedChild::new(Box::new(fake.clone()), kind),
         Some(id()),
-        front,
         DropKind::Wait,
     );
     let mark = crate::log_capture::mark();

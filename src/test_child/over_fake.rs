@@ -93,7 +93,6 @@ pub(crate) fn unreaped_over(fake: &FakeProcess, id: Option<ProcessId>) -> Unreap
     Unreaped::new(
         OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own),
         id,
-        false,
         SpawnPolicy::SYNC.unreaped_drop,
     )
 }

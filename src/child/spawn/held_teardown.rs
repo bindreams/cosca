@@ -19,16 +19,12 @@ use crate::child::owned::teardown::{Reach, TeardownOutcome};
 use crate::child::owned::unreaped::DropKind;
 use crate::child::owned::OwnedChild;
 use crate::child::spawn::policy::SpawnPolicy;
-#[cfg(unix)]
-use crate::elevation::front::Front;
 use crate::identity::ProcessId;
 use crate::Unreaped;
 
 /// What a held child's teardown is told.
 #[cfg(unix)]
 pub(crate) struct HeldTeardown<'a> {
-    /// The elevation front the child is, if it is one: sent nothing and looked at.
-    pub(crate) front: Option<Front>,
     /// The child's identity, if the spawn read one.
     pub(crate) id: Option<ProcessId>,
     /// Where a front's leaf's kill went. `None`: no such kill, so a running front is left. Only a
@@ -45,19 +41,20 @@ pub(crate) struct HeldTeardown<'a> {
 /// spawn's error; `None` for a child that is not a front), the child's fate, and the child itself if
 /// `how.disposition` hands back one that still runs.
 ///
-/// A child that is not a front is killed and reaped. A front is sent nothing and looked at: reaped
-/// if it has exited, waited for (warning once past 1 s) if `how.reach`, where its leaf's kill went,
-/// shows that kill reached it, and otherwise running. `why` leads the teardown's one warn, if it has one.
+/// A child that is not a front is killed and reaped. A front is sent
+/// nothing and looked at: reaped if it has exited, waited for (warning once past 1 s) if
+/// `how.reach`, where its leaf's kill went, shows that kill reached it, and otherwise running.
+/// `why` leads the teardown's one warn, if it has one.
 #[cfg(unix)]
 pub(crate) fn tear_down_held(child: OwnedChild, how: HeldTeardown<'_>, why: &mut Diagnosis) -> (Option<String>, Torn) {
     let HeldTeardown {
-        front,
         id,
         reach,
         disposition,
         policy,
     } = how;
     let pid = child.pid();
+    let front = child.tracked_kind().front();
     // Nothing here states what became of the held child's handle, so a wait on it may fail: only the
     // uncollected-after-wait check is waived, not what a kill may be refused for.
     if front.is_none() {
@@ -66,7 +63,7 @@ pub(crate) fn tear_down_held(child: OwnedChild, how: HeldTeardown<'_>, why: &mut
     }
     let (front_fate, torn) = look_at_failed_spawn_front(&child, id, Ok(reach), disposition, policy.teardown_warn_after);
     let torn = HandleTeardown::new(torn, Expect::of(&child, Past::WaitMayFail));
-    let torn = say_failed_spawn(child, id, true, torn, disposition, policy.unreaped_drop, why);
+    let torn = say_failed_spawn(child, id, torn, disposition, policy.unreaped_drop, why);
     let detail = if torn.unreaped.is_some() {
         front_fate.detail_handed_back(front, pid)
     } else {
@@ -241,7 +238,7 @@ pub(crate) fn tear_down_failed_spawn_between(
         between(&child, kill, &mut *why)
     });
     let torn = HandleTeardown::new(outcome, Expect::of(&child, past));
-    say_failed_spawn(child, id, false, torn, disposition, policy.unreaped_drop, why)
+    say_failed_spawn(child, id, torn, disposition, policy.unreaped_drop, why)
 }
 
 /// Tears `child` down as `kill` says, over its handle, expecting `past` of it (see [`Past`]); the
@@ -276,11 +273,10 @@ pub(crate) fn look_at_failed_spawn_front(
 }
 
 /// Says `torn` as the failed spawn's one warn; hands `child` back per `disposition` if it is
-/// uncollected, to do `unreaped_drop` when dropped. `front`: the child is an elevation front.
+/// uncollected, to do `unreaped_drop` when dropped.
 fn say_failed_spawn(
     child: OwnedChild,
     id: Option<ProcessId>,
-    front: bool,
     torn: HandleTeardown,
     disposition: Disposition,
     unreaped_drop: DropKind,
@@ -289,7 +285,7 @@ fn say_failed_spawn(
     let remains = torn.say_as_failed_spawn(why);
     let unreaped = disposition
         .hands_back(&remains)
-        .then(|| Unreaped::new(child, id, front, unreaped_drop));
+        .then(|| Unreaped::new(child, id, unreaped_drop));
     Torn {
         fate: remains.fate,
         unreaped,

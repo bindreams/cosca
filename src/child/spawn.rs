@@ -610,6 +610,7 @@ fn spawn_reported(
     let tracked = elevation
         .as_ref()
         .map_or(TrackedKind::Own, crate::elevation::ElevationReport::tracked);
+    #[cfg(unix)]
     let front = tracked.front();
     // Read the routing rule BEFORE the take, which empties the map the rule reads. Evaluated
     // after, it would collapse to "does it have an executable()", and a high-descriptor-only
@@ -828,6 +829,7 @@ fn spawn_reported(
             }
         }
     };
+    let front = owned.tracked_kind().front();
     // A front's leaf subtree, captured while it exists: a failure arm drops the leaf, killing it.
     #[cfg(target_os = "linux")]
     let subtree = front_subtree(front.and(prepared.cgroup_leaf.as_ref()));
@@ -914,7 +916,6 @@ fn spawn_reported(
             ) = held_teardown::tear_down_held(
                 owned,
                 held_teardown::HeldTeardown {
-                    front,
                     id: None,
                     #[cfg(target_os = "linux")]
                     reach: subtree.as_ref().map(|subtree| subtree as &dyn Reach),
@@ -989,7 +990,6 @@ fn spawn_reported(
                     held_teardown::tear_down_held(
                         owned,
                         held_teardown::HeldTeardown {
-                            front,
                             id: id_read,
                             #[cfg(target_os = "linux")]
                             reach: subtree.as_ref().map(|subtree| subtree as &dyn Reach),

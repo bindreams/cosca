@@ -74,8 +74,8 @@ fn the_unreaped_a_child_hands_back_does_what_its_spawns_policy_says_on_drop() {
 /// The `Unreaped` of a child reported as a launch that leaves no front is not a front's: its drop
 /// sends the one more kill.
 ///
-/// Mutants: `into_unreaped` passes `Unreaped::new` the front from `report.is_some()` or from
-/// `TrackedKind::runs_as_another_user`.
+/// Mutant: `Unreaped::let_go` decides its kill from `TrackedKind::runs_as_another_user` instead of
+/// `TrackedKind::front`.
 #[skuld::test]
 fn the_unreaped_a_child_without_a_front_hands_back_is_sent_the_drops_kill() {
     use crate::child::spawn::policy::SpawnPolicy;

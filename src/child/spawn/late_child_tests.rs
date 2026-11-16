@@ -9,7 +9,7 @@ use crate::child::spawn::policy::SpawnPolicy;
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::fake::FakeContains;
 use crate::containment::{Containment, Mechanism, Refusal, Skip, Tree, Why};
-use crate::elevation::front::TrackedKind;
+use crate::elevation::front::{Front, TrackedKind};
 use crate::error::{ChildFate, Error};
 use crate::os_process::child::{ExitRecord, KillRefusal, PeekOutcome};
 use crate::os_process::fake::{Answer, FakeProcess, ReapAnswer};
@@ -142,6 +142,25 @@ fn a_root_exited_but_not_reapable_after_its_kill_is_warned_of_at_the_reap() {
     };
     assert_eq!(fate, ChildFate::Reaped);
     assert_eq!(warns, 1);
+}
+
+/// A late child whose box tracks a front is sent no kill: it is looked at, and a look that fails
+/// hands the front back. The fake takes a kill, so a sent one shows in its calls.
+///
+/// Mutant: `abandon_boxed_late_child` never takes the front branch.
+#[skuld::test]
+fn a_late_front_is_looked_at_and_handed_back_not_killed() {
+    const PID: u32 = 4245;
+    let fake = delivered_kill(PID, [Answer::Exited]).reaps([ReapAnswer::Err(std::io::ErrorKind::Other)]);
+
+    let (failure, _) = abandon_as(TrackedKind::Front(Front::Sudo), &fake, PID);
+
+    let SpawnFailure::MayHaveStarted { fate, unreaped, .. } = failure else {
+        panic!("a late front's failure says the program may have started: {failure:?}");
+    };
+    assert_eq!(fake.signal_calls(), Vec::<Sig>::new(), "a front is sent no kill");
+    assert_eq!(fate, ChildFate::Unknown);
+    unreaped.expect("a front whose look failed is handed back").leak();
 }
 
 /// A zombie wait that fails is not swallowed: the one warn says so, and the error is in the failure's
@@ -564,7 +583,12 @@ fn delivered_kill(pid: u32, exits: impl IntoIterator<Item = Answer>) -> FakeProc
 /// The teardown of an uncontained late child over `fake`, under a policy that warns at once: the
 /// failure it answers, and how many slow-wait warns it logged.
 fn abandon_over(fake: &FakeProcess, pid: u32) -> (SpawnFailure, usize) {
-    let box_ = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
+    abandon_as(TrackedKind::Own, fake, pid)
+}
+
+/// [`abandon_over`] for a box that tracks `tracked`.
+fn abandon_as(tracked: TrackedKind, fake: &FakeProcess, pid: u32) -> (SpawnFailure, usize) {
+    let box_ = OwnedChild::new(Box::new(fake.clone()), tracked);
     let prepared = crate::containment::Prepared {
         mode: None,
         is_root: true,
@@ -577,7 +601,6 @@ fn abandon_over(fake: &FakeProcess, pid: u32) -> (SpawnFailure, usize) {
             box_,
             pid,
             error,
-            None,
             prepared,
             SpawnPolicy::WARNS_AT_ONCE,
         ));

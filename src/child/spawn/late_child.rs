@@ -80,7 +80,7 @@ pub(super) fn abandon_late_child(
             )
         }
     };
-    abandon_boxed_late_child(owned, pid, error, front, prepared, policy)
+    abandon_boxed_late_child(owned, pid, error, prepared, policy)
 }
 
 /// [`abandon_late_child`] once the child has its box `owned`.
@@ -88,17 +88,15 @@ fn abandon_boxed_late_child(
     owned: OwnedChild,
     pid: u32,
     error: Error,
-    front: Option<crate::elevation::front::Front>,
     prepared: crate::containment::Prepared,
     policy: SpawnPolicy,
 ) -> SpawnFailure {
-    if front.is_some() {
+    if owned.tracked_kind().front().is_some() {
         drop(prepared);
         let mut why = Diagnosis::of(format!("child {pid} {LATE}"));
         let (detail, torn) = held_teardown::tear_down_held(
             owned,
             HeldTeardown {
-                front,
                 id: None,
                 reach: None,
                 disposition: Disposition::HandBack,

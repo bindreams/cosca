@@ -316,7 +316,6 @@ fn conclude(
 fn unmovable(pid: u32, pidfd: OwnedFd, e: io::Error, kernel: SpawnKernel, on_failure: OnFailure<'_>) -> SpawnFailure {
     let owned = OwnedChild::over_pidfd(kernel, Some(pid), pidfd, on_failure.tracked);
     let how = held_teardown::HeldTeardown {
-        front: on_failure.tracked.front(),
         id: None,
         reach: None,
         disposition: Disposition::HandBack,

@@ -90,7 +90,16 @@ pub(crate) fn fire_on_block(fake: &FakeProcess) -> crate::wait::block_probe::Arm
 /// root. The write end of its stdin comes with it.
 #[cfg(any(target_os = "linux", windows))]
 pub(crate) fn held_owned_blocker(script: impl FnOnce(FakeProcess) -> FakeProcess) -> (OwnedChild, crate::PipeWriter) {
-    let (mut child, stdin) = crate::test_child::held_uncontained_blocker(true);
+    held_owned_blocker_reporting(None, script)
+}
+
+/// [`held_owned_blocker`] spawned as the launch `report` describes.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn held_owned_blocker_reporting(
+    report: Option<crate::elevation::ElevationReport>,
+    script: impl FnOnce(FakeProcess) -> FakeProcess,
+) -> (OwnedChild, crate::PipeWriter) {
+    let (mut child, stdin) = crate::test_child::held_uncontained_blocker_reporting(true, report);
     child.proc.script_over(script);
     child.kill_on_drop = false;
     let owned = child.proc.take().expect("the child holds its root");
