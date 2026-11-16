@@ -180,13 +180,17 @@ fn foreign_graceful_shutdown_tree_kills_a_member_that_ignores_the_sigterm_after_
 fn foreign_graceful_sweep_whose_walk_is_not_made_kills_the_members_its_sigterm_walk_held() {
     use crate::identity::{FakeKernel, HostKernel};
     let tree = survivor_tree();
-    let settling = tree.process.begin_graceful().expect("the SIGTERM walk");
+    let kernel = std::sync::Arc::new(FakeKernel::over(&HostKernel));
+    let settling = tree
+        .process
+        .begin_graceful(&crate::identity::spawn_kernel(std::sync::Arc::clone(&kernel)))
+        .expect("the SIGTERM walk");
     crate::test_child::wait_until_zombie(tree.child.id());
-    let unlistable = FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO));
+    kernel.state_pids(Err(libc::EIO));
 
     let err = tree
         .process
-        .kill_tree_settling("graceful_shutdown_tree", &unlistable, Some(&settling))
+        .kill_tree_settling("graceful_shutdown_tree", &settling)
         .expect_err("the walk was not made");
 
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
@@ -220,7 +224,11 @@ fn foreign_graceful_sweep_whose_walk_is_not_made_over_a_live_root_kills_the_held
     let middle = crate::Process::open(middle)
         .expect("open the middle")
         .expect("the middle runs");
-    let settling = tree.process.begin_graceful().expect("the SIGTERM walk");
+    let kernel = std::sync::Arc::new(FakeKernel::over(&HostKernel));
+    let settling = tree
+        .process
+        .begin_graceful(&crate::identity::spawn_kernel(std::sync::Arc::clone(&kernel)))
+        .expect("the SIGTERM walk");
     middle.wait().expect("the middle exits on the SIGTERM");
     let running: Vec<_> = tree
         .members
@@ -229,11 +237,11 @@ fn foreign_graceful_sweep_whose_walk_is_not_made_over_a_live_root_kills_the_held
         .filter(|member| member.is_alive() == Liveness::Alive)
         .collect();
     assert_eq!(running.len(), 1, "the member that ignores the SIGTERM runs, reparented");
-    let unlistable = FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO));
+    kernel.state_pids(Err(libc::EIO));
 
     let err = tree
         .process
-        .kill_tree_settling("graceful_shutdown_tree", &unlistable, Some(&settling))
+        .kill_tree_settling("graceful_shutdown_tree", &settling)
         .expect_err("the walk was not made");
 
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
@@ -280,6 +288,54 @@ fn foreign_graceful_shutdown_tree_kills_a_member_reparented_while_the_root_outli
         Some(libc::SIGKILL),
         "the sweep killed the live root: {status:?}"
     );
+}
+
+// The `SIGTERM` walk of `begin_graceful` reads the process table through the kernel it is given, and a
+// row stated before the call refuses it: the walk is not made, and nothing is signalled.
+//
+// Mutant: the walk reads through the host's kernel, lists the tree, and signals it.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn begin_graceful_walks_through_the_kernel_it_is_given() {
+    use crate::identity::{FakeKernel, HostKernel};
+    let mut child = blocker();
+    let process = crate::Process::open_pid(child.id()).expect("open").expect("running");
+    let kernel = std::sync::Arc::new(FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO)));
+    let sends = Capture::start();
+
+    let Err(err) = process.begin_graceful(&crate::identity::spawn_kernel(std::sync::Arc::clone(&kernel))) else {
+        panic!("the process table cannot be read, so the walk is not made");
+    };
+
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(sends.entries(), vec![], "nothing was signalled");
+    child.kill().expect("end the root");
+    child.wait().expect("reap the root");
+}
+
+// The settlement of `begin_graceful` holds the kernel the call was given, in its `Walker` as for its
+// sweep: three holders of that `Arc` stand while the settlement does, the caller's, the `Walker`'s and the
+// sweep's.
+//
+// Mutant: the `Walker` is built over a kernel of its own.
+#[skuld::test]
+fn begin_graceful_holds_the_kernel_it_is_given_in_the_settlement_and_its_walker() {
+    let mut child = blocker();
+    let process = crate::Process::open_pid(child.id()).expect("open").expect("running");
+    let kernel = crate::identity::spawn_kernel(crate::identity::HostKernel);
+
+    let Ok(settling) = process.begin_graceful(&kernel) else {
+        panic!("the SIGTERM walk");
+    };
+
+    assert_eq!(std::sync::Arc::strong_count(&kernel), 3);
+    drop(settling);
+    assert_eq!(
+        std::sync::Arc::strong_count(&kernel),
+        1,
+        "the settlement held every other"
+    );
+    child.wait().expect("reap the root");
 }
 
 // A walk from an exited root finds nothing, so `kill_tree` says it could not see the tree.

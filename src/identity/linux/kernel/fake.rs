@@ -20,7 +20,7 @@ pub(crate) struct FakeKernel<'a> {
     /// What answers a call the tables have nothing for. `None`: such a call panics.
     real: Option<&'a dyn Kernel>,
     open_proc: Option<Errno>,
-    reads: Vec<ReadRow>,
+    reads: Mutex<Vec<ReadRow>>,
     /// The any-pid rows: a file name and what every read of `<pid>/<file>` answers when no row of
     /// `reads` does. Behind a `Mutex` so a test can state one through `&self` after the kernel is
     /// shared.
@@ -30,9 +30,9 @@ pub(crate) struct FakeKernel<'a> {
     /// How many times each path has been read.
     read_counts: Mutex<Vec<(String, usize)>>,
     /// The listing of any `/proc`: the pids, or the call that failed and its raw errno.
-    pids: Option<Result<Vec<u32>, (ReadCall, i32)>>,
+    pids: Mutex<Option<Listing>>,
     /// A pid, the number of earlier listings of its threads before the row answers, and the answer.
-    tids: Vec<TidsRow>,
+    tids: Mutex<Vec<TidsRow>>,
     signal_probes: Vec<(Pid, Result<(), Errno>)>,
     /// A pid, the flags the row answers (`None`: any), and the answer.
     pidfd_opens: Vec<(Pid, Option<PidfdFlags>, PidfdRow)>,
@@ -116,12 +116,15 @@ impl Drop for StatedRow<'_, '_> {
     }
 }
 
+/// What a listing answers: the ids, or the call that failed and its raw errno.
+type Listing = Result<Vec<u32>, (ReadCall, i32)>;
+
 /// A read row: the path, the number of earlier reads of it before the row answers, and the answer.
 type ReadRow = (String, usize, ReadAnswer);
 
 /// A thread listing row: the pid, the number of earlier listings of its threads before the row answers,
 /// and the answer (`Err` as for a read row).
-type TidsRow = (u32, usize, Result<Vec<u32>, (ReadCall, i32)>);
+type TidsRow = (u32, usize, Listing);
 
 /// A `pidfs_ino` row: the pid, the path whose earlier read it waits for, and the answer.
 type PidfsRow = (Pid, Option<String>, Result<Option<u64>, Errno>);
@@ -150,12 +153,12 @@ impl<'a> FakeKernel<'a> {
         FakeKernel {
             real: None,
             open_proc: None,
-            reads: Vec::new(),
+            reads: Mutex::new(Vec::new()),
             any_pid_reads: Mutex::new(Vec::new()),
             any_pid_generation: AtomicU64::new(0),
             read_counts: Mutex::new(Vec::new()),
-            pids: None,
-            tids: Vec::new(),
+            pids: Mutex::new(None),
+            tids: Mutex::new(Vec::new()),
             signal_probes: Vec::new(),
             pidfd_opens: Vec::new(),
             pidfs_inos: Vec::new(),
@@ -289,33 +292,55 @@ impl<'a> FakeKernel<'a> {
 
     /// Reading `path` under any `/proc` opens it, and its `read(2)` (a symlink's `readlinkat`) fails
     /// with the raw `errno`.
-    pub(crate) fn on_read_failing_after_open(mut self, path: &str, errno: i32) -> Self {
-        self.reads.push((path.to_owned(), 0, Err((ReadCall::Read, errno))));
+    pub(crate) fn on_read_failing_after_open(self, path: &str, errno: i32) -> Self {
+        self.push_read(path, 0, Err((ReadCall::Read, errno)));
         self
     }
 
     /// From the read of `path` that follows `earlier_reads` reads of it, answers `answer`, as
     /// [`on_read`](Self::on_read) does. Of the rows whose count has been reached, the one with the
     /// highest count wins.
-    pub(crate) fn on_read_after(mut self, path: &str, earlier_reads: usize, answer: Result<&[u8], i32>) -> Self {
-        self.reads.push((
-            path.to_owned(),
+    pub(crate) fn on_read_after(self, path: &str, earlier_reads: usize, answer: Result<&[u8], i32>) -> Self {
+        self.push_read(
+            path,
             earlier_reads,
             answer.map(<[u8]>::to_vec).map_err(|errno| (ReadCall::Open, errno)),
-        ));
+        );
         self
     }
 
+    /// [`on_read`](Self::on_read) after the kernel is shared.
+    pub(crate) fn state_read(&self, path: &str, answer: Result<&[u8], i32>) {
+        self.push_read(
+            path,
+            0,
+            answer.map(<[u8]>::to_vec).map_err(|errno| (ReadCall::Open, errno)),
+        );
+    }
+
+    fn push_read(&self, path: &str, earlier_reads: usize, answer: ReadAnswer) {
+        self.reads
+            .lock()
+            .expect("no panic holds the rows")
+            .push((path.to_owned(), earlier_reads, answer));
+    }
+
     /// Listing any `/proc` answers `answer`: the pids, or the raw errno of its `openat2`.
-    pub(crate) fn on_pids(mut self, answer: Result<&[u32], i32>) -> Self {
-        self.pids = Some(answer.map(<[u32]>::to_vec).map_err(|errno| (ReadCall::Open, errno)));
+    pub(crate) fn on_pids(self, answer: Result<&[u32], i32>) -> Self {
+        self.state_pids(answer);
         self
+    }
+
+    /// [`on_pids`](Self::on_pids) after the kernel is shared.
+    pub(crate) fn state_pids(&self, answer: Result<&[u32], i32>) {
+        *self.pids.lock().expect("no panic holds the rows") =
+            Some(answer.map(<[u32]>::to_vec).map_err(|errno| (ReadCall::Open, errno)));
     }
 
     /// Listing any `/proc` opens it, and the listing itself (the directory's setup, or `getdents64`)
     /// fails with the raw `errno`.
-    pub(crate) fn on_pids_failing_after_open(mut self, errno: i32) -> Self {
-        self.pids = Some(Err((ReadCall::Read, errno)));
+    pub(crate) fn on_pids_failing_after_open(self, errno: i32) -> Self {
+        *self.pids.lock().expect("no panic holds the rows") = Some(Err((ReadCall::Read, errno)));
         self
     }
 
@@ -328,19 +353,35 @@ impl<'a> FakeKernel<'a> {
     /// From the listing of `pid`'s threads that follows `earlier_lists` listings of them, answers
     /// `answer`, as [`on_tids`](Self::on_tids) does. Of the rows whose count has been reached, the one
     /// with the highest count wins.
-    pub(crate) fn on_tids_after(mut self, pid: u32, earlier_lists: usize, answer: Result<&[u32], i32>) -> Self {
-        self.tids.push((
+    pub(crate) fn on_tids_after(self, pid: u32, earlier_lists: usize, answer: Result<&[u32], i32>) -> Self {
+        self.push_tids(
             pid,
             earlier_lists,
             answer.map(<[u32]>::to_vec).map_err(|errno| (ReadCall::Open, errno)),
-        ));
+        );
         self
+    }
+
+    /// [`on_tids`](Self::on_tids) after the kernel is shared.
+    pub(crate) fn state_tids(&self, pid: u32, answer: Result<&[u32], i32>) {
+        self.push_tids(
+            pid,
+            0,
+            answer.map(<[u32]>::to_vec).map_err(|errno| (ReadCall::Open, errno)),
+        );
+    }
+
+    fn push_tids(&self, pid: u32, earlier_lists: usize, answer: Listing) {
+        self.tids
+            .lock()
+            .expect("no panic holds the rows")
+            .push((pid, earlier_lists, answer));
     }
 
     /// Listing the threads of `pid` opens its `task` directory, and the listing itself fails with the
     /// raw `errno`.
-    pub(crate) fn on_tids_failing_after_open(mut self, pid: u32, errno: i32) -> Self {
-        self.tids.push((pid, 0, Err((ReadCall::Read, errno))));
+    pub(crate) fn on_tids_failing_after_open(self, pid: u32, errno: i32) -> Self {
+        self.push_tids(pid, 0, Err((ReadCall::Read, errno)));
         self
     }
 
@@ -454,17 +495,20 @@ impl<'a> FakeKernel<'a> {
     /// The read row that answers a read or readlink of `path`, if any.
     fn answer(&self, path: &str) -> Option<Result<Vec<u8>, ReadFailure>> {
         let earlier = self.count_read(path);
-        let row = self
-            .reads
-            .iter()
-            .filter(|(p, from, _)| p == path && *from <= earlier)
-            .max_by_key(|(_, from, _)| *from);
         let answered = |answer: &ReadAnswer| match answer {
             Ok(bytes) => Ok(bytes.clone()),
             Err((call, errno)) => Err(call.failure(*errno)),
         };
-        if let Some((_, _, answer)) = row {
-            return Some(answered(answer));
+        let stated = {
+            let reads = self.reads.lock().expect("no panic holds the rows");
+            reads
+                .iter()
+                .filter(|(p, from, _)| p == path && *from <= earlier)
+                .max_by_key(|(_, from, _)| *from)
+                .map(|(_, _, answer)| answered(answer))
+        };
+        if let Some(answer) = stated {
+            return Some(answer);
         }
         let (pid, file) = path.split_once('/')?;
         if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
@@ -543,7 +587,7 @@ impl Kernel for FakeKernel<'_> {
     }
 
     fn pids(&self, dir: &ProcDir) -> Result<Vec<u32>, ReadFailure> {
-        match &self.pids {
+        match &*self.pids.lock().expect("no panic holds the rows") {
             Some(Ok(pids)) => Ok(pids.clone()),
             Some(Err((call, errno))) => Err(call.failure(*errno)),
             None => self.real("pids").pids(dir),
@@ -552,14 +596,16 @@ impl Kernel for FakeKernel<'_> {
 
     fn tids(&self, dir: &ProcDir, pid: u32) -> Result<Vec<u32>, ReadFailure> {
         let earlier = self.count_read(&format!("{pid}/task"));
-        let row = self
-            .tids
-            .iter()
-            .filter(|(p, from, _)| *p == pid && *from <= earlier)
-            .max_by_key(|(_, from, _)| *from);
+        let row = {
+            let tids = self.tids.lock().expect("no panic holds the rows");
+            tids.iter()
+                .filter(|(p, from, _)| *p == pid && *from <= earlier)
+                .max_by_key(|(_, from, _)| *from)
+                .map(|(_, _, answer)| answer.clone())
+        };
         match row {
-            Some((_, _, Ok(tids))) => Ok(tids.clone()),
-            Some((_, _, Err((call, errno)))) => Err(call.failure(*errno)),
+            Some(Ok(tids)) => Ok(tids),
+            Some(Err((call, errno))) => Err(call.failure(errno)),
             None => self.real(&format!("tids of {pid}")).tids(dir, pid),
         }
     }

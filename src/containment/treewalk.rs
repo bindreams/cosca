@@ -128,7 +128,7 @@ use crate::containment::Why;
 use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill, TreeStop};
 use crate::error::Error;
 use crate::identity::Resolved;
-use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution};
+use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution, SpawnKernel};
 use crate::os_process::OsProcess;
 #[cfg(unix)]
 use crate::signal::RootState;
@@ -137,15 +137,31 @@ use crate::Recursive;
 use std::sync::Arc;
 
 /// A tree named by parentage: the root's identity, from which its descendants are enumerated and
-/// killed by identity at teardown ([`kill_tree`], [`terminate_tree`]).
-#[derive(Debug)]
+/// killed by identity at teardown ([`kill_tree`], [`terminate_tree`]), through the kernel it holds.
 pub(crate) struct Walker {
     root: ProcessId,
+    /// What the walk reads the process table, and every member it kills, through. A foreign graceful
+    /// call's walker holds that call's one kernel.
+    kernel: SpawnKernel,
+}
+
+impl std::fmt::Debug for Walker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Walker")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Walker {
-    pub(crate) fn new(root: ProcessId) -> Walker {
-        Walker { root }
+    pub(crate) fn new(root: ProcessId, kernel: SpawnKernel) -> Walker {
+        Walker { root, kernel }
+    }
+
+    /// A walker over `root` that holds a test's `kernel`.
+    #[cfg(test)]
+    pub(crate) fn over(root: ProcessId, kernel: impl Kernel + Send + 'static) -> Walker {
+        Walker::new(root, crate::identity::spawn_kernel(kernel))
     }
 
     /// The root the walk starts from.
@@ -157,7 +173,7 @@ impl Walker {
 
 impl Contains for Walker {
     fn kill(&self, root: Option<&dyn crate::containment::Root>) -> TreeKill<'_> {
-        kill_tree(self.root, root)
+        kill_tree(&*self.kernel, self.root, root)
     }
 
     fn root_left(&self, root: Error) -> Error {
@@ -167,7 +183,7 @@ impl Contains for Walker {
     /// Kills again the members an earlier kill left ([`with_earlier`]), and holds the ones this one
     /// leaves.
     fn kill_left(&self, result: Result<(), Unkilled>, left: Vec<Left>) -> KillLeftOutcome {
-        let (merged, killed) = with_earlier(&crate::identity::HostKernel, left, result);
+        let (merged, killed) = with_earlier(&*self.kernel, left, result);
         let left_now = match &merged {
             Ok(()) => Vec::new(),
             Err(left) => Left::of(left),
@@ -179,13 +195,17 @@ impl Contains for Walker {
         }
     }
 
+    fn refused_still(&self, held: &[Left]) -> Vec<Error> {
+        refused_still(&*self.kernel, held)
+    }
+
     fn send_terminate(
         &self,
         _pid: u32,
         root: Option<&dyn crate::containment::Root>,
         how: TreeStop,
     ) -> (TerminateOutcome, Option<Listing>) {
-        terminate_tree(&crate::identity::HostKernel, self.root, root, how)
+        terminate_tree(&*self.kernel, self.root, root, how)
     }
 
     /// No kernel object says "every member has exited".
@@ -964,6 +984,12 @@ impl PartialEq for WalkToken {
 }
 
 impl Left {
+    /// Whether the member was refused by an earlier kill (so a later call owes it), rather than only
+    /// reached by a `SIGTERM` walk.
+    pub(crate) fn is_refused(&self) -> bool {
+        !matches!(self, Left::Termed { .. })
+    }
+
     /// Every member `left` names, in order: each [`Error::MemberNotKilled`]. The error of a walk that
     /// was not made, or found no root, or whose root's exit had begun, names no process, so none is
     /// held. A member never read shares its `source` with its `Left`.
@@ -1455,16 +1481,13 @@ fn skipped_walk(root: Option<&dyn crate::containment::Root>) -> Option<Skip> {
     None
 }
 
-/// [`hard_kill`] from the host's process table, the root killed through `owner`'s handle if there is
+/// [`hard_kill`] from `kernel`'s process table, the root killed through `owner`'s handle if there is
 /// one, else by its identity: skipped where the root's number cannot be trusted ([`skipped_walk`]),
 /// else walked.
-pub(crate) fn kill_tree<'a>(root: ProcessId, owner: Option<&dyn Root>) -> TreeKill<'a> {
+pub(crate) fn kill_tree<'a>(kernel: &'a dyn Kernel, root: ProcessId, owner: Option<&dyn Root>) -> TreeKill<'a> {
     match skipped_walk(owner) {
-        Some(skip) => TreeKill::of(TreeKillOutcome::Skipped(skip)),
-        None => {
-            let kernel = &crate::identity::HostKernel;
-            hard_kill(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root)))
-        }
+        Some(skip) => TreeKill::of(TreeKillOutcome::Skipped(skip)).through(kernel),
+        None => hard_kill(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root))),
     }
 }
 

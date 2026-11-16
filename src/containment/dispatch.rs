@@ -31,6 +31,8 @@ pub(crate) struct Prepared {
     /// [`Command::spawn_suspended`](crate::Command::spawn_suspended)).
     #[cfg(windows)]
     pub frozen: bool,
+    /// The kernel the spawn started with: the single source for whatever consumes a `Prepared`.
+    pub kernel: crate::identity::SpawnKernel,
 }
 
 /// A child the spawn has just forked, as the spawn holds it: its pid, and the pidfd its clone
@@ -1271,8 +1273,19 @@ impl TreeKilled {
     ) -> Settled<Result<(), Error>> {
         match (outcome.into(), keeping) {
             (TreeKillOutcome::Unwalked(error), Keeping::ForWalkFromRunningRoot) => {
-                let mut members =
-                    crate::containment::treewalk::refused_still(&crate::identity::HostKernel, &self.lock().held);
+                let mut members = {
+                    let state = self.lock();
+                    match mechanism {
+                        Some(mechanism) => mechanism.refused_still(&state.held),
+                        None => {
+                            debug_assert!(
+                                !state.held.iter().any(crate::containment::treewalk::Left::is_refused),
+                                "a tree with no mechanism holds no refused member"
+                            );
+                            Vec::new()
+                        }
+                    }
+                };
                 members.push(error);
                 Settled::of(
                     Unkilled {
@@ -1475,13 +1488,6 @@ pub(crate) fn prepare(
         allow(unused_variables, reason = "only a Linux cgroup leaf waits for its drain")
     )]
     teardown_warn_after: Option<std::time::Duration>,
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "macos")),
-        allow(
-            unused_variables,
-            reason = "only a Linux cgroup leaf and a macOS fd marker own a clone of the spawn's kernel"
-        )
-    )]
     kernel: &crate::identity::SpawnKernel,
 ) -> Result<Prepared, Error> {
     let mode = req.mode;
@@ -1528,6 +1534,7 @@ pub(crate) fn prepare(
             console,
             #[cfg(windows)]
             frozen: flags.suspended,
+            kernel: std::sync::Arc::clone(kernel),
         });
     }
     // Linux sets the marker in the environment it builds itself (see [`marks_child_environment`]).
@@ -1564,6 +1571,7 @@ pub(crate) fn prepare(
                         mode,
                         is_root,
                         cgroup_leaf: None, // cgroup not used for Session
+                        kernel: std::sync::Arc::clone(kernel),
                     });
                 }
                 UnixSetup::None => {
@@ -1573,6 +1581,7 @@ pub(crate) fn prepare(
                         mode,
                         is_root,
                         cgroup_leaf: None,
+                        kernel: std::sync::Arc::clone(kernel),
                     });
                 }
                 UnixSetup::ProcessGroup => {
@@ -1614,12 +1623,14 @@ pub(crate) fn prepare(
                 mode,
                 is_root,
                 cgroup_leaf: leaf,
+                kernel: std::sync::Arc::clone(kernel),
             });
         }
         return Ok(Prepared {
             mode,
             is_root,
             cgroup_leaf: None,
+            kernel: std::sync::Arc::clone(kernel),
         });
     }
 
@@ -1680,6 +1691,7 @@ pub(crate) fn prepare(
         console,
         #[cfg(windows)]
         frozen: flags.suspended,
+        kernel: std::sync::Arc::clone(kernel),
     })
 }
 
@@ -1854,7 +1866,7 @@ fn attach_tree(
                 // TreeWalk root: no kernel container / process group; teardown is
                 // by identity: the one the spawn verified against the child's handle.
                 if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                    return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?))));
+                    return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?, prepared.kernel))));
                 }
 
                 let raw_pid = pid;
@@ -1950,7 +1962,7 @@ fn attach_tree(
                 }
                 // TreeWalk root: no process group; identity teardown.
                 if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                    return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?))));
+                    return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?, prepared.kernel))));
                 }
                 let raw_pid = pid;
                 debug_assert!(
@@ -1991,7 +2003,7 @@ fn attach_tree(
             // TreeWalk root: no job (spawned with CREATE_NEW_PROCESS_GROUP only);
             // identity teardown, with CTRL_BREAK to the group as cooperative term.
             if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
-                return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?))));
+                return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?, prepared.kernel))));
             }
             // A frozen root is assigned its job and left suspended. It gets no `TreeWalk` fallback:
             // a frozen root without a job would have nothing to kill it if its owner died.
@@ -2013,7 +2025,7 @@ fn attach_tree(
                     // containment.
                     // The root was spawned with CREATE_NEW_PROCESS_GROUP (root_flags), so
                     // `terminate`'s CTRL_BREAK still reaches the group.
-                    return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?))));
+                    return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?, prepared.kernel))));
                 }
                 Err(failure) => return Err(failure),
             }

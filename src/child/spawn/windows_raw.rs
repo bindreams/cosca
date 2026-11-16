@@ -205,6 +205,7 @@ pub(crate) fn spawn_raw(
         // route for a child this spawn deliberately put in another console.
         console,
         frozen: cmd.flags_request().suspended,
+        kernel: std::sync::Arc::clone(&kernel),
     };
     let tracked = cmd
         .elevation_report()

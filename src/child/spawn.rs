@@ -808,7 +808,7 @@ fn spawn_reported(
         fault::run_at(fault::SpawnPoint::BeforeAdopt, pid);
         let unique = match unique_report::adopted_id(unique, pid) {
             Ok(unique) => unique,
-            Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, tracked, prepared, policy, kernel)),
+            Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, tracked, prepared, policy)),
         };
         // A refused kqueue is the one way to fail, and no box exists then ([`leave_unwatched_child`]).
         match crate::os_process::macos::child::MacosChild::new(std::sync::Arc::clone(&kernel), pid, unique) {
@@ -818,7 +818,6 @@ fn spawn_reported(
             }
             Err(refusal) => {
                 return Err(leave_unwatched_child(
-                    &*kernel,
                     UnwatchedChild { child, pid, unique },
                     UnwatchedReport {
                         front,
@@ -1044,7 +1043,6 @@ fn abandon_unadopted(
     tracked: TrackedKind,
     prepared: crate::containment::Prepared,
     policy: SpawnPolicy,
-    kernel: crate::identity::SpawnKernel,
 ) -> SpawnFailure {
     use unique_report::Unadoptable;
 
@@ -1059,9 +1057,7 @@ fn abandon_unadopted(
             drop(child);
             SpawnFailure::NotStarted(error)
         }
-        Unadoptable::Late(unique) => {
-            late_child::abandon_late_child(child, unique, error, tracked, prepared, policy, kernel)
-        }
+        Unadoptable::Late(unique) => late_child::abandon_late_child(child, unique, error, tracked, prepared, policy),
         Unadoptable::Unverified => {
             let fate = leave_unverified_child(child);
             SpawnFailure::started(error, fate, None).with_detail(FrontFate::LeftUnreaped.detail(front, Some(pid)))
@@ -1110,11 +1106,7 @@ struct UnwatchedReport {
 /// nothing), its marker's holders are swept, and it is never waited on, so it stays a zombie until this
 /// process exits.
 #[cfg(target_os = "macos")]
-fn leave_unwatched_child(
-    kernel: &dyn crate::identity::Kernel,
-    unwatched: UnwatchedChild,
-    report: UnwatchedReport,
-) -> SpawnFailure {
+fn leave_unwatched_child(unwatched: UnwatchedChild, report: UnwatchedReport) -> SpawnFailure {
     let UnwatchedChild { child, pid, unique } = unwatched;
     let UnwatchedReport {
         front,
@@ -1122,7 +1114,7 @@ fn leave_unwatched_child(
         refusal,
         late,
     } = report;
-    let (fate, said, killing) = unwatched_child_fate(kernel, pid, unique, front.is_some());
+    let (fate, said, killing) = unwatched_child_fate(&*prepared.kernel, pid, unique, front.is_some());
     // The containment is no front's to kill: its marker closes with it.
     let holders = if front.is_some() {
         None

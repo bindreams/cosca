@@ -25,7 +25,7 @@ fn a_tree_call_given_no_owner_sends_the_roots_kill_by_identity() {
     let (child, stdin) = crate::test_child::held_uncontained_blocker(false);
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
 
-    super::kill_tree(id, None)
+    super::kill_tree(&crate::identity::HostKernel, id, None)
         .outcome()
         .into_result()
         .expect("the walk found the root and killed it");
@@ -1611,7 +1611,7 @@ fn a_walk_is_skipped_by_the_roots_state_only_on_macos() {
     for (name, state, untrusted) in states {
         let skipped = untrusted && cfg!(target_os = "macos");
         let root = StatedRoot::with_state(ROOT_PID, state);
-        let killed = super::kill_tree(self::root(), Some(&root)).outcome();
+        let killed = super::kill_tree(&crate::identity::HostKernel, self::root(), Some(&root)).outcome();
         assert_eq!(
             matches!(killed, TreeKillOutcome::Skipped(_)),
             skipped,
@@ -1635,6 +1635,34 @@ fn a_walk_is_skipped_by_the_roots_state_only_on_macos() {
             "terminate, {name}: {termed:?}"
         );
     }
+}
+
+/// A kill whose walk was skipped (macOS: the root's number cannot be trusted) is waited for through the
+/// kernel the call was given.
+///
+/// Mutant: the `Skipped` answer waits through the host's kernel, which finds the member gone.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn a_skipped_kills_wait_reads_through_the_kernel_the_call_was_given() {
+    use crate::containment::dispatch::TreeKillOutcome;
+    use crate::identity::{FakeKernel, HostKernel, UniqRead};
+    use crate::signal::RootState;
+    use crate::test_support::stated_root::StatedRoot;
+
+    // A pid above macOS's `PID_MAX`: the host has no such process, so only the row can refuse its open.
+    let member = id(999_999, ROOT_TOKEN);
+    let kernel = FakeKernel::over(&HostKernel).on_unique_info(member.pid(), UniqRead::Refused(libc::EPERM));
+    let owner = StatedRoot::with_state(ROOT_PID, || RootState::Unpinned);
+
+    let (outcome, mut wait) = super::kill_tree(&kernel, root(), Some(&owner)).split();
+    assert!(matches!(outcome, TreeKillOutcome::Skipped(_)), "{outcome:?}");
+    wait.reaching([member]);
+    let err = wait
+        .wait()
+        .expect_err("the member's open was refused by the stated row");
+
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
+    assert!(kernel.all_rows_taken(), "the wait read the row");
 }
 
 /// The held member's `source` is the first report's own `Arc`.

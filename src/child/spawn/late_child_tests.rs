@@ -593,6 +593,7 @@ fn abandon_as(tracked: TrackedKind, fake: &FakeProcess, pid: u32) -> (SpawnFailu
         mode: None,
         is_root: true,
         marker: None,
+        kernel: crate::identity::spawn_kernel(crate::identity::HostKernel),
     };
     let error = crate::error::Error::Io(std::io::Error::other("the late child was not adopted"));
     let mut failure = None;

@@ -35,13 +35,47 @@ fn is_running_alive_for_self_dead_for_wrong_token() {
     let Resolved::Found(tok) = start_token(pid) else {
         panic!("our own token must resolve");
     };
-    assert_eq!(is_running(pid, tok), Liveness::Alive, "we are obviously running");
+    assert_eq!(
+        is_running(&HostKernel, pid, tok),
+        Liveness::Alive,
+        "we are obviously running"
+    );
     let wrong = Key::from_raw(tok.raw().wrapping_add(1));
     assert_eq!(
-        is_running(pid, wrong),
+        is_running(&HostKernel, pid, wrong),
         Liveness::Dead,
         "a wrong token is a different process"
     );
+}
+
+/// `is_running` takes the creation time of the process it opened from the kernel it is given,
+/// whatever the host's own time for the pid is.
+///
+/// Mutant: `is_running` reads the creation time of its handle through the host.
+#[skuld::test]
+fn is_running_reads_the_creation_time_through_its_kernel() {
+    use windows::core::HRESULT;
+
+    use crate::identity::FakeKernel;
+
+    let pid = std::process::id();
+    let stated = Key::from_raw(1);
+    let rows: [(&str, Result<Key, HRESULT>, Liveness); 3] = [
+        ("the stated start", Ok(stated), Liveness::Alive),
+        ("another start", Ok(Key::from_raw(2)), Liveness::Dead),
+        (
+            "a refused read",
+            Err(HRESULT::from_win32(ERROR_ACCESS_DENIED.0)),
+            Liveness::Unknown,
+        ),
+    ];
+    for (name, row, expected) in rows {
+        let kernel = FakeKernel::new().on_creation_token(row);
+
+        assert_eq!(is_running(&kernel, pid, stated), expected, "{name}");
+
+        assert!(kernel.all_rows_taken(), "{name}: the row was not read");
+    }
 }
 
 /// A LIVE process we may not open at all: ERROR_ACCESS_DENIED must NOT read as absence.
@@ -62,7 +96,7 @@ fn denied_query_limited_reads_unknown_not_gone() {
         "an access-denied live process must not resolve as Gone"
     );
     assert_eq!(
-        is_running(child.pid(), token),
+        is_running(&HostKernel, child.pid(), token),
         Liveness::Unknown,
         "an access-denied live process must not read as Dead"
     );
@@ -85,7 +119,7 @@ fn denied_synchronize_resolves_identity_but_liveness_is_unknown_while_running() 
     assert!(child.is_running(), "precondition: the subject must be live");
     assert_eq!(start_token(child.pid()), Resolved::Found(token));
     assert_eq!(
-        is_running(child.pid(), token),
+        is_running(&HostKernel, child.pid(), token),
         Liveness::Unknown,
         "SYNCHRONIZE is denied and STILL_ACTIVE is ambiguous — never Alive, never Dead"
     );
@@ -107,7 +141,7 @@ fn exited_process_denying_synchronize_reads_dead() {
     let token = creation_token(child.handle()).expect("owned handle reads the token");
     child.terminate(); // exit code 1
     assert!(!child.is_running(), "precondition: the subject must have exited");
-    assert_eq!(is_running(child.pid(), token), Liveness::Dead);
+    assert_eq!(is_running(&HostKernel, child.pid(), token), Liveness::Dead);
 }
 
 /// A pid that cannot exist classifies as definitely-gone, not Unknown — otherwise the
@@ -121,7 +155,7 @@ fn nonexistent_pid_is_gone_not_unknown() {
     // tests assert theirs by fixture.
     let ghost = 0xFFFF_FFF0u32;
     assert_eq!(start_token(ghost), Resolved::Gone);
-    assert_eq!(is_running(ghost, Key::from_raw(1)), Liveness::Dead);
+    assert_eq!(is_running(&HostKernel, ghost, Key::from_raw(1)), Liveness::Dead);
 }
 
 /// `Process::kill` documents "a real failure (no rights / access-denied on a live process)
@@ -305,27 +339,27 @@ fn exit_look_agrees_with_is_running() {
     };
 
     let me = std::process::id();
-    assert_eq!(is_running(me, token_of(me)), liveness_of(look_at(me)));
-    assert_eq!(is_running(me, token_of(me)), Liveness::Alive);
+    assert_eq!(is_running(&HostKernel, me, token_of(me)), liveness_of(look_at(me)));
+    assert_eq!(is_running(&HostKernel, me, token_of(me)), Liveness::Alive);
 
     let query_only = crate::identity::windows_fixture::spawn_query_only(&done);
     let token = token_of(query_only.pid());
     assert_eq!(
-        is_running(query_only.pid(), token),
+        is_running(&HostKernel, query_only.pid(), token),
         liveness_of(look_at(query_only.pid()))
     );
     assert_eq!(
-        is_running(query_only.pid(), token),
+        is_running(&HostKernel, query_only.pid(), token),
         Liveness::Unknown,
         "running, unprovable"
     );
     query_only.terminate();
     assert_eq!(
-        is_running(query_only.pid(), token),
+        is_running(&HostKernel, query_only.pid(), token),
         liveness_of(look_at(query_only.pid()))
     );
     assert_eq!(
-        is_running(query_only.pid(), token),
+        is_running(&HostKernel, query_only.pid(), token),
         Liveness::Dead,
         "an exit code proves it"
     );
@@ -333,7 +367,7 @@ fn exit_look_agrees_with_is_running() {
     let unkillable = crate::identity::windows_fixture::spawn_unkillable(&done);
     let token = creation_token(unkillable.handle()).expect("the owned handle reads the token");
     assert_eq!(
-        is_running(unkillable.pid(), token),
+        is_running(&HostKernel, unkillable.pid(), token),
         Liveness::Unknown,
         "QUERY refused: no look"
     );

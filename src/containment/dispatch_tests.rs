@@ -14,8 +14,9 @@ const ROOT_PID: u32 = 4242;
 /// A tree walk's mechanism, which answers the members an earlier kill left (the root it walks from
 /// is never walked here).
 fn walker() -> crate::containment::mechanism::Mechanism {
-    crate::containment::mechanism::Mechanism::Walk(crate::containment::treewalk::Walker::new(
+    crate::containment::mechanism::Mechanism::Walk(crate::containment::treewalk::Walker::over(
         crate::identity::ProcessId::current(),
+        crate::identity::HostKernel,
     ))
 }
 
@@ -310,8 +311,9 @@ fn a_tree_is_actionable() {
     assert!(Tree::delegated().require_contained().is_err());
     // Every real mechanism is actionable. Cheap variants are built inline; Cgroup/JobObject
     // need an OS handle, so a test-only constructor builds one (asserted on its own platform).
-    let walk = Mechanism::Walk(crate::containment::treewalk::Walker::new(
+    let walk = Mechanism::Walk(crate::containment::treewalk::Walker::over(
         crate::identity::ProcessId::current(),
+        crate::identity::HostKernel,
     ));
     assert!(Tree::contained(walk).require_contained().is_ok());
     #[cfg(unix)]
@@ -352,7 +354,12 @@ fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
     // the holder's exec, and a fork landing there would inherit it.
     let _serialize = crate::child::spawn::spawn_lock();
 
-    let walk = || Tree::contained(Mechanism::Walk(Walker::new(crate::identity::ProcessId::current())));
+    let walk = || {
+        Tree::contained(Mechanism::Walk(Walker::over(
+            crate::identity::ProcessId::current(),
+            crate::identity::HostKernel,
+        )))
+    };
     let rooted = |state: fn() -> RootState| StatedRoot::with_state(1234, state);
     let unpinned = || rooted(|| RootState::Unpinned);
     let unknown = || rooted(|| RootState::Unknown(std::sync::Arc::new(std::io::Error::other("a failed peek"))));
@@ -415,67 +422,76 @@ fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
     }
 }
 
+/// `attach()` over the helper child, as a root or a nested member of `mode`, holding `kernel` in its
+/// `Prepared`: the tree it yields. The arms it drives (a tree walk, and a nested member) do not touch the
+/// child, so an exited child is fine.
+fn attach_trivial(
+    mode: crate::containment::ContainMode,
+    is_root: bool,
+    kernel: crate::identity::SpawnKernel,
+) -> super::Tree {
+    use super::{attach, Prepared};
+
+    // Held for the fork itself: a fork landing while a `fdmarker_tests.rs` test's marker write end
+    // is transiently open would inherit it into this not-yet-`exec`'d process, and a concurrent
+    // sweep could then find and SIGKILL it.
+    #[cfg(unix)]
+    let mut child = crate::test_spawn::spawn(&mut std::process::Command::new("true")).expect("spawn true");
+    #[cfg(windows)]
+    let mut child =
+        crate::test_spawn::spawn(std::process::Command::new("cmd").args(["/C", "exit"])).expect("spawn cmd");
+    let prepared = Prepared {
+        mode: Some(mode),
+        is_root,
+        #[cfg(target_os = "linux")]
+        cgroup_leaf: None,
+        #[cfg(target_os = "macos")]
+        marker: None,
+        #[cfg(windows)]
+        console: crate::containment::windows::ConsoleFacts::of(crate::containment::windows::group_flags(), true),
+        #[cfg(windows)]
+        frozen: false,
+        kernel,
+    };
+    #[cfg(windows)]
+    let proc_handle = {
+        use std::os::windows::io::AsRawHandle;
+        child.as_raw_handle()
+    };
+    let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(child.id()) else {
+        panic!("the helper child must be readable");
+    };
+    let attachment = attach(
+        #[cfg(unix)]
+        child.id(),
+        Ok(id),
+        #[cfg(target_os = "linux")]
+        crate::containment::cgroup::test_support::handle_of(
+            child.id(),
+            &crate::containment::cgroup::test_support::pidfd_of(child.id()),
+        ),
+        #[cfg(windows)]
+        proc_handle,
+        prepared,
+    )
+    .expect("attach");
+    // Reap before the caller asserts: the tree is owned and independent of `child`, so a failing
+    // assertion must not leak the helper.
+    _ = child.kill();
+    _ = child.wait();
+    attachment.tree
+}
+
 /// Drives the real `attach()` nested arms (not a hand-built variant): a nested
 /// (`!is_root`) contained spawn must yield BOTH halves of the delegated pair —
 /// `Containment::Delegated` and `Tree::Delegated` — for a kernel mechanism
 /// (Strongest) and TreeWalk, so `containment()` predicts the `_tree` error.
 #[skuld::test]
 fn nested_attach_is_delegated() {
-    use super::{attach, Prepared};
     use crate::containment::{ContainMode, Containment};
 
-    fn spawn_trivial() -> std::process::Child {
-        // attach()'s nested arms don't touch the child, so an exited child is fine. Held for
-        // the fork itself: a fork landing while a `fdmarker_tests.rs` test's marker write end
-        // is transiently open would inherit it into this not-yet-`exec`'d process, and a
-        // concurrent sweep could then find and SIGKILL it.
-        #[cfg(unix)]
-        return crate::test_spawn::spawn(&mut std::process::Command::new("true")).expect("spawn true");
-        #[cfg(windows)]
-        return crate::test_spawn::spawn(std::process::Command::new("cmd").args(["/C", "exit"])).expect("spawn cmd");
-    }
-
     for mode in [ContainMode::Strongest, ContainMode::TreeWalk] {
-        let mut child = spawn_trivial();
-        let prepared = Prepared {
-            mode: Some(mode),
-            is_root: false, // nested member
-            #[cfg(target_os = "linux")]
-            cgroup_leaf: None,
-            #[cfg(target_os = "macos")]
-            marker: None,
-            #[cfg(windows)]
-            console: crate::containment::windows::ConsoleFacts::of(crate::containment::windows::group_flags(), true),
-            #[cfg(windows)]
-            frozen: false,
-        };
-        #[cfg(windows)]
-        let proc_handle = {
-            use std::os::windows::io::AsRawHandle;
-            child.as_raw_handle()
-        };
-        let crate::identity::Resolved::Found(id) = crate::identity::ProcessId::of(child.id()) else {
-            panic!("the helper child must be readable");
-        };
-        let attachment = attach(
-            #[cfg(unix)]
-            child.id(),
-            Ok(id),
-            #[cfg(target_os = "linux")]
-            crate::containment::cgroup::test_support::handle_of(
-                child.id(),
-                &crate::containment::cgroup::test_support::pidfd_of(child.id()),
-            ),
-            #[cfg(windows)]
-            proc_handle,
-            prepared,
-        )
-        .expect("attach nested");
-        let tree = attachment.tree;
-        // Reap before asserting: `tree` is owned and independent of `child`, so a
-        // failing assertion must not leak the helper (the nested arms don't touch it).
-        _ = child.kill();
-        _ = child.wait();
+        let tree = attach_trivial(mode, false, crate::identity::spawn_kernel(crate::identity::HostKernel));
         assert_eq!(
             tree.containment(),
             Containment::Delegated,
@@ -483,6 +499,31 @@ fn nested_attach_is_delegated() {
             tree.containment()
         );
     }
+}
+
+/// A tree-walk root's tree holds the kernel its `Prepared` carries (the same `Arc`), on every platform:
+/// the Linux and non-Linux Unix arms, and the Windows arm that takes a tree walk by request. (A macOS
+/// root with an fd marker gets the marker, and a Windows root that falls back to a tree walk because no
+/// job could be made is not driven here.)
+///
+/// Mutant: an `attach_tree` arm builds its `Walker` over a kernel other than `prepared.kernel`.
+#[skuld::test]
+fn a_tree_walk_root_holds_the_kernel_its_prepared_carries() {
+    let kernel = crate::identity::spawn_kernel(crate::identity::HostKernel);
+
+    let tree = attach_trivial(
+        crate::containment::ContainMode::TreeWalk,
+        true,
+        std::sync::Arc::clone(&kernel),
+    );
+
+    assert_eq!(
+        std::sync::Arc::strong_count(&kernel),
+        2,
+        "the caller's and the tree walk's, which took the `Prepared`'s"
+    );
+    drop(tree);
+    assert_eq!(std::sync::Arc::strong_count(&kernel), 1, "the tree held the other");
 }
 
 // kill_tree handle-backstop (treewalk / macOS fd-marker fault seam) =====
@@ -1805,6 +1846,109 @@ fn a_kept_settlement_of_a_walk_not_made_names_the_members_an_earlier_kill_refuse
     termed.wait().expect("reap the member");
 }
 
+/// A kept settlement of a walk not made asks the kernel its walker holds whether a refused member still
+/// runs: where that kernel shows the member gone, it is not named.
+///
+/// Mutant: the settlement asks the host's kernel, which shows the member running, and names it.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_kept_settlement_asks_the_walkers_kernel_whether_a_refused_member_still_runs() {
+    use super::{Keeping, TreeKillOutcome, TreeKilled, Unkilled};
+    use crate::identity::{ticks_id, FakeKernel, HostKernel};
+    let (member, stdin) = crate::test_child::held_uncontained_blocker(false);
+    let id = ticks_id(member.id().expect(crate::test_child::IDENTITY_READ).pid());
+    let killed = TreeKilled::default();
+    killed
+        .settle(
+            Some(&walker()),
+            TreeKillOutcome::Ran(Err(Unkilled {
+                members: vec![member_left(id.pid())],
+                root: None,
+                resolved: vec![id],
+            })),
+            false,
+        )
+        .answer
+        .expect_err("the member was left");
+    let gone = FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_read(&format!("{}/stat", id.pid()), Err(libc::ENOENT))
+        .on_signal_probe(
+            rustix::process::Pid::from_raw(id.pid() as i32).expect("a live pid"),
+            Err(rustix::io::Errno::SRCH),
+        );
+    let walker_over_gone = crate::containment::mechanism::Mechanism::Walk(crate::containment::treewalk::Walker::over(
+        crate::identity::ProcessId::current(),
+        gone,
+    ));
+
+    let settled = killed.settle_for_kill_tree(
+        Some(&walker_over_gone),
+        unwalked(),
+        false,
+        Keeping::ForWalkFromRunningRoot,
+    );
+
+    let error = settled.answer.expect_err("a walk not made");
+    assert!(
+        matches!(
+            &error.left_members()[..],
+            [crate::error::Error::Unassessable { detail, .. }] if detail == "the snapshot failed"
+        ),
+        "the member is gone as the walker's kernel shows it, so only the walk's own error is left: {error:?}"
+    );
+    assert_eq!(
+        id.is_alive(),
+        crate::identity::Liveness::Alive,
+        "the host shows it running"
+    );
+    drop(stdin);
+    member.wait().expect("reap the member");
+}
+
+/// A kept settlement of a walk not made names a refused member that the kernel its walker holds shows
+/// running, though the host shows it gone.
+///
+/// Mutant: the settlement asks the host's kernel, which shows the member gone, and does not name it.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_kept_settlement_names_a_refused_member_its_walkers_kernel_shows_running() {
+    use super::Keeping;
+    use crate::error::Error;
+    use crate::identity::{ticks_id, FakeKernel, HostKernel, Liveness};
+    let (member, stdin) = crate::test_child::held_uncontained_blocker(false);
+    let id = ticks_id(member.id().expect(crate::test_child::IDENTITY_READ).pid());
+    let pid = id.pid();
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).expect("a live member's stat");
+    let killed = tree_left_with(pid, vec![id]);
+    drop(stdin);
+    member.wait().expect("reap the member");
+    assert_eq!(id.is_alive(), Liveness::Dead, "the host shows it gone");
+    let running = FakeKernel::over(&HostKernel)
+        .same_view()
+        .on_read(&format!("{pid}/stat"), Ok(&stat));
+    let walker_over_running = crate::containment::mechanism::Mechanism::Walk(
+        crate::containment::treewalk::Walker::over(crate::identity::ProcessId::current(), running),
+    );
+
+    let settled = killed.settle_for_kill_tree(
+        Some(&walker_over_running),
+        unwalked(),
+        false,
+        Keeping::ForWalkFromRunningRoot,
+    );
+
+    let error = settled.answer.expect_err("a walk not made");
+    assert!(
+        matches!(
+            &error.left_members()[..],
+            [Error::MemberNotKilled { pid: named, .. }, Error::Unassessable { detail, .. }]
+                if *named == pid && detail == "the snapshot failed"
+        ),
+        "the member runs as the walker's kernel shows it: {error:?}"
+    );
+}
+
 /// A call whose own complete `SIGTERM` walk reached the held members stands on it when the root has
 /// exited: every one gone or killed leaves the tree vouched for and the answer `Ok`; a walk that found
 /// nothing is an empty listing. A member another call's walk reached, a walk that could not read every
@@ -3112,6 +3256,7 @@ fn decide_for(
         mode: Some(mode),
         is_root: true,
         cgroup_leaf: Some(leaf),
+        kernel: crate::identity::spawn_kernel(crate::identity::HostKernel),
     };
     super::attach_tree(
         std::process::id(),
@@ -3393,6 +3538,7 @@ fn a_child_of_unknown_placement_has_its_group_as_containment() {
             mode: Some(crate::containment::ContainMode::BestEffort),
             is_root: true,
             cgroup_leaf: Some(leaf),
+            kernel: crate::identity::spawn_kernel(crate::identity::HostKernel),
         };
         let pidfd = crate::containment::cgroup::test_support::pidfd_of(std::process::id());
         let handle = crate::containment::cgroup::test_support::handle_of(std::process::id(), &pidfd);
@@ -3523,6 +3669,7 @@ mod frozen_attach {
             is_root,
             console: crate::containment::windows::ConsoleFacts::of(0, true),
             frozen,
+            kernel: crate::identity::spawn_kernel(crate::identity::HostKernel),
         }
     }
 

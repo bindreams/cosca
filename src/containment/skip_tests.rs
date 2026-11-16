@@ -218,8 +218,9 @@ fn kill_call(op: &'static str) -> super::SkipCall<'static> {
 /// A tree that names its members by a walk, which settles held members by identity.
 fn walking_tree() -> Tree {
     use crate::containment::mechanism::Mechanism;
-    Tree::contained(Mechanism::Walk(crate::containment::treewalk::Walker::new(
+    Tree::contained(Mechanism::Walk(crate::containment::treewalk::Walker::over(
         crate::identity::ProcessId::current(),
+        crate::identity::HostKernel,
     )))
 }
 
