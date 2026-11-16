@@ -54,8 +54,8 @@ pub(crate) enum TrackedKind {
 }
 
 impl TrackedKind {
-    /// The front this is, for the wording of a message and for the paths that end a child without
-    /// a box. No kill is decided from it.
+    /// The front this is, for wording and for ending a child that has no box. Teardowns that look at
+    /// a front instead of killing it read it from the box; `kill_root` decides every forced kill.
     pub(crate) fn front(self) -> Option<Front> {
         match self {
             TrackedKind::Front(front) => Some(front),

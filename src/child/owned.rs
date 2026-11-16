@@ -232,7 +232,8 @@ impl OwnedChild {
         self.os.pid()
     }
 
-    /// Who the tracked process is. Wording only: kills are decided by [`kill_root`](OwnedChild::kill_root).
+    /// Who the tracked process is. A forced kill is decided by [`kill_root`](OwnedChild::kill_root);
+    /// this is for wording, and for the teardowns that look at a front instead of killing it.
     pub(crate) fn tracked_kind(&self) -> TrackedKind {
         self.kind
     }

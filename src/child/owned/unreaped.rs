@@ -51,8 +51,6 @@ pub struct Unreaped {
     /// Empty once `wait`, `leak` or the drop has taken the child: it is settled once.
     child: ChildSlot,
     id: Option<ProcessId>,
-    /// Whether the child is an elevation front, which the drop sends no kill.
-    front: bool,
     drop_kind: DropKind,
 }
 
@@ -68,15 +66,14 @@ pub(crate) enum DropKind {
 }
 
 impl Unreaped {
-    /// Own `child`, whose identity the spawn read as `id`, if it did; `front`: it is an elevation
-    /// front. Its drop does what `drop_kind` says (the spawn's, [`SpawnPolicy::unreaped_drop`]).
+    /// Own `child`, whose identity the spawn read as `id`, if it did. Its drop does what `drop_kind`
+    /// says (the spawn's, [`SpawnPolicy::unreaped_drop`]); an elevation front is sent no kill.
     ///
     /// [`SpawnPolicy::unreaped_drop`]: crate::child::spawn::policy::SpawnPolicy::unreaped_drop
-    pub(crate) fn new(child: OwnedChild, id: Option<ProcessId>, front: bool, drop_kind: DropKind) -> Unreaped {
+    pub(crate) fn new(child: OwnedChild, id: Option<ProcessId>, drop_kind: DropKind) -> Unreaped {
         Unreaped {
             child: ChildSlot::new(child),
             id,
-            front,
             drop_kind,
         }
     }
@@ -189,7 +186,7 @@ impl Unreaped {
     /// The [`LetGo`](DropKind::LetGo) drop: the one kill (a front is sent none), the one look, and
     /// the one line [`let_go_line`] words.
     fn let_go(&self, child: &OwnedChild) {
-        let kill = (!self.front).then(|| child.signal(Sig::Kill));
+        let kill = child.tracked_kind().front().is_none().then(|| child.signal(Sig::Kill));
         let look = Settlement::new(child.wait(Some(crate::wait::now())), false);
         let (level, line) = let_go_line(child.pid(), kill.as_ref(), &look);
         log::log!(level, "{line}");
