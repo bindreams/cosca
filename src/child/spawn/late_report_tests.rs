@@ -11,8 +11,8 @@ use crate::test_child::Console;
 use std::rc::Rc;
 
 use super::identity_macos_tests::{
-    end_unsignalled_and_reap, has_not_exited, is_reaped, reap_by_pid, refuse_the_kill, spawn_over,
-    std_blocker_with_unique, sync_blocker,
+    end_unsignalled_and_reap, has_not_exited, is_reaped, reap_by_pid, spawn_over, std_blocker_with_unique,
+    sync_blocker, REFUSED_KILL_READ,
 };
 use super::unique_report;
 use crate::error::ChildFate;
@@ -857,9 +857,9 @@ fn tear_down_over(
     (fate, warns_of(pid, mark), sent.entries())
 }
 
-/// The teardown of a late child (a real blocker with the id `unique`) as the spawn makes it: its
-/// fate, and what failed in it. A child the teardown hands back is given up unreaped, still running
-/// if its kill was refused, for the test to end.
+/// The teardown of a late child (a real blocker with the id `unique`) as the spawn makes it, asking
+/// `kernel`: its fate, and what failed in it. A child the teardown hands back is given up unreaped,
+/// still running if its kill was refused, for the test to end.
 fn abandon(
     prepared: crate::containment::Prepared,
     child: std::process::Child,
@@ -904,16 +904,31 @@ fn macos_late_teardown_returns_a_refused_kill_for_the_cleanup() {
     let (blocker, unique) = std_blocker_with_unique();
     let (child, _stdin) = blocker.into_parts();
     let pid = child.id();
-    let _refused = refuse_the_kill();
 
-    let (fate, failures) = abandon(uncontained(), child, unique, Arc::new(FakeKernel::over(&HostKernel)));
+    let (kernel, _refused) = refused_kill(pid);
 
+    let (fate, failures) = abandon(uncontained(), child, unique, Arc::clone(&kernel));
+
+    assert!(kernel.all_rows_taken(), "the kill made its id read");
     assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
     let failures = failures.expect("the kill was refused");
     assert_eq!(failures.iter().len(), 1, "{failures:?}");
     let said = crate::error::said(&**failures.first());
     assert!(said.contains("killing the child"), "{said}");
     end_unsignalled_and_reap(pid);
+}
+
+/// A kernel on which the root's kill of the late child `pid` is refused: the id read it makes is a
+/// row, stated right before the kill (the teardown's reads of the child before it are the host's). The
+/// kill sends nothing and leaves the child running; the row is asserted taken. The hook is armed
+/// until the second value drops.
+fn refused_kill(pid: u32) -> (std::sync::Arc<FakeKernel<'static>>, crate::oneshot_hook::Armed) {
+    let kernel = std::sync::Arc::new(FakeKernel::over(&HostKernel));
+    let armed = crate::child::spawn::fault::set_at(crate::child::spawn::fault::SpawnPoint::BeforeLateRootKill, {
+        let kernel = std::sync::Arc::clone(&kernel);
+        move || kernel.state_unique_info(pid, REFUSED_KILL_READ)
+    });
+    (kernel, armed)
 }
 
 fn only(warns: &[String]) -> &str {
@@ -947,7 +962,8 @@ fn macos_late_teardown_with_a_refused_kill_hands_it_back_and_says_so() {
     let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
-    let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| vec![Box::new(refuse_the_kill())]);
+    let (kernel, _refused) = refused_kill(pid);
+    let (fate, warns, sent) = tear_down_over(kernel, uncontained(), child, &stdin, unique, || {}, |_| vec![]);
     assert_eq!(fate, ChildFate::Running { id: None });
     let warn = only(&warns);
     assert_eq!(sent, [], "a refused kill sends nothing");
@@ -978,10 +994,20 @@ fn macos_late_teardown_of_a_contained_child_with_a_refused_kill_names_it_running
         is_root: true,
         marker: None,
     };
-    let (fate, _warns, sent) = tear_down_with(walked, child, &stdin, unique, |_| {
-        crate::containment::enumerate::force_blind_snapshots(2);
-        vec![Box::new(refuse_the_kill())]
-    });
+    // The tree's reads of the root come before the kill's, and how many is the walk's business.
+    let (kernel, _refused) = refused_kill(pid);
+    let (fate, _warns, sent) = tear_down_over(
+        kernel,
+        walked,
+        child,
+        &stdin,
+        unique,
+        || {},
+        |_| {
+            crate::containment::enumerate::force_blind_snapshots(2);
+            vec![]
+        },
+    );
     crate::containment::enumerate::assert_blind_snapshots_consumed();
     assert!(
         matches!(fate, ChildFate::Running { id: Some(id) } if id.pid() == pid),
@@ -1029,17 +1055,9 @@ fn macos_late_teardown_with_a_refused_kill_and_a_failed_peek_is_unknown() {
     let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
-    let kernel =
-        Arc::new(FakeKernel::over(&HostKernel).on_peek(pid, Err(std::io::Error::from_raw_os_error(libc::EPERM))));
-    let (fate, warns, sent) = tear_down_over(
-        kernel,
-        uncontained(),
-        child,
-        &stdin,
-        unique,
-        || {},
-        |_| vec![Box::new(refuse_the_kill())],
-    );
+    let (kernel, _refused) = refused_kill(pid);
+    kernel.state_peek(pid, Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+    let (fate, warns, sent) = tear_down_over(kernel, uncontained(), child, &stdin, unique, || {}, |_| vec![]);
     assert_eq!(fate, ChildFate::Unknown);
     let warn = only(&warns);
     assert_eq!(sent, [], "a refused kill sends nothing");

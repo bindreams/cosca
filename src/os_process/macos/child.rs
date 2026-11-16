@@ -13,7 +13,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use super::{ExitWatch, Kqueue};
 use crate::error::Error;
-use crate::identity::{has_exited, held_by, Held, Kernel, ReadPurpose};
+use crate::identity::{has_exited, held_by, Held, Kernel};
 use crate::os_process::child::{Foreign, KillRefusal, OsChild, PeekOutcome, TryObserveOutcome};
 use crate::os_process::drive::{Step, Waitable};
 use crate::os_process::{Exit, ExitWait, OsProcess, WaitFor};
@@ -181,11 +181,9 @@ impl<K: Kernel + Send> MacosChild<K> {
                 "its exit watch has not fired, and whether it has exited could not be read",
             )
         };
-        let exited = match held_by(&self.kernel, self.pid, self.unique, ReadPurpose::Running) {
+        let exited = match held_by(&self.kernel, self.pid, self.unique) {
             Held::Parent(parent) if parent == std::process::id() => return Ok(Exit::Running(wait_for)),
-            Held::Parent(_) => {
-                has_exited(&self.kernel, self.pid, self.unique, ReadPurpose::Running).map_err(refused)?
-            }
+            Held::Parent(_) => has_exited(&self.kernel, self.pid, self.unique).map_err(refused)?,
             // Another process now, or reaped: exited.
             Held::Other | Held::Gone => true,
             Held::Refused(errno) => return Err(refused(errno)),

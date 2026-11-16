@@ -9,6 +9,4 @@ mod tracer_watch;
 #[cfg(test)]
 pub(crate) use exit_events::reap_registration;
 pub(crate) use exit_events::{drain_exit_events, register_exit_events};
-#[cfg(test)]
-pub(crate) use tracer_watch::seams as tracer_seams;
 pub(crate) use tracer_watch::{OnTracer, TracerWatch};

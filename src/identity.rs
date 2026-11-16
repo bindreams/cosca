@@ -326,8 +326,6 @@ impl OrderedRead {
 /// The backend's one read of `pid`, asking for its parent number when `ask_parent`. `expected`: see
 /// [`ProcessId::of_ordered_with`].
 fn read_ordered(kernel: &dyn Kernel, pid: RawPid, expected: Option<Key>, ask_parent: bool) -> OrderedRead {
-    #[cfg(all(test, target_os = "macos"))]
-    seams::note_by_pid_read();
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let read = backend::ordered_read(kernel, pid, expected, ask_parent);
     #[cfg(windows)]
@@ -397,8 +395,6 @@ impl ProcessId {
     /// [`of_explained`](Self::of_explained) through `kernel`: the one entry to a by-pid identity
     /// read, on every platform.
     pub(crate) fn of_with(kernel: &dyn Kernel, pid: RawPid) -> NumberRead {
-        #[cfg(all(test, target_os = "macos"))]
-        seams::note_by_pid_read();
         #[cfg(target_os = "linux")]
         {
             let (read, cause) = backend::of(kernel, pid);
@@ -761,7 +757,7 @@ pub(crate) use backend::kernel::fake::FakeKernel;
 pub(crate) use backend::kernel::fake::refusing_the_next_terminate;
 
 #[cfg(all(target_os = "macos", test))]
-pub(crate) use backend::kernel::fake::{exit_record, short_info};
+pub(crate) use backend::kernel::fake::{exit_record, short_info, short_info_held_by};
 
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use backend::proc_view::UNREADABLE_STATUS_REASON;
@@ -974,25 +970,6 @@ fn start_token_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Key>, Un
     (token, UnknownCause::default())
 }
 
-/// macOS test seams.
-#[cfg(all(target_os = "macos", test))]
-pub(crate) mod seams {
-    use std::cell::Cell;
-
-    thread_local! {
-        static BY_PID_READS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    pub(super) fn note_by_pid_read() {
-        BY_PID_READS.with(|n| n.set(n.get() + 1));
-    }
-
-    /// How many by-pid identity reads ([`ProcessId::of`](super::ProcessId::of)) this thread has made.
-    pub(crate) fn by_pid_reads() -> usize {
-        BY_PID_READS.with(Cell::get)
-    }
-}
-
 #[cfg(target_os = "linux")]
 impl ProcessId {
     /// The inode of the process's pidfd, when this id is of the `pidfs` kind: the proof of it is
@@ -1109,26 +1086,16 @@ pub(crate) fn unreadable_anchor(pid: RawPid) -> impl Kernel {
         .on_every_kinfo_refused(pid, libc::EPERM)
 }
 
-/// The thread-local hook that makes every by-pid identity read of `pid` on this thread answer
-/// `Unknown`, for the fd-marker sweep, which takes no kernel.
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) use backend::fault::force_unknown;
-
-/// The assert-free identity reads every `exit_only` check uses, and the purpose that names each.
+/// The assert-free identity reads every `exit_only` check uses.
 #[cfg(target_os = "macos")]
 pub(crate) use backend::{
-    exit_state_of, has_exited, held_by, link, origin, own_unique_id, uniq_info, Held, Link, Origin, ReadPurpose,
-    UniqInfo, UniqRead, LAUNCHD,
+    exit_state_of, has_exited, held_by, link, origin, own_unique_id, Held, Link, Origin, UniqInfo, UniqRead, LAUNCHD,
 };
 
 /// What a `proc_pidinfo` read by pid answers when it fails, the error of a [`Kernel`]'s short and BSD
 /// info reads.
 #[cfg(all(target_os = "macos", test))]
 pub(crate) use backend::ReadErr;
-
-/// The identity-read forcing seams.
-#[cfg(all(target_os = "macos", test))]
-pub(crate) use backend::{ppid_fault, uniq_fault};
 
 /// `containment::enumerate::macos`'s parent-pid resolver, reused whole (primary
 /// `proc_pidinfo` read, sysctl fallback, and the shared zero-ppid guard) — see

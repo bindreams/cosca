@@ -28,9 +28,7 @@
 
 use std::time::Duration;
 
-#[cfg(not(test))]
-use crate::identity::link;
-use crate::identity::{uniq_info, Kernel, Link, ReadPurpose, UniqRead, LAUNCHD};
+use crate::identity::{link, Kernel, Link, UniqRead, LAUNCHD};
 use crate::os_process::macos::kqueue::{Event, Kqueue, Subscription};
 
 /// The backoff's first interval after a walk finds a tracer gone, and its cap.
@@ -117,7 +115,7 @@ impl TracerWatch {
                     Err(e) if crate::error::first_os_code(&e) == Some(libc::ESRCH) => return Ok(self.gone()),
                     Err(e) => return Err(WalkError::Watch(e)),
                 }
-                match uniq_info(kernel, at, ReadPurpose::Link) {
+                match kernel.unique_info(at) {
                     UniqRead::Found(info) if info.unique_id == unique => {}
                     UniqRead::Found(_) | UniqRead::Gone => {
                         // The registration may name another process: deleted, so a later one attaches.
@@ -201,45 +199,6 @@ fn refused(pid: u32, errno: i32) -> WalkError {
         format!("tracer {pid}: its identity could not be read"),
         std::io::Error::from_raw_os_error(errno),
     ))
-}
-
-/// [`crate::identity::link`], or the answer a test queued for it.
-#[cfg(test)]
-fn link(kernel: &dyn Kernel, pid: u32) -> Link {
-    seams::take_link().unwrap_or_else(|| crate::identity::link(kernel, pid))
-}
-
-/// Test seams.
-#[cfg(test)]
-pub(crate) mod seams {
-    use std::cell::RefCell;
-    use std::collections::VecDeque;
-
-    use crate::identity::Link;
-
-    thread_local! {
-        static LINKS: RefCell<VecDeque<Link>> = const { RefCell::new(VecDeque::new()) };
-    }
-
-    /// While the guard lives, the walks on this thread take their `link` reads from `links`, in
-    /// order, and read for real once the queue is empty.
-    pub(crate) fn force_links(links: impl IntoIterator<Item = Link>) -> ForcedLinks {
-        LINKS.with(|l| *l.borrow_mut() = links.into_iter().collect());
-        ForcedLinks(())
-    }
-
-    #[must_use = "the reads are real again as soon as the guard is dropped"]
-    pub(crate) struct ForcedLinks(());
-
-    impl Drop for ForcedLinks {
-        fn drop(&mut self) {
-            LINKS.with(|l| l.borrow_mut().clear());
-        }
-    }
-
-    pub(super) fn take_link() -> Option<Link> {
-        LINKS.with(|l| l.borrow_mut().pop_front())
-    }
 }
 
 #[cfg(test)]

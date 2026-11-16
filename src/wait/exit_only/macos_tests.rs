@@ -3,9 +3,7 @@
 //! unique-id checks of a peek. The helpers at the top are shared with the `OwnedChild` macOS tests.
 
 use crate::child::spawn::identity_macos_tests::reap_by_pid;
-use crate::identity::{
-    short_info, uniq_fault, uniq_info, FakeKernel, HostKernel, ReadErr, ReadPurpose, UniqInfo, UniqRead, LAUNCHD,
-};
+use crate::identity::{short_info_held_by, FakeKernel, HostKernel, Kernel as _, ReadErr, UniqInfo, UniqRead, LAUNCHD};
 use crate::os_process::child::{adopted_blocker, Foreign, OsChild, PeekOutcome};
 use crate::test_child::wait_until_zombie;
 use crate::wait::exit_only::{self, Target};
@@ -19,7 +17,7 @@ pub(crate) fn found(unique_id: u64) -> UniqRead {
 
 /// `pid`'s real unique id.
 pub(crate) fn unique_of(pid: u32) -> u64 {
-    match uniq_info(&HostKernel, pid, ReadPurpose::Adopt) {
+    match HostKernel.unique_info(pid) {
         UniqRead::Found(info) => info.unique_id,
         other => panic!("the unique id of {pid}: {other:?}"),
     }
@@ -32,12 +30,12 @@ pub(crate) fn echild_yet_resolvable() -> (u32, u64) {
     (pid, unique_of(pid))
 }
 
-/// A kernel that reads `pid`'s parent as `ppid` for its next `reads` parent reads and is the host's
-/// otherwise: `pid` is held by `ppid`, as a tracer holds a child (not launchd), or launchd holds a
-/// zombie whose tracer died (XNU reparented it).
+/// A kernel that reads `pid`'s parent as `ppid` for its next `reads` parent reads, its state as the
+/// host's, and is the host's otherwise: `pid` is held by `ppid`, as a tracer holds a child (not
+/// launchd), or launchd holds a zombie whose tracer died (XNU reparented it).
 pub(crate) fn parent_reads(pid: u32, ppid: u32, reads: usize) -> FakeKernel<'static> {
     (0..reads).fold(FakeKernel::over(&HostKernel), |kernel, _| {
-        kernel.on_short_bsd(pid, Ok(short_info(ppid, libc::SRUN)))
+        kernel.on_short_bsd(pid, Ok(short_info_held_by(pid, ppid)))
     })
 }
 
@@ -207,31 +205,6 @@ fn a_second_reap_that_finds_nothing_is_skipped() {
     );
     assert!(kernel.all_rows_taken(), "the second reap must read the id and consume");
     reap_by_pid(pid);
-}
-
-/// `uniq_info`'s test seam hits only its purpose: arming one of `Peek`, `PreReap` and `SecondPeek`
-/// leaves the other two reads untouched.
-///
-/// Mutant: a purpose-blind seam.
-#[skuld::test]
-fn force_uniq_read_once_hits_only_its_purpose() {
-    let pid = std::process::id();
-    let real = uniq_info(&HostKernel, pid, ReadPurpose::Peek);
-    assert!(matches!(real, UniqRead::Found(_)), "{real:?}");
-    let all = [ReadPurpose::Peek, ReadPurpose::PreReap, ReadPurpose::SecondPeek];
-    for armed in all {
-        let forced = uniq_fault::force_uniq_read_once(armed, UniqRead::Refused(libc::EPERM));
-        for other in all.into_iter().filter(|p| *p != armed) {
-            assert_eq!(
-                uniq_info(&HostKernel, pid, other),
-                real,
-                "{other:?} read while {armed:?} was armed"
-            );
-        }
-        assert_eq!(uniq_info(&HostKernel, pid, armed), UniqRead::Refused(libc::EPERM));
-        assert_eq!(uniq_info(&HostKernel, pid, armed), real, "the force is taken once");
-        drop(forced);
-    }
 }
 
 // A pid that is not our child, yet still names it =====

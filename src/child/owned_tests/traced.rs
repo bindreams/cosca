@@ -3,14 +3,19 @@
 
 use std::time::Instant;
 
-use crate::identity::{uniq_info, HostKernel, ReadPurpose, UniqRead};
+use crate::identity::{HostKernel, Kernel, UniqRead};
 use crate::os_process::macos::kqueue::test_hooks;
 use crate::test_groups::{tracer_group, Group};
 use crate::test_support::tracer::{self, Mode, Report};
 
 /// A tracee held by a tracer, its handle, and the stdin that ends it.
 fn held() -> (crate::Child, crate::PipeWriter) {
-    let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
+    held_over(HostKernel)
+}
+
+/// [`held`] over `kernel`, the one its spawn and its box ask.
+fn held_over(kernel: impl Kernel + Send + 'static) -> (crate::Child, crate::PipeWriter) {
+    let (mut tracee, _) = tracer::spawn_tracee_over(tracer::Tracee::Plain, kernel);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
     (tracee, stdin)
 }
@@ -208,26 +213,43 @@ fn a_zombie_a_tracer_holds_has_exited_for_the_grace_watch_before_the_hand_back(
 }
 
 /// A zombie that launchd holds has exited for the grace watch, with a long grace unspent. The tracer's
-/// hold is the real state, and its parent read is forced to launchd, as when the tracer died while the
-/// tracee was exiting.
+/// hold is the real state, and its record reads as launchd's zombie while the watch looks, as when the
+/// tracer died while the tracee was exiting.
 ///
 /// Mutant: the look reads past the exit watch only for a parent that is a tracer, not for launchd.
 #[skuld::test]
 fn a_zombie_launchd_holds_has_exited_for_the_grace_watch_at_once(#[fixture(tracer_group)] _group: &Group) {
-    use crate::identity::{ppid_fault, LAUNCHD};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
-    let (tracee, stdin) = held();
+    use crate::identity::{short_info, FakeKernel, LAUNCHD};
+
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
+    let (tracee, stdin) = held_over(Arc::clone(&kernel));
+    let pid = tracee.pid();
+    let launchd_holds = Arc::new(AtomicBool::new(false));
+    kernel.state_every_short_bsd(pid, {
+        let launchd_holds = Arc::clone(&launchd_holds);
+        move || {
+            if launchd_holds.load(Ordering::SeqCst) {
+                Ok(short_info(LAUNCHD, libc::SZOMB))
+            } else {
+                HostKernel.short_bsd(pid)
+            }
+        }
+    });
     let mut helper = tracer::start(Mode::Hold).attach_shared(&tracee);
     assert_eq!(helper.recv(), Report::Attached);
     drop(stdin);
     assert_eq!(helper.recv(), Report::Exited);
     {
-        let _launchd = ppid_fault::force_ppid_with(|| Ok(LAUNCHD));
+        launchd_holds.store(true, Ordering::SeqCst);
         let long = Instant::now() + std::time::Duration::from_secs(3600);
         assert!(
             tracee.proc.exited_by(Some(long)).expect("a zombie launchd holds"),
             "the zombie has exited: no grace is spent on it"
         );
+        launchd_holds.store(false, Ordering::SeqCst);
     }
     helper.signal();
     assert_eq!(helper.recv(), Report::Reaped);
@@ -325,7 +347,7 @@ fn is_alive_during_the_grace_watch_does_not_swallow_its_wake(#[fixture(tracer_gr
 fn tracee_with_unique() -> (crate::Child, crate::PipeWriter, u64) {
     let (mut tracee, _) = tracer::spawn_tracee(tracer::Tracee::Plain);
     let stdin = tracee.stdin().expect("the tracee's stdin is piped");
-    let unique = match uniq_info(&HostKernel, tracee.pid(), ReadPurpose::Adopt) {
+    let unique = match HostKernel.unique_info(tracee.pid()) {
         UniqRead::Found(info) => info.unique_id,
         other => panic!("the tracee's unique id: {other:?}"),
     };
@@ -351,7 +373,7 @@ fn a_tracer_that_attaches_during_a_wait_wakes_it(#[fixture(tracer_group)] _group
 
     let (tracee, stdin, unique) = tracee_with_unique();
     let pid = tracee.pid();
-    let owned = super::macos::watch(pid, unique);
+    let owned = super::macos::watch(HostKernel, pid, unique);
     let pending = RefCell::new(Some(tracer::start(Mode::Auto)));
     let helper = Rc::new(RefCell::new(None));
     let stdin = RefCell::new(Some(stdin));
@@ -412,7 +434,7 @@ fn a_wait_on_a_child_whose_tracer_is_traced_watches_that_tracers_tracer(#[fixtur
     let outer_pid = outer.helper_pid();
     let stdin = RefCell::new(Some(stdin));
     let inner = Rc::new(RefCell::new(inner));
-    let owned = super::macos::watch(pid, unique);
+    let owned = super::macos::watch(HostKernel, pid, unique);
     let (rounds, looks) = super::macos::on_rounds({
         let inner = Rc::clone(&inner);
         move |round| match round {

@@ -98,9 +98,9 @@ fn a_refused_kinfo_read_is_unreadable() {
 /// Mutant: `link` reads `p_oppid` as the parent now.
 #[skuld::test]
 fn an_untraced_child_links_to_this_process() {
-    use super::{link, uniq_info, Link, ReadPurpose, UniqRead};
+    use super::{link, Kernel as _, Link, UniqRead};
     let child = blocker();
-    let UniqRead::Found(info) = uniq_info(&HostKernel, child.id(), ReadPurpose::Kill) else {
+    let UniqRead::Found(info) = HostKernel.unique_info(child.id()) else {
         panic!("the child's unique id must be readable")
     };
     assert_eq!(

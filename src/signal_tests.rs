@@ -63,24 +63,24 @@ mod macos {
     use std::io;
 
     use super::*;
-    use crate::identity::{uniq_info, FakeKernel, HostKernel, ReadPurpose, UniqInfo, UniqRead};
+    use crate::identity::{FakeKernel, HostKernel, Kernel as _, UniqInfo, UniqRead};
     use crate::signal::{read_identity, via_audit_token};
 
     /// `PID_MAX` is 99999, so this pid names nothing, ever.
     const NEVER_A_PID: u32 = 4_000_000;
 
     fn unique_id_of(pid: u32) -> u64 {
-        match uniq_info(&HostKernel, pid, ReadPurpose::Adopt) {
+        match HostKernel.unique_info(pid) {
             UniqRead::Found(info) => info.unique_id,
             other => panic!("the unique id of {pid}: {other:?}"),
         }
     }
 
-    // `uniq_info` -----
+    // `Kernel::unique_info` -----
 
     /// Mutant: `PROC_PIDTBSDINFO`, whose start read is refused for another user's process.
     #[skuld::test]
-    fn uniq_info_reads_another_users_process() {
+    fn unique_info_reads_another_users_process() {
         // launchd runs as root. On a runner that is not root this is another user's process.
         let a = unique_id_of(1);
         assert_eq!(a, unique_id_of(1), "the id is stable");
@@ -88,7 +88,7 @@ mod macos {
 
     /// Mutant: `arg = 0`, which does not look for zombies.
     #[skuld::test]
-    fn uniq_info_reads_a_zombie() {
+    fn unique_info_reads_a_zombie() {
         let mut child = blocker();
         let live = unique_id_of(child.id());
         drop(child.stdin.take());
@@ -108,8 +108,8 @@ mod macos {
 
     /// Mutant: `ESRCH` classified as refused.
     #[skuld::test]
-    fn uniq_info_says_gone_for_a_pid_that_names_nothing() {
-        assert_eq!(uniq_info(&HostKernel, NEVER_A_PID, ReadPurpose::Adopt), UniqRead::Gone);
+    fn unique_info_says_gone_for_a_pid_that_names_nothing() {
+        assert_eq!(HostKernel.unique_info(NEVER_A_PID), UniqRead::Gone);
     }
 
     // `identity_unreadable` -----

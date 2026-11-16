@@ -2766,6 +2766,7 @@ fn a_marker_tree_is_actionable() {
         handle,
         read_handle,
         fd: write.as_fd().as_raw_fd(),
+        kernel: crate::identity::spawn_kernel(crate::identity::HostKernel),
     };
     let marker = crate::containment::fdmarker::Marker::new(
         prepared,
@@ -3011,6 +3012,7 @@ fn wait_drained_reports_members_remain_then_all_markers_closed() {
         handle,
         read_handle: handle,
         fd: 3,
+        kernel: crate::identity::spawn_kernel(crate::identity::HostKernel),
     };
     let tree = Tree::contained(Mechanism::Marker(Marker::new(
         prepared,

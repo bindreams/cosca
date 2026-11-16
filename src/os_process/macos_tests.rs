@@ -5,7 +5,7 @@ use super::{signal_by_token, ExitWatch, MacosProcess, SignalByTokenOutcome};
 use crate::child::spawn::identity_macos_tests::other_unique_id;
 use crate::error::Error;
 use crate::identity::kinfo::kinfo_proc;
-use crate::identity::{uniq_info, FakeKernel, HostKernel, ProcessId, ReadPurpose, UniqInfo, UniqRead};
+use crate::identity::{FakeKernel, HostKernel, Kernel as _, ProcessId, UniqInfo, UniqRead};
 use crate::os_process::drive::exited_held;
 use crate::os_process::{kill, open, terminate, Exit, OsProcess};
 use crate::signal::{Sent, Sig};
@@ -57,7 +57,7 @@ fn a_kernel_that_fires_the_exit_watch(pid: u32) -> FakeKernel<'static> {
 
 /// What the host says of `id`'s process: the answer a row repeats where a test lets that read pass.
 fn own_unique_info(id: ProcessId) -> UniqInfo {
-    let UniqRead::Found(info) = uniq_info(&HostKernel, id.pid(), ReadPurpose::Kill) else {
+    let UniqRead::Found(info) = HostKernel.unique_info(id.pid()) else {
         panic!("the live blocker has a unique id");
     };
     info
@@ -90,7 +90,7 @@ fn a_held_process_looks_through_the_kernel_it_was_opened_with() {
     use crate::os_process::open_with;
 
     let (_child, id) = blocker();
-    let UniqRead::Found(own) = uniq_info(&HostKernel, id.pid(), ReadPurpose::Open) else {
+    let UniqRead::Found(own) = HostKernel.unique_info(id.pid()) else {
         panic!("the live blocker has a unique id");
     };
     let kernel = FakeKernel::over(&HostKernel)
@@ -1038,7 +1038,7 @@ fn a_running_child_with_a_watch(
     let mut child = crate::test_child::blocker();
     let stdin = child.stdin.take().expect("piped stdin");
     let id = ProcessId::of(child.id()).found().expect("identity of live child");
-    let UniqRead::Found(read) = uniq_info(&HostKernel, id.pid(), ReadPurpose::Kill) else {
+    let UniqRead::Found(read) = HostKernel.unique_info(id.pid()) else {
         panic!("the blocker's unique id must be readable");
     };
     let kernel = std::sync::Arc::new(kernel(id.pid()));
@@ -1140,7 +1140,7 @@ fn esrch_at_the_reap_registration_adopts_a_running_child() {
     let mut child = crate::test_child::blocker();
     let stdin = child.stdin.take().expect("piped stdin");
     let id = ProcessId::of(child.id()).found().expect("identity");
-    let UniqRead::Found(read) = uniq_info(&HostKernel, id.pid(), ReadPurpose::Kill) else {
+    let UniqRead::Found(read) = HostKernel.unique_info(id.pid()) else {
         panic!("the blocker's unique id must be readable");
     };
     let kernel = std::sync::Arc::new(

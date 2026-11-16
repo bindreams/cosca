@@ -8,7 +8,7 @@
 
 use std::fmt::Arguments;
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::Kernel;
 use crate::identity::kinfo::kinfo_proc;
@@ -23,7 +23,7 @@ struct Rows<A, T> {
 }
 
 /// What an `every` row makes at each call it answers.
-type EveryAnswer<T> = Box<dyn Fn() -> T + Send + Sync>;
+type EveryAnswer<T> = Arc<dyn Fn() -> T + Send + Sync>;
 
 impl<A: PartialEq, T> Rows<A, T> {
     fn new() -> Self {
@@ -45,7 +45,7 @@ impl<A: PartialEq, T> Rows<A, T> {
     fn push_every(&self, asked: A, answer: impl Fn() -> T + Send + Sync + 'static) {
         let mut rows = self.every.lock().expect("no thread panics holding the rows");
         rows.retain(|(row, _)| *row != asked);
-        rows.push((asked, Box::new(answer)));
+        rows.push((asked, Arc::new(answer)));
     }
 
     /// Whether every once row has answered. An `every` row is never left over.
@@ -53,19 +53,23 @@ impl<A: PartialEq, T> Rows<A, T> {
         self.once.lock().expect("no thread panics holding the rows").is_empty()
     }
 
-    /// The first row for `asked`, which it removes; else the first `every` row for it.
+    /// The first row for `asked`, which it removes; else the first `every` row for it. An `every`
+    /// answer runs with no lock held, so one that panics or takes rows itself leaves the rows usable.
     fn take(&self, asked: &A) -> Option<T> {
-        let mut rows = self.once.lock().expect("no thread panics holding the rows");
-        if let Some(at) = rows.iter().position(|(row, _)| row == asked) {
-            return Some(rows.remove(at).1);
+        {
+            let mut rows = self.once.lock().expect("no thread panics holding the rows");
+            if let Some(at) = rows.iter().position(|(row, _)| row == asked) {
+                return Some(rows.remove(at).1);
+            }
         }
-        drop(rows);
-        self.every
+        let answer = self
+            .every
             .lock()
             .expect("no thread panics holding the rows")
             .iter()
             .find(|(row, _)| row == asked)
-            .map(|(_, answer)| answer())
+            .map(|(_, answer)| Arc::clone(answer))?;
+        Some(answer())
     }
 }
 
@@ -88,6 +92,8 @@ pub(crate) struct FakeKernel<'a> {
     kinfo_reads: Mutex<Vec<(RawPid, usize)>>,
     /// How many unique-id reads each pid has had, whoever answered them.
     unique_info_reads: Mutex<Vec<(RawPid, usize)>>,
+    /// How many BSD-info reads each pid has had, whoever answered them.
+    bsd_info_reads: Mutex<Vec<(RawPid, usize)>>,
 }
 
 /// Counts one more read of `pid` in `counts`.
@@ -121,6 +127,7 @@ impl<'a> FakeKernel<'a> {
             peek_reads: Mutex::new(Vec::new()),
             kinfo_reads: Mutex::new(Vec::new()),
             unique_info_reads: Mutex::new(Vec::new()),
+            bsd_info_reads: Mutex::new(Vec::new()),
         }
     }
 
@@ -164,16 +171,6 @@ impl<'a> FakeKernel<'a> {
         self.peeks.push_every(pid, answer);
     }
 
-    /// Every short BSD-info read of `pid` that no row answers answers what `answer` makes, stated
-    /// after the kernel is shared. A second such row for `pid` replaces the first.
-    pub(crate) fn state_every_short_bsd(
-        &self,
-        pid: RawPid,
-        answer: impl Fn() -> Result<libc::proc_bsdshortinfo, ReadErr> + Send + Sync + 'static,
-    ) {
-        self.short_bsds.push_every(pid, answer);
-    }
-
     /// The next consume of `pid` answers `answer`, and takes nothing from the real process.
     pub(crate) fn on_consume(self, pid: u32, answer: io::Result<Option<Record>>) -> Self {
         self.consumes.push(pid, answer);
@@ -182,14 +179,48 @@ impl<'a> FakeKernel<'a> {
 
     /// The next unique-id read of `pid` answers `answer`.
     pub(crate) fn on_unique_info(self, pid: RawPid, answer: UniqRead) -> Self {
-        self.unique_infos.push(pid, answer);
+        self.state_unique_info(pid, answer);
         self
+    }
+
+    /// [`on_unique_info`](Self::on_unique_info) after the kernel is shared. A test that cannot name
+    /// a pid beforehand (a spawned child's) states the row from the spawn hook that knows it.
+    pub(crate) fn state_unique_info(&self, pid: RawPid, answer: UniqRead) {
+        self.unique_infos.push(pid, answer);
     }
 
     /// The next short BSD-info read of `pid` answers `answer`.
     pub(crate) fn on_short_bsd(self, pid: RawPid, answer: Result<libc::proc_bsdshortinfo, ReadErr>) -> Self {
-        self.short_bsds.push(pid, answer);
+        self.state_short_bsd(pid, answer);
         self
+    }
+
+    /// [`on_short_bsd`](Self::on_short_bsd) after the kernel is shared; see
+    /// [`state_unique_info`](Self::state_unique_info).
+    pub(crate) fn state_short_bsd(&self, pid: RawPid, answer: Result<libc::proc_bsdshortinfo, ReadErr>) {
+        self.short_bsds.push(pid, answer);
+    }
+
+    /// Every short BSD-info read of `pid` that no row answers answers what `answer` says at that
+    /// read: a parent that changes while the test runs is a value the test changes, not an order of
+    /// reads. A second such row for `pid` replaces the first.
+    pub(crate) fn on_every_short_bsd(
+        self,
+        pid: RawPid,
+        answer: impl Fn() -> Result<libc::proc_bsdshortinfo, ReadErr> + Send + Sync + 'static,
+    ) -> Self {
+        self.state_every_short_bsd(pid, answer);
+        self
+    }
+
+    /// [`on_every_short_bsd`](Self::on_every_short_bsd) after the kernel is shared; see
+    /// [`state_unique_info`](Self::state_unique_info).
+    pub(crate) fn state_every_short_bsd(
+        &self,
+        pid: RawPid,
+        answer: impl Fn() -> Result<libc::proc_bsdshortinfo, ReadErr> + Send + Sync + 'static,
+    ) {
+        self.short_bsds.push_every(pid, answer);
     }
 
     /// The next BSD-info read of `pid` answers `answer`.
@@ -201,6 +232,13 @@ impl<'a> FakeKernel<'a> {
     /// The next `kinfo_proc` read of `pid` finds `record`.
     pub(crate) fn on_kinfo(self, pid: RawPid, record: kinfo_proc) -> Self {
         self.kinfos.push(pid, (Resolved::Found(record), None));
+        self
+    }
+
+    /// Every `kinfo_proc` read of `pid` that no row answers finds what `record` makes at that read:
+    /// the parents a tracer's attach and its exit change are values the test changes.
+    pub(crate) fn on_every_kinfo(self, pid: RawPid, record: impl Fn() -> kinfo_proc + Send + Sync + 'static) -> Self {
+        self.kinfos.push_every(pid, move || (Resolved::Found(record()), None));
         self
     }
 
@@ -263,6 +301,26 @@ impl<'a> FakeKernel<'a> {
         reads_of(&self.unique_info_reads, pid)
     }
 
+    /// How many BSD-info reads of `pid` the kernel has been asked for.
+    pub(crate) fn bsd_info_reads(&self, pid: RawPid) -> usize {
+        reads_of(&self.bsd_info_reads, pid)
+    }
+
+    /// How many times the kernel has been asked for the record of `pid`: by pid, whichever way an
+    /// identity is read (BSD info, else `kinfo_proc`).
+    pub(crate) fn record_reads(&self, pid: RawPid) -> usize {
+        self.bsd_info_reads(pid) + self.kinfo_reads(pid)
+    }
+
+    /// [`record_reads`](Self::record_reads) of every pid together.
+    pub(crate) fn all_record_reads(&self) -> usize {
+        let total = |counts: &Mutex<Vec<(RawPid, usize)>>| {
+            let counts = counts.lock().expect("no panic holds the counts");
+            counts.iter().map(|(_, n)| n).sum::<usize>()
+        };
+        total(&self.bsd_info_reads) + total(&self.kinfo_reads)
+    }
+
     /// Whether every row stated for one call has answered it, `on_every_*` rows aside. A row left
     /// over is a call the test expected and the code never made, or made in another order.
     pub(crate) fn all_rows_taken(&self) -> bool {
@@ -312,6 +370,7 @@ impl Kernel for FakeKernel<'_> {
     }
 
     fn bsd_info(&self, pid: RawPid) -> Result<libc::proc_bsdinfo, ReadErr> {
+        count_read(&self.bsd_info_reads, pid);
         self.bsd_infos
             .take(&pid)
             .unwrap_or_else(|| self.real(format_args!("a BSD-info read of pid {pid}")).bsd_info(pid))
@@ -347,5 +406,15 @@ pub(crate) fn short_info(ppid: u32, status: u32) -> libc::proc_bsdshortinfo {
     let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
     info.pbsi_ppid = ppid;
     info.pbsi_status = status;
+    info
+}
+
+/// The host's short BSD info of the live process `pid`, stating only that `ppid` holds it: its state
+/// stays the host's, so a read of the state is not answered by the test.
+pub(crate) fn short_info_held_by(pid: RawPid, ppid: u32) -> libc::proc_bsdshortinfo {
+    let mut info = super::HostKernel
+        .short_bsd(pid)
+        .unwrap_or_else(|e| panic!("pid {pid} is live and has a short BSD info: {e:?}"));
+    info.pbsi_ppid = ppid;
     info
 }

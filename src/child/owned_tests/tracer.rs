@@ -94,7 +94,7 @@ mod macos {
 
     use super::super::fixtures::{try_wait, wait_status, Blocker};
     use crate::child::owned::{ChildWaitOutcome, State};
-    use crate::identity::{uniq_fault, ReadPurpose, UniqRead};
+    use crate::identity::{FakeKernel, HostKernel, Kernel as _, UniqRead};
     use crate::os_process::child::ExitRecord;
     use crate::signal::Sig;
     use crate::test_child::{run_fixture_output_within, step, watchdog};
@@ -253,11 +253,10 @@ mod macos {
         crate::log_capture::install();
         let _dog = watchdog("failed start read", BOUND);
         step("spawn");
-        let b = Blocker::spawn();
+        let (b, kernel) = Blocker::spawn_over(|_, _| FakeKernel::over(&HostKernel));
         attach_and_confirm_stop(&b);
         let marker = format!("second reap of pid {}", b.pid);
         let mark = crate::log_capture::mark();
-        let _forced = uniq_fault::force_uniq_read_once(ReadPurpose::SecondPeek, UniqRead::Refused(libc::EPERM));
         kill_stopped(&b);
         assert_killed(wait_status(&b.owned));
         assert!(
@@ -269,6 +268,10 @@ mod macos {
             Vec::<log::Level>::new(),
             "the wait made no second reap"
         );
+        // The end of the handle reads the child's id twice: the first reap's peek, which finds it, and
+        // the second reap's, which is refused.
+        kernel.state_unique_info(b.pid, HostKernel.unique_info(b.pid));
+        kernel.state_unique_info(b.pid, UniqRead::Refused(libc::EPERM));
         drop(b);
         assert_eq!(crate::log_capture::levels_since(mark, &marker), vec![log::Level::Warn]);
     }

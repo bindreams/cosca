@@ -1,4 +1,6 @@
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use crate::test_child::Console;
 
@@ -6,7 +8,8 @@ use super::{
     adopted_id, await_report, failed_spawn_error, read_report, register, seams, set_nonblocking, Report, Unadoptable,
 };
 use crate::error::Error;
-use crate::identity::HostKernel;
+use crate::identity::kinfo::kinfo_proc;
+use crate::identity::{FakeKernel, HostKernel};
 use crate::test_child::blocker;
 use crate::wait::block_probe::{self, on_blocking, on_each_block};
 
@@ -267,9 +270,9 @@ fn a_nonexistent_program_fails_with_stds_io_error() {
 /// Mutant: `own_unique_id` reads another flavor or another pid.
 #[skuld::test]
 fn own_unique_id_is_the_unique_id_of_this_process() {
-    use crate::identity::{uniq_info, HostKernel, ReadPurpose, UniqRead};
+    use crate::identity::{HostKernel, Kernel as _, UniqRead};
     let own = crate::identity::own_unique_id().expect("own id");
-    let UniqRead::Found(by_pid) = uniq_info(&HostKernel, std::process::id(), ReadPurpose::Kill) else {
+    let UniqRead::Found(by_pid) = HostKernel.unique_info(std::process::id()) else {
         panic!("this process has a unique id")
     };
     assert_eq!(own, by_pid.unique_id);
@@ -468,26 +471,31 @@ fn awaiting_a_reaped_pid_answers_missing_without_blocking() {
     assert!(matches!(report, Report::Missing), "{report:?}");
 }
 
-/// The parents a `kinfo_proc` read reports for a child this process forked, held by `parent`:
-/// `(p_oppid, e_ppid)`.
-fn forked_by_us_held_by(parent: u32) -> (libc::pid_t, libc::pid_t) {
-    (std::process::id() as libc::pid_t, parent as libc::pid_t)
+/// The `kinfo_proc` of the live child `pid` this process forked, held by `parent`.
+fn forked_by_us_held_by(pid: u32, parent: u32) -> kinfo_proc {
+    kinfo_proc::of_host_held_by(pid, std::process::id() as libc::pid_t, parent as libc::pid_t)
+}
+
+/// A kernel that reads the live child `pid` as forked by this process and held by whom `holder`
+/// says at each read, and is the host's otherwise.
+fn held_by_whom(pid: u32, holder: &Arc<AtomicU32>) -> FakeKernel<'static> {
+    let holder = Arc::clone(holder);
+    FakeKernel::over(&HostKernel).on_every_kinfo(pid, move || forked_by_us_held_by(pid, holder.load(Ordering::SeqCst)))
 }
 
 /// A child that launchd holds, whose parent at a tracer's attach is this process: its tracer died
 /// while it was exiting, and XNU gave it to launchd. It is gone, and the wait answers `Missing`
-/// without blocking. The child really runs; its `waitid` (a stated `ECHILD` row) and its parents are
-/// forced.
+/// without blocking. The child really runs; its `waitid` and its parents are stated rows.
 ///
 /// Mutant: the check takes a child this process forked for running, whoever holds it.
 #[skuld::test]
 fn awaiting_a_child_launchd_holds_after_its_tracer_died_answers_missing_without_blocking() {
-    use crate::identity::FakeKernel;
     let child = blocker();
     let pid = child.id();
     let (r, copy) = pipe();
-    let kernel = FakeKernel::over(&HostKernel).on_peek(pid, Err(crate::child::lifecycle::echild()));
-    let _parents = crate::identity::kinfo::fault::force_parents(pid, || forked_by_us_held_by(crate::identity::LAUNCHD));
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_peek(pid, Err(crate::child::lifecycle::echild()))
+        .on_every_kinfo(pid, move || forked_by_us_held_by(pid, crate::identity::LAUNCHD));
     let _release = release_on_block(copy);
     block_probe::take();
     let report = await_report(&kernel, &r, pid);
@@ -499,7 +507,7 @@ fn awaiting_a_child_launchd_holds_after_its_tracer_died_answers_missing_without_
 /// tracer alone, then gives the child to launchd, so no event of the child's reaches this process.
 /// The wait watches the tracer as well, and the tracer's exit makes it check the child again, which
 /// finds launchd holding it: `Missing`. A live `cat` stands in for the tracer. The child really runs;
-/// its `waitid` and its parents are forced: held by the stand-in while that runs, by launchd once it
+/// its `waitid` and its parents are stated rows: held by the stand-in while that runs, by launchd once it
 /// has exited. The hook on the wait's first block ends the stand-in and looks for an event pending on
 /// the wait's kqueue; if there is none, it drops a copy of the write end, so a wait that missed the
 /// tracer's exit ends at EOF instead of hanging.
@@ -510,25 +518,14 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use crate::identity::FakeKernel;
     let child = blocker();
     let pid = child.id();
     let mut tracer = blocker();
     let tracer_pid = tracer.id();
     let (r, copy) = pipe();
     // The child stays `ECHILD` to this process throughout.
-    let kernel = FakeKernel::over(&HostKernel).on_every_peek(pid, || Err(crate::child::lifecycle::echild()));
-    let tracer_exited = Rc::new(Cell::new(false));
-    let _parents = crate::identity::kinfo::fault::force_parents(pid, {
-        let exited = Rc::clone(&tracer_exited);
-        move || {
-            forked_by_us_held_by(if exited.get() {
-                crate::identity::LAUNCHD
-            } else {
-                tracer_pid
-            })
-        }
-    });
+    let holder = Arc::new(AtomicU32::new(tracer_pid));
+    let kernel = held_by_whom(pid, &holder).on_every_peek(pid, || Err(crate::child::lifecycle::echild()));
     let pending = Rc::new(Cell::new(None));
     let tracer_stdin = RefCell::new(tracer.stdin.take());
     let copy = RefCell::new(Some(copy));
@@ -538,7 +535,7 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
             if block.n == Some(1) {
                 drop(tracer_stdin.borrow_mut().take());
                 crate::test_child::wait_until_zombie(tracer_pid);
-                tracer_exited.set(true);
+                holder.store(crate::identity::LAUNCHD, Ordering::SeqCst);
                 pending.set(block.ready());
                 if pending.get() == Some(true) {
                     return;
@@ -562,7 +559,7 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
 /// `SIGSTOP` (see `wait::macos::TracerWatch`). The wait watches the child's signals,
 /// so it checks again, finds the tracer and watches it too; the tracer's exit, with launchd then
 /// holding the child, ends the wait: `Missing`. A live `cat` stands in for the tracer. The child
-/// really runs; its `waitid` and its parents are forced: running until the attach, then held by the
+/// really runs; its `waitid` and its parents are stated rows: running until the attach, then held by the
 /// stand-in, then by launchd once that has exited. A `SIGCONT` to the child stands in for the
 /// attach's `SIGSTOP`. Each of the two hooks looks for an event pending on the wait's kqueue; if
 /// there is none, it drops a copy of the write end, so a wait that missed it ends at EOF instead of
@@ -574,7 +571,6 @@ fn awaiting_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use crate::identity::FakeKernel;
     use crate::os_process::macos::kqueue::test_hooks::send_signal;
     let child = blocker();
     let pid = child.id();
@@ -582,14 +578,10 @@ fn awaiting_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
     let tracer_pid = tracer.id();
     let (r, copy) = pipe();
     // Running for the first check, then `ECHILD` throughout.
-    let kernel = FakeKernel::over(&HostKernel)
+    let holder = Arc::new(AtomicU32::new(std::process::id()));
+    let kernel = held_by_whom(pid, &holder)
         .on_peek(pid, Ok(None))
         .on_every_peek(pid, || Err(crate::child::lifecycle::echild()));
-    let holder = Rc::new(Cell::new(std::process::id()));
-    let _parents = crate::identity::kinfo::fault::force_parents(pid, {
-        let holder = Rc::clone(&holder);
-        move || forked_by_us_held_by(holder.get())
-    });
     let (attach_woke, exit_woke) = (Rc::new(Cell::new(None)), Rc::new(Cell::new(None)));
     let tracer_stdin = RefCell::new(tracer.stdin.take());
     let copy = RefCell::new(Some(copy));
@@ -598,7 +590,7 @@ fn awaiting_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
         move |block| {
             let woke = match block.n {
                 Some(1) => {
-                    holder.set(tracer_pid);
+                    holder.store(tracer_pid, Ordering::SeqCst);
                     send_signal(pid, libc::SIGCONT);
                     attach_woke.set(block.ready());
                     attach_woke.get()
@@ -606,7 +598,7 @@ fn awaiting_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
                 Some(2) => {
                     drop(tracer_stdin.borrow_mut().take());
                     crate::test_child::wait_until_zombie(tracer_pid);
-                    holder.set(crate::identity::LAUNCHD);
+                    holder.store(crate::identity::LAUNCHD, Ordering::SeqCst);
                     exit_woke.set(block.ready());
                     exit_woke.get()
                 }
@@ -658,22 +650,26 @@ fn waiting_warns(mark: usize) -> usize {
 }
 
 /// A wait on `child` (a [`blocker`]) whose checks find it held by `tracer` (another live child),
-/// with the tracer walks answering `links`. The hook on block `release_at` drops a copy of the write
-/// end, so the wait ends at EOF. Answers the report and each `kevent`'s timeout, one per block.
+/// with the first `gone_walks` tracer walks finding the tracer gone (its unique-id read is a row that
+/// says so). The hook on block `release_at` drops a copy of the write end, so the wait ends at EOF.
+/// Answers the report and each `kevent`'s timeout, one per block.
 fn await_held(
     child: u32,
     tracer: u32,
-    links: Vec<crate::identity::Link>,
+    gone_walks: usize,
     say_after: std::time::Duration,
     release_at: u32,
 ) -> (Report, Vec<Option<std::time::Duration>>) {
     use std::cell::RefCell;
 
-    use crate::identity::FakeKernel;
+    use crate::identity::UniqRead;
     let (r, copy) = pipe();
-    let kernel = FakeKernel::over(&HostKernel).on_every_peek(child, || Err(crate::child::lifecycle::echild()));
-    let _parents = crate::identity::kinfo::fault::force_parents(child, move || forked_by_us_held_by(tracer));
-    let _links = crate::wait::macos::tracer_seams::force_links(links);
+    let kernel = (0..gone_walks).fold(
+        FakeKernel::over(&HostKernel)
+            .on_every_peek(child, || Err(crate::child::lifecycle::echild()))
+            .on_every_kinfo(child, move || forked_by_us_held_by(child, tracer)),
+        |kernel, _| kernel.on_unique_info(tracer, UniqRead::Gone),
+    );
     let _warn = seams::warn_after(say_after);
     let copy = RefCell::new(Some(copy));
     let _hook = on_each_block(move |block| {
@@ -692,16 +688,9 @@ fn await_held(
 /// Mutants: the wait blocks with no timeout on `Recheck(after)`; `Recheck(0)` blocks.
 #[skuld::test]
 fn a_tracer_found_gone_arms_the_wait_with_its_backoff() {
-    use crate::identity::Link;
     let child = blocker();
     let tracer = blocker();
-    let (report, timeouts) = await_held(
-        child.id(),
-        tracer.id(),
-        vec![Link::Gone, Link::Gone],
-        std::time::Duration::from_secs(3600),
-        1,
-    );
+    let (report, timeouts) = await_held(child.id(), tracer.id(), 2, std::time::Duration::from_secs(3600), 1);
     assert!(matches!(report, Report::Missing), "{report:?}");
     assert_eq!(
         timeouts,
@@ -715,17 +704,10 @@ fn a_tracer_found_gone_arms_the_wait_with_its_backoff() {
 /// Mutants: the backoff alone times the block; the later of the two does.
 #[skuld::test]
 fn a_wait_held_by_a_tracer_blocks_for_the_sooner_of_its_backoff_and_its_warning() {
-    use crate::identity::Link;
     crate::log_capture::install();
     let child = blocker();
     let tracer = blocker();
-    let (report, timeouts) = await_held(
-        child.id(),
-        tracer.id(),
-        vec![Link::Gone, Link::Gone, Link::Gone],
-        std::time::Duration::ZERO,
-        2,
-    );
+    let (report, timeouts) = await_held(child.id(), tracer.id(), 3, std::time::Duration::ZERO, 2);
     assert!(matches!(report, Report::Missing), "{report:?}");
     let ms = std::time::Duration::from_millis;
     assert_eq!(
@@ -780,8 +762,6 @@ fn production_warns_after_one_second_and_a_test_only_with_a_guard() {
 /// Mutant: `check` reads through a host kernel.
 #[skuld::test]
 fn the_look_at_the_child_asks_the_kernel_it_was_given() {
-    use crate::identity::FakeKernel;
-
     /// Above macOS's `PID_MAX`: no host process has it.
     const STATED: u32 = 2_000_000_000;
     let kernel = FakeKernel::over(&HostKernel).on_peek(STATED, Ok(None));
@@ -797,8 +777,7 @@ fn the_look_at_the_child_asks_the_kernel_it_was_given() {
 /// kernel. Either leaves rows untaken, and a wait that blocks is ended at EOF by the released pipe.
 #[skuld::test]
 fn a_wait_on_a_traced_child_asks_the_kernel_it_was_given_for_the_child_and_its_tracer() {
-    use crate::identity::kinfo::kinfo_proc;
-    use crate::identity::{exit_record, FakeKernel};
+    use crate::identity::exit_record;
     use crate::os_process::macos::kqueue::Subscription;
     use crate::wait::exit_only::macos_tests::found;
 

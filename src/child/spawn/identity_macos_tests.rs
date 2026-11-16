@@ -5,16 +5,15 @@ use std::cell::{Cell, RefCell};
 
 use crate::test_child::Console;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::child::spawn::unique_report;
 use crate::error::Error;
-use crate::identity::{
-    ppid_fault, uniq_fault, uniq_info, FakeKernel, HostKernel, Kernel, ReadPurpose, UniqInfo, UniqRead, LAUNCHD,
-};
-use std::sync::Arc;
+use crate::identity::{short_info, FakeKernel, HostKernel, Kernel, UniqInfo, UniqRead, LAUNCHD};
 
-/// [`crate::Command::spawn`] over `kernel`, which the spawn and every box it builds ask.
+/// [`Command::spawn`](crate::Command::spawn) over `kernel`, the one the spawn and its box ask: a test
+/// that states rows after the child exists keeps a clone of it.
 pub(crate) fn spawn_over(
     cmd: &mut crate::Command,
     kernel: impl Kernel + Send + 'static,
@@ -77,7 +76,7 @@ pub(crate) fn vanished(err: &Error) -> bool {
 
 /// A child's unique id that differs from `pid`'s own.
 pub(crate) fn other_unique_id(pid: u32) -> UniqRead {
-    let UniqRead::Found(info) = uniq_info(&HostKernel, pid, ReadPurpose::Kill) else {
+    let UniqRead::Found(info) = HostKernel.unique_info(pid) else {
         panic!("the child's unique id must be readable")
     };
     UniqRead::Found(UniqInfo {
@@ -117,27 +116,27 @@ fn macos_sync_spawn_identity_after_a_real_reap_is_gone() {
 
 /// The pid names a different unique id at the re-read (a reap and a reuse): `Foreign`, so `Gone`, and
 /// the teardown that follows sends the pid nothing. The child is really reaped, as the reuse needs:
-/// the id the pid then names is forced.
+/// the id the pid then names is a row of the spawn's kernel, the re-read's.
 ///
-/// Mutant: the re-read compares nothing (`IdCheck::Other` is kept), so the spawn is `Ok`.
+/// Mutant: the look at the reaped child's pid takes a different unique id (`Held::Other`) for the
+/// child's own, so the spawn is `Ok`.
 #[skuld::test]
 fn macos_sync_spawn_identity_with_a_different_unique_id_is_gone() {
     let (mut cmd, writer) = sync_blocker();
     let pid = Rc::new(Cell::new(0));
-    let armed: Rc<RefCell<Option<uniq_fault::Forced>>> = Rc::default();
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
     let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
-        let (pid, armed) = (Rc::clone(&pid), Rc::clone(&armed));
+        let (pid, kernel) = (Rc::clone(&pid), Arc::clone(&kernel));
         move || {
             pid.set(fault::spawn_pid());
             let other = other_unique_id(pid.get());
             drop(writer);
             reap_by_pid(pid.get());
-            *armed.borrow_mut() = Some(uniq_fault::force_uniq_read_once(ReadPurpose::Running, other));
+            kernel.state_unique_info(pid.get(), other);
         }
     });
     let sent = crate::send_log::Capture::start();
-    let outcome = cmd.spawn();
-    drop(armed);
+    let outcome = spawn_over(&mut cmd, Arc::clone(&kernel));
     assert_ne!(pid.get(), 0, "the hook must have run");
     let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
         outcome.expect_err("a pid with another unique id is not the child"),
@@ -229,7 +228,8 @@ fn macos_sync_spawn_identity_with_a_refused_reread_fails_a_contained_spawn_and_e
 
 /// Spawns a blocker contained by `mode`, launched by `front`, whose identity re-read finds the pid
 /// holding another unique id (a reap and a reuse), so the child is `Gone`: its pid, and the warns the
-/// spawn logged. The child is really reaped, as the reuse needs: the id the pid then names is forced.
+/// spawn logged. The child is really reaped, as the reuse needs: the id the pid then names is a row of
+/// the spawn's kernel.
 fn foreign_reread_warns(
     mode: crate::ContainMode,
     elevation: Option<crate::elevation::ElevationReport>,
@@ -239,20 +239,19 @@ fn foreign_reread_warns(
     cmd.contain_with(mode);
     cmd.set_elevation_report(elevation);
     let pid = Rc::new(Cell::new(0));
-    let armed: Rc<RefCell<Option<uniq_fault::Forced>>> = Rc::default();
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
     let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
-        let (pid, armed) = (Rc::clone(&pid), Rc::clone(&armed));
+        let (pid, kernel) = (Rc::clone(&pid), Arc::clone(&kernel));
         move || {
             pid.set(fault::spawn_pid());
             let other = other_unique_id(pid.get());
             drop(writer);
             reap_by_pid(pid.get());
-            *armed.borrow_mut() = Some(uniq_fault::force_uniq_read_once(ReadPurpose::Running, other));
+            kernel.state_unique_info(pid.get(), other);
         }
     });
     let mark = crate::log_capture::mark();
-    let outcome = cmd.spawn();
-    drop(armed);
+    let outcome = spawn_over(&mut cmd, kernel);
     assert_ne!(pid.get(), 0, "the hook must have run");
     let _ = outcome.expect_err("a pid with another unique id fails the spawn");
     (pid.get(), crate::log_capture::warns_since(mark, ""))
@@ -318,7 +317,7 @@ fn macos_sync_spawn_identity_failure_of_a_front_notes_no_group() {
 }
 
 /// At the re-read the child answers `ECHILD` (the test reaped it) yet its pid still names it, held
-/// by launchd (forced): a dead tracer's tracee in transit. That is neither a reap nor ours, so it
+/// by launchd (stated): a dead tracer's tracee in transit. That is neither a reap nor ours, so it
 /// is `Gone` (it exited, and is not ours to reap) with a warn naming the pid, and the error says its
 /// zombie is held.
 ///
@@ -329,14 +328,13 @@ fn macos_sync_spawn_identity_held_by_launchd_is_gone() {
     crate::log_capture::install();
     let (mut cmd, writer) = sync_blocker();
     let pid = Rc::new(Cell::new(0));
-    let armed: Rc<RefCell<Vec<Box<dyn std::any::Any>>>> = Rc::default();
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
     let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
-        let (pid, armed) = (Rc::clone(&pid), Rc::clone(&armed));
-        move || arm_launchd_hold(&pid, &armed, writer)
+        let (pid, kernel) = (Rc::clone(&pid), Arc::clone(&kernel));
+        move || arm_launchd_hold(&pid, &kernel, writer)
     });
     let mark = crate::log_capture::mark();
-    let outcome = cmd.spawn();
-    drop(armed);
+    let outcome = spawn_over(&mut cmd, kernel);
     let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
         outcome.expect_err("a launchd hold fails the spawn"),
     );
@@ -355,27 +353,18 @@ fn macos_sync_spawn_identity_held_by_launchd_is_gone() {
     );
 }
 
-/// Reaps the child by pid (so the re-read's `waitid` answers `ECHILD`) and forces the id and parent
-/// reads that follow to say launchd holds it.
-pub(crate) fn arm_launchd_hold(
-    pid: &Rc<Cell<u32>>,
-    armed: &Rc<RefCell<Vec<Box<dyn std::any::Any>>>>,
-    writer: crate::PipeWriter,
-) {
+/// Reaps the child by pid (so the re-read's `waitid` answers `ECHILD`) and states the id and parent
+/// reads that follow as saying launchd holds it.
+pub(crate) fn arm_launchd_hold(pid: &Rc<Cell<u32>>, kernel: &FakeKernel<'_>, writer: crate::PipeWriter) {
     pid.set(fault::spawn_pid());
-    let UniqRead::Found(info) = uniq_info(&HostKernel, pid.get(), ReadPurpose::Kill) else {
+    let UniqRead::Found(info) = HostKernel.unique_info(pid.get()) else {
         panic!("the child's unique id must be readable")
     };
     drop(writer);
     reap_by_pid(pid.get());
-    let mut armed = armed.borrow_mut();
-    for _ in 0..2 {
-        armed.push(Box::new(uniq_fault::force_uniq_read_once(
-            ReadPurpose::Echild,
-            UniqRead::Found(info),
-        )));
-    }
-    armed.push(Box::new(ppid_fault::force_ppid_once(Ok(LAUNCHD))));
+    kernel.state_unique_info(pid.get(), UniqRead::Found(info));
+    kernel.state_short_bsd(pid.get(), Ok(short_info(LAUNCHD, libc::SRUN)));
+    kernel.state_unique_info(pid.get(), UniqRead::Found(info));
 }
 
 // The child's own unique-id read =====
@@ -383,16 +372,16 @@ pub(crate) fn arm_launchd_hold(
 /// The spawn takes the child's own report and reads the unique id by pid only for the running
 /// check.
 ///
-/// Mutant: the spawn reads the unique id by pid (`ReadPurpose::Adopt`), which the recorded read
-/// purposes show.
+/// Mutant: the spawn reads the unique id by pid to adopt it, which the count of the kernel's
+/// unique-id reads of the child shows.
 #[skuld::test]
 fn macos_sync_spawn_takes_the_childs_own_unique_id_and_reads_its_unique_id_by_pid_only_in_the_running_peek() {
     let (mut cmd, writer) = sync_blocker();
-    let reads = uniq_fault::record();
-    let child = cmd.spawn().expect("the child's own report needs no by-pid read");
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
+    let child = spawn_over(&mut cmd, Arc::clone(&kernel)).expect("the child's own report needs no by-pid read");
     assert_eq!(
-        reads.purposes(),
-        [ReadPurpose::Running],
+        kernel.unique_info_reads(child.pid()),
+        1,
         "the only by-pid read is the identity check's re-read, none to adopt the id"
     );
     drop(writer);
@@ -514,14 +503,15 @@ fn macos_sync_spawn_consults_the_report_before_attaching() {
 fn macos_fdmarker_attach_reads_nothing_by_pid() {
     let (mut cmd, _writer) = sync_blocker();
     cmd.contain();
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
     let reads_before_attach = Rc::new(Cell::new(None));
     let _hook = fault::set_at(SpawnPoint::BeforeAttach, {
-        let reads = Rc::clone(&reads_before_attach);
-        move || reads.set(Some(crate::identity::seams::by_pid_reads()))
+        let (reads, kernel) = (Rc::clone(&reads_before_attach), Arc::clone(&kernel));
+        move || reads.set(Some(kernel.all_record_reads()))
     });
-    let child = cmd.spawn().expect("spawn");
+    let child = spawn_over(&mut cmd, Arc::clone(&kernel)).expect("spawn");
     assert_eq!(
-        Some(crate::identity::seams::by_pid_reads()),
+        Some(kernel.all_record_reads()),
         reads_before_attach.get(),
         "nothing from the attach on may read an identity by pid"
     );
@@ -556,11 +546,9 @@ pub(crate) fn is_reaped(pid: u32) -> bool {
     rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
 }
 
-/// A refused kill, with the child left running and an `EPERM` for every id read the teardown makes
-/// of it: arms the kill's refusal and returns the guard.
-pub(crate) fn refuse_the_kill() -> uniq_fault::Forced {
-    uniq_fault::force_uniq_read_once(ReadPurpose::Kill, UniqRead::Refused(libc::EPERM))
-}
+/// The answer of the id read a kill makes of a child, refused: the kill sends nothing and leaves the
+/// child running.
+pub(crate) const REFUSED_KILL_READ: UniqRead = UniqRead::Refused(libc::EPERM);
 
 /// A child whose kill is refused, after its attach failed, is handed back in the error, still running,
 /// as a Linux child is; the error is the attach's own.
@@ -569,10 +557,15 @@ pub(crate) fn refuse_the_kill() -> uniq_fault::Forced {
 #[skuld::test]
 fn macos_a_failed_attach_whose_kill_is_refused_hands_the_child_back() {
     let (mut cmd, writer) = sync_blocker();
-    let _refused = refuse_the_kill();
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
+    let _refused = fault::set_at(SpawnPoint::BeforeAttach, {
+        let kernel = Arc::clone(&kernel);
+        move || kernel.state_unique_info(fault::spawn_pid(), REFUSED_KILL_READ)
+    });
     fault::set_force_attach_failure(true);
-    let error = cmd.spawn().expect_err("the forced attach failure fails the spawn");
+    let error = spawn_over(&mut cmd, Arc::clone(&kernel)).expect_err("the forced attach failure fails the spawn");
     fault::set_force_attach_failure(false);
+    assert!(kernel.all_rows_taken(), "the kill made its id read");
     let (cause, fate, handed_back) = crate::test_child::expect_handed_back(error, writer);
     assert!(matches!(cause, Error::Containment { .. }), "{cause:?}");
     assert!(
@@ -617,14 +610,15 @@ fn macos_treewalk_attach_reads_nothing_by_pid() {
     let (mut cmd, _writer) = sync_blocker();
     cmd.contain_with(crate::ContainMode::TreeWalk);
     cmd.suppress_fd_marker();
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
     let reads_before_attach = Rc::new(Cell::new(None));
     let _hook = fault::set_at(SpawnPoint::BeforeAttach, {
-        let reads = Rc::clone(&reads_before_attach);
-        move || reads.set(Some(crate::identity::seams::by_pid_reads()))
+        let (reads, kernel) = (Rc::clone(&reads_before_attach), Arc::clone(&kernel));
+        move || reads.set(Some(kernel.all_record_reads()))
     });
-    let child = cmd.spawn().expect("spawn");
+    let child = spawn_over(&mut cmd, Arc::clone(&kernel)).expect("spawn");
     assert_eq!(
-        Some(crate::identity::seams::by_pid_reads()),
+        Some(kernel.all_record_reads()),
         reads_before_attach.get(),
         "nothing from the attach on may read an identity by pid"
     );
@@ -776,6 +770,7 @@ fn refused_kqueue_of_a_late_child() {
     let how = Refusing {
         late: true,
         killed: true,
+        kill_read: None,
     };
     let refused = refused_kqueue_spawn(cmd, await_grandchild_before(&tree), (), how);
     let tree = tree.borrow_mut().take().expect("the tree");
@@ -798,8 +793,11 @@ fn refused_kqueue_of_a_late_child() {
 
 fn refused_kqueue_whose_kill_is_refused() {
     let (cmd, writer) = sync_blocker();
-    let _refused = refuse_the_kill();
-    let refused = refused_kqueue_spawn(cmd, || (), writer, Refusing::SENDS_NOTHING);
+    let how = Refusing {
+        kill_read: Some(REFUSED_KILL_READ),
+        ..Refusing::SENDS_NOTHING
+    };
+    let refused = refused_kqueue_spawn(cmd, || (), writer, how);
     assert_eq!(refused.fate(), crate::error::ChildFate::Running { id: None });
     assert!(refused.warn.contains("it could not be killed"), "{}", refused.warn);
     let cleanup = said_of(&refused.cleanup());
@@ -811,8 +809,11 @@ fn refused_kqueue_whose_kill_is_refused() {
 
 fn refused_kqueue_whose_kill_finds_the_child_gone() {
     let (cmd, writer) = sync_blocker();
-    let _gone = uniq_fault::force_uniq_read_once(ReadPurpose::Kill, UniqRead::Gone);
-    let refused = refused_kqueue_spawn(cmd, || (), writer, Refusing::SENDS_NOTHING);
+    let how = Refusing {
+        kill_read: Some(UniqRead::Gone),
+        ..Refusing::SENDS_NOTHING
+    };
+    let refused = refused_kqueue_spawn(cmd, || (), writer, how);
     assert_eq!(refused.fate(), crate::error::ChildFate::Gone);
     assert!(
         refused
@@ -856,16 +857,21 @@ struct Refusing {
     late: bool,
     /// The spawn kills the child through its unique id; otherwise it sends the child nothing.
     killed: bool,
+    /// What the kill's id read of the child answers, a row of the spawn's kernel stated once the
+    /// child exists; `None`: the host's.
+    kill_read: Option<UniqRead>,
 }
 
 impl Refusing {
     const KILLS: Refusing = Refusing {
         late: false,
         killed: true,
+        kill_read: None,
     };
     const SENDS_NOTHING: Refusing = Refusing {
         late: false,
         killed: false,
+        kill_read: None,
     };
 }
 
@@ -930,18 +936,26 @@ fn refused_kqueue_spawn<E>(mut cmd: crate::Command, before: impl Fn() + 'static,
     };
     let pid = Rc::new(Cell::new(None));
     let refused = Rc::new(RefCell::new(None));
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
     let _lower = fault::set_at(SpawnPoint::BeforeAdopt, {
-        let (pid, refused) = (Rc::clone(&pid), Rc::clone(&refused));
+        let (pid, refused, kernel) = (Rc::clone(&pid), Rc::clone(&refused), Arc::clone(&kernel));
         move || {
             before();
             pid.set(Some(fault::spawn_pid()));
+            if let Some(read) = how.kill_read {
+                kernel.state_unique_info(fault::spawn_pid(), read);
+            }
             *refused.borrow_mut() = Some(crate::test_child::refuse_new_descriptors());
         }
     });
     let mark = crate::log_capture::mark();
-    let spawned = cmd.spawn();
+    let spawned = spawn_over(&mut cmd, Arc::clone(&kernel));
     drop(refused.borrow_mut().take());
     let error = spawned.expect_err("a refused kqueue fails the spawn");
+    assert!(
+        kernel.all_rows_taken(),
+        "the kill made the id read its row answers (a row stated by `kill_read`)"
+    );
     let pid = pid.get().expect("the first-read hook ran");
     let warns = crate::log_capture::warns_since(mark, "could not be watched");
     assert_eq!(warns.len(), 1, "{warns:?}");

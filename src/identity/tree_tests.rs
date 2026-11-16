@@ -138,20 +138,28 @@ fn the_parent_of_a_spawned_child_is_the_current_process() {
 }
 
 /// On macOS, where reparenting makes it the proof, `parent` reads its process, then the parent, then
-/// its process again. Counted by the by-pid read seam. (Windows, which orders instead and reads its
-/// process once, has no counter.)
+/// its process again, and proves the parent still holds its pid with one more read of it. Counted as
+/// the records read by pid through the kernel. (Windows, which orders instead and reads its process
+/// once, has no counter.)
 ///
-/// Mutant: `parent` does not read its process again.
+/// Mutants: `parent` does not read its process again (the child's count is 1); it does not read the
+/// parent, or does not prove it held after the second read (the parent's count is 1 or 0).
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn parent_reads_its_process_again_under_the_parent() {
+    use crate::identity::FakeKernel;
+
     let (child, kid) = live_member();
-    let before = crate::identity::seams::by_pid_reads();
-    let parent = kid.parent().expect("the parent is readable");
-    let reads = crate::identity::seams::by_pid_reads() - before;
+    let kernel = FakeKernel::over(&HostKernel);
+    let parent = kid.parent_with(&kernel).expect("the parent is readable");
     release(child);
     assert_eq!(parent, Some(ProcessId::current()));
-    assert_eq!(reads, 3);
+    assert_eq!(kernel.record_reads(kid.pid()), 2, "the child, read twice");
+    assert_eq!(
+        kernel.record_reads(std::process::id()),
+        2,
+        "the parent, read once and proved held once"
+    );
 }
 
 /// A live process that did not create the candidate is not its parent, though it is a real process

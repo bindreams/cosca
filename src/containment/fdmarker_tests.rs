@@ -49,7 +49,24 @@ pub(crate) fn install_on(
     cmd: &mut std::process::Command,
     reserved: &[std::os::fd::RawFd],
 ) -> Result<super::PreparedMarker, crate::error::Error> {
-    crate::child::spawn::in_child::register_alone(cmd, |steps| super::install(steps, reserved))
+    crate::child::spawn::in_child::register_alone(cmd, |steps| super::install(steps, reserved, &host_kernel()))
+}
+
+/// `prepared`, whose marker's sweeps read through a kernel that refuses every read of `pid`'s record,
+/// as the OS can: the identity of `pid` is `Unknown`.
+fn refusing_reads_of(prepared: super::PreparedMarker, pid: crate::identity::RawPid) -> super::PreparedMarker {
+    reading_through(prepared, crate::identity::unreadable(pid))
+}
+
+/// `prepared`, whose marker's sweeps read through `kernel`.
+fn reading_through(
+    prepared: super::PreparedMarker,
+    kernel: impl crate::identity::Kernel + Send + 'static,
+) -> super::PreparedMarker {
+    super::PreparedMarker {
+        kernel: crate::identity::spawn_kernel(kernel),
+        ..prepared
+    }
 }
 
 fn all_pids() -> Vec<crate::identity::RawPid> {
@@ -347,7 +364,8 @@ fn a_child_with_a_colliding_fd_mapping_still_holds_the_marker() {
         .stdout(std::process::Stdio::piped());
     // Both steps in one hook, as a spawn adds them.
     let mut steps = crate::child::spawn::in_child::InChild::default();
-    let prepared = super::install(&mut steps, &[natural]).expect("install");
+    let host = host_kernel();
+    let prepared = super::install(&mut steps, &[natural], &host).expect("install");
     let handle = prepared.handle;
     fd_map::install(
         &mut steps,
@@ -1229,8 +1247,8 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
     );
 }
 
-/// A pass whose root's identity cannot be read (`identity::force_unknown` refuses its by-pid read, as
-/// the OS can) skips the walk channel and is `incomplete`: not observed is not observed absent. The
+/// A pass whose root's identity cannot be read (its kernel refuses its record, as the OS can) skips
+/// the walk channel and is `incomplete`: not observed is not observed absent. The
 /// root is already in `seen`, so the pass signals no one, and the walk is the only source of
 /// `incomplete`, and no walk is recorded. The warn names the marker handle. Mutants: the unreadable
 /// root is `Ok(None)` (a gone root), which walks nothing and reports a complete pass; the walk is
@@ -1243,8 +1261,7 @@ fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
     let prepared = install_on(&mut cmd, &[]).expect("install");
     drop(cmd);
     let root = inert_root();
-    let marker = super::Marker::new(prepared, root, None);
-    let _unreadable = crate::identity::force_unknown(root.pid());
+    let marker = super::Marker::new(refusing_reads_of(prepared, root.pid()), root, None);
 
     let mut reached = Vec::new();
     let mut state = super::SweepState::new(&mut reached);
@@ -1275,8 +1292,8 @@ fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
     assert_eq!(warned.len(), 1, "{warned:?}");
 }
 
-/// A pass whose walk cannot read a live child of its live root (`identity::force_unknown` refuses the
-/// child's by-pid read, as the OS can) does not signal it and is `incomplete`: not observed is not
+/// A pass whose walk cannot read a live child of its live root (its kernel refuses the child's
+/// record, as the OS can) does not signal it and is `incomplete`: not observed is not
 /// observed absent. The root is already in `seen`, so the child is the only candidate and nothing
 /// is signalled. Mutant: the sweep takes the walk's members and ignores `unassessed`: the pass
 /// reports complete.
@@ -1312,8 +1329,7 @@ fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete(
     let [child] = children[..] else {
         panic!("the root has exactly one child, got {children:?}");
     };
-    let marker = super::Marker::new(prepared, root, None);
-    let _unreadable = crate::identity::force_unknown(child.pid());
+    let marker = super::Marker::new(refusing_reads_of(prepared, child.pid()), root, None);
 
     let mut reached = Vec::new();
     let mut state = super::SweepState::new(&mut reached);
@@ -1344,6 +1360,143 @@ fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete(
     );
     let status = root_child.wait().expect("reap the root");
     assert_eq!((status.signal(), status.code()), (None, Some(0)));
+}
+
+/// A [`member_command`] child that holds a marker installed on it, with the marker's parts. The caller
+/// holds `test_spawn_lock()` for its whole body.
+fn held_child() -> (std::process::Child, super::PreparedMarker) {
+    let mut cmd = member_command(0);
+    let prepared = install_on(&mut cmd, &[]).expect("install the marker on the child");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the caller holds spawn_lock for its whole body"
+    )]
+    let mut child = cmd.spawn().expect("spawn the child");
+    drop(cmd);
+    await_member_ready(&mut child);
+    (child, prepared)
+}
+
+/// A marker holder that the marker's kernel cannot read (its record is refused, as the OS can, while
+/// the host reads it) is not signalled, and the sweep is `incomplete`: the holder's identity is read
+/// through the marker's kernel. The rows are asserted taken.
+///
+/// Mutant: the sweep reads the holder through `HostKernel`: the host finds it, the sweep signals it,
+/// and the rows are left.
+#[skuld::test]
+fn a_holder_its_kernel_cannot_read_is_not_signalled_and_the_sweep_is_incomplete() {
+    use crate::identity::{FakeKernel, HostKernel, ReadErr};
+
+    let _serialize = test_spawn_lock();
+    let (holder, prepared) = held_child();
+    let pid = holder.id();
+    let kernel = std::sync::Arc::new(
+        FakeKernel::over(&HostKernel)
+            .on_bsd_info(pid, Err(ReadErr::Refused(libc::EPERM)))
+            .on_kinfo_refused(pid, libc::EPERM),
+    );
+    let root = inert_root();
+    let marker = super::Marker::new(reading_through(prepared, std::sync::Arc::clone(&kernel)), root, None);
+
+    let mut reached = Vec::new();
+    let mut state = super::SweepState::new(&mut reached);
+    state.seen.insert(root);
+    let found = marker.sweep_pass(
+        nix::sys::signal::Signal::SIGKILL,
+        &mut state,
+        true,
+        super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
+    );
+
+    assert!(
+        kernel.all_rows_taken(),
+        "the holder was read through the marker's kernel"
+    );
+    assert!(state.incomplete, "a holder that cannot be read is not a complete sweep");
+    assert_eq!(found, 0, "nothing was found or signalled");
+    crate::child::spawn::identity_macos_tests::end_unsignalled_and_reap(pid);
+}
+
+/// A sweep's kill of a member its walk found reads the member's identity through the marker's kernel:
+/// a kernel that refuses that read leaves the member running and the sweep `incomplete`. The root is
+/// the member, and the walk's reads of it are records, so the unique-id row is the kill's. The row is
+/// asserted taken.
+///
+/// Mutant: the sweep's kill reads through `HostKernel`: the host finds the member, which is killed, and
+/// the row is left.
+#[skuld::test]
+fn a_sweeps_kill_of_a_walked_member_reads_its_identity_through_the_markers_kernel() {
+    use crate::identity::{FakeKernel, HostKernel};
+
+    let _serialize = test_spawn_lock();
+    let (member, prepared) = held_child();
+    let pid = member.id();
+    let root = crate::identity::ProcessId::of(pid)
+        .found()
+        .expect("the live member resolves");
+    let kernel = std::sync::Arc::new(
+        FakeKernel::over(&HostKernel).on_unique_info(pid, crate::child::spawn::identity_macos_tests::REFUSED_KILL_READ),
+    );
+    let marker = super::Marker::new(reading_through(prepared, std::sync::Arc::clone(&kernel)), root, None);
+
+    let mut reached = Vec::new();
+    let mut state = super::SweepState::new(&mut reached);
+    marker.sweep_pass(
+        nix::sys::signal::Signal::SIGKILL,
+        &mut state,
+        true,
+        super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
+    );
+
+    assert!(
+        kernel.all_rows_taken(),
+        "the kill read the member's identity through the marker's kernel"
+    );
+    assert!(
+        state.incomplete,
+        "a member whose kill was refused is not a complete sweep"
+    );
+    crate::child::spawn::identity_macos_tests::end_unsignalled_and_reap(pid);
+}
+
+/// A holder's kill reads its identity through the marker's kernel: a kernel that refuses that read
+/// leaves the holder running, and the kill is not attempted. The row is asserted taken.
+///
+/// Mutant: the holder's kill reads through `HostKernel`: the host finds the holder, which is killed, and
+/// the row is left.
+#[skuld::test]
+fn a_holders_kill_reads_its_identity_through_the_markers_kernel() {
+    use crate::identity::{FakeKernel, HostKernel};
+
+    let _serialize = test_spawn_lock();
+    let (holder, prepared) = held_child();
+    let pid = holder.id();
+    let id = crate::identity::ProcessId::of(pid)
+        .found()
+        .expect("the live holder resolves");
+    let kernel = std::sync::Arc::new(
+        FakeKernel::over(&HostKernel).on_unique_info(pid, crate::child::spawn::identity_macos_tests::REFUSED_KILL_READ),
+    );
+    let marker = super::Marker::new(
+        reading_through(prepared, std::sync::Arc::clone(&kernel)),
+        inert_root(),
+        None,
+    );
+
+    let outcome = marker.kill_holder(id, nix::sys::signal::Signal::SIGKILL);
+
+    assert!(
+        matches!(
+            outcome,
+            Some(crate::containment::treewalk::KillOutcome::NotAttempted(_))
+        ),
+        "{outcome:?}"
+    );
+    assert!(
+        kernel.all_rows_taken(),
+        "the kill read the holder's identity through the marker's kernel"
+    );
+    crate::child::spawn::identity_macos_tests::end_unsignalled_and_reap(pid);
 }
 
 /// Two failures of one teardown fold into one error with both failures whole as the members of the
@@ -1410,12 +1563,22 @@ fn two_group_errors_fold_into_one_variant_with_both_below_it() {
 
 // Holders-only sweeps (a reaped root) =====
 
-/// A marker nothing was spawned under, its write end closed with the command.
-fn marker_without_holders(root: crate::identity::ProcessId, pgid: Option<i32>) -> super::Marker {
+/// A marker nothing was spawned under, its write end closed with the command, whose sweeps read
+/// through `kernel`.
+fn marker_without_holders(
+    root: crate::identity::ProcessId,
+    pgid: Option<i32>,
+    kernel: crate::identity::SpawnKernel,
+) -> super::Marker {
     let mut cmd = std::process::Command::new("true");
     let prepared = install_on(&mut cmd, &[]).expect("install a scratch marker");
     drop(cmd);
-    super::Marker::new(prepared, root, pgid)
+    super::Marker::new(super::PreparedMarker { kernel, ..prepared }, root, pgid)
+}
+
+/// The kernel of the host, as a spawn starts with it.
+fn host_kernel() -> crate::identity::SpawnKernel {
+    crate::identity::spawn_kernel(crate::identity::HostKernel)
 }
 
 /// A group that cannot be signalled (`pgid` 0, which `signal_group` refuses) means the marker's
@@ -1425,7 +1588,7 @@ fn marker_without_holders(root: crate::identity::ProcessId, pgid: Option<i32>) -
 #[skuld::test]
 fn a_terminate_whose_group_cannot_be_signalled_says_nothing_was_sent() {
     let _serialize = test_spawn_lock();
-    let marker = marker_without_holders(inert_root(), Some(0));
+    let marker = marker_without_holders(inert_root(), Some(0), host_kernel());
     let root = crate::test_support::stated_root::StatedRoot::unreaped();
     match marker.terminate_tree(Some(&root)) {
         crate::containment::TerminateOutcome::NotSent(crate::error::Error::Unassessable { source: None, .. }) => {}
@@ -1442,8 +1605,11 @@ fn a_terminate_whose_group_cannot_be_signalled_says_nothing_was_sent() {
 fn a_terminate_that_sent_nothing_keeps_the_members_it_could_not_reach() {
     let _serialize = test_spawn_lock();
     let root_id = inert_root();
-    let marker = marker_without_holders(root_id, Some(0));
-    let _unreadable = crate::identity::force_unknown(root_id.pid());
+    let marker = marker_without_holders(
+        root_id,
+        Some(0),
+        crate::identity::spawn_kernel(crate::identity::unreadable(root_id.pid())),
+    );
     let root = crate::test_support::stated_root::StatedRoot::unreaped();
     match marker.terminate_tree(Some(&root)) {
         crate::containment::TerminateOutcome::NotSent(crate::error::Error::Unassessable {
@@ -1516,13 +1682,13 @@ fn a_skipped_kill_names_the_walk_and_the_group_only_when_there_is_one() {
     };
 
     let root = crate::identity::ProcessId::from_parts_for_test(4242, crate::identity::Key::for_test(1));
-    let rooted = skipped(marker_without_holders(root, None));
+    let rooted = skipped(marker_without_holders(root, None, host_kernel()));
     assert!(
         rooted.contains("root pid 4242") && !rooted.contains("pgid"),
         "{rooted:?}"
     );
 
-    let grouped = skipped(marker_without_holders(root, Some(4243)));
+    let grouped = skipped(marker_without_holders(root, Some(4243), host_kernel()));
     assert!(
         grouped.contains("pgid 4243") && grouped.contains("root pid 4242"),
         "{grouped:?}"
