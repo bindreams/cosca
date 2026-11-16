@@ -89,6 +89,11 @@ pub const CLONE3: skuld::Label;
 #[skuld::label]
 pub const STRAY_SIGNAL: skuld::Label;
 
+/// Selects the `CTRL_PROXY` group's tests: those that run the console-event proxy, which sends
+/// Ctrl+C or Ctrl+Break to every process on a console.
+#[skuld::label]
+pub const CTRL_PROXY: skuld::Label;
+
 /// Selects the `UNPRIVILEGED` group's tests: those that mean something only when the process holds no
 /// privilege (for one, `RLIMIT_NPROC` does not bind root).
 #[skuld::label]

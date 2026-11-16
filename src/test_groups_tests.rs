@@ -2,7 +2,7 @@
 
 use crate::test_groups::{check_group, require_consent, require_enabled};
 use crate::test_harness::{
-    CGROUP, CLONE3, DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, ROOT, SETUID, SHELL_EXECUTE,
+    CGROUP, CLONE3, CTRL_PROXY, DRIVE_MAPPING, ELEVATION_ROUTES, NAMESPACES, PATH_PROBES, ROOT, SETUID, SHELL_EXECUTE,
     SHELL_PROBES, STRAY_SIGNAL, TRACER, UID_SWITCH, UNPRIVILEGED,
 };
 
@@ -125,6 +125,7 @@ fn every_group_fixture_carries_exactly_its_label() {
         ("clone3", CLONE3),
         ("stray_signal", STRAY_SIGNAL),
         ("unprivileged", UNPRIVILEGED),
+        ("ctrl_proxy", CTRL_PROXY),
     ] {
         assert_eq!(skuld::fixture::collect_fixture_labels(&[fixture]), [label], "{fixture}");
     }

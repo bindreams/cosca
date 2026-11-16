@@ -371,6 +371,9 @@ fn main() {
     // The elevation shim, when this process was started as one; its test seams come from the environment.
     #[cfg(unix)]
     shim_hooks::init();
+    // The console-event proxy, which a test may start as a copy of this binary.
+    #[cfg(windows)]
+    cosca::init();
     let args: Vec<String> = std::env::args().collect();
     #[cfg(target_os = "linux")]
     if std::fs::read_link("/proc/self/exe").is_ok_and(|exe| exe.file_name() == Some("pkexec-impl".as_ref())) {

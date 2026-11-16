@@ -156,8 +156,8 @@
 //!   process group or the process table, and a start time (`created_at`), still do.
 //!   [`ProcessId::current`](identity::ProcessId::current) needs only a readable `/proc/self/stat`
 //!   before 6.9, and on 6.9+ no `/proc` at all.
-//! - The elevation shim (`cosca::init`) runs on Linux. Other platforms have no shim; `init` reports
-//!   that and does not start the program. It needs `/proc` mounted: it reaches cosca's socket through
+//! - The elevation shim (`cosca::init`) runs on Linux. macOS has no shim; `init` reports that and does
+//!   not start the program. Windows has none. It needs `/proc` mounted: it reaches cosca's socket through
 //!   `/proc/thread-self/fd`. Without it the shim refuses, saying so, and the program is not started.
 //!
 //! 32-bit Linux is unsupported: cosca does not compile there. Before Linux 6.14 a 32-bit kernel gives
@@ -221,14 +221,23 @@ pub mod stdio;
 #[cfg(windows)]
 pub use containment::Job;
 pub use containment::{ContainMode, Containment};
-#[cfg(unix)]
-pub use elevation::shim::{init, installed};
 #[doc(hidden)]
 #[cfg(unix)]
-pub use elevation::shim::{init_with_test_hooks, Gate, Inject, ShimTestHooks};
+pub use elevation::shim::{Gate, Inject, ShimTestHooks};
 pub use elevation::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, EnvSanitizer, Privilege, Secret};
 pub use graceful::GracefulMechanism;
 pub use stdio::{Fd, Stdio};
+
+mod init;
+mod role;
+#[doc(hidden)]
+pub use init::ctrl_proxy_main;
+#[doc(hidden)]
+#[cfg(unix)]
+pub use init::init_with_test_hooks;
+pub use init::{init, installed};
+
+mod stop;
 
 mod child;
 pub use child::{Child, SuspendedChild, Unreaped};
@@ -388,6 +397,9 @@ fn main() {
     // the shim's arguments runs it here and exits.
     #[cfg(unix)]
     shim_env_hooks::init();
+    // And the console-event proxy, which the proxy's tests start as a copy of this binary.
+    #[cfg(windows)]
+    init();
     #[cfg(target_os = "linux")]
     elevation::shim::owner_helper::run_if_requested();
     #[cfg(unix)]

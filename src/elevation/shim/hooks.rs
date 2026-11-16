@@ -1,5 +1,5 @@
 //! Test seams of the shim, injected by the host's `main` through
-//! [`init_with_test_hooks`](super::init_with_test_hooks). [`init`](super::init) installs none, and
+//! [`init_with_test_hooks`](crate::init_with_test_hooks). [`init`](crate::init) installs none, and
 //! the library reads no environment for seams, so a shipped shim cannot reach one.
 //!
 //! No hook runs in the child between the clone and `execve`: the child-side seams are data the
