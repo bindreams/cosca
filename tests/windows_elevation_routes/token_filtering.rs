@@ -246,10 +246,10 @@ fn measure_uac_policy(#[fixture(elevation_routes)] _group: &Group) {
     mark_test_passed(PROBE_MARKERS_ENV);
 }
 
-/// Question 2, measured at whatever integrity this process runs at. Read together with
-/// [`unelevated_caller_view`], which takes the same measurement at medium integrity and is the one
-/// that can actually answer the question — but only when its own report confirms
-/// `TokenIsElevated=false`; see that function's doc for when it cannot.
+/// Question 2, measured at whatever integrity this process runs at. [`unelevated_caller_view`]
+/// takes the same measurement at medium integrity, but from a synthesised token that can still read
+/// `TokenIsElevated=true`; see its doc. The unelevated answer comes from
+/// `logon_routes::does_create_process_with_logon_elevate`.
 #[skuld::test]
 fn linked_token_chain_here(#[fixture(elevation_routes)] _group: &Group) {
     let mut out = String::new();
@@ -286,19 +286,21 @@ fn linked_token_chain_here(#[fixture(elevation_routes)] _group: &Group) {
 /// **Question 2, properly.** Derive a medium-integrity token from this process's own, start this
 /// binary under it, and read its report. The token is always synthesised (disable the
 /// Administrators SID, stamp the medium integrity label), never the genuine filtered token Windows
-/// made: on a split-admin session `TokenLinkedToken` is readable but comes back at identification
-/// level for a caller without `SeTcbPrivilege`, so it cannot be duplicated into a primary token
-/// (`DuplicateTokenEx` fails with 0x80070542). Synthesis is close but NOT identical to filtering.
+/// made: on a split-admin session `TokenLinkedToken` is readable but duplicating it into a primary
+/// token fails (`DuplicateTokenEx` returned 0x80070542 in a devvm guest with elevation_type=2,
+/// measured). Synthesis is close but NOT identical to filtering.
 ///
 /// What each host yields, by `TokenElevationType`:
 ///
 /// - Default (1), an admin account with no UAC split, such as a GitHub-hosted runner: a
 ///   lowered-integrity token that still reads `TokenIsElevated=true` (measured).
+/// - Default (1), a non-admin account: not filtered and not elevated, so `TokenIsElevated=false`
+///   is expected (not measured).
 /// - Full (2), an elevated session of a split-token admin, such as a `devvm ssh --elevated` guest
-///   session: also synthesised; synthesis does not clear `TokenIsElevated`, so the line below is
-///   the record of what this host gave.
-/// - Limited (3), or a non-admin account: derived from an already filtered token, so
-///   `TokenIsElevated=false` is expected.
+///   session (elevation_type=2 measured there): also synthesised; synthesis does not clear
+///   `TokenIsElevated`, so the line below is the record of what this host gave.
+/// - Limited (3), a split-token admin's filtered session: derived from an already filtered token,
+///   so `TokenIsElevated=false` is expected (not measured).
 ///
 /// The probe prints the provenance and the `TokenIsElevated` line, and labels its verdict by that
 /// flag; read them before trusting the report as an unelevated caller's.
@@ -315,8 +317,10 @@ fn unelevated_caller_view(#[fixture(elevation_routes)] _group: &Group) {
     );
 
     let medium = synthesise_medium_token(&own);
-    let provenance = "a SYNTHESISED medium token (derived from this process's own token)";
-    println!("PROBE unelevated-view: medium token provenance = {provenance}");
+    println!(
+        "PROBE unelevated-view: medium token provenance = a SYNTHESISED medium token (derived from \
+         this process's own token)"
+    );
 
     let mut report = String::new();
     describe(&mut report, "medium token about to be used", medium.0);
@@ -464,11 +468,11 @@ fn unelevated_caller_view(#[fixture(elevation_routes)] _group: &Group) {
     mark_test_passed(PROBE_MARKERS_ENV);
 }
 
-/// A medium-integrity token for an account that has no UAC split to borrow one from: disable the
-/// Administrators SID (what filtering does to the groups) and stamp the medium integrity label
-/// (what filtering does to the label). It is NOT a real filtered token — notably the privilege set
-/// is whatever `DISABLE_MAX_PRIVILEGE` leaves — so any result taken under it is weaker evidence,
-/// and the caller says so.
+/// A medium-integrity token derived from `own`, on every host: disable the Administrators SID (what
+/// filtering does to the groups) and stamp the medium integrity label (what filtering does to the
+/// label). It is NOT a real filtered token — notably the privilege set is whatever
+/// `DISABLE_MAX_PRIVILEGE` leaves, and `TokenIsElevated` is carried over from `own` — so any result
+/// taken under it is weaker evidence, and the caller says so.
 fn synthesise_medium_token(own: &Token) -> Token {
     let mut admins = PSID::default();
     // SAFETY: the standard S-1-5-32-544 construction; freed below.

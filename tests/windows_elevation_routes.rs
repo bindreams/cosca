@@ -26,8 +26,8 @@
 //!   logon, and it is where the unelevated answers come from. It needs a disposable host.
 //! - `token_filtering::unelevated_caller_view` derives a SYNTHESISED medium token from this
 //!   process's own (it never gets the genuine filtered token: on a split-admin session
-//!   `TokenLinkedToken` is identification-level for a caller without `SeTcbPrivilege` and cannot
-//!   be duplicated) and starts a child under it, needing no account. On a desktop over SSH the
+//!   duplicating `TokenLinkedToken` into a primary token failed with 0x80070542 in a devvm guest
+//!   with elevation type Full) and starts a child under it, needing no account. On a desktop over SSH the
 //!   lowered-integrity child can fail to open the caller's window station and die in loader init
 //!   (0xC0000142); on a GitHub runner it instead SUCCEEDS and produces a full report, so 0xC0000142
 //!   is a possible failure of this route, not its guaranteed outcome, and the probe fails loudly
@@ -36,10 +36,13 @@
 //!   synthesis does not clear it. What each host yields:
 //!   - a Default (non-split) admin token, such as a GitHub-hosted runner's: `TokenIsElevated=true`
 //!     (measured), so the child is a lowered-integrity ELEVATED caller, not an unelevated one;
-//!   - an elevated session of a split-token admin (elevation type Full): also synthesised, and the
-//!     probe's printed `TokenIsElevated` line is the record of what it gave;
-//!   - a Limited token or a non-admin account: derived from an already filtered token, so
-//!     `TokenIsElevated=false` is expected.
+//!   - a Default non-admin account: not filtered and not elevated, so `TokenIsElevated=false` is
+//!     expected (not measured);
+//!   - an elevated session of a split-token admin (elevation type Full, seen in a devvm guest):
+//!     also synthesised, and the probe's printed `TokenIsElevated` line is the record of what it
+//!     gave;
+//!   - a Limited token (a split-token admin's filtered session): derived from an already filtered
+//!     token, so `TokenIsElevated=false` is expected (not measured).
 //!
 //!   The probe prints and labels which case it measured; read its output before trusting its
 //!   report as the unelevated answer.
