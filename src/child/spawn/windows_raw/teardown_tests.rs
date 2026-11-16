@@ -26,6 +26,7 @@ use crate::child::owned::{ChildWaitOutcome, OwnedChild};
 use crate::child::spawn::held_teardown::tear_down_failed_spawn;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::Diagnosis;
+use crate::elevation::front::TrackedKind;
 use crate::error::ChildFate;
 use crate::identity::{refusing_the_next_terminate, HostKernel, Kernel, ProcessId};
 use crate::os_process::child::{ExitRecord, KillRefusal, OsChild};
@@ -56,7 +57,10 @@ impl Suspended {
         )
         .expect("spawn suspended");
         Suspended {
-            owned: OwnedChild::new(Box::new(WindowsProcess::for_child(HostKernel, proc, pid))),
+            owned: OwnedChild::new(
+                Box::new(WindowsProcess::for_child(HostKernel, proc, pid)),
+                TrackedKind::Own,
+            ),
             pid,
         }
     }
@@ -143,7 +147,7 @@ fn uac(handle: OwnedHandle, pid: u32) -> FakeProcess {
 
 /// An [`OwnedChild`] over `fake`, and `fake` for the test to read what it was asked.
 fn owned(fake: FakeProcess) -> (OwnedChild, FakeProcess) {
-    (OwnedChild::new(Box::new(fake.clone())), fake)
+    (OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own), fake)
 }
 
 /// An [`OwnedChild`] over a duplicate of `owner`'s handle whose box owns `kernel`, and the fake
@@ -421,7 +425,10 @@ fn an_untracked_uac_child_is_waited_for_and_a_refused_kill_hands_it_back() {
         };
 
         let owner = Suspended::spawn();
-        let child = OwnedChild::new(Box::new(process(owner.duplicate(), owner.pid)));
+        let child = OwnedChild::new(
+            Box::new(process(owner.duplicate(), owner.pid)),
+            TrackedKind::AnotherUser,
+        );
         let (cause, fate, unreaped) = ended(child, owner.pid);
         assert_eq!(
             fate,
@@ -441,7 +448,10 @@ fn an_untracked_uac_child_is_waited_for_and_a_refused_kill_hands_it_back() {
         }
 
         let owner = Suspended::spawn();
-        let child = OwnedChild::new(Box::new(process(owner.without_terminate_right(), owner.pid)));
+        let child = OwnedChild::new(
+            Box::new(process(owner.without_terminate_right(), owner.pid)),
+            TrackedKind::AnotherUser,
+        );
         let (cause, fate, unreaped) = ended(child, owner.pid);
         assert_eq!(fate, ChildFate::Running { id: None }, "(pid read: {pid_read})");
         if !pid_read {
@@ -578,7 +588,10 @@ fn a_failed_spawn_teardown_with_a_denied_terminate_hands_the_child_back() {
     let id = owner.id();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let child = OwnedChild::new(Box::new(uac_process(owner.without_terminate_right(), owner.pid)));
+    let child = OwnedChild::new(
+        Box::new(uac_process(owner.without_terminate_right(), owner.pid)),
+        TrackedKind::AnotherUser,
+    );
 
     let (fate, unreaped) = after_a_failed_spawn(child, Some(id), Past::Clean, Disposition::HandBack, None);
 
@@ -614,7 +627,10 @@ fn failed_spawn_cleanup(child: OwnedChild, id: Option<ProcessId>, past: Past) ->
 fn a_failed_spawn_teardown_with_a_denied_terminate_reports_the_refusal_as_its_cleanup() {
     let owner = Suspended::spawn();
     let id = owner.id();
-    let child = OwnedChild::new(Box::new(uac_process(owner.without_terminate_right(), owner.pid)));
+    let child = OwnedChild::new(
+        Box::new(uac_process(owner.without_terminate_right(), owner.pid)),
+        TrackedKind::AnotherUser,
+    );
 
     let Torn {
         fate,

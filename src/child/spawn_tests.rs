@@ -12,6 +12,8 @@ use super::policy::SpawnPolicy;
 #[cfg(target_os = "linux")]
 use crate::child::owned::OwnedChild;
 use crate::command::Command;
+#[cfg(target_os = "linux")]
+use crate::elevation::front::TrackedKind;
 use crate::error::ChildFate;
 use crate::error::Error;
 use crate::test_child::Console;
@@ -1073,6 +1075,7 @@ fn finish_elevated_words_a_root_its_delivered_kill_reached_by_how_the_wait_ended
 fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() {
     use crate::child::owned::teardown::Disposition;
     use crate::child::owned::OwnedChild;
+    use crate::elevation::front::TrackedKind;
     use crate::os_process::child::{ExitRecord, Foreign};
     use crate::os_process::fake::{FakeProcess, ReapAnswer};
 
@@ -1090,7 +1093,10 @@ fn finish_elevated_words_a_root_whose_kill_was_refused_by_what_the_look_found() 
         (ReapAnswer::Running, refusal()),
     ];
     for (reap, said) in rows {
-        let child = OwnedChild::new(Box::new(FakeProcess::new([]).with_pid(42).reaps([reap])));
+        let child = OwnedChild::new(
+            Box::new(FakeProcess::new([]).with_pid(42).reaps([reap])),
+            TrackedKind::Own,
+        );
         let denied = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         let looked = child.look_after_refused_kill(None, denied, Disposition::HandBack);
         assert_eq!(super::root_after_a_refused_kill(refusal(), looked.refused_look()), said);
@@ -1772,7 +1778,7 @@ fn resolve_identity_of_a_reaped_child_whose_pid_a_same_tick_reuser_holds_is_gone
         .live_without_pidfs(pid, pidfd.try_clone().expect("the pidfd duplicates"))
         .same_view()
         .on_read(&format!("{pid}/stat"), Ok(&look_alike));
-    let held = OwnedChild::over_pidfd(HostKernel, Some(pid), held_through(&kernel, pid));
+    let held = OwnedChild::over_pidfd(HostKernel, Some(pid), held_through(&kernel, pid), TrackedKind::Own);
     let (read, _, _) = super::resolve_identity(&kernel, pid, &held);
     assert!(
         matches!(read, Resolved::Gone),
@@ -1813,7 +1819,11 @@ fn resolve_identity_reads_the_held_pidfd_and_needs_no_second_open() {
     let (child, pidfd) = live_child_with_pidfd();
     let pid = child.id();
     let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(pid, Err(rustix::io::Errno::MFILE));
-    let (read, _, why) = super::resolve_identity(&kernel, pid, &OwnedChild::over_pidfd(HostKernel, Some(pid), pidfd));
+    let (read, _, why) = super::resolve_identity(
+        &kernel,
+        pid,
+        &OwnedChild::over_pidfd(HostKernel, Some(pid), pidfd, TrackedKind::Own),
+    );
     let Resolved::Found(id) = read else {
         panic!("the held pidfd answers whatever a second open would: {read:?}")
     };
@@ -1837,7 +1847,7 @@ fn resolve_identity_with_a_failing_fstat_on_the_held_pidfd_is_unknown() {
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(pid, Ok(pidfd.try_clone().expect("the pidfd duplicates")))
         .on_pidfs_ino(pid, Err(rustix::io::Errno::BADF));
-    let held = OwnedChild::over_pidfd(HostKernel, Some(pid), held_through(&kernel, pid));
+    let held = OwnedChild::over_pidfd(HostKernel, Some(pid), held_through(&kernel, pid), TrackedKind::Own);
     let (read, _, _) = super::resolve_identity(&kernel, pid, &held);
     assert!(matches!(read, Resolved::Unknown), "{read:?}");
 }
@@ -1855,7 +1865,7 @@ fn resolve_identity_with_a_held_pidfd_that_has_no_inode_reads_proc() {
     let pid = child.id();
     let kernel =
         FakeKernel::over(&HostKernel).live_without_pidfs(pid, pidfd.try_clone().expect("the pidfd duplicates"));
-    let held = OwnedChild::over_pidfd(HostKernel, Some(pid), held_through(&kernel, pid));
+    let held = OwnedChild::over_pidfd(HostKernel, Some(pid), held_through(&kernel, pid), TrackedKind::Own);
     let (read, _, _) = super::resolve_identity(&kernel, pid, &held);
     match read {
         Resolved::Found(id) => assert_eq!(id, crate::identity::ticks_id(pid)),
@@ -1892,7 +1902,7 @@ fn resolve_identity_of_a_reaped_child_is_gone() {
     let kernel = FakeKernel::over(&HostKernel)
         .on_pidfd_open(pid, Ok(pidfd.try_clone().expect("the pidfd duplicates")))
         .on_pidfs_ino(pid, Ok(Some(1)));
-    let held = OwnedChild::over_pidfd(HostKernel, Some(pid), held_through(&kernel, pid));
+    let held = OwnedChild::over_pidfd(HostKernel, Some(pid), held_through(&kernel, pid), TrackedKind::Own);
     let (read, _, _) = super::resolve_identity(&kernel, pid, &held);
     assert!(matches!(read, Resolved::Gone), "a reaped child is gone: {read:?}");
 }

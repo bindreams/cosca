@@ -33,6 +33,7 @@ use std::fmt;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::elevation::front::TrackedKind;
 use crate::error::Error;
 use crate::os_process::child::{ExitRecord, Foreign, OsChild, PeekOutcome};
 use crate::signal::{Sent, Sig};
@@ -146,6 +147,9 @@ pub(crate) enum ChildWaitOutcome {
 pub(crate) struct OwnedChild {
     /// Outside the mutex: the holder waits on the `WaitFor` its look returned with the lock released.
     os: Box<dyn OsChild>,
+    /// Who the tracked process is, as the spawn left it; the kill rule reads it
+    /// ([`kill_root`](OwnedChild::kill_root)).
+    kind: TrackedKind,
     inner: Mutex<Inner>,
     condvar: Condvar,
     /// The thread that holds `inner`, for [`OwnedChild::lock`]'s self-deadlock check.
@@ -156,10 +160,12 @@ pub(crate) struct OwnedChild {
 // Construction =====
 
 impl OwnedChild {
-    /// Take over `os`. **Makes no call to it**: an already-exited child is still a zombie afterwards.
-    pub(crate) fn new(os: Box<dyn OsChild>) -> OwnedChild {
+    /// Take over `os`, whose tracked process is `kind`. **Makes no call to it**: an already-exited
+    /// child is still a zombie afterwards.
+    pub(crate) fn new(os: Box<dyn OsChild>, kind: TrackedKind) -> OwnedChild {
         OwnedChild {
             os,
+            kind,
             inner: Mutex::new(Inner {
                 state: State::N,
                 next_token: 0,
@@ -180,10 +186,12 @@ impl OwnedChild {
         kernel: K,
         pid: Option<u32>,
         pidfd: std::os::fd::OwnedFd,
+        kind: TrackedKind,
     ) -> OwnedChild {
-        OwnedChild::new(Box::new(crate::os_process::linux::LinuxProcess::new(
-            kernel, pid, pidfd,
-        )))
+        OwnedChild::new(
+            Box::new(crate::os_process::linux::LinuxProcess::new(kernel, pid, pidfd)),
+            kind,
+        )
     }
 
     /// Take over the std `child`, whose identity `id` the caller has just read, through
@@ -197,8 +205,9 @@ impl OwnedChild {
     pub(crate) fn adopt(
         child: std::process::Child,
         id: crate::identity::ProcessId,
+        kind: TrackedKind,
     ) -> Result<OwnedChild, (Error, std::process::Child)> {
-        crate::os_process::child::adopt_std(child, id).map(OwnedChild::new)
+        crate::os_process::child::adopt_std(child, id).map(|os| OwnedChild::new(os, kind))
     }
 
     /// [`adopt`](Self::adopt) on macOS with the kernel `kernel(pid, unique)` makes, for a test whose
@@ -213,13 +222,19 @@ impl OwnedChild {
         kernel: impl FnOnce(u32, u64) -> K,
         child: std::process::Child,
         id: crate::identity::ProcessId,
+        kind: TrackedKind,
     ) -> Result<OwnedChild, (Error, std::process::Child)> {
-        crate::os_process::child::adopt_std_over(kernel, child, id).map(OwnedChild::new)
+        crate::os_process::child::adopt_std_over(kernel, child, id).map(|os| OwnedChild::new(os, kind))
     }
 
     /// The child's pid, if its spawn learned it; see [`OsChild::pid`].
     pub(crate) fn pid(&self) -> Option<u32> {
         self.os.pid()
+    }
+
+    /// Who the tracked process is. Wording only: kills are decided by [`kill_root`](OwnedChild::kill_root).
+    pub(crate) fn tracked_kind(&self) -> TrackedKind {
+        self.kind
     }
 
     /// A number that names this child's OS handle object and no other's, for as long as the child is

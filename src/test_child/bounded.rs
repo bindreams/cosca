@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
+use crate::elevation::front::TrackedKind;
 use crate::identity::ProcessId;
 use crate::os_process::child::ExitRecord;
 use crate::signal::Sig;
@@ -52,7 +53,7 @@ fn output_within(mut child: Child, bound: Duration) -> Result<Output, Output> {
     let id = ProcessId::of(child.id())
         .found()
         .expect("the live child has an identity");
-    let shared = Arc::new(OwnedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}")));
+    let shared = Arc::new(OwnedChild::adopt(child, id, TrackedKind::Own).unwrap_or_else(|(e, _)| panic!("adopt: {e}")));
     let (tx, rx) = channel();
     let waiter = {
         let shared = Arc::clone(&shared);

@@ -116,7 +116,7 @@ impl SuspendedChild {
                 child.commit_kill_on_drop().map_err(Error::from)
             }
             Err(e) => {
-                let behind_front = child.front().is_some();
+                let behind_front = child.proc.tracked_kind().front().is_some();
                 let torn_down = child.tear_down_or_hand_back(Disposition::Leave);
                 Err(Error::from(failed_after_teardown(
                     could_not_resume(e),

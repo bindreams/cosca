@@ -815,16 +815,18 @@ fn a_holders_only_kill_that_failed_takes_the_term_and_the_reason_as_peers() {
 #[skuld::test]
 fn a_pidfd_shutdown_that_failed_takes_the_reason_as_a_peer() {
     use crate::child::graceful::PidfdShutdown;
-    use crate::elevation::front::Gate;
     use crate::error::Error;
     let failed = |term: Error| {
-        PidfdShutdown::start(Gate::Open, || Err(term))
-            .expect("the gate is open")
+        let child = crate::child::owned::OwnedChild::new(
+            Box::new(crate::os_process::fake::FakeProcess::new([]).with_exact_consume(false)),
+            crate::elevation::front::TrackedKind::Own,
+        );
+        PidfdShutdown::start(&child, || Err(term))
+            .expect("the rule let the SIGTERM through")
             .finish(
                 &term_call("skip_peers_probe_d1"),
                 &skip(unsure(libc::EACCES)),
                 None,
-                || Gate::Open,
                 || Ok(crate::signal::Sent::Delivered),
             )
     };

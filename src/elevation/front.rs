@@ -26,7 +26,11 @@
 
 use std::io;
 
+use crate::child::owned::teardown::Reach;
+use crate::child::owned::OwnedChild;
 use crate::error::{ElevationErrorKind, Error, Failures};
+use crate::os_process::child::PeekOutcome;
+use crate::signal::{Sent, Sig};
 
 /// How a message names the elevation front `pid` (`None`: not known).
 pub(crate) fn front_named(pid: Option<u32>) -> String {
@@ -36,9 +40,209 @@ pub(crate) fn front_named(pid: Option<u32>) -> String {
     )
 }
 
+/// Who the process an [`OwnedChild`] tracks is, as the spawn left it. The box holds it, and its
+/// [`kill_root`](OwnedChild::kill_root) and [`terminate_by`](OwnedChild::terminate_by) apply the
+/// rule this module states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrackedKind {
+    /// This process's own child: a plain spawn, an already-elevated parent's child.
+    Own,
+    /// The program, running as another user (pkexec, UAC): a refused signal is `Unkillable`.
+    AnotherUser,
+    /// A front (sudo, doas, osascript): a wrapper that may outlive the program.
+    Front(Front),
+}
+
+impl TrackedKind {
+    /// The front this is, for the wording of a message and for the paths that end a child without
+    /// a box. No kill is decided from it.
+    pub(crate) fn front(self) -> Option<Front> {
+        match self {
+            TrackedKind::Front(front) => Some(front),
+            TrackedKind::Own | TrackedKind::AnotherUser => None,
+        }
+    }
+
+    /// Whether a signal to the tracked process may be refused because it runs as another user, so
+    /// the refusal is `Unkillable`: the program (pkexec, UAC), or a front that may be the program
+    /// itself (direct exec).
+    fn runs_as_another_user(self) -> bool {
+        match self {
+            TrackedKind::Own => false,
+            TrackedKind::AnotherUser => true,
+            TrackedKind::Front(front) => front.may_be_the_program(),
+        }
+    }
+
+    /// A refused signal to the tracked process, as the error the caller gets: `EPERM` (POSIX) and
+    /// `ACCESS_DENIED` (Windows) both read `PermissionDenied`; anything else stays `Io`.
+    fn refusal(self, err: io::Error) -> Error {
+        if self.runs_as_another_user() && err.kind() == io::ErrorKind::PermissionDenied {
+            Error::Elevation {
+                kind: ElevationErrorKind::Unkillable,
+                detail: "could not signal the elevated child".into(),
+                source: Some(Error::io_cause(err)),
+            }
+        } else {
+            Error::Io(err)
+        }
+    }
+}
+
+/// What the root is when the rule lets its own kill follow the caller's step
+/// ([`OwnedChild::kill_root`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KillNeed {
+    /// Not a front: its kill is sent as any child's.
+    ThenRoot,
+    /// A front that has exited: a refused kill of it is `Ok`.
+    Exited,
+}
+
+/// What the caller's step did, for a root the rule leaves to its containment: a live front in a
+/// cgroup the containment kill reaches. That kill is then the only kill, and nothing is sent to the
+/// root after it ([`OwnedChild::kill_root`]).
+pub(crate) enum AloneStep<K, A> {
+    /// The containment kill completed (`Ok`) or failed (`Err`, how). The rule reads after it whether
+    /// it reached the front.
+    Killed { result: Result<(), Error>, carry: K },
+    /// No containment kill completed: the rule answers that the front's cgroup was not killed.
+    NotKilled(K),
+    /// The caller answered: nothing is read or sent.
+    Answered(A),
+}
+
+/// What the caller's step did, for a root the rule lets its own kill follow ([`KillNeed`]).
+pub(crate) enum RootStep<R, A> {
+    /// The root's own kill follows.
+    ThenRoot(R),
+    /// The caller answered, or sends the root's kill itself: nothing is sent.
+    Answered(A),
+}
+
+/// What [`OwnedChild::kill_root`] came to, by which step it called.
+pub(crate) enum KillRootOutcome<K, R, A> {
+    /// The rule refused before any step (a live front nothing reaches).
+    Refused(Error),
+    /// An [`AloneStep`] other than `Answered`, and the rule's read after it: `Ok` if the kill
+    /// reached the front, else the refusal.
+    Contained { reached: Result<(), Error>, carry: K },
+    /// A [`RootStep::ThenRoot`], and the root's own kill's answer.
+    Root { sent: Result<Sent, Error>, carry: R },
+    /// The step answered: nothing was sent to the root.
+    Answered(A),
+}
+
+impl OwnedChild {
+    /// The forced kill, with the rule applied. `reach` says where a containment kill lands (`None`: no
+    /// containment that holds the root): the rule reads it before the kill to choose between a
+    /// containment-only kill and a refusal, and after a containment-only kill to read whether it
+    /// reached the front. At most one step is called, before anything is sent to the root: `alone`
+    /// for a live front in a cgroup (given the front), `then_root` otherwise.
+    pub(crate) fn kill_root<K, R, A>(
+        &self,
+        reach: Option<&dyn Reach>,
+        alone: impl FnOnce(Front) -> AloneStep<K, A>,
+        then_root: impl FnOnce(KillNeed) -> RootStep<R, A>,
+    ) -> KillRootOutcome<K, R, A> {
+        let pid = self.pid();
+        let placed = || reach.map_or(Ok(false), |reach| reach.would_reach(self));
+        let need = match kill_gate(self.tracked_kind().front(), pid, || self.running(), placed) {
+            Gate::Closed(refusal) => return KillRootOutcome::Refused(refusal),
+            Gate::CgroupOnly(front) => {
+                // Nothing is signalled after the cgroup kill: it could only be refused. Whether the
+                // kill landed is read through the front's place, not through `Reach::reached`: a front
+                // the kill ended and another thread reaped has no place left, and has exited.
+                let (reached, carry) = match alone(front) {
+                    AloneStep::Answered(answer) => return KillRootOutcome::Answered(answer),
+                    AloneStep::Killed { result: Ok(()), carry } => (
+                        cgroup_kill_reached(front, pid, || self.running().map(|running| !running), placed),
+                        carry,
+                    ),
+                    AloneStep::Killed { result: Err(e), carry } => (Err(cgroup_kill_failed(front, pid, e)), carry),
+                    AloneStep::NotKilled(carry) => (Err(cgroup_not_killed(front, pid)), carry),
+                };
+                return KillRootOutcome::Contained { reached, carry };
+            }
+            Gate::Open => KillNeed::ThenRoot,
+            Gate::Exited => KillNeed::Exited,
+        };
+        match then_root(need) {
+            RootStep::Answered(answer) => KillRootOutcome::Answered(answer),
+            RootStep::ThenRoot(carry) => KillRootOutcome::Root {
+                sent: self.send_kill(need == KillNeed::Exited),
+                carry,
+            },
+        }
+    }
+
+    /// [`kill_root`](Self::kill_root) for a caller with no containment kill to make: the root's own
+    /// kill, unless the rule refuses it. A live front in a cgroup is refused too, for this call kills
+    /// through none.
+    #[cfg(any(target_os = "linux", not(unix)))]
+    pub(crate) fn kill_root_only(&self, reach: Option<&dyn Reach>) -> Result<Sent, Error> {
+        let pid = self.pid();
+        let killed = self.kill_root(
+            reach,
+            |front| {
+                AloneStep::<std::convert::Infallible, _>::Answered(refused(
+                    front,
+                    pid,
+                    Signal::Kill,
+                    Some(Reason::words("this call kills through no cgroup")),
+                ))
+            },
+            |_| RootStep::ThenRoot(()),
+        );
+        match killed {
+            KillRootOutcome::Refused(refusal) | KillRootOutcome::Answered(refusal) => Err(refusal),
+            KillRootOutcome::Root { sent, .. } => sent,
+            KillRootOutcome::Contained { carry, .. } => match carry {},
+        }
+    }
+
+    /// A `SIGTERM` sent by the caller's `send` (a group or console signal the box does not hold),
+    /// unless the rule refuses it: a live osascript front is refused, and nothing is sent.
+    pub(crate) fn terminate_by<T>(&self, send: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        match terminate_gate(self.tracked_kind().front(), self.pid(), || self.running()) {
+            Gate::Closed(refusal) => Err(refusal),
+            Gate::Open | Gate::Exited => send(),
+            Gate::CgroupOnly(_) => {
+                debug_assert!(false, "a SIGTERM's gate never leaves a front to a cgroup kill");
+                send()
+            }
+        }
+    }
+
+    /// Whether the root runs, read without reaping it.
+    fn running(&self) -> io::Result<bool> {
+        let peeked = self.peek().map_err(Error::into_io)?;
+        Ok(matches!(peeked, PeekOutcome::Running))
+    }
+
+    /// The root's own kill through its handle: `Sent::Gone` once it has exited or been reaped, a
+    /// refusal mapped as the tracked kind says. An exited front's refusal is `Ok`: an exit is
+    /// permanent, so a refused signal to it changes nothing.
+    fn send_kill(&self, exited_front: bool) -> Result<Sent, Error> {
+        match self.signal(Sig::Kill).map_err(Error::into_io) {
+            Ok(sent) => Ok(sent),
+            Err(e) if exited_front && e.kind() == io::ErrorKind::PermissionDenied => {
+                log::debug!(
+                    "the kill of the exited {} was refused ({report})",
+                    front_named(self.pid()),
+                    report = crate::error::Report(&e)
+                );
+                Ok(Sent::Delivered)
+            }
+            Err(e) if exited_front => Err(Error::Io(e)),
+            Err(e) => Err(self.tracked_kind().refusal(e)),
+        }
+    }
+}
+
 /// How a signal to a child may go.
 #[derive(Debug)]
-pub(crate) enum Gate {
+enum Gate {
     /// Not a front: signal it like any child.
     Open,
     /// A front that has exited. A kill answers `Ok`, as for any exited child, even where the
@@ -52,7 +256,7 @@ pub(crate) enum Gate {
     Closed(Error),
 }
 
-/// A front, and what a signal to it does. A tag, so a `Child` holding one stays small.
+/// A front, and what a signal to it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Front {
     Sudo,
@@ -86,14 +290,13 @@ impl Front {
 /// about one that may run: one that cannot be read is taken to run. A front `in_cgroup` cannot
 /// place is asked `running` again: one that exited meanwhile, and that another thread's `wait`
 /// reaped, has no cgroup left to read.
-pub(crate) fn kill_gate(
+fn kill_gate(
     front: Option<Front>,
-    pid: u32,
+    pid: impl Into<Option<u32>>,
     running: impl Fn() -> io::Result<bool>,
     in_cgroup: impl FnOnce() -> Result<bool, Error>,
 ) -> Gate {
-    #[cfg(test)]
-    seams::note_kill_gate();
+    let pid = pid.into();
     let Some(front) = front else {
         return Gate::Open;
     };
@@ -103,8 +306,6 @@ pub(crate) fn kill_gate(
         Ok(true) => {}
         Err(e) => unread.push(("whether it had exited could not be read", Error::Io(e))),
     }
-    #[cfg(test)]
-    seams::run_between_gate_reads();
     let placed = in_cgroup();
     if !matches!(placed, Ok(true)) && matches!(running(), Ok(false)) {
         return Gate::Exited;
@@ -162,27 +363,19 @@ fn unread_reason(unread: Unread) -> Option<Reason> {
 /// a session scope: it was not killed, and the answer is `Unkillable`, so nothing waits for it. So
 /// is one whose place cannot be read: nothing shows the kill reached it. A front killed and then
 /// moved before it exited reads the same (see [`Command::contain`](crate::Command::contain)).
-pub(crate) fn cgroup_kill_reached(
+fn cgroup_kill_reached(
     front: Front,
-    pid: u32,
+    pid: impl Into<Option<u32>>,
     exited: impl Fn() -> io::Result<bool>,
     under_leaf: impl FnOnce() -> Result<bool, Error>,
 ) -> Result<(), Error> {
-    let exited = || {
-        #[cfg(test)]
-        if seams::reach_reads_running() {
-            return Ok(false);
-        }
-        exited()
-    };
+    let pid = pid.into();
     let mut unread = Unread::new();
     match exited() {
         Ok(true) => return Ok(()),
         Ok(false) => {}
         Err(e) => unread.push(("whether it had exited could not be read", Error::Io(e))),
     }
-    #[cfg(test)]
-    seams::run_between_reach_reads();
     let placed = under_leaf();
     if !matches!(placed, Ok(true)) && matches!(exited(), Ok(true)) {
         return Ok(());
@@ -207,7 +400,7 @@ pub(crate) fn cgroup_kill_reached(
 
 /// The refusal of a kill of the front `pid` whose cgroup kill failed with `error`: nothing else was
 /// sent, since a kill of the front itself would orphan its elevated program.
-pub(crate) fn cgroup_kill_failed(front: Front, pid: u32, error: Error) -> Error {
+fn cgroup_kill_failed(front: Front, pid: impl Into<Option<u32>>, error: Error) -> Error {
     let reason = Reason {
         words: "its cgroup kill failed".to_owned(),
         cause: Some(std::sync::Arc::new(error)),
@@ -217,7 +410,7 @@ pub(crate) fn cgroup_kill_failed(front: Front, pid: u32, error: Error) -> Error 
 
 /// The refusal alone, without the tree's failure; use [`cgroup_kill_failed`] where the failure is
 /// the cause.
-pub(crate) fn cgroup_not_killed(front: Front, pid: u32) -> Error {
+fn cgroup_not_killed(front: Front, pid: impl Into<Option<u32>>) -> Error {
     refused(
         front,
         pid,
@@ -228,7 +421,12 @@ pub(crate) fn cgroup_not_killed(front: Front, pid: u32) -> Error {
 
 /// The gate for a `SIGTERM` to the child `pid`, the `front` its spawn launched (if any): closed only
 /// for a live front that does not relay it. `running` is asked only about such a front.
-pub(crate) fn terminate_gate(front: Option<Front>, pid: u32, running: impl FnOnce() -> io::Result<bool>) -> Gate {
+fn terminate_gate(
+    front: Option<Front>,
+    pid: impl Into<Option<u32>>,
+    running: impl FnOnce() -> io::Result<bool>,
+) -> Gate {
+    let pid = pid.into();
     let Some(front) = front.filter(|f| !f.relays_term()) else {
         return Gate::Open;
     };
@@ -271,7 +469,7 @@ enum Signal {
     Term,
 }
 
-fn refused(front: Front, pid: u32, signal: Signal, why: Option<Reason>) -> Error {
+fn refused(front: Front, pid: impl Into<Option<u32>>, signal: Signal, why: Option<Reason>) -> Error {
     let what = match signal {
         Signal::Kill => "no kill",
         Signal::Term => "no SIGTERM",
@@ -290,107 +488,6 @@ fn refused(front: Front, pid: u32, signal: Signal, why: Option<Reason>) -> Error
         kind: ElevationErrorKind::Unkillable,
         detail,
         source,
-    }
-}
-
-/// Test seam counting kill-gate evaluations on this thread, so a test can show a kill path decides
-/// once and does not re-ask the gate after its cgroup kill. Thread-local, with an RAII reset.
-#[cfg(test)]
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "only the Linux cgroup lane's tests count gates")
-)]
-pub(crate) mod seams {
-    use std::cell::Cell;
-
-    thread_local! {
-        static GATES: Cell<Option<u32>> = const { Cell::new(None) };
-        static BETWEEN_GATE_READS: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-        static BETWEEN_REACH_READS: crate::oneshot_hook::OneShotHook = const { crate::oneshot_hook::OneShotHook::new() };
-        static REACH_READS_RUNNING: Cell<u32> = const { Cell::new(0) };
-    }
-
-    /// While the guard lives, the check of a cgroup kill on this thread reads the front as still
-    /// running at its first read of whether it exited, whatever the kill did to it: a front just
-    /// killed may or may not have exited by then, and a test of what the check does between its
-    /// reads needs one that has not.
-    pub(crate) fn read_front_running_at_the_first_reach_read() -> ReachReadsRunning {
-        REACH_READS_RUNNING.with(|f| f.set(1));
-        ReachReadsRunning(())
-    }
-
-    /// As [`read_front_running_at_the_first_reach_read`], at every read of the check: for a test of
-    /// what it does with a front it cannot place.
-    pub(crate) fn read_front_running_at_every_reach_read() -> ReachReadsRunning {
-        REACH_READS_RUNNING.with(|f| f.set(u32::MAX));
-        ReachReadsRunning(())
-    }
-
-    #[must_use = "fronts are read as they are again as soon as the guard is dropped"]
-    pub(crate) struct ReachReadsRunning(());
-
-    impl Drop for ReachReadsRunning {
-        fn drop(&mut self) {
-            REACH_READS_RUNNING.with(|f| f.set(0));
-        }
-    }
-
-    /// Whether the read now being made reads the front as running.
-    pub(super) fn reach_reads_running() -> bool {
-        REACH_READS_RUNNING.with(|f| {
-            let remaining = f.get();
-            if remaining != u32::MAX {
-                f.set(remaining.saturating_sub(1));
-            }
-            remaining > 0
-        })
-    }
-
-    /// Run `hook` once in the next kill gate on this thread, between its read of whether the front
-    /// runs and its read of the front's cgroup.
-    pub(crate) fn set_between_gate_reads(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
-        crate::oneshot_hook::arm(&BETWEEN_GATE_READS, hook)
-    }
-    pub(super) fn run_between_gate_reads() {
-        crate::oneshot_hook::fire(&BETWEEN_GATE_READS);
-    }
-
-    /// Run `hook` once in the next check of a cgroup kill on this thread, after the kill's write
-    /// and its read of whether the front exited, before its read of the front's cgroup.
-    pub(crate) fn set_between_reach_reads(hook: impl FnOnce() + 'static) -> crate::oneshot_hook::Armed {
-        crate::oneshot_hook::arm(&BETWEEN_REACH_READS, hook)
-    }
-    pub(super) fn run_between_reach_reads() {
-        crate::oneshot_hook::fire(&BETWEEN_REACH_READS);
-    }
-
-    /// From now on kill-gate evaluations on THIS thread are counted.
-    pub(crate) fn count_kill_gates() -> GateCounter {
-        GATES.with(|g| g.set(Some(0)));
-        GateCounter(())
-    }
-
-    #[must_use = "counting stops as soon as the counter is dropped"]
-    pub(crate) struct GateCounter(());
-
-    impl GateCounter {
-        pub(crate) fn count(&self) -> u32 {
-            GATES.with(|g| g.get().expect("the counter is live"))
-        }
-    }
-
-    impl Drop for GateCounter {
-        fn drop(&mut self) {
-            GATES.with(|g| g.set(None));
-        }
-    }
-
-    pub(super) fn note_kill_gate() {
-        GATES.with(|g| {
-            if let Some(n) = g.get() {
-                g.set(Some(n + 1));
-            }
-        });
     }
 }
 

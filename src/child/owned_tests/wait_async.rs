@@ -6,6 +6,7 @@ use std::process::{ChildStdin, ExitStatus};
 
 use super::fixtures::{identity_of, status};
 use crate::child::owned::{ChildWaitOutcome, OwnedChild};
+use crate::elevation::front::TrackedKind;
 use crate::os_process::child::ExitRecord;
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::tokio::drive::drive_tests::poll_once;
@@ -29,7 +30,7 @@ pub(super) fn exits_three_on_eof() -> (OwnedChild, ChildStdin) {
         .stdout(std::process::Stdio::null());
     let (child, stdin) = crate::test_child::StdChild::spawn(&mut command).into_parts();
     let id = identity_of(&child);
-    let owned = OwnedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let owned = OwnedChild::adopt(child, id, TrackedKind::Own).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     (owned, stdin)
 }
 
@@ -41,7 +42,7 @@ pub(super) fn exits_three_on_eof() -> (OwnedChild, ChildStdin) {
 #[skuld::test(runtime = crate::tokio::test_runtime::paused)]
 async fn wait_async_reaps_and_caches_the_record() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Recheck, ReapAnswer::Exited(exit())]);
-    let mut child = OwnedChild::new(Box::new(fake.clone()));
+    let mut child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     assert_eq!(child.wait_async().await.unwrap(), ChildWaitOutcome::Exited(exit()));
     assert_eq!(child.wait(None).unwrap(), ChildWaitOutcome::Exited(exit()));
     assert_eq!(fake.looks(), 2);
@@ -51,7 +52,7 @@ async fn wait_async_reaps_and_caches_the_record() {
 #[skuld::test]
 async fn wait_async_after_a_sync_wait_answers_from_the_cache() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
-    let mut child = OwnedChild::new(Box::new(fake.clone()));
+    let mut child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     child.wait(None).unwrap();
     assert_eq!(child.wait_async().await.unwrap(), ChildWaitOutcome::Exited(exit()));
     assert_eq!(fake.looks(), 1);
@@ -63,7 +64,7 @@ async fn wait_async_after_a_sync_wait_answers_from_the_cache() {
 async fn wait_async_pauses_on_tokio_s_timer_for_a_recheck() {
     crate::wait::block_probe::take();
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Recheck, ReapAnswer::Recheck, ReapAnswer::Exited(exit())]);
-    let mut child = OwnedChild::new(Box::new(fake));
+    let mut child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     child.wait_async().await.unwrap();
     let pauses: Vec<_> = crate::wait::block_probe::take()
         .into_iter()
@@ -109,6 +110,6 @@ async fn a_dropped_wait_async_leaves_nobody_waiting() {
 fn wait_async_is_send() {
     fn assert_send<T: Send>(_: &T) {}
 
-    let mut child = OwnedChild::new(Box::new(FakeProcess::new([])));
+    let mut child = OwnedChild::new(Box::new(FakeProcess::new([])), TrackedKind::Own);
     assert_send(&child.wait_async());
 }

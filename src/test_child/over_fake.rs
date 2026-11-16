@@ -7,6 +7,7 @@ use crate::child::owned::OwnedChild;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::containment::fake::FakeContains;
 use crate::containment::{Attachment, Containment, Mechanism, Tree};
+use crate::elevation::front::TrackedKind;
 use crate::graceful::GracefulMechanism;
 use crate::identity::{Key, ProcessId};
 use crate::os_process::child::ExitRecord;
@@ -22,7 +23,7 @@ const ABSENT_PID: u32 = 0x7fff_fffe;
 /// kill on drop. The fake answers [`ABSENT_PID`] to the child's pid, as its identity names it.
 pub(crate) fn child_over(fake: &FakeProcess) -> Child {
     Child::from_parts(
-        OwnedChild::new(Box::new(fake.clone().with_pid(ABSENT_PID))),
+        OwnedChild::new(Box::new(fake.clone().with_pid(ABSENT_PID)), TrackedKind::Own),
         Some(ProcessId::from_parts_for_test(ABSENT_PID, Key::for_test(1))),
         BTreeMap::new(),
         false,
@@ -90,7 +91,7 @@ pub(crate) fn live_member() -> (Child, crate::PipeWriter, ProcessId) {
 
 pub(crate) fn unreaped_over(fake: &FakeProcess, id: Option<ProcessId>) -> Unreaped {
     Unreaped::new(
-        OwnedChild::new(Box::new(fake.clone())),
+        OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own),
         id,
         false,
         SpawnPolicy::SYNC.unreaped_drop,

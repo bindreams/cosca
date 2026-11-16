@@ -338,6 +338,7 @@ fn a_front_with_no_pid_is_named_as_such() {
         crate::identity::HostKernel,
         None,
         pidfd.try_clone_to_owned().expect("dup the pidfd"),
+        crate::elevation::front::TrackedKind::Own,
     );
     let mark = crate::log_capture::mark();
 

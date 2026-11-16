@@ -187,9 +187,10 @@ fn a_subtree_places_a_child_through_the_kernel_its_box_owns() {
     let kernel = FakeKernel::over(&HostKernel)
         .same_view()
         .on_read(&format!("{STATED}/cgroup"), Ok(b"0::/leaf/inner\n"));
-    let child = OwnedChild::new(Box::new(
-        FakeProcess::new([]).with_pid(STATED).with_kernel(spawn_kernel(kernel)),
-    ));
+    let child = OwnedChild::new(
+        Box::new(FakeProcess::new([]).with_pid(STATED).with_kernel(spawn_kernel(kernel))),
+        crate::elevation::front::TrackedKind::Own,
+    );
     let subtree = Subtree::new(
         None,
         None,

@@ -238,7 +238,7 @@ fn start_over(fork: ForkFn, placement: Option<(&mut CgroupLeaf, bool)>) -> Resul
         crate::identity::spawn_kernel(crate::identity::HostKernel),
         OnFailure {
             policy: SpawnPolicy::SYNC,
-            front: None,
+            tracked: crate::elevation::front::TrackedKind::Own,
             placement,
             refusing_placement,
         },
@@ -360,7 +360,7 @@ fn start_placed_expecting(
         crate::identity::spawn_kernel(crate::identity::HostKernel),
         OnFailure {
             policy: SpawnPolicy::SYNC,
-            front: None,
+            tracked: crate::elevation::front::TrackedKind::Own,
             placement: Some(leaf),
             refusing_placement: expects_refusal,
         },
@@ -536,7 +536,7 @@ fn start_via_the_real_clone(leaf: &mut CgroupLeaf) -> Result<Started, SpawnFailu
         crate::identity::spawn_kernel(crate::identity::HostKernel),
         OnFailure {
             policy: SpawnPolicy::SYNC,
-            front: None,
+            tracked: crate::elevation::front::TrackedKind::Own,
             placement: Some(leaf),
             refusing_placement: false,
         },
@@ -576,7 +576,7 @@ fn an_unreadable_status_channel_is_a_started_spawn_with_a_warning() {
         crate::identity::spawn_kernel(crate::identity::HostKernel),
         OnFailure {
             policy: SpawnPolicy::SYNC,
-            front: None,
+            tracked: crate::elevation::front::TrackedKind::Own,
             placement: Some(&mut leaf),
             refusing_placement: false,
         },
@@ -733,7 +733,7 @@ fn start_with_an_unmovable_pidfd(
         crate::identity::spawn_kernel(crate::identity::HostKernel),
         OnFailure {
             policy: SpawnPolicy::SYNC,
-            front: None,
+            tracked: crate::elevation::front::TrackedKind::Own,
             placement: leaf,
             refusing_placement: false,
         },

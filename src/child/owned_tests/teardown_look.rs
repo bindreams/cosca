@@ -9,6 +9,7 @@ use std::time::Duration;
 use super::teardown::{due_now, exit, fake, fire_on_block, id, slow_warns, PID};
 use crate::child::owned::teardown::{FrontLook, LookOutcome, Reach};
 use crate::child::owned::OwnedChild;
+use crate::elevation::front::TrackedKind;
 use crate::error::{ChildFate, Error};
 use crate::identity::ProcessId;
 use crate::os_process::child::Foreign;
@@ -61,6 +62,10 @@ impl FakeReach {
 impl Reach for FakeReach {
     fn reached(&self, child: &OwnedChild) -> Result<bool, Error> {
         self.asked.borrow_mut().push(child.pid());
+        self.would_reach(child)
+    }
+
+    fn would_reach(&self, _child: &OwnedChild) -> Result<bool, Error> {
         self.answer.map_err(|failing| match failing {
             Failing::Kind(kind) => Error::Io(io::Error::from(kind)),
             Failing::Refused => refusal(),
@@ -80,7 +85,7 @@ fn look_logged(
     warn_after: Option<Duration>,
 ) -> (FrontLook, Vec<(log::Level, String)>) {
     crate::log_capture::install();
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     let mark = crate::log_capture::mark();
     let torn = child.look_at_front(id, reach, warn_after);
     (torn, crate::log_capture::records_since_on_current_thread(mark, ""))

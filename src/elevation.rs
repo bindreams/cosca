@@ -321,26 +321,23 @@ pub struct ElevationReport {
 }
 
 impl ElevationReport {
-    /// The front the spawn leaves this process tracking, if any: a backend whose elevated program
-    /// outlives it. pkexec execs the program, and UAC and an already-elevated parent track it, so
-    /// none.
-    pub(crate) fn front(&self) -> Option<front::Front> {
+    /// Who the process the spawn leaves this process tracking is. A backend whose elevated program
+    /// outlives the tracked process is a front (sudo, doas, osascript). pkexec execs the program and
+    /// UAC tracks it, so each is the program running as another user. An already-elevated parent's
+    /// child is an ordinary child of an already-root parent: killable.
+    pub(crate) fn tracked(&self) -> front::TrackedKind {
+        use front::{Front, TrackedKind};
         match self.via {
-            ElevatedVia::Wrapped(Backend::Sudo) => Some(front::Front::Sudo),
-            ElevatedVia::Wrapped(Backend::Doas) => Some(front::Front::Doas),
-            ElevatedVia::MacosOsascript => Some(front::Front::Osascript),
-            ElevatedVia::Wrapped(Backend::Pkexec) | ElevatedVia::WindowsUac | ElevatedVia::AlreadyElevated => None,
+            ElevatedVia::Wrapped(Backend::Sudo) => TrackedKind::Front(Front::Sudo),
+            ElevatedVia::Wrapped(Backend::Doas) => TrackedKind::Front(Front::Doas),
+            ElevatedVia::MacosOsascript => TrackedKind::Front(Front::Osascript),
+            ElevatedVia::Wrapped(Backend::Pkexec) | ElevatedVia::WindowsUac => TrackedKind::AnotherUser,
+            ElevatedVia::AlreadyElevated => TrackedKind::Own,
             ElevatedVia::Wrapped(Backend::Auto) => {
                 debug_assert!(false, "a report never names Auto");
-                None
+                TrackedKind::Own
             }
         }
-    }
-
-    /// Whether the tracked process may run as another user, so that a refused signal to it is
-    /// `Unkillable`. `AlreadyElevated` is an ordinary child of an already-root parent: killable.
-    pub(crate) fn may_run_as_another_user(&self) -> bool {
-        matches!(self.via, ElevatedVia::Wrapped(_) | ElevatedVia::WindowsUac)
     }
 }
 
@@ -382,22 +379,6 @@ pub(crate) fn already_elevated_report(stdio: ElevatedStdio) -> ElevationReport {
         via: ElevatedVia::AlreadyElevated,
         stripped_env: Vec::new(),
         stdio,
-    }
-}
-
-/// Map a raw kill/terminate `io::Error` on an ELEVATED wrapper child to the typed
-/// `Unkillable` error. EPERM (POSIX) and ACCESS_DENIED (Windows) both surface as
-/// `io::ErrorKind::PermissionDenied`; anything else, or a non-elevated child, stays `Io`.
-pub(crate) fn map_elevated_kill_error(err: std::io::Error, elevated_wrapper: bool) -> crate::error::Error {
-    use crate::error::{ElevationErrorKind, Error};
-    if elevated_wrapper && err.kind() == std::io::ErrorKind::PermissionDenied {
-        Error::Elevation {
-            kind: ElevationErrorKind::Unkillable,
-            detail: "could not signal the elevated child".into(),
-            source: Some(Error::io_cause(err)),
-        }
-    } else {
-        Error::Io(err)
     }
 }
 

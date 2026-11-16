@@ -254,11 +254,10 @@ pub(crate) async fn root_through_pidfd<W: Waits>(w: &W, skip: &crate::containmen
         crate::containment::dispatch::TreeSignal::Term,
         None,
     );
-    let shutdown =
-        match super::PidfdShutdown::start(child.terminate_gate(), || child.proc.signal(crate::signal::Sig::Term)) {
-            Ok(shutdown) => shutdown,
-            Err(unkillable) => return unkillable,
-        };
+    let shutdown = match super::PidfdShutdown::start(&child.proc, || child.proc.signal(crate::signal::Sig::Term)) {
+        Ok(shutdown) => shutdown,
+        Err(unkillable) => return unkillable,
+    };
     #[cfg(test)]
     fault::run_hook(fault::HookPoint::AfterTerminate);
     let exited = if shutdown.needs_grace() {
@@ -266,17 +265,7 @@ pub(crate) async fn root_through_pidfd<W: Waits>(w: &W, skip: &crate::containmen
     } else {
         None
     };
-    shutdown.finish(
-        &call,
-        skip,
-        exited,
-        || child.kill_gate(),
-        || {
-            child
-                .kill_root()
-                .map_err(|e| crate::elevation::map_elevated_kill_error(e, child.may_run_as_another_user()))
-        },
-    )
+    shutdown.finish(&call, skip, exited, || child.proc.kill_root_only(Some(&child.tree)))
 }
 
 /// [`TerminateOutcome::HoldersOnly`](crate::containment::TerminateOutcome::HoldersOnly), `skip` what it

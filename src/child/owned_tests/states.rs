@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use super::fixtures::{assert_handed_off, owned_over, park_holder, spawn_waiter, status, try_wait};
 use crate::child::owned::seams;
 use crate::child::owned::{ChildWaitOutcome, OwnedChild, State};
+use crate::elevation::front::TrackedKind;
 use crate::error::Error;
 use crate::os_process::child::{ExitRecord, Foreign, PeekOutcome};
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
@@ -134,7 +135,7 @@ fn a_second_wait_blocks_behind_the_holder() {
 #[skuld::test]
 fn a_look_reaps_an_exited_child_once() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     let first = status(try_wait(&child));
     let second = status(try_wait(&child));
     assert_eq!(first, second);
@@ -149,7 +150,7 @@ fn a_look_reaps_an_exited_child_once() {
 #[skuld::test]
 fn exit_seen_only_once_the_record_is_found() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     assert!(!child.exit_seen());
     assert_eq!(try_wait(&child).expect("try_wait"), ChildWaitOutcome::DeadlinePassed);
     assert!(!child.exit_seen(), "a look that found the child running is not an exit");
@@ -163,7 +164,7 @@ fn exit_seen_only_once_the_record_is_found() {
 #[skuld::test]
 fn a_look_that_fails_returns_the_error_and_stays_n() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Err(KIND), ReapAnswer::Exited(exit())]);
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     let err = try_wait(&child).expect_err("the scripted failure");
     assert!(is_the_scripted_failure(&err), "{err:?}");
     assert!(matches!(child.lock().state, State::N));
@@ -388,7 +389,7 @@ fn a_non_holder_peek_that_is_foreign_returns_it_and_writes_nothing() {
 #[skuld::test]
 fn an_exit_is_seen_once_under_the_lock() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     let first = status(child.wait(None));
     assert_eq!(status(child.wait(None)), first);
     assert_eq!(fake.looks(), 1);
@@ -494,7 +495,7 @@ fn an_expired_holder_hands_off_to_a_blocked_wait() {
 #[skuld::test]
 fn a_holder_that_sees_a_foreign_reap_returns_it_and_restores_n() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Foreign(Foreign::Gone)]);
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     assert_eq!(
         child.wait(None).expect("foreign"),
         ChildWaitOutcome::Foreign(Foreign::Gone)
@@ -568,7 +569,7 @@ fn a_recheck_backs_off_until_the_zombie_shows() {
         ReapAnswer::Recheck,
         ReapAnswer::Exited(exit()),
     ]);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     crate::wait::block_probe::take();
     status(child.wait(None));
     let pauses = crate::wait::block_probe::take();
@@ -635,7 +636,7 @@ fn a_holder_blocked_on_its_wait_wakes_when_signalled() {
 #[skuld::test]
 fn a_foreign_reap_is_cached_as_nothing_and_wait_stays_n() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Foreign(Foreign::Gone), ReapAnswer::Exited(exit())]);
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     assert_eq!(
         child.wait(None).expect("foreign"),
         ChildWaitOutcome::Foreign(Foreign::Gone)
@@ -651,7 +652,7 @@ fn a_foreign_reap_is_cached_as_nothing_and_wait_stays_n() {
 #[skuld::test]
 fn exited_by_looks_through_exited_and_reaps_nothing() {
     let fake = FakeProcess::new([crate::os_process::fake::Answer::Exited]);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     assert!(child.exited_by(None).expect("exited_by"));
     assert_eq!(fake.looks(), 1);
     assert!(!child.exit_seen());
@@ -665,7 +666,7 @@ fn exited_by_looks_through_exited_and_reaps_nothing() {
 #[skuld::test]
 fn a_cached_status_never_reaches_the_os() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     let first = status(child.wait(None));
     assert_eq!(status(child.wait(None)), first);
     assert_eq!(status(child.wait(Some(far()))), first);
@@ -679,7 +680,7 @@ fn a_cached_status_never_reaches_the_os() {
 #[skuld::test]
 fn signal_after_the_reap_sends_nothing() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     status(child.wait(None));
     assert_eq!(
         child.signal(Sig::Kill).expect("an already-reaped child is success"),
@@ -696,7 +697,7 @@ fn signal_after_the_reap_sends_nothing() {
 #[skuld::test]
 fn a_held_signal_after_our_own_reap_is_gone() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     status(child.wait(None));
     assert_eq!(
         child
@@ -715,7 +716,7 @@ fn a_held_signal_after_our_own_reap_is_gone() {
 #[skuld::test]
 fn a_wait_consumes_nothing_and_the_drop_reaps_once() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     status(child.wait(None));
     status(child.wait(None));
     assert_eq!(fake.reap_calls(), 0, "a wait consumed the exit record");
@@ -734,7 +735,7 @@ fn a_zombie_reaped_elsewhere_after_the_wait_reads_as_a_foreign_reap() {
     let fake = FakeProcess::new([])
         .reaps([ReapAnswer::Exited(exit())])
         .peeks([Ok(PeekOutcome::Foreign(Foreign::Gone))]);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     status(child.wait(None));
     assert!(matches!(child.state(), RootState::Reaped), "{:?}", child.state());
 }
@@ -747,7 +748,7 @@ fn a_zombie_reaped_elsewhere_after_the_wait_reads_as_a_foreign_reap() {
 #[skuld::test]
 fn adopt_never_reaps() {
     let fake = FakeProcess::new([]);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     assert_eq!(fake.looks(), 0);
     assert!(!child.exit_seen());
 }
@@ -775,7 +776,7 @@ fn adopt_never_reaps_a_zombie() {
     };
     assert_eq!(r, 0, "waitid(WNOWAIT): {}", std::io::Error::last_os_error());
 
-    let owned = OwnedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let owned = OwnedChild::adopt(child, id, TrackedKind::Own).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     // Still a zombie: a non-consuming look finds its exit record.
     // SAFETY: as above.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -832,7 +833,7 @@ fn the_exit_is_recorded_as_soon_as_the_look_sees_it() {
         let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
         #[cfg(unix)]
         let fake = fake.peeks([Ok(PeekOutcome::Exit(exit()))]);
-        let child = OwnedChild::new(Box::new(fake));
+        let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
         let (gate, reached, release) = seams::park_gate();
         std::thread::scope(|scope| {
             let a = scope.spawn(|| {
@@ -863,7 +864,7 @@ fn the_state_stays_the_oss_answer_once_a_look_returns_the_record() {
     let fake = FakeProcess::new([])
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Exit(exit()))]);
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     assert_eq!(try_wait(&child).expect("try_wait"), ChildWaitOutcome::DeadlinePassed);
     assert!(matches!(child.hold(UNREAD_PID).state(), RootState::Unreaped));
     assert!(!child.exit_seen());
@@ -884,7 +885,7 @@ fn a_hold_checks_the_roots_group_by_its_own_state() {
     use crate::containment::check_number;
     use crate::identity::Resolved;
     let fake = FakeProcess::new([]).peeks([Ok(PeekOutcome::Running), Ok(PeekOutcome::Foreign(Foreign::Gone))]);
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     let check = || check_number(Some(&child.hold(UNREAD_PID))).map_err(|why| why.to_string());
     assert_eq!(check(), Ok(()));
     let refused = check().expect_err("reaped elsewhere");
@@ -894,7 +895,7 @@ fn a_hold_checks_the_roots_group_by_its_own_state() {
         .reaps([ReapAnswer::Exited(exit())])
         .peeks([Ok(PeekOutcome::Exit(exit()))])
         .number_reads_always(Resolved::Gone);
-    let child = OwnedChild::new(Box::new(fake));
+    let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     status(child.wait(None));
     let check = || check_number(Some(&child.hold(UNREAD_PID))).map_err(|why| why.to_string());
     assert_eq!(

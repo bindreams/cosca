@@ -99,30 +99,8 @@ fn remap_backend_missing_is_backend_unavailable_with_cause() {
     }
 }
 
-/// A permission refusal (`ERROR_ACCESS_DENIED`, `EACCES`), the kind both mappers act on.
-const OS_CODE: i32 = if cfg!(windows) { 5 } else { 13 };
-
-#[skuld::test]
-fn an_unkillable_error_has_the_refusal_as_its_cause() {
-    use crate::error::{ElevationErrorKind, Error};
-    let refusal = std::io::Error::from_raw_os_error(OS_CODE);
-    assert_eq!(
-        refusal.kind(),
-        std::io::ErrorKind::PermissionDenied,
-        "the test's code is a refusal"
-    );
-    let text = refusal.to_string();
-    let e = super::map_elevated_kill_error(refusal, true);
-    assert_eq!(crate::error::first_os_code(&e), Some(OS_CODE), "{e:?}");
-    match e {
-        Error::Elevation {
-            kind: ElevationErrorKind::Unkillable,
-            detail,
-            ..
-        } => assert!(!detail.contains(&text), "the cause is in the detail: {detail}"),
-        other => panic!("expected Unkillable, got {other:?}"),
-    }
-}
+/// A permission refusal (`ERROR_ACCESS_DENIED`, `EACCES`), the kind the mapper acts on.
+pub(crate) const OS_CODE: i32 = if cfg!(windows) { 5 } else { 13 };
 
 #[skuld::test]
 fn a_backend_unavailable_error_has_the_failed_exec_as_its_cause() {
@@ -321,37 +299,6 @@ fn detect_reports_macos() {
         "a macOS host must resolve /usr/bin/osascript"
     );
     assert!(h.arg_max.is_some(), "kern.argmax must be readable on macOS");
-}
-
-#[skuld::test]
-fn kill_error_on_an_elevated_wrapper_is_unkillable() {
-    use crate::error::{ElevationErrorKind, Error};
-    let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-    let e = super::map_elevated_kill_error(eperm, /* elevated_wrapper */ true);
-    assert!(
-        matches!(
-            e,
-            Error::Elevation {
-                kind: ElevationErrorKind::Unkillable,
-                ..
-            }
-        ),
-        "{e:?}"
-    );
-}
-
-#[skuld::test]
-fn kill_error_on_a_plain_child_stays_io() {
-    use crate::error::Error;
-    let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-    assert!(matches!(super::map_elevated_kill_error(eperm, false), Error::Io(_)));
-}
-
-#[skuld::test]
-fn non_permission_kill_error_stays_io_even_when_elevated() {
-    use crate::error::Error;
-    let other = std::io::Error::from(std::io::ErrorKind::NotFound);
-    assert!(matches!(super::map_elevated_kill_error(other, true), Error::Io(_)));
 }
 
 /// Every backend's argv gate is this one function; only the words differ. A program set by

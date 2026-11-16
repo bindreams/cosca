@@ -3,7 +3,7 @@
 use crate::pipe::{ParentEnd, PipeReader, PipeWriter};
 use std::collections::BTreeMap;
 
-use crate::child::owned::teardown::Disposition;
+use crate::child::owned::teardown::{Disposition, Reach};
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::command::Command;
 #[cfg(unix)]
@@ -11,6 +11,7 @@ use crate::containment::dispatch::TreeSignal;
 use crate::containment::dispatch::{Keeping, SweepFailure, Swept, TeardownCaller, TreeKillOutcome};
 use crate::containment::treewalk::WalkToken;
 use crate::containment::{Containment, TerminateOutcome};
+use crate::elevation::front::{AloneStep, KillNeed, KillRootOutcome, RootStep};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::stdio::Fd;
@@ -135,6 +136,38 @@ enum KillTree {
     SendOnly,
 }
 
+/// What a sweep's kill of the tree leaves for the rest of the sweep when the root's own kill follows
+/// it ([`Child::sweep_tree`]).
+enum Followed<'a> {
+    /// The mechanism skipped the kill: the root's own kill is part of the skip's answer.
+    #[cfg(unix)]
+    Skipped(crate::containment::Skip, crate::containment::KillWait<'a>),
+    /// The root's own kill is the backstop of a walk that was made.
+    Backstop {
+        walked: TreeKillOutcome,
+        wait: crate::containment::KillWait<'a>,
+    },
+}
+
+/// What a sweep's kill of the tree leaves for the rest of the sweep when no kill of the root follows
+/// it ([`Child::sweep_tree`]).
+enum Unsent<'a> {
+    /// No backstop: `outcome` is settled with what `keeping` says.
+    NoBackstop {
+        outcome: TreeKillOutcome,
+        keeping: Keeping,
+        wait: crate::containment::KillWait<'a>,
+    },
+    /// The mechanism skipped the kill, and the skip leaves the root's handle no kill to send.
+    #[cfg(unix)]
+    Skipped(crate::containment::Skip, crate::containment::KillWait<'a>),
+    /// A walk was made, and launchd holds the root's zombie, so no backstop was sent.
+    Unpinned {
+        walked: TreeKillOutcome,
+        wait: crate::containment::KillWait<'a>,
+    },
+}
+
 /// A spawned child process the crate owns.
 #[derive(Debug)]
 pub struct Child {
@@ -148,7 +181,8 @@ pub struct Child {
     /// The tree this handle owns, and where it stands after its kills; see [`crate::containment::Tree`].
     pub(crate) tree: crate::containment::Tree,
     graceful: crate::graceful::GracefulMechanism,
-    /// What the spawn achieved; [`Child::front`] reads the front from it.
+    /// What the spawn achieved; the box holds who the tracked process is
+    /// ([`OwnedChild::tracked_kind`]).
     elevation: Option<crate::elevation::ElevationReport>,
     /// What a failed-spawn cleanup already warned of, so the drop reports a repeat of it at `debug`
     /// and anything new at `warn`
@@ -185,6 +219,14 @@ impl Child {
             id.is_none_or(|id| proc.pid() == Some(id.pid())),
             "a child's process and identity name one pid"
         );
+        debug_assert_eq!(
+            proc.tracked_kind(),
+            elevation.as_ref().map_or(
+                crate::elevation::front::TrackedKind::Own,
+                crate::elevation::ElevationReport::tracked
+            ),
+            "the box tracks who the report says the spawn left tracked"
+        );
         Child {
             proc: ChildSlot::new(proc),
             id,
@@ -215,7 +257,7 @@ impl Child {
         match self.try_commit_kill_on_drop() {
             Ok(()) => Ok(self),
             Err(refusal) => {
-                let behind_front = self.front().is_some();
+                let behind_front = self.proc.tracked_kind().front().is_some();
                 Err(refused_commit(
                     refusal,
                     behind_front,
@@ -342,22 +384,6 @@ impl Child {
         self.wait_root(Some(crate::wait::now()), lifecycle::Orphaned::Quiet)
     }
 
-    /// The elevation front this child is, if any (see [`crate::elevation::front`]). The kill and
-    /// `SIGTERM` gates read it.
-    pub(crate) fn front(&self) -> Option<crate::elevation::front::Front> {
-        self.elevation
-            .as_ref()
-            .and_then(crate::elevation::ElevationReport::front)
-    }
-
-    /// Whether this child's tracked process may run as another user, so a refused signal to it is
-    /// `Unkillable` (see [`ElevationReport::may_run_as_another_user`](crate::elevation::ElevationReport::may_run_as_another_user)).
-    pub(crate) fn may_run_as_another_user(&self) -> bool {
-        self.elevation
-            .as_ref()
-            .is_some_and(crate::elevation::ElevationReport::may_run_as_another_user)
-    }
-
     /// Hard-kill the process. Returns `Ok(())` if already dead. Unlike
     /// [`Process::kill`](crate::Process::kill), which acts through a handle opened earlier, this
     /// signals through the child's own handle, so a refused Linux `pidfd_open` cannot fail it.
@@ -406,42 +432,49 @@ impl Child {
         {
             self.kill_sent(earlier).map(drop)
         }
-        #[cfg(not(unix))]
-        let _ = earlier;
         // Returns Ok(()) for an already-exited child (std delegates to std::process::Child::kill;
         // the raw path maps an already-dead TerminateProcess to Ok). ACCESS_DENIED on a UAC child
         // becomes the typed `Unkillable`.
         #[cfg(not(unix))]
         {
-            self.kill_root()
-                .map(drop)
-                .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user()))
+            let _ = earlier;
+            self.proc.kill_root_only(None).map(drop)
         }
-    }
-
-    /// Hard-kill the root through its handle ([`Sent::Gone`](crate::signal::Sent) once it has exited
-    /// or been reaped), with the OS's error as it gave it.
-    pub(crate) fn kill_root(&self) -> std::io::Result<crate::signal::Sent> {
-        self.proc.signal(crate::signal::Sig::Kill).map_err(Error::into_io)
-    }
-
-    /// Whether the root is running, read without reaping it, for the elevation front's gates.
-    #[cfg(unix)]
-    fn root_running(&self) -> std::io::Result<bool> {
-        let peeked = self.proc.peek().map_err(Error::into_io)?;
-        Ok(matches!(peeked, crate::os_process::child::PeekOutcome::Running))
     }
 
     /// [`kill_after`](Child::kill_after), reporting whether a signal was sent (see [`Sent`](crate::signal::Sent)).
     #[cfg(unix)]
     pub(crate) fn kill_sent(&self, earlier: Option<&str>) -> Result<crate::signal::Sent, Error> {
-        let gate = self.kill_gate();
         // A front's refusal is permanent and says nothing of the pid, so it outranks a root launchd
-        // holds, which the caller can do nothing about either way.
-        if !matches!(gate, crate::elevation::front::Gate::Closed(_)) {
-            self.refuse_unpinned("kill", earlier)?;
+        // holds, which the caller can do nothing about either way: the rule asks the step only
+        // after it refused.
+        let killed = self.proc.kill_root(
+            Some(&self.tree),
+            |_| match self.refuse_unpinned("kill", earlier) {
+                Err(refused) => AloneStep::Answered(refused),
+                Ok(()) => {
+                    debug_assert_eq!(
+                        self.containment(),
+                        Containment::CgroupV2,
+                        "a front the rule leaves to its containment is in a cgroup"
+                    );
+                    // A cgroup kill names no group by the root's pid, so no root is given.
+                    AloneStep::Killed {
+                        result: self.tree.kill_settled(None),
+                        carry: (),
+                    }
+                }
+            },
+            |_| match self.refuse_unpinned("kill", earlier) {
+                Err(refused) => RootStep::Answered(refused),
+                Ok(()) => RootStep::ThenRoot(()),
+            },
+        );
+        match killed {
+            KillRootOutcome::Refused(refused) | KillRootOutcome::Answered(refused) => Err(refused),
+            KillRootOutcome::Contained { reached, .. } => reached.map(|()| crate::signal::Sent::Delivered),
+            KillRootOutcome::Root { sent, .. } => sent,
         }
-        self.kill_sent_gated(gate)
     }
 
     /// Refuse `op` while the root is not pinned by this process (macOS: launchd holds its zombie).
@@ -458,80 +491,6 @@ impl Child {
         return crate::signal::is_unpinned(|| self.proc.state());
         #[cfg(not(unix))]
         false
-    }
-
-    /// [`kill_sent`](Child::kill_sent) under `gate`, this child's [`kill_gate`](Child::kill_gate)
-    /// read by the caller.
-    #[cfg(unix)]
-    pub(crate) fn kill_sent_gated(&self, gate: crate::elevation::front::Gate) -> Result<crate::signal::Sent, Error> {
-        use crate::elevation::front::Gate;
-        match gate {
-            Gate::Open => {}
-            // An exit is permanent, so a refused signal to an exited front changes nothing.
-            Gate::Exited => {
-                return match self.kill_root() {
-                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        log::debug!(
-                            "the kill of exited front pid {} was refused ({report})",
-                            self.pid(),
-                            report = crate::error::Report(&e)
-                        );
-                        Ok(crate::signal::Sent::Delivered)
-                    }
-                    other => other.map_err(Error::Io),
-                }
-            }
-            // Nothing is signalled after the cgroup kill: it could only be refused.
-            Gate::CgroupOnly(front) => {
-                // A cgroup kill names no group by the root's pid, so no root is given.
-                debug_assert_eq!(
-                    self.containment(),
-                    Containment::CgroupV2,
-                    "CgroupOnly is a front in a cgroup"
-                );
-                self.tree
-                    .kill_settled(None)
-                    .map_err(|e| crate::elevation::front::cgroup_kill_failed(front, self.pid(), e))?;
-                self.cgroup_kill_reached(front)?;
-                return Ok(crate::signal::Sent::Delivered);
-            }
-            Gate::Closed(unkillable) => return Err(unkillable),
-        }
-        // A plain child returns Ok(()) once exited. EPERM on an elevated wrapper child becomes
-        // the typed `Unkillable`.
-        self.kill_root()
-            .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user()))
-    }
-
-    /// What a forced kill of this child may do (see [`crate::elevation::front`]).
-    #[cfg(unix)]
-    pub(crate) fn kill_gate(&self) -> crate::elevation::front::Gate {
-        let pid = self.pid();
-        crate::elevation::front::kill_gate(
-            self.front(),
-            pid,
-            || self.root_running(),
-            || self.tree.would_reach(pid, self.proc.pidfd()),
-        )
-    }
-
-    /// Whether a cgroup kill just written reached this child's tracked process, the `front` (see
-    /// [`crate::elevation::front::cgroup_kill_reached`]).
-    #[cfg(unix)]
-    fn cgroup_kill_reached(&self, front: crate::elevation::front::Front) -> Result<(), Error> {
-        let pid = self.pid();
-        crate::elevation::front::cgroup_kill_reached(
-            front,
-            pid,
-            || self.root_running().map(|running| !running),
-            || self.tree.would_reach(pid, self.proc.pidfd()),
-        )
-    }
-
-    /// What a `SIGTERM` to this child may do (see [`crate::elevation::front`]).
-    #[cfg(unix)]
-    pub(crate) fn terminate_gate(&self) -> crate::elevation::front::Gate {
-        crate::elevation::front::terminate_gate(self.front(), self.pid(), || self.root_running())
     }
 
     /// Hard-kill the contained tree. Requires an actionable containment mechanism
@@ -737,96 +696,114 @@ impl Child {
         if let Err(e) = self.require_contained() {
             return Swept::unwaited(op, Err(e.into()));
         }
-        // Decided once: the gate is not asked again after the kill, when a killed front may read as
-        // neither exited nor in its cgroup. It comes before the root's state: a front
-        // that may not be signalled is refused whatever the root's number names.
-        #[cfg(unix)]
-        let front = match self.kill_gate() {
-            crate::elevation::front::Gate::Closed(unkillable) => return Swept::unwaited(op, Err(unkillable.into())),
-            crate::elevation::front::Gate::Open => None,
-            crate::elevation::front::Gate::Exited => Some(None),
-            crate::elevation::front::Gate::CgroupOnly(front) => Some(Some(front)),
-        };
         // The mechanism looks at the root right before it sends by the root's number, and sends the
         // root its own signal through this handle.
         let root_handle = self.proc.hold(self.pid());
+        #[cfg(unix)]
+        let reach: Option<&dyn Reach> = Some(&self.tree);
+        #[cfg(not(unix))]
+        let reach: Option<&dyn Reach> = None;
+        // The rule decides once, before the tree is killed: a front that may not be signalled is
+        // refused whatever the root's number names, and its tree is not killed.
         let root: Option<&dyn crate::containment::Root> = Some(&root_handle);
         // What the settlement kills again is waited for with what the send reached.
-        let (group_result, mut wait) = match kind {
+        let kill_tree = || match kind {
             KillTree::Waiting => self.tree.kill(root).split(),
             KillTree::SendOnly => (self.tree.send_kill(root), crate::containment::KillWait::none()),
         };
-        #[cfg(unix)]
-        let group_result = match group_result {
-            // An answer that needs no kill ends the call: no backstop.
-            answered @ TreeKillOutcome::Answered(_) => {
-                return self.settled_sweep(op, answered, Keeping::Nothing, wait, std::convert::identity);
-            }
-            TreeKillOutcome::Skipped(skip) => {
-                // The root's handle names the root even when its number is reused; its kill ends the
-                // root.
-                let sent = skip.root_alone.then(|| {
-                    root_handle
-                        .signal(crate::signal::Sig::Kill)
-                        .map_err(Error::into_io)
-                        .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user()))
-                });
-                let root_ended = sent.as_ref().is_some_and(SweepFailure::killed_root);
-                let answered = self
-                    .skip_call(op, TreeSignal::Kill, earlier)
-                    .answer(&self.tree, skip, sent);
-                wait.reaching(answered.killed_again);
-                return Swept::new(
-                    op,
-                    answered.answer.map_err(|error| SweepFailure { error, root_ended }),
-                    wait.with_root(self.proc.os_process(), self.pid(), root_ended),
-                );
-            }
-            other => other,
-        };
-        // A walk not made runs no backstop: it would end a root that a retry walks from. The settlement
-        // answers the walk's error, and keeps the members it holds while this handle sees the root running
-        // (the retry's walk from it reaches them and what they forked), or kills them once it has exited.
-        let group_result = match group_result {
-            unwalked @ TreeKillOutcome::Unwalked(_) => {
-                return self.settled_sweep(op, unwalked, self.keeping_over_unwalked(), wait, std::convert::identity);
-            }
-            walked => walked,
-        };
-        // A front in the cgroup: a signal after its kill could only be refused, and whether the kill
-        // reached it is read after it. One whose kill failed may still have its program running:
-        // left alone. An exited front needs no backstop.
-        #[cfg(unix)]
-        if let Some(in_cgroup) = front {
-            return self.settled_sweep(op, group_result, Keeping::Nothing, wait, |settled| {
-                match (settled, in_cgroup) {
-                    (Ok(()), Some(front)) => self.cgroup_kill_reached(front),
-                    (Err(left), Some(front)) => {
-                        Err(crate::elevation::front::cgroup_kill_failed(front, self.pid(), left))
-                    }
-                    (other, None) => other,
+        let killed = self.proc.kill_root(
+            reach,
+            // A front in the cgroup: its kill is the only one, and it is settled before the rule reads
+            // whether it reached the front.
+            |_| {
+                let (group_result, mut wait) = kill_tree();
+                let settled = self.tree.settle_for_kill_tree(group_result, false, Keeping::Nothing);
+                wait.reaching(settled.killed_again);
+                AloneStep::Killed {
+                    result: settled.answer,
+                    carry: wait,
                 }
-            });
+            },
+            |need| {
+                let (group_result, wait) = kill_tree();
+                self.sweep_tree(need, group_result, wait)
+            },
+        );
+        match killed {
+            KillRootOutcome::Refused(refusal) => Swept::unwaited(op, Err(refusal.into())),
+            // A signal after the front's cgroup kill could only be refused, and whether the kill reached
+            // it was read after it. One whose kill failed may still have its program running: left alone.
+            KillRootOutcome::Contained { reached, carry: wait } => {
+                Swept::new(op, reached.map_err(SweepFailure::from), wait)
+            }
+            #[cfg(unix)]
+            KillRootOutcome::Root {
+                sent,
+                carry: Followed::Skipped(skip, wait),
+            } => self.skipped_sweep(op, earlier, skip, wait, Some(sent)),
+            KillRootOutcome::Root {
+                sent,
+                carry: Followed::Backstop { walked, wait },
+            } => {
+                // Backstop for the TreeWalk mechanism: its hard_kill sends the root's kill through this
+                // handle, but kills nothing if the walk finds no root or cannot read the process table —
+                // this handle-based kill covers that, so its failure is contract-relevant.
+                self.backstopped_sweep(op, call, walked, wait, SweepFailure::backstop_of(sent), false)
+            }
+            // A walk not made runs no backstop: it would end the root a retry walks from. The settlement
+            // keeps the members while the root runs and kills them once it has exited.
+            KillRootOutcome::Answered(Unsent::NoBackstop { outcome, keeping, wait }) => {
+                self.settled_sweep(op, outcome, keeping, wait, std::convert::identity)
+            }
+            #[cfg(unix)]
+            KillRootOutcome::Answered(Unsent::Skipped(skip, wait)) => self.skipped_sweep(op, earlier, skip, wait, None),
+            KillRootOutcome::Answered(Unsent::Unpinned { walked, wait }) => {
+                log::debug!(
+                    "{op}({}): launchd holds the root's zombie, so the handle backstop is skipped",
+                    self.pid()
+                );
+                self.backstopped_sweep(op, call, walked, wait, (Ok(()), true), true)
+            }
         }
-        // Backstop for the TreeWalk mechanism: its hard_kill sends the root's kill through this handle,
-        // but kills nothing if the walk finds no root or cannot read the process table — this
-        // handle-based kill covers that, so its failure is contract-relevant.
-        // Read again: the sweep above can be long, and a root orphaned meanwhile is an exited zombie
-        // launchd holds, so there is nothing left for the backstop to kill.
-        let unpinned = self.root_is_unpinned();
-        let (backstop, root_ended) = if unpinned {
-            log::debug!(
-                "{op}({}): launchd holds the root's zombie, so the handle backstop is skipped",
-                self.pid()
-            );
-            (Ok(()), true)
-        } else {
-            SweepFailure::backstop_of(
-                self.kill_root()
-                    .map_err(|e| crate::elevation::map_elevated_kill_error(e, self.may_run_as_another_user())),
-            )
-        };
-        let settled = SweepFailure::of(&self.tree, group_result.in_call(call), backstop, self.pid(), root_ended);
+    }
+
+    /// The end of a sweep whose tree kill the mechanism skipped: `skip`, answered with `sent`, the
+    /// root's own kill through its handle (`None`: none was sent).
+    #[cfg(unix)]
+    fn skipped_sweep<'a>(
+        &'a self,
+        op: &'static str,
+        earlier: Option<&str>,
+        skip: crate::containment::Skip,
+        mut wait: crate::containment::KillWait<'a>,
+        sent: Option<Result<crate::signal::Sent, Error>>,
+    ) -> Swept<'a> {
+        // The root's handle names the root even when its number is reused; its kill ends the root.
+        let root_ended = sent.as_ref().is_some_and(SweepFailure::killed_root);
+        let answered = self
+            .skip_call(op, TreeSignal::Kill, earlier)
+            .answer(&self.tree, skip, sent);
+        wait.reaching(answered.killed_again);
+        Swept::new(
+            op,
+            answered.answer.map_err(|error| SweepFailure { error, root_ended }),
+            wait.with_root(self.proc.os_process(), self.pid(), root_ended),
+        )
+    }
+
+    /// The end of a sweep whose walk was made: `walked` settled with the root's backstop, `backstop`
+    /// and `root_ended` as [`SweepFailure::backstop_of`] gives them (`Ok(())` and `true` where launchd
+    /// holds the root's zombie and none was sent: `unpinned`).
+    fn backstopped_sweep<'a>(
+        &'a self,
+        op: &'static str,
+        call: Option<&WalkToken>,
+        walked: TreeKillOutcome,
+        mut wait: crate::containment::KillWait<'a>,
+        (backstop, root_ended): (Result<(), Error>, bool),
+        unpinned: bool,
+    ) -> Swept<'a> {
+        let settled = SweepFailure::of(&self.tree, walked.in_call(call), backstop, self.pid(), root_ended);
         wait.reaching(settled.killed_again);
         // A root launchd holds is not ours to wait on: nothing of ours killed it.
         Swept::new(
@@ -834,6 +811,51 @@ impl Child {
             settled.answer,
             wait.with_root(self.proc.os_process(), self.pid(), root_ended && !unpinned),
         )
+    }
+
+    /// What the sweep's kill of the tree (`group_result`, `wait`) leaves for the rest of the sweep, as
+    /// the step of [`kill_root`](OwnedChild::kill_root) for a root its own kill may follow: what `need`
+    /// says of the root decides it.
+    fn sweep_tree<'a>(
+        &'a self,
+        need: KillNeed,
+        group_result: TreeKillOutcome,
+        wait: crate::containment::KillWait<'a>,
+    ) -> RootStep<Followed<'a>, Unsent<'a>> {
+        let without_backstop =
+            |outcome, keeping, wait| RootStep::Answered(Unsent::NoBackstop { outcome, keeping, wait });
+        #[cfg(unix)]
+        let group_result = match group_result {
+            answered @ TreeKillOutcome::Answered(_) => return without_backstop(answered, Keeping::Nothing, wait),
+            TreeKillOutcome::Skipped(skip) if skip.root_alone => {
+                return RootStep::ThenRoot(Followed::Skipped(skip, wait))
+            }
+            TreeKillOutcome::Skipped(skip) => return RootStep::Answered(Unsent::Skipped(skip, wait)),
+            other => other,
+        };
+        let group_result = match group_result {
+            unwalked @ TreeKillOutcome::Unwalked(_) => {
+                return without_backstop(unwalked, self.keeping_over_unwalked(), wait);
+            }
+            walked => walked,
+        };
+        // An exited front needs no backstop.
+        if need == KillNeed::Exited {
+            return without_backstop(group_result, Keeping::Nothing, wait);
+        }
+        // Read again: the sweep above can be long, and a root orphaned meanwhile is an exited zombie
+        // launchd holds, so there is nothing left for the backstop to kill.
+        if self.root_is_unpinned() {
+            RootStep::Answered(Unsent::Unpinned {
+                walked: group_result,
+                wait,
+            })
+        } else {
+            RootStep::ThenRoot(Followed::Backstop {
+                walked: group_result,
+                wait,
+            })
+        }
     }
 
     /// The end of a sweep that runs no backstop: `outcome` settled (see

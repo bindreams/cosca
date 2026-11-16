@@ -630,12 +630,16 @@ pub(crate) fn launch_runas_with_host(
         0 => Err(windows::core::Error::from_thread()),
         pid => Ok(pid),
     };
+    let report = ElevationReport {
+        via: ElevatedVia::WindowsUac,
+        stripped_env: Vec::new(),
+        stdio: ElevatedStdio::OwnConsole,
+    };
     // The box first: the process is running, and everything after reaches it through the box.
-    let owned = OwnedChild::new(Box::new(WindowsProcess::for_uac(
-        kernel,
-        proc,
-        pid.as_ref().ok().copied(),
-    )));
+    let owned = OwnedChild::new(
+        Box::new(WindowsProcess::for_uac(kernel, proc, pid.as_ref().ok().copied())),
+        report.tracked(),
+    );
     // Identity from the OWNED handle — no second OpenProcess.
     let handle = HANDLE(owned.os_handle().as_raw_handle());
     // What could not be read: the pid's error, or the pid with the identity read's.
@@ -654,11 +658,6 @@ pub(crate) fn launch_runas_with_host(
         }
     };
 
-    let report = ElevationReport {
-        via: ElevatedVia::WindowsUac,
-        stripped_env: Vec::new(),
-        stdio: ElevatedStdio::OwnConsole,
-    };
     Ok(RunasOutcome::Launched { owned, id, report })
 }
 

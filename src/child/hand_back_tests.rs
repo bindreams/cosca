@@ -10,7 +10,7 @@ use crate::log_capture::warns_since;
 use crate::os_process::fake::FakeProcess;
 #[cfg(target_os = "linux")]
 use crate::test_child::Console;
-use crate::test_child::{held_uncontained_blocker, tear_down_holding};
+use crate::test_child::{held_uncontained_blocker, held_uncontained_blocker_reporting, tear_down_holding};
 
 /// Make the next kill of `child` fail with `PermissionDenied`, as an elevated child's does.
 fn refuse_the_kill(child: &mut Child) -> FakeProcess {
@@ -75,7 +75,7 @@ fn the_unreaped_a_child_hands_back_does_what_its_spawns_policy_says_on_drop() {
 /// sends the one more kill.
 ///
 /// Mutants: `into_unreaped` passes `Unreaped::new` the front from `report.is_some()` or from
-/// `may_run_as_another_user()`.
+/// `TrackedKind::runs_as_another_user`.
 #[skuld::test]
 fn the_unreaped_a_child_without_a_front_hands_back_is_sent_the_drops_kill() {
     use crate::child::spawn::policy::SpawnPolicy;
@@ -83,9 +83,8 @@ fn the_unreaped_a_child_without_a_front_hands_back_is_sent_the_drops_kill() {
     use crate::signal::Sig;
 
     for via in VIAS_WITHOUT_A_FRONT {
-        let (mut child, stdin) = held_uncontained_blocker(true);
+        let (mut child, stdin) = held_uncontained_blocker_reporting(true, Some(report(via.clone())));
         child.policy = SpawnPolicy::LET_GO;
-        child.elevation = Some(report(via.clone()));
         let refused = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         let fake = child.proc.script_over(|f| f.signals([refused(), refused()]));
         let (_, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
@@ -639,7 +638,7 @@ mod in_a_cgroup {
         assert_front_handed_back(id, mark, fate, handed_back);
     }
 
-    /// A front that leaves its leaf during the leaf's kill (the gate read `CgroupOnly`, and the kill
+    /// A front that leaves its leaf during the leaf's kill (the rule read the front in its cgroup, and the kill
     /// did not reach it) is handed back the same way.
     ///
     /// Mutant: the `CgroupOnly` arm of the drop's teardown drops the caller's disposition.

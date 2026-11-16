@@ -9,6 +9,7 @@ use crate::child::spawn::policy::SpawnPolicy;
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::fake::FakeContains;
 use crate::containment::{Containment, Mechanism, Refusal, Skip, Tree, Why};
+use crate::elevation::front::TrackedKind;
 use crate::error::{ChildFate, Error};
 use crate::os_process::child::{ExitRecord, KillRefusal, PeekOutcome};
 use crate::os_process::fake::{Answer, FakeProcess, ReapAnswer};
@@ -465,7 +466,7 @@ fn a_late_teardowns_notes_and_cleanup_follow_what_each_step_came_to() {
     crate::log_capture::install();
     for row in ROWS {
         let fake = root_killed(row.kill, PID);
-        let owned = OwnedChild::new(Box::new(fake.clone()));
+        let owned = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
         if matches!(row.kill, RootKilled::AlreadyReaped) {
             owned.wait(None).expect("the fake reaps it");
         }
@@ -563,7 +564,7 @@ fn delivered_kill(pid: u32, exits: impl IntoIterator<Item = Answer>) -> FakeProc
 /// The teardown of an uncontained late child over `fake`, under a policy that warns at once: the
 /// failure it answers, and how many slow-wait warns it logged.
 fn abandon_over(fake: &FakeProcess, pid: u32) -> (SpawnFailure, usize) {
-    let box_ = OwnedChild::new(Box::new(fake.clone()));
+    let box_ = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     let prepared = crate::containment::Prepared {
         mode: None,
         is_root: true,

@@ -118,7 +118,7 @@ impl SuspendedChild {
             mut child,
             wanted_kill_on_drop,
         } = self;
-        let behind_front = child.inner.front().is_some();
+        let behind_front = child.inner.proc.tracked_kind().front().is_some();
         if let Err(e) = platform::release(&child) {
             let torn_down =
                 on_blocking_pool(RESUME, move || child.inner.tear_down_or_hand_back(Disposition::Leave)).await;

@@ -25,6 +25,7 @@ use crate::child::Child;
 #[cfg(not(target_os = "linux"))]
 use crate::command::EnvOp;
 use crate::command::{Command, CommandInput};
+use crate::elevation::front::TrackedKind;
 #[cfg(unix)]
 use crate::error::ChildFate;
 use crate::error::Error;
@@ -170,72 +171,92 @@ fn spawn_over(
 #[cfg(unix)]
 pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> Result<Child, SpawnFailure> {
     use crate::containment::dispatch::{SettleOutcome, TreeKillOutcome};
+    use crate::elevation::front::{AloneStep, KillNeed, KillRootOutcome, RootStep};
 
     let Err(write_err) = written else {
         return Ok(child);
     };
-    // A live front outside a cgroup is not signalled, by its group or otherwise: the root's kill
-    // below then says why.
-    let gate = child.kill_gate();
-    // One look, shared by both tree kills.
-    let view = crate::containment::DropView::read(
-        crate::containment::dispatch::TeardownCaller::FinishElevated,
-        child.pid(),
-        child.id,
-        &child.proc,
-        &child.tree,
-    );
-    let mut report = crate::child::drop_report::DropReport::new(&view);
-    let mut skipped = None;
-    let front_closed = matches!(gate, crate::elevation::front::Gate::Closed(_));
-    let kill_tree = || {
+    // The rule's refusal answers for a live front outside a cgroup. A front in a cgroup is left to
+    // the tree's kill and read once after it: a killed front can read as neither exited nor in its
+    // cgroup between leaving the member list and becoming a zombie.
+    let read_view = || {
+        crate::containment::DropView::read(
+            crate::containment::dispatch::TeardownCaller::FinishElevated,
+            child.pid(),
+            child.id,
+            &child.proc,
+            &child.tree,
+        )
+    };
+    let kill_tree = |view: &crate::containment::DropView| {
         let root_handle = child.proc.hold(child.pid());
         // The cleanup sends only: its waits are the root's and the leaf's own.
         let kill = {
             let seen = crate::containment::Seen::new(&root_handle, view.look());
             child.tree.send_kill(Some(&seen))
         };
-        kill.log_skip(&view);
+        kill.log_skip(view);
         kill
     };
-    let tree = (child.containment().can_teardown() && !front_closed).then(|| {
-        let kill = kill_tree();
-        skipped = kill.skip_note(&view);
-        kill
-    });
+    let kill_tree_once = || {
+        // One look, shared by both tree kills.
+        let view = read_view();
+        let mut skipped = None;
+        let tree = child.containment().can_teardown().then(|| {
+            let kill = kill_tree(&view);
+            skipped = kill.skip_note(&view);
+            kill
+        });
+        (view, tree, skipped)
+    };
+    let killed = child.proc.kill_root(
+        Some(&child.tree),
+        |_| {
+            let torn = kill_tree_once();
+            if torn.1.as_ref().is_some_and(TreeKillOutcome::completed) {
+                AloneStep::Killed {
+                    result: Ok(()),
+                    carry: torn,
+                }
+            } else {
+                AloneStep::NotKilled(torn)
+            }
+        },
+        |need| {
+            let (view, tree, skipped) = kill_tree_once();
+            // A root launchd holds is sent nothing.
+            if view.unpinned_root() {
+                RootStep::Answered((view, tree, skipped))
+            } else {
+                RootStep::ThenRoot((view, tree, skipped, need == KillNeed::Exited))
+            }
+        },
+    );
+    // `root`: the root's answer; `None`: the root is one launchd holds, and nothing was sent to it.
+    let (view, tree, skipped, exited_front, root) = match killed {
+        KillRootOutcome::Refused(refusal) => (read_view(), None, None, false, Some(Err(refusal))),
+        // The cgroup kill alone ended the front, or did not.
+        KillRootOutcome::Contained {
+            reached,
+            carry: (view, tree, skipped),
+        } => (
+            view,
+            tree,
+            skipped,
+            false,
+            Some(reached.map(|()| crate::signal::Sent::Delivered)),
+        ),
+        KillRootOutcome::Root {
+            sent,
+            carry: (view, tree, skipped, exited_front),
+        } => (view, tree, skipped, exited_front, Some(sent)),
+        KillRootOutcome::Answered((view, tree, skipped)) => (view, tree, skipped, false, None),
+    };
+    let mut report = crate::child::drop_report::DropReport::new(&view);
     let tree_failure = tree.as_ref().and_then(TreeKillOutcome::incomplete);
-    let exited_front = matches!(gate, crate::elevation::front::Gate::Exited);
     let pid = child.pid();
-    let (root_note, torn) = if view.unpinned_root() {
-        // Nothing was signalled.
-        let fate = crate::os_process::child::Foreign::Gone.fate(false);
-        (
-            format!(
-                "the elevated child was left alone, neither signalled nor waited on: {}",
-                view.why_number_untrusted()
-            ),
-            Remains::collected(fate),
-        )
-    } else {
-        let root = match gate {
-            // Not asked again after the kill: a killed front can read as neither exited nor in its
-            // cgroup, between leaving the cgroup's member list and becoming a zombie. The kill's own
-            // outcome says it landed; the handle's state is settled by `settle`, below.
-            crate::elevation::front::Gate::CgroupOnly(front)
-                if tree.as_ref().is_some_and(TreeKillOutcome::completed) =>
-            {
-                child
-                    .cgroup_kill_reached(front)
-                    .map(|()| crate::signal::Sent::Delivered)
-            }
-            // No kill reached the cgroup: refused as `kill` refuses, naming why.
-            // The tree's failure, if there is one, is the cleanup's entry before this refusal.
-            crate::elevation::front::Gate::CgroupOnly(front) => {
-                Err(crate::elevation::front::cgroup_not_killed(front, child.pid()))
-            }
-            crate::elevation::front::Gate::Closed(unkillable) => Err(unkillable),
-            gate => child.kill_sent_gated(gate),
-        };
+    // A root launchd holds is left alone, whatever the rule answered.
+    let (root_note, torn) = if let Some(root) = root.filter(|_| !view.unpinned_root()) {
         match root {
             Ok(crate::signal::Sent::Gone) if exited_front => (
                 "the elevated child had already exited, and was reaped by someone else".to_string(),
@@ -288,6 +309,16 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 )
             }
         }
+    } else {
+        // Nothing was signalled.
+        let fate = crate::os_process::child::Foreign::Gone.fate(false);
+        (
+            format!(
+                "the elevated child was left alone, neither signalled nor waited on: {}",
+                view.why_number_untrusted()
+            ),
+            Remains::collected(fate),
+        )
     };
     // A root not shown collected is the caller's: it is disarmed, and handed back in the error.
     let hands_back = Disposition::HandBack.hands_back(&torn);
@@ -322,7 +353,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     // A handed-back root takes the drop, which makes the tree kill, with it: that kill is made here,
     // early. The one warn and the error's note say how it went.
     if hands_back && !tree_settled {
-        let early = kill_tree();
+        let early = kill_tree(&view);
         // What the early tree kill adds to the first attempt's report, and the outcome that report is
         // built from.
         let more = match child.tree.settle(early, fate.not_running()).answer.map_err(Arc::new) {
@@ -375,7 +406,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
     }
     // The drop, armed or not, need not warn of what the cleanup warned of again.
     child.reported = warned;
-    let behind_front = child.front().is_some();
+    let behind_front = child.proc.tracked_kind().front().is_some();
     let unreaped = hands_back.then(|| child.into_unreaped());
     // The password write's failure is the cause, with what the cleanup did in the `detail`. What failed
     // in the cleanup is beside it, in the order it happened: the tree's first kill, the root's refused
@@ -555,9 +586,11 @@ pub(crate) fn spawn_unelevated(
 ) -> Result<Child, SpawnFailure> {
     // Read now: a failed spawn's teardown needs the front before a `Child` exists.
     let elevation = cmd.elevation_report().cloned();
-    let front = elevation.as_ref().and_then(crate::elevation::ElevationReport::front);
-    spawn_reported(cmd, kill_on_drop, policy, elevation, front, kernel).map_err(|failure| {
-        if front.is_some() {
+    let behind_front = elevation
+        .as_ref()
+        .is_some_and(|report| report.tracked().front().is_some());
+    spawn_reported(cmd, kill_on_drop, policy, elevation, kernel).map_err(|failure| {
+        if behind_front {
             failure.behind_front()
         } else {
             failure
@@ -565,15 +598,19 @@ pub(crate) fn spawn_unelevated(
     })
 }
 
-/// [`spawn_unelevated`] for the report `elevation` the command carries and the `front` it names.
+/// [`spawn_unelevated`] for the report `elevation` the command carries; the kind of process the box
+/// tracks is the report's ([`ElevationReport::tracked`](crate::elevation::ElevationReport::tracked)).
 fn spawn_reported(
     cmd: &mut Command,
     kill_on_drop: bool,
     policy: SpawnPolicy,
     elevation: Option<crate::elevation::ElevationReport>,
-    front: Option<crate::elevation::front::Front>,
     kernel: crate::identity::SpawnKernel,
 ) -> Result<Child, SpawnFailure> {
+    let tracked = elevation
+        .as_ref()
+        .map_or(TrackedKind::Own, crate::elevation::ElevationReport::tracked);
+    let front = tracked.front();
     // Read the routing rule BEFORE the take, which empties the map the rule reads. Evaluated
     // after, it would collapse to "does it have an executable()", and a high-descriptor-only
     // command would take the std path — whose fd >= 3 collection is unix-only, so the
@@ -691,7 +728,7 @@ fn spawn_reported(
         let refusing_placement = prepared.refuses_failed_placement();
         let on_failure = fork_spawn::OnFailure {
             policy,
-            front,
+            tracked,
             placement: prepared.placement_leaf(),
             refusing_placement,
         };
@@ -744,11 +781,14 @@ fn spawn_reported(
         let pid = child.id();
         (
             pid,
-            OwnedChild::new(Box::new(crate::os_process::windows::WindowsProcess::for_child(
-                kernel,
-                std::os::windows::io::OwnedHandle::from(child),
-                pid,
-            ))),
+            OwnedChild::new(
+                Box::new(crate::os_process::windows::WindowsProcess::for_child(
+                    kernel,
+                    std::os::windows::io::OwnedHandle::from(child),
+                    pid,
+                )),
+                tracked,
+            ),
         )
     };
     #[cfg(windows)]
@@ -766,13 +806,13 @@ fn spawn_reported(
         fault::run_at(fault::SpawnPoint::BeforeAdopt, pid);
         let unique = match unique_report::adopted_id(unique, pid) {
             Ok(unique) => unique,
-            Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, front, prepared, policy, kernel)),
+            Err(not_adopted) => return Err(abandon_unadopted(child, not_adopted, tracked, prepared, policy, kernel)),
         };
         // A refused kqueue is the one way to fail, and no box exists then ([`leave_unwatched_child`]).
         match crate::os_process::macos::child::MacosChild::new(std::sync::Arc::clone(&kernel), pid, unique) {
             Ok(os) => {
                 drop(child);
-                (pid, OwnedChild::new(Box::new(os)))
+                (pid, OwnedChild::new(Box::new(os), tracked))
             }
             Err(refusal) => {
                 return Err(leave_unwatched_child(
@@ -1018,13 +1058,14 @@ pub(crate) fn warn_still_waiting(pid: Option<u32>, after: std::time::Duration) {
 fn abandon_unadopted(
     child: std::process::Child,
     not_adopted: unique_report::NotAdopted,
-    front: Option<crate::elevation::front::Front>,
+    tracked: TrackedKind,
     prepared: crate::containment::Prepared,
     policy: SpawnPolicy,
     kernel: crate::identity::SpawnKernel,
 ) -> SpawnFailure {
     use unique_report::Unadoptable;
 
+    let front = tracked.front();
     let pid = child.id();
     let error = not_adopted.error;
     match not_adopted.why {
@@ -1036,7 +1077,7 @@ fn abandon_unadopted(
             SpawnFailure::NotStarted(error)
         }
         Unadoptable::Late(unique) => {
-            late_child::abandon_late_child(child, unique, error, front, prepared, policy, kernel)
+            late_child::abandon_late_child(child, unique, error, tracked, prepared, policy, kernel)
         }
         Unadoptable::Unverified => {
             let fate = leave_unverified_child(child);

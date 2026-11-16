@@ -42,7 +42,7 @@ fn front_named(backend: Backend, host: &Host) -> Option<&'static str> {
     rewrite
         .derived
         .elevation_report()
-        .and_then(crate::elevation::ElevationReport::front)
+        .and_then(|report| report.tracked().front())
         .map(|front| front.name())
 }
 

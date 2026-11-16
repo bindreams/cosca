@@ -66,7 +66,7 @@ fn dead_child() -> (
                         teardown_warn_after: crate::tokio::slow_teardown_after(),
                         ..SpawnPolicy::SYNC
                     },
-                    front: None,
+                    tracked: crate::elevation::front::TrackedKind::Own,
                     placement: None,
                     refusing_placement: false,
                 },

@@ -5,6 +5,7 @@ use std::process::ExitStatus;
 
 use super::fixtures::status;
 use crate::child::owned::OwnedChild;
+use crate::elevation::front::TrackedKind;
 use crate::os_process::child::{ExitRecord, Foreign};
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::wait::exit_only::Reap;
@@ -19,7 +20,7 @@ fn exit() -> ExitRecord {
 #[skuld::test]
 fn a_handle_never_waited_on_consumes_at_its_end_where_the_consume_is_exact() {
     let fake = FakeProcess::new([]).with_exact_consume(true);
-    drop(OwnedChild::new(Box::new(fake.clone())));
+    drop(OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own));
     assert_eq!(fake.reap_calls(), 1);
 }
 
@@ -31,7 +32,7 @@ fn a_handle_never_waited_on_consumes_at_its_end_where_the_consume_is_exact() {
 #[skuld::test]
 fn a_handle_never_waited_on_consumes_nothing_where_the_consume_is_by_number() {
     let fake = FakeProcess::new([]).with_exact_consume(false);
-    drop(OwnedChild::new(Box::new(fake.clone())));
+    drop(OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own));
     assert_eq!(fake.reap_calls(), 0);
 }
 
@@ -45,7 +46,7 @@ fn a_handle_whose_wait_saw_the_exit_consumes_it_at_its_end_either_way() {
         let fake = FakeProcess::new([])
             .reaps([ReapAnswer::Exited(exit())])
             .with_exact_consume(exact);
-        let child = OwnedChild::new(Box::new(fake.clone()));
+        let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
         status(child.wait(None));
         assert_eq!(fake.reap_calls(), 0, "a wait consumed (exact: {exact})");
         drop(child);
@@ -62,7 +63,7 @@ fn a_wait_that_saw_no_exit_leaves_a_by_number_consume_unasked() {
     let fake = FakeProcess::new([])
         .reaps([ReapAnswer::Foreign(Foreign::Gone)])
         .with_exact_consume(false);
-    let child = OwnedChild::new(Box::new(fake.clone()));
+    let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     assert!(matches!(
         child.wait(None),
         Ok(crate::child::owned::ChildWaitOutcome::Foreign(Foreign::Gone))
@@ -98,7 +99,7 @@ fn the_end_of_the_handle_logs_what_its_consume_found() {
     ];
     for (answer, logged) in rows {
         let fake = FakeProcess::new([]).consumes([answer]);
-        let child = OwnedChild::new(Box::new(fake.clone()));
+        let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
         let mark = crate::log_capture::mark();
         drop(child);
         let records = crate::log_capture::records_since_on_current_thread(mark, "");
@@ -123,7 +124,12 @@ fn the_end_of_the_handle_logs_what_its_consume_found() {
 fn an_unreadable_record_at_the_end_of_the_handle_warns_and_asserts_but_never_mid_unwind() {
     crate::log_capture::install();
     let unreadable = ExitRecord::Unreadable { si_code: 99 };
-    let child = || OwnedChild::new(Box::new(FakeProcess::new([]).consumes([Ok(Reap::Reaped(unreadable))])));
+    let child = || {
+        OwnedChild::new(
+            Box::new(FakeProcess::new([]).consumes([Ok(Reap::Reaped(unreadable))])),
+            TrackedKind::Own,
+        )
+    };
 
     let mark = crate::log_capture::mark();
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

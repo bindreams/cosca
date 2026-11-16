@@ -2,6 +2,7 @@
 
 use super::fixtures::identity_of;
 use crate::child::owned::OwnedChild;
+use crate::elevation::front::TrackedKind;
 
 // The pidfd's number =====
 
@@ -37,7 +38,7 @@ fn an_adopted_pidfd_never_sits_in_a_stdio_slot() {
     );
     assert!(saved >= 10);
     assert_eq!(unsafe { libc::close(slot) }, 0);
-    let owned = OwnedChild::adopt(child, id).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
+    let owned = OwnedChild::adopt(child, id, TrackedKind::Own).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     let fd = std::os::fd::AsRawFd::as_raw_fd(&owned.os_handle());
     // Restore the slot first: the pidfd is still usable afterwards only if it never sat there.
     assert_eq!(unsafe { libc::dup2(saved, slot) }, slot);
