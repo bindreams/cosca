@@ -357,7 +357,8 @@ fn macos_sync_spawn_identity_held_by_launchd_is_gone() {
 }
 
 /// Reaps the child by pid (so the re-read's `waitid` answers `ECHILD`) and states the id and parent
-/// reads that follow as saying launchd holds it.
+/// reads that follow as saying launchd holds it as a zombie. The pid is reaped, so the host cannot
+/// read it: the row states its parent and its `SZOMB` state.
 pub(crate) fn arm_launchd_hold(pid: &Rc<Cell<u32>>, kernel: &FakeKernel<'_>, writer: crate::PipeWriter) {
     pid.set(fault::spawn_pid());
     let UniqRead::Found(info) = HostKernel.unique_info(pid.get()) else {
@@ -366,7 +367,7 @@ pub(crate) fn arm_launchd_hold(pid: &Rc<Cell<u32>>, kernel: &FakeKernel<'_>, wri
     drop(writer);
     reap_by_pid(pid.get());
     kernel.state_unique_info(pid.get(), UniqRead::Found(info));
-    kernel.state_short_bsd(pid.get(), Ok(short_info(LAUNCHD, libc::SRUN)));
+    kernel.state_short_bsd(pid.get(), Ok(short_info(LAUNCHD, libc::SZOMB)));
     kernel.state_unique_info(pid.get(), UniqRead::Found(info));
 }
 

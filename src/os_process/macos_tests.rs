@@ -769,21 +769,23 @@ fn a_refused_has_exited_read_is_unassessable_with_its_errno_as_the_source_and_wo
 
 /// A refused read of a child's look whose watch has not fired, of its parent or of whether it is a
 /// zombie, is `Unassessable` with the errno as its source, and says its watch has not fired. The
-/// child's parent reads launchd, so the second read is reached.
+/// child's parent reads launchd, so the second read is reached. The row states only that parent; the
+/// child's state stays the host's.
 ///
 /// Mutant: `MacosChild::exited` wraps the errno as `Error::Io`, words another situation, or answers
 /// `Running` for a read it could not make.
 #[skuld::test]
 fn a_refused_read_past_an_unfired_watch_is_unassessable_with_the_errno() {
-    use crate::identity::{short_info, LAUNCHD};
+    use crate::identity::LAUNCHD;
     use crate::os_process::macos::child::MacosChild;
+    use crate::wait::exit_only::macos_tests::parent_reads;
 
     for zombie_read in [false, true] {
         let (_child, id) = blocker();
         let read = own_unique_info(id);
         // The parent read is two unique-id reads around the parent, which is launchd, and the zombie
         // read two more: the third unique-id read is the zombie read's first.
-        let mut kernel = FakeKernel::over(&HostKernel).on_short_bsd(id.pid(), Ok(short_info(LAUNCHD, libc::SRUN)));
+        let mut kernel = parent_reads(id.pid(), LAUNCHD, 1);
         if zombie_read {
             kernel = kernel
                 .on_unique_info(id.pid(), UniqRead::Found(read))
@@ -816,19 +818,18 @@ fn a_refused_read_past_an_unfired_watch_is_unassessable_with_the_errno() {
 /// for an event that never comes.
 #[skuld::test]
 fn an_unfired_watch_on_a_running_child_another_process_holds_is_a_recheck() {
-    use crate::identity::{short_info, LAUNCHD};
+    use crate::identity::{short_info_held_by, LAUNCHD};
     use crate::os_process::macos::child::MacosChild;
     use crate::wait::exit_only::macos_tests::{echild_yet_resolvable, held_by_a_tracer_pid};
 
     let (pid, unique) = echild_yet_resolvable();
-    // Each look reads the parent, then whether the child is a zombie: two reads of the record, which
-    // states the parent and that the child runs.
+    // Each look reads the parent, then whether the child is a zombie: two reads of the record.
     let kernel = [LAUNCHD, held_by_a_tracer_pid()]
         .into_iter()
         .fold(FakeKernel::over(&HostKernel), |kernel, parent| {
             kernel
-                .on_short_bsd(pid, Ok(short_info(parent, libc::SRUN)))
-                .on_short_bsd(pid, Ok(short_info(parent, libc::SRUN)))
+                .on_short_bsd(pid, Ok(short_info_held_by(pid, parent)))
+                .on_short_bsd(pid, Ok(short_info_held_by(pid, parent)))
         });
     let mac = MacosChild::new(kernel, pid, unique).expect("watch the stand-in");
     for parent in [LAUNCHD, held_by_a_tracer_pid()] {
@@ -1159,27 +1160,26 @@ fn esrch_at_the_reap_registration_adopts_a_running_child() {
 /// A child whose tracer began its exit, then lost its own tracer, is held by launchd with its
 /// `p_oppid` kept: its `NOTE_EXIT` reaches only launchd, so nothing wakes a wait on the reap kqueue.
 /// The look is `Recheck`, which the driver paces, not `Running` on that kqueue. This process's own
-/// pid stands in for the child, held by a blocker whose stated parents say launchd holds it.
+/// pid stands in for the child, held by a blocker whose stated parents say launchd holds it. The
+/// child's row states only its parent, the tracer; its state stays the host's.
 ///
 /// Mutant: a tracer launchd holds answers `Running` on the reap kqueue: the wait blocks for an event
 /// that never comes.
 #[skuld::test]
 fn a_child_whose_tracer_is_exiting_at_launchd_is_a_recheck() {
-    use crate::identity::{short_info, LAUNCHD};
+    use crate::identity::LAUNCHD;
     use crate::os_process::child::{OsChild, TryObserveOutcome};
     use crate::os_process::macos::child::MacosChild;
-    use crate::wait::exit_only::macos_tests::echild_yet_resolvable;
+    use crate::wait::exit_only::macos_tests::{echild_yet_resolvable, parent_reads};
 
     let (pid, unique) = echild_yet_resolvable();
     let tracer = crate::test_child::blocker();
     let tracer_pid = tracer.id();
     // The child's parent is the tracer, which this process started and launchd holds.
-    let kernel = FakeKernel::over(&HostKernel)
-        .on_short_bsd(pid, Ok(short_info(tracer_pid, libc::SRUN)))
-        .on_kinfo(
-            tracer_pid,
-            kinfo_proc::of_host_held_by(tracer_pid, std::process::id() as libc::pid_t, LAUNCHD as libc::pid_t),
-        );
+    let kernel = parent_reads(pid, tracer_pid, 1).on_kinfo(
+        tracer_pid,
+        kinfo_proc::of_host_held_by(tracer_pid, std::process::id() as libc::pid_t, LAUNCHD as libc::pid_t),
+    );
     let mac = MacosChild::new(kernel, pid, unique).expect("watch the stand-in");
 
     let look = mac.try_observe().expect("look");
