@@ -91,7 +91,8 @@ fn m18_std_routes_and_the_shell_fallback() {
     }
 }
 
-/// The OS errno of a failed spawn, which the spawn gives as it is.
+/// The OS errno of a failed spawn whose error is the OS's own, bare (a miss, or a candidate that fails
+/// at the exec; not an entry the search could not examine, whose code is down the `source()` chain).
 #[cfg(unix)]
 fn raw_errno(error: &cosca::error::Error) -> Option<i32> {
     match error {
@@ -164,6 +165,49 @@ fn a_cosca_spawn_finds_its_program_in_the_parent_and_only_macos_falls_back_to_th
         let error = spawned.expect_err("only macOS runs a file with no `#!` through the shell");
         assert_eq!(raw_errno(&error), Some(libc::ENOEXEC), "{error:?}");
         assert!(!marker.exists(), "the script ran");
+    }
+}
+
+/// A bare name stops at a `PATH` entry the search cannot examine (a symlink to itself: `ELOOP` for
+/// every uid), though a later entry holds the program. The spawn's error is the lookup's: of the
+/// cause's kind, with no code of its own, the code down its `source()` chain, and its report names the
+/// entry and the candidate.
+///
+/// Mutants: the spawn skips the entry; it answers the bare OS error (names no entry); it rewraps the
+/// error (the code or the kind is lost).
+#[cfg(unix)]
+#[skuld::test]
+fn a_spawn_stops_at_an_unexaminable_path_entry_with_an_error_naming_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let looping = root.path().join("loop");
+    std::os::unix::fs::symlink("loop", &looping).expect("symlink");
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).expect("mkdir");
+    let tool = open.join("m18-tool");
+    std::fs::write(&tool, "#!/bin/sh\n").expect("write");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let candidate = looping.join("m18-tool");
+    let cause = std::fs::metadata(&candidate).expect_err("precondition: the entry cannot be examined");
+    assert_eq!(cause.raw_os_error(), Some(libc::ELOOP), "precondition: {cause:?}");
+
+    let mut cmd = common::command(common::Console::Hidden);
+    cmd.args(["m18-tool"])
+        .env("PATH", std::env::join_paths([&looping, &open]).expect("join"));
+    let error = cmd.spawn().expect_err("the entry stops the search");
+    let cosca::error::Error::Io(e) = &error else {
+        panic!("expected an I/O error, got {error:?}")
+    };
+    assert_eq!(e.raw_os_error(), None, "the code is down the chain: {e:?}");
+    assert_eq!(e.kind(), cause.kind(), "{e:?}");
+    assert_eq!(common::os_code(&error), Some(libc::ELOOP), "{error:?}");
+    let report = cosca::error::Report::new(&error).to_string();
+    for named in [&looping, &candidate] {
+        assert!(
+            report.contains(&format!("{named:?}")),
+            "{named:?} is not named: {report}"
+        );
     }
 }
 

@@ -482,7 +482,7 @@ fn an_undeterminable_candidate_fails_a_loadable_only_search_closed() {
 }
 
 /// The `EACCES` twin of [`an_undeterminable_candidate_fails_a_loadable_only_search_closed`]: the
-/// production case (`resolve.rs`'s `Err(e) if input.loadable_only` arm). Runs in a re-exec.
+/// production case (the `resolve.rs` arm that stops a POSIX or loadable_only search). Runs in a re-exec.
 #[cfg(unix)]
 #[skuld::test]
 fn a_denied_candidate_fails_a_loadable_only_search_closed() {

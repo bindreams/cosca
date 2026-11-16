@@ -1,7 +1,7 @@
 //! What detection makes of the one `PATH` lookup's answers for `sudo`, `doas` and `pkexec`, and what
 //! the planner then does with them. The lookup's own rules are held by `resolve::posix`'s tests.
 
-use super::super::{detect_with, find_fixed_front};
+use super::super::{detect_with, find_fixed_front, front_of};
 #[cfg(target_os = "linux")]
 use super::super::{rewrite_with_host, run_version_probe};
 use crate::elevation::plan::{FrontState, Host, Os, Transition};
@@ -56,17 +56,22 @@ fn is_unexamined_by(state: &FrontState, code: i32) -> bool {
     matches!(state, FrontState::Unexamined(error) if crate::error::first_os_code(error) == Some(code))
 }
 
-/// The `BackendUnavailable` a plan is, with the OS code of its cause.
-fn unavailable(plan: Transition) -> (String, Option<i32>) {
+/// The `BackendUnavailable` a plan is: its detail, the OS code of its cause, and the whole error as
+/// [`Report`](crate::error::Report) prints it.
+fn unavailable(plan: Transition) -> (String, Option<i32>, String) {
     match plan {
-        Transition::Reject {
-            error:
-                Error::Elevation {
-                    kind: ElevationErrorKind::BackendUnavailable,
-                    detail,
-                    source,
-                },
-        } => (detail, source.and_then(|s| crate::error::first_os_code(&*s))),
+        Transition::Reject { error } => match &error {
+            Error::Elevation {
+                kind: ElevationErrorKind::BackendUnavailable,
+                detail,
+                source,
+            } => (
+                detail.clone(),
+                source.as_ref().and_then(|s| crate::error::first_os_code(&**s)),
+                crate::error::Report(&error).to_string(),
+            ),
+            other => panic!("expected BackendUnavailable, got {other:?}"),
+        },
         other => panic!("expected BackendUnavailable, got {other:?}"),
     }
 }
@@ -102,16 +107,33 @@ fn a_miss_is_an_absent_front_without_an_error() {
     for front in [&host.available.sudo, &host.available.doas, &host.available.pkexec] {
         assert!(matches!(front, FrontState::Absent), "{front:?}");
     }
-    let (detail, cause) = unavailable(host.plan(Privilege::Elevated, Backend::Auto, Auth::NonInteractive));
+    let (detail, cause, _) = unavailable(host.plan(Privilege::Elevated, Backend::Auto, Auth::NonInteractive));
     assert!(detail.contains("no sudo/doas on PATH"), "{detail}");
     assert_eq!(cause, None);
 }
 
+/// A front is absent for a miss only: a stop whose cause reads as `NotFound` is the lookup's error and
+/// no answer to whether the front is there, as a miss is the search's own `ENOENT`.
+///
+/// Mutant: a front is absent when the lookup's error has kind `NotFound`.
+#[skuld::test]
+fn a_stop_whose_cause_is_not_found_is_not_an_absent_front() {
+    let cause = std::io::Error::new(std::io::ErrorKind::NotFound, "a cause that reads as a miss");
+    let stop = Error::Io(crate::error::io_context("could not tell, so the search stops", cause));
+    let state = front_of(Err(stop));
+    assert!(matches!(state, FrontState::Unexamined(_)), "{state:?}");
+    let miss = Error::Io(std::io::Error::from_raw_os_error(libc::ENOENT));
+    let state = front_of(Err(miss));
+    assert!(matches!(state, FrontState::Absent), "{state:?}");
+}
+
 /// An entry that cannot be examined is not a miss: the front is unexamined with the entry's error,
 /// the search does not go on to the `sudo` after the entry, and the planner reports that error as
-/// the cause of the `BackendUnavailable`, for `Auto` and for `sudo` named.
+/// the cause of the `BackendUnavailable`, for `Auto` and for `sudo` named, and the report names the
+/// entry.
 ///
-/// Mutants: the error becomes a miss; the search skips the entry and finds the later `sudo`.
+/// Mutants: the error becomes a miss; the search skips the entry and finds the later `sudo`; the
+/// lookup's error names no entry.
 #[skuld::test]
 fn an_error_that_is_not_a_miss_is_the_cause_when_the_plan_picks_the_front() {
     let root = tempfile::tempdir().unwrap();
@@ -127,9 +149,10 @@ fn an_error_that_is_not_a_miss_is_the_cause_when_the_plan_picks_the_front() {
             "{backend:?}: {:?}",
             host.available.sudo
         );
-        let (detail, cause) = unavailable(host.plan(Privilege::Elevated, backend, Auth::NonInteractive));
-        assert!(detail.contains("could not be examined"), "{backend:?}: {detail}");
+        let (detail, cause, report) = unavailable(host.plan(Privilege::Elevated, backend, Auth::NonInteractive));
+        assert!(detail.contains("could not be found or opened"), "{backend:?}: {detail}");
         assert_eq!(cause, Some(libc::ELOOP), "{backend:?}");
+        assert!(report.contains(&format!("{looping:?}")), "{backend:?}: {report}");
     }
 }
 
@@ -149,7 +172,7 @@ fn an_error_that_is_not_a_miss_is_the_cause_when_the_plan_picks_pkexec() {
         host.available.pkexec
     );
     assert!(host.pkexec_pin.is_none());
-    let (_, cause) = unavailable(host.plan(Privilege::Elevated, Backend::Pkexec, Auth::Gui));
+    let (_, cause, _) = unavailable(host.plan(Privilege::Elevated, Backend::Pkexec, Auth::Gui));
     assert_eq!(cause, Some(libc::ELOOP));
 }
 
@@ -267,6 +290,15 @@ fn a_fixed_front_is_found_absent_or_unexamined() {
         let state = find_fixed_front(&absent);
         assert!(matches!(state, FrontState::Absent), "{absent:?}: {state:?}");
     }
-    let state = find_fixed_front(&looping_entry(root.path()).join("osascript"));
+    let unreadable = looping_entry(root.path()).join("osascript");
+    let state = find_fixed_front(&unreadable);
     assert!(is_unexamined_by(&state, libc::ELOOP), "{state:?}");
+    let FrontState::Unexamined(cause) = &state else {
+        unreachable!("{state:?}")
+    };
+    let report = crate::error::Report(&**cause).to_string();
+    assert!(
+        report.contains(&format!("{unreadable:?}")),
+        "{unreadable:?} is not named: {report}"
+    );
 }

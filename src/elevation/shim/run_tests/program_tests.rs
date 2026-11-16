@@ -120,6 +120,38 @@ fn a_program_that_names_no_file_is_einval() {
     }
 }
 
+/// A `PATH` entry the lookup cannot examine ends the search with the OS code on the wire and the
+/// entry and the candidate in what the shim writes: its stderr line and its log.
+///
+/// Mutant: the shim rebuilds a bare error from the code, which names neither.
+#[skuld::test]
+fn an_unexaminable_entry_is_named_in_what_the_shim_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let looping = root.path().join("loop");
+    std::os::unix::fs::symlink("loop", &looping).unwrap();
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    script(&open, "tool", &root.path().join("ran"), 0o755);
+    let path = std::env::join_paths([&looping, &open]).unwrap();
+
+    let rig = ShimRig::new();
+    let mut run = rig.spawn(Spec::new("tool", &[]).search_path(path));
+    run.wait_for("first byte: A");
+    let outcome = rig.link.link.wait().unwrap();
+    let finished = run.finish();
+    assert_eq!(outcome, not_executed(NotExecuted::ExecFailed(Errno(libc::ELOOP))));
+    assert!(!root.path().join("ran").exists(), "the search went on past the entry");
+    let log = finished.lines.join("\n");
+    for (what, text) in [("stderr", &finished.stderr), ("log", &log)] {
+        for named in [&looping, &looping.join("tool")] {
+            assert!(
+                text.contains(&format!("{named:?}")),
+                "the {what} does not name {named:?}: {text}"
+            );
+        }
+    }
+}
+
 /// The signal masks of a program that prints `/proc/self/status`.
 fn program_signal_masks(spec: Spec) -> (u64, u64) {
     let rig = ShimRig::new();

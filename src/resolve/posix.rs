@@ -10,8 +10,10 @@
 //!   not part of the search: starting it is, and its failure (`EACCES`, `ENOEXEC`) is the launch's
 //!   own error, not `NotFound` and not a reason to search on.
 //! - A candidate that cannot be examined (`EACCES` on a locked entry, `ELOOP`, `EIO`, an unreachable
-//!   mount) stops the search with that error, so `PATH=/locked:/usr/bin` is `PermissionDenied` even
-//!   when `/usr/bin` holds the program. Only a definite absence (`ENOENT`, `ENOTDIR`) goes on.
+//!   mount) stops the search with an error of the cause's kind that names the entry and the
+//!   candidate and holds the OS code down its `source()` chain, so `PATH=/locked:/usr/bin` is
+//!   `PermissionDenied` even when `/usr/bin` holds the program. Only a definite absence (`ENOENT`,
+//!   `ENOTDIR`) goes on.
 //! - A name with a `/` is not searched: it is the one entry it names, read against the child's
 //!   directory, whatever the entry is (a directory or a device is the match too, and starting it is
 //!   the launch's own error). It is answered as written, for the child to read against that
@@ -45,9 +47,10 @@ pub(crate) struct Found {
 /// when `None`) with the `PATH` `path_var` (`None`: it has none).
 ///
 /// `InvalidInput` for a name that carries a NUL or names no file; `ENOENT` for a miss; the
-/// candidate's own error, bare, for one that cannot be examined (see the module doc), and the
-/// `cwd`'s own for a located name whose directory cannot be entered. The errors that stand for an OS
-/// answer carry its errno.
+/// candidate's error, naming the entry and the candidate, with the OS code down its `source()`
+/// chain, for one that cannot be examined (see the module doc); for a located name, which has no
+/// entry to name, the OS's own error, bare, whether its `cwd` cannot be entered or its file cannot be
+/// examined.
 pub(crate) fn lookup(program: &Path, cwd: Option<&Path>, path_var: Option<&OsStr>) -> Result<Found, Error> {
     if program.as_os_str().as_encoded_bytes().contains(&0) {
         return Err(Error::Io(std::io::Error::new(
@@ -74,13 +77,7 @@ pub(crate) fn lookup(program: &Path, cwd: Option<&Path>, path_var: Option<&OsStr
         loadable_only: false,
         normalise: &|path| Ok(path.to_path_buf()),
     })
-    .map_err(|error| match error {
-        // A miss is `ENOENT` itself: a caller of a spawn branches on the errno.
-        Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound && e.raw_os_error().is_none() => {
-            Error::Io(std::io::Error::from_raw_os_error(libc::ENOENT))
-        }
-        other => other,
-    })?;
+    .map_err(miss_as_enoent)?;
     Ok(if located {
         Found {
             path: program.to_path_buf(),
@@ -89,6 +86,22 @@ pub(crate) fn lookup(program: &Path, cwd: Option<&Path>, path_var: Option<&OsStr
     } else {
         Found { path: found, later }
     })
+}
+
+/// Whether `error` is a miss, as [`search`] gives it or as [`lookup`] does (`ENOENT`): the one
+/// `NotFound` that has no cause. A stop (an entry that cannot be examined) wraps its cause, so it has
+/// a `source()`, whatever kind it has.
+pub(crate) fn is_miss(error: &Error) -> bool {
+    matches!(error, Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound && std::error::Error::source(e).is_none())
+}
+
+/// [`search`]'s miss as `ENOENT` itself: a caller of a spawn branches on the errno.
+fn miss_as_enoent(error: Error) -> Error {
+    if is_miss(&error) {
+        Error::Io(std::io::Error::from_raw_os_error(libc::ENOENT))
+    } else {
+        error
+    }
 }
 
 /// The errno that stands for an error of [`lookup`], for a caller that can only say a number (the

@@ -507,6 +507,7 @@ struct LockedThenOpen {
     impersonation: Option<ImpersonationGuard>,
     guard: Option<DenyAclGuard>,
     root: Option<tempfile::TempDir>,
+    locked: PathBuf,
     open: PathBuf,
     path: std::ffi::OsString,
 }
@@ -562,6 +563,7 @@ fn locked_then_open() -> LockedThenOpen {
         impersonation: Some(impersonation),
         guard: Some(guard),
         root: Some(root),
+        locked,
         open,
         path,
     }
@@ -585,6 +587,48 @@ fn an_undeterminable_windows_acl_fails_a_loadable_only_search_closed() {
             let kind = e.io_errors().next().map(std::io::Error::kind);
             assert_eq!(kind, Some(std::io::ErrorKind::PermissionDenied), "{e}");
             assert_eq!(crate::error::first_os_code(&e), Some(5), "{e}");
+            // A searched name has a `PATH` entry: the error names it and the candidate.
+            let report = crate::error::Report(&e).to_string();
+            for named in [&fixture.locked, &fixture.locked.join("tool.exe")] {
+                assert!(
+                    report.contains(&format!("{named:?}")),
+                    "{named:?} is not named: {report}"
+                );
+            }
+        }
+        other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
+    }
+}
+
+/// A located name has no `PATH` entry: the error names the candidate alone, not an entry (the empty
+/// path of an absolute name, the cwd of a relative one).
+///
+/// Mutant: the error says `exists in` the entry for a located name too.
+#[skuld::test]
+fn an_undeterminable_located_candidate_names_no_entry() {
+    let fixture = locked_then_open();
+    let candidate = fixture.locked.join("tool.exe");
+    let found = resolve(ResolveInput {
+        program: &candidate,
+        cwd: None,
+        system_dirs: &no_system_dirs,
+        path_var: None,
+        windows: true,
+        loadable_only: true,
+        normalise: &as_written,
+    });
+    match found {
+        Err(e @ Error::Io(_)) => {
+            assert_eq!(crate::error::first_os_code(&e), Some(5), "{e}");
+            let report = crate::error::Report(&e).to_string();
+            assert!(
+                report.contains(&format!("{candidate:?}")),
+                "{candidate:?} is not named: {report}"
+            );
+            assert!(
+                !report.contains(" exists in "),
+                "an entry is named for a located name: {report}"
+            );
         }
         other => panic!("a loadable_only search must not skip an undeterminable candidate: {other:?}"),
     }

@@ -153,7 +153,7 @@ impl Shim {
     }
 
     /// Reports a failure before the program could run: `F` to cosca, the stderr line and the seam log.
-    fn not_executed(&self, report: NotExecuted, what: &str, e: &std::io::Error) -> Exit {
+    fn not_executed(&self, report: NotExecuted, what: &str, e: &(dyn std::error::Error + 'static)) -> Exit {
         let said = crate::error::Report(e);
         self.log
             .line(format_args!("refused {}: {what}: {said}", codes::NOT_EXECUTED));

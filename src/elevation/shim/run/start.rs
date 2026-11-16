@@ -111,10 +111,10 @@ pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &Owne
     let found = match crate::resolve::posix::lookup(std::path::Path::new(&args.program), None, search.as_deref()) {
         Ok(found) => found,
         Err(error) => {
+            // The wire carries only the errno; the written line keeps the entry.
             let errno = crate::resolve::posix::errno_of(&error);
-            let e = std::io::Error::from_raw_os_error(errno);
             let why = args.program.to_string_lossy().into_owned();
-            return Err(shim.not_executed(NotExecuted::ExecFailed(Errno(errno)), &why, &e));
+            return Err(shim.not_executed(NotExecuted::ExecFailed(Errno(errno)), &why, &error));
         }
     };
     let argv: Vec<&OsStr> = std::iter::once(args.program.as_os_str())
