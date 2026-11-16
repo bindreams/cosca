@@ -219,6 +219,14 @@ impl Kernel for PauseKernel<'_> {
     fn signal_probe(&self, target: Pid) -> Result<(), Errno> {
         self.inner.signal_probe(target)
     }
+
+    fn peek(&self, pidfd: std::os::fd::BorrowedFd<'_>) -> Result<Option<crate::identity::Record>, Errno> {
+        self.inner.peek(pidfd)
+    }
+
+    fn consume(&self, pidfd: std::os::fd::BorrowedFd<'_>) -> Result<Option<crate::identity::Record>, Errno> {
+        self.inner.consume(pidfd)
+    }
 }
 
 fn assert_by_path_stat_is_fake(pid: u32) {

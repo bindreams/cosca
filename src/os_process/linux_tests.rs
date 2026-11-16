@@ -278,8 +278,13 @@ fn a_linux_child_owns_and_lends_the_kernel_it_was_built_with() {
     use crate::os_process::linux::LinuxProcess;
 
     let target = rustix::process::Pid::from_raw(4242).expect("a positive pid");
-    let kernel = Arc::new(FakeKernel::new().on_signal_probe(target, Err(rustix::io::Errno::PERM)));
-    // A pidfd of this process, which is no child of it: the box's end finds nothing to reap through it.
+    // The box's end looks through its kernel first, and a pidfd of this process, which is no child of
+    // it, is `ECHILD` there: a foreign reap, with nothing to consume.
+    let kernel = Arc::new(
+        FakeKernel::new()
+            .on_signal_probe(target, Err(rustix::io::Errno::PERM))
+            .on_peek(std::process::id(), Err(rustix::io::Errno::CHILD)),
+    );
     let stand_in = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty())
         .expect("a pidfd of this process");
     let owned = crate::child::owned::OwnedChild::new(Box::new(LinuxProcess::new(Arc::clone(&kernel), None, stand_in)));
@@ -289,6 +294,7 @@ fn a_linux_child_owns_and_lends_the_kernel_it_was_built_with() {
 
     drop(owned);
     assert_eq!(Arc::strong_count(&kernel), 1, "dropping the box releases the kernel");
+    assert_eq!(kernel.peeks_left(), 0, "the box's end looked through its kernel");
 }
 
 /// A child whose pid is unknown (a box built over its pidfd alone) is signalled

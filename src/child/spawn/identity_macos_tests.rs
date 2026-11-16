@@ -9,8 +9,18 @@ use std::rc::Rc;
 use crate::child::spawn::fault::{self, SpawnPoint};
 use crate::child::spawn::unique_report;
 use crate::error::Error;
-use crate::identity::{ppid_fault, uniq_fault, uniq_info, HostKernel, ReadPurpose, UniqInfo, UniqRead, LAUNCHD};
-use crate::wait::exit_only::seams::force_peek_once;
+use crate::identity::{
+    ppid_fault, uniq_fault, uniq_info, FakeKernel, HostKernel, Kernel, ReadPurpose, UniqInfo, UniqRead, LAUNCHD,
+};
+use std::sync::Arc;
+
+/// [`crate::Command::spawn`] over `kernel`, which the spawn and every box it builds ask.
+pub(crate) fn spawn_over(
+    cmd: &mut crate::Command,
+    kernel: impl Kernel + Send + 'static,
+) -> Result<crate::Child, Error> {
+    Ok(crate::child::spawn::spawn_with(cmd, kernel)?)
+}
 
 /// Waits for `pid` (a child of this test) to exit, then reaps it by pid, as a foreign reaper would.
 pub(crate) fn reap_by_pid(pid: u32) {
@@ -147,20 +157,18 @@ fn macos_sync_spawn_identity_with_a_refused_reread_keeps_the_child_without_an_id
     crate::log_capture::install();
     let (mut cmd, _writer) = sync_blocker();
     let pid = Rc::new(Cell::new(0));
-    let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
     let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
-        let (pid, armed) = (Rc::clone(&pid), Rc::clone(&armed));
+        let (pid, kernel) = (Rc::clone(&pid), Arc::clone(&kernel));
         move || {
             pid.set(fault::spawn_pid());
-            *armed.borrow_mut() = Some(Box::new(force_peek_once(Err(std::io::Error::other(
-                "forced re-read refusal 5d1b",
-            )))));
+            kernel.state_peek(pid.get(), Err(std::io::Error::other("forced re-read refusal 5d1b")));
         }
     });
     let mark = crate::log_capture::mark();
-    let outcome = cmd.spawn();
-    drop(armed);
+    let outcome = spawn_over(&mut cmd, Arc::clone(&kernel));
     assert_ne!(pid.get(), 0, "the hook must have run");
+    assert!(kernel.all_rows_taken(), "the re-read's peek was the refused one");
     let child = outcome.expect("a refused re-read keeps the child");
     assert_eq!(
         child.id(),
@@ -194,19 +202,17 @@ fn macos_sync_spawn_identity_with_a_refused_reread_fails_a_contained_spawn_and_e
     let (mut cmd, _writer) = sync_blocker();
     cmd.contain_with(crate::ContainMode::Session);
     let pid = Rc::new(Cell::new(0));
-    let armed: Rc<RefCell<Option<Box<dyn std::any::Any>>>> = Rc::default();
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
     let _hook = fault::set_at(SpawnPoint::AfterIdentityRead, {
-        let (pid, armed) = (Rc::clone(&pid), Rc::clone(&armed));
+        let (pid, kernel) = (Rc::clone(&pid), Arc::clone(&kernel));
         move || {
             pid.set(fault::spawn_pid());
-            *armed.borrow_mut() = Some(Box::new(force_peek_once(Err(std::io::Error::other(
-                "forced re-read refusal 2f9a",
-            )))));
+            kernel.state_peek(pid.get(), Err(std::io::Error::other("forced re-read refusal 2f9a")));
         }
     });
-    let outcome = cmd.spawn();
-    drop(armed);
+    let outcome = spawn_over(&mut cmd, Arc::clone(&kernel));
     assert_ne!(pid.get(), 0, "the hook must have run");
+    assert!(kernel.all_rows_taken(), "the re-read's peek was the refused one");
     let (err, fate) = crate::child::spawn::failure::expect_may_have_started_with(
         outcome.expect_err("a contained spawn without an identity fails"),
     );

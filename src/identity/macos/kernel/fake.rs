@@ -19,26 +19,33 @@ use crate::os_process::macos::kqueue::{Kqueue, Subscription};
 /// `every` row answers each call no row of the kind answers.
 struct Rows<A, T> {
     once: Mutex<Vec<(A, T)>>,
-    every: Vec<(A, Box<dyn Fn() -> T + Send + Sync>)>,
+    every: Mutex<Vec<(A, EveryAnswer<T>)>>,
 }
+
+/// What an `every` row makes at each call it answers.
+type EveryAnswer<T> = Box<dyn Fn() -> T + Send + Sync>;
 
 impl<A: PartialEq, T> Rows<A, T> {
     fn new() -> Self {
         Rows {
             once: Mutex::new(Vec::new()),
-            every: Vec::new(),
+            every: Mutex::new(Vec::new()),
         }
     }
 
-    fn push(&mut self, asked: A, answer: T) {
+    /// Adds a row. Through a shared reference, so a row can be stated after the kernel is shared.
+    fn push(&self, asked: A, answer: T) {
         self.once
-            .get_mut()
-            .expect("no thread holds the rows")
+            .lock()
+            .expect("no thread panics holding the rows")
             .push((asked, answer));
     }
 
-    fn push_every(&mut self, asked: A, answer: impl Fn() -> T + Send + Sync + 'static) {
-        self.every.push((asked, Box::new(answer)));
+    /// Adds an `every` row for `asked`, in place of the one it had.
+    fn push_every(&self, asked: A, answer: impl Fn() -> T + Send + Sync + 'static) {
+        let mut rows = self.every.lock().expect("no thread panics holding the rows");
+        rows.retain(|(row, _)| *row != asked);
+        rows.push((asked, Box::new(answer)));
     }
 
     /// Whether every once row has answered. An `every` row is never left over.
@@ -52,7 +59,10 @@ impl<A: PartialEq, T> Rows<A, T> {
         if let Some(at) = rows.iter().position(|(row, _)| row == asked) {
             return Some(rows.remove(at).1);
         }
+        drop(rows);
         self.every
+            .lock()
+            .expect("no thread panics holding the rows")
             .iter()
             .find(|(row, _)| row == asked)
             .map(|(_, answer)| answer())
@@ -73,6 +83,7 @@ pub(crate) struct FakeKernel<'a> {
     kinfos: Rows<RawPid, KinfoAnswer>,
     /// `Err`: the registration is refused with this errno. `Ok`: it is made and never fires.
     subscribes: Rows<Subscription, Result<(), i32>>,
+    peek_reads: Mutex<Vec<(RawPid, usize)>>,
     /// How many `kinfo_proc` reads each pid has had, whoever answered them.
     kinfo_reads: Mutex<Vec<(RawPid, usize)>>,
     /// How many unique-id reads each pid has had, whoever answered them.
@@ -107,6 +118,7 @@ impl<'a> FakeKernel<'a> {
             bsd_infos: Rows::new(),
             kinfos: Rows::new(),
             subscribes: Rows::new(),
+            peek_reads: Mutex::new(Vec::new()),
             kinfo_reads: Mutex::new(Vec::new()),
             unique_info_reads: Mutex::new(Vec::new()),
         }
@@ -121,43 +133,79 @@ impl<'a> FakeKernel<'a> {
     }
 
     /// The next peek of `pid` answers `answer`: `Ok(None)` is a child that has not exited.
-    pub(crate) fn on_peek(mut self, pid: u32, answer: io::Result<Option<Record>>) -> Self {
-        self.peeks.push(pid, answer);
+    pub(crate) fn on_peek(self, pid: u32, answer: io::Result<Option<Record>>) -> Self {
+        self.state_peek(pid, answer);
         self
     }
 
+    /// [`on_peek`](Self::on_peek) after the kernel is shared: for a child whose pid the test learns
+    /// only once the spawn under test has made it.
+    pub(crate) fn state_peek(&self, pid: u32, answer: io::Result<Option<Record>>) {
+        self.peeks.push(pid, answer);
+    }
+
+    /// Every peek of `pid` that no row answers answers what `answer` makes. A second such row for
+    /// `pid` replaces the first.
+    pub(crate) fn on_every_peek(
+        self,
+        pid: u32,
+        answer: impl Fn() -> io::Result<Option<Record>> + Send + Sync + 'static,
+    ) -> Self {
+        self.state_every_peek(pid, answer);
+        self
+    }
+
+    /// [`on_every_peek`](Self::on_every_peek) after the kernel is shared.
+    pub(crate) fn state_every_peek(
+        &self,
+        pid: u32,
+        answer: impl Fn() -> io::Result<Option<Record>> + Send + Sync + 'static,
+    ) {
+        self.peeks.push_every(pid, answer);
+    }
+
+    /// Every short BSD-info read of `pid` that no row answers answers what `answer` makes, stated
+    /// after the kernel is shared. A second such row for `pid` replaces the first.
+    pub(crate) fn state_every_short_bsd(
+        &self,
+        pid: RawPid,
+        answer: impl Fn() -> Result<libc::proc_bsdshortinfo, ReadErr> + Send + Sync + 'static,
+    ) {
+        self.short_bsds.push_every(pid, answer);
+    }
+
     /// The next consume of `pid` answers `answer`, and takes nothing from the real process.
-    pub(crate) fn on_consume(mut self, pid: u32, answer: io::Result<Option<Record>>) -> Self {
+    pub(crate) fn on_consume(self, pid: u32, answer: io::Result<Option<Record>>) -> Self {
         self.consumes.push(pid, answer);
         self
     }
 
     /// The next unique-id read of `pid` answers `answer`.
-    pub(crate) fn on_unique_info(mut self, pid: RawPid, answer: UniqRead) -> Self {
+    pub(crate) fn on_unique_info(self, pid: RawPid, answer: UniqRead) -> Self {
         self.unique_infos.push(pid, answer);
         self
     }
 
     /// The next short BSD-info read of `pid` answers `answer`.
-    pub(crate) fn on_short_bsd(mut self, pid: RawPid, answer: Result<libc::proc_bsdshortinfo, ReadErr>) -> Self {
+    pub(crate) fn on_short_bsd(self, pid: RawPid, answer: Result<libc::proc_bsdshortinfo, ReadErr>) -> Self {
         self.short_bsds.push(pid, answer);
         self
     }
 
     /// The next BSD-info read of `pid` answers `answer`.
-    pub(crate) fn on_bsd_info(mut self, pid: RawPid, answer: Result<libc::proc_bsdinfo, ReadErr>) -> Self {
+    pub(crate) fn on_bsd_info(self, pid: RawPid, answer: Result<libc::proc_bsdinfo, ReadErr>) -> Self {
         self.bsd_infos.push(pid, answer);
         self
     }
 
     /// The next `kinfo_proc` read of `pid` finds `record`.
-    pub(crate) fn on_kinfo(mut self, pid: RawPid, record: kinfo_proc) -> Self {
+    pub(crate) fn on_kinfo(self, pid: RawPid, record: kinfo_proc) -> Self {
         self.kinfos.push(pid, (Resolved::Found(record), None));
         self
     }
 
     /// The next `kinfo_proc` read of `pid` is refused with `errno`.
-    pub(crate) fn on_kinfo_refused(mut self, pid: RawPid, errno: i32) -> Self {
+    pub(crate) fn on_kinfo_refused(self, pid: RawPid, errno: i32) -> Self {
         self.kinfos
             .push(pid, (Resolved::Unknown, Some(io::Error::from_raw_os_error(errno))));
         self
@@ -166,7 +214,7 @@ impl<'a> FakeKernel<'a> {
     /// Every unique-id read of `pid` that no row answers answers what `answer` says at that read, so
     /// a test that reads from two threads states what each sees, not an order of reads.
     pub(crate) fn on_every_unique_info(
-        mut self,
+        self,
         pid: RawPid,
         answer: impl Fn() -> UniqRead + Send + Sync + 'static,
     ) -> Self {
@@ -175,13 +223,13 @@ impl<'a> FakeKernel<'a> {
     }
 
     /// Every BSD-info read of `pid` that no row answers fails with `error`.
-    pub(crate) fn on_every_bsd_info_failing(mut self, pid: RawPid, error: ReadErr) -> Self {
+    pub(crate) fn on_every_bsd_info_failing(self, pid: RawPid, error: ReadErr) -> Self {
         self.bsd_infos.push_every(pid, move || Err(error));
         self
     }
 
     /// Every `kinfo_proc` read of `pid` that no row answers is refused with `errno`.
-    pub(crate) fn on_every_kinfo_refused(mut self, pid: RawPid, errno: i32) -> Self {
+    pub(crate) fn on_every_kinfo_refused(self, pid: RawPid, errno: i32) -> Self {
         self.kinfos.push_every(pid, move || {
             (Resolved::Unknown, Some(io::Error::from_raw_os_error(errno)))
         });
@@ -189,15 +237,20 @@ impl<'a> FakeKernel<'a> {
     }
 
     /// The next registration `what` is made and never fires.
-    pub(crate) fn on_subscribe(mut self, what: Subscription) -> Self {
+    pub(crate) fn on_subscribe(self, what: Subscription) -> Self {
         self.subscribes.push(what, Ok(()));
         self
     }
 
     /// The next registration `what` is refused with `errno` (a pid past `P_REF_DEAD` answers `ESRCH`).
-    pub(crate) fn on_subscribe_refused(mut self, what: Subscription, errno: i32) -> Self {
+    pub(crate) fn on_subscribe_refused(self, what: Subscription, errno: i32) -> Self {
         self.subscribes.push(what, Err(errno));
         self
+    }
+
+    /// How many peeks of `pid` the kernel has been asked for, whoever answered them.
+    pub(crate) fn peek_reads(&self, pid: u32) -> usize {
+        reads_of(&self.peek_reads, pid)
     }
 
     /// How many `kinfo_proc` reads of `pid` the kernel has been asked for.
@@ -231,6 +284,7 @@ impl<'a> FakeKernel<'a> {
 
 impl Kernel for FakeKernel<'_> {
     fn peek(&self, pid: u32) -> io::Result<Option<Record>> {
+        count_read(&self.peek_reads, pid);
         self.peeks
             .take(&pid)
             .unwrap_or_else(|| self.real(format_args!("a peek of pid {pid}")).peek(pid))

@@ -41,6 +41,19 @@ fn a_pointer_to_a_kernel_is_a_kernel() {
     assert_eq!(probes_itself(std::sync::Arc::new(HostKernel)), Ok(()));
 }
 
+/// A peek of the pidfd of a process that is not this one's child answers `ECHILD`, as a foreign reap
+/// does.
+///
+/// Mutant: `HostKernel::peek` answers `Ok(None)` (running) for an error.
+#[skuld::test]
+fn host_peek_of_a_pidfd_that_is_not_our_child_is_echild() {
+    use std::os::fd::AsFd as _;
+    let pidfd = HostKernel
+        .pidfd_open(getpid(), PidfdFlags::empty())
+        .expect("this process opens");
+    assert_eq!(HostKernel.peek(pidfd.as_fd()), Err(Errno::CHILD));
+}
+
 #[skuld::test]
 fn host_pidfd_open_opens_this_process_and_says_esrch_for_i32_max() {
     assert!(HostKernel.pidfd_open(getpid(), PidfdFlags::empty()).is_ok());

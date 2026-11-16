@@ -476,21 +476,21 @@ fn forked_by_us_held_by(parent: u32) -> (libc::pid_t, libc::pid_t) {
 
 /// A child that launchd holds, whose parent at a tracer's attach is this process: its tracer died
 /// while it was exiting, and XNU gave it to launchd. It is gone, and the wait answers `Missing`
-/// without blocking. The child really runs; its `waitid` and its parents are forced.
+/// without blocking. The child really runs; its `waitid` (a stated `ECHILD` row) and its parents are
+/// forced.
 ///
 /// Mutant: the check takes a child this process forked for running, whoever holds it.
 #[skuld::test]
 fn awaiting_a_child_launchd_holds_after_its_tracer_died_answers_missing_without_blocking() {
-    use crate::os_process::child::{Foreign, PeekOutcome};
-    use crate::wait::exit_only::seams::force_peek_once;
+    use crate::identity::FakeKernel;
     let child = blocker();
     let pid = child.id();
     let (r, copy) = pipe();
-    let _echild = force_peek_once(Ok(PeekOutcome::Foreign(Foreign::Gone)));
+    let kernel = FakeKernel::over(&HostKernel).on_peek(pid, Err(crate::child::lifecycle::echild()));
     let _parents = crate::identity::kinfo::fault::force_parents(pid, || forked_by_us_held_by(crate::identity::LAUNCHD));
     let _release = release_on_block(copy);
     block_probe::take();
-    let report = await_report(&HostKernel, &r, pid);
+    let report = await_report(&kernel, &r, pid);
     assert_eq!(block_probe::take(), [], "a child launchd holds is not waited for");
     assert!(matches!(report, Report::Missing), "{report:?}");
 }
@@ -510,15 +510,14 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use crate::os_process::child::{Foreign, PeekOutcome};
-    use crate::wait::exit_only::seams::force_peeks;
+    use crate::identity::FakeKernel;
     let child = blocker();
     let pid = child.id();
     let mut tracer = blocker();
     let tracer_pid = tracer.id();
     let (r, copy) = pipe();
-    // More than the wait takes: the child stays `ECHILD` to this process throughout.
-    let _echild = force_peeks((0..8).map(|_| Ok(PeekOutcome::Foreign(Foreign::Gone))));
+    // The child stays `ECHILD` to this process throughout.
+    let kernel = FakeKernel::over(&HostKernel).on_every_peek(pid, || Err(crate::child::lifecycle::echild()));
     let tracer_exited = Rc::new(Cell::new(false));
     let _parents = crate::identity::kinfo::fault::force_parents(pid, {
         let exited = Rc::clone(&tracer_exited);
@@ -549,7 +548,7 @@ fn awaiting_a_child_whose_tracer_dies_during_its_exit_is_woken_by_the_tracers_ex
         }
     });
     let _ = seams::take_wake();
-    let report = await_report(&HostKernel, &r, pid);
+    let report = await_report(&kernel, &r, pid);
     assert_eq!(pending.get(), Some(true), "the tracer's exit must wake the wait");
     assert_eq!(
         seams::take_wake(),
@@ -575,18 +574,17 @@ fn awaiting_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use crate::os_process::child::{Foreign, PeekOutcome};
+    use crate::identity::FakeKernel;
     use crate::os_process::macos::kqueue::test_hooks::send_signal;
-    use crate::wait::exit_only::seams::force_peeks;
     let child = blocker();
     let pid = child.id();
     let mut tracer = blocker();
     let tracer_pid = tracer.id();
     let (r, copy) = pipe();
-    // Running for the first check, then `ECHILD` throughout: more than the wait takes.
-    let _peeks = force_peeks(
-        std::iter::once(Ok(PeekOutcome::Running)).chain((0..8).map(|_| Ok(PeekOutcome::Foreign(Foreign::Gone)))),
-    );
+    // Running for the first check, then `ECHILD` throughout.
+    let kernel = FakeKernel::over(&HostKernel)
+        .on_peek(pid, Ok(None))
+        .on_every_peek(pid, || Err(crate::child::lifecycle::echild()));
     let holder = Rc::new(Cell::new(std::process::id()));
     let _parents = crate::identity::kinfo::fault::force_parents(pid, {
         let holder = Rc::clone(&holder);
@@ -620,7 +618,7 @@ fn awaiting_a_child_a_tracer_attaches_to_late_is_woken_by_the_attach() {
         }
     });
     let _ = seams::take_wake();
-    let report = await_report(&HostKernel, &r, pid);
+    let report = await_report(&kernel, &r, pid);
     assert_eq!(attach_woke.get(), Some(true), "the attach's signal must wake the wait");
     assert_eq!(
         exit_woke.get(),
@@ -671,10 +669,9 @@ fn await_held(
 ) -> (Report, Vec<Option<std::time::Duration>>) {
     use std::cell::RefCell;
 
-    use crate::os_process::child::{Foreign, PeekOutcome};
-    use crate::wait::exit_only::seams::force_peeks;
+    use crate::identity::FakeKernel;
     let (r, copy) = pipe();
-    let _echild = force_peeks((0..16).map(|_| Ok(PeekOutcome::Foreign(Foreign::Gone))));
+    let kernel = FakeKernel::over(&HostKernel).on_every_peek(child, || Err(crate::child::lifecycle::echild()));
     let _parents = crate::identity::kinfo::fault::force_parents(child, move || forked_by_us_held_by(tracer));
     let _links = crate::wait::macos::tracer_seams::force_links(links);
     let _warn = seams::warn_after(say_after);
@@ -685,7 +682,7 @@ fn await_held(
         }
     });
     block_probe::take();
-    let report = await_report(&HostKernel, &r, child);
+    let report = await_report(&kernel, &r, child);
     (report, block_probe::take())
 }
 

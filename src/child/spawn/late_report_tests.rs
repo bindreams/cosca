@@ -5,19 +5,19 @@
 //! came late means std's own spawn is not trusted, so the child is torn down through its unique id.
 
 use std::cell::Cell;
+use std::sync::Arc;
 
 use crate::test_child::Console;
 use std::rc::Rc;
 
 use super::identity_macos_tests::{
-    end_unsignalled_and_reap, has_not_exited, is_reaped, reap_by_pid, refuse_the_kill, std_blocker_with_unique,
-    sync_blocker,
+    end_unsignalled_and_reap, has_not_exited, is_reaped, reap_by_pid, refuse_the_kill, spawn_over,
+    std_blocker_with_unique, sync_blocker,
 };
 use super::unique_report;
 use crate::error::ChildFate;
-use crate::os_process::child::PeekOutcome;
+use crate::identity::{FakeKernel, HostKernel};
 use crate::test_groups::{stray_signal, tracer_group, Group};
-use crate::wait::exit_only::seams::force_peeks;
 
 // What the one warn says =====
 
@@ -795,12 +795,15 @@ fn tear_down(
     unique: u64,
     arm: impl FnOnce(u32) -> Vec<Box<dyn std::any::Any>>,
 ) -> (ChildFate, Vec<String>, Vec<crate::send_log::Entry>) {
-    let uncontained = crate::containment::Prepared {
+    tear_down_with(uncontained(), child, stdin, unique, arm)
+}
+
+fn uncontained() -> crate::containment::Prepared {
+    crate::containment::Prepared {
         mode: None,
         is_root: true,
         marker: None,
-    };
-    tear_down_with(uncontained, child, stdin, unique, arm)
+    }
 }
 
 /// [`tear_down`] of a child contained by `prepared`.
@@ -811,16 +814,27 @@ fn tear_down_with(
     unique: u64,
     arm: impl FnOnce(u32) -> Vec<Box<dyn std::any::Any>>,
 ) -> (ChildFate, Vec<String>, Vec<crate::send_log::Entry>) {
-    tear_down_warning_after(prepared, None, child, stdin, unique, arm)
+    tear_down_over(
+        Arc::new(FakeKernel::over(&HostKernel)),
+        prepared,
+        child,
+        stdin,
+        unique,
+        || {},
+        arm,
+    )
 }
 
-/// [`tear_down_with`] whose wait for the killed child warns once it passes `warn_after`.
-fn tear_down_warning_after(
+/// [`tear_down_with`] asking `kernel`, with `after_kill` run once the kill is sent (after the
+/// blocker's release). Every row the test stated must have answered when the teardown ends: a look
+/// it stopped making fails here, and not as an answer that was never given.
+fn tear_down_over(
+    kernel: Arc<FakeKernel<'static>>,
     prepared: crate::containment::Prepared,
-    warn_after: Option<std::time::Duration>,
     child: std::process::Child,
     stdin: &Rc<Cell<Option<std::process::ChildStdin>>>,
     unique: u64,
+    after_kill: impl FnOnce() + 'static,
     arm: impl FnOnce(u32) -> Vec<Box<dyn std::any::Any>>,
 ) -> (ChildFate, Vec<String>, Vec<crate::send_log::Entry>) {
     crate::log_capture::install();
@@ -828,14 +842,18 @@ fn tear_down_warning_after(
     let sent = crate::send_log::Capture::start();
     let _release = crate::child::spawn::fault::set_between_kill_and_wait({
         let stdin = Rc::clone(stdin);
-        move || drop(stdin.take())
+        move || {
+            drop(stdin.take());
+            after_kill();
+        }
     });
     let mark = crate::log_capture::mark();
-    // The forced answers are still armed when they are counted: a look the teardown stopped making
-    // fails here, and not as an answer that was never given.
     let _armed = arm(pid);
-    let (fate, _cleanup) = abandon(prepared, warn_after, child, unique);
-    crate::wait::exit_only::seams::assert_peeks_exhausted();
+    let (fate, _cleanup) = abandon(prepared, child, unique, Arc::clone(&kernel));
+    assert!(
+        kernel.all_rows_taken(),
+        "a look the teardown was stated to make was not made"
+    );
     (fate, warns_of(pid, mark), sent.entries())
 }
 
@@ -844,17 +862,13 @@ fn tear_down_warning_after(
 /// if its kill was refused, for the test to end.
 fn abandon(
     prepared: crate::containment::Prepared,
-    warn_after: Option<std::time::Duration>,
     child: std::process::Child,
     unique: u64,
+    kernel: Arc<FakeKernel<'static>>,
 ) -> (ChildFate, Option<crate::error::Failures>) {
     use crate::child::spawn::failure::SpawnFailure;
     use crate::child::spawn::policy::SpawnPolicy;
 
-    let policy = SpawnPolicy {
-        teardown_warn_after: warn_after,
-        ..SpawnPolicy::SYNC
-    };
     let error = crate::error::Error::Io(std::io::Error::other("the late child was not adopted"));
     let failure = super::late_child::abandon_late_child(
         child,
@@ -862,8 +876,8 @@ fn abandon(
         error,
         None,
         prepared,
-        policy,
-        crate::identity::spawn_kernel(crate::identity::HostKernel),
+        SpawnPolicy::SYNC,
+        crate::identity::spawn_kernel(kernel),
     );
     let SpawnFailure::MayHaveStarted {
         fate,
@@ -890,14 +904,9 @@ fn macos_late_teardown_returns_a_refused_kill_for_the_cleanup() {
     let (blocker, unique) = std_blocker_with_unique();
     let (child, _stdin) = blocker.into_parts();
     let pid = child.id();
-    let uncontained = crate::containment::Prepared {
-        mode: None,
-        is_root: true,
-        marker: None,
-    };
     let _refused = refuse_the_kill();
 
-    let (fate, failures) = abandon(uncontained, None, child, unique);
+    let (fate, failures) = abandon(uncontained(), child, unique, Arc::new(FakeKernel::over(&HostKernel)));
 
     assert!(matches!(fate, ChildFate::Running { .. }), "{fate:?}");
     let failures = failures.expect("the kill was refused");
@@ -1011,7 +1020,7 @@ fn macos_late_teardown_of_a_child_reaped_before_the_teardown_sends_nothing_and_i
 
 /// A refused kill and a peek of the child that fails: nothing shows what became of it, `Unknown`.
 /// The box's wait reads the child unverified, so a refused id read alone leaves it `Running`; the
-/// peek is forced to fail, as the OS's refusal of it does when the child is not ours to see.
+/// peek's row fails, as the OS's refusal of it does when the child is not ours to see.
 ///
 /// Mutant: the arm answers `Running` or `Reaped`.
 #[skuld::test]
@@ -1020,12 +1029,17 @@ fn macos_late_teardown_with_a_refused_kill_and_a_failed_peek_is_unknown() {
     let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
-    let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
-        vec![
-            Box::new(refuse_the_kill()),
-            Box::new(force_peeks([Err(std::io::Error::from_raw_os_error(libc::EPERM))])),
-        ]
-    });
+    let kernel =
+        Arc::new(FakeKernel::over(&HostKernel).on_peek(pid, Err(std::io::Error::from_raw_os_error(libc::EPERM))));
+    let (fate, warns, sent) = tear_down_over(
+        kernel,
+        uncontained(),
+        child,
+        &stdin,
+        unique,
+        || {},
+        |_| vec![Box::new(refuse_the_kill())],
+    );
     assert_eq!(fate, ChildFate::Unknown);
     let warn = only(&warns);
     assert_eq!(sent, [], "a refused kill sends nothing");
@@ -1036,29 +1050,37 @@ fn macos_late_teardown_with_a_refused_kill_and_a_failed_peek_is_unknown() {
     end_unsignalled_and_reap(pid);
 }
 
-/// A delivered kill, then a wait that shows someone else reaped the child: `Killed`.
-///
-/// The first forced answer is the teardown's look at whether the root is a zombie of ours; the second
-/// is the wait's.
+/// A delivered kill, then a wait that shows someone else reaped the child: `Killed`. The other reaper
+/// is the test, once the kill is sent.
 ///
 /// Mutant: the arm says the child was reaped, or `Gone`.
 #[skuld::test]
 fn macos_late_teardown_of_a_child_reaped_elsewhere_after_the_kill_is_killed() {
-    use crate::os_process::child::Foreign;
     let (blocker, unique) = std_blocker_with_unique();
     let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
-    let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
-        vec![Box::new(force_peeks([
-            Ok(PeekOutcome::Foreign(Foreign::Gone)),
-            Ok(PeekOutcome::Foreign(Foreign::Gone)),
-        ]))]
-    });
+    let (fate, warns, sent) = tear_down_over(
+        Arc::new(FakeKernel::over(&HostKernel)),
+        uncontained(),
+        child,
+        &stdin,
+        unique,
+        move || reap_by_pid(pid),
+        |_| vec![],
+    );
     assert_eq!(fate, ChildFate::Killed);
     assert_kill_sent(pid, &sent);
     assert!(only(&warns).contains(SAID_REAPED_ELSEWHERE), "{warns:?}");
-    reap_by_pid(pid);
+}
+
+/// The facts of a zombie launchd holds, as its tracer's death leaves it, stated for `pid` on `kernel`:
+/// `waitid` answers `ECHILD`, and its BSD info says a zombie whose parent is launchd.
+fn state_launchd_holds_the_zombie(kernel: &FakeKernel<'_>, pid: u32) {
+    kernel.state_every_peek(pid, || Err(crate::child::lifecycle::echild()));
+    kernel.state_every_short_bsd(pid, || {
+        Ok(crate::identity::short_info(crate::identity::LAUNCHD, libc::SZOMB))
+    });
 }
 
 /// A delivered kill, then a zombie launchd holds: `Killed`, and the warn says why.
@@ -1066,17 +1088,13 @@ fn macos_late_teardown_of_a_child_reaped_elsewhere_after_the_kill_is_killed() {
 /// Mutant: the arm says the child was reaped.
 #[skuld::test]
 fn macos_late_teardown_of_an_orphaned_zombie_after_the_kill_is_killed_and_says_so() {
-    use crate::os_process::child::Foreign;
     let (blocker, unique) = std_blocker_with_unique();
     let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
-    let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
-        vec![Box::new(force_peeks([
-            Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
-            Ok(PeekOutcome::Foreign(Foreign::Orphaned)),
-        ]))]
-    });
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
+    state_launchd_holds_the_zombie(&kernel, pid);
+    let (fate, warns, sent) = tear_down_over(kernel, uncontained(), child, &stdin, unique, || {}, |_| vec![]);
     assert_eq!(fate, ChildFate::Killed);
     assert_kill_sent(pid, &sent);
     let warn = only(&warns);
@@ -1084,8 +1102,8 @@ fn macos_late_teardown_of_an_orphaned_zombie_after_the_kill_is_killed_and_says_s
     reap_by_pid(pid);
 }
 
-/// A delivered kill, then a failed wait: `Killed`, with the failure in the warn. The first forced
-/// answer is the teardown's look at whether the root is a zombie of ours.
+/// A delivered kill, then a failed wait: `Killed`, with the failure in the warn. The first stated
+/// peek is the teardown's look at whether the root is a zombie of ours.
 ///
 /// Mutant: the arm says the child was reaped.
 #[skuld::test]
@@ -1094,12 +1112,12 @@ fn macos_late_teardown_with_a_failed_wait_is_killed() {
     let (child, stdin) = blocker.into_parts();
     let stdin = Rc::new(Cell::new(Some(stdin)));
     let pid = child.id();
-    let (fate, warns, sent) = tear_down(child, &stdin, unique, |_| {
-        vec![Box::new(force_peeks([
-            Ok(PeekOutcome::Running),
-            Err(std::io::Error::other("forced wait failure")),
-        ]))]
-    });
+    let kernel = Arc::new(
+        FakeKernel::over(&HostKernel)
+            .on_peek(pid, Ok(None))
+            .on_peek(pid, Err(std::io::Error::other("forced wait failure"))),
+    );
+    let (fate, warns, sent) = tear_down_over(kernel, uncontained(), child, &stdin, unique, || {}, |_| vec![]);
     assert_eq!(fate, ChildFate::Killed);
     assert_kill_sent(pid, &sent);
     let warn = only(&warns);
@@ -1124,15 +1142,26 @@ struct NotZombie {
     warn: String,
 }
 
-/// A late [`TREE_ARGV`] child contained as `contain` sets, whose wait after the root's kill is forced
-/// to `waited`, so the root is not shown an unreaped zombie. `spoil` runs once the grandchild runs,
-/// before the first sweep. The root is left a zombie, which this reaps.
+/// What became of a late root after its kill, so that it is not shown an unreaped zombie of ours.
+#[derive(Clone, Copy)]
+enum Elsewhere {
+    /// Someone else reaped it: the test, from the hook between the root's kill and its wait, which
+    /// runs on the teardown's thread before the wait and the second sweep, so both look after the
+    /// reap.
+    Reaped,
+    /// Its tracer died and launchd holds its zombie (stated rows of the spawn's kernel).
+    HeldByLaunchd,
+}
+
+/// A late [`TREE_ARGV`] child contained as `contain` sets, whose root `elsewhere` after its kill, so
+/// the root is not shown an unreaped zombie. `spoil` runs once the grandchild runs, before the first
+/// sweep. A root held by launchd is left a zombie, which this reaps.
 fn late_tree_not_zombie(
     contain: impl FnOnce(&mut crate::Command),
-    waited: crate::os_process::child::Foreign,
+    elsewhere: Elsewhere,
     spoil: impl FnOnce() + 'static,
 ) -> NotZombie {
-    use crate::child::spawn::fault::{set_at, SpawnPoint};
+    use crate::child::spawn::fault::{set_at, set_between_kill_and_wait, SpawnPoint};
     use std::cell::RefCell;
     crate::log_capture::install();
     let (tree, ends) = tree_pipes();
@@ -1153,28 +1182,42 @@ fn late_tree_not_zombie(
         }
     });
     let marks = Rc::new(Cell::new((0, 0)));
-    let forced: Rc<RefCell<Option<crate::wait::exit_only::seams::Forced>>> = Rc::default();
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
+    let root = Rc::new(Cell::new(0));
+    let looks_before = Rc::new(Cell::new(0));
     let _second = set_at(SpawnPoint::BeforeLateRootKill, {
-        let (walks, marks, forced) = (Rc::clone(&walks), Rc::clone(&marks), Rc::clone(&forced));
+        let (walks, marks, kernel, root, looks_before) = (
+            Rc::clone(&walks),
+            Rc::clone(&marks),
+            Arc::clone(&kernel),
+            Rc::clone(&root),
+            Rc::clone(&looks_before),
+        );
         move || {
             let holders = crate::containment::fdmarker::fault::holder_kills_so_far();
             marks.set((walks.walked().len(), holders.len()));
-            // The teardown's look at whether the root is a zombie of ours, the box's look at the
-            // second sweep's send, then the wait's.
-            *forced.borrow_mut() = Some(force_peeks([
-                Ok(PeekOutcome::Foreign(waited)),
-                Ok(PeekOutcome::Foreign(waited)),
-                Ok(PeekOutcome::Foreign(waited)),
-            ]));
+            root.set(crate::child::spawn::fault::spawn_pid());
+            looks_before.set(kernel.peek_reads(root.get()));
+            if let Elsewhere::HeldByLaunchd = elsewhere {
+                state_launchd_holds_the_zombie(&kernel, root.get());
+            }
         }
+    });
+    let _reap = matches!(elsewhere, Elsewhere::Reaped).then(|| {
+        let root = Rc::clone(&root);
+        set_between_kill_and_wait(move || reap_by_pid(root.get()))
     });
     let mark = crate::log_capture::mark();
     let err = {
         let _late = unique_report::seams::find_the_report_unwritten();
-        cmd.spawn().expect_err("a late child is not adopted")
+        spawn_over(&mut cmd, Arc::clone(&kernel)).expect_err("a late child is not adopted")
     };
-    crate::wait::exit_only::seams::assert_peeks_exhausted();
-    drop(forced.borrow_mut().take());
+    // The root's looks after its kill (the wait's, the second sweep's) are what find it not a zombie
+    // of ours: without them the outcomes below hold for another reason.
+    assert!(
+        kernel.peek_reads(root.get()) > looks_before.get(),
+        "the root was not looked at after its kill"
+    );
     let (_err, fate) = crate::child::spawn::failure::expect_may_have_started_with(err);
     let Some(crate::identity::Resolved::Found(id)) = crate::child::spawn::fault::take_captured() else {
         panic!("the spawn captured the child");
@@ -1188,7 +1231,9 @@ fn late_tree_not_zombie(
         holders_after: holders.killed()[holder_mark..].to_vec(),
         warn: only(&warns_of(id.pid(), mark)).to_owned(),
     };
-    reap_by_pid(id.pid());
+    if let Elsewhere::HeldByLaunchd = elsewhere {
+        reap_by_pid(id.pid());
+    }
     seen
 }
 
@@ -1208,7 +1253,7 @@ fn macos_late_marked_tree_whose_root_is_not_shown_a_zombie_still_sweeps_its_hold
         |cmd| {
             cmd.contain_with(ContainMode::TreeWalk);
         },
-        crate::os_process::child::Foreign::Gone,
+        Elsewhere::Reaped,
         || {
             // Two blind snapshots: pass 1 finds the root (not killed), so a second pass follows.
             crate::containment::enumerate::force_blind_snapshots(2);
@@ -1246,7 +1291,7 @@ fn macos_late_walked_tree_whose_root_is_not_shown_a_zombie_is_not_walked_again()
         |cmd| {
             cmd.contain_with(ContainMode::TreeWalk).suppress_fd_marker();
         },
-        crate::os_process::child::Foreign::Orphaned,
+        Elsewhere::HeldByLaunchd,
         || {},
     );
     assert!(!seen.survived, "the first sweep kills the grandchild");
@@ -1271,7 +1316,7 @@ fn macos_late_session_tree_whose_root_was_reaped_elsewhere_after_its_kill_says_i
         |cmd| {
             cmd.contain_with(ContainMode::Session).suppress_fd_marker();
         },
-        crate::os_process::child::Foreign::Gone,
+        Elsewhere::Reaped,
         || {},
     );
     assert!(!seen.survived, "the first sweep kills the grandchild");

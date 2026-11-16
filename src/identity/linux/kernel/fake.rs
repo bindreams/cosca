@@ -14,7 +14,7 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags};
 
 use super::Kernel;
-use crate::identity::{ProcDir, ProcOpenFailure, ReadFailure};
+use crate::identity::{pidfd_pid_in, HostKernel, PidfdTarget, ProcDir, ProcOpenFailure, ReadFailure, Record};
 
 pub(crate) struct FakeKernel<'a> {
     /// What answers a call the tables have nothing for. `None`: such a call panics.
@@ -42,6 +42,32 @@ pub(crate) struct FakeKernel<'a> {
     opened: Mutex<Vec<Opened>>,
     /// How many times `pidfs_ino` has been asked, whoever answered.
     pidfs_ino_calls: AtomicUsize,
+    peeks: Mutex<WaitRows>,
+    consumes: Mutex<WaitRows>,
+}
+
+/// `waitid` rows, in the order they were stated: a pid, and what one call through a pidfd that names
+/// it answers.
+type WaitRows = Vec<(u32, Result<Option<Record>, Errno>)>;
+
+/// The first row of `rows` for the process `pidfd` names, which it removes. Each row answers one
+/// call. The pidfd's pid is read from the host's `/proc` only when there are rows to match, and a
+/// pidfd whose target is reaped matches none.
+fn take_wait_row(rows: &Mutex<WaitRows>, pidfd: BorrowedFd<'_>) -> Option<Result<Option<Record>, Errno>> {
+    let mut rows = rows.lock().expect("no panic holds the rows");
+    if rows.is_empty() {
+        return None;
+    }
+    let pid = match ProcDir::open()
+        .map_err(crate::identity::ViewUnreadable::from)
+        .and_then(|dir| pidfd_pid_in(&HostKernel, &dir, pidfd))
+    {
+        Ok(PidfdTarget::Pid(pid)) => pid,
+        Ok(PidfdTarget::Reaped) => return None,
+        Err(why) => panic!("FakeKernel could not read the pid of a pidfd it holds rows for: {why:?}"),
+    };
+    let at = rows.iter().position(|(row, _)| *row == pid)?;
+    Some(rows.remove(at).1)
 }
 
 /// The call of a read or listing that a row's errno answers for.
@@ -135,7 +161,42 @@ impl<'a> FakeKernel<'a> {
             pidfs_inos: Vec::new(),
             opened: Mutex::new(Vec::new()),
             pidfs_ino_calls: AtomicUsize::new(0),
+            peeks: Mutex::new(Vec::new()),
+            consumes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The next peek through a pidfd that names `pid` answers `answer`: `Ok(None)` is a child that
+    /// has not exited. A peek of another process's pidfd is not this row's.
+    pub(crate) fn on_peek(self, pid: u32, answer: Result<Option<Record>, Errno>) -> Self {
+        self.state_peek(pid, answer);
+        self
+    }
+
+    /// [`on_peek`](Self::on_peek) after the kernel is shared: for a child whose pid the test learns
+    /// only once the spawn under test has made it.
+    pub(crate) fn state_peek(&self, pid: u32, answer: Result<Option<Record>, Errno>) {
+        self.peeks.lock().expect("no panic holds the rows").push((pid, answer));
+    }
+
+    /// The next consume through a pidfd that names `pid` answers `answer`, and takes nothing from the
+    /// real process.
+    pub(crate) fn on_consume(self, pid: u32, answer: Result<Option<Record>, Errno>) -> Self {
+        self.consumes
+            .lock()
+            .expect("no panic holds the rows")
+            .push((pid, answer));
+        self
+    }
+
+    /// How many stated peek rows have not answered yet.
+    pub(crate) fn peeks_left(&self) -> usize {
+        self.peeks.lock().expect("no panic holds the rows").len()
+    }
+
+    /// Whether every stated peek and consume row has answered.
+    pub(crate) fn all_rows_taken(&self) -> bool {
+        self.peeks_left() == 0 && self.consumes.lock().expect("no panic holds the rows").is_empty()
     }
 
     /// How many times the kernel has been asked for a pidfd's `pidfs_ino`: an identity read of a
@@ -507,6 +568,20 @@ impl Kernel for FakeKernel<'_> {
         match self.signal_probes.iter().rev().find(|(p, _)| *p == target) {
             Some((_, answer)) => *answer,
             None => self.real(&format!("signal_probe of {target:?}")).signal_probe(target),
+        }
+    }
+
+    fn peek(&self, pidfd: BorrowedFd<'_>) -> Result<Option<Record>, Errno> {
+        match take_wait_row(&self.peeks, pidfd) {
+            Some(answer) => answer,
+            None => self.real("a peek").peek(pidfd),
+        }
+    }
+
+    fn consume(&self, pidfd: BorrowedFd<'_>) -> Result<Option<Record>, Errno> {
+        match take_wait_row(&self.consumes, pidfd) {
+            Some(answer) => answer,
+            None => self.real("a consume").consume(pidfd),
         }
     }
 }
