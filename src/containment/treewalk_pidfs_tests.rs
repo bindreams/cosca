@@ -377,6 +377,7 @@ fn a_root_whose_proof_finds_another_process_walks_nothing() {
         &root_changed_hands(),
         root(),
         &super::ByIdentity::new(&root_changed_hands(), root()),
+        crate::containment::TreeStop::default(),
     );
     assert!(
         matches!(termed, Ok(super::Terminated::RootExited(_))),
@@ -411,6 +412,7 @@ fn a_root_whose_proof_cannot_be_made_is_unassessable_and_signals_nothing() {
             &root_proof_fails(),
             root(),
             &super::ByIdentity::new(&root_proof_fails(), root()),
+            crate::containment::TreeStop::default(),
         )
         .map(drop),
         root().children_with(&root_proof_fails(), Recursive::No).map(|_| ()),
@@ -454,15 +456,18 @@ fn live_child_in_a_table() -> (StdChild, ProcessId, FakeKernel<'static>) {
 /// proof": no send through a pidfd is recorded.
 #[skuld::test]
 fn a_kill_by_identity_is_sent_through_the_proved_pidfd() {
-    use nix::sys::signal::Signal;
     use std::os::unix::process::ExitStatusExt as _;
     let (mut child, id, kernel) = live_child_in_a_table();
     let sends = crate::send_log::Capture::start();
-    let outcome = super::kill_by_identity(&kernel, id, Signal::SIGTERM);
+    let outcome = super::kill_by_identity(&kernel, id, crate::signal::Sig::Graceful(crate::signal::Signal::Term));
     assert!(matches!(outcome, super::KillOutcome::Terminated), "{outcome:?}");
     assert_eq!(
         sends.entries(),
-        [(id.pid(), crate::signal::Sig::Term, crate::send_log::Via::Pidfd)]
+        [(
+            id.pid(),
+            crate::signal::Sig::Graceful(crate::signal::Signal::Term),
+            crate::send_log::Via::Pidfd
+        )]
     );
     assert_eq!(
         child.wait().expect("the child exits").signal(),
@@ -478,6 +483,6 @@ fn a_kill_by_identity_of_a_process_reaped_after_the_proof_is_already_gone() {
     let (mut child, id, kernel) = live_child_in_a_table();
     drop(child.stdin.take());
     child.wait().expect("the child exits at EOF");
-    let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
+    let outcome = super::kill_by_identity(&kernel, id, crate::signal::Sig::Graceful(crate::signal::Signal::Term));
     assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
 }

@@ -189,7 +189,7 @@ pub(crate) fn kill(p: &dyn OsProcess) -> Result<(), Error> {
 /// Send the graceful termination signal to the held process, without waiting. Already gone: `Ok`.
 #[cfg(unix)]
 pub(crate) fn terminate(p: &dyn OsProcess) -> Result<(), Error> {
-    p.signal(Sig::Term).map(|_: Sent| ())
+    p.signal(Sig::Graceful(crate::signal::Signal::Term)).map(|_: Sent| ())
 }
 
 /// There is no [`Sig`] to send for it on Windows: `Unsupported`.

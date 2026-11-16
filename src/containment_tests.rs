@@ -1,4 +1,34 @@
-use super::{ContainMode, Containment, Nesting};
+use super::{ContainMode, Containment, Nesting, TreeStop};
+
+/// The default tree stop is the platform's: `SIGTERM`, on Windows the `CTRL_BREAK`.
+#[skuld::test]
+fn the_default_tree_stop_names_the_platforms_graceful_signal() {
+    let stop = TreeStop::default();
+    #[cfg(unix)]
+    {
+        assert_eq!(stop.name(), "SIGTERM");
+        assert_eq!(stop.earlier(), "the SIGTERM");
+        assert_eq!(stop.signal(), crate::signal::Signal::Term);
+        assert_eq!(stop.sig(), crate::signal::Sig::Graceful(crate::signal::Signal::Term));
+    }
+    #[cfg(windows)]
+    {
+        assert_eq!(stop.name(), "CTRL_BREAK");
+        assert_eq!(stop.earlier(), "the CTRL_BREAK");
+    }
+}
+
+/// A stop made of a signal carries and names that signal, not the default's.
+#[cfg(unix)]
+#[skuld::test]
+fn a_tree_stop_of_a_signal_carries_and_names_it() {
+    use crate::signal::{Sig, Signal};
+    let stop = TreeStop::of(Signal::Usr1);
+    assert_eq!(stop.signal(), Signal::Usr1);
+    assert_eq!(stop.sig(), Sig::Graceful(Signal::Usr1));
+    assert_eq!(stop.name(), "SIGUSR1");
+    assert_eq!(stop.earlier(), "the SIGUSR1");
+}
 
 #[skuld::test]
 fn containment_display_names_the_mechanism() {

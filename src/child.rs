@@ -6,11 +6,9 @@ use std::collections::BTreeMap;
 use crate::child::owned::teardown::{Disposition, Reach};
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::command::Command;
-#[cfg(unix)]
-use crate::containment::dispatch::TreeSignal;
 use crate::containment::dispatch::{Keeping, SweepFailure, Swept, TeardownCaller, TreeKillOutcome};
 use crate::containment::treewalk::WalkToken;
-use crate::containment::{Containment, TerminateOutcome};
+use crate::containment::{Containment, TerminateOutcome, TreeStop};
 use crate::elevation::front::{AloneStep, KillNeed, KillRootOutcome, RootStep};
 use crate::error::Error;
 use crate::identity::ProcessId;
@@ -784,7 +782,7 @@ impl Child {
         // The root's handle names the root even when its number is reused; its kill ends the root.
         let root_ended = sent.as_ref().is_some_and(SweepFailure::killed_root);
         let answered = self
-            .skip_call(op, TreeSignal::Kill, earlier)
+            .skip_call(op, crate::signal::Sig::Kill, earlier)
             .answer(&self.tree, skip, sent);
         wait.reaching(answered.killed_again);
         Swept::new(
@@ -984,10 +982,12 @@ impl Child {
         let root_handle = self.proc.hold(self.pid());
         let root: Option<&dyn crate::containment::Root> = Some(&root_handle);
         // A separate `terminate_tree` is no call that sweeps: it holds its members for the next kill.
-        let (outcome, _) = self.tree.terminate(self.pid(), root, None);
+        let how = TreeStop::default();
+        let (outcome, _) = self.tree.terminate(self.pid(), root, None, how);
         #[cfg(unix)]
         {
-            let call = self.skip_call("terminate_tree", TreeSignal::Term, None);
+            let sig = how.sig();
+            let call = self.skip_call("terminate_tree", sig, None);
             match outcome {
                 TerminateOutcome::Sent { result, .. } => result,
                 TerminateOutcome::NotSent(not_sent) | TerminateOutcome::RootExited(not_sent) => Err(not_sent),
@@ -996,7 +996,7 @@ impl Child {
                     call.answer(&self.tree, skip, None).answer
                 }
                 TerminateOutcome::RootThroughPidfd(skip) => {
-                    let sent = root_handle.signal(crate::signal::Sig::Term);
+                    let sent = root_handle.signal(sig);
                     call.answer(&self.tree, skip, Some(sent)).answer
                 }
             }
@@ -1014,7 +1014,7 @@ impl Child {
     pub(crate) fn skip_call<'a>(
         &self,
         op: &'a str,
-        signal: TreeSignal,
+        signal: crate::signal::Sig,
         earlier: Option<&'a str>,
     ) -> crate::containment::SkipCall<'a> {
         crate::containment::SkipCall {

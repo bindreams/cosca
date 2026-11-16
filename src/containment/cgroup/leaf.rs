@@ -785,7 +785,7 @@ impl CgroupLeaf {
         }
     }
 
-    /// SIGTERM every process listed in `cgroup.procs` that is still in the leaf.
+    /// Send `signal` to every process listed in `cgroup.procs` that is still in the leaf.
     ///
     /// An already-gone leaf is `Ok`, on the same proof [`hard_kill`](Self::hard_kill) rests on
     /// ([`removed_after_drain`]): there is no member left to signal. The two halves must agree
@@ -794,12 +794,12 @@ impl CgroupLeaf {
     ///
     /// Each listed pid is pinned by a pidfd, shown to be in the leaf (or under it) and still
     /// running, then signalled through the pidfd, so a pid that exited and was reused after the read
-    /// is left alone. A member that leaves the leaf after that check still gets the `SIGTERM`: it is
-    /// the process that was checked. A member that cannot be pinned or placed gets no `SIGTERM` and
+    /// is left alone. A member that leaves the leaf after that check still gets the signal: it is
+    /// the process that was checked. A member that cannot be pinned or placed gets no signal and
     /// makes the call an error (see [`terminate_tree`](crate::Child::terminate_tree)); `cgroup.kill`
     /// still reaches it.
     ///
-    /// A listed member that got no `SIGTERM` for any reason but its exit is logged at `warn`, naming
+    /// A listed member that got no signal for any reason but its exit is logged at `warn`, naming
     /// the leaf and the pid, and makes the call an error once every member was tried:
     /// [`Error::Containment`](crate::error::Error::Containment) if a send failed, otherwise
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) for members that could not be
@@ -807,8 +807,11 @@ impl CgroupLeaf {
     /// a `cgroup.procs` line that is no pid.
     ///
     /// The outer `Err` is a `cgroup.procs` that could not be read: no member was listed, so nothing
-    /// was sent. Past it the `SIGTERM` went out, and the inner result is what the sends found.
-    pub(crate) fn terminate(&self) -> Result<Result<(), crate::error::Error>, crate::error::Error> {
+    /// was sent. Past it the signal went out, and the inner result is what the sends found.
+    pub(crate) fn terminate(
+        &self,
+        signal: crate::signal::Signal,
+    ) -> Result<Result<(), crate::error::Error>, crate::error::Error> {
         let path = self.leaf_path.join("cgroup.procs");
         let content = match self.dir.read("cgroup.procs") {
             Ok(c) => c,
@@ -820,11 +823,11 @@ impl CgroupLeaf {
         };
         #[cfg(test)]
         fault::run_after_procs_read();
-        Ok(self.terminate_listed(&content))
+        Ok(self.terminate_listed(&content, signal))
     }
 
     /// [`terminate`](Self::terminate) for the members `procs` lists, in `cgroup.procs`' format.
-    fn terminate_listed(&self, procs: &str) -> Result<(), crate::error::Error> {
+    fn terminate_listed(&self, procs: &str, signal: crate::signal::Signal) -> Result<(), crate::error::Error> {
         use crate::error::Error;
         let mut pids = Vec::new();
         let mut unproven: Vec<Error> = Vec::new();
@@ -849,7 +852,7 @@ impl CgroupLeaf {
         let subtree = self.listing_subtree();
         let mut failed: Vec<Error> = Vec::new();
         for pid in pids {
-            match self.terminate_member(pid, &subtree) {
+            match self.terminate_member(pid, &subtree, signal) {
                 Ok(()) => {}
                 Err(Unsignalled::Failed(unsent)) => failed.push(unsent),
                 Err(Unsignalled::Unproven(unsent)) => unproven.push(unsent),
@@ -861,7 +864,7 @@ impl CgroupLeaf {
         let leaf = self.leaf_path.display();
         let mut parts = Vec::new();
         if !failed.is_empty() {
-            parts.push(format!("the SIGTERM failed for {}", failed.len()));
+            parts.push(format!("the {} failed for {}", signal.name(), failed.len()));
         }
         if !unproven.is_empty() {
             parts.push(format!(
@@ -870,7 +873,8 @@ impl CgroupLeaf {
             ));
         }
         let detail = format!(
-            "cgroup leaf {leaf}: listed members got no SIGTERM: {}",
+            "cgroup leaf {leaf}: listed members got no {}: {}",
+            signal.name(),
             parts.join("; ")
         );
         // Each member says its own pid and cause: one is the call's `source`, and two or more are a
@@ -1012,10 +1016,10 @@ impl CgroupLeaf {
         (reached, unobserved)
     }
 
-    /// [`terminate`](Self::terminate)'s `SIGTERM` to the listed `pid`, if it is still a running
+    /// [`terminate`](Self::terminate)'s `signal` to the listed `pid`, if it is still a running
     /// member of the leaf. `Ok` once sent, or for a pid that is gone or not a running member, which
     /// it logs at `debug`; `Err` says why a pid that may be a member got none.
-    fn terminate_member(&self, pid: u32, subtree: &Subtree) -> Result<(), Unsignalled> {
+    fn terminate_member(&self, pid: u32, subtree: &Subtree, signal: crate::signal::Signal) -> Result<(), Unsignalled> {
         use std::os::fd::AsFd as _;
         let pidfd = match pin_member(&*self.kernel, pid) {
             Ok(pidfd) => pidfd,
@@ -1074,15 +1078,15 @@ impl CgroupLeaf {
                 )))
             }
         }
-        match send_term(pidfd.as_fd(), pid) {
+        match send_to_member(pidfd.as_fd(), pid, signal) {
             Ok(()) => Ok(()),
             Err(nix::errno::Errno::ESRCH) => {
-                log::debug!("cgroup terminate: pid {pid} exited before its SIGTERM");
+                log::debug!("cgroup terminate: pid {pid} exited before its {}", signal.name());
                 Ok(())
             }
             Err(e) => Err(Unsignalled::Failed(crate::error::Error::of_member(
                 pid,
-                "the SIGTERM could not be sent",
+                &format!("the {} could not be sent", signal.name()),
                 crate::error::Error::Io(std::io::Error::from(e)),
                 false,
             ))),
@@ -1172,23 +1176,19 @@ fn member_exited(pidfd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
     crate::os_process::poll::is_readable(pidfd)
 }
 
-/// [`CgroupLeaf::terminate`]'s `SIGTERM` to the member `pidfd` pins, and the kernel's answer. It goes
+/// [`CgroupLeaf::terminate`]'s `signal` to the member `pidfd` pins, and the kernel's answer. It goes
 /// through the shared send, which a test build notes the route of. A test build lets a
 /// `fail_terminate` seam answer in its place without sending.
-fn send_term(pidfd: std::os::fd::BorrowedFd<'_>, pid: u32) -> nix::Result<()> {
+fn send_to_member(pidfd: std::os::fd::BorrowedFd<'_>, pid: u32, signal: crate::signal::Signal) -> nix::Result<()> {
     use crate::containment::unix::{send_signal, Sys, Target};
     #[cfg(test)]
     if let Some(errno) = fault::terminate_fails(fault::TerminateStep::Send) {
         return Err(nix::errno::Errno::from_raw(errno));
     }
-    send_signal(
-        Target::LeafMember(pid),
-        Sys::Pidfd(pidfd, 0),
-        nix::sys::signal::Signal::SIGTERM,
-    )
+    send_signal(Target::LeafMember(pid), Sys::Pidfd(pidfd, 0), signal.as_nix())
 }
 
-/// Why [`CgroupLeaf::terminate`] sent a listed pid no `SIGTERM`: the error of that member, naming its
+/// Why [`CgroupLeaf::terminate`] sent a listed pid no signal: the error of that member, naming its
 /// pid, with the error of the call that failed as its `source`.
 enum Unsignalled {
     /// The send failed: a [`Containment`](crate::error::Error::Containment).

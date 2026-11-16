@@ -4,13 +4,12 @@
 //! found while the root was alive, by identity (#940). Linux only: on macOS a `TreeWalk` root is an fd
 //! marker.
 
-use std::io::Read as _;
 use std::time::Duration;
 
 use crate::error::Error;
 use crate::identity::{Liveness, ProcessId};
-use crate::test_child::{wait_until_zombie, Console, TERM_SURVIVOR_TREE_ARGV};
-use crate::{ContainMode, Containment, Recursive, Stdio};
+use crate::test_child::{wait_until_zombie, TERM_SURVIVOR_TREE_ARGV};
+use crate::{ContainMode, Containment, Recursive};
 
 /// The drop's warn over a tree the settlement could not vouch for.
 const DROP_WARN: &str = "Child::drop: contained-tree teardown did not fully succeed";
@@ -25,21 +24,11 @@ fn survivor_tree() -> (crate::Child, crate::PipeWriter, Vec<ProcessId>) {
 
 /// [`survivor_tree`] over `argv`, which prints `r\n` once its descendants are forked.
 fn tree_of(argv: &[&str]) -> (crate::Child, crate::PipeWriter, Vec<ProcessId>) {
-    let mut cmd = crate::test_child::command(Console::Hidden);
-    cmd.args(argv.iter().copied());
-    cmd.stdin(Stdio::pipe_in()).expect("stdin pipe");
-    cmd.stdout(Stdio::pipe_out()).expect("stdout pipe");
-    cmd.contain_with(ContainMode::TreeWalk);
-    let mut child = cmd.spawn().expect("spawn");
+    let (child, stdin, stdout) = crate::test_child::ready_tree(argv, |cmd| {
+        cmd.contain_with(ContainMode::TreeWalk);
+    });
+    drop(stdout);
     assert_eq!(child.containment(), Containment::TreeWalk);
-    let stdin = child.stdin().expect("stdin pipe");
-    let mut ready = [0u8; 2];
-    child
-        .stdout()
-        .expect("stdout pipe")
-        .read_exact(&mut ready)
-        .expect("the readiness line");
-    assert_eq!(&ready, b"r\n");
     let survivors = child
         .id()
         .expect("the root's identity")

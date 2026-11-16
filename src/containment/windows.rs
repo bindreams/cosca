@@ -384,12 +384,13 @@ impl crate::containment::Contains for JobHandle {
         &self,
         pid: u32,
         _root: Option<&dyn crate::containment::Root>,
+        how: crate::containment::TreeStop,
     ) -> (
         crate::containment::TerminateOutcome,
         Option<crate::containment::treewalk::Listing>,
     ) {
         // One event, so an error is an event that was not sent (`NoConsole` or the OS's refusal).
-        let sent = crate::containment::TerminateOutcome::of(terminate(pid).map(Ok), Some("the SIGTERM"));
+        let sent = crate::containment::TerminateOutcome::of(terminate(pid).map(Ok), Some(how.earlier()));
         (sent, None)
     }
 

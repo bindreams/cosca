@@ -61,14 +61,14 @@ fn spawn_group_leader() -> crate::test_child::StdChild {
 ///
 /// Mutant: a send folds the refusal into `Sent { result: Err(..) }`.
 fn assert_refused_sends_are_not_sent() {
-    use crate::containment::{Contains as _, TerminateOutcome};
+    use crate::containment::{Contains as _, TerminateOutcome, TreeStop};
 
     let leader = spawn_group_leader();
     let job = crate::containment::windows::assign_to_kill_on_close_job(
         std::os::windows::io::AsRawHandle::as_raw_handle(&*leader),
     )
     .expect("assign the group leader to a job");
-    let (outcome, _) = job.send_terminate(leader.id(), None);
+    let (outcome, _) = job.send_terminate(leader.id(), None, TreeStop::default());
     assert!(
         matches!(outcome, TerminateOutcome::NotSent(_)),
         "a job's refused break must be NotSent, got {outcome:?}"
@@ -80,7 +80,8 @@ fn assert_refused_sends_are_not_sent() {
     let id = crate::identity::ProcessId::of(leader.id())
         .found()
         .expect("the live group leader resolves");
-    let (outcome, _) = crate::containment::treewalk::terminate_tree(&crate::identity::HostKernel, id, None);
+    let (outcome, _) =
+        crate::containment::treewalk::terminate_tree(&crate::identity::HostKernel, id, None, TreeStop::default());
     assert!(
         matches!(outcome, TerminateOutcome::NotSent(_)),
         "a walker's refused break must be NotSent, got {outcome:?}"

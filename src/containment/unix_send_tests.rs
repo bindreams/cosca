@@ -155,7 +155,7 @@ fn a_terminate_whose_check_fails_says_nothing_was_sent() {
     let pgid = child.id() as i32;
     let root = StatedRoot::with_state(pgid as u32, || crate::signal::RootState::Reaped);
     let capture = crate::send_log::Capture::start();
-    let sent = super::term_group_sent(pgid, Some(&root));
+    let sent = super::term_group_sent(pgid, Some(&root), crate::signal::Signal::Term);
     let steps = capture.group_steps();
 
     assert_eq!(steps, [GroupStep::Check], "nothing was sent");

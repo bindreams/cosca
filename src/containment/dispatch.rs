@@ -542,14 +542,6 @@ impl TreeKilled {
     }
 }
 
-/// Which signal a tree path sends.
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum TreeSignal {
-    Kill,
-    Term,
-}
-
 /// A tree kill that did not complete, and every member it left running. It reports none of them:
 /// [`Tree::settle`] decides what the root's own death leaves, and the caller reports that, once.
 #[derive(Debug)]
@@ -675,7 +667,7 @@ impl UnvouchedKind {
     fn found(self) -> &'static str {
         match self {
             UnvouchedKind::HeldMembersGone => {
-                "the members an earlier kill left, or a SIGTERM walk reached, are gone now, but no later walk has \
+                "the members an earlier kill left, or a cooperative walk reached, are gone now, but no later walk has \
                  checked what they forked"
             }
             UnvouchedKind::RootSeenRunning => {
@@ -712,7 +704,7 @@ impl UnvouchedKind {
     fn gone_root_text(self) -> &'static str {
         match self {
             UnvouchedKind::HeldMembersGone => {
-                "the members an earlier kill left, or a SIGTERM walk reached, are gone; the tree could not be walked \
+                "the members an earlier kill left, or a cooperative walk reached, are gone; the tree could not be walked \
                  from its exited root, so what they forked is unknown"
             }
             UnvouchedKind::RootSeenRunning => {

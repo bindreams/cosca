@@ -316,17 +316,7 @@ fn drop_kills_and_reaps_the_child() {
 #[cfg(unix)]
 fn drop_kills_a_tree_contained_by(contain: impl FnOnce(&mut crate::Command), expected: crate::Containment) {
     use std::io::Read as _;
-    let mut cmd = crate::test_child::command(Console::Hidden);
-    cmd.args(crate::test_child::CAT_TREE_ARGV.iter().copied());
-    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
-    contain(&mut cmd);
-    let mut child = cmd.spawn().expect("spawn");
-    let stdin = child.stdin().expect("piped stdin");
-    let mut stdout = child.stdout().expect("piped stdout");
-    let mut ready = [0u8; 2];
-    stdout.read_exact(&mut ready).expect("readiness line");
-    assert_eq!(&ready, b"r\n");
+    let (child, stdin, mut stdout) = crate::test_child::ready_tree(crate::test_child::CAT_TREE_ARGV, contain);
     // Containment was established, so a tree that survives the drop is a missing kill and not a
     // missing mechanism.
     assert_eq!(child.containment(), expected);

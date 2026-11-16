@@ -72,7 +72,7 @@ fn signal_hands_the_process_mechanism_to_the_roots_closure_as_a_term() {
         Ok(())
     })
     .expect("the closure's answer is the call's");
-    assert_eq!(sent, [crate::signal::Sig::Term]);
+    assert_eq!(sent, [crate::signal::Sig::Graceful(crate::signal::Signal::Term)]);
 }
 
 // Windows has no per-process graceful signal: the `Process` mechanism is refused, and the root's

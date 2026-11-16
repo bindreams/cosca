@@ -71,7 +71,7 @@ fn terminate_pins_a_member_through_the_kernel_the_leaf_was_given() {
     let leaf = leaf_over(kernel, dir.path());
     let subtree = leaf.subtree_with(None);
 
-    let result = leaf.terminate_member(STATED, &subtree);
+    let result = leaf.terminate_member(STATED, &subtree, crate::signal::Signal::Term);
 
     assert!(
         matches!(result, Err(Unsignalled::Unproven(_))),
@@ -95,7 +95,7 @@ fn terminate_places_a_pinned_member_through_the_kernel_the_leaf_was_given() {
     let leaf = leaf_over(kernel, dir.path());
     let subtree = leaf.subtree_with(None);
 
-    let result = leaf.terminate_member(STATED, &subtree);
+    let result = leaf.terminate_member(STATED, &subtree, crate::signal::Signal::Term);
 
     assert!(
         matches!(result, Ok(())),

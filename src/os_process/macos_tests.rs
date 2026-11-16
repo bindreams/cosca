@@ -244,6 +244,10 @@ fn a_refused_reread_after_esrch_keeps_the_errno() {
         panic!("a refused re-read is Error::Io: {err:?}");
     };
     assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied, "{err:?}");
+    assert!(
+        io.to_string().ends_with("; SIGKILL not sent"),
+        "the signal is named: {io}"
+    );
 }
 
 /// The token send answers `EPERM` to a process whose exit has begun and that is not yet a zombie
@@ -320,7 +324,13 @@ fn a_sigterm_refused_with_eperm_keeps_the_raw_eperm_whatever_the_exit() {
     let kernel = FakeKernel::over(&HostKernel).on_kinfo(id.pid(), kinfo_proc::of_host_with_exit(id.pid(), true));
     let mut idversion = known.id_version;
     let refused = crate::signal::seams::refuse_kills();
-    let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, Sig::Term);
+    let outcome = signal_by_token(
+        &kernel,
+        id.pid(),
+        known.unique_id,
+        &mut idversion,
+        Sig::Graceful(crate::signal::Signal::Term),
+    );
     drop(refused);
     let err = outcome.expect_err("only a SIGKILL's refusal is read for an exit");
     assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");

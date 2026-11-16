@@ -6,12 +6,18 @@ use std::io;
 #[cfg(unix)]
 use std::sync::Arc;
 
+#[cfg(unix)]
+mod public;
+#[cfg(unix)]
+pub(crate) use public::Signal;
+
 /// A signal cosca sends to an owned process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sig {
     Kill,
+    /// A cooperative signal, as the caller's stop chose it.
     #[cfg(unix)]
-    Term,
+    Graceful(Signal),
 }
 
 #[cfg(target_os = "linux")]
@@ -19,7 +25,17 @@ impl Sig {
     fn as_rustix(self) -> rustix::process::Signal {
         match self {
             Sig::Kill => rustix::process::Signal::KILL,
-            Sig::Term => rustix::process::Signal::TERM,
+            Sig::Graceful(signal) => signal.as_rustix(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Sig {
+    pub(crate) fn as_nix(self) -> nix::sys::signal::Signal {
+        match self {
+            Sig::Kill => nix::sys::signal::Signal::SIGKILL,
+            Sig::Graceful(signal) => signal.as_nix(),
         }
     }
 }
@@ -27,10 +43,15 @@ impl Sig {
 #[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 impl Sig {
     pub(crate) fn as_libc(self) -> libc::c_int {
-        match self {
-            Sig::Kill => libc::SIGKILL,
-            Sig::Term => libc::SIGTERM,
-        }
+        self.as_nix() as libc::c_int
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for Sig {
+    /// The signal's name as the platform spells it: `SIGTERM`, `SIGKILL`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_nix().as_str())
     }
 }
 
@@ -214,7 +235,7 @@ pub(crate) fn send_pidfd(
         Ok(()) => Ok(Sent::Delivered),
         Err(rustix::io::Errno::SRCH) => {
             log::debug!(
-                "pidfd_send_signal({sig:?}) to {}: it is already gone",
+                "pidfd_send_signal({sig}) to {}: it is already gone",
                 crate::os_process::child_named(pid)
             );
             Ok(Sent::Gone)
@@ -266,11 +287,11 @@ pub(crate) fn via_audit_token(
     use crate::os_process::macos::{read_version, signal_by_token, SignalByTokenOutcome};
 
     let Some(unique) = identity else {
-        log::debug!("child {pid} holds no unique id; {sig:?} not sent");
+        log::debug!("child {pid} holds no unique id; {sig} not sent");
         return Ok(Sent::Unverified);
     };
     let Some(mut idversion) = read_version(kernel, pid, unique, sig)? else {
-        log::debug!("child {pid} is gone or its pid names another process; {sig:?} not sent");
+        log::debug!("child {pid} is gone or its pid names another process; {sig} not sent");
         return Ok(Sent::Gone);
     };
     let sent = signal_by_token(kernel, pid, unique, &mut idversion, sig);

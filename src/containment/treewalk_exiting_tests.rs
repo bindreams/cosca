@@ -68,7 +68,13 @@ fn a_kill_of_a_root_that_has_begun_to_exit_kills_its_members_and_is_unassessable
 fn a_terminate_of_a_root_that_has_begun_to_exit_signals_its_members_and_lists_them_incomplete() {
     let (child, root, descendant) = live_member_with_descendant();
     let kernel = exiting_root(root);
-    let walked = super::terminate(&kernel, root, &super::ByIdentity::new(&kernel, root)).expect("the table reads");
+    let walked = super::terminate(
+        &kernel,
+        root,
+        &super::ByIdentity::new(&kernel, root),
+        crate::containment::TreeStop::default(),
+    )
+    .expect("the table reads");
     let super::Terminated::Walked(listing) = walked else {
         panic!("the members were walked");
     };
@@ -94,7 +100,12 @@ fn a_root_that_has_begun_to_exit_with_no_member_is_no_root_and_nothing_is_sent()
         ),
         "the root has no tree to walk"
     );
-    let termed = super::terminate(&kernel, id, &super::ByIdentity::new(&kernel, id));
+    let termed = super::terminate(
+        &kernel,
+        id,
+        &super::ByIdentity::new(&kernel, id),
+        crate::containment::TreeStop::default(),
+    );
     assert!(
         matches!(termed, Ok(super::Terminated::RootExited(_))),
         "nothing is sent"
@@ -125,22 +136,43 @@ fn a_kill_whose_exit_flag_cannot_be_read_kills_its_members_and_answers_with_the_
     }
 }
 
-/// The same for the `SIGTERM` walk: members and root are signalled, and the listing cannot vouch for the
-/// tree. Mutant: the walk is `NotSent` with nothing signalled, or its listing is `complete`.
+/// The same for the terminate walk, whichever signal it sends: members and root are signalled, the
+/// listing cannot vouch for the tree, and the one `warn` says so naming that signal. Mutants: the walk
+/// is `NotSent` with nothing signalled, or its listing is `complete`; the `warn` names `SIGTERM`
+/// whatever the walk sends.
 #[skuld::test]
 fn a_terminate_whose_exit_flag_cannot_be_read_signals_its_members_and_lists_them_incomplete() {
-    let (child, root, descendant) = live_member_with_descendant();
-    let kernel = flag_unreadable(root);
-    let walked = super::terminate(&kernel, root, &super::ByIdentity::new(&kernel, root)).expect("members were found");
-    let super::Terminated::Walked(listing) = walked else {
-        panic!("the members were walked");
-    };
-    assert_eq!(listing.members, [descendant]);
-    assert!(
-        !listing.complete,
-        "a listing with an unread flag cannot vouch for the tree"
-    );
-    assert_both_signalled("terminate", child, libc::SIGTERM);
+    use crate::signal::Signal;
+    crate::log_capture::install();
+    for (signal, signo, name) in [
+        (Signal::Term, libc::SIGTERM, "SIGTERM"),
+        (Signal::Usr1, libc::SIGUSR1, "SIGUSR1"),
+    ] {
+        let (child, root, descendant) = live_member_with_descendant();
+        let kernel = flag_unreadable(root);
+        let mark = crate::log_capture::mark();
+        let walked = super::terminate(
+            &kernel,
+            root,
+            &super::ByIdentity::new(&kernel, root),
+            crate::containment::TreeStop::of(signal),
+        )
+        .expect("members were found");
+        let super::Terminated::Walked(listing) = walked else {
+            panic!("the members were walked");
+        };
+        assert_eq!(listing.members, [descendant]);
+        assert!(
+            !listing.complete,
+            "a listing with an unread flag cannot vouch for the tree"
+        );
+        assert_both_signalled("terminate", child, signo);
+        let warns = crate::log_capture::warns_since(mark, &format!("walk of pid {} cannot vouch", root.pid()));
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains(&format!("the {name} walk")), "{warns:?}");
+        let other = if name == "SIGTERM" { "SIGUSR1" } else { "SIGTERM" };
+        assert!(!warns[0].contains(other), "{warns:?}");
+    }
 }
 
 /// With no member found, a flag that cannot be read is a walk not made: nothing is killed or sent, the
@@ -156,7 +188,12 @@ fn a_walk_with_no_member_whose_exit_flag_cannot_be_read_sends_nothing() {
         ),
         "no member was found and the flag is unread"
     );
-    let termed = super::terminate(&kernel, root, &super::ByIdentity::new(&kernel, root));
+    let termed = super::terminate(
+        &kernel,
+        root,
+        &super::ByIdentity::new(&kernel, root),
+        crate::containment::TreeStop::default(),
+    );
     assert!(
         matches!(termed, Err(crate::error::Error::Unassessable { .. })),
         "nothing is sent"

@@ -208,6 +208,7 @@ async fn async_the_root_through_its_pidfd_awaits_the_grace() {
     let error = never_blocking(crate::child::graceful::shutdown::root_through_pidfd(
         &child,
         &skip,
+        crate::containment::TreeStop::default(),
         Duration::from_secs(30),
     ))
     .await;
@@ -753,7 +754,13 @@ async fn a_holders_only_escalation_awaits_each_member_its_kill_reached() {
 
     let (error, ()) = ::tokio::join!(
         async {
-            let error = crate::child::graceful::shutdown::holders_only(&child, skip, Duration::ZERO).await;
+            let error = crate::child::graceful::shutdown::holders_only(
+                &child,
+                skip,
+                crate::containment::TreeStop::default(),
+                Duration::ZERO,
+            )
+            .await;
             done.set(true);
             error
         },

@@ -95,7 +95,7 @@ fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
     );
     assert_eq!(
         sends.entries(),
-        vec![(pid, Sig::Term, Via::Identity)],
+        vec![(pid, Sig::Graceful(crate::signal::Signal::Term), Via::Identity)],
         "the escalation must send nothing to a root we do not pin: the terminate's SIGTERM is the only send"
     );
     assert_eq!(warns_since(mark, ""), Vec::<String>::new());
@@ -138,7 +138,11 @@ fn graceful_shutdown_of_an_exited_root_launchd_holds_is_refused_without_a_warn()
                 && detail.contains("launchd")),
         "{err:?}"
     );
-    assert_eq!(root.signal_calls(), vec![Sig::Term], "only the SIGTERM was sent");
+    assert_eq!(
+        root.signal_calls(),
+        vec![Sig::Graceful(crate::signal::Signal::Term)],
+        "only the SIGTERM was sent"
+    );
     assert_eq!(root.looks(), 2, "one look at the exit, and the reap's");
     assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 }
@@ -331,7 +335,10 @@ fn graceful_shutdown_tree_sweep_refuses_a_root_orphaned_during_the_grace() {
         "{err:?}"
     );
     // The terminate sent the root its SIGTERM through the handle; the refused sweep sent it nothing.
-    assert_eq!(sends.entries(), vec![(pid, Sig::Term, Via::Identity)]);
+    assert_eq!(
+        sends.entries(),
+        vec![(pid, Sig::Graceful(crate::signal::Signal::Term), Via::Identity)]
+    );
     assert!(
         !sends.by_identity().iter().any(|(_, signo)| *signo == libc::SIGKILL),
         "{:?}",

@@ -71,7 +71,7 @@ impl std::fmt::Display for GracefulMechanism {
 /// through here.
 ///
 /// `signal_root` sends a [`Sig`](crate::signal::Sig) to the root through the caller's own handle;
-/// the Unix `Process` mechanism calls it with `Sig::Term`. On Windows that mechanism is
+/// the Unix `Process` mechanism calls it with `SIGTERM`. On Windows that mechanism is
 /// `Unsupported` and does not call it. The console mechanisms address `pid` and do not call it.
 ///
 /// Matched exhaustively with no wildcard, so a future variant is a compile error at the one
@@ -88,7 +88,7 @@ pub(crate) fn signal(
     drop(signal_root);
     match mechanism {
         #[cfg(unix)]
-        GracefulMechanism::Process => signal_root(crate::signal::Sig::Term),
+        GracefulMechanism::Process => signal_root(crate::signal::Sig::Graceful(crate::signal::Signal::Term)),
         #[cfg(windows)]
         GracefulMechanism::Process => Err(crate::error::Error::terminate_unsupported()),
         // One arm for both. This process's console list is readable, but absence from it does

@@ -472,7 +472,7 @@ enum Signal {
 fn refused(front: Front, pid: impl Into<Option<u32>>, signal: Signal, why: Option<Reason>) -> Error {
     let what = match signal {
         Signal::Kill => "no kill",
-        Signal::Term => "no SIGTERM",
+        Signal::Term => "no signal",
     };
     let mut detail = format!("{}; {what} was sent.", describe(front, pid));
     // Only Linux has a cgroup to reach the program through; osascript runs on macOS.

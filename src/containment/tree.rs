@@ -8,7 +8,7 @@ use crate::containment::drain_edge::DrainEdge;
 use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{Contains, Mechanism};
 use crate::containment::treewalk::{Listing, WalkToken};
-use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
+use crate::containment::{Containment, Root, TerminateOutcome, TreeKill, TreeStop};
 use crate::error::Error;
 
 /// Owns the OS containment resource for a spawned child. `killed` is where the tree stands after the
@@ -200,14 +200,15 @@ impl Tree {
             .answer
     }
 
-    /// Send the graceful termination signal to the tree (signal-only), as [`kill`](Self::kill) decides
-    /// it from `root`: the outcome says what went out, or what was skipped and what the caller does
-    /// about it. Returns the walk's token for `call` ([`hold_walked`](Self::hold_walked)).
+    /// Send the cooperative stop `how` to the tree (signal-only), as [`kill`](Self::kill) decides it
+    /// from `root`: the outcome says what went out, or what was skipped and what the caller does about
+    /// it. Returns the walk's token for `call` ([`hold_walked`](Self::hold_walked)).
     pub(crate) fn terminate(
         &self,
         pid: u32,
         root: Option<&dyn Root>,
         call: Option<&WalkToken>,
+        how: TreeStop,
     ) -> (TerminateOutcome, Option<WalkToken>) {
         match &self.holder {
             Holder::None | Holder::Delegated => {
@@ -222,7 +223,7 @@ impl Tree {
             }
             Holder::Contained(mechanism) => {
                 debug_assert!(!self.released, "a send on a released tree");
-                let (outcome, listing) = mechanism.send_terminate(pid, root);
+                let (outcome, listing) = mechanism.send_terminate(pid, root, how);
                 let walk = listing.and_then(|listing| self.hold_walked(listing, call));
                 (outcome, walk)
             }

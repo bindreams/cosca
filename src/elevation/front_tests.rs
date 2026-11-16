@@ -380,7 +380,7 @@ fn a_sigterm_to_a_live_osascript_is_closed() {
     let osascript = report(ElevatedVia::MacosOsascript).tracked().front();
     let detail = refusal_detail(terminate_gate(osascript, PID, || Ok(true)));
     assert!(detail.contains(&format!("pid {PID} is osascript")), "{detail}");
-    assert!(detail.contains("no SIGTERM was sent"), "{detail}");
+    assert!(detail.contains("no signal was sent"), "{detail}");
     let error = refusal(terminate_gate(osascript, PID, || Err(os_error())));
     assert_refused_by_one_read(&error, "whether it had exited could not be read");
     assert!(matches!(terminate_gate(osascript, PID, || Ok(false)), Gate::Open));
