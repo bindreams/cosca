@@ -76,6 +76,8 @@ pub(crate) fn lookup(program: &Path, cwd: Option<&Path>, path_var: Option<&OsStr
         windows: false,
         loadable_only: false,
         normalise: &|path| Ok(path.to_path_buf()),
+        child_drive_dir: &|_| None,
+        same_drive: &|_, _| false,
     })
     .map_err(miss_as_enoent)?;
     Ok(if located {

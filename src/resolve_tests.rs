@@ -64,6 +64,8 @@ fn go(program: &str, cwd: &Path, path: Option<&OsStr>) -> Result<std::path::Path
         windows: HOST_WINDOWS,
         loadable_only: false,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     })
 }
 
@@ -393,6 +395,8 @@ fn go_win_path(program: &str, cwd: &Path, path: Option<&OsStr>) -> Result<std::p
         windows: true,
         loadable_only: false,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     })
 }
 
@@ -650,7 +654,7 @@ fn fixture_relative_cwd_is_applied_once() {
             || std::env::current_dir().map_err(Error::Io),
         )
         .unwrap();
-        resolve::resolve_executable(Path::new("./tool"), Some(&base), None).unwrap()
+        resolve::resolve_executable(Path::new("./tool"), Some(&base), &no_drive_dir, None).unwrap()
     };
     // POSIX reads the relative base against the directory this process inherited and keeps it
     // relative: it is the child that enters `sub`, so no path of this process's directory is read.
@@ -665,49 +669,6 @@ fn fixture_relative_cwd_is_applied_once() {
         assert!(got.is_absolute(), "{got:?}");
         assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
     }
-}
-
-/// The end-to-end half of [`a_drive_relative_name_is_refused_on_shape`], on a real Windows runner
-/// with a plantable file where the process's own current directory is.
-///
-/// The refusal itself no longer depends on the host: `resolve` states it explicitly, before any
-/// candidate is built, so the host-independent test pins it on every platform. What only a
-/// Windows runner can show is that a drive-relative name does not resolve through the process's
-/// REAL current directory on drive C — the directory the `cwd` parameter never names, since
-/// `PathBuf::push` clears for any prefixed path.
-#[cfg(windows)]
-#[skuld::test]
-fn a_drive_relative_name_fails_closed() {
-    let cwd = tempfile::tempdir().unwrap();
-    // Planted where the process's actual OS cwd is about to be, so any route that reached drive
-    // C's current directory has something to find; a tempdir under `%TEMP%`, as here, lives on the
-    // runner's system drive, which is `C:` on every GitHub-hosted Windows runner this crate targets.
-    touch(cwd.path(), "tool.exe");
-    // The refusal must hold even where the process's REAL cwd is `cwd.path()` — see
-    // `empty_path_elements_are_skipped`'s doc for why this runs in a re-exec'd child.
-    crate::test_child::run_fixture_with_cwd(
-        crate::test_child::fixture_path!(fixture_drive_relative_name_fails_closed),
-        cwd.path(),
-        FIXTURE_DRIVE_RELATIVE_MARKER,
-    );
-}
-
-#[cfg(windows)]
-const FIXTURE_DRIVE_RELATIVE_MARKER: &str = "COSCA_FIXTURE_DRIVE_RELATIVE";
-
-/// The child half of [`a_drive_relative_name_fails_closed`]; see
-/// [`fixture_empty_path_elements_are_skipped`]'s doc for the shared shape.
-#[cfg(windows)]
-#[skuld::test]
-fn fixture_drive_relative_name_fails_closed() {
-    let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_DRIVE_RELATIVE_MARKER) else {
-        return; // picked up by an ordinary suite run — deliberately inert
-    };
-    assert!(
-        cwd.join("tool.exe").is_file(),
-        "the parent must have planted `tool.exe` in this directory: {cwd:?}"
-    );
-    assert_refused_on_shape("C:tool", go("C:tool", &cwd, None));
 }
 
 // ── Windows system directories precede PATH for a bare name ─────────────────────────────
@@ -748,6 +709,8 @@ fn bare_name_in_a_system_dir_and_on_path_resolves_from_the_system_dir() {
         windows: true,
         loadable_only: false,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     })
     .unwrap();
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
@@ -774,6 +737,8 @@ fn bare_name_only_on_path_still_resolves_from_path() {
         windows: true,
         loadable_only: false,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     })
     .unwrap();
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
@@ -801,6 +766,8 @@ fn empty_system_dirs_reproduces_the_pre_fix_path_only_search() {
         windows: true,
         loadable_only: false,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     })
     .unwrap();
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
@@ -815,6 +782,8 @@ fn empty_system_dirs_reproduces_the_pre_fix_path_only_search() {
         windows: true,
         loadable_only: false,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     });
     assert_not_found("tool", miss);
 }
@@ -850,6 +819,8 @@ fn posix_ignores_system_dirs_entirely() {
         windows: false,
         loadable_only: false,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     });
     assert_not_found("tool", got);
 }
@@ -875,6 +846,8 @@ fn a_located_name_still_resolves_when_the_system_dirs_query_fails() {
         windows: true,
         loadable_only: false,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     })
     .unwrap();
     assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
@@ -903,6 +876,8 @@ fn a_bare_name_fails_closed_when_the_system_dirs_query_fails() {
         windows: true,
         loadable_only: false,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     });
     match got {
         Err(Error::Io(e)) => {
@@ -933,9 +908,8 @@ fn a_located_name_never_falls_back_to_a_search() {
 
 #[skuld::test]
 fn a_miss_is_reported_as_not_found() {
-    // `resolve_executable_in`'s doc promises `ErrorKind::NotFound` for a miss. Nothing asserted
-    // the kind, so changing it was invisible. (A drive-relative name is a REFUSAL, not a miss —
-    // see the module doc's kind rule and `a_drive_relative_name_is_refused_on_shape`.)
+    // `resolve_executable_in`'s doc promises `ErrorKind::NotFound` for a miss. (A name that names
+    // no file is a REFUSAL, not a miss — see the module doc's kind rule.)
     let cwd = tempfile::tempdir().unwrap();
     let err = go_win_path("no-such-program-41d9", cwd.path(), None).unwrap_err();
     match err {
@@ -998,7 +972,7 @@ fn an_empty_program_never_resolves() {
 /// A refused name must be refused for its SHAPE, not merely missed by the search. Asserting
 /// `is_err()` alone passes vacuously — the file does not exist either — so it would not have
 /// caught the planted-sibling case at all. See `resolve`'s module doc for the kind rule.
-fn assert_refused_on_shape(name: &str, got: Result<std::path::PathBuf, Error>) {
+pub(crate) fn assert_refused_on_shape<T: std::fmt::Debug>(name: &str, got: Result<T, Error>) {
     match got {
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
         other => panic!("{name:?} names no file and must be refused on shape, got {other:?}"),
@@ -1006,24 +980,10 @@ fn assert_refused_on_shape(name: &str, got: Result<std::path::PathBuf, Error>) {
 }
 
 /// The other half of the kind rule: the name was ACCEPTED and searched, and nothing matched.
-fn assert_not_found(name: &str, got: Result<std::path::PathBuf, Error>) {
+pub(crate) fn assert_not_found<T: std::fmt::Debug>(name: &str, got: Result<T, Error>) {
     match got {
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
         other => panic!("{name:?} was searched and missed, so it must be NotFound, got {other:?}"),
-    }
-}
-
-#[skuld::test]
-fn a_drive_relative_name_is_refused_on_shape() {
-    // `C:tool` names a file relative to drive C's OWN current directory — state cosca does not
-    // track and never will, so no filesystem can make it resolve. Under the kind rule that is a
-    // refusal, not a search miss. It reported `NotFound` only incidentally: `PathBuf::push` clears
-    // for a prefixed path, so every candidate failed `resolve`'s `is_absolute()` filter and the
-    // loop fell through to the generic trailing error, which would have changed kind silently if
-    // that filter ever did.
-    let cwd = tempfile::tempdir().unwrap();
-    for n in ["C:tool", "D:sub/x", "C:tool.exe", r"Z:a\b", "1:tool", "\u{e9}:tool"] {
-        assert_refused_on_shape(n, go_win_path(n, cwd.path(), None));
     }
 }
 

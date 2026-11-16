@@ -82,10 +82,10 @@ fn a_verbatim_process_cwd_completes_a_relative_name_as_win32_does() {
 }
 
 #[cfg(windows)]
-/// A drive-relative `current_dir` on another drive takes that drive's own directory, `=X:`, as
-/// Win32 does: cosca's raw backend runs the child where `GetFullPathNameW` and std do, for every
-/// shape of that variable. Only a fully qualified value naming an existing directory is used; any
-/// other falls back to the drive's root, and `GetFullPathNameW` then rewrites `=X:` to it.
+/// A drive-relative `current_dir` on another drive takes that drive's own directory, `=X:`, by
+/// `DriveDirs`' rule: for each shape of that variable set here, cosca's raw backend runs the child
+/// where `GetFullPathNameW` and std do. A value the rule does not use falls back to the drive's
+/// root, and `GetFullPathNameW` then rewrites `=X:` to it.
 ///
 /// System-affecting: the probe maps a drive letter (`DefineDosDeviceW`) for the whole logon
 /// session, so it is the `DRIVE_MAPPING` group (`src/test_groups.rs`).
@@ -144,8 +144,8 @@ fn m12_a_cwd_on_a_removed_or_repointed_subst(#[fixture(drive_mapping)] _group: &
 /// `windows_path_resolution`'s `m7_` test has the rows that need no mapping. Drive X prints as
 /// `<X>:` and the temp directory's drive T as `<T>:`.
 ///
-/// Records only. Preconditions, asserted: the mapping serves its directories, the child runs in
-/// the row's cwd and sees the row's `=X:` value.
+/// Asserted: the mapping serves its directories, the child runs in the row's cwd and sees the row's
+/// `=X:` value, and its answer is D1's prediction.
 ///
 /// System-affecting: it maps a drive letter (`DefineDosDeviceW`) for the whole logon session, and
 /// removes it when done, so it is the `DRIVE_MAPPING` group.
@@ -202,15 +202,18 @@ fn m7_a_drive_relative_name_against_a_drive_directory_on_its_own_drive(#[fixture
         row("existing", &format!(r"{x}\exists"), &tool, true),
         row("missing", &format!(r"{x}\gone"), &tool, false),
         row("a_file", &format!(r"{x}\afile"), &tool, false),
-        row("trailing_separator", &format!(r"{x}\exists\"), &tool, true),
-        // The child (`cosca_testbin`) has no `longPathAware` manifest: this records its behaviour
-        // on a long value, not where ntdll's own threshold lies.
-        row("longer_than_max_path", &long, &tool, true),
-        // A verbatim value: D1 predicts the result normalised (dots dropped, `..` stopped at the
-        // drive).
-        row("verbatim_dotted_name", &verbatim, &format!(r"{x}sub.\tool.exe"), true),
-        row("verbatim_dotted_dir", &verbatim, &format!("{x}sub."), true),
-        row("verbatim_up_past_root", &verbatim, &format!(r"{x}..\..\t.exe"), true),
+        // The answer keeps the value's separator before the name's own (a stated limit: opening
+        // that name fails, where cosca completes onto the directory).
+        Row {
+            arm: Arm::Answer(format!(r"{x}\exists\\tool")),
+            ..row("trailing_separator", &format!(r"{x}\exists\"), &tool, true)
+        },
+        // A value of 260 units or more is ignored (`m7b_...` measures the limit).
+        row("longer_than_max_path", &long, &tool, false),
+        // A verbatim value is ignored, whatever the name.
+        row("verbatim_dotted_name", &verbatim, &format!(r"{x}sub.\tool.exe"), false),
+        row("verbatim_dotted_dir", &verbatim, &format!("{x}sub."), false),
+        row("verbatim_up_past_root", &verbatim, &format!(r"{x}..\..\t.exe"), false),
     ];
     for row in &rows {
         run(row, &render, &drives);

@@ -1,16 +1,18 @@
 use super::*;
 use crate::command::EnvOp;
+use crate::resolve::no_drive_dir;
 use std::ffi::OsString;
 use std::path::Path;
 
 /// Resolve against the PATH `ops` give a child of this process, as a spawn does.
 fn resolve_with(exe: &Path, cmd_cwd: Option<&Path>, ops: &[EnvOp]) -> Result<PathBuf, Error> {
     let snapshot = EnvSnapshot::read().unwrap();
-    let env = ChildEnv::capture(&snapshot, ops);
+    let block = EnvSnapshot::from_block(ChildEnv::capture(&snapshot, ops).into_block()?);
     let base = effective_cwd(cmd_cwd, &DriveDirs::new(&snapshot), || {
         std::env::current_dir().map_err(Error::Io)
     })?;
-    resolve_executable(exe, Some(&base), env.path())
+    let path = block.var(OsStr::new("PATH"));
+    resolve_executable(exe, Some(&base), &no_drive_dir, path.as_deref())
 }
 
 /// A snapshot holding `base` in order.
@@ -73,6 +75,7 @@ fn resolve_bare_name_is_not_taken_from_base_cwd() {
         std::path::Path::new("sp_shadow"),
         Some(dir.path()),
         &no_system_dirs,
+        &no_drive_dir,
         None,
         false,
     ));
@@ -315,6 +318,7 @@ fn resolve_skips_directory_shadow_and_finds_path_exe() {
         std::path::Path::new("sp_dirtool"),
         Some(base.path()),
         &no_system_dirs,
+        &no_drive_dir,
         Some(joined.as_os_str()),
         false,
     )
@@ -339,6 +343,7 @@ fn resolve_absolute_directory_is_not_returned() {
         &sub,
         Some(dir.path()),
         &no_system_dirs,
+        &no_drive_dir,
         None,
         false,
     ));
@@ -358,6 +363,7 @@ fn path_wins_over_base_cwd_when_both_have_exe() {
         std::path::Path::new("sp_pref"),
         Some(base.path()),
         &no_system_dirs,
+        &no_drive_dir,
         Some(other.path().as_os_str()),
         false,
     )
@@ -563,11 +569,11 @@ fn a_located_and_an_absolute_name_never_query_system_dirs_when_resolved_directly
 
     // Located: the name contains a separator.
     let located = Path::new(".").join(file.file_name().unwrap());
-    let got = resolve_executable_in(&located, Some(dir.path()), &panics, None, false).unwrap();
+    let got = resolve_executable_in(&located, Some(dir.path()), &panics, &no_drive_dir, None, false).unwrap();
     assert_eq!(got.canonicalize().unwrap(), file.canonicalize().unwrap());
 
     // Absolute.
-    let got = resolve_executable_in(&file, Some(dir.path()), &panics, None, false).unwrap();
+    let got = resolve_executable_in(&file, Some(dir.path()), &panics, &no_drive_dir, None, false).unwrap();
     assert_eq!(got.canonicalize().unwrap(), file.canonicalize().unwrap());
 }
 
@@ -597,6 +603,7 @@ fn a_bare_name_names_get_system_directory_w_when_the_system_query_fails() {
         Path::new("sp_sysfail"),
         Some(cwd.path()),
         &system_dirs_fn,
+        &no_drive_dir,
         Some(pathdir.path().as_os_str()),
         false,
     )
@@ -629,6 +636,7 @@ fn a_bare_name_names_get_system_windows_directory_w_when_the_system_windows_quer
         Path::new("sp_winfail"),
         Some(cwd.path()),
         &system_dirs_fn,
+        &no_drive_dir,
         Some(pathdir.path().as_os_str()),
         false,
     )
@@ -639,21 +647,6 @@ fn a_bare_name_names_get_system_windows_directory_w_when_the_system_windows_quer
     };
     assert!(msg.contains("GetSystemWindowsDirectoryW"), "{msg:?}");
     assert!(!msg.contains("GetSystemDirectoryW"), "{msg:?}");
-}
-
-/// A drive-relative name (`C:tool`) is refused as `InvalidInput` before any search — see
-/// [`resolve_executable_in`]'s doc — so `system_dirs` must never be consulted for it, even one that
-/// would panic if called, through [`resolve_executable_in`] directly.
-#[skuld::test]
-fn a_drive_relative_name_is_refused_without_querying_system_dirs() {
-    let panics =
-        || -> Result<Vec<PathBuf>, Error> { panic!("system_dirs must not be queried for a drive-relative name") };
-    let cwd = tempfile::tempdir().unwrap();
-    let err = resolve_executable_in(Path::new("C:tool"), Some(cwd.path()), &panics, None, false).unwrap_err();
-    match err {
-        Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e:?}"),
-        other => panic!("expected Io(InvalidInput), got {other:?}"),
-    }
 }
 
 /// [`query_wide_dir`] wraps the Win32 failure through [`crate::error::io_context`] rather than a
@@ -739,6 +732,7 @@ fn the_app_directory_is_not_searched() {
         Path::new(&name),
         Some(base.path()),
         &app_dir_fn,
+        &no_drive_dir,
         Some(empty_path.path().as_os_str()),
         false,
     );
@@ -753,8 +747,12 @@ fn the_app_directory_is_not_searched() {
     // that out by proving `resolve_executable`'s own plumbing can find the decoy when nothing
     // excludes it, before the miss below claims that a specific exclusion is why it fails.
     let app_dir_as_path = planted.dir().into_os_string();
-    let with_app_dir_on_path =
-        resolve_executable(Path::new(&name), Some(base.path()), Some(app_dir_as_path.as_os_str()));
+    let with_app_dir_on_path = resolve_executable(
+        Path::new(&name),
+        Some(base.path()),
+        &no_drive_dir,
+        Some(app_dir_as_path.as_os_str()),
+    );
     assert_eq!(
         with_app_dir_on_path.unwrap().canonicalize().unwrap(),
         planted.0.path().canonicalize().unwrap()
@@ -763,7 +761,12 @@ fn the_app_directory_is_not_searched() {
     // The real entry point again, this time with the app directory excluded as it is in
     // production: `resolve_executable` calls `windows_system_dirs`, which — this test's whole
     // point — never includes the app directory, and the app directory is not on `PATH` either.
-    let got = resolve_executable(Path::new(&name), Some(base.path()), Some(empty_path.path().as_os_str()));
+    let got = resolve_executable(
+        Path::new(&name),
+        Some(base.path()),
+        &no_drive_dir,
+        Some(empty_path.path().as_os_str()),
+    );
     assert_not_found(got);
 }
 
@@ -778,6 +781,7 @@ fn resolve_finds_a_real_system32_binary_through_system_dirs() {
         std::path::Path::new("notepad"),
         Some(cwd.path()),
         &windows_system_dirs,
+        &no_drive_dir,
         None,
         false,
     )
@@ -1012,7 +1016,7 @@ fn an_inherited_key_keeps_its_casing() {
 // One environment snapshot per spawn =====
 
 /// `CreateProcessW` keeps duplicate names as given, and `GetEnvironmentVariableW` returns the first.
-/// `path()`, which resolution searches, must be the `PATH` the child reads from its block.
+/// The `PATH` that resolution searches is the one the child reads from its block: the first entry.
 #[skuld::test]
 fn path_is_the_one_the_child_reads_from_its_block() {
     let base = [
@@ -1027,10 +1031,8 @@ fn path_is_the_one_the_child_reads_from_its_block() {
             "b",
         ),
     ] {
-        let path = env.path().map(OsStr::to_os_string);
         let block = EnvSnapshot::from_block(env.into_block().unwrap());
-        assert_eq!(path, block.var(OsStr::new("PATH")));
-        assert_eq!(path.as_deref(), Some(OsStr::new(want)));
+        assert_eq!(block.var(OsStr::new("PATH")).as_deref(), Some(OsStr::new(want)));
     }
 }
 
@@ -1078,8 +1080,9 @@ fn resolution_searches_the_given_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("sp_snapshot.exe")).unwrap();
     let base = [(OsString::from("PATH"), dir.path().as_os_str().to_os_string())];
-    let env = ChildEnv::capture(&snapshot(&base), &[]);
-    let got = resolve_executable(Path::new("sp_snapshot"), None, env.path()).unwrap();
+    let block = EnvSnapshot::from_block(ChildEnv::capture(&snapshot(&base), &[]).into_block().unwrap());
+    let path = block.var(OsStr::new("PATH"));
+    let got = resolve_executable(Path::new("sp_snapshot"), None, &no_drive_dir, path.as_deref()).unwrap();
     assert_eq!(
         got.canonicalize().unwrap(),
         dir.path().join("sp_snapshot.exe").canonicalize().unwrap()

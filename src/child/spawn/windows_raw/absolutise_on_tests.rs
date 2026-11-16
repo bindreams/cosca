@@ -195,32 +195,26 @@ fn a_digit_drive_takes_that_drives_directory() {
     assert!(!got.used_cwd);
 }
 
-/// `complete_on` uses a drive directory only when fully qualified; its reader answers whether one
-/// exists.
+/// `complete_on` completes a drive-relative name onto the directory its reader gives, on any drive. Which
+/// value is usable is [`DriveDirs`]' rule.
 #[skuld::test]
-fn a_drive_directory_is_used_only_when_fully_qualified() {
-    for (value, want) in [
-        (r"Q:\qcwd", r"Q:\qcwd\tool.exe"),
-        (r"\\srv\shr\d", r"\\srv\shr\d\tool.exe"),
-        ("Q:rel", r"Q:\tool.exe"),
-        ("rel", r"Q:\tool.exe"),
-        (r"\rooted", r"Q:\tool.exe"),
-    ] {
+fn a_drive_directory_the_reader_gives_is_used() {
+    for (dir, want) in [(r"Q:\qcwd", r"Q:\qcwd\tool.exe"), (r"Q:\", r"Q:\tool.exe")] {
         let got = complete_on(
             Path::new("Q:tool.exe"),
             || Ok(PathBuf::from(r"D:\base")),
-            |_| Ok(Some(OsString::from(value))),
+            |_| Ok(Some(OsString::from(dir))),
         )
         .unwrap();
-        assert_eq!(got.path, PathBuf::from(want), "=Q:={value:?}");
+        assert_eq!(got.path, PathBuf::from(want), "{dir:?}");
     }
 }
 
-/// A spawn uses a drive's `=X:` value only when it is fully qualified and names an existing
-/// directory, on any drive; otherwise the drive's root, as `GetFullPathNameW` does (measured by
-/// `tests/windows_process_cwd.rs`).
+/// A spawn uses a drive's `=X:` value only when it is the drive's own directory by [`DriveDirs`]' rule,
+/// on any drive; otherwise the drive's root, as `GetFullPathNameW` does (measured by
+/// `tests/windows_path_resolution/drive_rule.rs`).
 #[skuld::test]
-fn only_an_existing_fully_qualified_drive_directory_is_used() {
+fn only_an_existing_directory_given_as_a_drive_path_is_used() {
     let dir = tempfile::tempdir().unwrap();
     let existing = dir.path().to_str().unwrap().to_owned();
     let file = dir.path().join("afile");
@@ -245,6 +239,103 @@ fn only_an_existing_fully_qualified_drive_directory_is_used() {
     }
 }
 
+/// `=Q:` values that [`DriveDirs`] ignores although every probe finds a directory, so only the
+/// spelling decides: each is one Win32 ignores (measured), where a value spelled as Win32 normalises
+/// it is used.
+const IGNORED_DRIVE_VALUES: &[&str] = &[
+    r"\\?\Q:\qcwd",
+    r"\\?\UNC\srv\shr\d",
+    r"\\?\q:\qcwd",
+    r"//?/Q:/qcwd",
+    r"\\.\Q:\qcwd",
+    r"\\srv\shr\d",
+    "Q:/qcwd",
+    r"Q:\qcwd/sub",
+    r"Q:\qcwd\\sub",
+    r"Q:\qcwd\..\qcwd",
+    r"Q:\qcwd\.",
+    r"Q:\qcwd.",
+    "Q:\\qcwd ",
+    "Q:",
+    "Q:rel",
+    "rel",
+    r"\rooted",
+    "",
+];
+
+/// `=Q:` values [`DriveDirs`] uses when its probe finds a directory.
+const USED_DRIVE_VALUES: &[&str] = &[r"Q:\qcwd", r"q:\qcwd", r"Q:\qcwd\", r"Q:\PROGRA~1", r"Q:\"];
+
+#[skuld::test]
+fn a_drive_value_win32_ignores_answers_as_no_directory() {
+    for value in IGNORED_DRIVE_VALUES {
+        let snapshot = snapshot_with(&format!("=Q:={value}"));
+        let dirs = DriveDirs::with_probe(&snapshot, |_| true);
+        assert_eq!(dirs.get("Q:".as_ref()), None, "=Q:={value:?}");
+    }
+    for value in USED_DRIVE_VALUES {
+        let snapshot = snapshot_with(&format!("=Q:={value}"));
+        let dirs = DriveDirs::with_probe(&snapshot, |_| true);
+        assert_eq!(dirs.get("Q:".as_ref()), Some(OsString::from(value)), "=Q:={value:?}");
+    }
+}
+
+/// A value of 260 UTF-16 units or more is ignored, 259 used: Win32's own limit (measured, in a child
+/// that is long-path aware too), and the value is measured before anything is asked of the filesystem.
+#[skuld::test]
+fn a_drive_value_of_260_units_or_more_answers_as_no_directory() {
+    thread_local! {
+        static PROBED: Cell<bool> = const { Cell::new(false) };
+    }
+    fn probe(_: &Path) -> bool {
+        PROBED.with(|p| p.set(true));
+        true
+    }
+    let of_len = |units: usize| format!(r"Q:\{}", "a".repeat(units - 3));
+    for (units, fits) in [(259, true), (260, false), (261, false)] {
+        let value = of_len(units);
+        assert_eq!(value.encode_utf16().count(), units);
+        let snapshot = snapshot_with(&format!("=Q:={value}"));
+        PROBED.with(|p| p.set(false));
+        let got = DriveDirs::with_probe(&snapshot, probe).get("Q:".as_ref());
+        assert_eq!(got.is_some(), fits, "{units} units");
+        assert_eq!(PROBED.with(Cell::get), fits, "{units} units: probed only when it fits");
+    }
+}
+
+/// The drive-directory reader of one spawn, as `absolutise_exact_on` takes it.
+fn drive_reader<'a>(dirs: &'a DriveDirs<'_>) -> impl FnOnce(&std::ffi::OsStr) -> Result<Option<OsString>, Error> + 'a {
+    |drive| Ok(dirs.get(drive))
+}
+
+/// The exact arm and a drive-relative `current_dir` follow the same rule as the search: a value Win32
+/// ignores (a verbatim one, or a forward-slash one) answers as no directory, so `Q:tool.exe` completes
+/// onto the drive's root.
+#[skuld::test]
+fn a_drive_value_win32_ignores_sends_an_exact_name_to_the_drives_root() {
+    for value in [r"\\?\Q:\qcwd", "Q:/qcwd"] {
+        let snapshot = snapshot_with(&format!("=Q:={value}"));
+        let dirs = DriveDirs::with_probe(&snapshot, |_| true);
+        let got = absolutise_exact_on(
+            Path::new("Q:tool.exe"),
+            || Ok(PathBuf::from(r"D:\base")),
+            drive_reader(&dirs),
+        )
+        .unwrap();
+        assert_eq!(got.path, PathBuf::from(r"Q:\tool.exe"), "=Q:={value:?}");
+    }
+}
+
+#[skuld::test]
+fn a_drive_value_win32_ignores_sends_a_current_dir_to_the_drives_root() {
+    for value in [r"\\?\Q:\qcwd", "Q:/qcwd"] {
+        let snapshot = snapshot_with(&format!("=Q:={value}"));
+        let dirs = DriveDirs::with_probe(&snapshot, |_| true);
+        let got = super::effective_cwd(Some(Path::new("Q:sub")), &dirs, || Ok(PathBuf::from(r"D:\base"))).unwrap();
+        assert_eq!(got, PathBuf::from(r"Q:\sub"), "=Q:={value:?}");
+    }
+}
+
 /// Each drive is probed once per spawn, however many steps ask, and however they spell it.
 #[skuld::test]
 fn a_drive_directory_is_probed_once() {
@@ -264,6 +355,31 @@ fn a_drive_directory_is_probed_once() {
     let relative = snapshot_with("=R:=rel");
     assert_eq!(DriveDirs::with_probe(&relative, probe).get("R:".as_ref()), None);
     assert_eq!(PROBES.with(Cell::get), 1);
+}
+
+/// Two environments naming one directory share its probe: the answer one step got is the answer the
+/// other gets, even if the directory has gone since, and a directory only the second names is its own.
+#[skuld::test]
+fn views_over_two_environments_share_what_was_probed() {
+    thread_local! {
+        static ANSWERS: Cell<usize> = const { Cell::new(0) };
+    }
+    fn probe(_: &Path) -> bool {
+        // The first probe finds a directory; any later one would not.
+        ANSWERS.with(|a| a.set(a.get() + 1));
+        ANSWERS.with(Cell::get) == 1
+    }
+    let process = snapshot_with(r"=Q:=Q:\shared");
+    let child = snapshot_with(r"=Q:=Q:\shared");
+    let other = snapshot_with(r"=Q:=Q:\only-the-child");
+    let process_dirs = DriveDirs::with_probe(&process, probe);
+    assert_eq!(process_dirs.get("Q:".as_ref()), Some(OsString::from(r"Q:\shared")));
+    assert_eq!(
+        process_dirs.over(&child).get("Q:".as_ref()),
+        Some(OsString::from(r"Q:\shared"))
+    );
+    assert_eq!(process_dirs.over(&other).get("Q:".as_ref()), None);
+    assert_eq!(ANSWERS.with(Cell::get), 2);
 }
 
 /// On a verbatim cwd a relative name is joined as written and `GetFullPathNameW` collapses it,
@@ -409,7 +525,13 @@ fn a_verbatim_current_dir_finds_a_dot_relative_name() {
     std::fs::write(dir.path().join("tool.exe"), b"x").unwrap();
     let mut verbatim = OsString::from(r"\\?\");
     verbatim.push(dir.path());
-    let got = super::resolve_executable(Path::new("./tool.exe"), Some(Path::new(&verbatim)), None).unwrap();
+    let got = super::resolve_executable(
+        Path::new("./tool.exe"),
+        Some(Path::new(&verbatim)),
+        &crate::resolve::no_drive_dir,
+        None,
+    )
+    .unwrap();
     assert_eq!(got, Path::new(&verbatim).join("tool.exe"));
 }
 

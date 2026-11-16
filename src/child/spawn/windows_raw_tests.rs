@@ -7,6 +7,7 @@
 use super::*;
 use crate::command::Command;
 use crate::error::Error;
+use crate::resolve::resolve_tests::assert_not_found;
 use crate::test_child::Console;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
@@ -200,9 +201,9 @@ fn image(cmd: &Command) -> Result<Option<PathBuf>, Error> {
     Ok(target(cmd, &spawn_env(cmd)?)?.image)
 }
 
-/// [`target_with`]'s image with this process's cwd read as [`EXACT_CWD`].
-fn image_on(cmd: &Command) -> Result<Option<PathBuf>, Error> {
-    Ok(target_with(cmd, &spawn_env(cmd)?, || Ok(PathBuf::from(EXACT_CWD)))?.image)
+/// [`target_with`]'s image with this process's cwd read as `process_cwd`.
+fn image_on(cmd: &Command, process_cwd: &Path) -> Result<Option<PathBuf>, Error> {
+    Ok(target_with(cmd, &spawn_env(cmd)?, || Ok(process_cwd.to_path_buf()))?.image)
 }
 
 const EXACT_CWD: &str = r"C:\cosca-process-cwd";
@@ -213,7 +214,7 @@ fn target_completes_an_exact_program_without_searching_it() {
     // append `.exe` to, is only completed against this process's cwd, as the loader would.
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.raw_executable("tool").args(["tool"]);
-    let image = image_on(&cmd).expect("an exact program is never searched, so it cannot miss");
+    let image = image_on(&cmd, Path::new(EXACT_CWD)).expect("an exact program is never searched, so it cannot miss");
     assert_eq!(image.as_deref(), Some(Path::new(r"C:\cosca-process-cwd\tool")));
 }
 
@@ -363,7 +364,7 @@ fn target_completes_an_exact_program_as_the_loader_does() {
     let mut cmd = crate::test_child::command(Console::Hidden);
     cmd.raw_executable(r"t\tool.").args(["tool"]);
     assert_eq!(
-        image_on(&cmd).unwrap().as_deref(),
+        image_on(&cmd, Path::new(EXACT_CWD)).unwrap().as_deref(),
         Some(Path::new(r"C:\cosca-process-cwd\t\tool"))
     );
 }
@@ -393,7 +394,10 @@ fn target_completes_an_exact_program_that_is_not_a_batch_file() {
     for n in ["setup.exe", "setup.bat.exe"] {
         let mut cmd = crate::test_child::command(Console::Hidden);
         cmd.raw_executable(n).args(["tool"]);
-        assert_eq!(image_on(&cmd).unwrap(), Some(Path::new(EXACT_CWD).join(n)));
+        assert_eq!(
+            image_on(&cmd, Path::new(EXACT_CWD)).unwrap(),
+            Some(Path::new(EXACT_CWD).join(n))
+        );
     }
 }
 
@@ -573,6 +577,194 @@ fn target_pins_the_process_cwd_for_every_program() {
     .unwrap();
     assert_eq!(reads.get(), 1);
     assert_eq!(got.cwd, PathBuf::from(EXACT_CWD));
+}
+
+// `executable("X:tool")`: a drive-relative name, completed against the child's own state ----------
+//
+// The child's `=X:` variables are what `Command::env` sets: the policy reads the child's block, never
+// this process's. Every file is in a temp directory built here.
+
+/// A directory holding `tool.exe`, its drive (`T:`), and a drive that is not T.
+fn tool_in_a_directory() -> (tempfile::TempDir, String, &'static str) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("tool.exe"), b"x").unwrap();
+    let t = dir.path().to_str().unwrap()[..2].to_owned();
+    let other = if t.eq_ignore_ascii_case("Q:") { "R:" } else { "Q:" };
+    (dir, t, other)
+}
+
+/// On the drive of the child's directory the name is appended to that directory: `current_dir`'s,
+/// else this process's.
+#[skuld::test]
+fn a_drive_relative_executable_on_the_childs_drive_is_completed_against_its_directory() {
+    let (dir, t, _) = tool_in_a_directory();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.executable(format!("{t}tool"))
+        .args(["tool"])
+        .current_dir(dir.path());
+    assert_eq!(
+        image_on(&cmd, elsewhere.path()).unwrap(),
+        Some(dir.path().join("tool.exe"))
+    );
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.executable(format!("{t}tool")).args(["tool"]);
+    assert_eq!(image_on(&cmd, dir.path()).unwrap(), Some(dir.path().join("tool.exe")));
+}
+
+/// On another drive the name is appended to the child's `=X:` directory, which is the child's
+/// environment's: `Command::env` sets it, and `env_remove` and `env_clear` take it away, so the file
+/// is no longer the one the variable named. A digit is a drive too.
+#[skuld::test]
+fn a_drive_relative_executable_on_another_drive_follows_the_childs_environment() {
+    let (dir, _, other) = tool_in_a_directory();
+    let want = Some(dir.path().join("tool.exe"));
+    let cwd = tempfile::tempdir().unwrap();
+    for drive in [other, "1:"] {
+        let command = |ops: &dyn Fn(&mut Command)| {
+            let mut cmd = crate::test_child::command(Console::Hidden);
+            cmd.executable(format!("{drive}tool"))
+                .args(["tool"])
+                .current_dir(cwd.path());
+            ops(&mut cmd);
+            cmd
+        };
+        let var = format!("={drive}");
+        let found = command(&|c| {
+            c.env(&var, dir.path());
+        });
+        assert_eq!(image_on(&found, cwd.path()).unwrap(), want, "{drive}");
+        let removed = command(&|c| {
+            c.env(&var, dir.path()).env_remove(&var);
+        });
+        assert_not_found(&format!("{drive}tool after env_remove"), image_on(&removed, cwd.path()));
+        let cleared = command(&|c| {
+            c.env(&var, dir.path()).env_clear();
+        });
+        assert_not_found(&format!("{drive}tool after env_clear"), image_on(&cleared, cwd.path()));
+    }
+}
+
+/// An `=X:` value Win32 ignores is no directory, whatever it names: the name falls to the drive's
+/// root, as when the variable is missing. A verbatim value and a forward-slash one are two such.
+///
+/// Mutant: the value is used whenever it is fully qualified and an existing directory.
+#[skuld::test]
+fn a_drive_relative_executable_ignores_a_drive_variable_win32_ignores() {
+    let (dir, t, other) = tool_in_a_directory();
+    assert!(
+        !Path::new(&format!(r"{t}\tool.exe")).exists(),
+        "precondition: the root of {t} holds no tool.exe"
+    );
+    let var = format!("={t}");
+    let dir_slashes = dir.path().to_str().unwrap().replace('\\', "/");
+    for value in [format!(r"\\?\{}", dir.path().display()), dir_slashes] {
+        let mut cmd = crate::test_child::command(Console::Hidden);
+        cmd.executable(format!("{t}tool"))
+            .args(["tool"])
+            .current_dir(format!(r"{other}\cosca-149-nowhere"))
+            .env(&var, &value);
+        assert_not_found(&format!("{t}tool with =T:={value}"), image_on(&cmd, dir.path()));
+        cmd.env(&var, dir.path());
+        assert_eq!(image_on(&cmd, dir.path()).unwrap(), Some(dir.path().join("tool.exe")));
+    }
+}
+
+/// This process's cwd is no source: with `current_dir` on another drive and no `=X:` in the child's
+/// environment, `X:tool` is not appended to this process's directory on `X:`, though it holds the
+/// file. With the variable set it is found: the control.
+///
+/// Mutant: the name is appended to this process's cwd.
+#[skuld::test]
+fn a_drive_relative_executable_does_not_read_this_processs_cwd() {
+    let (dir, t, other) = tool_in_a_directory();
+    assert!(
+        !Path::new(&format!(r"{t}\tool.exe")).exists(),
+        "precondition: the root of {t} holds no tool.exe"
+    );
+    let want = Some(dir.path().join("tool.exe"));
+    let var = format!("={t}");
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.executable(format!("{t}tool"))
+        .args(["tool"])
+        .current_dir(format!(r"{other}\cosca-149-nowhere"))
+        .env_remove(&var);
+    assert_not_found(&format!("{t}tool"), image_on(&cmd, dir.path()));
+    cmd.env(&var, dir.path());
+    assert_eq!(image_on(&cmd, dir.path()).unwrap(), want);
+}
+
+/// A drive-relative name is never resolved through the real cwd of the process: with a `tool.exe`
+/// planted in it, and the child's `current_dir` a directory on the same drive that has none, the name
+/// is a miss. It runs in a re-executed copy of this binary, whose cwd is the planted directory, and
+/// reads that cwd itself, by [`target`].
+#[skuld::test]
+fn a_drive_relative_executable_is_not_resolved_through_the_real_cwd() {
+    let planted = tempfile::tempdir().unwrap();
+    std::fs::write(planted.path().join("tool.exe"), b"x").unwrap();
+    crate::test_child::run_fixture_with_cwd(
+        crate::test_child::fixture_path!(fixture_a_drive_relative_executable_is_not_resolved_through_the_real_cwd),
+        planted.path(),
+        FIXTURE_REAL_CWD_MARKER,
+    );
+}
+
+const FIXTURE_REAL_CWD_MARKER: &str = "COSCA_FIXTURE_DRIVE_RELATIVE_REAL_CWD";
+
+/// The child half of [`a_drive_relative_executable_is_not_resolved_through_the_real_cwd`].
+#[skuld::test]
+fn fixture_a_drive_relative_executable_is_not_resolved_through_the_real_cwd() {
+    let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_REAL_CWD_MARKER) else {
+        return; // picked up by an ordinary suite run: deliberately inert
+    };
+    assert!(
+        cwd.join("tool.exe").is_file(),
+        "the parent plants `tool.exe` here: {cwd:?}"
+    );
+    let empty = tempfile::tempdir().unwrap();
+    let drive = empty.path().to_str().unwrap()[..2].to_owned();
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.executable(format!("{drive}tool"))
+        .args(["tool"])
+        .current_dir(empty.path());
+    assert_not_found(
+        "a drive-relative name on a directory with no file",
+        target(&cmd, &spawn_env(&cmd).unwrap()).map(|t| t.image),
+    );
+}
+
+/// A completed name is a located name like any other: `X:rest`, `.\rest` and `<cwd>\rest` give the
+/// same image or the same kind of error. `tool.` is included: Win32 would trim its dot to `tool.exe`,
+/// which none of the three reads.
+#[skuld::test]
+fn a_completed_drive_relative_executable_is_read_as_the_located_name_written_out() {
+    let (dir, t, _) = tool_in_a_directory();
+    let cwd = dir.path();
+    std::fs::create_dir(cwd.join("sub")).unwrap();
+    std::fs::write(cwd.join("sub").join("tool.exe"), b"x").unwrap();
+    let outcome = |name: &str| {
+        let mut cmd = crate::test_child::command(Console::Hidden);
+        cmd.executable(name).args(["tool"]).current_dir(cwd);
+        match image_on(&cmd, cwd) {
+            Ok(image) => Ok(image.map(|p| p.canonicalize().unwrap())),
+            Err(Error::Io(e)) => Err(e.kind()),
+            Err(other) => panic!("{name}: {other:?}"),
+        }
+    };
+    for rest in ["tool.", "tool ", "...", "..", "sub.", r"sub.\tool", r"sub\tool", "tool"] {
+        let written = [
+            format!("{t}{rest}"),
+            format!(r".\{rest}"),
+            format!(r"{}\{rest}", cwd.display()),
+        ];
+        let outcomes: Vec<_> = written.iter().map(|w| outcome(w)).collect();
+        assert!(
+            outcomes.windows(2).all(|pair| pair[0] == pair[1]),
+            "{rest:?}: {written:?} gave {outcomes:?}"
+        );
+    }
+    assert_eq!(outcome(&format!("{t}tool.")), Err(std::io::ErrorKind::NotFound));
+    assert_eq!(outcome(&format!("{t}..")), Err(std::io::ErrorKind::InvalidInput));
 }
 
 // The post-spawn identity read and attach =====

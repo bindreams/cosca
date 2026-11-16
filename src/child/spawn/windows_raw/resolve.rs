@@ -6,14 +6,15 @@
 //! directory (the directory this process's own image loaded from) nor the current directory is ever searched; a
 //! name containing a separator is not searched at all and is tried as written first, falling back to `name.exe`
 //! only when it carries no extension) rather than full `CreateProcessW` search parity — this keeps
-//! `.bat`/`.cmd` out of resolution so batch-program rejection stays a separate concern. The system-directory
+//! `.bat`/`.cmd` out of resolution so batch-program rejection stays a separate concern. A drive-relative
+//! name is completed first by [`crate::resolve::drive_relative::drive_base`]. The system-directory
 //! step exists to reproduce `CreateProcessW`'s own NULL-`lpApplicationName` search order minus the app
 //! directory, the current directory, and the 16-bit system directory (Win32 provides no function to query it,
 //! and this crate does not reconstruct it — see [`windows_system_dirs`]'s doc). The app directory and the
 //! current directory ARE queryable; see [`resolve_executable_in`]'s doc for why they are excluded anyway.
 //! [`ChildEnv`] is the child's environment, captured once per spawn from an [`EnvSnapshot`] and a
-//! recorded [`EnvOp`] sequence; resolution reads its `PATH` and [`ChildEnv::into_block`] gives
-//! `CreateProcessW` its block.
+//! recorded [`EnvOp`] sequence; [`ChildEnv::into_block`] gives `CreateProcessW` its block, and resolution
+//! reads its `PATH` and `=X:` variables from that block, as the child reads them.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -28,6 +29,7 @@ use super::env_key::EnvKey;
 use super::env_snapshot::EnvSnapshot;
 use crate::command::EnvOp;
 use crate::error::Error;
+use crate::resolve::drive_relative::DriveBase;
 
 // Program resolution =====
 
@@ -38,12 +40,15 @@ use crate::error::Error;
 /// `lpCurrentDirectory`, so the file resolved and the directory run in come from one read of this
 /// process's state.
 ///
-/// `path` is the child's `PATH`, [`ChildEnv::path`] of the same [`ChildEnv`] whose
-/// [`ChildEnv::into_block`] the child is spawned with, so the directories searched here are the
-/// ones the CHILD will actually have — as [`crate::resolve::ResolveInput::path_var`]'s doc
-/// promises — and no second read of this process's environment can disagree with the block.
-pub(crate) fn resolve_executable(exe: &Path, base: Option<&Path>, path: Option<&OsStr>) -> Result<PathBuf, Error> {
-    resolve_executable_in(exe, base, &windows_system_dirs, path, false)
+/// `path` is the child's `PATH`, read from its block, so the directories searched are the ones the
+/// child has.
+pub(crate) fn resolve_executable(
+    exe: &Path,
+    base: Option<&Path>,
+    child_drive_dir: &dyn Fn(&OsStr) -> Option<OsString>,
+    path: Option<&OsStr>,
+) -> Result<PathBuf, Error> {
+    resolve_executable_in(exe, base, &windows_system_dirs, child_drive_dir, path, false)
 }
 
 /// A raw spawn's effective working directory: filled once per spawn, and the one value every later
@@ -284,6 +289,12 @@ pub(crate) struct Completed {
     pub(crate) used_cwd: bool,
 }
 
+/// Whether two drive prefixes name one drive: `RtlGetFullPathName_U` upcases both units by the table
+/// an environment key uses (`é:` and `É:` are one).
+fn same_drive(a: &OsStr, b: &OsStr) -> bool {
+    EnvKey::new(a) == EnvKey::new(b)
+}
+
 /// Complete `path` as `GetFullPathNameW` would, with this process's cwd read through
 /// `process_cwd` (at most once) and another drive's own current directory through `drive_cwd`,
 /// instead of by `GetFullPathNameW` itself. `GetFullPathNameW` then only normalises a path that is
@@ -297,8 +308,8 @@ pub(crate) struct Completed {
 ///   [`DriveAbsolute`](crate::resolve::PathType::DriveAbsolute): as written. Nothing is read.
 /// - [`DriveRelative`](crate::resolve::PathType::DriveRelative) (`C:x`): the cwd is read to learn
 ///   the current drive. On that drive the rest is appended to the cwd. On another, it is appended
-///   to that drive's own directory as `drive_cwd` reports it ([`DriveDirs`] for a spawn), if fully
-///   qualified, else to the drive's root, and the cwd is not used.
+///   to that drive's own directory as `drive_cwd` reports it ([`DriveDirs`] for a spawn), else to
+///   the drive's root, and the cwd is not used.
 /// - [`Rooted`](crate::resolve::PathType::Rooted) (`\x`): appended to the cwd's drive or share.
 ///   Refused on a verbatim cwd, where Win32 completes it off the cwd's volume (`\t.exe`,
 ///   measured).
@@ -353,29 +364,11 @@ fn anchor(
             used_cwd: false,
         },
         PathType::DriveRelative => {
-            let (drive, rest) = crate::resolve::split_drive(name).expect("a drive-relative path has a drive");
             let cwd = process_cwd()?;
-            // Case-insensitive by the OS's own table, as `RtlGetFullPathName_U` upcases both units,
-            // not by ASCII alone: a drive may be any unit.
-            let on_cwd_drive = crate::resolve::split_drive(cwd.as_os_str())
-                .is_some_and(|(d, _)| super::env_key::EnvKey::new(d) == super::env_key::EnvKey::new(drive));
-            if on_cwd_drive {
-                Completed {
-                    path: append(cwd.as_os_str(), rest),
-                    used_cwd: true,
-                }
-            } else {
-                let base = drive_cwd(drive)?
-                    .filter(|dir| crate::resolve::is_absolute_name(dir, true))
-                    .unwrap_or_else(|| {
-                        let mut root = drive.to_os_string();
-                        root.push("\\");
-                        root
-                    });
-                Completed {
-                    path: append(&base, rest),
-                    used_cwd: false,
-                }
+            let (base, rest) = crate::resolve::drive_relative::drive_base(name, &cwd, &same_drive, drive_cwd)?;
+            Completed {
+                path: PathBuf::from(crate::resolve::join::append(base.path().as_os_str(), rest, "\\")),
+                used_cwd: matches!(base, DriveBase::Cwd(_)),
             }
         }
         PathType::Rooted | PathType::Relative => {
@@ -408,22 +401,30 @@ fn anchor(
     Ok(done)
 }
 
-/// `rest` after the directory `base`, by [`crate::resolve::join::append`].
-fn append(base: &OsStr, rest: &OsStr) -> PathBuf {
-    PathBuf::from(crate::resolve::join::append(base, rest, "\\"))
-}
-
-/// Each drive's own directory for one spawn, as `GetFullPathNameW` uses it: the `=Q:` value in the
-/// spawn's environment snapshot when it is fully qualified and names an existing directory, else
-/// none, so the drive's root is used (measured by `tests/windows_process_cwd.rs`; Wine uses any
-/// value, and notes the existence check as a Windows difference it does not model).
+/// Each drive's own directory for one spawn: the `=Q:` value in the spawn's environment snapshot
+/// when all of these hold, else none, so the drive's root is used:
 ///
-/// Each drive is probed at most once, so every step of one spawn completes against the same
-/// answer even if the directory appears or vanishes meanwhile.
+/// - it is [`DriveAbsolute`](crate::resolve::PathType::DriveAbsolute) (`Q:\x`), so not UNC, verbatim
+///   or device, rooted, relative, or a bare `Q:`;
+/// - `GetFullPathNameW` returns it unchanged, so not `Q:/x`, `Q:\x\.`, `Q:\x.` or `Q:\x\\y`;
+/// - it is at most 259 UTF-16 units, so it fits `MAX_PATH` with its NUL. A long-path-aware child
+///   ignores a longer one too, so this is not a long-path feature;
+/// - it names an existing directory.
+///
+/// These clauses stand in for the check `GetFullPathNameW` makes, which opens `\??\<value>` as a
+/// directory (Wine makes none: it uses any value), so some values differ from it, among them a bare
+/// drive, a trailing separator on a directory that is no root, a directory whose name ends in a dot
+/// or a space, and a directory this process can see but may not open.
+///
+/// This is the one rule: the search, the exact arm and `current_dir` all follow it.
+///
+/// Each directory is probed at most once, so every step of one spawn completes against the same
+/// answer even if the directory appears or vanishes meanwhile. The views of [`DriveDirs::over`]
+/// share that answer, so two environments naming one directory cannot disagree about it.
 pub(crate) struct DriveDirs<'a> {
     snapshot: &'a EnvSnapshot,
     is_dir: fn(&Path) -> bool,
-    probed: std::cell::RefCell<Vec<(EnvKey, Option<OsString>)>>,
+    probed: std::rc::Rc<std::cell::RefCell<Vec<(OsString, bool)>>>,
 }
 
 impl<'a> DriveDirs<'a> {
@@ -440,21 +441,41 @@ impl<'a> DriveDirs<'a> {
         }
     }
 
-    /// `drive`'s own directory, or `None` for its root. Fully qualified before it is probed, so a
-    /// relative value never reads this process's cwd.
-    pub(crate) fn get(&self, drive: &OsStr) -> Option<OsString> {
-        let key = EnvKey::new(drive);
-        if let Some((_, dir)) = self.probed.borrow().iter().find(|(k, _)| *k == key) {
-            return dir.clone();
+    /// These drive directories read from `snapshot` instead, with the probes of this one.
+    pub(crate) fn over<'b>(&self, snapshot: &'b EnvSnapshot) -> DriveDirs<'b> {
+        DriveDirs {
+            snapshot,
+            is_dir: self.is_dir,
+            probed: std::rc::Rc::clone(&self.probed),
         }
-        let dir = self
-            .snapshot
-            .var(&drive_cwd_var(drive))
-            .filter(|dir| crate::resolve::is_absolute_name(dir, true) && (self.is_dir)(Path::new(dir)));
-        self.probed.borrow_mut().push((key, dir.clone()));
-        dir
+    }
+
+    /// `drive`'s own directory, or `None` for its root. The value's length and spelling are checked
+    /// before it is probed, so a relative value never reads this process's cwd.
+    pub(crate) fn get(&self, drive: &OsStr) -> Option<OsString> {
+        let dir = self.snapshot.var(&drive_cwd_var(drive)).filter(|dir| {
+            dir.encode_wide().count() <= MAX_PATH_UNITS
+                && crate::resolve::path_type(dir) == crate::resolve::PathType::DriveAbsolute
+                // A drive-absolute path is normalised without reading any process state.
+                && full_path_name(Path::new(dir)).is_ok_and(|full| full.as_os_str() == dir.as_os_str())
+        })?;
+        let known = self
+            .probed
+            .borrow()
+            .iter()
+            .find(|(d, _)| *d == dir)
+            .map(|&(_, is_dir)| is_dir);
+        let is_dir = known.unwrap_or_else(|| {
+            let is_dir = (self.is_dir)(Path::new(&dir));
+            self.probed.borrow_mut().push((dir.clone(), is_dir));
+            is_dir
+        });
+        is_dir.then_some(dir)
     }
 }
+
+/// The longest `=X:` value Win32 uses, in UTF-16 units: `MAX_PATH` less its NUL.
+const MAX_PATH_UNITS: usize = 259;
 
 /// The name of the variable holding `drive`'s own current directory: `=Q:` for `Q:`.
 pub(crate) fn drive_cwd_var(drive: &OsStr) -> OsString {
@@ -476,8 +497,7 @@ pub(crate) fn drive_cwd_var(drive: &OsStr) -> OsString {
 /// the same value.
 ///
 /// Completes as `GetFullPathNameW` does: against the same base the loader uses, with no existence
-/// check, and a drive-relative name through that drive's own current directory (state cosca does
-/// not track, which is why `executable()` fails such names closed).
+/// check, and a drive-relative name through that drive's own current directory ([`DriveDirs`]).
 pub(crate) fn absolutise_exact_on(
     program: &Path,
     process_cwd: impl FnOnce() -> Result<PathBuf, Error>,
@@ -581,10 +601,9 @@ fn complete_exact(program: &Path, anchored: impl FnOnce() -> Result<PathBuf, Err
 ///
 /// `loadable_only` is [`crate::resolve::ResolveInput::loadable_only`].
 ///
-/// A drive-relative name such as `C:tool` is refused outright — `InvalidInput`, before any
-/// search — and is never loaded from `base_cwd`: resolving it would need drive C's own current
-/// directory, which cosca does not track. A name that names no file (`C:\`, `tools\dir\`,
-/// `...`, a bare `\\server\share`) is refused the same way.
+/// A drive-relative name such as `C:tool` is completed and resolved by [`crate::resolve`] (see its
+/// module doc). A name that names no file (`C:\`, `tools\dir\`, `..`, a bare `\\server\share`, `C:`)
+/// is refused outright, before any search.
 ///
 /// On a verbatim (`\\?\`) `base_cwd`, a rooted name (`\bin\tool.exe`) is refused as
 /// `InvalidInput` too, since Win32 completes it to `\\bin\tool.exe`, off the base's volume
@@ -604,6 +623,7 @@ pub(crate) fn resolve_executable_in(
     exe: &Path,
     base_cwd: Option<&Path>,
     system_dirs: &dyn Fn() -> Result<Vec<PathBuf>, Error>,
+    child_drive_dir: &dyn Fn(&OsStr) -> Option<OsString>,
     path: Option<&OsStr>,
     loadable_only: bool,
 ) -> Result<PathBuf, Error> {
@@ -615,6 +635,8 @@ pub(crate) fn resolve_executable_in(
         windows: true,
         loadable_only,
         normalise: &normalise_candidate,
+        child_drive_dir,
+        same_drive: &same_drive,
     })
 }
 
@@ -632,8 +654,8 @@ fn normalise_candidate(candidate: &Path) -> std::io::Result<PathBuf> {
 /// A child's environment: a snapshot of this process's, with ops applied.
 pub(crate) enum ChildEnv {
     /// The snapshot's block verbatim, duplicates and order included, as std's NULL block hands a
-    /// child this process's own. `path` is what `GetEnvironmentVariableW` reads from it.
-    Inherited { block: Vec<u16>, path: Option<OsString> },
+    /// child this process's own.
+    Inherited { block: Vec<u16> },
     /// Rebuilt from the snapshot's variables, as std's `CommandEnv::capture` rebuilds from
     /// `vars_os`.
     Captured(BTreeMap<EnvKey, OsString>),
@@ -644,7 +666,6 @@ impl ChildEnv {
     pub(crate) fn inherit(snapshot: &EnvSnapshot) -> Self {
         Self::Inherited {
             block: snapshot.block().to_vec(),
-            path: snapshot.var(OsStr::new("PATH")),
         }
     }
 
@@ -693,14 +714,6 @@ impl ChildEnv {
         match self {
             Self::Inherited { .. } => None,
             Self::Captured(vars) => Some(vars.iter().map(|(key, val)| (key.name(), val.as_os_str()))),
-        }
-    }
-
-    /// The child's `PATH`, as it will read it.
-    pub(crate) fn path(&self) -> Option<&OsStr> {
-        match self {
-            Self::Inherited { path, .. } => path.as_deref(),
-            Self::Captured(vars) => vars.get(&EnvKey::new(OsStr::new("PATH"))).map(OsString::as_os_str),
         }
     }
 

@@ -69,6 +69,8 @@ fn an_absolute_name_needs_no_base() {
         windows: cfg!(windows),
         loadable_only: false,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     });
     assert_eq!(got.unwrap(), tool);
 }
@@ -93,6 +95,8 @@ fn a_bare_name_needs_no_base() {
         windows: cfg!(windows),
         loadable_only: false,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     });
     assert_eq!(got.unwrap(), tool);
 }
@@ -117,6 +121,8 @@ fn a_unc_shaped_name_with_no_share_is_refused() {
             windows: true,
             loadable_only: false,
             normalise: &as_written,
+            child_drive_dir: &no_drive_dir,
+            same_drive: &ascii_same_drive,
         });
         match got {
             Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{name:?}: {e}"),
@@ -125,8 +131,9 @@ fn a_unc_shaped_name_with_no_share_is_refused() {
     }
 }
 
-/// Exactly the names the resolver reads a base for: a relative located name. A bare name, an
-/// absolute one, and the two refused shapes do not.
+/// Exactly the names the resolver reads a base for: a relative located name, and a drive-relative
+/// one, which it completes against the base. A bare name, an absolute one, and the refused UNC
+/// shape do not.
 #[skuld::test]
 fn which_names_need_a_base() {
     for (name, want) in [
@@ -136,7 +143,8 @@ fn which_names_need_a_base() {
         ("tool.exe", false),
         (r"C:\t\tool.exe", false),
         (r"\\srv\shr\tool.exe", false),
-        ("C:tool.exe", false),
+        ("C:tool.exe", true),
+        ("1:tool.exe", true),
         (r"\\tool.exe", false),
     ] {
         assert_eq!(needs_base(OsStr::new(name), true), want, "{name:?}");
@@ -193,27 +201,14 @@ fn a_lone_surrogate_is_a_drive() {
 }
 
 /// Every classifier agrees with the path type: `1:tool.exe` is drive-relative to all of them, so
-/// the resolver refuses it rather than searching `PATH` for `1:tool.exe.exe`.
+/// it is never searched for on `PATH` (`1:tool.exe.exe`), and needs a base to be completed against.
 #[skuld::test]
 fn a_digit_drive_is_drive_relative_everywhere() {
     let name = OsStr::new("1:tool.exe");
     assert_eq!(classify(name, true), Shape::Located);
     assert!(is_drive_relative(name, true));
     assert!(!is_absolute_name(name, true));
-    assert!(!needs_base(name, true));
-    let got = resolve(ResolveInput {
-        program: Path::new(name),
-        cwd: None,
-        system_dirs: &no_system_dirs,
-        path_var: None,
-        windows: true,
-        loadable_only: false,
-        normalise: &as_written,
-    });
-    match got {
-        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}"),
-        other => panic!("expected InvalidInput, got {other:?}"),
-    }
+    assert!(needs_base(name, true));
 }
 
 /// A separator in slot 0 is never a drive, so `\:x` has no prefix.
@@ -238,6 +233,8 @@ fn a_located_name_without_a_base_is_a_contract_violation() {
         windows: true,
         loadable_only: false,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     });
 }
 
@@ -260,11 +257,22 @@ fn candidates_join_by_the_one_classifier() {
         (r"\\?\C:\work", "/t.exe", r"\\?\C:\t.exe".to_owned()),
     ] {
         assert_eq!(
-            join_candidate(Path::new(dir), OsStr::new(candidate), true),
+            join_candidate(Path::new(dir), OsStr::new(candidate), true, false),
             PathBuf::from(&want),
             "{dir:?} + {candidate:?}"
         );
     }
+}
+
+/// A completed drive-relative name is appended as units: `D:\x` after `C:\work` is a file in it, where
+/// a join would make it drive D's root.
+#[skuld::test]
+fn a_completed_drive_relative_name_is_appended_as_units() {
+    let sep = std::path::MAIN_SEPARATOR_STR;
+    let got = join_candidate(Path::new(r"C:\work"), OsStr::new(r"D:\x"), true, true);
+    assert_eq!(got, PathBuf::from(format!(r"C:\work{sep}D:\x")));
+    let got = join_candidate(Path::new(r"C:\work"), OsStr::new(r"D:\x"), true, false);
+    assert_eq!(got, PathBuf::from(r"D:\x"));
 }
 
 /// Acceptance asks the one classifier too: `1:\tool.exe` is fully qualified to Win32 though std
@@ -413,6 +421,8 @@ fn search_tool(path_var: &OsStr, loadable_only: bool) -> Result<PathBuf, Error> 
         windows: true,
         loadable_only,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     })
 }
 
@@ -675,6 +685,8 @@ fn a_relative_windows_base_is_a_contract_violation() {
         windows: true,
         loadable_only: false,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     });
 }
 
@@ -691,6 +703,8 @@ fn loadable_only_on_the_posix_grammar_is_a_contract_violation() {
         windows: false,
         loadable_only: true,
         normalise: &as_written,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     });
 }
 
@@ -714,6 +728,8 @@ fn a_candidate_made_verbatim_by_its_base_is_normalised() {
         windows: true,
         loadable_only: false,
         normalise: &normalise,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     });
     assert_eq!(got.unwrap(), tool);
     assert_eq!(*seen.borrow(), [PathBuf::from(r"\\?\C:\d\sub.\tool.exe")]);
@@ -736,6 +752,8 @@ fn a_candidate_made_verbatim_by_its_base_is_joined_as_written() {
         windows: true,
         loadable_only: false,
         normalise: &normalise,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     });
     assert_eq!(*seen.borrow(), [PathBuf::from(r"\\?\UNC\srv\shr\d\..\..\..\t.exe")]);
 }
@@ -753,6 +771,8 @@ fn a_rooted_name_on_a_verbatim_base_is_refused() {
             windows: true,
             loadable_only: false,
             normalise: &never,
+            child_drive_dir: &no_drive_dir,
+            same_drive: &ascii_same_drive,
         });
         match got {
             Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{cwd:?}: {e}"),
@@ -777,6 +797,8 @@ fn only_a_verbatim_base_makes_a_candidate_normalised() {
             windows: true,
             loadable_only: false,
             normalise: &never,
+            child_drive_dir: &no_drive_dir,
+            same_drive: &ascii_same_drive,
         });
         match got {
             Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{program:?}: {e}"),
@@ -800,6 +822,8 @@ fn a_verbatim_search_directory_is_taken_as_written() {
         windows: true,
         loadable_only: false,
         normalise: &never,
+        child_drive_dir: &no_drive_dir,
+        same_drive: &ascii_same_drive,
     });
     match got {
         Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}"),
@@ -835,6 +859,8 @@ fn a_normalised_candidate_that_names_no_file_is_refused() {
             windows: true,
             loadable_only: false,
             normalise: &normalise,
+            child_drive_dir: &no_drive_dir,
+            same_drive: &ascii_same_drive,
         });
         match got {
             Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{completed:?}: {e}"),
