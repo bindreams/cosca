@@ -98,7 +98,7 @@ impl PkexecVersion {
             op: "elevation through a pkexec not shown to be polkit 121 or later".into(),
             platform: "unix",
             detail: format!(
-                "{why}; cosca passes pkexec --keep-cwd, which polkit {KEEP_CWD_SINCE} added, and an older                  pkexec takes it for the program and searches PATH for it. Use sudo/doas, or polkit                  {KEEP_CWD_SINCE} or later"
+                "{why}; cosca passes pkexec --keep-cwd, which polkit {KEEP_CWD_SINCE} added, and an older pkexec takes it for the program and searches PATH for it. Use sudo/doas, or polkit {KEEP_CWD_SINCE} or later"
             ),
             source: None,
         })
