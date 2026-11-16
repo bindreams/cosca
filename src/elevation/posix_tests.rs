@@ -198,116 +198,18 @@ fn terminator_protects_a_program_with_equals_or_leading_dash() {
     assert_eq!(dash, s(&["/usr/bin/doas", "--", "-prog"]));
 }
 
+#[path = "posix_tests/detect.rs"]
+mod detect;
 #[path = "posix_tests/pkexec_probe.rs"]
 mod pkexec_probe;
 #[path = "posix_tests/shim_argv.rs"]
 mod shim_argv;
 
 #[cfg(unix)]
-#[skuld::test]
-fn resolve_in_path_var_finds_an_executable_in_a_temp_dir() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    let f = dir.path().join("sudo");
-    std::fs::write(&f, b"#!/bin/sh\ntrue\n").unwrap();
-    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let got = super::resolve_in_path_var(dir.path().as_os_str(), "sudo");
-    assert_eq!(got, Some(f));
-}
-
-#[cfg(unix)]
-#[skuld::test]
-fn resolve_skips_a_non_executable_same_named_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let f = dir.path().join("sudo");
-    std::fs::write(&f, b"not exec").unwrap(); // mode 0644 — no exec bit
-    let got = super::resolve_in_path_var(dir.path().as_os_str(), "sudo");
-    assert_eq!(got, None, "a non-executable file named sudo must be skipped");
-}
-
-#[cfg(unix)]
-#[skuld::test]
-fn empty_path_element_is_not_resolved_from_cwd() {
-    // `resolve_in_path_var` is PURE (it takes the PATH string as a parameter), so
-    // this is tested directly against explicit PATH values — no process-global
-    // chdir, and thus no cross-test race and no leaked CWD on a mid-test panic.
-
-    // A single empty PATH element must be skipped, never treated as "." (CWD).
-    assert_eq!(super::resolve_in_path_var(OsStr::new(""), "sudo"), None);
-
-    // A mid-string empty element is skipped too: put a non-matching dir, then the
-    // empty element, then the real match — so the empty branch is actually exercised
-    // (matching in an earlier element would let a skip bug pass silently).
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    let sudo = dir.path().join("sudo");
-    std::fs::write(&sudo, b"#!/bin/sh\ntrue\n").unwrap();
-    std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let path_var = format!("/nonexistent::{}", dir.path().display());
-    let got = super::resolve_in_path_var(OsStr::new(&path_var), "sudo");
-    assert_eq!(
-        got,
-        Some(sudo),
-        "a mid-string empty PATH element must be skipped, not resolved"
-    );
-
-    // A PATH consisting only of empty elements resolves nothing.
-    assert_eq!(super::resolve_in_path_var(OsStr::new(":"), "sudo"), None);
-}
-
-const FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER: &str = "COSCA_FIXTURE_RELATIVE_PATH_ELEMENTS";
-
-/// A relative `PATH` element (`relbin`, `.`) names a directory under the cwd at detection time, and
-/// a backend found there would be exec-checked against one directory and run from another — or
-/// not found by path at all. `relbin/sudo` and `./sudo` are planted in the fixture's real cwd, so
-/// skipping them is observable only if the element is refused rather than merely missed.
-#[cfg(unix)]
-#[skuld::test]
-fn relative_path_elements_are_never_resolved() {
-    use std::os::unix::fs::PermissionsExt;
-    let cwd = tempfile::tempdir().unwrap();
-    for dir in ["relbin", "abs", "."] {
-        let sudo = cwd.path().join(dir).join("sudo");
-        std::fs::create_dir_all(sudo.parent().unwrap()).unwrap();
-        std::fs::write(&sudo, b"#!/bin/sh\ntrue\n").unwrap();
-        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    crate::test_child::run_fixture_with_cwd(
-        crate::test_child::fixture_path!(fixture_relative_path_elements_are_never_resolved),
-        cwd.path(),
-        FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER,
-    );
-}
-
-/// The child half of [`relative_path_elements_are_never_resolved`], run with the prepared
-/// directory as its real cwd; inert in an ordinary suite run.
-#[cfg(unix)]
-#[skuld::test]
-fn fixture_relative_path_elements_are_never_resolved() {
-    let Some(cwd) = crate::test_child::expected_cwd(FIXTURE_RELATIVE_PATH_ELEMENTS_MARKER) else {
-        return;
-    };
-    for relative in ["relbin", ".", "./relbin"] {
-        assert_eq!(
-            super::resolve_in_path_var(OsStr::new(relative), "sudo"),
-            None,
-            "{relative}"
-        );
-    }
-    let abs = cwd.join("abs");
-    let path_var = format!("relbin:{}", abs.display());
-    assert_eq!(
-        super::resolve_in_path_var(OsStr::new(&path_var), "sudo"),
-        Some(abs.join("sudo")),
-        "a relative element must be skipped, not resolved ahead of an absolute one"
-    );
-}
-
-#[cfg(unix)]
 mod rewrite_tests {
     use super::super::{password_line, rewrite_with_host, PendingPassword, PosixRewrite};
     use crate::command::{CommandInput, EnvOp};
-    use crate::elevation::plan::{BackendSet, Host, Os};
+    use crate::elevation::plan::{BackendSet, FrontState, Host, Os};
     use crate::elevation::{Auth, Backend, ElevatedStdio, ElevatedVia};
     use crate::error::Error;
     use crate::stdio::{Fd, ResolvedStdio, Stdio};
@@ -320,10 +222,10 @@ mod rewrite_tests {
             elevated: false,
             has_tty: true,
             available: BackendSet {
-                sudo: Some(PathBuf::from("/usr/bin/sudo")),
-                doas: Some(PathBuf::from("/usr/bin/doas")),
-                pkexec: None,
-                osascript: None,
+                sudo: FrontState::Found(PathBuf::from("/usr/bin/sudo")),
+                doas: FrontState::Found(PathBuf::from("/usr/bin/doas")),
+                pkexec: FrontState::Absent,
+                osascript: FrontState::Absent,
             },
             os: Os::Unix,
             arg_max: None,
@@ -411,10 +313,10 @@ mod rewrite_tests {
     fn doas_or_pkexec_with_env_is_unsupported() {
         let doas_host = Host {
             available: BackendSet {
-                sudo: None,
-                doas: Some(PathBuf::from("/usr/bin/doas")),
-                pkexec: None,
-                osascript: None,
+                sudo: FrontState::Absent,
+                doas: FrontState::Found(PathBuf::from("/usr/bin/doas")),
+                pkexec: FrontState::Absent,
+                osascript: FrontState::Absent,
             },
             ..sudo_host()
         };
@@ -430,10 +332,10 @@ mod rewrite_tests {
 
         let pk_host = Host {
             available: BackendSet {
-                sudo: None,
-                doas: None,
-                pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
-                osascript: None,
+                sudo: FrontState::Absent,
+                doas: FrontState::Absent,
+                pkexec: FrontState::Found(PathBuf::from("/usr/bin/pkexec")),
+                osascript: FrontState::Absent,
             },
             ..sudo_host()
         };
@@ -579,10 +481,10 @@ mod rewrite_tests {
                 .elevation_auth(Auth::NonInteractive);
             let doas_host = Host {
                 available: BackendSet {
-                    sudo: None,
-                    doas: Some(PathBuf::from("/usr/bin/doas")),
-                    pkexec: None,
-                    osascript: None,
+                    sudo: FrontState::Absent,
+                    doas: FrontState::Found(PathBuf::from("/usr/bin/doas")),
+                    pkexec: FrontState::Absent,
+                    osascript: FrontState::Absent,
                 },
                 ..host.clone()
             };
@@ -711,10 +613,10 @@ mod rewrite_tests {
             elevated,
             has_tty: false,
             available: BackendSet {
-                sudo: Some(PathBuf::from("/usr/bin/sudo")),
-                doas: None,
-                pkexec: None,
-                osascript: Some(PathBuf::from("/usr/bin/osascript")),
+                sudo: FrontState::Found(PathBuf::from("/usr/bin/sudo")),
+                doas: FrontState::Absent,
+                pkexec: FrontState::Absent,
+                osascript: FrontState::Found(PathBuf::from("/usr/bin/osascript")),
             },
             os: Os::MacOs,
             arg_max: Some(1_048_576),
@@ -812,7 +714,7 @@ mod rewrite_tests {
         // BackendUnavailable then reaches the caller verbatim rather than being
         // pre-empted by a structural complaint.
         let mut host = macos_gui_host(false);
-        host.available.osascript = None;
+        host.available.osascript = FrontState::Absent;
         let mut c = crate::test_child::command(Console::Hidden);
         c.args(["/usr/bin/id"]).elevation_auth(Auth::Gui);
         match rewrite_with_host(&mut c, &host) {

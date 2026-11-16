@@ -928,6 +928,7 @@ pub(crate) fn shared_io(e: &Arc<std::io::Error>) -> std::io::Error {
 }
 
 /// [`shared_io`] as the `source` of an error: an [`Error::Io`] over the handed-out `io::Error`.
+#[cfg(unix)]
 pub(crate) fn shared_io_cause(e: &Arc<std::io::Error>) -> Arc<Error> {
     Error::io_cause(shared_io(e))
 }

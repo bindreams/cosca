@@ -783,7 +783,7 @@ fn split_path_var_windows(bytes: &[u8]) -> Vec<PathBuf> {
 /// failure), as distinct from saying it does not: see [`resolve`] for what each caller does with
 /// that. Only a missing file or directory, a non-directory in the path, and a name no filesystem
 /// accepts are a definite "not here".
-fn is_file(path: &Path, named: bool) -> std::io::Result<bool> {
+pub(crate) fn is_file(path: &Path, named: bool) -> std::io::Result<bool> {
     match std::fs::metadata(path) {
         Ok(meta) => Ok(named || meta.is_file()),
         Err(e) if is_absence(&e) => Ok(false),

@@ -3,8 +3,9 @@
 use super::super::{detect_with, probe_pkexec, run_version_probe};
 use crate::elevation::pkexec::PkexecVersion;
 use crate::elevation::plan::launches_pkexec;
-use crate::elevation::plan::Os;
-use crate::elevation::{Auth, Backend, Secret};
+use crate::elevation::plan::{FrontState, Os, Transition};
+use crate::elevation::{Auth, Backend, Privilege, Secret};
+use crate::error::{ElevationErrorKind, Error};
 use std::path::{Path, PathBuf};
 
 /// An executable-mode `#!/bin/sh` script named `pkexec` holding `body`, in `dir`. Never exec'd
@@ -95,6 +96,27 @@ fn a_probe_that_cannot_run_says_so() {
     );
 }
 
+/// A pkexec that started and ran, but whose wait fails, is `RunFailed`, not `SpawnFailed`: the
+/// front is there. With `SIGCHLD` ignored the kernel reaps the child itself and the wait fails with
+/// `ECHILD`. (A test is a process of its own under nextest, so the disposition reaches no other.)
+///
+/// Mutant: a failed wait is `SpawnFailed`.
+#[skuld::test]
+fn a_probe_whose_wait_fails_after_it_ran_is_run_failed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pkexec = script(dir.path(), "echo 'pkexec version 127'");
+    // SAFETY: installing the ignore disposition is async-signal-safe and touches no memory; it is
+    // restored below.
+    let before = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+    let v = run_version_probe(sh(&pkexec));
+    // SAFETY: restores the disposition read above.
+    unsafe { libc::signal(libc::SIGCHLD, before) };
+    assert!(
+        matches!(v, PkexecVersion::RunFailed(ref e) if e.raw_os_error() == Some(libc::ECHILD)),
+        "{v:?}"
+    );
+}
+
 #[skuld::test]
 fn a_probe_that_fails_keeps_its_status_and_output() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -144,7 +166,7 @@ fn detect_stores_the_pkexec_it_probed() {
             }
         },
     );
-    assert_eq!(host.available.pkexec.as_deref(), Some(real.as_path()));
+    assert!(matches!(&host.available.pkexec, FrontState::Found(p) if *p == real));
     let pin = host.pkexec_pin.as_ref().expect("pinned");
     assert!(
         pin.as_raw_fd() >= 3,
@@ -194,15 +216,26 @@ fn detect_opens_and_probes_only_for_a_request_that_launches_pkexec() {
             host.pkexec_version
         );
         assert!(host.pkexec_pin.is_none());
-        assert_eq!(host.available.pkexec, Some(bin.join("pkexec")));
+        assert!(matches!(&host.available.pkexec, FrontState::Found(p) if *p == bin.join("pkexec")));
         assert_eq!(host.os, os);
     }
 }
 
-/// A PATH match whose real file cannot be found is neither stored nor probed, and the reason is
-/// kept for the planner's refusal.
+/// The error of a front that could not be examined, as the whole chain prints it.
+fn unexamined_chain(state: &FrontState) -> (Option<i32>, String) {
+    match state {
+        FrontState::Unexamined(error) => (
+            crate::error::first_os_code(&**error),
+            crate::error::Report(&**error).to_string(),
+        ),
+        other => panic!("expected Unexamined, got {other:?}"),
+    }
+}
+
+/// A PATH match whose real file cannot be found is a front that could not be examined: it is
+/// neither pinned nor probed, and the error, with the path, is kept for the planner's refusal.
 #[skuld::test]
-fn a_pkexec_that_cannot_be_canonicalised_is_not_stored_or_probed() {
+fn a_pkexec_that_cannot_be_canonicalised_is_unexamined_and_not_probed() {
     let (_root, bin, _real) = linked_pkexec();
     let host = detect_with(
         Some(bin.as_os_str()),
@@ -213,14 +246,25 @@ fn a_pkexec_that_cannot_be_canonicalised_is_not_stored_or_probed() {
         |_| Err(std::io::Error::from_raw_os_error(libc::ELOOP)),
         |_| panic!("probed a pkexec that was never resolved"),
     );
-    assert_eq!(host.available.pkexec, None);
     assert!(host.pkexec_pin.is_none());
-    match host.pkexec_version {
-        PkexecVersion::Unresolved { path, error } => {
-            assert_eq!(Path::new(&path), bin.join("pkexec"));
-            assert_eq!(error.raw_os_error(), Some(libc::ELOOP), "{error:?}");
+    assert!(matches!(host.pkexec_version, PkexecVersion::NotProbed));
+    let (code, chain) = unexamined_chain(&host.available.pkexec);
+    assert_eq!(code, Some(libc::ELOOP), "{chain}");
+    assert!(chain.contains(&bin.join("pkexec").display().to_string()), "{chain}");
+    // The planner reports it as a backend that could not be examined, not as one missing.
+    match host.plan(Privilege::Elevated, Backend::Pkexec, Auth::Gui) {
+        Transition::Reject {
+            error:
+                Error::Elevation {
+                    kind: ElevationErrorKind::BackendUnavailable,
+                    detail,
+                    source: Some(cause),
+                },
+        } => {
+            assert_eq!(crate::error::first_os_code(&*cause), Some(libc::ELOOP));
+            assert!(!detail.contains("not on PATH"), "{detail}");
         }
-        other => panic!("expected Unresolved, got {other:?}"),
+        other => panic!("expected BackendUnavailable caused by ELOOP, got {other:?}"),
     }
 }
 
@@ -238,21 +282,19 @@ fn a_canonical_path_that_is_a_symlink_is_not_pinned() {
         |p| Ok(p.to_path_buf()),
         |_| panic!("probed a pkexec that was never pinned"),
     );
-    assert_eq!(host.available.pkexec, None);
     assert!(host.pkexec_pin.is_none());
-    match host.pkexec_version {
-        PkexecVersion::Unpinned { path, error } => {
-            assert_eq!(Path::new(&path), bin.join("pkexec"));
-            let refusal = &*error;
-            // Linux's `O_PATH | O_NOFOLLOW` opens the link itself, which is not a regular file;
-            // elsewhere `O_NOFOLLOW` fails the open.
-            #[cfg(target_os = "linux")]
-            assert_eq!(refusal.to_string(), "not a regular file");
-            #[cfg(not(target_os = "linux"))]
-            assert_eq!(refusal.raw_os_error(), Some(libc::ELOOP), "{refusal}");
-        }
-        other => panic!("expected Unpinned, got {other:?}"),
-    }
+    assert!(matches!(host.pkexec_version, PkexecVersion::NotProbed));
+    let (code, chain) = unexamined_chain(&host.available.pkexec);
+    assert!(chain.contains(&bin.join("pkexec").display().to_string()), "{chain}");
+    // Linux's `O_PATH | O_NOFOLLOW` opens the link itself, which is not a regular file; elsewhere
+    // `O_NOFOLLOW` fails the open.
+    #[cfg(target_os = "linux")]
+    assert!(
+        code.is_none() && chain.contains("not a regular file"),
+        "{code:?}: {chain}"
+    );
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(code, Some(libc::ELOOP), "{chain}");
 }
 
 /// A FIFO renamed over the canonical path is neither waited on nor pinned: the open does not block
@@ -279,10 +321,6 @@ fn a_fifo_at_the_canonical_path_is_not_pinned() {
         |_| panic!("probed a FIFO"),
     );
     assert!(host.pkexec_pin.is_none());
-    match host.pkexec_version {
-        PkexecVersion::Unpinned { error, .. } => {
-            assert!(error.to_string().contains("not a regular file"), "{error:?}")
-        }
-        other => panic!("expected Unpinned, got {other:?}"),
-    }
+    let (_, chain) = unexamined_chain(&host.available.pkexec);
+    assert!(chain.contains("not a regular file"), "{chain}");
 }

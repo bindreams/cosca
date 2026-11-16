@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
 use super::pkexec::PkexecVersion;
-use super::plan::{launches_pkexec, BackendSet, Host, Os, Transition};
+use super::plan::{launches_pkexec, BackendSet, FrontState, Host, Os, Transition};
 use super::shim::protocol::ShimArgs;
 use super::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, Launch, Privilege, Secret};
 use crate::command::{Command, CommandInput, EnvOp};
@@ -202,33 +202,6 @@ pub fn controlling_terminal_present() -> bool {
     }
 }
 
-/// A best-effort HINT that `path` is an executable file for the EFFECTIVE ids.
-/// `faccessat(AT_EACCESS)` answers for the ids that will actually exec (unlike
-/// `access`, which uses the real ids); a real exec failure is still surfaced as
-/// `BackendUnavailable` at spawn time.
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: faccessat with a valid NUL-terminated path; a read-only permission query.
-    path.is_file() && unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
-}
-
-/// Path resolution over an explicit PATH value: check the exec bit and SKIP every
-/// non-absolute element. An empty element means the cwd, and any relative one (`bin`, `.`)
-/// names a directory under it: a backend found there would be exec-checked against the cwd at
-/// detection and launched against whatever the cwd is later, so it is never resolved.
-pub(super) fn resolve_in_path_var(path_var: &OsStr, program: &str) -> Option<PathBuf> {
-    std::env::split_paths(path_var).find_map(|dir| {
-        if !dir.is_absolute() {
-            return None;
-        }
-        let cand = dir.join(program);
-        is_executable(&cand).then_some(cand)
-    })
-}
-
 /// Reads `sysctl kern.argmax` for [`Host::arg_max`]; `None` if the query fails.
 #[cfg(target_os = "macos")]
 fn kern_argmax() -> Option<usize> {
@@ -312,8 +285,12 @@ pub(crate) fn run_version_probe(mut probe: std::process::Command) -> PkexecVersi
         let _guard = crate::child::spawn::spawn_lock();
         probe.spawn()
     };
-    match spawned.and_then(std::process::Child::wait_with_output) {
-        Err(e) => PkexecVersion::SpawnFailed(std::sync::Arc::new(e)),
+    let child = match spawned {
+        Ok(child) => child,
+        Err(e) => return PkexecVersion::SpawnFailed(std::sync::Arc::new(e)),
+    };
+    match child.wait_with_output() {
+        Err(e) => PkexecVersion::RunFailed(std::sync::Arc::new(e)),
         Ok(out) if !out.status.success() => PkexecVersion::Failed {
             status: out.status.to_string(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -323,15 +300,37 @@ pub(crate) fn run_version_probe(mut probe: std::process::Command) -> PkexecVersi
     }
 }
 
-/// `pkexec` on `path_var` ([`resolve_in_path_var`]), with every symlink followed to the real file
-/// by `canonicalize`, which detection then pins ([`pin`]): the probe and the launch exec that
-/// file. `None` if `PATH` has no pkexec; `Err` with the match if its real file cannot be found.
-pub(crate) fn pkexec_on(
-    path_var: &OsStr,
-    canonicalize: impl FnOnce(&Path) -> std::io::Result<PathBuf>,
-) -> Option<Result<PathBuf, (PathBuf, std::io::Error)>> {
-    let found = resolve_in_path_var(path_var, "pkexec")?;
-    Some(canonicalize(&found).map_err(|e| (found, e)))
+/// The front `program` on `path_var`, by the one search every unix spawn makes
+/// ([`crate::resolve::posix::lookup`]; `None` has no `PATH` and finds nothing): the file it finds,
+/// whatever its mode, and no later candidate. A miss is [`FrontState::Absent`]; an entry that could
+/// not be examined is the lookup's own error, which is no answer to whether the front is there.
+fn find_front(path_var: Option<&OsStr>, program: &str) -> FrontState {
+    match crate::resolve::posix::lookup(Path::new(program), None, path_var) {
+        Ok(found) => FrontState::Found(found.path),
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => FrontState::Absent,
+        Err(other) => FrontState::Unexamined(std::sync::Arc::new(other)),
+    }
+}
+
+/// The front at the fixed `path`, which no `PATH` entry can stand in for: [`FrontState::Found`] if it
+/// is a file, [`FrontState::Absent`] if it is missing or is not one, and [`FrontState::Unexamined`]
+/// if it could not be examined.
+#[cfg_attr(
+    not(any(target_os = "macos", test)),
+    allow(dead_code, reason = "only the macOS detection finds a front at a fixed path")
+)]
+pub(crate) fn find_fixed_front(path: &Path) -> FrontState {
+    match crate::resolve::is_file(path, false) {
+        Ok(true) => FrontState::Found(path.to_path_buf()),
+        Ok(false) => FrontState::Absent,
+        Err(e) => FrontState::Unexamined(Error::io_cause(e)),
+    }
+}
+
+/// A front that could not be examined, because `e` failed it: `context` says where, `e` is the
+/// source.
+fn unexamined_io(context: String, e: std::io::Error) -> FrontState {
+    FrontState::Unexamined(Error::io_cause(crate::error::io_context(context, e)))
 }
 
 /// The [`Os`] this build runs on.
@@ -356,54 +355,59 @@ pub(crate) fn detect_with(
     canonicalize: impl FnOnce(&Path) -> std::io::Result<PathBuf>,
     run: impl FnOnce(std::process::Command) -> PkexecVersion,
 ) -> Host {
-    let on_path = |program| path_var.and_then(|p| resolve_in_path_var(p, program));
+    let (sudo, doas) = (find_front(path_var, "sudo"), find_front(path_var, "doas"));
+    let found_pkexec = find_front(path_var, "pkexec");
     let (pkexec, pkexec_pin, pkexec_version) = if !launches_pkexec(os, backend, auth, elevated) {
-        (on_path("pkexec"), None, PkexecVersion::NotProbed)
+        (found_pkexec, None, PkexecVersion::NotProbed)
     } else {
-        match path_var.and_then(|p| pkexec_on(p, canonicalize)) {
-            None => (None, None, PkexecVersion::NotProbed),
-            Some(Err((found, e))) => (
-                None,
-                None,
-                PkexecVersion::Unresolved {
-                    path: found.display().to_string(),
-                    error: std::sync::Arc::new(e),
-                },
-            ),
-            Some(Ok(real)) => match pin(&real) {
-                Ok(pinned) => {
-                    let version = probe_pkexec(&real, &pinned, run);
-                    (Some(real), Some(std::sync::Arc::new(pinned)), version)
-                }
+        // Every symlink followed to the real file, which is pinned ([`pin`]) so that the probe and the
+        // launch exec that file. A file that cannot be resolved or pinned is a front that could not be
+        // examined.
+        match found_pkexec {
+            FrontState::Found(found) => match canonicalize(&found) {
                 Err(e) => (
+                    unexamined_io(
+                        format!("pkexec at {} could not be resolved to its real file", found.display()),
+                        e,
+                    ),
                     None,
-                    None,
-                    PkexecVersion::Unpinned {
-                        path: real.display().to_string(),
-                        error: std::sync::Arc::new(e),
-                    },
+                    PkexecVersion::NotProbed,
                 ),
+                Ok(real) => match pin(&real) {
+                    Ok(pinned) => {
+                        let version = probe_pkexec(&real, &pinned, run);
+                        (FrontState::Found(real), Some(std::sync::Arc::new(pinned)), version)
+                    }
+                    Err(e) => (
+                        unexamined_io(
+                            format!("pkexec at {} could not be opened as its real file", real.display()),
+                            e,
+                        ),
+                        None,
+                        PkexecVersion::NotProbed,
+                    ),
+                },
             },
+            absent_or_unexamined => (absent_or_unexamined, None, PkexecVersion::NotProbed),
         }
     };
     Host {
         elevated,
         has_tty: controlling_terminal_present(),
         available: BackendSet {
-            sudo: on_path("sudo"),
-            doas: on_path("doas"),
+            sudo,
+            doas,
             pkexec,
             // A fixed system path, never PATH-resolved: a PATH lookup would let a
             // shadowing `osascript` earlier on PATH receive an elevation request.
             osascript: {
                 #[cfg(target_os = "macos")]
                 {
-                    let p = Path::new("/usr/bin/osascript");
-                    is_executable(p).then(|| p.to_path_buf())
+                    find_fixed_front(Path::new("/usr/bin/osascript"))
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    None
+                    FrontState::Absent
                 }
             },
         },
@@ -776,7 +780,7 @@ pub(crate) fn rewrite_with_host(cmd: &mut Command, host: &Host) -> Result<PosixR
                     !matches!(host.pkexec_version, PkexecVersion::NotProbed),
                     "detect asks a pkexec request's pkexec its version"
                 );
-                if let Some(refusal) = host.pkexec_version.refusal() {
+                if let Some(refusal) = host.pkexec_version.refusal(&path) {
                     return Err(refusal);
                 }
             }

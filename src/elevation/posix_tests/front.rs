@@ -3,7 +3,7 @@
 use super::super::rewrite_with_host;
 use super::rewrite_tests::{elevated_sudo_host, sudo_host};
 use crate::elevation::pkexec::PkexecVersion;
-use crate::elevation::plan::{BackendSet, Host, Os};
+use crate::elevation::plan::{BackendSet, FrontState, Host, Os};
 use crate::elevation::{Auth, Backend};
 use crate::test_child::Console;
 use std::path::PathBuf;
@@ -12,10 +12,10 @@ use std::path::PathBuf;
 fn every_backend_host() -> Host {
     Host {
         available: BackendSet {
-            sudo: Some(PathBuf::from("/usr/bin/sudo")),
-            doas: Some(PathBuf::from("/usr/bin/doas")),
-            pkexec: Some(PathBuf::from("/usr/bin/pkexec")),
-            osascript: None,
+            sudo: FrontState::Found(PathBuf::from("/usr/bin/sudo")),
+            doas: FrontState::Found(PathBuf::from("/usr/bin/doas")),
+            pkexec: FrontState::Found(PathBuf::from("/usr/bin/pkexec")),
+            osascript: FrontState::Absent,
         },
         pkexec_version: PkexecVersion::Parsed {
             version: "121".into(),
