@@ -1,18 +1,21 @@
-//! [`PidfdShutdown`]'s outcomes: the `SIGTERM` through the root's pidfd, the grace, and the kill, for
+//! [`PidfdShutdown`](super::PidfdShutdown)'s outcomes: the `SIGTERM` through the root's pidfd, the grace, and the kill, for
 //! a root whose number may name another process but whose pidfd names it exactly (Linux).
 
 use std::cell::RefCell;
 
-use super::PidfdShutdown;
+use super::SignalTreeCooperativelyOutcome;
+use crate::child::owned::slot::ChildSlot;
 use crate::child::owned::OwnedChild;
-use crate::containment::{Refusal, Skip, SkipCall, Why};
+use crate::containment::fake::FakeContains;
+use crate::containment::{Containment, Refusal, Skip, SkipCall, TerminateOutcome, Why};
 use crate::elevation::front::{Front, TrackedKind};
 use crate::error::{ElevationErrorKind, Error};
 use crate::log_capture::warns_since;
 use crate::os_process::child::PeekOutcome;
-use crate::os_process::fake::FakeProcess;
+use crate::os_process::fake::{FakeProcess, SignalAnswer};
 use crate::signal::Sent;
 use crate::signal::Sig;
+use crate::test_child::over_fake::child_with;
 use crate::test_child::reaped_elsewhere::{ROOT_KILLED_BY_PIDFD, ROOT_TERMED_BY_PIDFD};
 
 /// A pgid no test process holds: the decisions only name it in their text.
@@ -54,18 +57,6 @@ fn assert_names_the_skip(err: &Error) {
     assert!(crate::error::said(err).contains("forced"), "{err:?}");
 }
 
-/// A box over a fake that reads running at every read, tracked as `kind`. Its end consumes nothing.
-fn running_as(kind: TrackedKind) -> OwnedChild {
-    OwnedChild::new(
-        Box::new(
-            FakeProcess::new([])
-                .peeks_always(|| Ok(PeekOutcome::Running))
-                .with_exact_consume(false),
-        ),
-        kind,
-    )
-}
-
 /// What the box of a [`run`] is: the rule's answer to a `SIGTERM` or a kill follows from it.
 #[derive(Clone, Copy)]
 enum LiveBox {
@@ -78,12 +69,13 @@ enum LiveBox {
     SudoOutsideACgroup,
 }
 
-/// One run over the box `kind`: `term` answers the `SIGTERM` (unless the rule refuses it), `exited` the
-/// grace (`None`: the grace is not asked), `kill` the escalation (unless the rule refuses it). Returns
-/// the error, what was sent, and the warns.
+/// One run over the box `kind`: the child's default stop (the real action, on a shutdown target over a
+/// mechanism that names no tree but the root's pidfd) sends the `SIGTERM`, which `term` answers (unless
+/// the rule refuses it); `exited` answers the grace (`None`: the grace is not asked), `kill` the
+/// escalation (unless the rule refuses it). Returns the error, what was sent, and the warns.
 fn run(
     kind: LiveBox,
-    term: Result<Sent, Error>,
+    term: SignalAnswer,
     exited: Option<Result<bool, std::io::Error>>,
     kill: Result<Sent, Error>,
 ) -> (Error, Vec<&'static str>, Vec<String>) {
@@ -91,25 +83,41 @@ fn run(
     let call = graceful_call();
     let sent = RefCell::new(Vec::new());
     let mark = crate::log_capture::mark();
-    let child = running_as(match kind {
-        LiveBox::Own => TrackedKind::Own,
-        LiveBox::Osascript => TrackedKind::Front(Front::Osascript),
-        LiveBox::SudoOutsideACgroup => TrackedKind::Front(Front::Sudo),
-    });
-    let shutdown = match PidfdShutdown::start(&child, || {
+    let root = FakeProcess::new([])
+        .peeks_always(|| Ok(PeekOutcome::Running))
+        .with_exact_consume(false)
+        .signals([term]);
+    let (tree, _) = FakeContains::new(Containment::Session, false);
+    let mut child = child_with(
+        &root,
+        tree.answering_terminates([TerminateOutcome::RootThroughPidfd(skip())]),
+    );
+    child.proc = ChildSlot::new(OwnedChild::new(
+        Box::new(root.clone().with_pid(child.pid())),
+        match kind {
+            LiveBox::Own => TrackedKind::Own,
+            LiveBox::Osascript => TrackedKind::Front(Front::Osascript),
+            LiveBox::SudoOutsideACgroup => TrackedKind::Front(Front::Sudo),
+        },
+    ));
+    let outcome = child.signal_tree_cooperatively();
+    if !root.signal_calls().is_empty() {
         sent.borrow_mut().push("term");
-        term
-    }) {
-        Ok(shutdown) => shutdown,
-        Err(e) => return (e, sent.into_inner(), warns_since(mark, "")),
+    }
+    let SignalTreeCooperativelyOutcome::RootThroughPidfd(skip, shutdown, _, acted) = outcome else {
+        let SignalTreeCooperativelyOutcome::End(refused) = outcome else {
+            panic!("the stop ended neither on its pidfd nor on a refusal");
+        };
+        return (refused, sent.into_inner(), warns_since(mark, ""));
     };
+    assert!(acted.is_none(), "the default action answered Ok: {acted:?}");
     // A grace the row does not answer reads as an exit, so a wrongly waited one shows in `sent`.
     let waited = shutdown.needs_grace().then(|| {
         sent.borrow_mut().push("grace");
         exited.unwrap_or(Ok(true)).map_err(Error::Io)
     });
-    let err = shutdown.finish(&call, &skip(), waited, || match kind {
-        LiveBox::SudoOutsideACgroup => child.kill_root_only(None),
+    let err = shutdown.finish(&call, &skip, waited, || match kind {
+        LiveBox::SudoOutsideACgroup => child.proc.kill_root_only(None),
         LiveBox::Own | LiveBox::Osascript => {
             sent.borrow_mut().push("kill");
             kill
@@ -219,7 +227,7 @@ fn a_front_the_kill_may_not_reach_is_refused_after_the_grace() {
 
 #[skuld::test]
 fn a_failed_sigterm_waits_no_grace_and_is_the_error() {
-    let forced = || Error::Io(std::io::Error::other("forced term failure"));
+    let forced = || std::io::Error::other("forced term failure");
     let (err, sent, warns) = run(LiveBox::Own, Err(forced()), None, Ok(Sent::Delivered));
     // An `Io` is a leaf with no slot for peers: the call's `Unassessable` holds it, after the refusal's cause.
     assert!(
@@ -236,7 +244,7 @@ fn a_failed_sigterm_waits_no_grace_and_is_the_error() {
     assert_eq!(warns.len(), 1, "{warns:?}");
     let said = format!(
         "sent nothing: the SIGTERM to the root through its pidfd failed ({})",
-        crate::error::said(&forced())
+        crate::error::said(&Error::Io(forced()))
     );
     assert!(warns[0].contains(&said), "{warns:?}");
 }

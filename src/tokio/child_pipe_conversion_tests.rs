@@ -25,7 +25,8 @@ use super::Child;
 fn a_child_without_a_process() -> Child {
     let attachment = Attachment {
         tree: Tree::none(),
-        graceful: crate::graceful::GracefulMechanism::Process,
+        #[cfg(windows)]
+        console: Default::default(),
     };
     Child::from_sync(crate::Child::from_parts(
         OwnedChild::new(Box::new(FakeProcess::new([]).with_pid(1)), TrackedKind::Own),
@@ -35,6 +36,7 @@ fn a_child_without_a_process() -> Child {
         attachment,
         None,
         SpawnPolicy::SYNC,
+        crate::stop::StopAction::default(),
     ))
 }
 

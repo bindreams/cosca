@@ -2,9 +2,9 @@
 //!
 //! `sudo` and `doas` without a pty, and macOS `osascript`, leave cosca tracking a process that runs
 //! as the caller and outlives the elevated program it launched. A `SIGKILL` to that front is
-//! allowed, and orphans the program instead of ending it. With direct exec (`!use_pty`,
-//! `!pam_session`, or doas without PAM) the tracked process is the root program itself, whose
-//! signal is refused. Which of the two cosca holds is not known at spawn.
+//! allowed, and orphans the program instead of ending it. With direct exec (sudo with `!use_pty`,
+//! `!pam_session` and `!pam_setcred`; doas without PAM) the tracked process is the root program itself,
+//! whose signal is refused. Which of the two cosca holds is not known at spawn.
 //!
 //! So a forced kill never signals a live front. It goes through a cgroup whose `cgroup.kill`
 //! reaches the tracked process whatever its credentials, and nothing is signalled after it. Whether
@@ -17,9 +17,11 @@
 //! and a program stuck in uninterruptible sleep can outlive it. Only `wait_tree()` observes the
 //! program's own end.
 //!
-//! A `SIGTERM` is gated only for osascript, which would end and leave the program running, so
-//! `terminate()` on it is refused like a kill. A sudo or doas front relays it to the program; with
-//! direct exec the tracked process is the root program itself, which refuses it (`EPERM`).
+//! A cooperative signal is gated by what the front relays to the program ([`Front::relayed`]): a signal
+//! it does not relay would end the front, or do nothing, and leave the program running, so it is refused
+//! and nothing is sent. osascript relays none, so `terminate()` on it is refused like a kill. With
+//! direct exec the tracked process is the root program itself, which refuses a signal it may not be
+//! sent (`EPERM`).
 //!
 //! pkexec, a UAC child and an already-elevated child track the program itself and are signalled
 //! like any child.
@@ -188,7 +190,7 @@ impl OwnedChild {
                 AloneStep::<std::convert::Infallible, _>::Answered(refused(
                     front,
                     pid,
-                    Signal::Kill,
+                    Act::Kill,
                     Some(Reason::words("this call kills through no cgroup")),
                 ))
             },
@@ -201,14 +203,27 @@ impl OwnedChild {
         }
     }
 
-    /// A `SIGTERM` sent by the caller's `send` (a group or console signal the box does not hold),
-    /// unless the rule refuses it: a live osascript front is refused, and nothing is sent.
-    pub(crate) fn terminate_by<T>(&self, send: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
-        match terminate_gate(self.tracked_kind().front(), self.pid(), || self.running()) {
+    /// The cooperative `signal`, sent by the caller's `send`, unless the rule refuses it: a live front
+    /// that relays no signal (osascript) or does not relay `signal` is refused, and nothing is sent.
+    #[cfg(unix)]
+    pub(crate) fn terminate_by<T>(
+        &self,
+        signal: crate::signal::Signal,
+        send: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let front = self.tracked_kind().front();
+        let gate = match terminate_gate(front, self.pid(), || self.running()) {
+            Gate::Open | Gate::Exited => relay_gate(front, self.pid(), signal, || self.running()),
+            closed => closed,
+        };
+        match gate {
             Gate::Closed(refusal) => Err(refusal),
             Gate::Open | Gate::Exited => send(),
             Gate::CgroupOnly(_) => {
-                debug_assert!(false, "a SIGTERM's gate never leaves a front to a cgroup kill");
+                debug_assert!(
+                    false,
+                    "a cooperative signal's gate never leaves a front to a cgroup kill"
+                );
                 send()
             }
         }
@@ -278,9 +293,27 @@ impl Front {
         !matches!(self, Front::Osascript)
     }
 
-    /// A `SIGTERM` to the front reaches the program.
-    fn relays_term(self) -> bool {
-        !matches!(self, Front::Osascript)
+    /// The signals a front relays to the program it launched, as measured (sudo 1.9.16p2 and opendoas 6.8.2
+    /// on Debian 13; osascript relays none): any other signal sent to the front does not reach the program,
+    /// and most end the front itself and leave the program running. pkexec is no front: it execs the
+    /// program, so a signal to it is a signal to the program.
+    #[cfg(unix)]
+    pub(crate) fn relayed(self) -> &'static [crate::signal::Signal] {
+        use crate::signal::Signal::{Hup, Int, Quit, Term, Tstp, Usr1, Usr2, Winch};
+        match self {
+            Front::Sudo => &[Hup, Int, Quit, Usr1, Usr2, Term, Tstp, Winch],
+            Front::Doas => &[Term],
+            Front::Osascript => &[],
+        }
+    }
+
+    /// No signal sent to the front reaches the program.
+    fn relays_no_signal(self) -> bool {
+        #[cfg(unix)]
+        return self.relayed().is_empty();
+        // No elevation front exists off Unix; the fact is the one the table states.
+        #[cfg(not(unix))]
+        matches!(self, Front::Osascript)
     }
 }
 
@@ -312,10 +345,10 @@ fn kill_gate(
     }
     match placed {
         Ok(true) => Gate::CgroupOnly(front),
-        Ok(false) => Gate::Closed(refused(front, pid, Signal::Kill, unread_reason(unread))),
+        Ok(false) => Gate::Closed(refused(front, pid, Act::Kill, unread_reason(unread))),
         Err(e) => {
             unread.push(("whether its cgroup kill reaches it could not be read", e));
-            Gate::Closed(refused(front, pid, Signal::Kill, unread_reason(unread)))
+            Gate::Closed(refused(front, pid, Act::Kill, unread_reason(unread)))
         }
     }
 }
@@ -395,7 +428,7 @@ fn cgroup_kill_reached(
             cause,
         },
     };
-    Err(refused(front, pid, Signal::Kill, Some(reason)))
+    Err(refused(front, pid, Act::Kill, Some(reason)))
 }
 
 /// The refusal of a kill of the front `pid` whose cgroup kill failed with `error`: nothing else was
@@ -405,40 +438,93 @@ fn cgroup_kill_failed(front: Front, pid: impl Into<Option<u32>>, error: Error) -
         words: "its cgroup kill failed".to_owned(),
         cause: Some(std::sync::Arc::new(error)),
     };
-    refused(front, pid, Signal::Kill, Some(reason))
+    refused(front, pid, Act::Kill, Some(reason))
 }
 
 /// The refusal alone, without the tree's failure; use [`cgroup_kill_failed`] where the failure is
 /// the cause.
 fn cgroup_not_killed(front: Front, pid: impl Into<Option<u32>>) -> Error {
-    refused(
-        front,
-        pid,
-        Signal::Kill,
-        Some(Reason::words("its cgroup was not killed")),
-    )
+    refused(front, pid, Act::Kill, Some(Reason::words("its cgroup was not killed")))
 }
 
-/// The gate for a `SIGTERM` to the child `pid`, the `front` its spawn launched (if any): closed only
-/// for a live front that does not relay it. `running` is asked only about such a front.
+/// The gate for a cooperative signal to the child `pid`, the `front` its spawn launched (if any):
+/// closed only for a live front that relays no signal at all (osascript), which a signal would end and
+/// leave the program running. `running` is asked only about such a front.
 fn terminate_gate(
     front: Option<Front>,
     pid: impl Into<Option<u32>>,
     running: impl FnOnce() -> io::Result<bool>,
 ) -> Gate {
-    let pid = pid.into();
-    let Some(front) = front.filter(|f| !f.relays_term()) else {
+    gate_while_live(
+        front.filter(|f| f.relays_no_signal()),
+        pid.into(),
+        running,
+        |front, pid, why| refused(front, pid, Act::Signal, why),
+    )
+}
+
+/// The gate for the cooperative `signal` to the child `pid`, the `front` its spawn launched (if any):
+/// closed only for a live front that relays some signals and not this one ([`Front::relayed`]), whose
+/// refusal is `Unsupported`, naming them. One that relays none is [`terminate_gate`]'s. `running` is
+/// asked only about such a front.
+#[cfg(unix)]
+fn relay_gate(
+    front: Option<Front>,
+    pid: impl Into<Option<u32>>,
+    signal: crate::signal::Signal,
+    running: impl FnOnce() -> io::Result<bool>,
+) -> Gate {
+    gate_while_live(
+        front.filter(|f| !f.relayed().is_empty() && !f.relayed().contains(&signal)),
+        pid.into(),
+        running,
+        |front, pid, why| not_relayed(front, pid, signal, why),
+    )
+}
+
+/// The gate of a `front` (if any) that refuses a signal while it runs: open for an exited one, closed
+/// with `refusal` for one that runs or whose state cannot be read.
+fn gate_while_live(
+    front: Option<Front>,
+    pid: Option<u32>,
+    running: impl FnOnce() -> io::Result<bool>,
+    refusal: impl FnOnce(Front, Option<u32>, Option<Reason>) -> Error,
+) -> Gate {
+    let Some(front) = front else {
         return Gate::Open;
     };
     match running() {
         Ok(false) => Gate::Open,
-        Ok(true) => Gate::Closed(refused(front, pid, Signal::Term, None)),
-        Err(e) => Gate::Closed(refused(
+        Ok(true) => Gate::Closed(refusal(front, pid, None)),
+        Err(e) => Gate::Closed(refusal(
             front,
             pid,
-            Signal::Term,
             unread_reason(vec![("whether it had exited could not be read", Error::Io(e))]),
         )),
+    }
+}
+
+/// The refusal of the cooperative `signal` to the live `front` `pid`, which relays other signals.
+#[cfg(unix)]
+fn not_relayed(front: Front, pid: Option<u32>, signal: crate::signal::Signal, why: Option<Reason>) -> Error {
+    let names: Vec<&str> = front.relayed().iter().map(|s| s.name()).collect();
+    let mut detail = format!(
+        "{}; {} is not a signal {} relays to the elevated program (it relays {}), so no signal was sent.",
+        describe(front, pid),
+        signal.name(),
+        front.name(),
+        names.join(", ")
+    );
+    let mut source = None;
+    if let Some(Reason { words, cause }) = why {
+        detail.push_str(&format!(" ({words})"));
+        source = cause;
+    }
+    Error::Unsupported {
+        op: format!("send {} to the elevation front", signal.name()),
+        platform: std::env::consts::OS,
+        detail,
+        source,
     }
 }
 
@@ -463,20 +549,21 @@ pub(crate) fn describe(front: Front, pid: impl Into<Option<u32>>) -> String {
     }
 }
 
+/// What a refusal says was not sent.
 #[derive(Clone, Copy)]
-enum Signal {
+enum Act {
     Kill,
-    Term,
+    Signal,
 }
 
-fn refused(front: Front, pid: impl Into<Option<u32>>, signal: Signal, why: Option<Reason>) -> Error {
+fn refused(front: Front, pid: impl Into<Option<u32>>, signal: Act, why: Option<Reason>) -> Error {
     let what = match signal {
-        Signal::Kill => "no kill",
-        Signal::Term => "no signal",
+        Act::Kill => "no kill",
+        Act::Signal => "no signal",
     };
     let mut detail = format!("{}; {what} was sent.", describe(front, pid));
     // Only Linux has a cgroup to reach the program through; osascript runs on macOS.
-    if matches!(signal, Signal::Kill) && !matches!(front, Front::Osascript) {
+    if matches!(signal, Act::Kill) && !matches!(front, Front::Osascript) {
         detail.push_str(" Only a cgroup (Linux containment) that holds it reaches the program.");
     }
     let mut source = None;

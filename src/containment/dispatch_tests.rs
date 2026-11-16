@@ -445,7 +445,7 @@ fn nested_attach_is_delegated() {
             #[cfg(target_os = "macos")]
             marker: None,
             #[cfg(windows)]
-            graceful: crate::containment::windows::mechanism_from_flags(crate::containment::windows::group_flags()),
+            console: crate::containment::windows::ConsoleFacts::of(crate::containment::windows::group_flags(), true),
             #[cfg(windows)]
             frozen: false,
         };
@@ -3036,21 +3036,29 @@ fn wait_drained_reports_members_remain_then_all_markers_closed() {
     );
 }
 
-/// The UAC-elevated attachment bypasses `mechanism_from_flags` entirely — nothing in the flag
-/// matrix covers it — so its three fields are pinned here. `Unknown`, not the `None` a flagless
-/// spawn yields nor the `OtherConsoleGroup` a suppressed one does: a copy-paste of either must
-/// fail. What the dispatcher then does with the value is
-/// `signal_refuses_a_child_cosca_did_not_create`, in `src/graceful_tests.rs`.
+/// The UAC-elevated attachment bypasses `ConsoleFacts::of` entirely — nothing in the flag matrix
+/// covers it — so its fields are pinned here. `elevated`, with no group and no route, not the facts a
+/// flagless spawn yields nor those of a suppressed one: a copy-paste of either must fail. What the
+/// stop does with the value is `a_prepared_send_refuses_a_child_cosca_did_not_create`, in
+/// `src/stop_tests.rs`.
 #[cfg(windows)]
 #[skuld::test]
 fn uac_elevated_attachment_has_no_in_process_route() {
     use super::Attachment;
+    use crate::containment::windows::ConsoleFacts;
     use crate::containment::Containment;
-    use crate::graceful::GracefulMechanism;
 
     let a = Attachment::uac_elevated();
     assert_eq!(a.tree.containment(), Containment::None);
-    assert_eq!(a.graceful, GracefulMechanism::Unknown);
+    assert_eq!(
+        a.console,
+        ConsoleFacts {
+            group: false,
+            own_console_flags: false,
+            caller_had_console: false,
+            elevated: true,
+        }
+    );
 }
 
 // The cgroup placement decision =====
@@ -3513,7 +3521,7 @@ mod frozen_attach {
         Prepared {
             mode,
             is_root,
-            graceful: crate::graceful::GracefulMechanism::None,
+            console: crate::containment::windows::ConsoleFacts::of(0, true),
             frozen,
         }
     }

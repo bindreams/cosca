@@ -16,9 +16,11 @@ impl Child {
     /// Send the child its cooperative shutdown signal — a request to exit, not an order.
     /// Signal-only: does not wait or reap.
     ///
-    /// Which signal, and how far it goes, is per child: read it from
-    /// [`graceful_mechanism`](Child::graceful_mechanism). On Unix it is an identity-bound
-    /// `SIGTERM` to this process alone, so it cannot race a concurrent reap onto a recycled pid.
+    /// Runs the child's stop action, which for a child of the async `Command` is
+    /// [`stop::default`](crate::stop::default), on a [`StopTarget`](crate::StopTarget) that stands for the
+    /// root alone: the sync [`Child::terminate`](crate::Child::terminate) with the same default. On Unix it
+    /// is an identity-bound `SIGTERM` to this process alone, so it cannot race a concurrent reap onto a
+    /// recycled pid.
     /// On Windows it is `CTRL_BREAK` to the child's own **console process group** — every child
     /// spawned with [`contain`](crate::tokio::Command::contain), including a nested
     /// [`Delegated`](crate::Containment::Delegated) one. A child that leads no group of its own
@@ -82,9 +84,12 @@ impl Child {
     /// child ignores the cooperative signal. `grace` is relative; `Duration::ZERO` signals,
     /// polls once, then escalates.
     ///
-    /// Every caveat on [`terminate`](Child::terminate) applies to the cooperative half, and a
-    /// cooperative-signal error propagates immediately: no grace is waited, nothing is killed,
-    /// and the child is left running for the caller to `kill`.
+    /// The cooperative half is [`terminate`](Child::terminate): the child's stop action
+    /// ([`stop::default`](crate::stop::default): the async `Command` sets none) run on a root target, and
+    /// every caveat on it applies. An
+    /// error of the action propagates immediately: no grace is waited, nothing is killed, and the child
+    /// is left running for the caller to `kill`. The escalation after the grace names what was sent
+    /// before it as what the action's last prepared send sent, or "the stop action" when it sent none.
     ///
     /// An untaken stdin pipe stays open through the grace: unlike [`wait`](Child::wait), the grace
     /// does not close it, so the signal, not an EOF on stdin, is what ends the child. The reap
@@ -128,8 +133,9 @@ impl Child {
         crate::child::graceful::shutdown::shutdown_lone(self, grace).await
     }
 
-    /// Cooperative-then-forced shutdown of the contained tree: send the group its graceful
-    /// signal (`SIGTERM` via `killpg`/cgroup, or `CTRL_BREAK` to the job/console group), wait
+    /// Cooperative-then-forced shutdown of the contained tree: run the child's stop action
+    /// ([`stop::default`](crate::stop::default): the async `Command` sets none) on a tree target, which sends the group its
+    /// graceful signal (`SIGTERM` via `killpg`/cgroup, or `CTRL_BREAK` to the job/console group), wait
     /// up to `grace`, then hard-sweep any survivors and reap the root. Returns the root's
     /// `ExitStatus`. Requires an actionable containment mechanism (errors `Unsupported`
     /// otherwise — use [`graceful_shutdown`](Child::graceful_shutdown) for a lone child).
@@ -161,10 +167,10 @@ impl Child {
     /// **And success here does not prove the event was delivered.** A root that shares no
     /// console with the caller is reported as success and reaches nobody — including a root
     /// spawned with [`no_window`](crate::Command::no_window) or
-    /// `detached()`, which gets a console of its own. Such a root is
-    /// reported as [`GracefulMechanism::OtherConsoleGroup`](crate::GracefulMechanism::OtherConsoleGroup)
-    /// by [`graceful_mechanism`](Child::graceful_mechanism): that is what cosca recorded about
-    /// the *route* from this process, never an authority on whether a signal will arrive. It is
+    /// `detached()`, which gets a console of its own. For such a root
+    /// `StopTarget::leads_group_on_our_console` is
+    /// `false`: that is what cosca recorded about the *route* from this process, never an authority on
+    /// whether a signal will arrive. It is
     /// also not "this child cannot be shut down politely" — a process attached to the child's own
     /// console can deliver the event. The cooperative op returns `Ok` and delivers nothing; the
     /// forced ops ([`kill`](Child::kill) / [`kill_tree`](Child::kill_tree), and the escalation
@@ -207,6 +213,14 @@ impl Child {
     /// (`NoConsole`, an invalid process group, a root whose number may name another process, an fd
     /// marker whose group send failed with nothing else signalled) returns at once: there is
     /// nothing for a grace wait or sweep to act on yet.
+    ///
+    /// **An action's error ends the call before its grace unless its last prepared send went out.** When
+    /// the last prepared send of the child's stop action was refused, or the action made none, the
+    /// action's own `Err` is the call's answer, with nothing waited and nothing killed; this holds even
+    /// when an earlier send of the same action went out and a later step failed. When its last prepared
+    /// send went out, the call goes on to the grace and the sweep and keeps the action's error as the
+    /// refusal above. An action of the caller's own that makes no prepared send and returns `Ok` goes on
+    /// to the grace and the sweep, with nothing assumed about what it sent.
     ///
     /// A refused Linux `pidfd_open` while watching the root is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)); it is a
     /// watch failure, so the sweep still runs.

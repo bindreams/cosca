@@ -1286,11 +1286,12 @@ pub(crate) mod fault {
 /// ([`Walk::unassessed`]), nor a member whose signal was not sent: they are warned of and not
 /// signalled, and the result is still `Ok`.
 ///
-/// Windows: send `CTRL_BREAK_EVENT` to the root's process group (the root was
-/// spawned with `CREATE_NEW_PROCESS_GROUP`). This is cooperative only and reaches
-/// only processes that share the root's console group; a nested *contained*
-/// descendant is spawned into its OWN process group (`CREATE_NEW_PROCESS_GROUP`)
-/// and therefore does NOT receive this CTRL_BREAK. THIS WALK cannot reach those
+/// Windows: sends nothing, and walks nothing. The caller's stop function has already sent
+/// `CTRL_BREAK_EVENT` to the root's process group (the root was spawned with
+/// `CREATE_NEW_PROCESS_GROUP`), and `how` carries the answer of that send, which is this
+/// function's. The event is cooperative only and reaches only processes that share the root's
+/// console group; a nested *contained* descendant is spawned into its OWN process group
+/// (`CREATE_NEW_PROCESS_GROUP`) and therefore does NOT receive it. THIS WALK cannot reach those
 /// nested groups — but their own holder can, through the nested child's own handle
 /// (see [`Child::terminate`](crate::Child::terminate)). From a single handle, the
 /// identity `hard_kill` (`kill_tree`) remains the only op that reaches every member.
@@ -1298,10 +1299,11 @@ pub(crate) mod fault {
 ///
 /// # Errors
 ///
-/// As [`hard_kill`] on Unix. Windows: those of `containment::windows::terminate`.
+/// As [`hard_kill`] on Unix. Windows: the answer of the caller's own send of the `CTRL_BREAK`, which the
+/// stop carries.
 ///
 /// On Unix the root's signal goes through [`Root::signal`] of `held`, as [`hard_kill`]'s kill does;
-/// Windows signals the root's process group and sends it nothing.
+/// Windows sends nothing.
 ///
 /// The members it found, the root apart, are its [`Listing`] (none on Windows): once the root exits
 /// they are reparented out of every later walk, so a later kill can reach them only by these
@@ -1361,8 +1363,9 @@ pub(crate) fn terminate(
     }
     #[cfg(windows)]
     {
-        let _ = (kernel, held, how);
-        crate::containment::windows::terminate(root.pid()).map(|()| {
+        let _ = (kernel, root, held);
+        // The `CTRL_BREAK` is the caller's stop function's send: the walk lists no member.
+        how.into_sent().map(|()| {
             Terminated::Walked(Listing {
                 members: Vec::new(),
                 complete: true,

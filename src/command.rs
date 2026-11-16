@@ -31,6 +31,8 @@ pub struct Command {
     /// before a `Child` exists; the `Child` then keeps it.
     elevation_report: Option<crate::elevation::ElevationReport>,
     flags: FlagsRequest,
+    /// What the child's cooperative stop does ([`Command::graceful_stop`]).
+    stop: crate::stop::StopAction,
     /// Files the spawn needs open until it runs: a pinned elevation backend exec'd through
     /// `/proc/self/fd/N`.
     held: Vec<std::sync::Arc<std::fs::File>>,
@@ -85,6 +87,7 @@ impl Default for Command {
             elevation_report: None,
             held: Vec::new(),
             flags: FlagsRequest::default(),
+            stop: crate::stop::StopAction::default(),
         }
     }
 }
@@ -615,6 +618,41 @@ impl Command {
         self
     }
 
+    /// Sets what the child's cooperative stop does: the action [`Child::terminate`](crate::Child::terminate),
+    /// [`graceful_shutdown`](crate::Child::graceful_shutdown),
+    /// [`terminate_tree`](crate::Child::terminate_tree) and
+    /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) run to ask the child to stop,
+    /// before they wait. Without it the child's stop is [`stop::default`](crate::stop::default).
+    ///
+    /// The action is given a [`StopTarget`](crate::StopTarget): the root for `terminate` and
+    /// `graceful_shutdown`, the contained tree for the two tree calls
+    /// ([`covers_tree`](crate::StopTarget::covers_tree)). Compose it from the prepared functions of
+    /// [`stop`](crate::stop), each of which does its own sending inside the rules a child's `terminate`
+    /// applies, and from [`StopTarget::wait_exit`](crate::StopTarget::wait_exit); or write the stop
+    /// yourself (a byte on a control pipe). What the action answers is what the call answers: an error
+    /// ends `terminate` and `terminate_tree` with it, and ends the shutdown calls before their grace is
+    /// waited, with the child left running for the caller to [`kill`](crate::Child::kill), unless the
+    /// action's last prepared send went out, in which case a `graceful_shutdown_tree` goes on to its
+    /// grace and sweep and keeps the error as its cooperative error.
+    ///
+    /// ```no_run
+    /// # #[cfg(unix)] fn demo() -> Result<(), cosca::error::Error> {
+    /// use cosca::{stop, Command, Signal};
+    ///
+    /// let mut command = Command::new();
+    /// command.arg("my-service");
+    /// // Ask for a clean exit with SIGINT, as an operator at a terminal would.
+    /// command.graceful_stop(|target| stop::send_signal(target, Signal::Int));
+    /// # Ok(()) }
+    /// ```
+    pub fn graceful_stop(
+        &mut self,
+        action: impl Fn(&crate::StopTarget<'_>) -> Result<(), Error> + Send + Sync + 'static,
+    ) -> &mut Command {
+        self.stop = crate::stop::StopAction::Sync(std::sync::Arc::new(action));
+        self
+    }
+
     /// Contain the child's whole process tree using the strongest mechanism
     /// the host offers, so dropping or `kill_tree`-ing the child tears down every
     /// descendant. See [`crate::Containment`] for the per-OS mechanisms.
@@ -725,9 +763,9 @@ impl Command {
     /// signal sent from this process cannot reach it. Not requesting this does not establish the
     /// reverse — whether a child shares this process's console also depends on the child image's
     /// subsystem and on what the child does with its own console. What cosca recorded about the
-    /// route is reported per child by
-    /// [`Child::graceful_mechanism`](crate::Child::graceful_mechanism); it is a statement about
-    /// the route, never an authority on whether a signal will arrive.
+    /// route is
+    /// `StopTarget::leads_group_on_our_console`; it is
+    /// a statement about the route, never an authority on whether a signal will arrive.
     ///
     /// This is not "such a child cannot be shut down politely" — a process attached to the child's
     /// own console can deliver the event. Nor does cosca report an error for one: the cooperative
@@ -953,6 +991,7 @@ impl Command {
             fd_marker_suppressed: false,
             elevation_report: Some(report),
             flags: self.flags,
+            stop: self.stop.clone(),
             held: Vec::new(),
         }
     }
@@ -976,6 +1015,11 @@ impl Command {
 
     pub(crate) fn kill_on_drop_flag(&self) -> bool {
         self.kill_on_drop
+    }
+
+    /// What the child this command spawns does to stop cooperatively.
+    pub(crate) fn stop_action(&self) -> crate::stop::StopAction {
+        self.stop.clone()
     }
 }
 

@@ -1,14 +1,15 @@
 //! [`Signal`]: a signal a caller may choose for a cooperative stop.
 
-/// A signal sent to ask a process, or a tree of them, to stop.
+/// A signal sent to ask a process, or a tree of them, to stop: what
+/// `stop::send_signal` sends.
 ///
 /// Every signal [`nix::sys::signal::Signal`] names on the platform except `SIGKILL` and `SIGSTOP`,
-/// which a process cannot handle (a forced end is a kill); a signal only one platform has exists only
-/// there. Real-time signals are not included.
+/// which a process cannot handle (a forced end is a kill, [`Child::kill`](crate::Child::kill)); a
+/// signal only one platform has exists only there. Real-time signals are not included: a signal
+/// needs a name here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-#[allow(dead_code, reason = "crate-private until the public stop functions take it")]
-pub(crate) enum Signal {
+pub enum Signal {
     Hup,
     Int,
     Quit,
@@ -48,7 +49,7 @@ pub(crate) enum Signal {
 
 impl Signal {
     /// The signal's name as the platform spells it, `"SIGTERM"` for [`Term`](Self::Term).
-    pub(crate) fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         self.as_nix().as_str()
     }
 

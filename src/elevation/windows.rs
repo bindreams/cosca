@@ -669,6 +669,7 @@ pub(crate) fn spawn_elevated(
             Attachment::uac_elevated(),
             Some(report),
             policy,
+            cmd.stop_action(),
         )),
     }
 }

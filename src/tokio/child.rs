@@ -112,12 +112,6 @@ impl Child {
         self.inner.containment()
     }
 
-    /// Async mirror of [`Child::graceful_mechanism`](crate::Child::graceful_mechanism) — see
-    /// there for what the value claims, and what it deliberately does not.
-    pub fn graceful_mechanism(&self) -> crate::graceful::GracefulMechanism {
-        self.inner.graceful_mechanism()
-    }
-
     /// The achieved elevation state, or `None` if elevation was not requested (mirrors the sync
     /// [`Child::elevation`](crate::Child::elevation)).
     pub fn elevation(&self) -> Option<crate::elevation::ElevationReport> {

@@ -15,7 +15,7 @@ use crate::containment::Containment;
 use crate::test_child::ctrl_break::{
     self, assert_acked, assert_in_our_console, kill_release_reap, Grandchild, Handler, STATUS_CONTROL_C_EXIT,
 };
-use crate::GracefulMechanism;
+use crate::StopTarget;
 
 /// A contained [`ctrl_break`] root answering with `handler`, after its handshake.
 fn spawn_root(handler: Handler, mode: crate::ContainMode) -> (crate::Child, TcpStream) {
@@ -55,7 +55,7 @@ fn spawn(
 fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
     let _warns = crate::log_capture::warn_watch();
     let (child, mut sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
-    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
+    assert!(StopTarget::from(&child).leads_group_on_our_console());
     assert_in_our_console(child.pid(), "the root");
     child.terminate().expect("terminate a console-group child");
     ctrl_break::assert_break_sent_to(child.pid());
@@ -75,7 +75,7 @@ fn child_terminate_delivers_ctrl_break_to_a_contained_root() {
 fn a_plain_contained_root_really_receives_the_break() {
     let (child, mut sock) = spawn_root(Handler::Ack, crate::ContainMode::Strongest);
     assert_eq!(child.containment(), Containment::JobObject);
-    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
+    assert!(StopTarget::from(&child).leads_group_on_our_console());
     assert_in_our_console(child.pid(), "the root");
     child.terminate_tree().expect("terminate_tree on a contained root");
     ctrl_break::assert_break_sent_to(child.pid());
@@ -300,10 +300,10 @@ fn assert_own_console_route(child: &crate::Child, expected_containment: Containm
         expected_containment,
         "this test is about the wrong thing if containment did not take"
     );
-    assert_eq!(
-        child.graceful_mechanism(),
-        GracefulMechanism::OtherConsoleGroup,
-        "cosca's honest report of the route"
+    let console = child.console;
+    assert!(
+        console.group && console.own_console_flags && !StopTarget::from(child).leads_group_on_our_console(),
+        "cosca's honest report of the route: a group in a console of its own, {console:?}"
     );
 }
 
@@ -410,9 +410,8 @@ fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
     let _warns = crate::log_capture::warn_watch();
     let (child, sock) = ctrl_break::spawn_consoleless_root();
     let pid = child.pid();
-    assert_eq!(
-        child.graceful_mechanism(),
-        GracefulMechanism::ConsoleGroup,
+    assert!(
+        StopTarget::from(&child).leads_group_on_our_console(),
         "the flags do not exclude delivery: that is exactly what makes this a gap"
     );
     child.terminate().expect("the documented false success");

@@ -7,7 +7,7 @@ use super::{
     assert_acked, assert_break_sent_to, assert_in_our_console, connect_reporter, kill_release_reap, report_done,
     spawn_member, Handler,
 };
-use crate::{Containment, GracefulMechanism};
+use crate::{Containment, StopTarget};
 
 /// The fully-qualified libtest path of [`fixture_nested_terminate_reporter`].
 pub(crate) const REPORTER_TEST: &str = "test_child::ctrl_break::nested::fixture_nested_terminate_reporter";
@@ -33,7 +33,7 @@ fn fixture_nested_terminate_reporter() {
         Containment::Delegated,
         "this process is contained, so its own spawn is nested"
     );
-    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
+    assert!(StopTarget::from(&child).leads_group_on_our_console());
     assert_in_our_console(pid, "the nested member");
 
     // A nested member owns no tree teardown. The refusal comes before any signal, so the one break

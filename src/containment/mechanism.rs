@@ -101,11 +101,12 @@ pub(crate) trait Contains: fmt::Debug {
     }
 
     /// The cooperative stop `how` to every member it names, as [`send_kill`](Self::send_kill) decides
-    /// it from `root`: on Unix the signal `how` carries; on Windows the `CTRL_BREAK` to the root's
-    /// group `pid`. Signal-only. Beside the outcome, the listing of the walk that made it, which the
-    /// settlement holds ([`Tree::terminate`](crate::containment::Tree::terminate)); `None` for a
-    /// mechanism whose terminate holds no listing: one with no walk, and the macOS fd marker, which
-    /// walks but keeps nothing.
+    /// it from `root`: on Unix the signal `how` carries; on Windows nothing is sent here, for the
+    /// caller's stop function already sent the `CTRL_BREAK` to the root's group `pid` and `how` carries
+    /// the answer of that send, which the mechanism takes with the rest of its bookkeeping. Signal-only.
+    /// Beside the outcome, the listing of the walk that made it, which the settlement holds
+    /// ([`Tree::terminate`](crate::containment::Tree::terminate)); `None` for a mechanism whose terminate
+    /// holds no listing: one with no walk, and the macOS fd marker, which walks but keeps nothing.
     fn send_terminate(&self, pid: u32, root: Option<&dyn Root>, how: TreeStop) -> (TerminateOutcome, Option<Listing>);
 
     /// The tree's own kernel edge for "no member runs" (a cgroup's `populated`, a job's process

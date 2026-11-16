@@ -9,7 +9,7 @@ use std::sync::Arc;
 #[cfg(unix)]
 mod public;
 #[cfg(unix)]
-pub(crate) use public::Signal;
+pub use public::Signal;
 
 /// A signal cosca sends to an owned process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

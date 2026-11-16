@@ -9,7 +9,7 @@ use crate::containment::Containment;
 use crate::test_child::ctrl_break::{
     self, assert_acked, assert_in_our_console, kill_release_reap_async, Grandchild, Handler, STATUS_CONTROL_C_EXIT,
 };
-use crate::GracefulMechanism;
+use crate::StopTarget;
 
 async fn spawn_root(handler: Handler) -> (crate::tokio::Child, TcpStream) {
     spawn_root_configured(handler, crate::ContainMode::Strongest, |_| {}).await
@@ -45,7 +45,7 @@ async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
     let _warns = crate::log_capture::warn_watch();
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, mut sock) = spawn_root(Handler::Ack).await;
-    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
+    assert!(StopTarget::from(&child.inner).leads_group_on_our_console());
     assert_in_our_console(child.pid(), "the root");
     child.terminate().expect("terminate a console-group child");
     ctrl_break::assert_break_sent_to(child.pid());
@@ -63,7 +63,7 @@ async fn an_async_plain_contained_root_really_receives_the_break() {
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, mut sock) = spawn_root(Handler::Ack).await;
     assert_eq!(child.containment(), Containment::JobObject);
-    assert_eq!(child.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
+    assert!(StopTarget::from(&child.inner).leads_group_on_our_console());
     assert_in_our_console(child.pid(), "the root");
     child.terminate_tree().expect("terminate_tree on a contained root");
     ctrl_break::assert_break_sent_to(child.pid());
@@ -133,10 +133,10 @@ fn assert_own_console_route(child: &crate::tokio::Child, expected_containment: C
         expected_containment,
         "this test is about the wrong thing if containment did not take"
     );
-    assert_eq!(
-        child.graceful_mechanism(),
-        GracefulMechanism::OtherConsoleGroup,
-        "cosca's honest report of the route"
+    let console = child.inner.console;
+    assert!(
+        console.group && console.own_console_flags && !StopTarget::from(&child.inner).leads_group_on_our_console(),
+        "cosca's honest report of the route: a group in a console of its own, {console:?}"
     );
 }
 

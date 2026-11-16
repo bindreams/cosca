@@ -1,8 +1,8 @@
-//! Unit tests for the graceful-mechanism vocabulary and its dispatch.
+//! Unit tests for the policies a graceful shutdown applies to the answers of its waits.
 
 use std::cell::Cell;
 
-use super::{after_grace, after_tree_grace, GracefulMechanism};
+use super::{after_grace, after_tree_grace};
 use crate::error::{said, Error};
 
 /// The call a pure policy row names, as a caller's `graceful_shutdown_tree(pid)` does.
@@ -29,129 +29,6 @@ fn counted(
 
 fn message(r: Result<(), Error>) -> String {
     said(&r.expect_err("an error"))
-}
-
-// The four strings are a stable, distinct vocabulary. Exact, not `contains`: a refactor that
-// collapsed two variants onto one string would still satisfy a substring check.
-#[skuld::test]
-fn graceful_mechanism_display_is_stable_and_distinct() {
-    let all = [
-        (GracefulMechanism::Process, "process"),
-        (GracefulMechanism::ConsoleGroup, "own console group"),
-        (
-            GracefulMechanism::OtherConsoleGroup,
-            "own console group in another console",
-        ),
-        (GracefulMechanism::Unknown, "unknown"),
-        (GracefulMechanism::None, "none"),
-    ];
-    for (mechanism, expected) in all {
-        assert_eq!(mechanism.to_string(), expected, "Display for {mechanism:?}");
-    }
-    for (i, (_, a)) in all.iter().enumerate() {
-        for (_, b) in all.iter().skip(i + 1) {
-            assert_ne!(a, b, "two variants share a Display string");
-        }
-    }
-}
-
-/// The root's closure for a mechanism that must not signal the root.
-fn root_is_not_signalled(sig: crate::signal::Sig) -> Result<(), crate::error::Error> {
-    panic!("the mechanism signalled the root with {sig:?}")
-}
-
-// The Unix `Process` mechanism signals through the caller's own handle, with `SIGTERM`, and by
-// nothing else: a dispatcher that opened the child by its number would never call the closure.
-// The id names no process, so such a regression finds nothing to signal.
-#[cfg(unix)]
-#[skuld::test]
-fn signal_hands_the_process_mechanism_to_the_roots_closure_as_a_term() {
-    let mut sent = Vec::new();
-    super::signal(GracefulMechanism::Process, 0x7fff_fffe, |sig| {
-        sent.push(sig);
-        Ok(())
-    })
-    .expect("the closure's answer is the call's");
-    assert_eq!(sent, [crate::signal::Sig::Graceful(crate::signal::Signal::Term)]);
-}
-
-// Windows has no per-process graceful signal: the `Process` mechanism is refused, and the root's
-// closure is never called.
-#[cfg(windows)]
-#[skuld::test]
-fn signal_refuses_the_process_mechanism_without_signalling_the_root() {
-    let err = super::signal(GracefulMechanism::Process, std::process::id(), root_is_not_signalled)
-        .expect_err("Windows has no per-process graceful signal");
-    assert!(matches!(err, crate::error::Error::Unsupported { .. }), "{err:?}");
-}
-
-// `None` is the one mechanism the crate refuses up front, and it refuses with the remedy: a
-// wildcard arm that fell through to the console call would return something else entirely.
-#[skuld::test]
-fn signal_refuses_a_child_with_no_mechanism() {
-    let err = super::signal(GracefulMechanism::None, std::process::id(), root_is_not_signalled)
-        .expect_err("no group to address");
-    let crate::error::Error::Unsupported { detail, .. } = &err else {
-        panic!("expected Unsupported, got {err:?}");
-    };
-    assert!(detail.contains("contain"), "the refusal must name the remedy: {detail}");
-}
-
-// `OtherConsoleGroup` shares `ConsoleGroup`'s arm — the flag word says the child's group lives
-// in another console, but a child may re-attach to ours after it starts, so the signal is
-// attempted rather than refused. No spawn through the public containment API can carry this
-// mechanism (the flag words emitted never produce it), so the dispatcher is the only place the
-// routing can be pinned at all. `Ok` is what separates the two worlds: the `Unsupported` arms
-// refuse, and the `Process` arm — the only other path out of `signal` — is itself `Unsupported` on
-// Windows.
-#[cfg(windows)]
-#[skuld::test]
-fn signal_attempts_a_child_whose_group_may_be_in_another_console() {
-    let (child, stdin) = crate::test_child::held_contained_blocker_on_console(crate::Stdio::null());
-    let other = super::signal(GracefulMechanism::OtherConsoleGroup, child.pid(), root_is_not_signalled);
-    let group = super::signal(GracefulMechanism::ConsoleGroup, child.pid(), root_is_not_signalled);
-    assert!(
-        other.is_ok(),
-        "OtherConsoleGroup must be attempted, not refused: {other:?}"
-    );
-    assert_eq!(
-        other.is_ok(),
-        group.is_ok(),
-        "the two console mechanisms must take one path: {other:?} vs {group:?}"
-    );
-    // Cleanup, not the subject: the two breaks may already have ended the blocker (a delivered break
-    // ends a handler-less child), so the kill's outcome and the exit status prove nothing here.
-    // Releasing stdin keeps the wait from blocking if the blocker is still alive.
-    _ = child.kill_tree();
-    drop(stdin);
-    _ = child.wait();
-}
-
-// The dispatcher's half of `uac_elevated_attachment_has_no_in_process_route`, which pins only
-// the recorded constant. The subject is a live contained child of OUR own, whose group a
-// wrongly-routed event really would reach: a dispatcher that fired at it returns `Ok` (or the
-// OS's `Io` if the event finds no group), never this typed refusal, so the variant-and-detail
-// assertion below is what separates the two worlds — and the misfire lands on a child this test
-// already owns rather than a stranger.
-#[cfg(windows)]
-#[skuld::test]
-fn signal_refuses_a_child_cosca_did_not_create() {
-    let (child, stdin) = crate::test_child::held_contained_blocker_on_console(crate::Stdio::null());
-    let mechanism = crate::containment::Attachment::uac_elevated().graceful;
-    let err = super::signal(mechanism, child.pid(), root_is_not_signalled)
-        .expect_err("a child cosca did not create must not be signalled");
-    let crate::error::Error::Unsupported { detail, .. } = &err else {
-        panic!("expected Unsupported, got {err:?}");
-    };
-    assert!(
-        detail.contains("did not create this child"),
-        "the refusal must say whose child this is not: {detail}"
-    );
-    assert!(detail.contains("kill()"), "the refusal must name the remedy: {detail}");
-    child.kill_tree().expect("kill_tree");
-    // Released after the kill so a no-op kill fails the assertion, not the wait.
-    drop(stdin);
-    crate::test_child::assert_killed("the blocker", child.wait().expect("reap the blocker"));
 }
 
 // after_grace / after_tree_grace =====

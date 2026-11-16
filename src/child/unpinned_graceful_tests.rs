@@ -108,6 +108,49 @@ fn graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace() {
     drop(writer);
 }
 
+/// [`graceful_shutdown_does_not_escalate_to_a_root_orphaned_during_the_grace`] for a caller's own action
+/// that sent no prepared send: the refusal words what was sent before it as "the stop action", not as the
+/// default's signal.
+///
+/// Mutants: the refusal names the `SIGTERM` whatever the action did; it says it sent nothing at all.
+#[skuld::test]
+fn graceful_shutdown_words_a_callers_own_action_in_the_escalations_refusal() {
+    use crate::test_child::{command, Console, BLOCKER_ARGV};
+
+    crate::log_capture::install();
+    let mut cmd = command(Console::Hidden);
+    cmd.args(BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout null");
+    cmd.contain();
+    cmd.graceful_stop(|_| Ok(()));
+    let mut child = cmd.spawn().expect("spawn");
+    let writer = child.stdin().expect("piped stdin");
+    let fake = child.proc.script_over(|f| f);
+    let hook = crate::graceful_hooks::at(
+        crate::graceful_hooks::HookPoint::BeforeEscalation,
+        orphan_next_peek(&fake),
+    );
+
+    let err = child
+        .graceful_shutdown(Duration::ZERO)
+        .expect_err("a root this process does not pin is not killed");
+
+    fake.assert_peeks_exhausted();
+    assert_refused(&err, "kill");
+    assert!(
+        matches!(&err, Error::Unassessable { detail, .. } if detail.contains("though the stop action was sent before it")),
+        "{err:?}"
+    );
+    drop(hook);
+
+    let status = child
+        .graceful_shutdown(Duration::ZERO)
+        .expect("a root that reads true is escalated to");
+    crate::test_child::assert_killed("the blocker", status);
+    drop(writer);
+}
+
 /// A root that exited and is held by launchd is neither killed nor looked at before the reap, and
 /// nothing warns that the zombie is not ours to reap: the grace watch ends at once on the exit, with
 /// the grace unspent, and the reap's own answer, that launchd holds it, is the refusal, saying the

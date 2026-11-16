@@ -7,7 +7,7 @@
 //! `CreateProcessW` receives. On the std backend those differ: std stores the word verbatim and
 //! then ORs `CREATE_UNICODE_ENVIRONMENT` into it at spawn, plus `EXTENDED_STARTUPINFO_PRESENT`
 //! when it holds a proc-thread attribute list. No predicate may read the returned word as a fact
-//! about the child, with one argued exception: `mechanism_from_flags` reads only four bits that
+//! about the child, with one argued exception: `ConsoleFacts::of` reads only four bits that
 //! std neither adds nor removes.
 //!
 //! # What the flags settle about the child's console

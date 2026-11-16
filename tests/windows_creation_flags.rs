@@ -285,14 +285,14 @@ fn a_plain_child_joins_the_callers_console_via_async_executable() {
 }
 
 #[cfg(windows)]
-/// Each raw backend builds its own `Prepared` literal, so its cooperative-signal derivation is a
-/// SEPARATE site from `prepare`'s: the std-path twin passing says nothing about this one.
+/// Each raw backend builds its own `Prepared` literal, so its console facts are a SEPARATE
+/// derivation from `prepare`'s: the std-path twin passing says nothing about this one.
 ///
 /// Two children, so neither a constant nor an unwired derivation passes: a derivation reading
-/// only the containment half of the word reports `ConsoleGroup` for both.
+/// only the containment half of the word records a route for both.
 #[skuld::test]
 fn a_no_window_contained_child_reports_no_in_process_route_via_the_raw_backend() {
-    use cosca::GracefulMechanism;
+    use cosca::StopTarget;
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap().to_string();
@@ -319,15 +319,13 @@ fn a_no_window_contained_child_reports_no_in_process_route_via_the_raw_backend()
     };
 
     let (plain, plain_sock) = spawn_one(false);
-    assert_eq!(
-        plain.graceful_mechanism(),
-        GracefulMechanism::ConsoleGroup,
+    assert!(
+        StopTarget::from(&plain).leads_group_on_our_console(),
         "a contained raw-backend child leads a group in OUR console"
     );
     let (hidden, hidden_sock) = spawn_one(true);
-    assert_eq!(
-        hidden.graceful_mechanism(),
-        GracefulMechanism::OtherConsoleGroup,
+    assert!(
+        !StopTarget::from(&hidden).leads_group_on_our_console(),
         "the raw backend's own derivation must read the composed word"
     );
 
@@ -339,12 +337,12 @@ fn a_no_window_contained_child_reports_no_in_process_route_via_the_raw_backend()
 }
 
 #[cfg(windows)]
-/// The async raw backend has a `Prepared` literal of its own — a third derivation site.
+/// The async raw backend reads the composed word too: a contained child it spawns with `no_window` gets
+/// a console of its own, as the child itself reports, while a plain one shares ours. (What cosca
+/// recorded of the route is read through `StopTarget`, which a tokio child does not yet give.)
 #[cfg(feature = "tokio")]
 #[skuld::test]
-async fn an_async_no_window_contained_child_reports_no_in_process_route_via_the_raw_backend() {
-    use cosca::GracefulMechanism;
-
+async fn an_async_no_window_contained_child_gets_a_console_of_its_own_via_the_raw_backend() {
     let (listener, addr) = common::bind_async_listener();
     let me = std::process::id().to_string();
 
@@ -353,7 +351,7 @@ async fn an_async_no_window_contained_child_reports_no_in_process_route_via_the_
         addr: &str,
         me: &str,
         hidden: bool,
-    ) -> (cosca::tokio::Child, TcpStream) {
+    ) -> (cosca::tokio::Child, TcpStream, String) {
         let mut cmd = common::tokio_command(common::Console::Asked);
         cmd.executable(testbin())
             .args(report_argv(addr, me))
@@ -370,16 +368,20 @@ async fn an_async_no_window_contained_child_reports_no_in_process_route_via_the_
             escape_report_field("cosca_testbin"),
             "this leg must have reached the raw backend: {report}"
         );
-        (child, sock)
+        (child, sock, report)
     }
 
-    let (plain, plain_sock) = spawn_one(&listener, &addr, &me, false).await;
-    assert_eq!(plain.graceful_mechanism(), GracefulMechanism::ConsoleGroup);
-    let (hidden, hidden_sock) = spawn_one(&listener, &addr, &me, true).await;
+    let (plain, plain_sock, plain_report) = spawn_one(&listener, &addr, &me, false).await;
     assert_eq!(
-        hidden.graceful_mechanism(),
-        GracefulMechanism::OtherConsoleGroup,
-        "the async raw backend's own derivation must read the composed word"
+        report_field(&plain_report, "sees_caller"),
+        "1",
+        "a plain contained child shares OUR console: {plain_report}"
+    );
+    let (hidden, hidden_sock, hidden_report) = spawn_one(&listener, &addr, &me, true).await;
+    assert_eq!(
+        report_field(&hidden_report, "sees_caller"),
+        "0",
+        "the async raw backend must read the composed word: {hidden_report}"
     );
 
     for (mut child, sock) in [(plain, plain_sock), (hidden, hidden_sock)] {

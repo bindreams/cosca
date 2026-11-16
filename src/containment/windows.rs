@@ -378,11 +378,11 @@ impl crate::containment::Contains for JobHandle {
         )
     }
 
-    /// `CTRL_BREAK` to the root's console group `pid`: a nested contained descendant leads its own
-    /// group and never receives it.
+    /// The `CTRL_BREAK` the caller's stop function sent to the root's console group: a nested contained
+    /// descendant leads its own group and never receives it. The job sends nothing and lists nothing.
     fn send_terminate(
         &self,
-        pid: u32,
+        _pid: u32,
         _root: Option<&dyn crate::containment::Root>,
         how: crate::containment::TreeStop,
     ) -> (
@@ -390,7 +390,8 @@ impl crate::containment::Contains for JobHandle {
         Option<crate::containment::treewalk::Listing>,
     ) {
         // One event, so an error is an event that was not sent (`NoConsole` or the OS's refusal).
-        let sent = crate::containment::TerminateOutcome::of(terminate(pid).map(Ok), Some(how.earlier()));
+        let earlier = how.earlier();
+        let sent = crate::containment::TerminateOutcome::of(how.into_sent().map(Ok), Some(earlier));
         (sent, None)
     }
 
@@ -413,54 +414,89 @@ impl crate::containment::Contains for JobHandle {
 /// `CREATE_NEW_PROCESS_GROUP`: child leads its own console group so
 /// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` can target it.
 /// Shared by the std path and the raw `CreateProcessW` backend via `windows_contain_setup`.
-/// What this word implies about cooperative shutdown is derived by [`mechanism_from_flags`].
+/// What this word implies about cooperative shutdown is derived by [`ConsoleFacts::of`].
 pub(crate) fn root_flags() -> u32 {
     CREATE_SUSPENDED.0 | CREATE_NEW_PROCESS_GROUP.0
 }
 
 /// Pre-spawn creation flags for a nested (non-root) spawn.
 /// Only `CREATE_NEW_PROCESS_GROUP` — no suspension needed for nested spawns.
-/// What this word implies about cooperative shutdown is derived by [`mechanism_from_flags`].
+/// What this word implies about cooperative shutdown is derived by [`ConsoleFacts::of`].
 pub(crate) fn group_flags() -> u32 {
     CREATE_NEW_PROCESS_GROUP.0
 }
 
-/// Which cooperative signal a child spawned with `creation_flags` can be sent, derived from the
-/// flag word the spawn actually passed to `CreateProcessW`.
+/// What the spawn recorded about a child's console, for the stop functions to read: where a console
+/// event addressed to the child's group would go, from this process.
 ///
-/// Three rows:
-///
-/// - `CREATE_NEW_PROCESS_GROUP` absent → [`GracefulMechanism::None`]. The child sits in the
-///   spawner's group, so no console control event can ever be addressed to it individually by
-///   any process, and group leadership cannot be changed after creation. This is the one flat
-///   negative the flag word settles absolutely.
-/// - the group flag set, and none of `DETACHED_PROCESS` / `CREATE_NEW_CONSOLE` /
-///   `CREATE_NO_WINDOW` → [`GracefulMechanism::ConsoleGroup`].
-/// - the group flag set together with any of those three → [`GracefulMechanism::OtherConsoleGroup`].
-///
-/// What the results do **not** mean. `ConsoleGroup` says the flags do not *exclude* in-process
-/// delivery — it is not a claim the child is reachable. Console membership is not a function of
-/// the flag word at all: a GUI-subsystem image never attaches to the spawner's console whatever
-/// the flags say, and any child may `FreeConsole`/`AllocConsole`/`AttachConsole` after it starts.
-/// An out-of-console group makes `GenerateConsoleCtrlEvent` report success while delivering
-/// nothing, which is why the split exists. And `OtherConsoleGroup` is not "unreachable": a child
-/// spawned with window suppression owns a *private* console a helper process can attach to, so
-/// the claim is about the route from here, never a verdict on the child.
-///
-/// Any future creation-flag surface must extend this one function rather than deriving a
-/// mechanism of its own.
-pub(crate) fn mechanism_from_flags(creation_flags: u32) -> crate::graceful::GracefulMechanism {
-    use crate::graceful::GracefulMechanism;
-    use windows::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, DETACHED_PROCESS};
+/// Fixed at the child's creation, from the flag word the spawn actually passed to `CreateProcessW` and
+/// from this process's own console at that moment. The word is a sound negative and an unsound positive:
+/// a detaching or window-suppressing flag being present is enough to know the child is not on this
+/// process's console, but no flag can establish that it is. A GUI-subsystem image never attaches to its
+/// spawner's console whatever the flags say, and any child may `FreeConsole`/`AllocConsole`/
+/// `AttachConsole` after it starts. So the facts say which event could be sent and whether this process
+/// has a route to send it, never that a given send will arrive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ConsoleFacts {
+    /// The child leads a console process group of its own (`CREATE_NEW_PROCESS_GROUP`). Absent, it sits in
+    /// its spawner's group, so no console event can ever be addressed to it alone, by any process, and
+    /// group leadership cannot be changed after creation.
+    pub(crate) group: bool,
+    /// The word carries a flag that puts the child on a console of its own or none (`DETACHED_PROCESS`,
+    /// `CREATE_NEW_CONSOLE`, `CREATE_NO_WINDOW`): its group is not on this process's console. Not
+    /// "unreachable": a process attached to the child's own console can deliver an event.
+    pub(crate) own_console_flags: bool,
+    /// This process had a console when it created the child. Read once before the create; `false` when
+    /// the probe failed.
+    pub(crate) caller_had_console: bool,
+    /// Cosca did not create this child: a system service created a UAC-elevated one, with creation flags
+    /// this process never sees, so whether it leads a group of its own is unknowable from here, and a pid
+    /// that leads none addresses its leader's whole group instead.
+    pub(crate) elevated: bool,
+}
 
-    if creation_flags & CREATE_NEW_PROCESS_GROUP.0 == 0 {
-        return GracefulMechanism::None;
+impl ConsoleFacts {
+    /// The facts of a child created with `creation_flags` by a process that had a console
+    /// (`caller_had_console`). The one place that reads the four bits: any future creation-flag surface
+    /// extends this function rather than deriving a fact of its own.
+    pub(crate) fn of(creation_flags: u32, caller_had_console: bool) -> ConsoleFacts {
+        use windows::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, DETACHED_PROCESS};
+
+        let out_of_console = DETACHED_PROCESS.0 | CREATE_NEW_CONSOLE.0 | CREATE_NO_WINDOW.0;
+        ConsoleFacts {
+            group: creation_flags & CREATE_NEW_PROCESS_GROUP.0 != 0,
+            own_console_flags: creation_flags & out_of_console != 0,
+            caller_had_console,
+            elevated: false,
+        }
     }
-    let out_of_console = DETACHED_PROCESS.0 | CREATE_NEW_CONSOLE.0 | CREATE_NO_WINDOW.0;
-    if creation_flags & out_of_console != 0 {
-        return GracefulMechanism::OtherConsoleGroup;
+
+    /// [`after_probe`](Self::after_probe) for a spawn about to create the child, which reads this
+    /// process's console now.
+    pub(crate) fn at_spawn(creation_flags: u32) -> ConsoleFacts {
+        ConsoleFacts::after_probe(creation_flags, caller_has_console())
     }
-    GracefulMechanism::ConsoleGroup
+
+    /// [`of`](Self::of) for the answer `probe` of [`caller_has_console`]. A probe that failed is recorded
+    /// as no console, and logged.
+    pub(crate) fn after_probe(creation_flags: u32, probe: io::Result<bool>) -> ConsoleFacts {
+        let caller_had_console = probe.unwrap_or_else(|e| {
+            log::debug!(
+                "the console probe failed ({report}); recording that this process had no console at the spawn",
+                report = crate::error::Report(&e)
+            );
+            false
+        });
+        ConsoleFacts::of(creation_flags, caller_had_console)
+    }
+
+    /// The facts of a child a system service created on a UAC consent.
+    pub(crate) fn uac_elevated() -> ConsoleFacts {
+        ConsoleFacts {
+            elevated: true,
+            ..ConsoleFacts::default()
+        }
+    }
 }
 
 /// Clear the inherit flag on the parent's std handles before spawning. Prevents
@@ -489,10 +525,9 @@ pub(crate) fn clear_std_handle_inheritance() {
 /// `ERROR_INVALID_HANDLE`. Unlike `GetConsoleWindow` this is correct for a *windowless*
 /// console (`CREATE_NO_WINDOW`, ConPTY), which can signal fine.
 ///
-/// Used only to CONFIRM a failure that already happened, never to gate one before it. Both
-/// orderings race a concurrent `AttachConsole`/`FreeConsole`; a confirmation at worst
-/// withholds the typed error, while a guard decides the outcome from state that may already
-/// be gone.
+/// Never gates a send: a guard would decide from console state that may already be gone. It confirms a
+/// failed send ([`classify_ctrl_event_failure`]) and records the console at spawn
+/// ([`ConsoleFacts::at_spawn`]).
 pub(crate) fn caller_has_console() -> io::Result<bool> {
     use windows::Win32::Foundation::{SetLastError, ERROR_INVALID_HANDLE, WIN32_ERROR};
     use windows::Win32::System::Console::GetConsoleProcessList;

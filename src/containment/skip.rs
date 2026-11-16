@@ -156,28 +156,42 @@ impl TerminateOutcome {
 
 /// The cooperative stop a tree route carries out.
 ///
-/// Unix: the signal the route sends to every member it reaches. Windows: it carries nothing; the
-/// `CTRL_BREAK` goes to the root's console group.
-#[derive(Debug, Clone, Copy)]
+/// Unix: the signal the route sends to every member it reaches. Windows: the `CTRL_BREAK` the stop
+/// function already sent to the root's console group, which the route takes with the rest of what it
+/// does (the outcome, the tree walk's listing).
+#[derive(Debug)]
+#[cfg_attr(unix, derive(Clone, Copy))]
 pub(crate) struct TreeStop {
     #[cfg(unix)]
     signal: crate::signal::Signal,
+    #[cfg(windows)]
+    sent: Result<(), Error>,
 }
 
+#[cfg(unix)]
 impl Default for TreeStop {
-    /// `SIGTERM`; on Windows the `CTRL_BREAK`.
+    /// `SIGTERM`.
     fn default() -> TreeStop {
-        TreeStop {
-            #[cfg(unix)]
-            signal: crate::signal::Signal::Term,
-        }
+        TreeStop::of(crate::signal::Signal::Term)
     }
 }
 
 impl TreeStop {
-    #[cfg(all(unix, test))]
+    #[cfg(unix)]
     pub(crate) fn of(signal: crate::signal::Signal) -> TreeStop {
         TreeStop { signal }
+    }
+
+    /// The stop of a `CTRL_BREAK` whose send answered `sent`.
+    #[cfg(windows)]
+    pub(crate) fn of_break(sent: Result<(), Error>) -> TreeStop {
+        TreeStop { sent }
+    }
+
+    /// What the send the stop function made answered.
+    #[cfg(windows)]
+    pub(crate) fn into_sent(self) -> Result<(), Error> {
+        self.sent
     }
 
     #[cfg(unix)]
@@ -196,13 +210,23 @@ impl TreeStop {
         #[cfg(unix)]
         return self.signal.name();
         #[cfg(windows)]
-        "CTRL_BREAK"
+        CTRL_BREAK
     }
 
-    /// `name` as a sentence fragment: "the SIGTERM".
+    /// [`name`](Self::name) as a sentence fragment: "the SIGTERM".
     pub(crate) fn earlier(&self) -> String {
-        format!("the {}", self.name())
+        earlier_of(self.name())
     }
+}
+
+/// What the Windows stop sends: its name, as [`TreeStop::name`] answers it.
+#[cfg(windows)]
+pub(crate) const CTRL_BREAK: &str = "CTRL_BREAK";
+
+/// A stop's `name` as a sentence fragment: "the SIGTERM". The one wording of what a sweep's error says
+/// was sent before it.
+pub(crate) fn earlier_of(name: &str) -> String {
+    format!("the {name}")
 }
 
 #[cfg(all(test, unix))]

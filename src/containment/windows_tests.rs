@@ -1871,67 +1871,97 @@ fn a_different_failure_code_stays_io_whatever_the_probe_says() {
     assert!(matches!(e, crate::error::Error::Io(_)), "got {e:?}");
 }
 
-// The mechanism the creation-flag word settles, one test per row. Nine inputs, three distinct
-// outcomes: no constant implementation passes, and the last three rows pin that
-// `OtherConsoleGroup` is a statement about a route to a group that EXISTS, not a synonym for
-// "detached" — with no group flag there is nothing to address, whatever the console situation.
-mod mechanism_from_flags_tests {
-    use crate::containment::windows::{group_flags, mechanism_from_flags, root_flags};
-    use crate::graceful::GracefulMechanism;
+// The console facts the creation-flag word settles, one test per row. Nine inputs, three distinct
+// outcomes: no constant implementation passes, and the last three rows pin that `own_console_flags` is
+// a statement about a console of its own for a group that EXISTS, not a synonym for "detached" — with no
+// group flag there is nothing to address, whatever the console situation. The probe's answer is the
+// caller's: it passes through whatever the word says.
+mod console_facts_tests {
+    use crate::containment::windows::{group_flags, root_flags, ConsoleFacts};
     use windows::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, DETACHED_PROCESS};
 
-    #[skuld::test]
-    fn mechanism_from_flags_reports_none_for_no_flags() {
-        assert_eq!(mechanism_from_flags(0), GracefulMechanism::None);
+    fn facts(word: u32) -> (bool, bool) {
+        let facts = ConsoleFacts::of(word, true);
+        assert!(facts.caller_had_console && !facts.elevated, "{facts:?}");
+        (facts.group, facts.own_console_flags)
     }
 
     #[skuld::test]
-    fn mechanism_from_flags_reports_console_group_for_group_flags() {
-        assert_eq!(mechanism_from_flags(group_flags()), GracefulMechanism::ConsoleGroup);
+    fn console_facts_report_no_group_for_no_flags() {
+        assert_eq!(facts(0), (false, false));
     }
 
     #[skuld::test]
-    fn mechanism_from_flags_reports_console_group_for_root_flags() {
-        assert_eq!(mechanism_from_flags(root_flags()), GracefulMechanism::ConsoleGroup);
+    fn console_facts_report_a_group_on_our_console_for_group_flags() {
+        assert_eq!(facts(group_flags()), (true, false));
     }
 
     #[skuld::test]
-    fn mechanism_from_flags_reports_other_console_group_for_group_plus_detached() {
+    fn console_facts_report_a_group_on_our_console_for_root_flags() {
+        assert_eq!(facts(root_flags()), (true, false));
+    }
+
+    #[skuld::test]
+    fn console_facts_report_a_group_in_a_console_of_its_own_for_group_plus_detached() {
+        assert_eq!(facts(group_flags() | DETACHED_PROCESS.0), (true, true));
+    }
+
+    #[skuld::test]
+    fn console_facts_report_a_group_in_a_console_of_its_own_for_group_plus_new_console() {
+        assert_eq!(facts(group_flags() | CREATE_NEW_CONSOLE.0), (true, true));
+    }
+
+    #[skuld::test]
+    fn console_facts_report_a_group_in_a_console_of_its_own_for_group_plus_no_window() {
+        assert_eq!(facts(group_flags() | CREATE_NO_WINDOW.0), (true, true));
+    }
+
+    #[skuld::test]
+    fn console_facts_report_no_group_for_detached_without_a_group() {
+        assert_eq!(facts(DETACHED_PROCESS.0), (false, true));
+    }
+
+    #[skuld::test]
+    fn console_facts_report_no_group_for_a_new_console_without_a_group() {
+        assert_eq!(facts(CREATE_NEW_CONSOLE.0), (false, true));
+    }
+
+    #[skuld::test]
+    fn console_facts_report_no_group_for_no_window_without_a_group() {
+        assert_eq!(facts(CREATE_NO_WINDOW.0), (false, true));
+    }
+
+    #[skuld::test]
+    fn console_facts_carry_the_callers_console_as_given() {
+        assert!(!ConsoleFacts::of(group_flags(), false).caller_had_console);
+        assert!(ConsoleFacts::of(group_flags(), true).caller_had_console);
+    }
+
+    /// A probe that failed is recorded as no console, whatever the word says of the rest, and logged.
+    ///
+    /// Mutants: a failed probe is recorded as a console; the rest of the facts are dropped with it.
+    #[skuld::test]
+    fn console_facts_record_a_failed_probe_as_no_console() {
+        crate::log_capture::install();
+        let mark = crate::log_capture::mark();
+        let failed = ConsoleFacts::after_probe(group_flags(), Err(std::io::Error::other("forced probe failure")));
         assert_eq!(
-            mechanism_from_flags(group_flags() | DETACHED_PROCESS.0),
-            GracefulMechanism::OtherConsoleGroup
+            failed,
+            ConsoleFacts {
+                caller_had_console: false,
+                ..ConsoleFacts::of(group_flags(), true)
+            }
         );
-    }
-
-    #[skuld::test]
-    fn mechanism_from_flags_reports_other_console_group_for_group_plus_new_console() {
+        assert!(failed.group && !failed.own_console_flags, "{failed:?}");
+        let logged = crate::log_capture::records_since_on_current_thread(mark, "the console probe failed");
+        assert!(
+            matches!(&logged[..], [(log::Level::Debug, said)] if said.contains("forced probe failure")),
+            "{logged:?}"
+        );
         assert_eq!(
-            mechanism_from_flags(group_flags() | CREATE_NEW_CONSOLE.0),
-            GracefulMechanism::OtherConsoleGroup
+            ConsoleFacts::after_probe(group_flags(), Ok(true)),
+            ConsoleFacts::of(group_flags(), true)
         );
-    }
-
-    #[skuld::test]
-    fn mechanism_from_flags_reports_other_console_group_for_group_plus_no_window() {
-        assert_eq!(
-            mechanism_from_flags(group_flags() | CREATE_NO_WINDOW.0),
-            GracefulMechanism::OtherConsoleGroup
-        );
-    }
-
-    #[skuld::test]
-    fn mechanism_from_flags_reports_none_for_detached_without_a_group() {
-        assert_eq!(mechanism_from_flags(DETACHED_PROCESS.0), GracefulMechanism::None);
-    }
-
-    #[skuld::test]
-    fn mechanism_from_flags_reports_none_for_a_new_console_without_a_group() {
-        assert_eq!(mechanism_from_flags(CREATE_NEW_CONSOLE.0), GracefulMechanism::None);
-    }
-
-    #[skuld::test]
-    fn mechanism_from_flags_reports_none_for_no_window_without_a_group() {
-        assert_eq!(mechanism_from_flags(CREATE_NO_WINDOW.0), GracefulMechanism::None);
     }
 }
 

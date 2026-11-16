@@ -637,6 +637,17 @@ fn spawn_control_on(
     (child, sock)
 }
 
+/// Asserts `err` is the refusal of a console control event for a child created without the process-group
+/// flag (an uncontained Windows spawn): `Unsupported`, saying the child leads no group of its own.
+#[cfg(windows)]
+#[track_caller]
+pub fn assert_refused_for_no_group(err: &cosca::error::Error) {
+    assert!(
+        matches!(err, cosca::error::Error::Unsupported { detail, .. } if detail.contains("leads no console process group")),
+        "got {err:?}"
+    );
+}
+
 /// Convenience alias for the common `control-block` blocker (no `.contain()`). A one-line
 /// shortcut over `spawn_control`, NOT a second copy of the body.
 pub fn spawn_blocker() -> (cosca::Child, TcpStream) {

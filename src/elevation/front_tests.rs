@@ -1,10 +1,14 @@
 use std::cell::Cell;
 use std::io;
 
+#[cfg(unix)]
+use super::relay_gate;
 use super::{kill_gate, terminate_gate, Front, Gate, TrackedKind};
 use crate::elevation::elevation_tests::{report, OS_CODE};
 use crate::elevation::{Backend, ElevatedVia, ElevationReport};
 use crate::error::{ElevationErrorKind, Error};
+#[cfg(unix)]
+use crate::Signal;
 
 const PID: u32 = 4242;
 
@@ -384,6 +388,74 @@ fn a_sigterm_to_a_live_osascript_is_closed() {
     let error = refusal(terminate_gate(osascript, PID, || Err(os_error())));
     assert_refused_by_one_read(&error, "whether it had exited could not be read");
     assert!(matches!(terminate_gate(osascript, PID, || Ok(false)), Gate::Open));
+}
+
+/// A signal a front relays is open without reading the front.
+///
+/// Mutant: the gate asks the front's state for a relayed signal.
+#[cfg(unix)]
+#[skuld::test]
+fn a_signal_a_front_relays_is_open_without_reading_it() {
+    for front in [Front::Sudo, Front::Doas] {
+        for &signal in front.relayed() {
+            let g = relay_gate(Some(front), PID, signal, || panic!("not asked"));
+            assert!(matches!(g, Gate::Open), "{front:?} {signal:?}: {g:?}");
+        }
+    }
+}
+
+/// A signal a live sudo or doas front does not relay would end the front and leave the program running
+/// (or reach nothing): refused as `Unsupported`, naming the front, the signal and what the front relays.
+///
+/// Mutant: the table lets a signal the front does not relay through.
+#[cfg(unix)]
+#[skuld::test]
+fn a_signal_a_live_front_does_not_relay_is_refused_as_unsupported() {
+    for (front, signal) in [
+        (Front::Sudo, Signal::Alrm),
+        (Front::Sudo, Signal::Cont),
+        (Front::Sudo, Signal::Chld),
+        (Front::Doas, Signal::Hup),
+        (Front::Doas, Signal::Usr1),
+        (Front::Doas, Signal::Int),
+    ] {
+        let Gate::Closed(Error::Unsupported { detail, .. }) = relay_gate(Some(front), PID, signal, || Ok(true)) else {
+            panic!("{front:?} {signal:?} was not refused as Unsupported");
+        };
+        assert!(detail.contains(&format!("pid {PID}")), "{detail}");
+        assert!(detail.contains(front.name()), "{detail}");
+        assert!(detail.contains(signal.name()), "{detail}");
+        for relayed in front.relayed() {
+            assert!(detail.contains(relayed.name()), "{detail}");
+        }
+        assert!(detail.contains("no signal was sent"), "{detail}");
+    }
+}
+
+/// An exited front is signalled whatever the signal, as one is for a `SIGTERM`; one whose state cannot be
+/// read is refused, with the read's error as the cause.
+#[cfg(unix)]
+#[skuld::test]
+fn a_front_that_has_exited_is_open_to_any_signal_and_an_unread_one_is_refused() {
+    let g = relay_gate(Some(Front::Sudo), PID, Signal::Alrm, || Ok(false));
+    assert!(matches!(g, Gate::Open), "{g:?}");
+    let error = refusal(relay_gate(Some(Front::Doas), PID, Signal::Hup, || Err(os_error())));
+    assert!(matches!(error, Error::Unsupported { .. }), "{error:?}");
+    assert_eq!(crate::error::first_os_code(&error), Some(CODE), "{error:?}");
+    assert!(
+        crate::error::said(&error).contains("whether it had exited could not be read"),
+        "{error:?}"
+    );
+}
+
+/// Not a front, or osascript (whose refusal is `terminate_gate`'s): the relay gate adds nothing.
+#[cfg(unix)]
+#[skuld::test]
+fn the_relay_gate_leaves_osascript_and_every_non_front_to_the_other_gate() {
+    let g = relay_gate(None, PID, Signal::Alrm, || panic!("not asked"));
+    assert!(matches!(g, Gate::Open), "{g:?}");
+    let g = relay_gate(Some(Front::Osascript), PID, Signal::Alrm, || panic!("not asked"));
+    assert!(matches!(g, Gate::Open), "{g:?}");
 }
 
 /// What `cgroup_kill_reached` asked, in order (`e`xited, `u`nder the leaf), and its answer.

@@ -204,32 +204,44 @@ fn the_structural_bits_are_reserved() {
     }
 }
 
-/// The three containment shapes must not all report the same cooperative-signal mechanism: an
-/// uncontained spawn leads no group, while both contained shapes do. Asserted on the COMPOSED
-/// word, which is the only word any spawn path derives a mechanism from.
+/// The three containment shapes must not all record the same console facts: an uncontained spawn
+/// leads no group, while both contained shapes do, and window suppression puts the group in a console
+/// of its own. Asserted on the COMPOSED word, which is the only word any spawn path derives the facts
+/// from.
 #[skuld::test]
-fn the_composed_word_reports_a_different_mechanism_for_each_containment_shape() {
-    use crate::containment::windows::mechanism_from_flags;
-    use crate::graceful::GracefulMechanism;
+fn the_composed_word_records_different_console_facts_for_each_containment_shape() {
+    use crate::containment::windows::ConsoleFacts;
 
     let none = FlagsRequest::default();
+    let facts = |word| ConsoleFacts::of(word, true);
     assert_eq!(
-        mechanism_from_flags(word(&uncontained(), none, true, SpawnBackend::Std)),
-        GracefulMechanism::None,
+        facts(word(&uncontained(), none, true, SpawnBackend::Std)),
+        ConsoleFacts {
+            group: false,
+            own_console_flags: false,
+            caller_had_console: true,
+            elevated: false,
+        },
         "an uncontained spawn passes no group flag, so it leads no group"
     );
+    let on_our_console = ConsoleFacts {
+        group: true,
+        own_console_flags: false,
+        caller_had_console: true,
+        elevated: false,
+    };
     assert_eq!(
-        mechanism_from_flags(word(&contained(), none, true, SpawnBackend::Std)),
-        GracefulMechanism::ConsoleGroup,
+        facts(word(&contained(), none, true, SpawnBackend::Std)),
+        on_our_console,
         "a Strongest root spawns suspended into its own group"
     );
     assert_eq!(
-        mechanism_from_flags(word(&contained(), none, false, SpawnBackend::Std)),
-        GracefulMechanism::ConsoleGroup,
+        facts(word(&contained(), none, false, SpawnBackend::Std)),
+        on_our_console,
         "a nested spawn leads its own group too"
     );
     assert_eq!(
-        mechanism_from_flags(word(
+        facts(word(
             &contained(),
             FlagsRequest {
                 no_window: true,
@@ -238,7 +250,10 @@ fn the_composed_word_reports_a_different_mechanism_for_each_containment_shape() 
             true,
             SpawnBackend::Std
         )),
-        GracefulMechanism::OtherConsoleGroup,
+        ConsoleFacts {
+            own_console_flags: true,
+            ..on_our_console
+        },
         "window suppression puts the child's group in a console of its own"
     );
 }
@@ -432,9 +447,9 @@ fn no_suspended_request_leaves_the_word_without_create_suspended_unchanged() {
 }
 
 /// `CREATE_SUSPENDED` is the only bit a suspended request adds. In particular it adds no process
-/// group, which would change the cooperative signal an uncontained child can be sent.
+/// group, which would change the cooperative stop an uncontained child can be sent.
 #[skuld::test]
-fn suspended_request_adds_no_other_bit_so_the_graceful_mechanism_is_unchanged() {
+fn suspended_request_adds_no_other_bit_so_the_console_facts_are_unchanged() {
     for (contain, is_root) in [(uncontained(), false), (contained(), true), (contained(), false)] {
         let plain = word(&contain, FlagsRequest::default(), is_root, SpawnBackend::Std);
         let frozen = word(
@@ -448,8 +463,8 @@ fn suspended_request_adds_no_other_bit_so_the_graceful_mechanism_is_unchanged() 
         );
         assert_eq!(frozen & !CREATE_SUSPENDED.0, plain & !CREATE_SUSPENDED.0);
         assert_eq!(
-            crate::containment::windows::mechanism_from_flags(frozen),
-            crate::containment::windows::mechanism_from_flags(plain),
+            crate::containment::windows::ConsoleFacts::of(frozen, true),
+            crate::containment::windows::ConsoleFacts::of(plain, true),
         );
     }
 }

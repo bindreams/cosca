@@ -176,15 +176,10 @@ async fn async_terminate_sends_sigterm() {
 #[skuld::test]
 async fn async_terminate_unsupported_for_an_uncontained_child_on_windows() {
     let (mut child, sock) = common::spawn_blocker_async().await;
-    assert_eq!(
-        child.graceful_mechanism(),
-        cosca::GracefulMechanism::None,
-        "the refusal follows from the recorded fact, not from the platform"
-    );
     let err = child
         .terminate()
         .expect_err("a child that leads no group cannot be addressed");
-    assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
+    common::assert_refused_for_no_group(&err);
     common::kill_release_reap_async(&mut child, sock).await;
 }
 
@@ -320,16 +315,11 @@ async fn async_graceful_tree_cancel_does_not_escalate() {
 async fn async_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
     use std::time::Duration;
     let (mut child, sock) = common::spawn_blocker_async().await;
-    assert_eq!(
-        child.graceful_mechanism(),
-        cosca::GracefulMechanism::None,
-        "the refusal follows from the recorded fact, not from the platform"
-    );
     let err = child
         .graceful_shutdown(Duration::from_secs(1))
         .await
         .expect_err("a child that leads no group cannot be addressed");
-    assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
+    common::assert_refused_for_no_group(&err);
     common::kill_release_reap_async(&mut child, sock).await;
 }
 
@@ -363,29 +353,29 @@ async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
 
 #[cfg(feature = "tokio")]
 /// The one assertion that catches a future divergence between the two hand-mirrored surfaces:
-/// the async query must report exactly what the sync side pins, for both an uncontained and a
-/// contained child.
+/// the async child must refuse an uncontained child exactly as the sync side does, alive and after a
+/// reap. (A contained child is not compared here: its soft stop ends it, and a contained root reaped
+/// before its drop warns, per host, #382.)
 #[skuld::test]
-async fn async_graceful_mechanism_matches_the_sync_surface() {
+async fn async_refusals_match_the_sync_surface() {
     let _warns = common::warn_watch();
     let (mut uncontained, s1) = common::spawn_blocker_async().await;
-    let (mut contained, s2) = common::spawn_control_async_on_console("control-block", &["R"], true).await;
     let (sync_uncontained, s3) = common::spawn_blocker();
-    let (sync_contained, s4) = common::spawn_control_on_console("control-block", &["R"], true);
+    // Windows refuses a child that leads no group, and sends nothing: both mirrors, alive.
+    #[cfg(windows)]
     assert_eq!(
-        uncontained.graceful_mechanism(),
-        sync_uncontained.graceful_mechanism(),
-        "uncontained: the two mirrors disagree"
+        refusal_shape(&uncontained.terminate()),
+        refusal_shape(&sync_uncontained.terminate()),
+        "uncontained: the two mirrors answer with different error shapes"
     );
     assert_eq!(
-        contained.graceful_mechanism(),
-        sync_contained.graceful_mechanism(),
-        "contained: the two mirrors disagree"
+        refusal_shape(&uncontained.terminate_tree()),
+        refusal_shape(&sync_uncontained.terminate_tree()),
+        "uncontained terminate_tree: the two mirrors answer with different error shapes"
     );
-    // The mechanism is only half of it: the two mirrors must also refuse for the same REASON.
+    // The mirrors must also refuse for the same REASON after a reap.
     // Reaped first: that is where a pid-scoped refusal that also swallowed the pid-INDEPENDENT
-    // ones would start answering something the sync side never answers. Uncontained on purpose,
-    // as the contained pair is compared above.
+    // ones would start answering something the sync side never answers. Uncontained on purpose.
     //
     // Each child blocks on a piped stdin this test holds and releases right after the `kill()`: a
     // `kill()` that did nothing exits 0 and fails `assert_killed`.
@@ -421,10 +411,7 @@ async fn async_graceful_mechanism_matches_the_sync_surface() {
     );
 
     common::kill_release_reap_async(&mut uncontained, s1).await;
-    // The group, before the reap, for the contained ones: a contained root reaped first and then
-    // dropped warns (#382).
-    common::kill_tree_release_reap_async(&mut contained, s2).await;
-    common::kill_release_reap_all(vec![(sync_uncontained, s3), (sync_contained, s4)]);
+    common::kill_release_reap_all(vec![(sync_uncontained, s3)]);
 }
 
 #[cfg(feature = "tokio")]
