@@ -125,7 +125,7 @@ use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{Contains, KillLeftOutcome};
 #[cfg(target_os = "macos")]
 use crate::containment::Why;
-use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill};
+use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill, TreeStop};
 use crate::error::Error;
 use crate::identity::Resolved;
 use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution};
@@ -183,8 +183,9 @@ impl Contains for Walker {
         &self,
         _pid: u32,
         root: Option<&dyn crate::containment::Root>,
+        how: TreeStop,
     ) -> (TerminateOutcome, Option<Listing>) {
-        terminate_tree(&crate::identity::HostKernel, self.root, root)
+        terminate_tree(&crate::identity::HostKernel, self.root, root, how)
     }
 
     /// No kernel object says "every member has exited".
@@ -271,7 +272,7 @@ impl KillOutcome {
 /// Warn of a best-effort kill of `id` with `signal` that sent nothing to a process that may be
 /// running, for a caller that returns no error for it ([`terminate`], the fd marker's sweep).
 #[cfg(unix)]
-pub(crate) fn warn_if_not_attempted(id: ProcessId, signal: Signal, outcome: &KillOutcome) {
+pub(crate) fn warn_if_not_attempted(id: ProcessId, signal: Sig, outcome: &KillOutcome) {
     if let KillOutcome::NotAttempted(why) = outcome {
         log::warn!(
             "treewalk: pid {} was sent no {signal}: {report}",
@@ -350,9 +351,6 @@ pub(crate) fn resolve_or_drop(
         ProcessId::of_ordered_with(kernel, pid, Some(parent), None, bound),
     )
 }
-
-#[cfg(unix)]
-use nix::sys::signal::Signal;
 
 /// Pure descendant filter (host-testable on every OS). Walks `parents` down from
 /// `root`, and for each pid whose ppid chains to `root.pid()` resolves its
@@ -725,24 +723,14 @@ fn kill_opened(id: ProcessId, opened: Result<Option<Box<dyn OsProcess + '_>>, Er
     }
 }
 
-/// The [`Sig`] a walk sends for `signal`: SIGKILL or SIGTERM, the only two it sends.
-#[cfg(unix)]
-fn sig_of(signal: Signal) -> Sig {
-    match signal {
-        Signal::SIGKILL => Sig::Kill,
-        Signal::SIGTERM => Sig::Term,
-        other => unreachable!("a walk sends SIGKILL or SIGTERM, not {other}"),
-    }
-}
-
 /// Signal `id` through a handle opened by identity ([`open_by_identity`]) — never a recycled pid.
 /// The handle pins the process, so a pid reused after the open cannot be hit (macOS: by its audit
 /// token, which the kernel checks). Already gone (`Ok(None)` from the open, or the send's own answer)
 /// is success. A process that cannot be opened or proved leaves no identity, so nothing is sent:
 /// `NotAttempted`. Best-effort.
 #[cfg(unix)]
-pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Signal) -> KillOutcome {
-    kill_opened(id, open_by_identity(kernel, id), sig_of(signal))
+pub(crate) fn kill_by_identity(kernel: &dyn Kernel, id: ProcessId, signal: Sig) -> KillOutcome {
+    kill_opened(id, open_by_identity(kernel, id), signal)
 }
 
 /// Terminate `id` through a handle opened by identity ([`open_by_identity`]). Already gone
@@ -935,7 +923,7 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
 #[cfg(any(unix, windows))]
 fn kill_one(kernel: &dyn Kernel, id: ProcessId) -> KillOutcome {
     #[cfg(unix)]
-    return kill_by_identity(kernel, id, Signal::SIGKILL);
+    return kill_by_identity(kernel, id, Sig::Kill);
     #[cfg(windows)]
     kill_by_identity(kernel, id)
 }
@@ -1289,9 +1277,9 @@ pub(crate) mod fault {
     }
 }
 
-/// Graceful termination of the tree rooted at `root`.
+/// Cooperative stop `how` of the tree rooted at `root`.
 ///
-/// Unix: the same snapshot + identity walk with SIGTERM (root then descendants) —
+/// Unix: the same snapshot + identity walk with the signal `how` carries (root then descendants) —
 /// cooperative shutdown that still re-verifies identity before each signal, so it
 /// reaches the whole genuine tree that the walk could assess, and errors as `hard_kill` does
 /// (`# Errors`). Unlike `hard_kill` it does not report a candidate the walk could not assess
@@ -1312,7 +1300,7 @@ pub(crate) mod fault {
 ///
 /// As [`hard_kill`] on Unix. Windows: those of `containment::windows::terminate`.
 ///
-/// On Unix the root's `SIGTERM` goes through [`Root::signal`] of `held`, as [`hard_kill`]'s kill does;
+/// On Unix the root's signal goes through [`Root::signal`] of `held`, as [`hard_kill`]'s kill does;
 /// Windows signals the root's process group and sends it nothing.
 ///
 /// The members it found, the root apart, are its [`Listing`] (none on Windows): once the root exits
@@ -1321,10 +1309,16 @@ pub(crate) mod fault {
 /// nothing ([`Terminated::RootExited`], see the module doc); one whose walk finds members signals
 /// them, and its [`Listing`] is not complete. So is the listing of a walk whose members were signalled
 /// though the flag could not be read; with no member found, that error is the walk's.
-pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -> Result<Terminated, Error> {
+pub(crate) fn terminate(
+    kernel: &dyn Kernel,
+    root: ProcessId,
+    held: &dyn Root,
+    how: TreeStop,
+) -> Result<Terminated, Error> {
     debug_assert_eq!(held.pid(), root.pid(), "the held root is not the walk's root");
     #[cfg(unix)]
     {
+        let signal = how.signal();
         let table = crate::containment::enumerate::process_table(kernel)?;
         let Some(walk) = walk_from(kernel, root, &table.parents, Recursive::Yes)? else {
             return Ok(Terminated::RootExited(exited_root_error(root.pid())));
@@ -1333,7 +1327,7 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -
         fault::note_walk(root.pid());
         // A root whose exit has begun, and whose walk finds no member, sends nothing, whether or not the
         // walk could read every candidate: a signal to its zombie reaches no one, and the exit may have
-        // reparented every child. Read before the root's own `SIGTERM`, which would begin its exit.
+        // reparented every child. Read before the root's own signal, which would begin its exit.
         let begun = match exit_begun(kernel, &table, root) {
             Ok(true) if walk.members.is_empty() => {
                 return Ok(Terminated::RootExited(exited_root_error(root.pid())));
@@ -1343,7 +1337,8 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -
             // The members are signalled as before the flag was read; the listing cannot vouch for the tree.
             Err(unreadable) => {
                 log::warn!(
-                    "treewalk: the SIGTERM walk of pid {pid} cannot vouch for its tree: {report}",
+                    "treewalk: the {name} walk of pid {pid} cannot vouch for its tree: {report}",
+                    name = signal.name(),
                     pid = root.pid(),
                     report = crate::error::Report(&unreadable)
                 );
@@ -1352,9 +1347,10 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -
         };
         // Best effort by contract: a candidate that could not be read is warned of and not signalled.
         warn_unassessed(&walk.unassessed);
-        warn_if_not_attempted(root, Signal::SIGTERM, &KillOutcome::of(held.signal(Sig::Term)));
+        let sig = how.sig();
+        warn_if_not_attempted(root, sig, &KillOutcome::of(held.signal(sig)));
         for id in &walk.members {
-            warn_if_not_attempted(*id, Signal::SIGTERM, &kill_by_identity(kernel, *id, Signal::SIGTERM));
+            warn_if_not_attempted(*id, sig, &kill_by_identity(kernel, *id, sig));
         }
         Ok(Terminated::Walked(Listing {
             // A root whose exit had begun, or whose flag could not be read, may have had children
@@ -1365,7 +1361,7 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -
     }
     #[cfg(windows)]
     {
-        let _ = (kernel, held);
+        let _ = (kernel, held, how);
         crate::containment::windows::terminate(root.pid()).map(|()| {
             Terminated::Walked(Listing {
                 members: Vec::new(),
@@ -1375,7 +1371,7 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (kernel, root, held);
+        let _ = (kernel, root, held, how);
         Ok(Terminated::Walked(Listing {
             members: Vec::new(),
             complete: true,
@@ -1383,7 +1379,7 @@ pub(crate) fn terminate(kernel: &dyn Kernel, root: ProcessId, held: &dyn Root) -
     }
 }
 
-/// The members a `SIGTERM` walk found and signalled, the root apart.
+/// The members a cooperative walk found and signalled, the root apart.
 #[derive(Debug)]
 pub(crate) struct Listing {
     pub(crate) members: Vec<ProcessId>,
@@ -1394,7 +1390,7 @@ pub(crate) struct Listing {
 
 /// What [`terminate`]'s walk did, once the process table was read (an unreadable table is its `Err`).
 pub(crate) enum Terminated {
-    /// The `SIGTERM`s went out to the root and to the members of the listing.
+    /// The signals went out to the root and to the members of the listing.
     Walked(Listing),
     /// Nothing was sent: the root has exited and the walk found no member.
     #[cfg_attr(
@@ -1415,7 +1411,7 @@ impl Terminated {
     }
 }
 
-/// The error of a `SIGTERM` that sent nothing because the root `pid` has exited.
+/// The error of a cooperative signal that sent nothing because the root `pid` has exited.
 #[cfg(unix)]
 fn exited_root_error(pid: u32) -> Error {
     Error::Unassessable {
@@ -1475,6 +1471,7 @@ pub(crate) fn terminate_tree(
     kernel: &dyn Kernel,
     root: ProcessId,
     owner: Option<&dyn Root>,
+    how: TreeStop,
 ) -> (TerminateOutcome, Option<Listing>) {
     match skipped_walk(owner) {
         Some(skip) => (TerminateOutcome::End(skip), None),
@@ -1482,11 +1479,12 @@ pub(crate) fn terminate_tree(
             // `NotSent` is an error that comes before the first signal: the process table could not be
             // read or the walk made (Unix), or the break could not be sent (Windows). A failed signal to
             // the root or a member is only warned of, so it is `Sent { Ok }`.
-            match terminate(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root))) {
+            let earlier = how.earlier();
+            match terminate(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root)), how) {
                 Ok(Terminated::Walked(listing)) => (
                     TerminateOutcome::Sent {
                         result: Ok(()),
-                        earlier: Some("the SIGTERM"),
+                        earlier: Some(earlier),
                     },
                     Some(listing),
                 ),

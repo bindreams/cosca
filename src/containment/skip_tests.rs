@@ -32,37 +32,38 @@ fn killed(settled: bool) -> Tree {
 /// Mutant: the answer folds the error into its text and keeps no source.
 #[skuld::test]
 fn a_skip_over_an_unsure_handle_answers_with_its_error_as_the_source() {
-    use super::SkipCall;
-    use crate::containment::dispatch::TreeSignal;
     use crate::error::Error;
+    use crate::signal::Sent;
 
     crate::log_capture::install();
-    let mark = crate::log_capture::mark();
     let os_error = std::io::Error::from_raw_os_error(libc::EPERM).to_string();
-    let call = SkipCall {
-        op: "skip_cause_probe_7e1",
-        pid: PID,
-        signal: TreeSignal::Term,
-        earlier: None,
-    };
-    let why = Why::MayNameAnother(
-        Refusal::Unsure(PID, std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EPERM))),
-        None,
-    );
+    for (signal, name) in SENT {
+        let mark = crate::log_capture::mark();
+        let why = Why::MayNameAnother(
+            Refusal::Unsure(PID, std::sync::Arc::new(std::io::Error::from_raw_os_error(libc::EPERM))),
+            None,
+        );
 
-    let answer = call
-        .answer(&killed(false), skip(why), None)
-        .answer
-        .expect_err("a skipped call is no success");
+        let answer = graceful_call("skip_cause_probe_7e1", signal)
+            .answer(&killed(false), skip(why), Some(Ok(Sent::Delivered)))
+            .answer
+            .expect_err("a skipped call is no success");
 
-    let Error::Unassessable { detail, .. } = &answer else {
-        panic!("got {answer:?}");
-    };
-    assert_eq!(crate::error::first_os_code(&answer), Some(libc::EPERM), "{answer:?}");
-    assert!(!detail.contains(&os_error), "{detail}");
-    let warns = crate::log_capture::warns_since(mark, "skip_cause_probe_7e1");
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].contains(&os_error), "{warns:?}");
+        let Error::Unassessable { detail, .. } = &answer else {
+            panic!("got {answer:?}");
+        };
+        assert_eq!(crate::error::first_os_code(&answer), Some(libc::EPERM), "{answer:?}");
+        assert!(!detail.contains(&os_error), "{detail}");
+        assert_names_only(detail, name);
+        assert!(
+            detail.contains(&format!("sent the {name} to the root through its pidfd")),
+            "{detail}"
+        );
+        let warns = crate::log_capture::warns_since(mark, "skip_cause_probe_7e1");
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains(&os_error), "{warns:?}");
+        assert_names_only(&warns[0], name);
+    }
 }
 
 /// A sweep that skipped what the root's number names, and whose holders' sweep (macOS) failed
@@ -157,7 +158,7 @@ fn a_skip_is_moot_only_over_a_killed_tree_whose_root_is_untrusted() {
 #[skuld::test]
 fn a_tree_call_that_skipped_an_untrusted_root_leaves_the_drop_what_a_drop_alone_finds() {
     use super::SkipCall;
-    use crate::containment::dispatch::TreeSignal;
+    use crate::signal::Sig;
 
     let untrusted = |swept: bool| Skip {
         holders: swept.then_some(Ok(())),
@@ -166,7 +167,7 @@ fn a_tree_call_that_skipped_an_untrusted_root_leaves_the_drop_what_a_drop_alone_
     let call = SkipCall {
         op: "skip_untrusted_probe_c3",
         pid: PID,
-        signal: TreeSignal::Kill,
+        signal: Sig::Kill,
         earlier: None,
     };
     for swept in [false, true] {
@@ -209,7 +210,7 @@ fn kill_call(op: &'static str) -> super::SkipCall<'static> {
     super::SkipCall {
         op,
         pid: PID,
-        signal: crate::containment::dispatch::TreeSignal::Kill,
+        signal: crate::signal::Sig::Kill,
         earlier: None,
     }
 }
@@ -459,7 +460,7 @@ fn a_skipped_kill_whose_holders_failed_leaves_the_drop_a_warn_in_either_order() 
 /// control is moot.
 #[skuld::test]
 fn a_skipped_call_over_a_killed_tree_is_moot_when_a_kill_does_not_outlive_its_reason() {
-    use crate::containment::dispatch::TreeSignal;
+    use crate::signal::Sig;
     crate::log_capture::install();
     type Case = (&'static str, fn() -> Why, bool);
     let cases: [Case; 2] = [
@@ -475,7 +476,7 @@ fn a_skipped_call_over_a_killed_tree_is_moot_when_a_kill_does_not_outlive_its_re
         ),
     ];
     for (name, why, moot) in cases {
-        for signal in [TreeSignal::Kill, TreeSignal::Term] {
+        for signal in [Sig::Kill, Sig::Graceful(crate::signal::Signal::Term)] {
             let mark = crate::log_capture::mark();
             let answer = super::SkipCall {
                 op: "skip_moot_probe_g1",
@@ -565,12 +566,28 @@ fn unsure(code: i32) -> Why {
     )
 }
 
-fn term_call(op: &'static str) -> super::SkipCall<'static> {
+fn graceful_call(op: &'static str, signal: crate::signal::Signal) -> super::SkipCall<'static> {
     super::SkipCall {
         op,
         pid: PID,
-        signal: crate::containment::dispatch::TreeSignal::Term,
+        signal: crate::signal::Sig::Graceful(signal),
         earlier: None,
+    }
+}
+
+/// The signals a call's texts are run with, and how each is spelled: a text that hardcodes one
+/// name is wrong for the other.
+const SENT: [(crate::signal::Signal, &str); 2] = [
+    (crate::signal::Signal::Term, "SIGTERM"),
+    (crate::signal::Signal::Usr1, "SIGUSR1"),
+];
+
+/// `text` names `name`, and none of the other `SENT` signals.
+#[track_caller]
+fn assert_names_only(text: &str, name: &str) {
+    assert!(text.contains(name), "{name} is missing: {text}");
+    for (_, other) in SENT.iter().filter(|(_, other)| *other != name) {
+        assert!(!text.contains(other), "{other} is named beside {name}: {text}");
     }
 }
 
@@ -603,7 +620,7 @@ fn a_skipped_call_whose_holders_and_root_both_failed_keeps_both_and_the_reason()
         source: Some(Error::io_cause(std::io::Error::from_raw_os_error(libc::EPERM))),
     };
 
-    let answer = term_call("skip_peers_probe_a1")
+    let answer = graceful_call("skip_peers_probe_a1", crate::signal::Signal::Term)
         .answer(
             &killed(false),
             Skip {
@@ -632,7 +649,7 @@ fn a_skipped_calls_root_failure_takes_the_reason_as_a_peer() {
         source: Some(Error::io_cause(std::io::Error::from_raw_os_error(libc::EPERM))),
     };
 
-    let answer = term_call("skip_peers_probe_a2")
+    let answer = graceful_call("skip_peers_probe_a2", crate::signal::Signal::Term)
         .answer(&killed(false), skip(unsure(libc::EACCES)), Some(Err(root)))
         .answer
         .expect_err("a skipped call is no success");
@@ -651,14 +668,23 @@ fn a_skipped_calls_io_failure_goes_below_the_unassessable_after_the_reason() {
     use crate::error::Error;
     let eperm = || Error::Io(std::io::Error::from_raw_os_error(libc::EPERM));
 
-    let answer = term_call("skip_peers_probe_a3")
-        .answer(&killed(false), skip(unsure(libc::EACCES)), Some(Err(eperm())))
-        .answer
-        .expect_err("a skipped call is no success");
-    assert!(matches!(&answer, Error::Unassessable { .. }), "{answer:?}");
-    assert_eq!(codes_below(&answer), [Some(libc::EACCES), Some(libc::EPERM)]);
+    for (signal, name) in SENT {
+        let answer = graceful_call("skip_peers_probe_a3", signal)
+            .answer(&killed(false), skip(unsure(libc::EACCES)), Some(Err(eperm())))
+            .answer
+            .expect_err("a skipped call is no success");
+        let Error::Unassessable { detail, .. } = &answer else {
+            panic!("{answer:?}");
+        };
+        assert_names_only(detail, name);
+        assert!(
+            detail.contains(&format!("the {name} to the root through its pidfd failed")),
+            "{detail}"
+        );
+        assert_eq!(codes_below(&answer), [Some(libc::EACCES), Some(libc::EPERM)]);
+    }
 
-    let alone = term_call("skip_peers_probe_a4")
+    let alone = graceful_call("skip_peers_probe_a4", crate::signal::Signal::Term)
         .answer(
             &killed(false),
             skip(Why::MayNameAnother(Refusal::ReapedElsewhere(PID), None)),
@@ -684,7 +710,7 @@ fn an_untrusted_roots_cause_joins_the_failed_holders_sweep() {
         source: Some(Error::io_cause(std::io::Error::from_raw_os_error(libc::EPERM))),
     };
 
-    let answer = term_call("skip_peers_probe_b1")
+    let answer = graceful_call("skip_peers_probe_b1", crate::signal::Signal::Term)
         .answer(
             &killed(false),
             Skip {
@@ -724,7 +750,7 @@ fn a_reason_with_two_causes_joins_the_failed_holders_sweep_flat() {
     let expected = [Some(libc::EPERM), Some(libc::EACCES), Some(libc::EMFILE)];
 
     // In the call's answer the causes are below the skip's own `Unassessable`, the one peer.
-    let answer = term_call("skip_peers_probe_d1")
+    let answer = graceful_call("skip_peers_probe_d1", crate::signal::Signal::Term)
         .answer(
             &killed(false),
             Skip {
@@ -778,7 +804,7 @@ fn a_holders_only_kill_that_failed_takes_the_term_and_the_reason_as_peers() {
         source: Some(Error::io_cause(std::io::Error::from_raw_os_error(libc::EIO))),
     };
 
-    let settled = term_call("skip_peers_probe_c1").holders_settled(
+    let settled = graceful_call("skip_peers_probe_c1", crate::signal::Signal::Term).holders_settled(
         &killed(false),
         Skip {
             holders: Some(Err(term_failed())),
@@ -792,20 +818,26 @@ fn a_holders_only_kill_that_failed_takes_the_term_and_the_reason_as_peers() {
         [Some(libc::EPERM), Some(libc::EIO), Some(libc::EACCES)]
     );
 
-    let settled = term_call("skip_peers_probe_c2").holders_settled(
-        &killed(false),
-        Skip {
-            holders: Some(Err(term_failed())),
-            ..skip(unsure(libc::EACCES))
-        },
-        TreeKillOutcome::Ran(Ok(())),
-    );
-    assert!(
-        matches!(&settled.answer, Error::Unassessable { .. }),
-        "{:?}",
-        settled.answer
-    );
-    assert_eq!(codes_below(&settled.answer), [Some(libc::EACCES), Some(libc::EIO)]);
+    // The detail says which signal the holders were sent.
+    for (signal, name) in SENT {
+        let settled = graceful_call("skip_peers_probe_c2", signal).holders_settled(
+            &killed(false),
+            Skip {
+                holders: Some(Err(term_failed())),
+                ..skip(unsure(libc::EACCES))
+            },
+            TreeKillOutcome::Ran(Ok(())),
+        );
+        let Error::Unassessable { detail, .. } = &settled.answer else {
+            panic!("{:?}", settled.answer);
+        };
+        assert_names_only(detail, name);
+        assert!(
+            detail.contains(&format!("sent the {name} only to the marker holders")),
+            "{detail}"
+        );
+        assert_eq!(codes_below(&settled.answer), [Some(libc::EACCES), Some(libc::EIO)]);
+    }
 }
 
 /// A Linux call that signalled the root through its pidfd and failed, over a skip with a reason,
@@ -816,7 +848,7 @@ fn a_holders_only_kill_that_failed_takes_the_term_and_the_reason_as_peers() {
 fn a_pidfd_shutdown_that_failed_takes_the_reason_as_a_peer() {
     use crate::child::graceful::PidfdShutdown;
     use crate::error::Error;
-    let failed = |term: Error| {
+    let failed = |term: Error, signal| {
         let child = crate::child::owned::OwnedChild::new(
             Box::new(crate::os_process::fake::FakeProcess::new([]).with_exact_consume(false)),
             crate::elevation::front::TrackedKind::Own,
@@ -824,21 +856,33 @@ fn a_pidfd_shutdown_that_failed_takes_the_reason_as_a_peer() {
         PidfdShutdown::start(&child, || Err(term))
             .expect("the rule let the SIGTERM through")
             .finish(
-                &term_call("skip_peers_probe_d1"),
+                &graceful_call("skip_peers_probe_d1", signal),
                 &skip(unsure(libc::EACCES)),
                 None,
                 || Ok(crate::signal::Sent::Delivered),
             )
     };
 
-    let answer = failed(Error::Unassessable {
-        detail: "the SIGTERM failed".into(),
-        source: Some(Error::io_cause(std::io::Error::from_raw_os_error(libc::EPERM))),
-    });
+    let answer = failed(
+        Error::Unassessable {
+            detail: "the SIGTERM failed".into(),
+            source: Some(Error::io_cause(std::io::Error::from_raw_os_error(libc::EPERM))),
+        },
+        crate::signal::Signal::Term,
+    );
     assert!(matches!(&answer, Error::Unassessable { detail, .. } if detail == "the SIGTERM failed"));
     assert_eq!(codes_below(&answer), [Some(libc::EPERM), Some(libc::EACCES)]);
 
-    let answer = failed(Error::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
-    assert!(matches!(&answer, Error::Unassessable { .. }), "{answer:?}");
-    assert_eq!(codes_below(&answer), [Some(libc::EACCES), Some(libc::EPERM)]);
+    for (signal, name) in SENT {
+        let answer = failed(Error::Io(std::io::Error::from_raw_os_error(libc::EPERM)), signal);
+        let Error::Unassessable { detail, .. } = &answer else {
+            panic!("{answer:?}");
+        };
+        assert_names_only(detail, name);
+        assert!(
+            detail.contains(&format!("the {name} to the root through its pidfd failed")),
+            "{detail}"
+        );
+        assert_eq!(codes_below(&answer), [Some(libc::EACCES), Some(libc::EPERM)]);
+    }
 }

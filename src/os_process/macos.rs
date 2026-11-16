@@ -169,7 +169,7 @@ pub(crate) fn read_version(kernel: &dyn Kernel, pid: u32, unique: u64, sig: Sig)
         UniqRead::Found(now) if now.unique_id == unique => Ok(Some(now.id_version)),
         UniqRead::Found(_) | UniqRead::Gone => Ok(None),
         UniqRead::Refused(errno) => Err(io_context(
-            format!("pid {pid}: its identity could not be read; {sig:?} not sent"),
+            format!("pid {pid}: its identity could not be read; {sig} not sent"),
             io::Error::from_raw_os_error(errno),
         )),
     }
@@ -205,21 +205,21 @@ pub(crate) fn signal_by_token(
             Err(libc::EPERM) if sig == Sig::Kill => {
                 return match exit_state_of(kernel, pid, unique) {
                     Resolved::Found(ExitState::Exiting) => {
-                        log::debug!("{sig:?} to pid {pid}: refused with EPERM, its exit has begun");
+                        log::debug!("{sig} to pid {pid}: refused with EPERM, its exit has begun");
                         Ok(SignalByTokenOutcome::Exiting)
                     }
                     Resolved::Found(ExitState::Zombie) => {
-                        log::debug!("{sig:?} to pid {pid}: refused with EPERM, it has exited and is not reaped yet");
+                        log::debug!("{sig} to pid {pid}: refused with EPERM, it has exited and is not reaped yet");
                         Ok(SignalByTokenOutcome::ExitedUnreaped)
                     }
                     Resolved::Gone => {
                         log::debug!(
-                            "{sig:?} to pid {pid}: refused with EPERM, and it is gone, or its pid names another process"
+                            "{sig} to pid {pid}: refused with EPERM, and it is gone, or its pid names another process"
                         );
                         Ok(SignalByTokenOutcome::Gone)
                     }
                     Resolved::Unknown => {
-                        log::debug!("{sig:?} to pid {pid}: refused with EPERM, and its exit state could not be read");
+                        log::debug!("{sig} to pid {pid}: refused with EPERM, and its exit state could not be read");
                         Err(io::Error::from_raw_os_error(libc::EPERM))
                     }
                     Resolved::Found(ExitState::Running) => Err(io::Error::from_raw_os_error(libc::EPERM)),
@@ -230,13 +230,13 @@ pub(crate) fn signal_by_token(
         // `ESRCH` is a zombie, an `exec`, or a process that is gone: read what the pid names.
         match read_version(kernel, pid, unique, sig)? {
             Some(now) if now == *idversion => {
-                log::debug!("{sig:?} to pid {pid}: it has exited and is not reaped yet");
+                log::debug!("{sig} to pid {pid}: it has exited and is not reaped yet");
                 return Ok(SignalByTokenOutcome::ExitedUnreaped);
             }
             // It `exec`ed: the same process under a new version.
             Some(now) => *idversion = now,
             None => {
-                log::debug!("{sig:?} to pid {pid}: it is gone, or its pid names another process");
+                log::debug!("{sig} to pid {pid}: it is gone, or its pid names another process");
                 return Ok(SignalByTokenOutcome::Gone);
             }
         }

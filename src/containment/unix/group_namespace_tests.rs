@@ -94,6 +94,7 @@ fn fixture_group_terminate_overmount() {
     let outcome = crate::containment::unix::term_group_tree(
         pid as i32,
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+        crate::containment::TreeStop::default(),
     );
 
     let status = child.wait().expect("reap the member");

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
 use crate::containment::treewalk::{Left, Listing};
-use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
+use crate::containment::{Containment, Root, TerminateOutcome, TreeKill, TreeStop};
 use crate::error::Error;
 use crate::identity::ProcessId;
 
@@ -100,12 +100,13 @@ pub(crate) trait Contains: fmt::Debug {
         root_left_alone(root)
     }
 
-    /// The cooperative signal to every member it names, as [`send_kill`](Self::send_kill) decides it
-    /// from `root`: `SIGTERM`, or `CTRL_BREAK` to the root's group `pid` on Windows. Signal-only. Beside
-    /// the outcome, the listing of the walk that made it, which the settlement holds
-    /// ([`Tree::terminate`](crate::containment::Tree::terminate)); `None` for a mechanism whose terminate
-    /// holds no listing: one with no walk, and the macOS fd marker, which walks but keeps nothing.
-    fn send_terminate(&self, pid: u32, root: Option<&dyn Root>) -> (TerminateOutcome, Option<Listing>);
+    /// The cooperative stop `how` to every member it names, as [`send_kill`](Self::send_kill) decides
+    /// it from `root`: on Unix the signal `how` carries; on Windows the `CTRL_BREAK` to the root's
+    /// group `pid`. Signal-only. Beside the outcome, the listing of the walk that made it, which the
+    /// settlement holds ([`Tree::terminate`](crate::containment::Tree::terminate)); `None` for a
+    /// mechanism whose terminate holds no listing: one with no walk, and the macOS fd marker, which
+    /// walks but keeps nothing.
+    fn send_terminate(&self, pid: u32, root: Option<&dyn Root>, how: TreeStop) -> (TerminateOutcome, Option<Listing>);
 
     /// The tree's own kernel edge for "no member runs" (a cgroup's `populated`, a job's process
     /// list, a marker pipe's EOF); `None` for a group, a session and a walk.
@@ -268,19 +269,19 @@ impl Contains for Mechanism {
         }
     }
 
-    fn send_terminate(&self, pid: u32, root: Option<&dyn Root>) -> (TerminateOutcome, Option<Listing>) {
+    fn send_terminate(&self, pid: u32, root: Option<&dyn Root>, how: TreeStop) -> (TerminateOutcome, Option<Listing>) {
         match self {
             #[cfg(target_os = "linux")]
-            Mechanism::Cgroup(m) => m.send_terminate(pid, root),
+            Mechanism::Cgroup(m) => m.send_terminate(pid, root, how),
             #[cfg(windows)]
-            Mechanism::Job(m) => m.send_terminate(pid, root),
+            Mechanism::Job(m) => m.send_terminate(pid, root, how),
             #[cfg(unix)]
-            Mechanism::Group(m) => m.send_terminate(pid, root),
+            Mechanism::Group(m) => m.send_terminate(pid, root, how),
             #[cfg(target_os = "macos")]
-            Mechanism::Marker(m) => m.send_terminate(pid, root),
-            Mechanism::Walk(m) => m.send_terminate(pid, root),
+            Mechanism::Marker(m) => m.send_terminate(pid, root, how),
+            Mechanism::Walk(m) => m.send_terminate(pid, root, how),
             #[cfg(test)]
-            Mechanism::Fake(m) => m.send_terminate(pid, root),
+            Mechanism::Fake(m) => m.send_terminate(pid, root, how),
         }
     }
 

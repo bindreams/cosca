@@ -1756,6 +1756,64 @@ pub(crate) const CAT_TREE_ARGV: &[&str] = &[
     "exec 3<&0; { cat <&3 3<&- && echo eof; } & echo r; exec cat",
 ];
 
+/// A root and one descendant (a subshell) on one stdin pipe, each handling `SIGHUP`, `SIGTERM`,
+/// `SIGUSR1` and `SIGUSR2` by printing `<root|leaf> SIG<NAME>` and exiting. The descendant prints `r`
+/// once both have installed their handlers. A signal only the handlers see is reported by name, so a
+/// test learns which signal each of the two received. When none arrives the stdin's end makes each
+/// print `<root|leaf> eof` instead.
+#[cfg(unix)]
+pub(crate) const SIGNAL_REPORTING_TREE_ARGV: &[&str] = &[
+    "sh",
+    "-c",
+    "exec 3<&0; \
+     traps() { trap \"echo $1 SIGHUP; exit 0\" HUP; trap \"echo $1 SIGTERM; exit 0\" TERM; \
+               trap \"echo $1 SIGUSR1; exit 0\" USR1; trap \"echo $1 SIGUSR2; exit 0\" USR2; }; \
+     traps root; \
+     { traps leaf; echo r; cat <&3 3<&- & wait; echo 'leaf eof'; } & \
+     cat <&3 3<&- & wait; echo 'root eof'",
+];
+
+/// A tree of `argv` contained as `contain` asks, once it has printed `r\n`: the child, the write end
+/// of its stdin and its stdout, from which the readiness line has been read.
+#[cfg(unix)]
+pub(crate) fn ready_tree(
+    argv: &[&str],
+    contain: impl FnOnce(&mut crate::Command),
+) -> (crate::Child, crate::PipeWriter, crate::PipeReader) {
+    use std::io::Read as _;
+
+    let mut cmd = command(Console::Hidden);
+    cmd.args(argv.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    contain(&mut cmd);
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut stdout = child.stdout().expect("piped stdout");
+    let mut ready = [0u8; 2];
+    stdout.read_exact(&mut ready).expect("readiness line");
+    assert_eq!(&ready, b"r\n");
+    (child, stdin, stdout)
+}
+
+/// The two report lines of a [`SIGNAL_REPORTING_TREE_ARGV`] tree (one per process), sorted. Blocks
+/// until both have been printed.
+#[cfg(unix)]
+pub(crate) fn two_signal_reports(stdout: crate::PipeReader) -> Vec<String> {
+    use std::io::BufRead as _;
+
+    let mut stdout = std::io::BufReader::new(stdout);
+    let mut reports: Vec<String> = (0..2)
+        .map(|_| {
+            let mut line = String::new();
+            stdout.read_line(&mut line).expect("a report line");
+            line.trim_end().to_owned()
+        })
+        .collect();
+    reports.sort();
+    reports
+}
+
 /// Three processes that ignore `SIGTERM` (an ignored disposition survives `exec`) and block on one
 /// stdin pipe: the root (`cat`), a subshell, and the subshell's child `sh`. The child prints `r`
 /// once it runs, so all three exist when a test reads it. Each of the last two then prints its own

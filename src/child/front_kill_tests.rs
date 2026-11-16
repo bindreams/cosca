@@ -342,7 +342,7 @@ fn graceful_shutdown_of_a_front_that_exits_before_its_escalation() {
         }
         assert_eq!(
             sent.signal_calls(),
-            [Sig::Term, Sig::Kill],
+            [Sig::Graceful(crate::signal::Signal::Term), Sig::Kill],
             "the refusal was the escalation's kill"
         );
     }
@@ -904,7 +904,7 @@ fn a_pkexec_childs_refused_escalation_is_unkillable_as_for_kill() {
     );
     assert_eq!(
         fake.signal_calls(),
-        [Sig::Term, Sig::Kill],
+        [Sig::Graceful(crate::signal::Signal::Term), Sig::Kill],
         "the escalation was reached"
     );
     assert_ends_unsignalled(&child, stdin);

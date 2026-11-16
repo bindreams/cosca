@@ -57,7 +57,7 @@ use crate::containment::drain_edge::DrainEdge;
 use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::treewalk::Listing;
-use crate::containment::{check_number, Containment, Root, Skip, TerminateOutcome, TreeKill, Why};
+use crate::containment::{check_number, Containment, Root, Skip, TerminateOutcome, TreeKill, TreeStop, Why};
 use crate::error::{Error, Failures};
 use std::sync::Arc;
 
@@ -87,8 +87,8 @@ impl Contains for Group {
         kill_group_tree(self.pgid, root)
     }
 
-    fn send_terminate(&self, _pid: u32, root: Option<&dyn Root>) -> (TerminateOutcome, Option<Listing>) {
-        (term_group_tree(self.pgid, root), None)
+    fn send_terminate(&self, _pid: u32, root: Option<&dyn Root>, how: TreeStop) -> (TerminateOutcome, Option<Listing>) {
+        (term_group_tree(self.pgid, root, how), None)
     }
 
     /// No kernel object says "every member has exited".
@@ -347,22 +347,26 @@ pub(crate) mod fault {
     }
 }
 
-/// Send the graceful signal to the whole process group, then confirm no live
+/// Send `SIGTERM` to the whole process group, then confirm no live
 /// member refused it. See [`signal_group`].
 #[cfg(test)]
 pub(crate) fn term_group(pgid: i32, root: Option<&dyn Root>) -> Result<(), Error> {
-    term_group_sent(pgid, root).flatten()
+    term_group_sent(pgid, root, crate::signal::Signal::Term).flatten()
 }
 
 /// [`term_group`], saying whether the signal went out: `Err` is a send that did not happen, `Ok` what the
 /// check after the send found.
-pub(crate) fn term_group_sent(pgid: i32, root: Option<&dyn Root>) -> Result<Result<(), Error>, Error> {
+pub(crate) fn term_group_sent(
+    pgid: i32,
+    root: Option<&dyn Root>,
+    signal: crate::signal::Signal,
+) -> Result<Result<(), Error>, Error> {
     #[cfg(test)]
     if fault::intercept_term_group(pgid) {
         return Ok(Ok(()));
     }
-    // A `SIGTERM` is only probed, never resent: no member is reached by a handle of its own.
-    signal_group_sent(pgid, Signal::SIGTERM, root, &mut Vec::new())
+    // A cooperative signal is only probed, never resent: no member is reached by a handle of its own.
+    signal_group_sent(pgid, signal.as_nix(), root, &mut Vec::new())
 }
 
 /// What a process group's kill or terminate sends by the root's number, from one look at `root`
@@ -434,8 +438,9 @@ pub(crate) fn kill_group_tree<'a>(pgid: i32, root: Option<&dyn Root>) -> TreeKil
 /// the call, or, on Linux when the root's handle still names it exactly, leaves the root alone to the
 /// caller ([`TerminateOutcome::RootThroughPidfd`]). A send that did not go out is
 /// [`TerminateOutcome::NotSent`].
-pub(crate) fn term_group_tree(pgid: i32, root: Option<&dyn Root>) -> TerminateOutcome {
-    let sent = |root: Option<&dyn Root>| TerminateOutcome::of(term_group_sent(pgid, root), Some("the SIGTERM"));
+pub(crate) fn term_group_tree(pgid: i32, root: Option<&dyn Root>, how: TreeStop) -> TerminateOutcome {
+    let signal = how.signal();
+    let sent = |root: Option<&dyn Root>| TerminateOutcome::of(term_group_sent(pgid, root, signal), Some(how.earlier()));
     let Some(root) = root else {
         debug_assert!(false, "a group terminate was given no root to look at");
         return sent(None);

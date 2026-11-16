@@ -396,7 +396,7 @@ pub(crate) use root::Root;
 pub(crate) use root::Seen;
 #[cfg(unix)]
 pub(crate) use root::{check_number, NotItsGroup};
-pub(crate) use skip::{Skip, TerminateOutcome};
+pub(crate) use skip::{Skip, TerminateOutcome, TreeStop};
 #[cfg(unix)]
 pub(crate) use skip::{SkipCall, Why};
 pub(crate) use tree::Tree;

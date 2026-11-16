@@ -5,7 +5,6 @@ use std::cell::RefCell;
 
 use super::PidfdShutdown;
 use crate::child::owned::OwnedChild;
-use crate::containment::dispatch::TreeSignal;
 use crate::containment::{Refusal, Skip, SkipCall, Why};
 use crate::elevation::front::{Front, TrackedKind};
 use crate::error::{ElevationErrorKind, Error};
@@ -13,6 +12,7 @@ use crate::log_capture::warns_since;
 use crate::os_process::child::PeekOutcome;
 use crate::os_process::fake::FakeProcess;
 use crate::signal::Sent;
+use crate::signal::Sig;
 use crate::test_child::reaped_elsewhere::{ROOT_KILLED_BY_PIDFD, ROOT_TERMED_BY_PIDFD};
 
 /// A pgid no test process holds: the decisions only name it in their text.
@@ -22,7 +22,7 @@ fn graceful_call() -> SkipCall<'static> {
     SkipCall {
         op: "graceful_shutdown_tree",
         pid: PGID as u32,
-        signal: TreeSignal::Term,
+        signal: Sig::Graceful(crate::signal::Signal::Term),
         earlier: None,
     }
 }
@@ -128,7 +128,7 @@ fn a_front_the_sigterm_may_not_reach_is_refused_with_nothing_sent() {
     );
     assert!(
         matches!(&err, Error::Elevation { kind: ElevationErrorKind::Unkillable, detail, .. }
-            if detail.contains("is osascript") && detail.contains("no SIGTERM was sent")),
+            if detail.contains("is osascript") && detail.contains("no signal was sent")),
         "{err:?}"
     );
     assert_eq!(sent, Vec::<&str>::new());

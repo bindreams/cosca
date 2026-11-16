@@ -181,7 +181,7 @@ impl Process {
     pub(crate) fn terminate_walk(&self, kernel: &dyn crate::identity::Kernel) -> Result<Terminated, Error> {
         #[cfg(unix)]
         {
-            crate::containment::treewalk::terminate(kernel, self.id, self)
+            crate::containment::treewalk::terminate(kernel, self.id, self, crate::containment::TreeStop::default())
         }
         #[cfg(windows)]
         {

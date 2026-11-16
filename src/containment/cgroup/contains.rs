@@ -10,7 +10,7 @@ use crate::containment::drain_edge::DrainEdge;
 use crate::containment::mechanism::AwaitableRelease;
 use crate::containment::mechanism::{Contains, Release};
 use crate::containment::treewalk::Listing;
-use crate::containment::{Containment, Root, TerminateOutcome, TreeKill};
+use crate::containment::{Containment, Root, TerminateOutcome, TreeKill, TreeStop};
 
 // The leaf's `Debug` hides its path; `subject` names it.
 impl std::fmt::Debug for CgroupLeaf {
@@ -81,8 +81,14 @@ impl Contains for CgroupLeaf {
         TreeKillOutcome::Ran(self.hard_kill().map_err(Unkilled::from))
     }
 
-    fn send_terminate(&self, _pid: u32, _root: Option<&dyn Root>) -> (TerminateOutcome, Option<Listing>) {
-        (TerminateOutcome::of(self.terminate(), Some("the SIGTERM")), None)
+    fn send_terminate(
+        &self,
+        _pid: u32,
+        _root: Option<&dyn Root>,
+        how: TreeStop,
+    ) -> (TerminateOutcome, Option<Listing>) {
+        let signal = how.signal();
+        (TerminateOutcome::of(self.terminate(signal), Some(how.earlier())), None)
     }
 
     fn drain_edge(&self) -> Option<DrainEdge<'_>> {

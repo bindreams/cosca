@@ -929,7 +929,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     // Pass 1: fires unconditionally (first_pass=true), killing P via killpg(pgid). Neither T
     // nor Q exists yet, so pass 1 cannot reach either regardless.
     pass1_marker.sweep_pass(
-        nix::sys::signal::Signal::SIGKILL,
+        crate::signal::Sig::Kill,
         &mut state,
         true,
         super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
@@ -982,7 +982,7 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     // Pass 2: T's own holder scan on THIS pass confirms a live member of `pgid` (T itself), so
     // the gate must open and the group signal must re-fire, reaching Q via killpg.
     marker.sweep_pass(
-        nix::sys::signal::Signal::SIGKILL,
+        crate::signal::Sig::Kill,
         &mut state,
         false,
         super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
@@ -1051,7 +1051,7 @@ fn kill_holder_leaves_a_denied_pid_unsignalled_and_reports_incomplete() {
 
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let outcome = marker.kill_holder(id, nix::sys::signal::Signal::SIGKILL);
+    let outcome = marker.kill_holder(id, crate::signal::Sig::Kill);
     assert!(
         matches!(
             outcome,
@@ -1094,7 +1094,7 @@ fn a_refired_group_signal_that_fails_again_keeps_both_failures() {
     sends.fail_with_unassessable();
 
     marker.sweep_pass(
-        nix::sys::signal::Signal::SIGKILL,
+        crate::signal::Sig::Kill,
         &mut state,
         false,
         super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
@@ -1201,7 +1201,7 @@ fn a_pass_counts_only_the_identities_no_earlier_pass_had_seen() {
     let mut state = super::SweepState::new(&mut reached);
     state.seen.insert(sh_id);
     let found = marker.sweep_pass(
-        nix::sys::signal::Signal::SIGKILL,
+        crate::signal::Sig::Kill,
         &mut state,
         false,
         super::Scope::HoldersOnly { except: None },
@@ -1269,7 +1269,7 @@ fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
     let walks = crate::containment::treewalk::fault::record_walks();
     let mark = crate::log_capture::mark();
     let found = marker.sweep_pass(
-        nix::sys::signal::Signal::SIGKILL,
+        crate::signal::Sig::Kill,
         &mut state,
         true,
         super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
@@ -1335,7 +1335,7 @@ fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete(
     let mut state = super::SweepState::new(&mut reached);
     state.seen.insert(root);
     let found = marker.sweep_pass(
-        nix::sys::signal::Signal::SIGKILL,
+        crate::signal::Sig::Kill,
         &mut state,
         true,
         super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
@@ -1402,7 +1402,7 @@ fn a_holder_its_kernel_cannot_read_is_not_signalled_and_the_sweep_is_incomplete(
     let mut state = super::SweepState::new(&mut reached);
     state.seen.insert(root);
     let found = marker.sweep_pass(
-        nix::sys::signal::Signal::SIGKILL,
+        crate::signal::Sig::Kill,
         &mut state,
         true,
         super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
@@ -1442,7 +1442,7 @@ fn a_sweeps_kill_of_a_walked_member_reads_its_identity_through_the_markers_kerne
     let mut reached = Vec::new();
     let mut state = super::SweepState::new(&mut reached);
     marker.sweep_pass(
-        nix::sys::signal::Signal::SIGKILL,
+        crate::signal::Sig::Kill,
         &mut state,
         true,
         super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
@@ -1483,7 +1483,7 @@ fn a_holders_kill_reads_its_identity_through_the_markers_kernel() {
         None,
     );
 
-    let outcome = marker.kill_holder(id, nix::sys::signal::Signal::SIGKILL);
+    let outcome = marker.kill_holder(id, crate::signal::Sig::Kill);
 
     assert!(
         matches!(
@@ -1590,7 +1590,7 @@ fn a_terminate_whose_group_cannot_be_signalled_says_nothing_was_sent() {
     let _serialize = test_spawn_lock();
     let marker = marker_without_holders(inert_root(), Some(0), host_kernel());
     let root = crate::test_support::stated_root::StatedRoot::unreaped();
-    match marker.terminate_tree(Some(&root)) {
+    match marker.terminate_tree(Some(&root), crate::containment::TreeStop::default()) {
         crate::containment::TerminateOutcome::NotSent(crate::error::Error::Unassessable { source: None, .. }) => {}
         other => panic!("expected NotSent(Unassessable), got {other:?}"),
     }
@@ -1611,7 +1611,7 @@ fn a_terminate_that_sent_nothing_keeps_the_members_it_could_not_reach() {
         crate::identity::spawn_kernel(crate::identity::unreadable(root_id.pid())),
     );
     let root = crate::test_support::stated_root::StatedRoot::unreaped();
-    match marker.terminate_tree(Some(&root)) {
+    match marker.terminate_tree(Some(&root), crate::containment::TreeStop::default()) {
         crate::containment::TerminateOutcome::NotSent(crate::error::Error::Unassessable {
             detail,
             source: Some(source),
@@ -1650,7 +1650,7 @@ fn a_group_send_that_fails_while_a_holder_is_signalled_is_sent() {
     let marker = super::Marker::new(prepared, inert_root(), Some(0));
     let root = crate::test_support::stated_root::StatedRoot::unreaped();
 
-    let outcome = marker.terminate_tree(Some(&root));
+    let outcome = marker.terminate_tree(Some(&root), crate::containment::TreeStop::default());
 
     let status = holder.wait().expect("reap the holder");
     assert_eq!(status.signal(), Some(libc::SIGTERM), "the holder was sent the SIGTERM");

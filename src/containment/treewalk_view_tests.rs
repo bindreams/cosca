@@ -92,7 +92,13 @@ pub(super) fn id_walks() -> [(&'static str, Walk); 2] {
                 .map_err(Unkilled::into_error)
         }),
         ("terminate", |k, id| {
-            super::terminate(k, id, &super::ByIdentity::new(k, id)).and_then(super::Terminated::into_result)
+            super::terminate(
+                k,
+                id,
+                &super::ByIdentity::new(k, id),
+                crate::containment::TreeStop::default(),
+            )
+            .and_then(super::Terminated::into_result)
         }),
     ]
 }
@@ -135,7 +141,7 @@ fn a_walkers_terminate_over_an_untrusted_view_says_nothing_was_sent() {
     for view in VIEWS {
         let (child, id) = live_member();
         let kernel = view.fail(FakeKernel::over(&HostKernel), 0);
-        match super::terminate_tree(&kernel, id, None).0 {
+        match super::terminate_tree(&kernel, id, None, crate::containment::TreeStop::default()).0 {
             crate::containment::TerminateOutcome::NotSent(Error::Unassessable { detail, .. })
                 if detail.contains(view.cause()) => {}
             other => panic!("expected NotSent(Unassessable) naming {}, got {other:?}", view.cause()),
@@ -253,7 +259,13 @@ fn terminate_over_an_exited_root_with_an_unreadable_candidate_sends_nothing() {
     let (child, root, _, kernel) = root_with_an_unreadable_descendant();
     let kernel = super::treewalk_exiting_tests::with_exiting_root(kernel, root);
 
-    let walked = super::terminate(&kernel, root, &super::ByIdentity::new(&kernel, root)).expect("the table reads");
+    let walked = super::terminate(
+        &kernel,
+        root,
+        &super::ByIdentity::new(&kernel, root),
+        crate::containment::TreeStop::default(),
+    )
+    .expect("the table reads");
 
     assert!(matches!(walked, super::Terminated::RootExited(_)), "nothing is sent");
     release(child);
@@ -428,12 +440,20 @@ fn kill_by_identity_spares_a_pid_the_kernel_cannot_read_or_shows_as_another_proc
     let unreadable_kernel = FakeKernel::over(&HostKernel)
         .live_without_pidfs(pid, pidfd_of(pid))
         .on_read(&format!("{pid}/stat"), Err(libc::EACCES));
-    let outcome = super::kill_by_identity(&unreadable_kernel, id, nix::sys::signal::Signal::SIGTERM);
+    let outcome = super::kill_by_identity(
+        &unreadable_kernel,
+        id,
+        crate::signal::Sig::Graceful(crate::signal::Signal::Term),
+    );
     assert!(matches!(outcome, super::KillOutcome::NotAttempted(_)), "{outcome:?}");
     let new_owner = FakeKernel::over(&HostKernel)
         .live_without_pidfs(pid, pidfd_of(pid))
         .on_read(&format!("{pid}/stat"), Ok(&stat_of_a_new_owner(pid)));
-    let outcome = super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM);
+    let outcome = super::kill_by_identity(
+        &new_owner,
+        id,
+        crate::signal::Sig::Graceful(crate::signal::Signal::Term),
+    );
     assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
     release(child);
 }
@@ -449,7 +469,7 @@ fn kill_by_identity_spares_a_pidfs_pid_the_kernel_cannot_open_or_shows_as_anothe
     let ino = id.pidfs_ino().expect("a pidfs host makes pidfs ids");
     let refusing = FakeKernel::over(&HostKernel).on_pidfd_open(pid, Err(rustix::io::Errno::MFILE));
     // The reason is the refusal's own, so an error built from it names the process and why.
-    let outcome = super::kill_by_identity(&refusing, id, nix::sys::signal::Signal::SIGTERM);
+    let outcome = super::kill_by_identity(&refusing, id, crate::signal::Sig::Graceful(crate::signal::Signal::Term));
     let super::KillOutcome::NotAttempted(why) = outcome else {
         panic!("expected NotAttempted, got {outcome:?}");
     };
@@ -462,7 +482,11 @@ fn kill_by_identity_spares_a_pidfs_pid_the_kernel_cannot_open_or_shows_as_anothe
     assert!(source.is_some(), "{why:?}");
     assert_eq!(crate::error::first_os_code(&why), Some(libc::EMFILE), "{why:?}");
     let new_owner = FakeKernel::over(&HostKernel).on_pidfs_ino(pid, Ok(Some(ino + 1)));
-    let outcome = super::kill_by_identity(&new_owner, id, nix::sys::signal::Signal::SIGTERM);
+    let outcome = super::kill_by_identity(
+        &new_owner,
+        id,
+        crate::signal::Sig::Graceful(crate::signal::Signal::Term),
+    );
     assert!(matches!(outcome, super::KillOutcome::AlreadyGone), "{outcome:?}");
     release(child);
 }
@@ -636,7 +660,13 @@ fn a_descendant_that_cannot_be_read_makes_hard_kill_and_kill_tree_err_naming_it_
     release_with_a_signalled_root("kill_tree", child, libc::SIGKILL);
 
     let (child, root, _, kernel) = root_with_an_unreadable_descendant();
-    super::terminate(&kernel, root, &super::ByIdentity::new(&kernel, root)).expect("best effort");
+    super::terminate(
+        &kernel,
+        root,
+        &super::ByIdentity::new(&kernel, root),
+        crate::containment::TreeStop::default(),
+    )
+    .expect("best effort");
     release_with_a_signalled_root("terminate", child, libc::SIGTERM);
 }
 
@@ -677,7 +707,13 @@ fn a_descendant_that_cannot_be_read_is_reported_once() {
 
     let (child, root, descendant, kernel) = root_with_an_unreadable_descendant();
     let mark = crate::log_capture::mark();
-    super::terminate(&kernel, root, &super::ByIdentity::new(&kernel, root)).expect("best effort");
+    super::terminate(
+        &kernel,
+        root,
+        &super::ByIdentity::new(&kernel, root),
+        crate::containment::TreeStop::default(),
+    )
+    .expect("best effort");
     let warned = warns_naming(mark, descendant);
     assert_eq!(warned.len(), 1, "{warned:?}");
     assert!(
@@ -912,7 +948,7 @@ fn a_failed_pidfd_call_is_the_same_error_at_the_kill_and_at_the_walk() {
     for (row, kernel, errno) in kernels {
         let (_, cause) = ProcessId::of_with(&kernel, PID);
         let walk = crate::identity::unqueryable(&format!("pid {PID}"), cause);
-        let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
+        let outcome = super::kill_by_identity(&kernel, id, crate::signal::Sig::Graceful(crate::signal::Signal::Term));
         let super::KillOutcome::NotAttempted(kill) = outcome else {
             panic!("{row}: expected NotAttempted, got {outcome:?}");
         };
@@ -959,7 +995,7 @@ fn the_kill_of_a_live_thread_that_leads_no_group_is_unassessable_not_a_refusal()
         .on_pidfd_open_flags(PID, crate::identity::PIDFD_THREAD, Ok(reader.into()))
         .on_pidfs_ino(PID, Ok(Some(100)));
     let id = ProcessId::from_parts_for_test(PID, Key::Pidfs(100));
-    let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
+    let outcome = super::kill_by_identity(&kernel, id, crate::signal::Sig::Graceful(crate::signal::Signal::Term));
     assert_unproved("live thread", outcome, PID);
 }
 
@@ -977,7 +1013,7 @@ fn the_kill_of_a_member_whose_poll_reports_pollerr_is_unassessable_not_a_refusal
         .on_pidfd_open_flags(PID, crate::identity::PIDFD_THREAD, Ok(writer.into()))
         .on_pidfs_ino(PID, Ok(Some(100)));
     let id = ProcessId::from_parts_for_test(PID, Key::Pidfs(100));
-    let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
+    let outcome = super::kill_by_identity(&kernel, id, crate::signal::Sig::Graceful(crate::signal::Signal::Term));
     assert_unproved("POLLERR", outcome, PID);
 }
 
@@ -993,7 +1029,7 @@ fn a_failed_inode_read_is_named_by_the_kill() {
             .on_pidfd_open(PID, Ok(reader.into()))
             .on_pidfs_ino(PID, Err(errno));
         let id = ProcessId::from_parts_for_test(PID, Key::Pidfs(100));
-        let outcome = super::kill_by_identity(&kernel, id, nix::sys::signal::Signal::SIGTERM);
+        let outcome = super::kill_by_identity(&kernel, id, crate::signal::Sig::Graceful(crate::signal::Signal::Term));
         let super::KillOutcome::NotAttempted(Error::Unassessable { detail, source }) = outcome else {
             panic!("{errno}: expected NotAttempted(Unassessable), got {outcome:?}");
         };

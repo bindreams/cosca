@@ -45,18 +45,20 @@ pub(crate) enum SignalTreeCooperativelyOutcome {
     /// its sweep may stand on; `None` when the walk was incomplete or did not run.
     Sent {
         result: Result<(), Error>,
-        earlier: Option<&'static str>,
+        earlier: Option<String>,
         walk: Option<crate::containment::treewalk::WalkToken>,
     },
     /// The call ends now, with this error: nothing was sent, or what the root's number names was
     /// skipped and nothing else is left to signal.
     End(Error),
-    /// [`TerminateOutcome::RootThroughPidfd`](crate::containment::TerminateOutcome::RootThroughPidfd)
+    /// [`TerminateOutcome::RootThroughPidfd`](crate::containment::TerminateOutcome::RootThroughPidfd),
+    /// to be sent the stop's signal, the one the route was given.
     #[cfg(target_os = "linux")]
-    RootThroughPidfd(Skip),
-    /// [`TerminateOutcome::HoldersOnly`](crate::containment::TerminateOutcome::HoldersOnly)
+    RootThroughPidfd(Skip, crate::containment::TreeStop),
+    /// [`TerminateOutcome::HoldersOnly`](crate::containment::TerminateOutcome::HoldersOnly), whose
+    /// holders were sent the stop's signal.
     #[cfg(unix)]
-    HoldersOnly(Skip),
+    HoldersOnly(Skip, crate::containment::TreeStop),
 }
 
 impl Child {
@@ -313,16 +315,17 @@ impl Child {
             return forced;
         }
         let call = crate::containment::treewalk::WalkToken::new();
-        let (outcome, walk) = self.tree.terminate(self.pid(), root, Some(&call));
+        let how = crate::containment::TreeStop::default();
+        let name = how.name();
+        let (outcome, walk) = self.tree.terminate(self.pid(), root, Some(&call), how);
         match outcome {
             TerminateOutcome::Sent { result, earlier, .. } => {
                 SignalTreeCooperativelyOutcome::Sent { result, earlier, walk }
             }
             TerminateOutcome::NotSent(not_sent) => SignalTreeCooperativelyOutcome::End(not_sent),
-            // No SIGTERM walk, so no token.
             TerminateOutcome::RootExited(exited) => {
                 log::debug!(
-                    "graceful_shutdown_tree({}): sent no SIGTERM: {report}",
+                    "graceful_shutdown_tree({}): sent no {name}: {report}",
                     self.pid(),
                     report = crate::error::Report(&exited)
                 );
@@ -334,11 +337,7 @@ impl Child {
             }
             #[cfg(unix)]
             TerminateOutcome::End(skip) => {
-                let call = self.skip_call(
-                    "graceful_shutdown_tree",
-                    crate::containment::dispatch::TreeSignal::Term,
-                    None,
-                );
+                let call = self.skip_call("graceful_shutdown_tree", how.sig(), None);
                 match call.answer(&self.tree, skip, None).answer {
                     Err(e) => SignalTreeCooperativelyOutcome::End(e),
                     // Already killed: nothing to signal.
@@ -350,7 +349,7 @@ impl Child {
                 }
             }
             #[cfg(target_os = "linux")]
-            TerminateOutcome::RootThroughPidfd(skip) => SignalTreeCooperativelyOutcome::RootThroughPidfd(skip),
+            TerminateOutcome::RootThroughPidfd(skip) => SignalTreeCooperativelyOutcome::RootThroughPidfd(skip, how),
             #[cfg(all(unix, not(target_os = "linux")))]
             TerminateOutcome::RootThroughPidfd(_) => unreachable!("only a Linux pidfd names the root exactly"),
             // A tree this handle already killed leaves nothing for the grace and the kill of the holders
@@ -369,7 +368,7 @@ impl Child {
                 }
             }
             #[cfg(unix)]
-            TerminateOutcome::HoldersOnly(skip) => SignalTreeCooperativelyOutcome::HoldersOnly(skip),
+            TerminateOutcome::HoldersOnly(skip) => SignalTreeCooperativelyOutcome::HoldersOnly(skip, how),
             #[cfg(not(unix))]
             TerminateOutcome::End(_) | TerminateOutcome::RootThroughPidfd(_) | TerminateOutcome::HoldersOnly(_) => {
                 unreachable!("only a Unix mechanism skips by the root's number")
@@ -432,7 +431,7 @@ impl HoldersShutdown<'_> {
     }
 }
 
-/// [`TerminateOutcome::RootThroughPidfd`] (Linux), sync and async: the `SIGTERM` through the root's
+/// [`TerminateOutcome::RootThroughPidfd`] (Linux), sync and async: the cooperative signal through the root's
 /// pidfd, the grace, then a kill through the pidfd if the root outlived it. Nothing goes out by the
 /// number. A front that may not be signalled is refused, as for the tree paths.
 ///
@@ -445,10 +444,10 @@ pub(crate) struct PidfdShutdown {
 
 #[cfg(target_os = "linux")]
 impl PidfdShutdown {
-    /// The `SIGTERM` `send` makes, unless `child`'s rule refuses it
+    /// The signal `send` makes, unless `child`'s rule refuses it
     /// ([`OwnedChild::terminate_by`](crate::child::owned::OwnedChild::terminate_by)): the refusal is
     /// the call's error, and the outcome of the send it let through is kept, so a refusal and a failed
-    /// `SIGTERM` stay distinct.
+    /// signal stay distinct.
     pub(crate) fn start(
         child: &crate::child::owned::OwnedChild,
         send: impl FnOnce() -> Result<crate::signal::Sent, Error>,
@@ -456,7 +455,7 @@ impl PidfdShutdown {
         child.terminate_by(|| Ok(send())).map(|term| PidfdShutdown { term })
     }
 
-    /// Whether the `SIGTERM` reached the root, so the grace is waited.
+    /// Whether the signal reached the root, so the grace is waited.
     pub(crate) fn needs_grace(&self) -> bool {
         matches!(self.term, Ok(crate::signal::Sent::Delivered))
     }
@@ -486,15 +485,16 @@ impl PidfdShutdown {
                 Some(kill())
             }
         };
-        let termed = "sent the SIGTERM to the root through its pidfd, which names it exactly";
+        let name = call.signal;
+        let termed = format!("sent the {name} to the root through its pidfd, which names it exactly");
         // The warn says each failure in full; the returned `Unassessable` says only that it failed,
         // for the failure is a peer or a cause of the answer.
         let sent = |with_errors: bool| match (&self.term, &kill) {
             (Err(e), _) if with_errors => format!(
-                "sent nothing: the SIGTERM to the root through its pidfd failed ({})",
+                "sent nothing: the {name} to the root through its pidfd failed ({})",
                 crate::error::Report(e)
             ),
-            (Err(_), _) => "sent nothing: the SIGTERM to the root through its pidfd failed".to_owned(),
+            (Err(_), _) => format!("sent nothing: the {name} to the root through its pidfd failed"),
             (Ok(Sent::Delivered), None) => format!("{termed}, and it exited within the grace; sent nothing else"),
             (Ok(Sent::Delivered), Some(Ok(Sent::Delivered))) => {
                 format!("{termed}, then killed the root through its pidfd after the grace, and sent nothing else")
@@ -586,7 +586,7 @@ pub(crate) mod fault {
         } else {
             super::SignalTreeCooperativelyOutcome::Sent {
                 result: Err(error),
-                earlier: Some("the SIGTERM"),
+                earlier: Some("the SIGTERM".to_owned()),
                 walk: None,
             }
         })

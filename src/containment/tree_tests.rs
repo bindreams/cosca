@@ -6,6 +6,8 @@ use crate::containment::fake::FakeContains;
 use crate::containment::treewalk::Walker;
 use crate::containment::{Containment, Mechanism, Tree};
 use crate::error::Error;
+#[cfg(target_os = "linux")]
+use crate::test_groups::cgroup;
 
 /// `Tree::containment()` is the one source of what a child reports: it answers for each kind of
 /// tree this platform has, with no `Containment` stored beside it.
@@ -254,7 +256,7 @@ fn a_send_on_a_released_tree_that_kept_its_mechanism_asserts() {
     let asserts = |send: &dyn Fn()| catch_unwind(AssertUnwindSafe(send)).is_err();
     assert!(asserts(&|| _ = tree.kill(None)), "kill did not assert");
     assert!(
-        asserts(&|| _ = tree.terminate(1, None, None)),
+        asserts(&|| _ = tree.terminate(1, None, None, crate::containment::TreeStop::default())),
         "terminate did not assert"
     );
     assert!(asserts(&|| _ = tree.would_reach(1, None)), "would_reach did not assert");
@@ -304,4 +306,66 @@ fn a_child_over_a_stated_mechanism_reports_and_signals_through_it() {
     assert_eq!(*sends.lock().unwrap(), ["terminate"]);
     let err = child.wait_tree().expect_err("the fake states no drain edge");
     assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+}
+
+/// A tree whose root and descendant each report the signal they receive
+/// ([`SIGNAL_REPORTING_TREE_ARGV`](crate::test_child::SIGNAL_REPORTING_TREE_ARGV)), sent `SIGUSR1` by the
+/// tree's own terminate: both report `SIGUSR1`, and the outcome's `earlier` names it.
+#[cfg(unix)]
+fn terminate_sends_the_signal_it_is_given(mode: crate::ContainMode, gives: Containment) {
+    use crate::containment::{TerminateOutcome, TreeStop};
+    use crate::signal::Signal;
+
+    let (child, stdin, stdout) = crate::test_child::ready_tree(crate::test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
+        cmd.contain_with(mode);
+    });
+    assert_eq!(child.containment(), gives);
+    {
+        let root = child.proc.hold(child.pid());
+        let (outcome, _) = child
+            .tree
+            .terminate(child.pid(), Some(&root), None, TreeStop::of(Signal::Usr1));
+        let TerminateOutcome::Sent {
+            result: Ok(()),
+            earlier,
+        } = outcome
+        else {
+            panic!("the terminate sent: {outcome:?}");
+        };
+        assert_eq!(earlier.as_deref(), Some("the SIGUSR1"));
+    }
+    assert_eq!(
+        crate::test_child::two_signal_reports(stdout),
+        ["leaf SIGUSR1", "root SIGUSR1"]
+    );
+    child.wait().expect("the root exited on its handler");
+    drop(stdin);
+}
+
+/// Mutant: the leaf sends `SIGTERM` whatever it is given.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_cgroup_leaf_terminate_sends_the_signal_it_is_given(#[fixture(cgroup)] _group: &crate::test_groups::Group) {
+    terminate_sends_the_signal_it_is_given(crate::ContainMode::Strongest, Containment::CgroupV2);
+}
+
+/// Mutant: the group sends `SIGTERM` whatever it is given.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_session_terminate_sends_the_signal_it_is_given() {
+    terminate_sends_the_signal_it_is_given(crate::ContainMode::Session, Containment::Session);
+}
+
+/// Mutant: the walk sends `SIGTERM` whatever it is given.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_tree_walk_terminate_sends_the_signal_it_is_given() {
+    terminate_sends_the_signal_it_is_given(crate::ContainMode::TreeWalk, Containment::TreeWalk);
+}
+
+/// Mutant: the marker's sweep sends `SIGTERM` whatever it is given.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn an_fd_marker_terminate_sends_the_signal_it_is_given() {
+    terminate_sends_the_signal_it_is_given(crate::ContainMode::Strongest, Containment::FdMarker);
 }

@@ -277,7 +277,7 @@ fn a_tree_walk_terminate_tree_sends_the_roots_term_through_the_childs_handle() {
 
     child.terminate_tree().expect("the handle took the SIGTERM");
 
-    assert_eq!(fake.signal_calls(), vec![Sig::Term]);
+    assert_eq!(fake.signal_calls(), vec![Sig::Graceful(crate::signal::Signal::Term)]);
     // A `SIGTERM` the walk sent the root by its identity is a send the log holds at once; the root's
     // exit, below, follows it only when the kernel gets to it.
     assert_eq!(

@@ -119,7 +119,7 @@ pub(crate) enum TerminateOutcome {
     /// check after it found. `earlier` names what a later sweep's error says was sent before it.
     Sent {
         result: Result<(), Error>,
-        earlier: Option<&'static str>,
+        earlier: Option<String>,
     },
     /// Nothing was sent: the call ends with this error.
     NotSent(Error),
@@ -146,11 +146,62 @@ impl TerminateOutcome {
     /// The outcome of a send that answered as `sent`: the outer `Err` is a send that did not go out
     /// ([`NotSent`](Self::NotSent)), the `Ok` what the check after the send found
     /// ([`Sent`](Self::Sent)).
-    pub(crate) fn of(sent: Result<Result<(), Error>, Error>, earlier: Option<&'static str>) -> TerminateOutcome {
+    pub(crate) fn of(sent: Result<Result<(), Error>, Error>, earlier: Option<String>) -> TerminateOutcome {
         match sent {
             Ok(result) => TerminateOutcome::Sent { result, earlier },
             Err(not_sent) => TerminateOutcome::NotSent(not_sent),
         }
+    }
+}
+
+/// The cooperative stop a tree route carries out.
+///
+/// Unix: the signal the route sends to every member it reaches. Windows: it carries nothing; the
+/// `CTRL_BREAK` goes to the root's console group.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TreeStop {
+    #[cfg(unix)]
+    signal: crate::signal::Signal,
+}
+
+impl Default for TreeStop {
+    /// `SIGTERM`; on Windows the `CTRL_BREAK`.
+    fn default() -> TreeStop {
+        TreeStop {
+            #[cfg(unix)]
+            signal: crate::signal::Signal::Term,
+        }
+    }
+}
+
+impl TreeStop {
+    #[cfg(all(unix, test))]
+    pub(crate) fn of(signal: crate::signal::Signal) -> TreeStop {
+        TreeStop { signal }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn signal(&self) -> crate::signal::Signal {
+        self.signal
+    }
+
+    /// The stop's signal as a [`Sig`](crate::signal::Sig), for the routes a kill shares.
+    #[cfg(unix)]
+    pub(crate) fn sig(&self) -> crate::signal::Sig {
+        crate::signal::Sig::Graceful(self.signal)
+    }
+
+    /// The stop's name: "SIGTERM", "CTRL_BREAK".
+    pub(crate) fn name(&self) -> &'static str {
+        #[cfg(unix)]
+        return self.signal.name();
+        #[cfg(windows)]
+        "CTRL_BREAK"
+    }
+
+    /// `name` as a sentence fragment: "the SIGTERM".
+    pub(crate) fn earlier(&self) -> String {
+        format!("the {}", self.name())
     }
 }
 
@@ -164,10 +215,10 @@ pub(crate) use call::SkipCall;
 #[cfg(unix)]
 mod call {
     use super::{Skip, Why};
-    use crate::containment::dispatch::{Keeping, SettleOutcome, Settled, TreeKillOutcome, TreeSignal};
+    use crate::containment::dispatch::{Keeping, SettleOutcome, Settled, TreeKillOutcome};
     use crate::containment::Tree;
     use crate::error::Error;
-    use crate::signal::Sent;
+    use crate::signal::{Sent, Sig};
     use std::sync::Arc;
 
     /// What a skipped call sent, as the warn (each failure in full) and the error (only that it
@@ -205,14 +256,14 @@ mod call {
     pub(crate) struct SkipCall<'a> {
         pub(crate) op: &'a str,
         pub(crate) pid: u32,
-        pub(crate) signal: TreeSignal,
+        pub(crate) signal: Sig,
         pub(crate) earlier: Option<&'a str>,
     }
 
     impl SkipCall<'_> {
         /// The call's answer to `skip`: its kill, or its terminate that ended there. A `Kill` is
         /// settled into the handle's state through [`Tree::settle`], the only writer of it, and a
-        /// `Term` never is.
+        /// `Graceful` never is.
         ///
         /// Nothing was sent by the root's number, and what names the tree by identity (a macOS fd
         /// marker's holders) was signalled by the mechanism. `root`: the signal to the root through
@@ -280,11 +331,11 @@ mod call {
         /// The one settlement of a skip, whatever its kind; `holders` is the sweep by identity of the
         /// marker holders. `Kill` settles as a drop does: the error holds every member the tree is left
         /// with (a failed holders' sweep, a member an earlier kill refused), and the members killed
-        /// again by identity come back with it. `Term` settles nothing and answers the holders' sweep.
+        /// again by identity come back with it. `Graceful` settles nothing and answers the holders' sweep.
         /// The `bool`: the tree was already killed when settled, read under the settlement's lock.
         fn settle_skip(&self, tree: &Tree, holders: Option<Result<(), Error>>) -> (Settled<Result<(), Error>>, bool) {
             match self.signal {
-                TreeSignal::Kill => {
+                Sig::Kill => {
                     let Settled { answer, killed_again } = tree.settle(TreeKillOutcome::SkippedHolders(holders), false);
                     let over_killed = matches!(answer, Ok(SettleOutcome::Skipped { over_killed: true }));
                     (
@@ -295,7 +346,7 @@ mod call {
                         over_killed,
                     )
                 }
-                TreeSignal::Term => {
+                Sig::Graceful(_) => {
                     let answer = holders.unwrap_or(Ok(()));
                     let over_killed = answer.is_ok() && tree.is_killed();
                     (Settled::of(answer), over_killed)
@@ -307,13 +358,16 @@ mod call {
         /// anything.
         fn went(&self, holders: &Option<Result<(), Error>>, root: &Option<Result<Sent, Error>>) -> Went {
             let (sent_root, failed_root) = match self.signal {
-                TreeSignal::Kill => (
-                    "killed the root through its pidfd, which names it exactly",
-                    "the kill of the root",
+                Sig::Kill => (
+                    "killed the root through its pidfd, which names it exactly".to_owned(),
+                    "the kill of the root".to_owned(),
                 ),
-                TreeSignal::Term => (
-                    "sent the SIGTERM to the root through its pidfd, which names it exactly",
-                    "the SIGTERM to the root",
+                Sig::Graceful(signal) => (
+                    format!(
+                        "sent the {} to the root through its pidfd, which names it exactly",
+                        signal.name()
+                    ),
+                    format!("the {} to the root", signal.name()),
                 ),
             };
             // Every row says only what went to the root or the holders, so it stays true beside the
@@ -332,7 +386,7 @@ mod call {
                     nothing: true,
                     ..same("sent nothing")
                 },
-                (None, Some(Ok(Sent::Delivered))) => same(sent_root),
+                (None, Some(Ok(Sent::Delivered))) => same(&sent_root),
                 (None, Some(Ok(Sent::Gone))) => same("sent nothing to the root: its pidfd shows it is gone"),
                 (None, Some(Ok(_))) => same("sent nothing to the root: its handle no longer reaches it"),
                 (None, Some(Err(e))) => Went::of(
@@ -409,14 +463,15 @@ mod call {
         }
 
         /// macOS: the end of a call that signalled an fd marker's holders alone ([`Skip::holders`] of
-        /// `skip` is their `SIGTERM`), after the grace: `kill` is the kill of any holder left, the
+        /// `skip` is their signal), after the grace: `kill` is the kill of any holder left, the
         /// mechanism's own with the same root. One `warn` names what was skipped. The kill's error, or
-        /// `Unassessable`, with the `SIGTERM`'s failure and the refusal's reason below its variant.
+        /// `Unassessable`, with the signal's failure and the refusal's reason below its variant.
         pub(crate) fn holders_settled(&self, tree: &Tree, skip: Skip, kill: TreeKillOutcome) -> Settled<Error> {
             let Settled {
                 answer: settled,
                 killed_again,
             } = tree.settle_for_kill_tree(kill, false, Keeping::Nothing);
+            let name = self.signal;
             // The warn says each failure in full; the returned `Unassessable` says only that it
             // failed, for the failure is a peer of the answer.
             let sent = |with_errors: bool| {
@@ -427,11 +482,11 @@ mod call {
                 };
                 let term = said(skip.holders.as_ref().and_then(|h| h.as_ref().err()));
                 let kill_failed = said(settled.as_ref().err());
-                format!("sent the SIGTERM only to the marker holders{term}, then killed any left after the grace{kill_failed}")
+                format!("sent the {name} only to the marker holders{term}, then killed any left after the grace{kill_failed}")
             };
             let detail = self.skipped_detail(&skip, &sent(false));
             skip.why.warn(&self.skipped_detail(&skip, &sent(true)));
-            // The `SIGTERM`'s failure and the refusal's reason are peers of the kill's failure, as they
+            // The signal's failure and the refusal's reason are peers of the kill's failure, as they
             // are of any answer of a skip.
             let cause = skip.why.cause();
             let term_failed = skip.holders.and_then(Result::err).map(Arc::new);

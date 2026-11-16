@@ -362,7 +362,7 @@ fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
             matches!(&killed, TreeKillOutcome::Skipped(skip) if matches!(skip.why, Why::Untrusted { .. }) && skip.holders.is_none()),
             "{name}: {killed:?}"
         );
-        let (termed, _) = walk().terminate(1234, Some(&root), None);
+        let (termed, _) = walk().terminate(1234, Some(&root), None, crate::containment::TreeStop::default());
         assert!(matches!(termed, TerminateOutcome::End(_)), "{name}: {termed:?}");
     }
 
@@ -398,15 +398,15 @@ fn an_untrusted_root_skips_the_walk_and_leaves_a_marker_its_holders() {
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{name}: {status:?}");
 
         let (marker, mut holder) = held();
-        let (termed, _) = marker.terminate(1234, Some(&root), None);
+        let (termed, _) = marker.terminate(1234, Some(&root), None, crate::containment::TreeStop::default());
         assert!(
             matches!(
                 termed,
                 TerminateOutcome::Sent {
                     result: Ok(()),
-                    earlier: Some("the SIGTERM"),
+                    earlier: Some(ref earlier),
                     ..
-                }
+                } if earlier == "the SIGTERM"
             ),
             "{name}: {termed:?}"
         );

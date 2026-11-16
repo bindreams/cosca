@@ -138,7 +138,11 @@ fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_al
     );
     assert_eq!(
         sends.entries(),
-        [(pid, crate::signal::Sig::Term, crate::send_log::Via::Pidfd)],
+        [(
+            pid,
+            crate::signal::Sig::Graceful(crate::signal::Signal::Term),
+            crate::send_log::Via::Pidfd
+        )],
         "the root is signalled through its pidfd, and nothing else is sent"
     );
     assert_one_untrusted_number_warn(mark, pid);
@@ -159,7 +163,8 @@ fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_al
 #[skuld::test]
 fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its_pidfd_alone() {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
-    use crate::signal::Sig::{Kill, Term};
+    use crate::signal::Sig::{Graceful, Kill};
+    use crate::signal::Signal::Term;
     use crate::test_child::reaped_elsewhere::{term_ignoring_session_cat, ROOT_TERMED_BY_PIDFD};
     use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
@@ -192,7 +197,7 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its
     let via_pidfd = crate::send_log::Via::Pidfd;
     assert_eq!(
         sends.entries(),
-        [(pid, Term, via_pidfd), (pid, Kill, via_pidfd)],
+        [(pid, Graceful(Term), via_pidfd), (pid, Kill, via_pidfd)],
         "the SIGTERM, then the kill, both through the pidfd"
     );
     assert_one_untrusted_number_warn(mark, pid);
@@ -217,7 +222,8 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_escalates_through_its
 fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_that_exited() {
     let _old_kernel = crate::containment::unix::fault::refuse_pidfd_group_flag();
     use crate::graceful_hooks::{at, HookPoint};
-    use crate::signal::Sig::Term;
+    use crate::signal::Sig::Graceful;
+    use crate::signal::Signal::Term;
     use crate::test_child::reaped_elsewhere::ROOT_TERMED_BY_PIDFD;
     use std::os::unix::process::ExitStatusExt as _;
     crate::log_capture::install();
@@ -235,7 +241,7 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_
         move || {
             assert_eq!(
                 sends.entries(),
-                [(pid, Term, crate::send_log::Via::Pidfd)],
+                [(pid, Graceful(Term), crate::send_log::Via::Pidfd)],
                 "the SIGTERM went out before the grace"
             );
             drop(stdin);
@@ -251,7 +257,7 @@ fn graceful_shutdown_tree_of_a_root_its_handle_cannot_read_sends_no_kill_to_one_
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
     assert_eq!(
         sends.entries(),
-        [(pid, Term, crate::send_log::Via::Pidfd)],
+        [(pid, Graceful(Term), crate::send_log::Via::Pidfd)],
         "only the SIGTERM, through the pidfd"
     );
     assert_one_untrusted_number_warn(mark, pid);

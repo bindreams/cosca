@@ -29,7 +29,13 @@ fn walks() -> [(&'static str, Walk); 4] {
         }),
         ("terminate", |p| {
             let hk = &crate::identity::HostKernel;
-            super::terminate(hk, p.id(), &super::ByIdentity::new(hk, p.id())).and_then(super::Terminated::into_result)
+            super::terminate(
+                hk,
+                p.id(),
+                &super::ByIdentity::new(hk, p.id()),
+                crate::containment::TreeStop::default(),
+            )
+            .and_then(super::Terminated::into_result)
         }),
         ("kill_tree", |p| p.kill_tree()),
         ("terminate_tree", |p| p.terminate_tree()),
@@ -70,7 +76,12 @@ fn every_walk_over_a_failed_listing_errors_and_signals_nothing() {
 fn a_walkers_terminate_over_a_failed_listing_says_nothing_was_sent() {
     let (child, id) = live_member();
     let forced = force_blind_snapshot();
-    let (outcome, _) = super::terminate_tree(&crate::identity::HostKernel, id, None);
+    let (outcome, _) = super::terminate_tree(
+        &crate::identity::HostKernel,
+        id,
+        None,
+        crate::containment::TreeStop::default(),
+    );
     drop(forced);
     match outcome {
         crate::containment::TerminateOutcome::NotSent(Error::Unassessable { detail, .. })
@@ -166,7 +177,12 @@ fn every_walk_from_a_root_that_lost_its_pid_signals_nothing_and_a_kill_is_unasse
     release(child);
 
     let (child, _) = live_member();
-    let result = super::terminate(&kernel, stale, &super::ByIdentity::new(&kernel, stale));
+    let result = super::terminate(
+        &kernel,
+        stale,
+        &super::ByIdentity::new(&kernel, stale),
+        crate::containment::TreeStop::default(),
+    );
     assert!(
         matches!(result, Ok(super::Terminated::RootExited(_))),
         "terminate sends nothing: {:?}",

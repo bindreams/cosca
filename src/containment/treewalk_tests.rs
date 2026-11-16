@@ -46,7 +46,12 @@ fn a_tree_call_given_no_owner_sends_the_roots_term_by_identity() {
     let (child, stdin) = crate::test_child::held_uncontained_blocker(false);
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
 
-    match super::terminate_tree(&crate::identity::HostKernel, id, None) {
+    match super::terminate_tree(
+        &crate::identity::HostKernel,
+        id,
+        None,
+        crate::containment::TreeStop::default(),
+    ) {
         (crate::containment::TerminateOutcome::Sent { result: Ok(()), .. }, Some(_)) => {}
         other => panic!("the walk found the root and signalled it: {other:?}"),
     }
@@ -1456,7 +1461,13 @@ fn terminate_warns_once_of_a_member_that_refuses_the_signal(#[fixture(setuid)] _
 
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     let kernel = crate::identity::HostKernel;
-    super::terminate(&kernel, id, &super::ByIdentity::new(&kernel, id)).expect("best effort");
+    super::terminate(
+        &kernel,
+        id,
+        &super::ByIdentity::new(&kernel, id),
+        crate::containment::TreeStop::default(),
+    )
+    .expect("best effort");
 
     let os = std::io::Error::from_raw_os_error(libc::EPERM);
     let warned = crate::log_capture::warns_since(mark, "was sent no SIGTERM");
@@ -1612,7 +1623,12 @@ fn a_walk_is_skipped_by_the_roots_state_only_on_macos() {
                 "kill, {name}: {killed:?}"
             );
         }
-        let (termed, _) = super::terminate_tree(&crate::identity::HostKernel, self::root(), Some(&root));
+        let (termed, _) = super::terminate_tree(
+            &crate::identity::HostKernel,
+            self::root(),
+            Some(&root),
+            crate::containment::TreeStop::default(),
+        );
         assert_eq!(
             matches!(termed, TerminateOutcome::End(_)),
             skipped,

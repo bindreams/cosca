@@ -73,7 +73,11 @@ fn kill_group_and_term_group_reject_non_positive_pgid(#[fixture(stray_signal)] _
 #[skuld::test]
 fn term_group_tree_of_a_non_positive_pgid_says_nothing_was_sent(#[fixture(stray_signal)] _stray: &Group) {
     for pgid in [0, -1, i32::MIN] {
-        match super::term_group_tree(pgid, Some(&StatedRoot::unreaped())) {
+        match super::term_group_tree(
+            pgid,
+            Some(&StatedRoot::unreaped()),
+            crate::containment::TreeStop::default(),
+        ) {
             crate::containment::TerminateOutcome::NotSent(crate::error::Error::Unassessable {
                 source: None, ..
             }) => {}
@@ -337,17 +341,17 @@ mod group_kill_and_terminate {
     fn a_group_terminate_sends_or_skips_by_the_roots_state() {
         for root in [Root::Unreaped, Root::ReapedElsewhere, Root::Unknown] {
             let recorder = fault::record_term_group();
-            let outcome = term_group_tree(PGID, Some(&stated(root)));
+            let outcome = term_group_tree(PGID, Some(&stated(root)), crate::containment::TreeStop::default());
             let sent = recorder.termed();
             match (root, outcome) {
                 (
                     Root::Unreaped,
                     TerminateOutcome::Sent {
                         result: Ok(()),
-                        earlier: Some("the SIGTERM"),
+                        earlier: Some(ref earlier),
                         ..
                     },
-                ) => assert_eq!(sent, [PGID], "{root:?}"),
+                ) if earlier == "the SIGTERM" => assert_eq!(sent, [PGID], "{root:?}"),
                 // Only Linux has a pidfd to name the root with.
                 (Root::Unknown, TerminateOutcome::RootThroughPidfd(skip)) if cfg!(target_os = "linux") => {
                     assert_eq!(sent, Vec::<i32>::new(), "{root:?}");
@@ -394,17 +398,17 @@ fn a_send_refused_for_an_unsure_root_has_the_handles_error_as_its_source() {
 #[skuld::test]
 fn a_skip_over_an_untrusted_root_has_the_handles_error_as_its_source() {
     use super::skipped_group;
-    use crate::containment::dispatch::TreeSignal;
     use crate::containment::root::NumberLook;
     use crate::containment::{SkipCall, Tree};
     use crate::error::Error;
     use crate::signal::RootState;
+    use crate::signal::Sig;
 
     let os_error = std::io::Error::from_raw_os_error(libc::EPERM).to_string();
     let call = SkipCall {
         op: "skip_untrusted_probe_4c2",
         pid: 999_999,
-        signal: TreeSignal::Term,
+        signal: Sig::Graceful(crate::signal::Signal::Term),
         earlier: None,
     };
     let skip = skipped_group(
@@ -435,15 +439,15 @@ fn a_skip_over_an_untrusted_root_has_the_handles_error_as_its_source() {
 #[skuld::test]
 fn a_skip_over_an_untrusted_root_with_a_context_error_keeps_its_os_code() {
     use super::skipped_group;
-    use crate::containment::dispatch::TreeSignal;
     use crate::containment::root::NumberLook;
     use crate::containment::{SkipCall, Tree};
     use crate::signal::RootState;
+    use crate::signal::Sig;
 
     let call = SkipCall {
         op: "skip_untrusted_context_probe",
         pid: 999_999,
-        signal: TreeSignal::Term,
+        signal: Sig::Graceful(crate::signal::Signal::Term),
         earlier: None,
     };
     let handle_error = crate::error::io_context(

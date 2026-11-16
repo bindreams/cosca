@@ -845,9 +845,10 @@ use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::sweep_passes::run_passes;
 use crate::containment::treewalk::{KillOutcome, Listing};
-use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill, Why};
+use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill, TreeStop, Why};
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
+use crate::signal::Sig;
 
 /// What a sweep may do.
 #[derive(Clone, Copy)]
@@ -899,11 +900,11 @@ impl<'k> SweepState<'k> {
     /// `incomplete`, and it is not retried (see [`Marker::sweep_pass`]). Any delivered signal is
     /// `delivered`; only a delivered `SIGKILL` adds `id` to `killed` (the members the kill's wait waits
     /// for), and only when `waited_for` (the root's owner waits for the root).
-    fn record(&mut self, id: ProcessId, signal: nix::sys::signal::Signal, outcome: &KillOutcome, waited_for: bool) {
+    fn record(&mut self, id: ProcessId, signal: Sig, outcome: &KillOutcome, waited_for: bool) {
         match outcome {
             KillOutcome::Terminated => {
                 self.delivered = true;
-                if waited_for && signal == nix::sys::signal::Signal::SIGKILL {
+                if waited_for && signal == Sig::Kill {
                     self.killed.push(id);
                 }
             }
@@ -955,8 +956,8 @@ impl Contains for Marker {
         self.kill_tree(root)
     }
 
-    fn send_terminate(&self, _pid: u32, root: Option<&dyn Root>) -> (TerminateOutcome, Option<Listing>) {
-        (self.terminate_tree(root), None)
+    fn send_terminate(&self, _pid: u32, root: Option<&dyn Root>, how: TreeStop) -> (TerminateOutcome, Option<Listing>) {
+        (self.terminate_tree(root, how), None)
     }
 
     /// The marker pipe's EOF, advisory: see [`TreeDrain`](crate::containment::TreeDrain).
@@ -1227,43 +1228,42 @@ impl Marker {
         // Re-snapshots and re-computes after every pass, repeating while `run_passes` says another
         // pass is needed — no numeric cap (forbidden by this crate's no-arbitrary-loop-limit
         // rule).
-        let still_forking =
-            run_passes(|pass| self.sweep_pass(nix::sys::signal::Signal::SIGKILL, &mut state, pass == 1, scope));
+        let still_forking = run_passes(|pass| self.sweep_pass(Sig::Kill, &mut state, pass == 1, scope));
         Self::finish_sweep(self.handle, state.group_result, state.incomplete, still_forking)
     }
 
     /// See [`hard_kill`](Self::hard_kill)'s doc for what `Err` does and does not mean here, and
     /// `sweep_pass`'s doc for the shared per-pass mechanics. Unlike `hard_kill`, this never
-    /// loops: SIGTERM is catchable and ignorable, so a re-snapshot loop could spin forever
+    /// loops: a cooperative signal is catchable and ignorable, so a re-snapshot loop could spin forever
     /// against a member that traps it and keeps forking on every delivery, hanging
     /// `terminate_tree()` — a blocking API with no timeout — forever. One pass, matching
     /// `term_group`'s own cooperative, best-effort contract; `hard_kill` (`kill_tree`) is the
     /// guaranteed sweep.
-    fn terminate(&self, root: Option<&dyn Root>) -> Result<Result<(), Error>, Error> {
-        self.terminate_impl(Scope::Full(root))
+    fn terminate(&self, root: Option<&dyn Root>, how: TreeStop) -> Result<Result<(), Error>, Error> {
+        self.terminate_impl(Scope::Full(root), how)
     }
 
-    /// The marker's cooperative signal as a tree call decides it, on one look at `root`
+    /// The marker's cooperative stop `how` as a tree call decides it, on one look at `root`
     /// ([`kill_tree`](Self::kill_tree)): the holders alone get it when the root's number names no
     /// one, and then, once the number may name another process, the caller waits the grace and
     /// kills any left ([`TerminateOutcome::HoldersOnly`]). A signal never sent is
     /// [`TerminateOutcome::NotSent`].
-    pub(crate) fn terminate_tree(&self, root: Option<&dyn Root>) -> TerminateOutcome {
-        let holders_only = |except| self.terminate_impl(Scope::HoldersOnly { except });
-        let earlier = Some("the SIGTERM");
+    pub(crate) fn terminate_tree(&self, root: Option<&dyn Root>, how: TreeStop) -> TerminateOutcome {
+        let holders_only = |except| self.terminate_impl(Scope::HoldersOnly { except }, how);
+        let earlier = Some(how.earlier());
         let Some((look, except)) = self.look_at(root) else {
             let result = match self.root {
                 None => holders_only(None),
                 Some(_) => {
                     debug_assert!(false, "a marker with a root was given no root to look at");
-                    self.terminate(root)
+                    self.terminate(root, how)
                 }
             };
             return TerminateOutcome::of(result, earlier);
         };
         let root_pid = root.map_or(0, Root::pid);
         match look {
-            NumberLook::Trusted => TerminateOutcome::of(self.terminate(root), earlier),
+            NumberLook::Trusted => TerminateOutcome::of(self.terminate(root, how), earlier),
             NumberLook::Untrusted(_) => TerminateOutcome::of(holders_only(except), earlier),
             look => match holders_only(None) {
                 Ok(result) => TerminateOutcome::HoldersOnly(self.skip("signal", root_pid, look, result)),
@@ -1272,16 +1272,16 @@ impl Marker {
         }
     }
 
-    /// One `SIGTERM` pass of `scope`: `Err` is a signal never sent (a read end that no longer names
+    /// One pass of `scope` with the stop `how`'s signal: `Err` is a signal never sent (a read end that no longer names
     /// its pipe, or a group that cannot be signalled while no other channel sent anything), `Ok` what
     /// the pass found. A group that cannot be signalled is one failed channel: when another channel
     /// sent, its failure is among what the pass found.
-    fn terminate_impl(&self, scope: Scope<'_>) -> Result<Result<(), Error>, Error> {
+    fn terminate_impl(&self, scope: Scope<'_>, how: TreeStop) -> Result<Result<(), Error>, Error> {
         self.check_read_end_still_valid()?;
-        // A `SIGTERM` is not a kill: nothing it reaches is waited for.
+        // A cooperative signal is not a kill: nothing it reaches is waited for.
         let mut reached = Vec::new();
         let mut state = SweepState::new(&mut reached);
-        self.sweep_pass(nix::sys::signal::Signal::SIGTERM, &mut state, true, scope);
+        self.sweep_pass(how.sig(), &mut state, true, scope);
         let swept = Self::finish_sweep(self.handle, state.group_result, state.incomplete, false);
         match swept {
             // Nothing was sent: the group's failure and the members that refused or could not be assessed
@@ -1451,13 +1451,7 @@ impl Marker {
     /// member was freshly confirmed," not eliminated, and this module makes no claim beyond
     /// that. Each pass's `killpg` is preceded by its own root check
     /// ([`check_number`](crate::containment::check_number)).
-    fn sweep_pass(
-        &self,
-        signal: nix::sys::signal::Signal,
-        state: &mut SweepState<'_>,
-        first_pass: bool,
-        scope: Scope<'_>,
-    ) -> usize {
+    fn sweep_pass(&self, signal: Sig, state: &mut SweepState<'_>, first_pass: bool, scope: Scope<'_>) -> usize {
         let SweepState {
             seen,
             group_result,
@@ -1638,16 +1632,16 @@ impl Marker {
                 // ordinary refusal — preserved as-is here, NOT collapsed into a stringified
                 // `io::Error` (see this fn's doc, and `combine_group_errors`).
                 let this_pass_group_result: Result<(), Error> = match (self.pgid, signal) {
-                    (Some(pgid), nix::sys::signal::Signal::SIGKILL) => {
-                        crate::containment::unix::kill_group(pgid, group_root, killed)
-                    }
-                    (Some(pgid), _) => match crate::containment::unix::term_group_sent(pgid, group_root) {
-                        Ok(checked) => checked,
-                        Err(unsent) => {
-                            *group_unsent = true;
-                            Err(unsent)
+                    (Some(pgid), Sig::Kill) => crate::containment::unix::kill_group(pgid, group_root, killed),
+                    (Some(pgid), Sig::Graceful(signal)) => {
+                        match crate::containment::unix::term_group_sent(pgid, group_root, signal) {
+                            Ok(checked) => checked,
+                            Err(unsent) => {
+                                *group_unsent = true;
+                                Err(unsent)
+                            }
                         }
-                    },
+                    }
                     (None, _) => Ok(()),
                 };
                 *group_result = match (std::mem::replace(group_result, Ok(())), this_pass_group_result) {
@@ -1767,7 +1761,7 @@ impl Marker {
     ///
     /// Returns the outcome of the kill for the caller to fold ([`SweepState::record`]), or `None` for a
     /// confirmed non-holder (nothing to fold: not incomplete, just resolved).
-    fn kill_holder(&self, id: ProcessId, signal: nix::sys::signal::Signal) -> Option<KillOutcome> {
+    fn kill_holder(&self, id: ProcessId, signal: Sig) -> Option<KillOutcome> {
         match holds_marker_query(id.pid(), self.handle) {
             MarkerQuery::NotHeld => {
                 log::debug!(
@@ -1794,7 +1788,7 @@ impl Marker {
                 // sent nothing, leaves no record of a holder killed.
                 #[cfg(test)]
                 if matches!(outcome, KillOutcome::Terminated) {
-                    fault::note_holder_kill(id.pid(), signal);
+                    fault::note_holder_kill(id.pid(), signal.as_nix());
                 }
                 Some(outcome)
             }
