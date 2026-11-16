@@ -24,17 +24,28 @@
 //! - `logon_routes::does_create_process_with_logon_elevate` logs a throwaway administrator on and
 //!   runs the whole report inside the resulting child. That child is a REAL process from a REAL
 //!   logon, and it is where the unelevated answers come from. It needs a disposable host.
-//! - `token_filtering::unelevated_caller_view` derives a medium token from this process's own and
-//!   starts a child under it, needing no account. On a desktop over SSH the lowered-integrity child
-//!   can fail to open the caller's window station and die in loader init (0xC0000142); on a GitHub
-//!   runner it instead SUCCEEDS and produces a full report, so 0xC0000142 is a possible failure of
-//!   this route, not its guaranteed outcome, and the probe fails loudly rather than reporting a
-//!   misleading negative if it happens. Succeeding is not the same as measuring an unelevated
-//!   caller, though: `TokenIsElevated` is fixed at token creation from the source logon's elevation
-//!   type, so on a Default (non-split) admin token — what a GitHub-hosted runner's account has —
-//!   synthesis cannot clear it, and the resulting child is a lowered-integrity ELEVATED caller, not
-//!   an unelevated one. The probe prints and labels which case it measured; read its output before
-//!   trusting its report as the unelevated answer.
+//! - `token_filtering::unelevated_caller_view` derives a SYNTHESISED medium token from this
+//!   process's own (it never gets the genuine filtered token: on a split-admin session
+//!   duplicating `TokenLinkedToken` into a primary token failed with 0x80070542 in a devvm guest
+//!   with elevation type Full) and starts a child under it, needing no account. On a desktop over SSH the
+//!   lowered-integrity child can fail to open the caller's window station and die in loader init
+//!   (0xC0000142); on a GitHub runner it instead SUCCEEDS and produces a full report, so 0xC0000142
+//!   is a possible failure of this route, not its guaranteed outcome, and the probe fails loudly
+//!   rather than reporting a misleading negative if it happens. Succeeding is not the same as
+//!   measuring an unelevated caller, though: `TokenIsElevated` is fixed at token creation, and
+//!   synthesis does not clear it. What each host yields:
+//!   - a Default (non-split) admin token, such as a GitHub-hosted runner's: `TokenIsElevated=true`
+//!     (measured), so the child is a lowered-integrity ELEVATED caller, not an unelevated one;
+//!   - a Default non-admin account: not filtered and not elevated, so `TokenIsElevated=false` is
+//!     expected (not measured);
+//!   - an elevated session of a split-token admin (elevation type Full, seen in a devvm guest):
+//!     also synthesised, and the probe's printed `TokenIsElevated` line is the record of what it
+//!     gave;
+//!   - a Limited token (a split-token admin's filtered session): derived from an already filtered
+//!     token, so `TokenIsElevated=false` is expected (not measured).
+//!
+//!   The probe prints and labels which case it measured; read its output before trusting its
+//!   report as the unelevated answer.
 //!
 //! # Why they are gated, and the two safety gates
 //!
