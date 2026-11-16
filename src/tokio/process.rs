@@ -53,9 +53,9 @@ impl Process {
         self.inner.is_alive()
     }
 
-    /// Resolve when the process exits. Death-watch — yields no `ExitStatus` (only the real
-    /// parent gets one). Non-reaping and signal-free; `Err` only on a watch failure. Dropping the future cancels the watch on every
-    /// platform (the Windows registered wait is unregistered).
+    /// Resolve when the process exits. Death-watch: yields `()`, not an `ExitStatus`.
+    /// Non-reaping and signal-free; `Err` only on a watch failure. Dropping the future cancels the
+    /// watch on every platform (the Windows registered wait is unregistered).
     ///
     /// # Runtime
     ///

@@ -38,7 +38,7 @@ and needs no build of the crate, so it runs in about a second as a prek hook and
 
 ### Doc tests
 
-nextest doesn't run doctests, so CI runs them separately with `cargo test --doc`. cosca has none today. Claude Code agents in this repo deny plain
+nextest doesn't run doctests, so CI runs them separately with `cargo test --doc`. An example that would act on a real process (spawn, open, kill) is `no_run`: it compiles and never runs. Claude Code agents in this repo deny plain
 `cargo test` (`.claude/settings.json`), so an agent can't run that step locally either.
 
 ### Test groups

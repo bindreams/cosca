@@ -345,7 +345,12 @@ fn read_ordered(kernel: &dyn Kernel, pid: RawPid, expected: Option<Key>, ask_par
 
 /// A process identity that stays unique across time: `(pid, key)`.
 /// `Eq`/`Hash` are over the pair, so a recycled PID never compares equal to the
-/// original process.
+/// original process, except on Linux below 6.9, where the key is the `/proc` start time in clock
+/// ticks and a pid taken again within the same tick compares equal (see
+/// [`Process::kill_tree`](crate::Process::kill_tree)).
+///
+/// An id only names a process: to act on one, open a [`Process`](crate::Process) from it; for a
+/// process you spawn, use a [`Child`](crate::Child).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessId {
     pid: RawPid,

@@ -169,6 +169,9 @@ enum Unsent<'a> {
 }
 
 /// A spawned child process the crate owns.
+///
+/// To act on a process this program did not spawn, hold it with a [`Process`](crate::Process); to
+/// name a process exactly, or keep its identity for later, use a [`ProcessId`].
 #[derive(Debug)]
 pub struct Child {
     /// Empty only inside [`tear_down_or_hand_back`](Child::tear_down_or_hand_back), which consumes
