@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, FILETIME, HANDLE};
 use windows::Win32::Security::{
-    AllocateAndInitializeSid, CreateRestrictedToken, DuplicateTokenEx, FreeSid, LogonUserW, SecurityImpersonation,
-    SetTokenInformation, TokenIntegrityLevel, TokenPrimary, DISABLE_MAX_PRIVILEGE, LOGON32_LOGON_BATCH,
-    LOGON32_LOGON_INTERACTIVE, LOGON32_LOGON_NETWORK, LOGON32_LOGON_NETWORK_CLEARTEXT, LOGON32_LOGON_SERVICE,
-    LOGON32_PROVIDER_DEFAULT, PSID, SECURITY_MANDATORY_LABEL_AUTHORITY, SECURITY_NT_AUTHORITY, SID_AND_ATTRIBUTES,
-    TOKEN_ADJUST_DEFAULT, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    AllocateAndInitializeSid, CreateRestrictedToken, FreeSid, LogonUserW, SetTokenInformation, TokenIntegrityLevel,
+    DISABLE_MAX_PRIVILEGE, LOGON32_LOGON_BATCH, LOGON32_LOGON_INTERACTIVE, LOGON32_LOGON_NETWORK,
+    LOGON32_LOGON_NETWORK_CLEARTEXT, LOGON32_LOGON_SERVICE, LOGON32_PROVIDER_DEFAULT, PSID,
+    SECURITY_MANDATORY_LABEL_AUTHORITY, SECURITY_NT_AUTHORITY, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
 };
 use windows::Win32::System::SystemServices::{
     DOMAIN_ALIAS_RID_ADMINS, SECURITY_BUILTIN_DOMAIN_RID, SECURITY_MANDATORY_MEDIUM_RID,
@@ -283,11 +283,25 @@ fn linked_token_chain_here(#[fixture(elevation_routes)] _group: &Group) {
     mark_test_passed(PROBE_MARKERS_ENV);
 }
 
-/// **Question 2, properly.** Derive a medium-integrity token, start this binary under it, and read
-/// its report. Where this process is the FULL half of a UAC split, the medium token is its own
-/// `TokenLinkedToken` — the genuine filtered token Windows made, not an imitation. Otherwise one
-/// is synthesised by disabling the Administrators SID and stamping the medium integrity label,
-/// which is close but NOT identical, and the report says which was used.
+/// **Question 2, properly.** Derive a medium-integrity token from this process's own, start this
+/// binary under it, and read its report. The token is always synthesised (disable the
+/// Administrators SID, stamp the medium integrity label), never the genuine filtered token Windows
+/// made: on a split-admin session `TokenLinkedToken` is readable but comes back at identification
+/// level for a caller without `SeTcbPrivilege`, so it cannot be duplicated into a primary token
+/// (`DuplicateTokenEx` fails with 0x80070542). Synthesis is close but NOT identical to filtering.
+///
+/// What each host yields, by `TokenElevationType`:
+///
+/// - Default (1), an admin account with no UAC split, such as a GitHub-hosted runner: a
+///   lowered-integrity token that still reads `TokenIsElevated=true` (measured).
+/// - Full (2), an elevated session of a split-token admin, such as a `devvm ssh --elevated` guest
+///   session: also synthesised; synthesis does not clear `TokenIsElevated`, so the line below is
+///   the record of what this host gave.
+/// - Limited (3), or a non-admin account: derived from an already filtered token, so
+///   `TokenIsElevated=false` is expected.
+///
+/// The probe prints the provenance and the `TokenIsElevated` line, and labels its verdict by that
+/// flag; read them before trusting the report as an unelevated caller's.
 #[skuld::test]
 fn unelevated_caller_view(#[fixture(elevation_routes)] _group: &Group) {
     let own = open_own_token(TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT)
@@ -300,32 +314,8 @@ fn unelevated_caller_view(#[fixture(elevation_routes)] _group: &Group) {
         elevation_type_name(etype)
     );
 
-    let (medium, provenance) = if etype == 2 {
-        match linked_token(own.0) {
-            Ok(linked) => {
-                let mut primary = HANDLE::default();
-                // SAFETY: `linked` is live; the duplicate is wrapped in a `Token` immediately.
-                unsafe {
-                    DuplicateTokenEx(
-                        linked.0,
-                        TOKEN_ALL_ACCESS,
-                        None,
-                        SecurityImpersonation,
-                        TokenPrimary,
-                        &mut primary,
-                    )
-                }
-                .expect("DuplicateTokenEx on the linked filtered token");
-                (Token(primary), "the genuine UAC-filtered linked token")
-            }
-            Err(e) => panic!("this process is the full half of a split but its linked token is unreadable: {e}"),
-        }
-    } else {
-        (
-            synthesise_medium_token(&own),
-            "a SYNTHESISED medium token (no UAC split on this account)",
-        )
-    };
+    let medium = synthesise_medium_token(&own);
+    let provenance = "a SYNTHESISED medium token (derived from this process's own token)";
     println!("PROBE unelevated-view: medium token provenance = {provenance}");
 
     let mut report = String::new();
@@ -338,17 +328,17 @@ fn unelevated_caller_view(#[fixture(elevation_routes)] _group: &Group) {
     // non-split admin token (`elevation_type=1`) has synthesis disable the Administrators SID and
     // lower integrity to Medium, but `TokenIsElevated` is fixed at token creation from the source
     // logon's elevation type and neither of those adjustments touches it — so the synthesised
-    // token still reads `elevated=true`. Only the genuine `TokenLinkedToken` route (`etype == 2`, a
-    // real UAC split) clears it. Print this prominently instead of asserting it false: on a
-    // non-split admin account it is EXPECTED to stay true, so asserting false would fail this
-    // probe on exactly the hosts it is meant to run on.
+    // token still reads `elevated=true`. Nothing this probe does clears it; only a token that is
+    // not derived from an elevated one is unelevated. Print this prominently instead of asserting
+    // it false: on an elevated session it is EXPECTED to stay true, so asserting false would fail
+    // this probe on exactly the hosts it is meant to run on.
     let medium_is_elevated = token_is_elevated(medium.0)
         .unwrap_or_else(|e| panic!("could not read the medium token's own TokenIsElevated flag: {e}"));
     if medium_is_elevated {
         println!(
             "PROBE unelevated-view: medium token TokenIsElevated=true -- NOT a genuine unelevated \
              view. Integrity was lowered and the Administrators SID disabled, but this token was \
-             derived from a non-split admin token, and TokenIsElevated cannot be cleared that way. \
+             derived from an elevated token, and TokenIsElevated cannot be cleared that way. \
              Read everything below as \"lowered integrity, still an elevated token\", not as an \
              unelevated caller's report."
         );
