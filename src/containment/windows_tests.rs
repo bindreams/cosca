@@ -542,8 +542,12 @@ fn a_drain_that_left_a_settled_member_out_does_not_stand_for_it_later() {
     };
     // A member the caller may not wait on, with no console host beside it: a later wait for it fails.
     let member = crate::identity::windows_fixture::spawn_query_only_without_console(&done);
-    let id = crate::identity::windows_identity_from_handle_result(member.handle(), member.pid())
-        .expect("the restricted member's identity");
+    let id = crate::identity::windows_identity_from_handle_result(
+        &crate::identity::HostKernel,
+        member.handle(),
+        member.pid(),
+    )
+    .expect("the restricted member's identity");
     let job = super::JobHandle::create_empty_for_test();
     job.assign_for_test(member.handle().0)
         .expect("assign the restricted member to the job");
@@ -864,7 +868,7 @@ fn a_kill_wait_reports_a_member_it_waited_for_once_when_the_snapshot_cannot_read
     };
     let member = crate::identity::windows_fixture::spawn_query_only_without_console(&done);
     let pid = member.pid();
-    let id = crate::identity::windows_identity_from_handle_result(member.handle(), pid)
+    let id = crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, member.handle(), pid)
         .expect("the restricted member's identity");
     let job = super::JobHandle::create_empty_for_test();
     job.assign_for_test(member.handle().0)
@@ -1446,8 +1450,12 @@ fn a_kill_wait_names_a_member_it_may_not_wait_on_once() {
         return;
     };
     let member = crate::identity::windows_fixture::spawn_query_only_without_console(&done);
-    let id = crate::identity::windows_identity_from_handle_result(member.handle(), member.pid())
-        .expect("the restricted member's identity");
+    let id = crate::identity::windows_identity_from_handle_result(
+        &crate::identity::HostKernel,
+        member.handle(),
+        member.pid(),
+    )
+    .expect("the restricted member's identity");
     let job = super::JobHandle::create_empty_for_test();
     job.assign_for_test(member.handle().0)
         .expect("assign the restricted member to the job");
@@ -1516,8 +1524,12 @@ fn assert_the_failed_root_is_the_one_error(done: &crate::test_own_process::Compl
     use crate::error::Error;
 
     let member = crate::identity::windows_fixture::spawn_query_only_without_console(done);
-    let id = crate::identity::windows_identity_from_handle_result(member.handle(), member.pid())
-        .expect("the restricted member's identity");
+    let id = crate::identity::windows_identity_from_handle_result(
+        &crate::identity::HostKernel,
+        member.handle(),
+        member.pid(),
+    )
+    .expect("the restricted member's identity");
     let root = crate::os_process::windows::WindowsProcess::open(crate::identity::HostKernel, id)
         .expect("open the restricted member")
         .expect("a live process opens with QUERY alone");

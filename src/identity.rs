@@ -801,6 +801,9 @@ pub(crate) struct UnknownCause {
     /// The `NTSTATUS` of the refused creator-pid query that left the read `Unknown`.
     #[cfg(windows)]
     creator_status: Option<windows::Win32::Foundation::NTSTATUS>,
+    /// The failed `GetProcessTimes` of a held handle that left the read `Unknown`.
+    #[cfg(windows)]
+    creation_token: Option<windows::core::Error>,
     /// The candidate's own failed read, when the proof of its parent failed too and decided the
     /// answer ([`Judged::proved`]): kept beside the parent's cause, which this one is.
     candidate: Option<Box<UnknownCause>>,
@@ -843,6 +846,16 @@ impl UnknownCause {
     pub(crate) fn of_sequence_status(status: windows::Win32::Foundation::NTSTATUS) -> UnknownCause {
         UnknownCause {
             sequence_status: Some(status),
+            ..UnknownCause::default()
+        }
+    }
+
+    /// The cause of a read of a held handle whose `GetProcessTimes` failed with `error` and left it
+    /// `Unknown`.
+    #[cfg(windows)]
+    pub(crate) fn of_creation_token_error(error: windows::core::Error) -> UnknownCause {
+        UnknownCause {
+            creation_token: Some(error),
             ..UnknownCause::default()
         }
     }
@@ -913,9 +926,10 @@ impl UnknownCause {
 
     /// The error for `subject`'s `Unknown` read when the read knows why: [`Error::Unsupported`] for
     /// a refusal ([`into_refusal`](Self::into_refusal)), else [`Error::Unassessable`] with the view's
-    /// reason or the errno that failed; on Windows, `Error::Unassessable` naming the refused
-    /// sequence-number query, else the refused creator-pid query, with the query's `NTSTATUS` as its
-    /// source as a Win32 error ([`nt_io_error`](crate::error::nt_io_error)). `None` when nothing
+    /// reason or the errno that failed; on Windows, `Error::Unassessable` naming the failed creation-time
+    /// read of a held handle, with its Win32 error as the source, else the refused sequence-number
+    /// query, else the refused creator-pid query, with the query's `NTSTATUS` as its source as a Win32
+    /// error ([`nt_io_error`](crate::error::nt_io_error)). `None` when nothing
     /// is known (macOS knows only a failed `kinfo_proc` read): `hidepid`, a racing exit, an access
     /// denial.
     pub(crate) fn into_error(self, subject: &str) -> Option<crate::error::Error> {
@@ -934,6 +948,12 @@ impl UnknownCause {
         }
         #[cfg(windows)]
         {
+            if let Some(failure) = self.creation_token {
+                return Some(crate::error::Error::Unassessable {
+                    detail: format!("{subject} exists but its creation time could not be read"),
+                    source: Some(crate::error::Error::io_cause(crate::error::win32_io_error(failure))),
+                });
+            }
             let refused = self
                 .sequence_status
                 .map(|status| ("process sequence number", status))
@@ -968,6 +988,32 @@ fn start_token_explained(kernel: &dyn Kernel, pid: RawPid) -> (Resolved<Key>, Un
         backend::start_token(pid)
     };
     (token, UnknownCause::default())
+}
+
+#[cfg(windows)]
+impl ProcessId {
+    /// [`of_with`](Self::of_with) for the child `pid` that the caller holds the process handle `held`
+    /// of: the start token is read from `held` and the pid is not opened again, so a refused open
+    /// (an elevated child's, say) cannot answer. The handle pins the pid, so the read names the child
+    /// and needs no check, and it answers [`Resolved::Found`] or [`Resolved::Unknown`], never `Gone`:
+    /// the handle shows the process exists, so a failed read is not evidence of absence (the process
+    /// may exit mid-query). `held` must
+    /// be a handle of `pid`, with `PROCESS_QUERY_LIMITED_INFORMATION`.
+    pub(crate) fn of_held_with(
+        kernel: &dyn Kernel,
+        pid: RawPid,
+        held: std::os::windows::io::BorrowedHandle<'_>,
+    ) -> NumberRead {
+        use std::os::windows::io::AsRawHandle;
+        let handle = windows::Win32::Foundation::HANDLE(held.as_raw_handle());
+        // SAFETY: `held` is a live process handle.
+        let held_pid = unsafe { windows::Win32::System::Threading::GetProcessId(handle) };
+        debug_assert_eq!(held_pid, pid, "the held handle is of the pid it is read as");
+        match windows_identity_from_handle_result(kernel, handle, pid) {
+            Ok(id) => (Resolved::Found(id), UnknownCause::default()),
+            Err(e) => (Resolved::Unknown, UnknownCause::of_creation_token_error(e)),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1129,15 +1175,15 @@ pub(crate) fn windows_handle_identity(handle: windows::Win32::Foundation::HANDLE
 }
 
 /// Build a `ProcessId` from an already-open Windows handle + its pid, reusing the
-/// creation-token read (no second `OpenProcess`). Forwards to the private backend so
-/// the runas launch can derive identity from the owned handle of a possibly-elevated
-/// child without re-opening it by pid.
+/// creation-token read (no second `OpenProcess`), keeping the read's error. Forwards to the
+/// private backend.
 #[cfg(windows)]
 pub(crate) fn windows_identity_from_handle_result(
+    kernel: &dyn Kernel,
     handle: windows::Win32::Foundation::HANDLE,
     pid: RawPid,
 ) -> windows::core::Result<ProcessId> {
-    backend::windows_identity_from_handle_result(handle, pid)
+    backend::windows_identity_from_handle_result(kernel, handle, pid)
 }
 
 #[cfg(test)]

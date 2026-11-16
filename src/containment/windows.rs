@@ -337,7 +337,7 @@ fn member_identity(
         Standing::NotMember => return Ok(None),
         Standing::Unproved(e) => return Err(NotNamed::Membership(e)),
     };
-    let id = crate::identity::windows_identity_from_handle_result(handle, pid);
+    let id = crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, handle, pid);
     #[cfg(test)]
     let id = forced(fault::Step::Identity, Some(pid)).and(id);
     // SAFETY: opened by the caller and kept nowhere else.

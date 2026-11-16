@@ -9,6 +9,7 @@ use std::process::Stdio as StdStdio;
 #[cfg(unix)]
 use std::sync::Arc;
 
+#[cfg(unix)]
 use crate::child::drop_teardown::Torn;
 #[cfg(unix)]
 use crate::child::lifecycle::{wait_to_exit, Settlement};
@@ -850,12 +851,10 @@ fn spawn_reported(
         pid,
         pidfd: owned.os_handle(),
     };
-    let (resolved, cause, mut why) = resolve_identity(
-        owned.kernel(),
-        pid,
-        #[cfg(unix)]
-        &owned,
-    );
+    let (resolved, cause, mut why) = resolve_identity(owned.kernel(), pid, &owned);
+    #[cfg(windows)]
+    let id = windows_identity_or_keep(pid, resolved, cause, &mut why);
+    #[cfg(unix)]
     let id = match resolved {
         crate::identity::Resolved::Found(id) => Ok(id),
         // Kept with no identity; see `Child::id`.
@@ -905,7 +904,6 @@ fn spawn_reported(
             }
             let error = spawn_identity_error(other, cause);
             // A child the teardown could not end comes back in the error.
-            #[cfg(unix)]
             let (
                 detail,
                 Torn {
@@ -926,23 +924,7 @@ fn spawn_reported(
                 },
                 &mut why,
             );
-            // Windows has no elevation front to leave: every child is killed and reaped.
-            #[cfg(windows)]
-            let Torn {
-                fate: child_fate,
-                unreaped,
-                cleanup,
-            } = held_teardown::tear_down_failed_spawn(
-                owned,
-                None,
-                crate::child::owned::teardown::Past::Clean,
-                crate::child::owned::teardown::Disposition::HandBack,
-                policy,
-                &mut why,
-            );
-            let failure = SpawnFailure::started(error, child_fate, unreaped);
-            #[cfg(unix)]
-            let failure = failure.with_detail(detail);
+            let failure = SpawnFailure::started(error, child_fate, unreaped).with_detail(detail);
             // The group's refused kill came before the teardown's failures.
             #[cfg(target_os = "linux")]
             let failure = failure.with_cleanup(group_kill_failure);
@@ -1953,7 +1935,9 @@ pub(crate) fn spawn_identity_error(
 /// - **macOS:** the same, but the peek compares the pid's current unique id with the one the box
 ///   carries; a mismatch is `Foreign`, an unreadable id is an error (`Unknown`), and `Orphaned`
 ///   (held by launchd after its tracer died) is `Gone`, as every foreign verdict is.
-/// - **Windows:** the process handle pins the pid, so the read stands and there is no check.
+/// - **Windows:** the read is of the process handle the box holds, not a second open of the pid (an
+///   elevated child's can be refused), and the handle pins the pid, so the read stands and there is no
+///   check.
 ///
 /// What the check found out, when it could not show the read named our child, comes back as a
 /// [`Diagnosis`]: the failed spawn's teardown carries it in its one `warn`, unless the child is kept
@@ -1962,7 +1946,7 @@ pub(crate) fn spawn_identity_error(
 pub(crate) fn resolve_identity(
     kernel: &dyn crate::identity::Kernel,
     pid: u32,
-    #[cfg(unix)] through: &OwnedChild,
+    through: &OwnedChild,
 ) -> (
     crate::identity::Resolved<ProcessId>,
     crate::identity::UnknownCause,
@@ -1970,9 +1954,9 @@ pub(crate) fn resolve_identity(
 ) {
     use crate::identity::Resolved;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     let (read, cause) = resolve_identity_unchecked(kernel, pid, through.os_handle());
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     let (read, cause) = resolve_identity_unchecked(kernel, pid);
     let Resolved::Found(_) = read else {
         return (read, cause, Diagnosis::default());
@@ -2121,16 +2105,40 @@ pub(crate) fn kept_without_identity(pid: u32, cause: crate::identity::UnknownCau
     error
 }
 
+/// The identity of a just-spawned Windows child from its handle read, or the keep without one
+/// ([`kept_without_identity`], whose error a caller with no containment may drop). Windows is where
+/// the read is of a held handle, which finds the child or cannot say, so a `Gone` is a contract
+/// violation: a debug build asserts it, and a release build keeps the child as `Unknown` does. Unix
+/// tears the child down on `Gone`, so its arm is not served by this.
+#[cfg(windows)]
+pub(crate) fn windows_identity_or_keep(
+    pid: u32,
+    read: crate::identity::Resolved<ProcessId>,
+    cause: crate::identity::UnknownCause,
+    why: &mut Diagnosis,
+) -> Result<ProcessId, Error> {
+    use crate::identity::Resolved;
+
+    match read {
+        Resolved::Found(id) => Ok(id),
+        Resolved::Unknown => Err(kept_without_identity(pid, cause, why)),
+        Resolved::Gone => {
+            debug_assert!(false, "the read of a Windows process handle never says `Gone`");
+            Err(kept_without_identity(pid, cause, why))
+        }
+    }
+}
+
 /// The unchecked half of [`resolve_identity`]: the read, which nothing has yet shown to name our
 /// child, and why it was `Unknown` when the read itself knows. Only `resolve_identity` and tests
 /// call it. A test-only fault seam (`fault`) can force the vanished or unreadable branch.
 ///
-/// On Linux the read is of the held pidfd `held`, not a second open of `pid`. Elsewhere it is by
-/// pid.
+/// On Linux the read is of the held pidfd `held`, and on Windows of the held process handle, not a
+/// second open of `pid`. On macOS it is by pid.
 pub(crate) fn resolve_identity_unchecked(
     kernel: &dyn crate::identity::Kernel,
     pid: u32,
-    #[cfg(target_os = "linux")] held: std::os::fd::BorrowedFd<'_>,
+    #[cfg(any(target_os = "linux", windows))] held: crate::os_process::child::OsHandle<'_>,
 ) -> (crate::identity::Resolved<ProcessId>, crate::identity::UnknownCause) {
     #[cfg(test)]
     {
@@ -2138,6 +2146,7 @@ pub(crate) fn resolve_identity_unchecked(
             fault::capture(ProcessId::of(pid));
             return (crate::identity::Resolved::Unknown, Default::default());
         }
+        #[cfg(unix)]
         if fault::force_identity_vanished() {
             // Capture the child's real identity for the test to check what became of the child,
             // then simulate a vanish so `spawn` takes the identity-failure arm.
@@ -2146,11 +2155,11 @@ pub(crate) fn resolve_identity_unchecked(
             return (crate::identity::Resolved::Gone, Default::default());
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     {
         ProcessId::of_held_with(kernel, pid, held)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         ProcessId::of_with(kernel, pid)
     }
@@ -2174,11 +2183,14 @@ pub(crate) fn attach_or_fault(
         if let Ok(id) = &id {
             fault::capture(crate::identity::Resolved::Found(*id));
         }
-        let mut prepared = prepared;
-        prepared.settle_verdict(
-            #[cfg(target_os = "linux")]
-            child,
-        );
+        #[cfg(unix)]
+        {
+            let mut prepared = prepared;
+            prepared.settle_verdict(
+                #[cfg(target_os = "linux")]
+                child,
+            );
+        }
         // Model a REAL attach failure, which surfaces as `Error::Containment` (not `Error::Io`), so
         // the tests assert production behavior rather than the seam's fabricated variant.
         return Err(Error::Containment {
@@ -2300,6 +2312,7 @@ impl FrontFate {
 /// Settle `prepared`'s placement verdict in a failure arm after the fork, before the child is torn
 /// down, so the teardown never races the verdict's reads. A verdict that says the program never ran
 /// comes back as the attach's not-started failure.
+#[cfg(unix)]
 pub(crate) fn settle_before_teardown(
     prepared: &mut crate::containment::Prepared,
     #[cfg(target_os = "linux")] child: crate::containment::ChildHandle<'_>,
@@ -2402,6 +2415,7 @@ pub(crate) mod fault {
     use crate::relayed_probe::{self, Probe};
 
     thread_local! {
+        #[cfg(unix)]
         static FORCE_VANISH: Cell<bool> = const { Cell::new(false) };
         static FORCE_UNKNOWN: Cell<bool> = const { Cell::new(false) };
         static FORCE_ATTACH_FAIL: Cell<bool> = const { Cell::new(false) };
@@ -2422,6 +2436,9 @@ pub(crate) mod fault {
         static TEARDOWN_REAPS: std::cell::RefCell<Option<Vec<TeardownReap>>> = const { std::cell::RefCell::new(None) };
     }
 
+    /// The identity read says another process holds the pid. Unix only: the read of a Windows handle
+    /// never says so.
+    #[cfg(unix)]
     pub(crate) fn set_force_identity_vanished(on: bool) {
         FORCE_VANISH.with(|f| f.set(on));
     }
@@ -2433,6 +2450,7 @@ pub(crate) mod fault {
     pub(crate) fn force_identity_unknown() -> bool {
         FORCE_UNKNOWN.with(|f| f.get())
     }
+    #[cfg(unix)]
     pub(crate) fn force_identity_vanished() -> bool {
         FORCE_VANISH.with(|f| f.get())
     }

@@ -420,14 +420,15 @@ pub(super) fn order_key(pid: RawPid, key: Key) -> (Resolved<OrderKey>, UnknownCa
     (read.map(|(_, order)| order), cause)
 }
 
-/// Build a `ProcessId` from an already-open Windows process handle and its pid, reusing the
-/// creation-token read. Avoids a second `OpenProcess` (which can fail and would otherwise
-/// force dropping a live elevated child).
+/// Build a `ProcessId` from an already-open Windows process handle and its pid, reading the creation
+/// token through `kernel`. Avoids a second `OpenProcess`, which can be refused for a process
+/// whose own DACL is restricted (an elevated child's, say).
 pub(crate) fn windows_identity_from_handle_result(
+    kernel: &dyn super::Kernel,
     handle: HANDLE,
     pid: RawPid,
 ) -> windows::core::Result<crate::identity::ProcessId> {
-    let start = creation_token_result(handle)?;
+    let start = kernel.creation_token(handle)?;
     Ok(crate::identity::ProcessId { pid, key: start })
 }
 

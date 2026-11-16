@@ -340,7 +340,7 @@ fn settle_root(root: &dyn OsProcess, pid: u32, failed: bool, members: &mut Vec<P
     if failed {
         reported.push(pid);
     }
-    match crate::identity::windows_identity_from_handle_result(raw, pid) {
+    match crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, raw, pid) {
         Ok(id) => members.push(id),
         Err(e) => log::warn!(
             "the identity of the root, pid {pid}, cannot be read, so the drain's snapshot may name it again: \

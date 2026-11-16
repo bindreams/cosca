@@ -262,6 +262,12 @@ pub enum ElevatedVia {
     /// A POSIX backend wrapped the child (the resolved backend that ran).
     Wrapped(Backend),
     /// Windows `ShellExecuteEx("runas")` elevated the child through UAC.
+    ///
+    /// The child is returned by the same spawn as every other Windows child, with no containment. A
+    /// child whose identity cannot be read is returned with [`id`](crate::Child::id) `None` and keeps
+    /// running. One whose pid cannot be read cannot be a [`Child`](crate::Child): it is terminated
+    /// and waited for, and the spawn fails with
+    /// [`ElevationErrorKind::Untracked`](crate::error::ElevationErrorKind::Untracked).
     WindowsUac,
     /// macOS `osascript … with administrator privileges` asked Authorization
     /// Services to run the command as root.

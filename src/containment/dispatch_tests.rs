@@ -2938,23 +2938,23 @@ fn prepare_installs_no_marker_for_an_elevation_derived_spawn() {
     );
 }
 
-/// The spawn's identity read tells an OS refusal from a vanished pid: denial must not read as
-/// vanishing, and absence must not read as denial.
+/// The error of a failed identity read tells an OS refusal from a vanished pid: denial must not read
+/// as vanishing, and absence must not read as denial. The reads are by pid, which can be denied.
 #[cfg(windows)]
 #[skuld::test]
-fn spawn_identity_distinguishes_a_denied_pid_from_a_vanished_one() {
+fn spawn_identity_error_distinguishes_a_denied_pid_from_a_vanished_one() {
     let Some(done) = crate::test_own_process::own_process(
-        crate::test_own_process::test_path!(spawn_identity_distinguishes_a_denied_pid_from_a_vanished_one),
+        crate::test_own_process::test_path!(spawn_identity_error_distinguishes_a_denied_pid_from_a_vanished_one),
         crate::test_spawn::spawn,
     ) else {
         return;
     };
-    use crate::child::spawn::{resolve_identity_unchecked, spawn_identity_error};
+    use crate::child::spawn::spawn_identity_error;
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     let child = crate::identity::windows_fixture::spawn_restricted(&done, PROCESS_SYNCHRONIZE.0);
     assert!(child.is_running(), "precondition: the subject must be live");
 
-    let (read, cause) = resolve_identity_unchecked(&crate::identity::HostKernel, child.pid());
+    let (read, cause) = crate::identity::ProcessId::of_with(&crate::identity::HostKernel, child.pid());
     let denied = spawn_identity_error(read, cause);
     assert!(
         matches!(denied, crate::error::Error::Unassessable { .. }),
@@ -2962,7 +2962,7 @@ fn spawn_identity_distinguishes_a_denied_pid_from_a_vanished_one() {
     );
 
     // Contrast: a pid no process holds.
-    let (read, cause) = resolve_identity_unchecked(&crate::identity::HostKernel, 0xFFFF_FFF0);
+    let (read, cause) = crate::identity::ProcessId::of_with(&crate::identity::HostKernel, 0xFFFF_FFF0);
     let absent = spawn_identity_error(read, cause);
     assert!(
         matches!(&absent, crate::error::Error::Io(e) if e.to_string().contains("reaped by another party")),

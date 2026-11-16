@@ -78,14 +78,12 @@ use windows::Win32::System::Threading::{
     LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
-use crate::child::drop_teardown::Torn;
-use crate::child::owned::teardown::{Disposition, Past};
 use crate::child::owned::OwnedChild;
-use crate::child::spawn::held_teardown::{tear_down_after_failed_windows_attach, tear_down_failed_spawn};
+use crate::child::spawn::held_teardown::tear_down_after_failed_windows_attach;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::{
     attach_or_fault, null_end, reject_batch_path, resolve_identity, resolve_stdio, spawn_lock, ChildEnd, Classify,
-    Diagnosis, ParentStd, SpawnFailure,
+    ParentStd, SpawnFailure,
 };
 use crate::child::Child;
 use crate::command::{Command, CommandInput, EnvOp, ExecutableSpec};
@@ -211,31 +209,8 @@ pub(crate) fn spawn_raw(
         .map_or(TrackedKind::Own, crate::elevation::ElevationReport::tracked);
     let owned = OwnedChild::new(Box::new(WindowsProcess::for_child(kernel, proc, pid)), tracked);
     let raw_handle = owned.os_handle().as_raw_handle();
-    let (resolved, cause, mut why) = resolve_identity(owned.kernel(), pid);
-    let id = match resolved {
-        crate::identity::Resolved::Found(id) => Ok(id),
-        // Kept with no identity; see `Child::id`.
-        crate::identity::Resolved::Unknown => Err(crate::child::spawn::kept_without_identity(pid, cause, &mut why)),
-        other => {
-            // A child the teardown could not end comes back in the failure.
-            let Torn {
-                fate,
-                unreaped,
-                cleanup,
-            } = tear_down_failed_spawn(
-                owned,
-                None,
-                Past::Clean,
-                Disposition::HandBack,
-                policy,
-                &mut Diagnosis::default(),
-            );
-            return Err(
-                SpawnFailure::started(crate::child::spawn::spawn_identity_error(other, cause), fate, unreaped)
-                    .with_cleanup(cleanup),
-            );
-        }
-    };
+    let (resolved, cause, mut why) = resolve_identity(owned.kernel(), pid, &owned);
+    let id = crate::child::spawn::windows_identity_or_keep(pid, resolved, cause, &mut why);
     let id_read = id.as_ref().ok().copied();
     #[cfg(test)]
     crate::child::spawn::fault::run_at(crate::child::spawn::fault::SpawnPoint::BeforeAttach, pid);

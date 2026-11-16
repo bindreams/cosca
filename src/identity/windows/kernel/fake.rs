@@ -13,8 +13,11 @@ use windows::core::HRESULT;
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE};
 
 use super::Kernel;
+use crate::identity::Key;
 
 pub(crate) struct FakeKernel {
+    /// The answers of the `creation_token` calls, in call order; `Err` is the failure's `HRESULT`.
+    creation_tokens: Mutex<VecDeque<Result<Key, HRESULT>>>,
     /// The answers of the `terminate` calls, in call order; `Err` is the failure's `HRESULT`.
     terminates: Mutex<VecDeque<Result<(), HRESULT>>>,
 }
@@ -33,8 +36,18 @@ pub(crate) fn refusing_the_next_terminate() -> FakeKernel {
 impl FakeKernel {
     pub(crate) fn new() -> Self {
         FakeKernel {
+            creation_tokens: Mutex::new(VecDeque::new()),
             terminates: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// The next `creation_token` call after the earlier rows answers `answer`, and reads nothing.
+    pub(crate) fn on_creation_token(mut self, answer: Result<Key, HRESULT>) -> Self {
+        self.creation_tokens
+            .get_mut()
+            .expect("no thread holds the rows")
+            .push_back(answer);
+        self
     }
 
     /// The next `terminate` call after the earlier rows answers `answer`, and calls nothing.
@@ -53,10 +66,27 @@ impl FakeKernel {
             .lock()
             .expect("no thread panics holding the rows")
             .is_empty()
+            && self
+                .creation_tokens
+                .lock()
+                .expect("no thread panics holding the rows")
+                .is_empty()
     }
 }
 
 impl Kernel for FakeKernel {
+    fn creation_token(&self, _handle: HANDLE) -> windows::core::Result<Key> {
+        let row = self
+            .creation_tokens
+            .lock()
+            .expect("no thread panics holding the rows")
+            .pop_front();
+        match row.expect("the fake kernel has no row left for creation_token") {
+            Ok(key) => Ok(key),
+            Err(code) => Err(windows::core::Error::from_hresult(code)),
+        }
+    }
+
     fn terminate(&self, _handle: HANDLE, _exit_code: u32) -> windows::core::Result<()> {
         let row = self
             .terminates

@@ -32,18 +32,19 @@ use windows::Win32::Foundation::LUID;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0};
 use windows::Win32::Security::{
     AddAccessAllowedAce, AdjustTokenPrivileges, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
-    LookupPrivilegeValueW, SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION, LUID_AND_ATTRIBUTES,
-    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DEBUG_NAME, SE_PRIVILEGE_REMOVED,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
+    LookupPrivilegeValueW, SetKernelObjectSecurity, SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION,
+    DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+    SE_DEBUG_NAME, SE_PRIVILEGE_REMOVED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
     JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, QueryFullProcessImageNameW, ResumeThread,
+    GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, ResumeThread,
     TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS, INFINITE,
     PROCESS_CREATION_FLAGS, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    PROCESS_WRITE_DAC,
 };
 
 /// Remove `SeDebugPrivilege` from THIS process's token.
@@ -61,7 +62,7 @@ use windows::Win32::System::Threading::{
 /// `SE_PRIVILEGE_REMOVED` is irreversible for the token and the token is shared by every thread of
 /// the process, so a test running beside others would change what they observe. Calling it
 /// again is harmless: the privilege is already gone.
-fn drop_se_debug_privilege(_alone: &Completion) {
+pub(crate) fn drop_se_debug_privilege(_alone: &Completion) {
     let mut token = HANDLE::default();
     // SAFETY: GetCurrentProcess returns a pseudo-handle needing no close.
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) }
@@ -83,6 +84,31 @@ fn drop_se_debug_privilege(_alone: &Completion) {
     // SAFETY: `token` is an owned handle we are done with.
     unsafe { CloseHandle(token) }.expect("CloseHandle(process token)");
     adjusted.expect("AdjustTokenPrivileges(SeDebugPrivilege, SE_PRIVILEGE_REMOVED)");
+}
+
+/// Gives the live process `pid`, which we created, an empty DACL: no by-pid open of it succeeds
+/// from now on, while a handle already held keeps the rights it was granted. For a test that
+/// restricts a child the code under test has already started. The owner may always write the DACL,
+/// so the open for it is the one that is not refused. A token holding `SeDebugPrivilege` enabled
+/// opens it anyway: the caller first runs [`drop_se_debug_privilege`].
+pub(crate) fn deny_every_open_by_pid(pid: u32) {
+    // SAFETY: a plain open; the handle is closed below.
+    let process = unsafe { OpenProcess(PROCESS_WRITE_DAC, false, pid) }.expect("OpenProcess(PROCESS_WRITE_DAC)");
+    let mut acl_buf = vec![0u32; 2];
+    let acl = acl_buf.as_mut_ptr().cast::<ACL>();
+    // SAFETY: `acl_buf` is 8 bytes, DWORD-aligned, and an empty ACL needs only its 8-byte header.
+    unsafe { InitializeAcl(acl, (acl_buf.len() * 4) as u32, ACL_REVISION) }.expect("InitializeAcl");
+    let mut sd = SECURITY_DESCRIPTOR::default();
+    let psd = PSECURITY_DESCRIPTOR(&mut sd as *mut _ as *mut _);
+    // SAFETY: `sd` is a stack SECURITY_DESCRIPTOR; 1 is the only defined revision.
+    unsafe { InitializeSecurityDescriptor(psd, 1) }.expect("InitializeSecurityDescriptor");
+    // SAFETY: `psd` is initialized; `acl_buf` outlives the call below.
+    unsafe { SetSecurityDescriptorDacl(psd, true, Some(acl), false) }.expect("SetSecurityDescriptorDacl");
+    // SAFETY: `process` is a live handle with `WRITE_DAC`; `psd` holds a DACL.
+    let set = unsafe { SetKernelObjectSecurity(process, DACL_SECURITY_INFORMATION, psd) };
+    // SAFETY: `process` is an owned handle we are done with.
+    unsafe { CloseHandle(process) }.expect("CloseHandle(process)");
+    set.expect("SetKernelObjectSecurity(DACL)");
 }
 
 /// The image path of process `pid`, read on a handle of its own; `None` once it is gone.

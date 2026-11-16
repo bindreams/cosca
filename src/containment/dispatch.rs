@@ -96,6 +96,7 @@ impl Prepared {
     /// The verdict that says the program never ran comes back as the attach's own not-started
     /// failure ([`not_started_failure`]), so a failed spawn that finds the child's identity gone
     /// answers as the attach would have.
+    #[cfg(unix)]
     pub(crate) fn settle_verdict(
         &mut self,
         #[cfg(target_os = "linux")] child: ChildHandle<'_>,

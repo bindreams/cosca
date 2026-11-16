@@ -238,8 +238,9 @@ fn a_look_without_synchronize_reads_the_exit_code() {
         return;
     };
     let child = crate::identity::windows_fixture::spawn_query_only(&done);
-    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
-        .expect("the owned handle always yields an identity");
+    let id =
+        crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, child.handle(), child.pid())
+            .expect("the owned handle always yields an identity");
     let p = open(id).unwrap().expect("a live process opens with QUERY alone");
     assert_access_denied(p.exited(), "a look at a running process");
     assert_access_denied(
@@ -266,8 +267,9 @@ fn kill_of_a_live_process_without_terminate_is_io_access_denied() {
         return;
     };
     let child = crate::identity::windows_fixture::spawn_query_only(&done);
-    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
-        .expect("the owned handle always yields an identity");
+    let id =
+        crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, child.handle(), child.pid())
+            .expect("the owned handle always yields an identity");
     let p = open(id).unwrap().expect("a live process opens with QUERY alone");
     assert_access_denied(p.signal(Sig::Kill), "a kill without PROCESS_TERMINATE");
     assert!(child.is_running(), "nothing killed it");
@@ -328,8 +330,9 @@ fn denied_open_source(
     call: impl FnOnce(ProcessId) -> Result<(), crate::error::Error>,
 ) -> std::io::Error {
     let child = crate::identity::windows_fixture::spawn_unkillable(done);
-    let id = crate::identity::windows_identity_from_handle_result(child.handle(), child.pid())
-        .expect("the owned handle always yields an identity");
+    let id =
+        crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, child.handle(), child.pid())
+            .expect("the owned handle always yields an identity");
     assert!(child.is_running(), "precondition: the subject must be live");
     let err = call(id).expect_err("an unopenable live process is not 'gone'");
     let crate::error::Error::Unassessable { source, .. } = err else {

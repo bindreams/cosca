@@ -815,8 +815,12 @@ mod windows {
             return;
         };
         let member = crate::identity::windows_fixture::spawn_query_only_without_console(&done);
-        let id = crate::identity::windows_identity_from_handle_result(member.handle(), member.pid())
-            .expect("the restricted member's identity");
+        let id = crate::identity::windows_identity_from_handle_result(
+            &crate::identity::HostKernel,
+            member.handle(),
+            member.pid(),
+        )
+        .expect("the restricted member's identity");
         let job = JobHandle::create_empty_for_test();
         job.assign_for_test(member.handle().0)
             .expect("assign the restricted member to the job");

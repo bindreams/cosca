@@ -78,7 +78,7 @@ fn a_teardown_reap_is_recorded_only_while_its_recorder_lives() {
 // the seam (which records the child's real identity); `fault::assert_child_reaped` then proves it
 // was reaped. macOS ends those arms the same way, through its box (see `macos_*` below).
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[skuld::test]
 fn identity_failure_reaps_the_spawned_child() {
     let (mut cmd, teardown) = teardown_blocker();
@@ -246,6 +246,44 @@ fn a_kept_child_without_an_identity_is_killed_and_reaped_on_drop() {
     teardown.assert_killed();
 }
 
+/// A child whose process object refuses every open by pid still has an identity: the spawn reads it
+/// through the handle it holds, which the child's DACL does not govern. The child is restricted from
+/// the spawn's `BeforeIdentity` point.
+///
+/// Mutant: the identity read goes back to opening the child by pid, so it is refused and the child
+/// has no identity.
+#[cfg(windows)]
+#[skuld::test]
+fn a_child_that_refuses_every_open_by_pid_has_an_identity_read_through_the_spawns_handle() {
+    use crate::identity::windows_fixture::{deny_every_open_by_pid, drop_se_debug_privilege};
+    use crate::identity::{HostKernel, ProcessId, Resolved};
+
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(
+            a_child_that_refuses_every_open_by_pid_has_an_identity_read_through_the_spawns_handle
+        ),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    drop_se_debug_privilege(&done);
+    let (mut cmd, teardown) = teardown_blocker();
+    let _restrict = fault::set_at(fault::SpawnPoint::BeforeIdentity, || {
+        deny_every_open_by_pid(fault::spawn_pid())
+    });
+
+    let child = cmd.spawn().expect("a child that refuses opens by pid is spawned");
+
+    let (by_pid, _) = ProcessId::of_with(&HostKernel, child.pid());
+    assert!(
+        matches!(by_pid, Resolved::Unknown),
+        "precondition: no open of the child by pid is granted: {by_pid:?}"
+    );
+    assert!(child.id().is_some(), "the identity is read through the spawn's handle");
+    drop(child);
+    teardown.assert_killed();
+}
+
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
 fn attach_failure_reaps_the_spawned_child() {
@@ -358,8 +396,9 @@ fn assert_a_refused_teardown_kill_is_handed_back(
 /// through it, and keeps nothing of it once the child is gone: the test's own handle on the kernel is
 /// the only one left. The child's box answers from a stated row (Linux, macOS: for a pid no host
 /// process can have; Windows: a `terminate` row, one per backend), and the identity read is counted:
-/// on Linux a `pidfs_ino` of the held pidfd, on macOS a unique-id read of the child's pid. The
-/// cgroup leaf's kernel is `cgroup_a_created_leaf_reads_through_the_kernel_it_was_created_over`'s.
+/// on Linux a `pidfs_ino` of the held pidfd, on macOS a unique-id read of the child's pid, on Windows
+/// the `creation_token` row of the held handle, one per backend (each backend's own key, and every row
+/// consumed). The cgroup leaf's kernel is `cgroup_a_created_leaf_reads_through_the_kernel_it_was_created_over`'s.
 ///
 /// Mutants: the child's box is built over its own kernel; `resolve_identity` reads through a host
 /// kernel; the box is leaked.
@@ -381,7 +420,13 @@ fn a_spawn_hands_its_kernel_to_the_boxes_it_makes_and_keeps_nothing_after() {
     #[cfg(windows)]
     let stated = windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_NOT_SUPPORTED.0);
     #[cfg(windows)]
-    let kernel = Arc::new(FakeKernel::new().on_terminate(Err(stated)).on_terminate(Err(stated)));
+    let kernel = Arc::new(
+        FakeKernel::new()
+            .on_creation_token(Ok(crate::identity::Key::from_raw(1)))
+            .on_creation_token(Ok(crate::identity::Key::from_raw(2)))
+            .on_terminate(Err(stated))
+            .on_terminate(Err(stated)),
+    );
     #[cfg(target_os = "linux")]
     let kernel = Arc::new(FakeKernel::over(&HostKernel).on_signal_probe(
         rustix::process::Pid::from_raw(STATED as i32).expect("a positive pid"),
@@ -440,6 +485,12 @@ fn a_spawn_hands_its_kernel_to_the_boxes_it_makes_and_keeps_nothing_after() {
                 kernel.unique_info_reads(child.pid() as crate::identity::RawPid) >= 1,
                 "the identity check reads the child through the spawn's kernel"
             );
+            #[cfg(windows)]
+            assert_eq!(
+                child.id().map(|id| (id.pid(), id.key())),
+                Some((child.pid(), crate::identity::Key::from_raw(if raw { 2 } else { 1 }))),
+                "the identity is the stated row's, read through the spawn's kernel (raw backend: {raw})"
+            );
             assert!(child.wait().expect("wait").success());
         }
         assert_eq!(
@@ -448,6 +499,9 @@ fn a_spawn_hands_its_kernel_to_the_boxes_it_makes_and_keeps_nothing_after() {
             "no box or leaf of the spawn outlives its child (raw backend: {raw})"
         );
     }
+    // Every row answered: a spawn that read by pid or through a host kernel leaves its `creation_token` row.
+    #[cfg(windows)]
+    assert!(kernel.all_rows_taken(), "each backend's spawn consumed its stated rows");
 }
 
 #[skuld::test]
