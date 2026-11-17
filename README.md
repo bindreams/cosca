@@ -12,6 +12,19 @@ Platform requirements, including Linux 5.6 or newer, are in the crate documentat
 
 The design rules every change follows are in [docs/principles.md](docs/principles.md).
 
+## Stopping a child
+
+`terminate`, `terminate_tree`, `graceful_shutdown` and `graceful_shutdown_tree` ask a child to stop. What they send is an action the command carries, `Command::graceful_stop`: without one, `SIGTERM` on Unix and `Ctrl+Break` on Windows, as `stop::default` says. What each stop reaches on each platform is in the [`cosca::stop`](src/stop.rs) docs.
+
+On Unix, a chosen signal, to the child or its whole tree:
+
+```rust
+let mut command = cosca::run(["my-service"]);
+command.contain().graceful_stop(|target| cosca::stop::send_signal(target, cosca::Signal::Int));
+```
+
+On Windows, Ctrl+C in place of Ctrl+Break goes through a helper process, and reaches a child only if its Ctrl+C is not ignored, which a console process group (`contain` makes one) and a creator that ignores Ctrl+C both cause. The `cosca::stop` docs have the example, with `cosca::init()` first thing in `main`.
+
 ## Running tests
 
 Run the suite with [`cargo nextest`](https://nexte.st/) (`cargo install cargo-nextest`):

@@ -1,9 +1,9 @@
 //! A child's cooperative stop: what [`Child::terminate`](crate::Child::terminate),
 //! [`graceful_shutdown`](crate::Child::graceful_shutdown),
 //! [`terminate_tree`](crate::Child::terminate_tree) and
-//! [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) send before they wait, as an action
-//! the caller chooses ([`Command::graceful_stop`](crate::Command::graceful_stop)) and the functions it is
-//! composed of.
+//! [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) send to ask the child to stop (the
+//! graceful shutdowns then wait, and the other two return), as an action the caller chooses
+//! ([`Command::graceful_stop`](crate::Command::graceful_stop)) and the functions it is composed of.
 //!
 //! An action is a function of a [`StopTarget`], which stands for the child's root or for its tree. The
 //! functions here are the prepared actions, each callable on its own from an action of the caller's:
@@ -22,6 +22,110 @@
 //! composed of sends stops at its first `?`; or `Ok` for a tree this handle already killed. Only the
 //! outcomes the call alone can finish, the root reachable only through its pidfd and an fd marker's
 //! holders alone, answer `Ok` and defer to the call, which finishes them after the action returns.
+//!
+//! # The default
+//!
+//! A child whose command set no action does [`default`]: `SIGTERM` on Unix, `Ctrl+Break` on Windows.
+//! `default` lists which child is sent how, and which it refuses.
+//!
+//! # What a stop reaches
+//!
+//! A stop is a request, which a process may handle or ignore. What it is sent to depends on the target
+//! and, on Unix, on the child's containment mechanism.
+//!
+//! **Unix.** A route that lists the tree (`CgroupV2`, `TreeWalk`) signals the members it listed when the
+//! pass began; a process that enters the tree later is not signalled.
+//!
+//! | Target | Containment | The signal reaches |
+//! |---|---|---|
+//! | root (`terminate`, `graceful_shutdown`) | any | the root alone (`send_signal` says how the handle names it) |
+//! | tree (`terminate_tree`, `graceful_shutdown_tree`) | [`CgroupV2`](crate::Containment::CgroupV2) | the processes in the leaf itself, each pinned by a pidfd before it is signalled; not one in a cgroup under the leaf, nor one in a pid namespace this process cannot see (that one makes the call an error), which `kill_tree` reaches |
+//! | tree | [`ProcessGroup`](crate::Containment::ProcessGroup), [`Session`](crate::Containment::Session) | the members of the process group the root leads (for a session, its first group) when the signal is sent; a member that left the group, as a `setsid` child does, is not reached |
+//! | tree | [`TreeWalk`](crate::Containment::TreeWalk) | the root and every descendant the walk finds from the root's identity; a process reparented away from the tree, or whose identity cannot be read, is not reached |
+//! | tree | [`FdMarker`](crate::Containment::FdMarker) (macOS) | the process group, the root's descendants and the marker's holders; how often each is sent the signal is in the doc of [`Containment::FdMarker`](crate::Containment::FdMarker) |
+//!
+//! A tree call on a child that owns no tree (uncontained, or a member of an ancestor's containment) is
+//! [`Error::Unsupported`] before the action runs.
+//!
+//! A Unix root that something else reaped can change what the routes named by the root's pid reach (a
+//! process group, a session, a macOS fd marker's group and walk): see the section on a child reaped by
+//! something else in [`Command::contain`](crate::Command::contain).
+//!
+//! **Windows.** The prepared sends deliver a console event, and the containment mechanism sends nothing
+//! of its own, so a root target and a tree target reach the same processes:
+//!
+//! | Send | The event reaches |
+//! |---|---|
+//! | direct (`send_ctrl_break_to_group`) | when the child is on this process's console, every process in its console process group: the child, and the descendants that stayed in the group, not a nested contained descendant, which leads a group of its own. A child with a console of its own, or with none, is sent nothing, and the send still answers `Ok` |
+//! | through the proxy (`send_console_event_via_proxy`) | every process on the child's console, in whatever process group: the child, its descendants that share the console, and any other process attached to it |
+//!
+//! Neither reaches a descendant that has a console of its own or was started detached. A root that has
+//! already exited changes what the proxy reaches: it sends nothing, even to descendants on the root's
+//! console, which `graceful_shutdown_tree`'s sweep ends, where the direct send to the group would still
+//! reach them (see `send_console_event_via_proxy`).
+//!
+//! # Choosing an action
+//!
+//! [`Command::graceful_stop`](crate::Command::graceful_stop) takes a function of a [`StopTarget`]; it
+//! gives the signature and says what the call does with the function's answer. Four ways to write one:
+//!
+//! - **Another signal (Unix).** `stop::send_signal(target, Signal::Int)` sends the signal `Signal` names
+//!   in place of `SIGTERM`, to the root or the tree as the target says. A `sudo` or `doas` front relays
+//!   only some signals and an `osascript` front none: `send_signal` lists them.
+//! - **Ctrl+C in place of Ctrl+Break (Windows).**
+//!   `stop::send_console_event_via_proxy(target, CtrlEvent::CtrlC)`. A child created with a console
+//!   process group starts with Ctrl+C ignored, and `contain` creates one: give the child none with
+//!   `Command::new_process_group(false)`, and see `send_console_event_via_proxy` for when Ctrl+C then
+//!   reaches it. The proxy sends to a whole console and refuses one that is this process's own, so this
+//!   suits a child with a console of its own (`no_window()`) or a caller with no console.
+//! - **A composition.** [`StopTarget::wait_exit`] waits up to a grace for the root to exit, so an action
+//!   can ask, wait, and ask harder. [`covers_tree`](StopTarget::covers_tree) tells the action which kind
+//!   of target it has.
+//! - **An action of your own.** Write to a control pipe, call a service's stop.
+//!
+//! ```no_run
+//! # #[cfg(unix)] fn demo() {
+//! use std::time::Duration;
+//!
+//! use cosca::{stop, Command, Signal};
+//!
+//! let mut command = Command::new();
+//! command.arg("my-service");
+//! command.graceful_stop(|target| {
+//!     stop::send_signal(target, Signal::Int)?;
+//!     if !target.wait_exit(Duration::from_secs(5))? {
+//!         stop::send_signal(target, Signal::Term)?;
+//!     }
+//!     Ok(())
+//! });
+//! # }
+//! ```
+//!
+//! ```no_run
+//! # #[cfg(windows)] fn demo() {
+//! use cosca::{stop, Command, CtrlEvent};
+//!
+//! // `cosca::init()` is the first call of this program's `main`.
+//! let mut command = Command::new();
+//! command.arg("worker.exe").contain().no_window().new_process_group(false);
+//! command.graceful_stop(|target| stop::send_console_event_via_proxy(target, CtrlEvent::CtrlC));
+//! # }
+//! ```
+//!
+//! # Limits
+//!
+//! Each is stated in full where it is linked.
+//!
+//! - **The proxy needs a host that called [`init`](crate::init)**, or a `Command::ctrl_proxy` naming the
+//!   `cosca-ctrl-proxy` executable: see `CtrlProxy`.
+//! - **A stop sent before the child has set its console up.** A proxy-routed child can look like one with
+//!   no console: see [`default`].
+//! - **The wait for the proxy has no cap, and the grace starts when the action returns:** see
+//!   `send_console_event_via_proxy` and
+//!   [`Child::graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree).
+//! - **A front that does not relay the signal.** An elevated child behind such a front is refused the
+//!   signal, with nothing sent: see `send_signal`.
+//! - **A direct send's success does not prove delivery:** see [`Child::terminate`](crate::Child::terminate).
 
 mod action;
 pub(crate) mod proxy;
@@ -81,12 +185,15 @@ use crate::error::Error;
 ///   is started.
 /// - Case 3, the child has no console to attach to (`detached()`, or a GUI-subsystem program given
 ///   `no_window`), or has not set one up yet: the proxy finds none and the error names `Child::kill`.
+/// - Case 3, the child's console is also this process's own (one changed console after the spawn): an event
+///   sent there would reach this process too. The error names `stop::send_ctrl_break_to_group`, and
+///   `Command::new_process_group` for a child that leads no group.
 ///
 /// **Before the child has run.** A child that has not set its console up yet looks like one without a
-/// console, so a stop sent to a just-spawned child of case 3 can be refused as the last item says, and
-/// the graceful calls end there with the child running. A caller that has observed output or a handshake
-/// from the child is past that window. A caller that wants the child gone before it has run at all uses
-/// `Child::kill`.
+/// console, so a stop sent to a just-spawned child of case 3 can be refused as in the case 3 item for a
+/// child with no console to attach to, and the graceful calls end there with the child running. A caller
+/// that has observed output or a handshake from the child is past that window. A caller that wants the
+/// child gone before it has run at all uses `Child::kill`.
 ///
 /// The route is chosen from what was true at the spawn, so a caller that changes its own console
 /// afterwards (frees it, attaches another) sets an explicit action. A child that was created on this
@@ -300,7 +407,11 @@ fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Res
 /// ends a process that has no handler for it. A child created with the process-group flag
 /// ([`Command::new_process_group`](crate::Command::new_process_group), which `contain` sets) starts
 /// with Ctrl+C ignored, and so do its descendants unless one re-enables it, so [`CtrlEvent::CtrlC`]
-/// does nothing to such a child. The proxy re-enables Ctrl+C for itself and nothing else.
+/// does nothing to such a child. A child created without the flag inherits this process's own state, which
+/// is ignored when this process was itself created with the flag (a contained cosca child is, by default).
+/// [`CtrlEvent::CtrlC`] therefore reaches a child only when its Ctrl+C is not ignored: a child created
+/// without the flag by a process whose own is not ignored, or one that re-enables it itself. The proxy
+/// re-enables Ctrl+C for itself and nothing else.
 ///
 /// The child must have a console to attach to. A stop sent before the child has set one up (a child
 /// that was just created and has shown the caller no output or handshake) can find none: that is
