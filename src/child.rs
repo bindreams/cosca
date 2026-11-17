@@ -902,14 +902,18 @@ impl Child {
     /// action of the caller's own answers as it chooses: the call does nothing else.
     ///
     /// **Windows: what the default actually signals.** `CTRL_BREAK` is delivered to the root's
-    /// **process group**, not to the tree. A nested contained descendant leads its own
-    /// group and never receives it, so from THIS handle only
+    /// **process group**, not to the tree. A nested contained descendant that leads its own
+    /// group never receives it, so from THIS handle only
     /// [`kill_tree`](Child::kill_tree) reaches every member. The layers this skips are not
     /// beyond a polite shutdown, though: the holder of a nested descendant's own `Child` can
     /// drain it with [`terminate`](Child::terminate) or
     /// [`graceful_shutdown`](Child::graceful_shutdown) before this root is torn down, and a
     /// chain in which each level shuts down its own children drains completely, because a
     /// child that owns a console can politely signal its own group-leading children.
+    ///
+    /// **A root created with `new_process_group(false)` is refused.** The default action returns
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported): nothing is sent, nothing is waited for,
+    /// nothing is killed, and the tree keeps running. [`kill_tree`](Child::kill_tree) ends it.
     ///
     /// **And success here does not prove the event was delivered.** A root that shares no
     /// console with the caller is reported as success and reaches nobody — including a root

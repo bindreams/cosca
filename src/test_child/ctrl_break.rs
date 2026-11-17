@@ -336,12 +336,12 @@ pub(crate) fn spawn_ignoring_root() -> (crate::Child, TcpStream) {
     (child, sock)
 }
 
-/// [`spawn_member`] for the tokio `Child`.
+/// [`spawn_member`] for the tokio `Child`, which is not contained when `mode` is `None`.
 #[cfg(feature = "tokio")]
 pub(crate) async fn spawn_member_async(
     handler: Handler,
     grandchild: Option<Handler>,
-    mode: crate::ContainMode,
+    mode: Option<crate::ContainMode>,
     configure: impl FnOnce(&mut crate::tokio::Command),
 ) -> (crate::tokio::Child, TcpStream, Option<Grandchild>) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
@@ -352,7 +352,9 @@ pub(crate) async fn spawn_member_async(
     for (key, value) in member_env(&addr, handler, grandchild) {
         cmd.env(key, value);
     }
-    cmd.contain_with(mode);
+    if let Some(mode) = mode {
+        cmd.contain_with(mode);
+    }
     configure(&mut cmd);
     let child = cmd.spawn().await.expect("spawn the root");
     let mut sock = accept_root(&listener, child.id().expect(IDENTITY_READ));

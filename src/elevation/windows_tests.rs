@@ -535,6 +535,28 @@ fn elevation_rejects_detached() {
     crate::error::assert_detail_is_not_hard_wrapped(&detail);
 }
 
+/// An explicit process-group request, either value, is refused whoever the caller is: the consent
+/// launch cannot carry it, and the verdict is a property of the request. Unset requests nothing.
+#[skuld::test]
+fn elevation_rejects_an_explicit_process_group_request() {
+    for group in [true, false] {
+        let mut c = crate::test_child::command(Console::Hidden);
+        c.args([r"C:\Windows\System32\whoami.exe"])
+            .elevate()
+            .new_process_group(group);
+        let detail = unsupported_detail(super::reject_unsupported_config(&c));
+        assert!(detail.contains("new_process_group"), "{detail}");
+        crate::error::assert_detail_is_not_hard_wrapped(&detail);
+    }
+}
+
+#[skuld::test]
+fn elevation_accepts_an_unset_process_group() {
+    let mut c = crate::test_child::command(Console::Hidden);
+    c.args([r"C:\Windows\System32\whoami.exe"]).elevate();
+    assert!(super::reject_unsupported_config(&c).is_ok());
+}
+
 #[skuld::test]
 fn elevation_rejects_breakaway() {
     let mut c = crate::test_child::command(Console::Hidden);

@@ -638,12 +638,12 @@ fn spawn_control_on(
 }
 
 /// Asserts `err` is the refusal of a console control event for a child created without the process-group
-/// flag (an uncontained Windows spawn): `Unsupported`, saying the child leads no group of its own.
+/// flag: `Unsupported`, saying it leads no group and naming `Command::new_process_group`.
 #[cfg(windows)]
 #[track_caller]
 pub fn assert_refused_for_no_group(err: &cosca::error::Error) {
     assert!(
-        matches!(err, cosca::error::Error::Unsupported { detail, .. } if detail.contains("leads no console process group")),
+        matches!(err, cosca::error::Error::Unsupported { detail, .. } if detail.contains("leads no console process group") && detail.contains("Command::new_process_group")),
         "got {err:?}"
     );
 }

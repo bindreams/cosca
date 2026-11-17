@@ -47,6 +47,10 @@ pub(crate) struct FlagsRequest {
     pub detached: bool,
     #[cfg(windows)]
     pub breakaway_from_job: bool,
+    /// Whether the child leads a console process group of its own (`CREATE_NEW_PROCESS_GROUP`).
+    /// `None` is "as containment decides": on for a contained spawn, off for an uncontained one.
+    #[cfg(windows)]
+    pub process_group: Option<bool>,
     /// Create the child suspended and leave it so: set by `spawn_suspended` for the duration of
     /// the call, never by a caller. The word then carries `CREATE_SUSPENDED` for every
     /// containment shape, and `attach` does not resume.
@@ -124,7 +128,7 @@ fn reserved_table() -> [Reserved; 10] {
         Reserved {
             bit: CREATE_NEW_PROCESS_GROUP.0,
             name: "CREATE_NEW_PROCESS_GROUP",
-            remedy: "use contain(), which is what makes the child's group addressable",
+            remedy: "use new_process_group()",
         },
         Reserved {
             bit: CREATE_UNICODE_ENVIRONMENT.0,
@@ -207,7 +211,11 @@ pub(crate) fn windows_spawn(
     }
 
     let setup = crate::containment::dispatch::windows_contain_setup(contain, is_root);
-    let mut creation_flags = setup.creation_flags | flags.raw;
+    let mut creation_flags = flags.raw;
+    // Containment's mechanisms do not read this bit.
+    if flags.process_group.unwrap_or(setup.default_group) {
+        creation_flags |= CREATE_NEW_PROCESS_GROUP.0;
+    }
     if flags.no_window {
         creation_flags |= CREATE_NO_WINDOW.0;
     }
@@ -220,7 +228,7 @@ pub(crate) fn windows_spawn(
     if flags.breakaway_from_job {
         creation_flags |= CREATE_BREAKAWAY_FROM_JOB.0;
     }
-    if flags.suspended {
+    if setup.suspend_root || flags.suspended {
         creation_flags |= CREATE_SUSPENDED.0;
     }
     if backend == SpawnBackend::Raw {
@@ -299,4 +307,4 @@ pub(crate) fn classify_spawn_syscall_error(err: Error, flags: FlagsRequest) -> E
 
 #[cfg(all(test, windows))]
 #[path = "flags_tests.rs"]
-mod flags_tests;
+pub(crate) mod flags_tests;

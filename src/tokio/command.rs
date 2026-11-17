@@ -161,6 +161,13 @@ impl Command {
         self
     }
 
+    /// Mirrors [`new_process_group`](crate::Command::new_process_group).
+    #[cfg(windows)]
+    pub fn new_process_group(&mut self, group: bool) -> &mut Command {
+        self.inner.new_process_group(group);
+        self
+    }
+
     /// Spawn outside this process's job object — mirrors
     /// [`breakaway_from_job`](crate::Command::breakaway_from_job), including everything it does
     /// not promise.

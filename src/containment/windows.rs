@@ -29,8 +29,8 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Threading::{
     GetProcessId, GetProcessIdOfThread, OpenProcess, OpenThread, ResumeThread, WaitForMultipleObjects,
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    CREATE_NEW_PROCESS_GROUP, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, THREAD_QUERY_LIMITED_INFORMATION,
+    THREAD_SUSPEND_RESUME,
 };
 
 use crate::containment::tree_kill::{Settled, Unnamed};
@@ -379,7 +379,8 @@ impl crate::containment::Contains for JobHandle {
     }
 
     /// The `CTRL_BREAK` the caller's stop function sent to the root's console group: a nested contained
-    /// descendant leads its own group and never receives it. The job sends nothing and lists nothing.
+    /// descendant that leads a group of its own never receives it. The job sends nothing
+    /// and lists nothing.
     fn send_terminate(
         &self,
         _pid: u32,
@@ -407,23 +408,6 @@ impl crate::containment::Contains for JobHandle {
     fn disarm(&self) -> io::Result<()> {
         JobHandle::disarm(self)
     }
-}
-
-/// Pre-spawn creation flags for a root spawn.
-/// `CREATE_SUSPENDED`: child must not execute before it is inside the job.
-/// `CREATE_NEW_PROCESS_GROUP`: child leads its own console group so
-/// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` can target it.
-/// Shared by the std path and the raw `CreateProcessW` backend via `windows_contain_setup`.
-/// What this word implies about cooperative shutdown is derived by [`ConsoleFacts::of`].
-pub(crate) fn root_flags() -> u32 {
-    CREATE_SUSPENDED.0 | CREATE_NEW_PROCESS_GROUP.0
-}
-
-/// Pre-spawn creation flags for a nested (non-root) spawn.
-/// Only `CREATE_NEW_PROCESS_GROUP` — no suspension needed for nested spawns.
-/// What this word implies about cooperative shutdown is derived by [`ConsoleFacts::of`].
-pub(crate) fn group_flags() -> u32 {
-    CREATE_NEW_PROCESS_GROUP.0
 }
 
 /// What the spawn recorded about a child's console, for the stop functions to read: where a console
@@ -687,8 +671,9 @@ pub(crate) fn probe_job_breakaway() -> JobBreakaway {
 }
 
 /// Send `CTRL_BREAK_EVENT` to the process group rooted at `pid`.
-/// The child was spawned with `CREATE_NEW_PROCESS_GROUP`, making it the leader;
-/// targeting its `pid` reaches the whole group without affecting the parent's console.
+/// The child must have been spawned with `CREATE_NEW_PROCESS_GROUP` (unchecked here;
+/// `stop::send_ctrl_break_to_group` checks it), so its `pid` addresses its whole group without touching
+/// the parent's console.
 /// `CTRL_C` cannot be group-targeted; `CTRL_BREAK` is the only option here.
 ///
 /// **Precondition: the caller holds something that pins `pid`** — the owning `Child`'s process

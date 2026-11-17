@@ -663,6 +663,10 @@ impl Command {
     /// mechanism is a Job Object, which is always offered: a child that cannot be put in it is
     /// terminated and reaped before it runs, and the error names the Job Object.
     ///
+    /// # Windows: the child's process group
+    /// On Windows a contained child also leads a console process group by default; see
+    /// `new_process_group`.
+    ///
     /// # A child reaped by something else
     /// [`wait`](crate::Child::wait) reaps nothing: the root stays a zombie, which pins its number,
     /// until its handle drops, so a tree call after `wait` is as exact as before it. Another reaper in
@@ -794,6 +798,34 @@ impl Command {
         self
     }
 
+    /// Whether the child is created with `CREATE_NEW_PROCESS_GROUP`, leading a console process group
+    /// of its own.
+    ///
+    /// The group is what lets a console event be addressed to the child alone:
+    /// [`stop::send_ctrl_break_to_group`](crate::stop::send_ctrl_break_to_group), which the default
+    /// stop action uses, refuses a child that leads none with [`Error::Unsupported`], because the
+    /// event would otherwise reach its spawner's whole group. Leadership is fixed at creation.
+    ///
+    /// Unset, the child leads a group when it is contained ([`contain`](Self::contain), root and
+    /// nested) and none otherwise. `true` gives one to an uncontained child; `false` takes it from a
+    /// contained one, which stays contained and is killed as before, and cannot be sent a console
+    /// event alone.
+    ///
+    /// A child created with the group starts with `Ctrl+C` ignored, which its descendants inherit
+    /// unless one re-enables it. `Ctrl+Break` is the event that reaches such a child.
+    ///
+    /// A bit set here is not a request for the raw hatch: [`creation_flags`](Self::creation_flags)
+    /// refuses `CREATE_NEW_PROCESS_GROUP`.
+    ///
+    /// An elevated spawn ([`elevate`](Self::elevate)) refuses either value with
+    /// [`Error::Unsupported`], because the consent-prompt launch takes no creation flags.
+    /// Unset is accepted.
+    #[cfg(windows)]
+    pub fn new_process_group(&mut self, group: bool) -> &mut Command {
+        self.flags.process_group = Some(group);
+        self
+    }
+
     /// Spawn the child with `CREATE_BREAKAWAY_FROM_JOB`, so it starts outside whatever job object
     /// this process belongs to.
     ///
@@ -843,7 +875,7 @@ impl Command {
     /// | Flag | Why reserved | Instead |
     /// | --- | --- | --- |
     /// | `CREATE_SUSPENDED` | cosca suspends and resumes a contained root itself | [`spawn_suspended`](Self::spawn_suspended) |
-    /// | `CREATE_NEW_PROCESS_GROUP` | load-bearing for `CTRL_BREAK` delivery to the contained root | [`contain`](Self::contain) |
+    /// | `CREATE_NEW_PROCESS_GROUP` | decides whether the child leads a console process group, which `CTRL_BREAK` delivery needs | [`new_process_group`](Self::new_process_group) |
     /// | `CREATE_NEW_CONSOLE` | measured: the child gets its own *visible* console window, overriding a requested window suppression | none |
     /// | `CREATE_UNICODE_ENVIRONMENT` | both backends supply it structurally, so a caller can neither set nor clear it meaningfully | none |
     /// | `EXTENDED_STARTUPINFO_PRESENT` | it announces a structure only the spawn backend can supply | none |

@@ -184,6 +184,14 @@ pub(crate) fn reject_unsupported_config(cmd: &Command) -> Result<(), Error> {
              system service, not by this process's job.",
         );
     }
+    if flags.process_group.is_some() {
+        return unsupported(
+            "new_process_group() + elevate on Windows",
+            "the runas launch takes a show-command and no creation flags, so \
+             CREATE_NEW_PROCESS_GROUP cannot be expressed. Elevate without new_process_group(), or \
+             spawn unelevated.",
+        );
+    }
     if flags.raw != 0 {
         return unsupported(
             "creation_flags() + elevate on Windows",

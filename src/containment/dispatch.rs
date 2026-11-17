@@ -1391,33 +1391,30 @@ pub(crate) fn unix_setup_for(mode: Option<ContainMode>) -> UnixSetup {
 /// onto the command, the root env marker, `clear_std_handle_inheritance`).
 #[cfg(windows)]
 pub(crate) struct WindowsContain {
-    /// Creation flags to OR into the spawn: `root_flags` (suspend + new group) for a Strongest
-    /// root, `group_flags` (new group only) otherwise; `0` when uncontained (`mode` is `None`).
-    pub creation_flags: u32,
+    /// Whether the root starts suspended: a Strongest root, until it is in its job (assigned in attach).
+    /// Nested, `TreeWalk` and uncontained spawns hold nothing back.
+    pub suspend_root: bool,
+    /// Whether the child leads a console process group when the caller's request does not say: every
+    /// contained spawn, root or nested, and no uncontained one.
+    pub default_group: bool,
     /// Whether this spawn must set the inherited root marker so descendants join THIS group.
     pub marker_env: bool,
 }
 
 /// Decide the Windows pre-spawn containment flags + marker for `req`/`is_root`. Pure — directly
-/// unit-testable. Returns `{ creation_flags: 0, marker_env: false }` when `req.mode` is `None`.
+/// unit-testable. Returns every field `false` when `req.mode` is `None`.
 #[cfg(windows)]
 pub(crate) fn windows_contain_setup(req: &ContainRequest, is_root: bool) -> WindowsContain {
     let Some(mode) = req.mode else {
         return WindowsContain {
-            creation_flags: 0,
+            suspend_root: false,
+            default_group: false,
             marker_env: false,
         };
     };
-    let creation_flags = if is_root && !matches!(mode, ContainMode::TreeWalk) {
-        // Strongest root: suspend + new process group (job assigned in attach).
-        crate::containment::windows::root_flags()
-    } else {
-        // TreeWalk root (no suspend, no job — identity teardown) and all nested spawns:
-        // CREATE_NEW_PROCESS_GROUP only, so `terminate` can CTRL_BREAK the root's group.
-        crate::containment::windows::group_flags()
-    };
     WindowsContain {
-        creation_flags,
+        suspend_root: is_root && !matches!(mode, ContainMode::TreeWalk),
+        default_group: true,
         marker_env: marks_environment(req, is_root),
     }
 }
@@ -2000,8 +1997,8 @@ fn attach_tree(
     #[cfg(windows)]
     {
         if prepared.mode.is_some() && prepared.is_root {
-            // TreeWalk root: no job (spawned with CREATE_NEW_PROCESS_GROUP only);
-            // identity teardown, with CTRL_BREAK to the group as cooperative term.
+            // TreeWalk root: no job; identity teardown, with CTRL_BREAK to the group as cooperative
+            // term when the root leads one (the default for a contained spawn).
             if matches!(prepared.mode, Some(ContainMode::TreeWalk)) {
                 return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?, prepared.kernel))));
             }
@@ -2023,8 +2020,8 @@ fn attach_tree(
                 Ok(None) => {
                     // Fall back to the universal TreeWalk mechanism rather than silently yielding no
                     // containment.
-                    // The root was spawned with CREATE_NEW_PROCESS_GROUP (root_flags), so
-                    // `terminate`'s CTRL_BREAK still reaches the group.
+                    // The root leads its own group unless the caller opted out, so `terminate`'s
+                    // CTRL_BREAK still reaches it.
                     return Ok(Tree::contained(Mechanism::Walk(Walker::new(id?, prepared.kernel))));
                 }
                 Err(failure) => return Err(failure),
