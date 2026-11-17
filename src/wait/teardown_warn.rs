@@ -4,6 +4,18 @@
 
 use std::time::{Duration, Instant};
 
+/// How long a blocking wait on what a teardown killed (a failed spawn's, the armed drop's), or on the
+/// helper a stop starts (the console-event proxy), runs before it warns that it is still waiting.
+/// Messaging only: no wait ends on it. A tokio test opts in with its own threshold, never this one.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "the tokio teardowns read it outside tests; the proxy's wait is Windows-only"
+    )
+)]
+pub(crate) const LATE: Duration = Duration::from_secs(1);
+
 /// When a teardown's warn is due, and how long into the wait that is.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Due {

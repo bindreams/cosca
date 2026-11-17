@@ -55,6 +55,10 @@ mod handle_snapshot;
 #[path = "shim_hooks.rs"]
 mod shim_hooks;
 
+#[cfg(windows)]
+#[path = "proxy_fixture.rs"]
+mod proxy_fixture;
+
 #[cfg(unix)]
 #[path = "setuid_stdin_block.rs"]
 mod setuid_stdin_block;
@@ -371,6 +375,9 @@ fn main() {
     // The elevation shim, when this process was started as one; its test seams come from the environment.
     #[cfg(unix)]
     shim_hooks::init();
+    // Before `init()`, so a copy named for the fixture never plays the real proxy.
+    #[cfg(windows)]
+    proxy_fixture::run_if_named();
     // The console-event proxy, which a test may start as a copy of this binary.
     #[cfg(windows)]
     cosca::init();

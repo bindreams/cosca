@@ -275,6 +275,11 @@ path = "tests/ctrl_proxy_bin.rs"
 harness = false
 
 [[test]]
+name = "ctrl_proxy_host"
+path = "tests/ctrl_proxy_host.rs"
+harness = false
+
+[[test]]
 name = "windows_breakaway"
 path = "tests/windows_breakaway.rs"
 harness = false

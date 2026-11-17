@@ -678,6 +678,7 @@ pub(crate) fn spawn_elevated(
             Some(report),
             policy,
             cmd.stop_action(),
+            cmd.ctrl_proxy_setting(),
         )),
     }
 }

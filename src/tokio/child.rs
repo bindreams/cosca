@@ -438,22 +438,14 @@ pub(crate) fn async_policy() -> crate::child::spawn::policy::SpawnPolicy {
 }
 
 /// How long a failed spawn's teardown, or the armed drop, waits for what it killed before it warns
-/// that it is still waiting. Messaging only: no wait ends on it.
-#[cfg_attr(
-    test,
-    allow(dead_code, reason = "a test opts in with its own threshold, never this one")
-)]
-const LATE: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// How long a failed spawn's teardown, or the armed drop, waits for what it killed before it warns
-/// that it is still waiting: [`LATE`]. In a test, only one that opted in
+/// that it is still waiting: [`LATE`](crate::wait::teardown_warn::LATE). In a test, only one that opted in
 /// (`fault::warn_slow_teardowns_after`): a loaded runner could pass the threshold, and a test's verdict
 /// must not depend on elapsed time.
 pub(crate) fn slow_teardown_after() -> Option<std::time::Duration> {
     #[cfg(test)]
     return fault::slow_teardown_after();
     #[cfg(not(test))]
-    Some(LATE)
+    Some(crate::wait::teardown_warn::LATE)
 }
 
 #[cfg(test)]

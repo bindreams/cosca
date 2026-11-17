@@ -28,7 +28,7 @@ pub(crate) const ADDR_ENV: &str = "COSCA_FIXTURE_CONSOLE_LESS_ADDR";
 /// Require that this process has no console, measured: a zero from `GetConsoleProcessList` is also
 /// how it reports failure, so the error code must say "no console" for the checks not to be
 /// vacuous.
-fn assert_no_console() {
+pub(crate) fn assert_no_console() {
     use windows::Win32::Foundation::{SetLastError, ERROR_INVALID_HANDLE, WIN32_ERROR};
     use windows::Win32::System::Console::GetConsoleProcessList;
 
@@ -68,7 +68,10 @@ fn assert_refused_sends_are_not_sent() {
         std::os::windows::io::AsRawHandle::as_raw_handle(&*leader),
     )
     .expect("assign the group leader to a job");
-    let broken = TreeStop::of_break(crate::containment::windows::terminate(leader.id()));
+    let broken = TreeStop::of_event(
+        crate::stop::proxy::protocol::CtrlEvent::CtrlBreak,
+        crate::containment::SendOutcome::direct(crate::containment::windows::terminate(leader.id())),
+    );
     let (outcome, _) = job.send_terminate(leader.id(), None, broken);
     assert!(
         matches!(outcome, TerminateOutcome::NotSent(_)),
@@ -81,7 +84,10 @@ fn assert_refused_sends_are_not_sent() {
     let id = crate::identity::ProcessId::of(leader.id())
         .found()
         .expect("the live group leader resolves");
-    let broken = TreeStop::of_break(crate::containment::windows::terminate(leader.id()));
+    let broken = TreeStop::of_event(
+        crate::stop::proxy::protocol::CtrlEvent::CtrlBreak,
+        crate::containment::SendOutcome::direct(crate::containment::windows::terminate(leader.id())),
+    );
     let (outcome, _) = crate::containment::treewalk::terminate_tree(&crate::identity::HostKernel, id, None, broken);
     assert!(
         matches!(outcome, TerminateOutcome::NotSent(_)),

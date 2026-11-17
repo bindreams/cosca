@@ -378,9 +378,7 @@ impl crate::containment::Contains for JobHandle {
         )
     }
 
-    /// The `CTRL_BREAK` the caller's stop function sent to the root's console group: a nested contained
-    /// descendant that leads a group of its own never receives it. The job sends nothing
-    /// and lists nothing.
+    /// The console event the caller's stop function sent: the job sends nothing and lists nothing.
     fn send_terminate(
         &self,
         _pid: u32,
@@ -390,9 +388,8 @@ impl crate::containment::Contains for JobHandle {
         crate::containment::TerminateOutcome,
         Option<crate::containment::treewalk::Listing>,
     ) {
-        // One event, so an error is an event that was not sent (`NoConsole` or the OS's refusal).
         let earlier = how.earlier();
-        let sent = crate::containment::TerminateOutcome::of(how.into_sent().map(Ok), Some(earlier));
+        let sent = crate::containment::TerminateOutcome::of_send(how.into_sent(), Some(earlier));
         (sent, None)
     }
 
@@ -736,7 +733,7 @@ fn terminate_with(
     match send() {
         Ok(()) => {
             #[cfg(test)]
-            observe::record_ctrl_break(pid);
+            observe::record_ctrl_send(observe::CtrlSend::Direct { group: pid });
             Ok(())
         }
         Err(e) => Err(classify_ctrl_event_failure(pid, win32_io_error(e), console())),
@@ -749,16 +746,33 @@ fn terminate_with(
 ///   process first. The real handle flags cannot serve as the observation: the mutation is
 ///   process-global and permanent, so any earlier contained spawn in the same test binary would
 ///   already have made it meaningless.
-/// - A `CTRL_BREAK` went out: the group `terminate` addressed, once Windows accepted the event.
-///   The event lands asynchronously, so a test asserts this before it waits for the target's own
+/// - A console event was sent ([`CtrlSend`]): a `CTRL_BREAK` to the group `terminate` addressed, once
+///   Windows accepted the event, or the answer the proxy gave to the one a stop asked it to send. The
+///   event lands asynchronously, so a test asserts this before it waits for the target's own
 ///   evidence, and a call that sent nothing fails that assertion instead of leaving the wait
 ///   unbounded.
 #[cfg(test)]
 pub(crate) mod observe {
     use std::cell::{Cell, RefCell};
+
+    use crate::stop::proxy::protocol::{CtrlEvent, ProxyAnswer};
+
+    /// A send of a console event, as the sender records it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum CtrlSend {
+        /// `CTRL_BREAK` sent from this process to the console process group led by `group`.
+        Direct { group: u32 },
+        /// The proxy answered `answer` to the request to send `event` to `target`'s console.
+        Proxy {
+            target: u32,
+            event: CtrlEvent,
+            answer: ProxyAnswer,
+        },
+    }
+
     thread_local! {
         static INHERITANCE_CLEARED: Cell<bool> = const { Cell::new(false) };
-        static CTRL_BREAKS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+        static CTRL_SENDS: RefCell<Vec<CtrlSend>> = const { RefCell::new(Vec::new()) };
     }
     pub(crate) fn record_inheritance_cleared() {
         INHERITANCE_CLEARED.with(|f| f.set(true));
@@ -766,12 +780,12 @@ pub(crate) mod observe {
     pub(crate) fn take_inheritance_cleared() -> bool {
         INHERITANCE_CLEARED.with(|f| f.replace(false))
     }
-    pub(crate) fn record_ctrl_break(group: u32) {
-        CTRL_BREAKS.with(|b| b.borrow_mut().push(group));
+    pub(crate) fn record_ctrl_send(send: CtrlSend) {
+        CTRL_SENDS.with(|s| s.borrow_mut().push(send));
     }
-    /// The groups sent a `CTRL_BREAK` on this thread since the last take, in order.
-    pub(crate) fn take_ctrl_breaks() -> Vec<u32> {
-        CTRL_BREAKS.with(|b| std::mem::take(&mut *b.borrow_mut()))
+    /// The sends made on this thread since the last take, in order.
+    pub(crate) fn take_ctrl_sends() -> Vec<CtrlSend> {
+        CTRL_SENDS.with(|s| std::mem::take(&mut *s.borrow_mut()))
     }
 }
 

@@ -397,7 +397,7 @@ pub(crate) use root::Seen;
 #[cfg(unix)]
 pub(crate) use root::{check_number, NotItsGroup};
 #[cfg(windows)]
-pub(crate) use skip::CTRL_BREAK;
+pub(crate) use skip::SendOutcome;
 pub(crate) use skip::{earlier_of, Skip, TerminateOutcome, TreeStop};
 #[cfg(unix)]
 pub(crate) use skip::{SkipCall, Why};

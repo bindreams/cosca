@@ -29,6 +29,11 @@ pub(crate) use action::StopAction;
 pub use target::StopTarget;
 pub(crate) use target::{RootRecord, Scope, TreeCall, TreeRecord};
 
+#[cfg(windows)]
+use crate::containment::SendOutcome;
+#[cfg(windows)]
+use proxy::protocol::CtrlEvent;
+
 use crate::error::Error;
 
 /// The stop a child does when its command set none: on Unix, `send_signal` with
@@ -94,7 +99,10 @@ pub fn send_signal(target: &StopTarget<'_>, signal: crate::Signal) -> Result<(),
             Err(refusal)
         }
         (Ok(sent), Scope::Root) => {
-            target.note_root_send(signal.name(), &sent);
+            match &sent {
+                Ok(()) => target.note_root_went_out(signal.name()),
+                Err(refusal) => target.note_refused(refusal),
+            }
             sent
         }
         (Ok(sent), Scope::Tree(_)) => sent,
@@ -106,9 +114,9 @@ pub fn send_signal(target: &StopTarget<'_>, signal: crate::Signal) -> Result<(),
 /// The event reaches every process in the group, so a descendant that stayed in the group is told to stop
 /// too, and a nested contained descendant, which by default leads a group of its own, is not. Windows reports
 /// success for an event aimed at a group in another console and delivers nothing, and this process
-/// cannot rule that case out: a child created with `no_window`, or `detached`, has a console of its own,
-/// and the send answers `Ok` and reaches nobody. Each call also leaves a dead entry in the caller's
-/// console process list.
+/// cannot rule that case out: a child created with `no_window` has a console of its own, and the send
+/// answers `Ok` and reaches nobody; so does a child created with `detached`, which has none. Each call
+/// also leaves a dead entry in the caller's console process list.
 ///
 /// The caller must have a console: [`Error::NoConsole`] otherwise (a GUI program, a service, a detached
 /// process). A tree target is sent the same event; the group is the same.
@@ -128,12 +136,7 @@ pub fn send_ctrl_break_to_group(target: &StopTarget<'_>) -> Result<(), Error> {
     let child = target.child();
     let console = child.console;
     let refusal = if console.elevated {
-        Some(
-            "cosca did not create this child — a system elevation service did — so \
-             whether it leads a console process group of its own is unknown, and an \
-             event addressed to its pid would reach its leader's whole group instead. \
-             Use kill() for a hard teardown.",
-        )
+        Some(ELEVATED_REFUSAL)
     } else if !console.group {
         Some(
             "this child leads no console process group of its own, so no console control \
@@ -145,23 +148,137 @@ pub fn send_ctrl_break_to_group(target: &StopTarget<'_>) -> Result<(), Error> {
         None
     };
     if let Some(detail) = refusal {
-        let refusal = Error::Unsupported {
-            op: "graceful terminate".into(),
-            platform: std::env::consts::OS,
-            detail: detail.into(),
-            source: None,
-        };
-        target.note_refused(&refusal);
-        return Err(refusal);
+        return Err(refuse(target, detail));
     }
-    let sent = crate::containment::windows::terminate(child.pid());
+    conclude(
+        target,
+        CtrlEvent::CtrlBreak,
+        SendOutcome::direct(crate::containment::windows::terminate(child.pid())),
+    )
+}
+
+/// Windows: why a prepared send refuses a child cosca did not create.
+#[cfg(windows)]
+const ELEVATED_REFUSAL: &str = "cosca did not create this child — a system elevation service did — so \
+     whether it leads a console process group of its own is unknown, and an \
+     event addressed to its pid would reach its leader's whole group instead. \
+     Use kill() for a hard teardown.";
+
+/// Windows: [`Error::Unsupported`] for a graceful stop, with `detail`. Nothing was sent.
+#[cfg(windows)]
+fn unsupported(detail: impl Into<String>) -> Error {
+    Error::Unsupported {
+        op: "graceful terminate".into(),
+        platform: std::env::consts::OS,
+        detail: detail.into(),
+        source: None,
+    }
+}
+
+/// Windows: a prepared send's refusal before it sent anything: the error, left as what the last send
+/// did, for either kind of target.
+#[cfg(windows)]
+fn refuse(target: &StopTarget<'_>, detail: impl Into<String>) -> Error {
+    let refusal = unsupported(detail);
+    target.note_refused(&refusal);
+    refusal
+}
+
+/// Windows: a prepared send's end: `sent`, what the send of `event` came to ([`SendOutcome`] says what
+/// each outcome means), left as what the last send did, and, on a tree target, handed to the mechanism's
+/// route, whose answer is the call's.
+#[cfg(windows)]
+fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Result<(), Error> {
     match target.scope() {
-        Scope::Root => {
-            target.note_root_send(crate::containment::CTRL_BREAK, &sent);
-            sent
-        }
-        Scope::Tree(call) => target.send_tree(call, crate::containment::TreeStop::of_break(sent)),
+        Scope::Root => match sent {
+            SendOutcome::Sent(answer) => {
+                target.note_root_went_out(event.name());
+                answer
+            }
+            SendOutcome::RootExited(_) => {
+                target.note_root_went_out(event.name());
+                Ok(())
+            }
+            SendOutcome::NotSent(not_sent) => {
+                target.note_refused(&not_sent);
+                Err(not_sent)
+            }
+        },
+        Scope::Tree(call) => target.send_tree(call, crate::containment::TreeStop::of_event(event, sent)),
     }
+}
+
+/// Windows: sends `event` to the console of the child, from a process of its own, and does not wait
+/// for the child.
+///
+/// A Windows process can send a console event only to the console it is attached to, and a process
+/// attached to one console cannot attach to another. A stop that must reach a child outside this
+/// process's console (a child created with `no_window`, or this process having no console at all, as a
+/// service has none) starts a helper, the proxy, that has no console of its own: the proxy attaches to
+/// the child's console, sends `event` to it, and answers by its exit code. This function starts it
+/// (see [`CtrlProxy`](crate::CtrlProxy) and [`Command::ctrl_proxy`](crate::Command::ctrl_proxy)), waits
+/// for its answer, and returns what the answer means. It runs inside the rules
+/// [`send_ctrl_break_to_group`] runs inside, and a tree target is handed the answer as that function
+/// hands its own.
+///
+/// # What it reaches
+///
+/// The event goes to **every process on the child's console**: the child, its descendants that share the
+/// console, and any other process attached to it, in whatever process group. [`CtrlEvent::CtrlBreak`]
+/// ends a process that has no handler for it. A child created with the process-group flag
+/// ([`Command::new_process_group`](crate::Command::new_process_group), which `contain` sets) starts
+/// with Ctrl+C ignored, and so do its descendants unless one re-enables it, so [`CtrlEvent::CtrlC`]
+/// does nothing to such a child. The proxy re-enables Ctrl+C for itself and nothing else.
+///
+/// The child must have a console to attach to. A stop sent before the child has set one up (a child
+/// that was just created and has shown the caller no output or handshake) can find none: that is
+/// answered [`Error::Unsupported`], as for a child that never has one.
+///
+/// # Waits
+///
+/// The call waits, with no cap, for the proxy's answer, warning once after one second. No state of
+/// another process on the child's console was found to hold the proxy: a handler that never returns,
+/// every thread suspended, a debugger holding the process, and an exit as the event is generated were
+/// measured, and other states were not. A [`CtrlProxy::Executable`](crate::CtrlProxy::Executable) that
+/// is not a proxy and does not exit holds the call, and [`Child::kill`](crate::Child::kill) does not
+/// release it: the wait is for the proxy, not for the child.
+///
+/// # Errors
+///
+/// [`Error::Unsupported`], with nothing sent and, for the first three, nothing started:
+/// - the child is one a system service created on a UAC consent;
+/// - the child has no identity ([`Child::id`](crate::Child::id) is `None`), which the proxy names its
+///   target by, so that a reused pid is never sent an event;
+/// - [`CtrlProxy::HostExecutable`](crate::CtrlProxy::HostExecutable) is set and the host program has
+///   not called [`init`](crate::init);
+/// - the proxy found no console to attach to for the child (the child has none, as a child created
+///   with [`detached`](crate::Command::detached) has none, or has not set it up yet), and the child had
+///   not exited when cosca looked;
+/// - the child's console is this process's own, which an event would reach as well (send
+///   [`Ctrl+Break` to the child's group](send_ctrl_break_to_group) instead);
+/// - the proxy's attach to the child's console was refused, and the child had not exited when cosca
+///   looked;
+/// - the program started does not speak this cosca's protocol version, or is no proxy.
+///
+/// An [`Error::Io`] says nothing was sent: the proxy could not be started, or it failed before it
+/// generated the event. [`Error::Unassessable`] says whether the event was sent is unknown: the proxy
+/// ended without a known answer, or generated the event and did not see its own copy. So does an
+/// [`Error::MayHaveStarted`] from the start of the proxy, which says the proxy may have run.
+///
+/// On a tree target, an error that says the event may have been sent still goes on to the grace and
+/// sweep, with that error as the cooperative error; every other error, `Unsupported` included, ends the
+/// call as a refused send.
+///
+/// # A child that has exited
+///
+/// When the proxy cannot attach and cosca's look finds the child exited, nothing was sent. On a root
+/// target the answer is `Ok`, as [`send_ctrl_break_to_group`] answers an exited child. On a tree target
+/// `terminate_tree` answers an error, and `graceful_shutdown_tree` goes on to its grace, sweep and
+/// reap with no event sent: members that outlived the root are ended by the sweep without a console
+/// event, where the direct send to the group would have reached them.
+#[cfg(windows)]
+pub fn send_console_event_via_proxy(target: &StopTarget<'_>, event: CtrlEvent) -> Result<(), Error> {
+    proxy::send(target, event)
 }
 
 #[cfg(test)]

@@ -28,8 +28,15 @@
 //!    included. A close seen before the call sends nothing ([`ProxyAnswer::NothingSent`]); one that
 //!    races the call is answered [`ProxyAnswer::Unconfirmed`] by the wait.
 //! 9. A wait, with no cap, for the routine to see this process's own copy: only then has the console
-//!    host handed the event out, so only then may the console be left. A process on the console that
-//!    is stuck holds the proxy, and the caller kills it. The wait also ends when the console closes.
+//!    host handed the event out, so only then may the console be left. The wait also ends when the
+//!    console closes. Measured on CI, on both Windows architectures, for both events, with one other
+//!    process on a hidden console (`.tmp/claude/findings/2026-11-17-997-measure4.md`): the proxy saw
+//!    its own copy and answered `Sent` in 2600 of 2600 runs, at the speed of the control (a handler that
+//!    returns at once), while that process was in a handler that never returns (200 runs), had every
+//!    thread suspended (200), was stopped under a debugger (400), or exited as the event was generated
+//!    (1600). So another process on the console did not keep the proxy from seeing its own copy in
+//!    those states. Not measured: a process frozen by a job or created suspended, a handler blocked in
+//!    a close event, several such processes at once, a Windows Terminal console, a session-0 console.
 //! 10. `FreeConsole`; the answer.
 //!
 //! Residual: a control event from another source while the proxy is attached can end it or be taken

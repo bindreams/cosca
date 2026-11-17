@@ -37,7 +37,7 @@ fn a_refused_send_replaces_the_record_of_an_earlier_one() {
     let child = child_over(&FakeProcess::new([]));
 
     let root = StopTarget::from(&child);
-    root.note_root_send("SIGTEST", &Ok(()));
+    root.note_root_went_out("SIGTEST");
     assert!(matches!(
         &*root.root_record.lock().unwrap(),
         Some(RootRecord::Sent("SIGTEST"))
@@ -56,11 +56,6 @@ fn a_refused_send_replaces_the_record_of_an_earlier_one() {
     assert!(
         matches!(tree.into_tree_record(), Some(TreeRecord::NotSent(report)) if report.contains("refused by the test"))
     );
-
-    // A send that answered an error is recorded as the refusal too.
-    let root = StopTarget::from(&child);
-    root.note_root_send("SIGTEST", &Err(refusal()));
-    assert!(matches!(root.into_root_record(), Some(RootRecord::Refused(_))));
 }
 
 /// `wait_exit` waits for the root through the child's handle, for a root target and a tree target alike,

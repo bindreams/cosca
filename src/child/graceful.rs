@@ -161,6 +161,8 @@ impl Child {
     /// before it as what the action's last prepared send sent, or "the stop action" when it sent none, or
     /// when its last send was refused and the action went on (the refusal is logged at `debug`).
     ///
+    /// The grace starts when the stop action returns: an action that does not return holds the call.
+    ///
     /// **Windows: the two halves have different radii.** The cooperative half reaches the
     /// child's whole console group; the forced half reaches only the child. So a descendant
     /// that stayed in the child's group can be left told-to-exit but not killed: if the child
@@ -223,8 +225,10 @@ impl Child {
     /// descendants draining, so the wait watches the **root only** and the sweep always runs
     /// afterward regardless of what it saw.
     ///
-    /// **Windows: what this actually signals, and what the grace costs.** `CTRL_BREAK` goes
-    /// to the root's **process group** only. A nested contained descendant that leads its own
+    /// **Windows: what the default action signals, and what the grace costs.** `CTRL_BREAK` goes
+    /// to the root's **process group** only (an action that sends through the proxy, as
+    /// `stop::send_console_event_via_proxy`, reaches every process on the child's console instead). A
+    /// nested contained descendant that leads its own
     /// group never receives it — so it does not exit during the grace, idles through the
     /// whole window, and is then killed by the sweep (a job object *is* drain-observable, so
     /// this shows up as `grace` fully elapsing rather than draining early, not as a skipped
@@ -243,8 +247,8 @@ impl Child {
     ///
     /// **And success here does not prove the event was delivered.** A root that shares no
     /// console with the caller is reported as success and reaches nobody — including a root
-    /// spawned with [`no_window`](crate::Command::no_window) or
-    /// `detached()`, which gets a console of its own. For such a root
+    /// spawned with [`no_window`](crate::Command::no_window) (a console of its own) or
+    /// `detached()` (none). For such a root
     /// `StopTarget::leads_group_on_our_console` is
     /// `false`: that is what cosca recorded about the *route* from this process, never an authority on
     /// whether a signal will arrive. It is
@@ -287,6 +291,8 @@ impl Child {
     /// (`NoConsole`, an invalid process group, a root whose number may name another process, an fd
     /// marker whose group send failed with nothing else signalled) returns at once: there is
     /// nothing for a grace wait or sweep to act on yet.
+    ///
+    /// **The grace starts when the stop action returns.** An action that does not return holds the call.
     ///
     /// **An action's error ends the call before its grace unless its last prepared send went out.** When
     /// the last prepared send of the child's stop action was refused, or the action made none, the
@@ -630,7 +636,10 @@ pub(crate) mod fault {
         #[cfg(unix)]
         return crate::containment::TreeStop::default();
         #[cfg(windows)]
-        crate::containment::TreeStop::of_break(Ok(()))
+        crate::containment::TreeStop::of_event(
+            crate::stop::proxy::protocol::CtrlEvent::CtrlBreak,
+            crate::containment::SendOutcome::Sent(Ok(())),
+        )
     }
 
     /// Force the next `kill_tree` call inside `graceful_shutdown_tree` on THIS thread — the
