@@ -204,6 +204,26 @@ impl Capture {
         steps.sort_by_key(|&(place, _)| place);
         steps.into_iter().map(|(_, step)| step).collect()
     }
+
+    /// Ends the capture: `Err` unless it holds an attempted send of `signo` (to a group, a group's leader, or
+    /// a member by its identity), whatever the syscall answered. Lets a test's stop action fail by assertion
+    /// when its send sent nothing. A check of the root is no send. A cgroup leaf's sends to its members are
+    /// recorded elsewhere and are not seen here.
+    #[cfg(unix)]
+    pub(crate) fn require_a_send(self, signo: i32) -> Result<(), crate::error::Error> {
+        let attempted = self.ordered_steps().into_iter().any(|step| match step {
+            OrderedStep::Group(GroupStep::Group(_, sent) | GroupStep::Leader(_, sent)) => sent == signo,
+            OrderedStep::Identity(_, sent) => sent == signo,
+            OrderedStep::Group(_) => false,
+        });
+        if attempted {
+            Ok(())
+        } else {
+            Err(crate::error::Error::Io(std::io::Error::other(format!(
+                "no send of signal {signo} was attempted"
+            ))))
+        }
+    }
 }
 
 impl Capture {

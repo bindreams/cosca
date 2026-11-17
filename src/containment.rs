@@ -74,7 +74,11 @@ pub enum Containment {
     /// unconditional instance of the reuse risk beyond pass 1's existing one (see
     /// `Marker::sweep_pass`, `src/containment/fdmarker.rs`, for the full argument and its
     /// stated limits). `terminate_tree` (SIGTERM, catchable and ignorable) takes exactly one
-    /// pass and does not chase forks.
+    /// pass and does not chase forks. In that pass, and in a chosen signal sent to a tree, the signal
+    /// goes to the tree's process group, where it has one, and once by its identity to each member the
+    /// walk or the marker scan finds; a member of the group that the walk or the scan also finds is sent
+    /// it twice. Two sends of one signal pending together merge, so a handler that keeps its process
+    /// running runs once or twice.
     ///
     /// Naive-child containment, not a sandbox. A member leaves the set by closing the
     /// descriptor, by being spawned through a path that scrubs inherited descriptors (Python's
