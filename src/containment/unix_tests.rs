@@ -67,6 +67,100 @@ fn kill_group_and_term_group_reject_non_positive_pgid(#[fixture(stray_signal)] _
     }
 }
 
+/// A group that the members cannot be sent through is the outer `Err`: an invalid group id, and a root
+/// whose check fails (its number may name another group), each before anything is listed or sent.
+///
+/// Mutants: the root's check is skipped; an invalid group id is listed.
+#[skuld::test]
+fn term_group_members_sends_nothing_through_a_group_it_cannot_use(#[fixture(stray_signal)] _stray: &Group) {
+    let sent = std::collections::HashSet::new();
+    for pgid in [0, -1, i32::MIN] {
+        let err = super::term_group_members(
+            &crate::identity::HostKernel,
+            pgid,
+            crate::Signal::Term,
+            Some(&StatedRoot::unreaped()),
+            &sent,
+            &mut Vec::new(),
+        )
+        .expect_err("an invalid group id is nothing sent");
+        assert!(
+            matches!(err, crate::error::Error::Unassessable { .. }),
+            "{pgid}: {err:?}"
+        );
+    }
+    // The group is a valid number that no process of ours leads: only the root's check stops the listing.
+    let reaped = StatedRoot::with_state(std::process::id(), || crate::signal::RootState::Reaped);
+    let err = super::term_group_members(
+        &crate::identity::HostKernel,
+        i32::MAX,
+        crate::Signal::Term,
+        Some(&reaped),
+        &sent,
+        &mut Vec::new(),
+    )
+    .expect_err("a root that may not name its group is nothing sent");
+    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+}
+
+/// The recorder that stops `term_group_sent` stops `term_group_members` too: the use of the group's number
+/// is recorded, and nothing is listed or sent. The tests that assert a cooperative signal did not use an
+/// untrusted root's number read the recorder, whichever of the two makes the use.
+///
+/// Mutant: `term_group_members` does not ask the recorder.
+#[skuld::test]
+fn term_group_members_is_recorded_as_a_use_of_the_groups_number() {
+    let recorder = super::fault::record_term_group();
+    let mut delivered = Vec::new();
+    let answer = super::term_group_members(
+        &crate::identity::HostKernel,
+        i32::MAX,
+        crate::Signal::Term,
+        Some(&StatedRoot::unreaped()),
+        &std::collections::HashSet::new(),
+        &mut delivered,
+    );
+    assert!(matches!(answer, Ok(Ok(()))), "{answer:?}");
+    assert_eq!(recorder.termed(), [i32::MAX]);
+    assert!(delivered.is_empty(), "{delivered:?}");
+}
+
+/// A group that cannot be listed is a send that did not go out: the outer `Err`, which a caller that
+/// sends through other channels folds as a failed group send, and which says nothing was sent (no "after
+/// SIGTERM"), with the listing's errno below it.
+///
+/// Mutant: a failed listing is answered as a send that went out (the inner `Err`).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn term_group_members_says_nothing_went_out_for_a_group_that_cannot_be_listed() {
+    use crate::error::Error;
+    use crate::identity::{FakeKernel, HostKernel};
+
+    let kernel = FakeKernel::over(&HostKernel).same_view().on_pids(Err(libc::EIO));
+    let capture = crate::send_log::Capture::start();
+    let err = super::term_group_members(
+        &kernel,
+        1234,
+        crate::Signal::Term,
+        Some(&StatedRoot::unreaped()),
+        &std::collections::HashSet::new(),
+        &mut Vec::new(),
+    )
+    .expect_err("a group that cannot be listed is nothing sent");
+    let sent = capture.by_identity();
+    drop(capture);
+
+    let Error::Unassessable { detail, .. } = &err else {
+        panic!("{err:?}");
+    };
+    assert_eq!(
+        detail,
+        "process group 1234 could not be listed, so SIGTERM was not sent to its members"
+    );
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
+    assert_eq!(sent, [], "nothing was sent");
+}
+
 /// A `pgid <= 0` refusal is a terminate that sent nothing: the tree call ends with it, with no grace.
 ///
 /// Mutant: the refusal is a `Sent { result: Err(..) }`, which `graceful_shutdown_tree` holds for.
@@ -504,7 +598,7 @@ fn a_group_with_refusers_answers_containment_with_every_members_cause() {
             unassessable: vec![(9, member_cause(libc::EIO))],
         },
         42,
-        nix::sys::signal::Signal::SIGKILL,
+        crate::signal::Sig::Kill,
     )
     .expect_err("the group was not cleared");
 
@@ -537,7 +631,7 @@ fn a_group_with_one_refuser_has_that_member_as_its_cause() {
             unassessable: vec![],
         },
         42,
-        nix::sys::signal::Signal::SIGTERM,
+        crate::signal::Sig::Graceful(crate::Signal::Term),
     )
     .expect_err("the group was not cleared");
 
@@ -560,7 +654,7 @@ fn a_group_with_only_unassessable_members_answers_unassessable_with_every_cause(
             members: vec![(5, member_cause(libc::EIO)), (6, member_cause(libc::EACCES))],
         },
         42,
-        nix::sys::signal::Signal::SIGKILL,
+        crate::signal::Sig::Kill,
     )
     .expect_err("the group was not cleared");
 
@@ -594,7 +688,7 @@ fn a_group_whose_listing_is_refused_answers_unsupported() {
             source: ListingFailure::Unsupported(refusal.unsupported("listing process group 42")),
         },
         42,
-        nix::sys::signal::Signal::SIGKILL,
+        crate::signal::Sig::Kill,
     )
     .expect_err("the group was not cleared");
     let Error::Unsupported { op, detail, .. } = &answer else {
@@ -625,7 +719,7 @@ fn a_group_whose_listing_failed_with_an_enosys_of_its_own_answers_unassessable()
             source: ListingFailure::Failed(source),
         },
         42,
-        nix::sys::signal::Signal::SIGKILL,
+        crate::signal::Sig::Kill,
     )
     .expect_err("the group was not cleared");
     assert!(matches!(answer, Error::Unassessable { .. }), "{answer:?}");
@@ -643,9 +737,16 @@ fn a_listing_that_fails_after_its_open_with_enosys_answers_unassessable() {
     let kernel = FakeKernel::over(&HostKernel)
         .same_view()
         .on_pids_failing_after_open(libc::ENOSYS);
-    let signal = nix::sys::signal::Signal::SIGKILL;
+    let signal = crate::signal::Sig::Kill;
     let answer = super::answer_of(
-        super::group::state(&kernel, 42, signal, None, &mut Vec::new()),
+        super::group::state(
+            &kernel,
+            42,
+            signal,
+            super::group::Delivery::AfterGroupSend,
+            None,
+            &mut Vec::new(),
+        ),
         42,
         signal,
     )

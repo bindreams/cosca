@@ -204,6 +204,27 @@ impl Capture {
         steps.sort_by_key(|&(place, _)| place);
         steps.into_iter().map(|(_, step)| step).collect()
     }
+
+    /// Ends the capture: `Err` unless it holds a send of `signo` that reached a target (a group, a group's
+    /// leader, or a member by its identity). The guard of a stop action that waits on what its send does: a
+    /// send that delivered nothing fails the action here, by an assertion on the log, where the wait would
+    /// be for a report that never comes. The root's check, which a send that delivers nothing still makes,
+    /// is no send.
+    #[cfg(unix)]
+    pub(crate) fn require_a_send(self, signo: i32) -> Result<(), crate::error::Error> {
+        let reached = self.ordered_steps().into_iter().any(|step| match step {
+            OrderedStep::Group(GroupStep::Group(_, sent) | GroupStep::Leader(_, sent)) => sent == signo,
+            OrderedStep::Identity(_, sent) => sent == signo,
+            OrderedStep::Group(_) => false,
+        });
+        if reached {
+            Ok(())
+        } else {
+            Err(crate::error::Error::Io(std::io::Error::other(
+                "the first send made no send",
+            )))
+        }
+    }
 }
 
 impl Capture {

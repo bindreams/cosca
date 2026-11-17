@@ -76,6 +76,15 @@ pub enum Containment {
     /// stated limits). `terminate_tree` (SIGTERM, catchable and ignorable) takes exactly one
     /// pass and does not chase forks.
     ///
+    /// **A cooperative signal is delivered once to each member.** (`terminate_tree`, the first step of
+    /// `graceful_shutdown_tree`, and a chosen signal sent by `stop::send_signal`.) It is not sent to the
+    /// group: the group is listed, and each member listed when the pass began (a member of the group, a
+    /// descendant the walk finds, a marker holder, whichever channels name it) is sent the signal once, by
+    /// its identity. A handler that keeps the process running runs once for it. A process that joins the
+    /// group, or is forked into the tree, after that listing is not sent it; the kill after a grace still
+    /// ends it. A member of the group the OS refuses the signal is named in the answer, as is one that could
+    /// not be assessed (see `Marker::sweep_pass`). `SIGKILL` keeps the group send and the other channels.
+    ///
     /// Naive-child containment, not a sandbox. A member leaves the set by closing the
     /// descriptor, by being spawned through a path that scrubs inherited descriptors (Python's
     /// `subprocess`, Node's `child_process`, `POSIX_SPAWN_CLOEXEC_DEFAULT`), by changing

@@ -2,12 +2,15 @@
 
 #[cfg(target_os = "linux")]
 use super::ListingFailure;
-use super::{members, state, GroupState, Member};
+use super::{members, state, Delivery, GroupState, Member};
 #[cfg(target_os = "linux")]
 use crate::identity::{FakeKernel, UNREADABLE_STATUS_REASON};
 use crate::identity::{HostKernel, Liveness, ProcessId};
+use crate::signal::Sig;
 use crate::test_groups::{stray_signal, Group};
-use nix::sys::signal::Signal;
+
+/// A cooperative `SIGTERM`.
+const TERM: Sig = Sig::Graceful(crate::Signal::Term);
 
 fn is_alive(m: &Member) -> bool {
     matches!(m.id.is_alive(), Liveness::Alive)
@@ -144,7 +147,8 @@ fn state_of_an_owned_group_is_cleared_and_the_signal_was_real() {
             state(
                 &HostKernel,
                 pgid,
-                Signal::SIGKILL,
+                Sig::Kill,
+                Delivery::AfterGroupSend,
                 Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
                 &mut Vec::new()
             ),
@@ -178,7 +182,14 @@ fn a_group_kill_names_no_root_among_the_members_it_reached() {
         crate::test_support::stated_root::StatedRoot::with_state(child.id(), || crate::signal::RootState::Unreaped);
 
     let mut killed = Vec::new();
-    let verdict = state(&HostKernel, pgid, Signal::SIGKILL, Some(&root), &mut killed);
+    let verdict = state(
+        &HostKernel,
+        pgid,
+        Sig::Kill,
+        Delivery::AfterGroupSend,
+        Some(&root),
+        &mut killed,
+    );
 
     assert!(matches!(verdict, GroupState::Cleared), "got {verdict:?}");
     assert_eq!(
@@ -206,7 +217,8 @@ fn state_of_an_all_zombie_group_is_cleared() {
             state(
                 &HostKernel,
                 pid as i32,
-                Signal::SIGKILL,
+                Sig::Kill,
+                Delivery::AfterGroupSend,
                 Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
                 &mut Vec::new()
             ),
@@ -336,24 +348,24 @@ fn decide_prioritizes_refused_over_unassessable_over_cleared() {
     }
 }
 
-/// `excluded_from_sigkill_resend`'s pure predicate, isolated from any real listing or signal:
+/// `excluded_from_real_send`'s pure predicate, isolated from any real listing or signal:
 /// pid 1 is excluded regardless of `system`, a `system`-flagged pid is excluded regardless of
 /// its number, and an ordinary user pid is excluded by neither rule.
 #[skuld::test]
-fn excluded_from_sigkill_resend_covers_pid_1_and_system_independently() {
-    use super::excluded_from_sigkill_resend;
+fn excluded_from_real_send_covers_pid_1_and_system_independently() {
+    use super::excluded_from_real_send;
 
-    assert!(excluded_from_sigkill_resend(1, false), "pid 1 must be excluded");
+    assert!(excluded_from_real_send(1, false), "pid 1 must be excluded");
     assert!(
-        excluded_from_sigkill_resend(1, true),
+        excluded_from_real_send(1, true),
         "pid 1 must be excluded even if also flagged system"
     );
     assert!(
-        excluded_from_sigkill_resend(12345, true),
+        excluded_from_real_send(12345, true),
         "a system-flagged pid other than 1 must be excluded"
     );
     assert!(
-        !excluded_from_sigkill_resend(12345, false),
+        !excluded_from_real_send(12345, false),
         "an ordinary, non-system pid must not be excluded"
     );
 }
@@ -382,7 +394,8 @@ fn term_group_probe_reports_pid_1_as_a_refuser_unless_reachable(#[fixture(stray_
         state(
             &HostKernel,
             pgid,
-            Signal::SIGTERM,
+            TERM,
+            Delivery::AfterGroupSend,
             Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
             &mut Vec::new(),
         ),
@@ -446,9 +459,10 @@ fn a_member_whose_pidfd_cannot_be_opened_is_unassessable_and_nothing_is_sent() {
         let mark = crate::log_capture::mark();
         let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(child.pid(), Err(errno));
         let capture = Capture::start();
-        let reached = super::resend_sigkill(
+        let reached = super::send_to_member(
             &kernel,
             id,
+            Sig::Kill,
             Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
         );
 
@@ -484,7 +498,8 @@ fn converge_re_verifies_a_member_through_its_kernel() {
     let state = super::converge(
         &kernel,
         pid as i32,
-        Signal::SIGTERM,
+        TERM,
+        Delivery::AfterGroupSend,
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
         &mut Vec::new(),
     );
@@ -518,7 +533,14 @@ fn converge_looks_at_a_members_liveness_through_its_kernel() {
         checks.set(checks.get() + 1);
         crate::signal::RootState::Unreaped
     });
-    let state = super::converge(&kernel, pid as i32, Signal::SIGTERM, Some(&root), &mut Vec::new());
+    let state = super::converge(
+        &kernel,
+        pid as i32,
+        TERM,
+        Delivery::AfterGroupSend,
+        Some(&root),
+        &mut Vec::new(),
+    );
 
     assert!(matches!(state, Ok(GroupState::Cleared)), "got {state:?}");
     assert_eq!(checks.get(), 0, "nothing was attempted on a member that is not alive");
@@ -545,7 +567,8 @@ fn converge_looks_again_at_a_refusing_member_through_its_kernel() {
     let state = super::converge(
         &kernel,
         pid as i32,
-        Signal::SIGTERM,
+        TERM,
+        Delivery::AfterGroupSend,
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
         &mut Vec::new(),
     );
@@ -572,7 +595,8 @@ fn converge_sigkill_lists_through_its_kernel_and_sends_nothing_when_a_pidfd_cann
     let state = super::converge(
         &kernel,
         pid as i32,
-        Signal::SIGKILL,
+        Sig::Kill,
+        Delivery::AfterGroupSend,
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
         &mut Vec::new(),
     );
@@ -602,7 +626,8 @@ fn converge_clears_a_member_whose_exit_began_when_the_resend_was_refused() {
     let state = super::converge(
         &kernel,
         pid as i32,
-        Signal::SIGKILL,
+        Sig::Kill,
+        Delivery::AfterGroupSend,
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
         &mut killed,
     );
@@ -630,7 +655,8 @@ fn converge_refuses_a_member_whose_resend_was_refused_with_no_exit_begun() {
     let state = super::converge(
         &kernel,
         pid as i32,
-        Signal::SIGKILL,
+        Sig::Kill,
+        Delivery::AfterGroupSend,
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
         &mut killed,
     );
@@ -669,9 +695,10 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
         rustix::process::PidfdFlags::empty(),
         Err(rustix::io::Errno::NOENT),
     );
-    let reached = super::resend_sigkill(
+    let reached = super::send_to_member(
         &kernel,
         id,
+        Sig::Kill,
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
     );
 
@@ -690,16 +717,17 @@ fn a_live_non_leader_thread_member_is_unknown_and_never_falls_back_to_kill() {
     worker.join().unwrap();
 }
 
-/// What `resend_sigkill` answers for a live member whose send the kernel answers as `errno` (`None`:
+/// What `send_to_member` answers for a live member whose send the kernel answers as `errno` (`None`:
 /// a real send, which ends the member).
 fn resend_answer(errno: Option<i32>) -> super::Reached {
     let mut child = StdChild::spawn(&mut member_command(0));
     await_member_ready(&mut child);
     let id = ProcessId::of(child.id()).found().expect("the live member resolves");
     let answering = errno.map(crate::signal::seams::fail_kills_with);
-    let reached = super::resend_sigkill(
+    let reached = super::send_to_member(
         &HostKernel,
         id,
+        Sig::Kill,
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
     );
     drop(answering);
@@ -711,7 +739,7 @@ fn resend_answer(errno: Option<i32>) -> super::Reached {
 /// `Unknown`", "another errno is `No`", "`Gone` is `Unknown`".
 #[skuld::test]
 fn a_resends_answer_is_the_members_reached() {
-    assert!(matches!(resend_answer(None), super::Reached::Killed), "delivered");
+    assert!(matches!(resend_answer(None), super::Reached::Delivered), "delivered");
     assert!(matches!(resend_answer(Some(libc::ESRCH)), super::Reached::Yes), "gone");
     // A refusal and an anomalous answer keep the error the send answered.
     assert!(
@@ -722,6 +750,313 @@ fn a_resends_answer_is_the_members_reached() {
         matches!(resend_answer(Some(libc::EIO)), super::Reached::Unknown(ref why) if first_os_code(why) == Some(libc::EIO)),
         "EIO"
     );
+}
+
+// Members sent to in place of a group send =====
+
+/// Two live members of one group: its leader, and a second member that joined it. Each has announced
+/// itself.
+fn two_live_members() -> (StdChild, StdChild) {
+    let mut leader = StdChild::spawn(&mut member_command(0));
+    await_member_ready(&mut leader);
+    let mut other = StdChild::spawn(&mut member_command(leader.id() as i32));
+    await_member_ready(&mut other);
+    (leader, other)
+}
+
+fn id_of(child: &StdChild) -> ProcessId {
+    ProcessId::of(child.id()).found().expect("the live member resolves")
+}
+
+/// What `converge` did of a group, sending `TERM` in place of a group send to every member not in `sent`.
+struct InPlace {
+    state: Result<GroupState, super::ListingFailure>,
+    /// The members the signal was delivered to.
+    delivered: Vec<ProcessId>,
+    /// The sends by identity, as the send log has them.
+    by_identity: Vec<crate::send_log::IdentityEntry>,
+    /// The checks and sends by number: nothing but the root's check is expected.
+    group_steps: Vec<crate::send_log::GroupStep>,
+}
+
+impl InPlace {
+    fn of(leader: &StdChild, sent: &std::collections::HashSet<ProcessId>) -> InPlace {
+        let root = crate::test_support::stated_root::StatedRoot::unreaped();
+        InPlace::with_root(leader, sent, &root)
+    }
+
+    fn with_root(
+        leader: &StdChild,
+        sent: &std::collections::HashSet<ProcessId>,
+        root: &dyn crate::containment::Root,
+    ) -> InPlace {
+        let capture = crate::send_log::Capture::start();
+        let mut delivered = Vec::new();
+        let state = super::converge(
+            &HostKernel,
+            leader.id() as i32,
+            TERM,
+            Delivery::InPlaceOfGroupSend { sent },
+            Some(root),
+            &mut delivered,
+        );
+        InPlace {
+            state,
+            delivered,
+            by_identity: capture.by_identity(),
+            group_steps: capture.group_steps(),
+        }
+    }
+
+    /// Asserts nothing was sent by number: the root was checked, and that is all.
+    #[track_caller]
+    fn assert_sent_nothing_by_number(&self) {
+        assert!(
+            self.group_steps
+                .iter()
+                .all(|step| matches!(step, crate::send_log::GroupStep::Check)),
+            "nothing was sent by number: {:?}",
+            self.group_steps
+        );
+    }
+}
+
+/// In place of a group send, each listed member the caller has not sent to is sent the signal once, by
+/// its identity, and none is sent to by number: the member that is in `sent` is neither sent to nor
+/// classified, and keeps running. The signal is what ends the member sent to, and the member in `sent`
+/// shows it had none.
+///
+/// Mutants: a member in `sent` is sent to as well; a member not in it is not sent to; a member is sent to
+/// twice; the group is signalled as well.
+#[skuld::test]
+fn converge_in_place_sends_once_to_each_listed_member_not_already_sent_to() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (mut leader, mut other) = two_live_members();
+    let (leader_id, other_id) = (id_of(&leader), id_of(&other));
+    let sent = std::collections::HashSet::from([leader_id]);
+
+    let did = InPlace::of(&leader, &sent);
+
+    assert!(matches!(did.state, Ok(GroupState::Cleared)), "got {:?}", did.state);
+    assert_eq!(did.delivered, [other_id], "the member it was delivered to");
+    assert_eq!(
+        did.by_identity,
+        [(other.id(), libc::SIGTERM)],
+        "one send, to the member not in `sent`"
+    );
+    did.assert_sent_nothing_by_number();
+    assert_eq!(
+        other.wait().expect("reap").signal(),
+        Some(libc::SIGTERM),
+        "the signal ended it"
+    );
+    // `wait` ends the stdin: the leader exits on its end of input, with no signal.
+    assert_eq!(
+        leader.wait().expect("reap").signal(),
+        None,
+        "the member in `sent` was not signalled"
+    );
+}
+
+/// A member that has died is not sent to: its liveness is looked at before any send, and the group is
+/// cleared of it. The other member is sent to once.
+///
+/// Mutant: a dead member is sent to as well (the send log shows it).
+#[skuld::test]
+fn converge_in_place_sends_nothing_to_a_dead_member() {
+    use std::os::unix::process::CommandExt;
+
+    let mut live = StdChild::spawn(&mut member_command(0));
+    await_member_ready(&mut live);
+    let pgid = live.id() as i32;
+    let mut zombie =
+        crate::test_spawn::spawn(std::process::Command::new("true").process_group(pgid)).expect("spawn true");
+    await_zombie(zombie.id());
+    let live_id = id_of(&live);
+
+    let did = InPlace::of(&live, &std::collections::HashSet::new());
+
+    assert!(matches!(did.state, Ok(GroupState::Cleared)), "got {:?}", did.state);
+    assert_eq!(did.delivered, [live_id]);
+    assert_eq!(
+        did.by_identity,
+        [(live.id(), libc::SIGTERM)],
+        "nothing was sent to the dead member"
+    );
+    zombie.wait().expect("reap the zombie");
+    live.wait().expect("reap");
+}
+
+/// A member whose send the OS refuses (`EPERM`) is named a refuser, and one in `sent` is not
+/// classified: only the member not in it is in the answer. Nothing is delivered.
+///
+/// Mutants: the member in `sent` is classified as well; the refusal is read as unassessable.
+#[skuld::test]
+fn converge_in_place_names_a_member_that_refused_the_signal() {
+    let (mut leader, mut other) = two_live_members();
+    let sent = std::collections::HashSet::from([id_of(&leader)]);
+
+    let refusing = crate::signal::seams::refuse_kills();
+    let did = InPlace::of(&leader, &sent);
+    drop(refusing);
+
+    match did.state {
+        Ok(GroupState::Refused { refused, unassessable }) => {
+            let pids: Vec<_> = refused.iter().map(|(pid, _)| *pid).collect();
+            assert_eq!(pids, [other.id()]);
+            assert_eq!(first_os_code(&refused[0].1), Some(libc::EPERM));
+            assert!(unassessable.is_empty(), "{unassessable:?}");
+        }
+        other => panic!("expected Refused, got {other:?}"),
+    }
+    assert!(did.delivered.is_empty(), "{:?}", did.delivered);
+    other.wait().expect("reap");
+    leader.wait().expect("reap");
+}
+
+/// A member whose send fails with anything but `EPERM` is named unassessable, with its cause: a failure
+/// says nothing about whether it refused.
+///
+/// Mutant: any failure is read as a refusal.
+#[skuld::test]
+fn converge_in_place_names_a_member_whose_send_failed_otherwise_unassessable() {
+    let (mut leader, mut other) = two_live_members();
+    let sent = std::collections::HashSet::from([id_of(&leader)]);
+
+    let failing = crate::signal::seams::fail_kills_with(libc::EIO);
+    let did = InPlace::of(&leader, &sent);
+    drop(failing);
+
+    match did.state {
+        Ok(GroupState::Unassessed { members }) => {
+            let pids: Vec<_> = members.iter().map(|(pid, _)| *pid).collect();
+            assert_eq!(pids, [other.id()]);
+            assert_eq!(first_os_code(&members[0].1), Some(libc::EIO));
+        }
+        other => panic!("expected Unassessed, got {other:?}"),
+    }
+    assert!(did.delivered.is_empty(), "{:?}", did.delivered);
+    other.wait().expect("reap");
+    leader.wait().expect("reap");
+}
+
+/// In place of a group send the root is among the members it delivered to, so a caller that sends to the
+/// root itself does not send twice; after a group send it is not (its owner waits for it).
+///
+/// Mutant: the root is left out in place of a group send.
+#[skuld::test]
+fn converge_in_place_names_the_root_among_the_members_it_reached() {
+    let (mut leader, mut other) = two_live_members();
+    let root =
+        crate::test_support::stated_root::StatedRoot::with_state(leader.id(), || crate::signal::RootState::Unreaped);
+    let mut want = vec![leader.id(), other.id()];
+    want.sort_unstable();
+
+    let did = InPlace::with_root(&leader, &std::collections::HashSet::new(), &root);
+
+    assert!(matches!(did.state, Ok(GroupState::Cleared)), "got {:?}", did.state);
+    let mut got: Vec<_> = did.delivered.iter().map(ProcessId::pid).collect();
+    got.sort_unstable();
+    assert_eq!(got, want);
+    other.wait().expect("reap");
+    leader.wait().expect("reap");
+}
+
+/// pid 1 in the group is excluded from the real send, as `killpg` itself skips it, and named
+/// unassessable with the reason: nothing is sent to it, by its identity or by number. The rows put pid 1
+/// in the group and give it a pidfd that is no process's, so no send could reach the host's init.
+///
+/// Mutant: the exclusion is made only for a `SIGKILL`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn converge_in_place_excludes_pid_1_and_names_it_unassessable() {
+    let (kernel, _writer) = scan_shows_group_1234_of(1);
+    let capture = crate::send_log::Capture::start();
+    let mut delivered = Vec::new();
+    let sent = std::collections::HashSet::new();
+    let state = super::converge(
+        &kernel,
+        1234,
+        TERM,
+        Delivery::InPlaceOfGroupSend { sent: &sent },
+        Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+        &mut delivered,
+    );
+    let (by_identity, group_steps) = (capture.by_identity(), capture.group_steps());
+    drop(capture);
+
+    match state {
+        Ok(GroupState::Unassessed { members }) => {
+            let pids: Vec<_> = members.iter().map(|(pid, _)| *pid).collect();
+            assert_eq!(pids, [1]);
+            let said = crate::error::said(&members[0].1);
+            assert!(said.contains("excluded from the SIGTERM send"), "{said}");
+        }
+        other => panic!("expected Unassessed, got {other:?}"),
+    }
+    assert!(delivered.is_empty(), "{delivered:?}");
+    assert_eq!(by_identity, [], "nothing was sent by identity");
+    assert!(
+        group_steps
+            .iter()
+            .all(|step| matches!(step, crate::send_log::GroupStep::Check)),
+        "nothing was sent by number: {group_steps:?}"
+    );
+}
+
+/// A group that cannot be listed is `Unlistable`, and says so in words that fit its delivery: after a
+/// group send the signal went out before the listing failed; in place of one nothing was sent. The
+/// listing's own failure is the source, with its errno.
+///
+/// Mutants: the two are worded alike; a failed listing is a cleared group.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn state_says_what_a_group_that_cannot_be_listed_left_unsent() {
+    let sent = std::collections::HashSet::new();
+    for (delivery, said) in [
+        (
+            Delivery::AfterGroupSend,
+            "process group 1234 could not be listed after SIGTERM",
+        ),
+        (
+            Delivery::InPlaceOfGroupSend { sent: &sent },
+            "process group 1234 could not be listed, so SIGTERM was not sent to its members",
+        ),
+    ] {
+        let kernel = FakeKernel::over(&HostKernel).same_view().on_pids(Err(libc::EIO));
+        let capture = crate::send_log::Capture::start();
+        let verdict = state(
+            &kernel,
+            1234,
+            TERM,
+            delivery,
+            Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
+            &mut Vec::new(),
+        );
+        let (by_identity, group_steps) = (capture.by_identity(), capture.group_steps());
+        drop(capture);
+
+        match verdict {
+            GroupState::Unlistable { detail, source } => {
+                assert_eq!(detail, said);
+                let ListingFailure::Failed(source) = source else {
+                    panic!("{delivery:?}: a failure that is no refusal: {source:?}");
+                };
+                assert_eq!(
+                    crate::error::first_os_code(&source),
+                    Some(libc::EIO),
+                    "{delivery:?}: {source:?}"
+                );
+            }
+            other => panic!("{delivery:?}: expected Unlistable, got {other:?}"),
+        }
+        assert_eq!(by_identity, [], "{delivery:?}: nothing was sent");
+        assert!(
+            group_steps.is_empty(),
+            "{delivery:?}: nothing was sent or checked: {group_steps:?}"
+        );
+    }
 }
 
 // Checked /proc view (Linux) =====
@@ -1025,15 +1360,22 @@ fn members_is_not_unsupported_when_the_listing_fails_after_the_open() {
 /// `stat_fixture` puts the process in group 1234.
 #[cfg(target_os = "linux")]
 fn scan_shows_group_1234() -> (FakeKernel<'static>, std::io::PipeWriter) {
+    scan_shows_group_1234_of(PID)
+}
+
+/// [`scan_shows_group_1234`] for the process `pid`. Its pidfd is a pipe's read end that never polls
+/// readable, so the process reads as running and no send through it reaches any process.
+#[cfg(target_os = "linux")]
+fn scan_shows_group_1234_of(pid: u32) -> (FakeKernel<'static>, std::io::PipeWriter) {
     use crate::identity::stat_parse::stat_fixture;
 
     let (reader, writer) = std::io::pipe().expect("a pipe");
     let kernel = FakeKernel::over(&HostKernel)
         .same_view()
-        .on_pids(Ok(&[PID]))
-        .on_read(&format!("{PID}/stat"), Ok(&stat_fixture("S", 777)))
-        .on_pidfd_open(PID, Ok(reader.into()))
-        .on_pidfs_ino(PID, Ok(Some(100)));
+        .on_pids(Ok(&[pid]))
+        .on_read(&format!("{pid}/stat"), Ok(&stat_fixture("S", 777)))
+        .on_pidfd_open(pid, Ok(reader.into()))
+        .on_pidfs_ino(pid, Ok(Some(100)));
     (kernel, writer)
 }
 

@@ -12,12 +12,19 @@
 //!
 //! So the group's actual membership decides (see `converge` below), and this module owns the
 //! listing: sysctl `KERN_PROC_PGRP` on macOS, `/proc` on Linux.
+//!
+//! `converge` reaches the listed members one of two ways ([`Delivery`]): after the caller sent the signal
+//! to the group as a whole (a `SIGKILL` is resent to each member, any other signal only probed), or in
+//! place of that send, where each listed member the caller has not sent to yet is sent the signal itself.
+//! Either way each member passes the same gate, send and classification, so the group's answer names the
+//! members that refused the signal and those that could not be assessed.
 
-use nix::sys::signal::Signal;
+use std::collections::HashSet;
 
 use crate::containment::{check_number, Root};
 use crate::error::Error;
 use crate::identity::{ProcessId, RawPid};
+use crate::signal::Sig;
 
 /// One process-group member as the listing found it, carrying the identity (built from the
 /// same record that named the pid) needed to re-verify later that a check still lands on the
@@ -26,7 +33,7 @@ use crate::identity::{ProcessId, RawPid};
 /// `system`: xnu's own `P_SYSTEM` flag (see `identity::kinfo::P_SYSTEM`), read directly from
 /// the same `kinfo_proc` record the listing already fetched — no second syscall. Always
 /// `false` on Linux and other Unix: their listings carry no equivalent flag, and `killpg`'s
-/// own kernel-side exclusion this crate must mirror (see `excluded_from_sigkill_resend`) is
+/// own kernel-side exclusion this crate must mirror (see `excluded_from_real_send`) is
 /// specifically xnu's `killpg1` behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Member {
@@ -361,9 +368,9 @@ pub(crate) enum GroupState {
 enum Reached {
     /// Not a survivor, by any evidence: already gone, or not in the group any more.
     Yes,
-    /// The `SIGKILL` resend was delivered to it: it is not a survivor, and the kill's wait goes on to
-    /// wait for its exit.
-    Killed,
+    /// The signal was delivered to it by a send of its own: it is not a survivor, and a kill's wait goes
+    /// on to wait for its exit.
+    Delivered,
     /// A confirmed refusal, with the error the signal or probe answered.
     No(Error),
     /// Could not be assessed, with the error that says why.
@@ -398,7 +405,7 @@ fn classify_member(
     match liveness {
         crate::identity::Liveness::Dead => MemberOutcome::NotASurvivor,
         crate::identity::Liveness::Alive | crate::identity::Liveness::Unknown => match reached() {
-            Reached::Yes | Reached::Killed => MemberOutcome::NotASurvivor,
+            Reached::Yes | Reached::Delivered => MemberOutcome::NotASurvivor,
             Reached::No(cause) => MemberOutcome::Survivor(pid, cause),
             Reached::Unknown(cause) => MemberOutcome::Unassessable(pid, cause),
         },
@@ -408,7 +415,7 @@ fn classify_member(
 /// Re-verify `id` is still the SAME identity, probe it with `kill(pid, 0)`, and classify the
 /// answer. The probe sends no signal, which [`OsProcess::signal`](crate::os_process::OsProcess::signal)
 /// cannot express, so it is not sent through an opened handle as the `SIGKILL` resend is
-/// ([`resend_sigkill`]).
+/// ([`send_to_member`]).
 ///
 /// `EPERM` and only `EPERM` classifies as a confirmed refusal; every other unexpected errno is
 /// `Unknown`, not `No` — conservative, and consistent with every other "not EPERM/ESRCH"
@@ -493,12 +500,12 @@ fn probe_member(
     }
 }
 
-/// The root's check before the resend of `signal` (`None`: the probe) to the listed `pid`
+/// The root's check before the send of `signal` (`None`: the probe) to the listed `pid`
 /// ([`check_number`]). `Err` is the member's answer when nothing may go out: a group with no
 /// member left holds no listed process, so that process is not a survivor; any other failed check
 /// leaves it unassessable.
-fn root_check_before_send(root: Option<&dyn Root>, pid: RawPid, signal: Option<Signal>) -> Result<(), Reached> {
-    let send = signal.map_or_else(|| "probed".to_owned(), |signal| format!("resent {signal}"));
+fn root_check_before_send(root: Option<&dyn Root>, pid: RawPid, signal: Option<Sig>) -> Result<(), Reached> {
+    let send = signal.map_or_else(|| "probed".to_owned(), |signal| format!("sent {signal}"));
     match check_number(root) {
         Ok(()) => Ok(()),
         Err(why @ crate::containment::NotItsGroup::Empty) => {
@@ -521,7 +528,8 @@ fn root_check_before_send(root: Option<&dyn Root>, pid: RawPid, signal: Option<S
     }
 }
 
-/// The `SIGKILL` resend to a listed member, through the handle
+/// The send of `signal` to a listed member (a `SIGKILL` resend after a group send, or any signal sent in
+/// place of one: [`Delivery`]), through the handle
 /// [`open_with`](crate::os_process::open_with) opens for its identity and its
 /// [`signal`](crate::os_process::OsProcess::signal): the handle names the SAME process the open
 /// just confirmed, even if the pid number is reused by something else in between. Linux: a
@@ -534,7 +542,9 @@ fn root_check_before_send(root: Option<&dyn Root>, pid: RawPid, signal: Option<S
 ///   `id.exists()` saying `Gone`) and a ptraced zombie thread, and a macOS pid that names another
 ///   process.
 /// - `EPERM` from a member whose exit has begun (macOS `P_WEXIT`, not yet a zombie) is
-///   `Reached::Killed`; from a zombie or gone member, `Reached::Yes`; otherwise `Reached::No`.
+///   `Reached::Delivered`; from a zombie or gone member, `Reached::Yes`; otherwise `Reached::No`. That
+///   reading is the send's own and is made only for a `SIGKILL` (`signal_by_token`): any other signal's
+///   `EPERM` is a refusal, whatever the member's state, and `reconfirm_survivor` takes the second look.
 /// - `Error::NotThreadGroupLeader` is `Reached::Unknown`, with no fallback. The kernel did answer:
 ///   this pid is a live thread, not a process. `kill(2)` on a tid signals the whole thread group
 ///   that owns it, which is not the member that was listed.
@@ -547,30 +557,30 @@ fn root_check_before_send(root: Option<&dyn Root>, pid: RawPid, signal: Option<S
 /// Never signals when `id.exists()` answers `Unknown` in the open: `pidfd_open` binds to whatever
 /// holds the pid number now, so a recycled pid would be hit. The member is left unsignalled and
 /// reported `Unassessable` (`hidepid` hosts, `Ticks` ids before 6.9).
-fn resend_sigkill(
+fn send_to_member(
     kernel: &dyn crate::identity::Kernel,
     id: crate::identity::ProcessId,
+    signal: Sig,
     root: Option<&dyn Root>,
 ) -> Reached {
     use crate::containment::treewalk::KillOutcome;
-    use crate::signal::Sig;
     match crate::os_process::open_with(kernel, id).map_err(crate::os_process::OpenFailure::into_open_error) {
         Ok(None) => Reached::Yes, // already gone
-        Ok(Some(os)) => match root_check_before_send(root, id.pid(), Some(Signal::SIGKILL)) {
+        Ok(Some(os)) => match root_check_before_send(root, id.pid(), Some(signal)) {
             Err(reached) => reached,
             Ok(()) => {
-                match KillOutcome::of(os.signal(Sig::Kill)) {
-                    KillOutcome::Terminated => Reached::Killed,
+                match KillOutcome::of(os.signal(signal)) {
+                    KillOutcome::Terminated => Reached::Delivered,
                     // Exited between the open and the send.
                     KillOutcome::AlreadyGone => Reached::Yes,
                     KillOutcome::NotAttempted(refused) if matches!(&refused, Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)) =>
                     {
-                        log::debug!("containment::unix::group: SIGKILL to pid {} refused: EPERM", id.pid());
+                        log::debug!("containment::unix::group: {signal} to pid {} refused: EPERM", id.pid());
                         Reached::No(refused)
                     }
                     KillOutcome::NotAttempted(e) => {
                         log::warn!(
-                            "containment::unix::group: SIGKILL to pid {} answered {report}, neither EPERM nor ESRCH",
+                            "containment::unix::group: {signal} to pid {} answered {report}, neither EPERM nor ESRCH",
                             id.pid(),
                             report = crate::error::Report(&e)
                         );
@@ -617,7 +627,7 @@ fn resend_sigkill(
 /// **Downgrades on `Liveness::Dead` only — `Liveness::Unknown` keeps `Survivor`.** Downgrading
 /// on `Unknown` too would throw away STRONGER evidence for WEAKER: the `Survivor` this
 /// function receives already carries a REAL, directly-observed `EPERM` from
-/// `resend_sigkill`'s own send, or `probe_member`'s `kill(2)` — the kernel's authoritative,
+/// `send_to_member`'s own send, or `probe_member`'s `kill(2)` — the kernel's authoritative,
 /// first-hand answer to "may this caller signal this process". `recheck`'s liveness query is a
 /// WEAKER, independently-deniable signal (the same class of query that can itself answer
 /// `Unknown` under `hidepid` or a sandboxed runtime); a denied liveness reconfirmation is not
@@ -649,23 +659,57 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
     }
 }
 
+/// How [`converge`] reaches the members it lists.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Delivery<'a> {
+    /// The caller sent the signal to the group as a whole just before the listing (`killpg`, or its
+    /// pidfd form). A `SIGKILL` is resent to each listed member for real, since the group send reached
+    /// only the members it could; any other signal is only probed, never resent: the members that took the
+    /// group send have the signal already.
+    AfterGroupSend,
+    /// No group send was made. Each listed member that is not in `sent` is sent the signal for real, by
+    /// its identity, once. A member in `sent` is the caller's already: it is not sent to and not
+    /// classified.
+    #[cfg_attr(
+        not(any(target_os = "macos", test)),
+        allow(dead_code, reason = "only macOS's fd marker sends in place of a group send")
+    )]
+    InPlaceOfGroupSend { sent: &'a HashSet<ProcessId> },
+}
+
+impl Delivery<'_> {
+    /// Whether `signal` is sent to a listed member for real, as against a probe.
+    fn sends(self, signal: Sig) -> bool {
+        match self {
+            Delivery::AfterGroupSend => signal == Sig::Kill,
+            Delivery::InPlaceOfGroupSend { .. } => true,
+        }
+    }
+
+    /// Whether the caller has sent the signal to `id` already.
+    fn has_sent_to(self, id: ProcessId) -> bool {
+        matches!(self, Delivery::InPlaceOfGroupSend { sent } if sent.contains(&id))
+    }
+}
+
 /// List `pgid` once, classify every member, and decide the group's verdict. See this task's
-/// design note above for why there is exactly one listing pass, and why `SIGKILL` resends the
-/// real signal while every other signal (in practice, only `SIGTERM`) only probes. Runs the
+/// design note above for why there is exactly one listing pass, and [`Delivery`] for how each listed
+/// member is reached: a real send (a `SIGKILL` after a group send, any signal in place of one) or a probe
+/// (any other signal after a group send). Runs the
 /// loop to completion — a member classified `Unassessable` does NOT short-circuit the pass:
-/// on the `SIGKILL` path `converge` is the delivery mechanism itself, so cutting the loop
+/// where `converge` is the delivery mechanism itself, cutting the loop
 /// short would silently skip signalling every member listed after it. `decide` (below) is
 /// what turns the fully-accumulated result into one verdict.
 ///
-/// A pid excluded from the `SIGKILL` resend (see `excluded_from_sigkill_resend`, just below)
+/// A pid excluded from a real send (see `excluded_from_real_send`, just below)
 /// classifies `Unassessable`, NOT `Cleared`: it was never actually reached, so folding it into
 /// "not a survivor" would manufacture the same false-`Ok` #61 exists to eliminate, just for
 /// this pid specifically.
 ///
-/// **The group's number, and each resend.** The listing names members by `pgid`, a number that
+/// **The group's number, and each send.** The listing names members by `pgid`, a number that
 /// stays the root's group only while the group has a member: on Linux 6.9+ the root's pidfd shows
-/// that exactly, and elsewhere the root's state stands in for it (unreaped). Each `SIGKILL` resend
-/// and `SIGTERM` probe checks the root ([`check_number`]) first. A `SIGKILL` resend opens the
+/// that exactly, and elsewhere the root's state stands in for it (unreaped). Each real send
+/// and each `SIGTERM` probe checks the root ([`check_number`]) first. A real send opens the
 /// member by its identity before that check (see `containment::unix`'s module doc); a member that cannot be opened
 /// is unassessable and not signalled. A
 /// `SIGTERM` probe checks the root, then the member's identity right before the probe. A member
@@ -674,14 +718,17 @@ fn reconfirm_survivor(outcome: MemberOutcome, recheck: impl FnOnce() -> crate::i
 /// a survivor. A change between a check and the send is not seen: the window `Child::kill_tree`
 /// documents.
 ///
-/// A `SIGKILL` resend that was delivered adds its member to `killed`: the kill's wait goes on to wait
-/// for it by identity. The root is not added: its owner waits for it.
+/// A real send that was delivered adds its member to `delivered`, for the caller to wait for it by
+/// identity (a kill's wait) or to know the member has the signal. After a group send the root is not
+/// added: its owner waits for it. In place of one it is, so a caller that sends to the root itself does
+/// not send twice.
 pub(crate) fn converge(
     kernel: &dyn crate::identity::Kernel,
     pgid: i32,
-    signal: Signal,
+    signal: Sig,
+    delivery: Delivery<'_>,
     root: Option<&dyn Root>,
-    killed: &mut Vec<crate::identity::ProcessId>,
+    delivered: &mut Vec<crate::identity::ProcessId>,
 ) -> Result<GroupState, ListingFailure> {
     #[cfg(test)]
     let listing_pgid = fault::listed(pgid);
@@ -694,35 +741,41 @@ pub(crate) fn converge(
     let mut unassessable = Vec::new();
     for m in &listed {
         let id = m.id;
-        let mut delivered = false;
+        if delivery.has_sent_to(id) {
+            continue;
+        }
+        let mut sent = false;
         let outcome = classify_member(id.pid(), id.is_alive_with(kernel), || {
-            if signal == Signal::SIGKILL && excluded_from_sigkill_resend(id.pid(), m.system) {
+            if !delivery.sends(signal) {
+                // Never resent: only probed (see `Delivery::AfterGroupSend`).
+                return probe_member(kernel, id.pid(), id, root);
+            }
+            if excluded_from_real_send(id.pid(), m.system) {
                 log::warn!(
                     "containment::unix::group: pid {pid} in process group {pgid} is excluded \
-                     from the SIGKILL resend (mirrors xnu's own killpg1 exclusion for init/ \
+                     from the {signal} send (mirrors xnu's own killpg1 exclusion for init/ \
                      P_SYSTEM) and reported unassessable, not cleared, since it was never \
                      actually reached",
                     pid = id.pid()
                 );
                 return Reached::Unknown(Error::Unassessable {
-                    detail: "it is excluded from the SIGKILL resend (init, or a system process), so it was \
-                             never reached"
-                        .to_owned(),
+                    detail: format!(
+                        "it is excluded from the {signal} send (init, or a system process), so it was never reached"
+                    ),
                     source: None,
                 });
             }
-            if signal == Signal::SIGKILL {
-                let reached = resend_sigkill(kernel, id, root);
-                delivered = matches!(reached, Reached::Killed);
-                reached
-            } else {
-                // `SIGTERM` is never resent: it is only probed (see this fn's doc).
-                probe_member(kernel, id.pid(), id, root)
-            }
+            let reached = send_to_member(kernel, id, signal, root);
+            sent = matches!(reached, Reached::Delivered);
+            reached
         });
-        // The root is waited for through its owner, which holds its handle.
-        if delivered && Some(id.pid()) != root.map(Root::pid) {
-            killed.push(id);
+        // After a group send the root is waited for through its owner, which holds its handle.
+        let waited_for = match delivery {
+            Delivery::AfterGroupSend => Some(id.pid()) != root.map(Root::pid),
+            Delivery::InPlaceOfGroupSend { .. } => true,
+        };
+        if sent && waited_for {
+            delivered.push(id);
         }
         match reconfirm_survivor(outcome, || id.is_alive_with(kernel)) {
             MemberOutcome::NotASurvivor => {}
@@ -733,18 +786,18 @@ pub(crate) fn converge(
     Ok(decide(refused, unassessable))
 }
 
-/// Mirrors xnu's own `killpg1` exclusion set for the `SIGKILL` resend above: `killpg1` skips
+/// Mirrors xnu's own `killpg1` exclusion set for a real send to a listed member: `killpg1` skips
 /// `kernproc`, `initproc` (pid 1), and every `P_SYSTEM`-flagged process before it even counts a
 /// group as reachable. `kernproc` (pid 0) never appears in a listed group's membership, so only
-/// the other two need restating here — this crate's own per-member resend does not inherit
+/// the other two need restating here — this crate's own per-member send does not inherit
 /// `killpg`'s kernel-side exclusion for free, and without it a live `P_SYSTEM` process would
-/// receive a real `SIGKILL` that `killpg` itself would have refused to send. Pure, and tested
+/// receive a real signal that `killpg` itself would have refused to send. Pure, and tested
 /// directly against synthetic pid/`system` combinations (`group_tests.rs`) rather than only
 /// through `converge`'s live path.
 ///
 /// `system` comes from the listing's own `Member::system` — real on macOS, always `false`
 /// elsewhere, where no equivalent kernel flag exists to restate.
-fn excluded_from_sigkill_resend(pid: RawPid, system: bool) -> bool {
+fn excluded_from_real_send(pid: RawPid, system: bool) -> bool {
     pid == 1 || system
 }
 
@@ -764,31 +817,44 @@ fn decide(refused: Vec<(RawPid, Error)>, unassessable: Vec<(RawPid, Error)>) -> 
     GroupState::Cleared
 }
 
-/// The friendly wrapper `unix.rs` calls: list `pgid`, converge on delivering `signal`, and
-/// turn a listing failure into the same `Unlistable` shape a per-member `Unknown` produces.
+/// The friendly wrapper `unix.rs` calls: list `pgid`, converge on delivering `signal` as `delivery` says,
+/// and turn a listing failure into the same `Unlistable` shape a per-member `Unknown` produces.
 ///
 /// `pgid <= 0` is a `debug_assert!`, not a runtime guard, here: it documents this module's own
 /// contract (never called with an unaddressable group id) rather than pretending to be a
-/// safety net for a dangerous syscall — the REAL guard, which runs before `killpg` is ever
-/// called, is in `unix.rs`'s `signal_group` (this module's only production caller).
+/// safety net for a dangerous syscall — the REAL guard, which runs before `killpg` or a listing is ever
+/// made, is in `unix.rs`'s `signal_group_sent` and `signal_group_members` (this module's only production
+/// callers).
 pub(crate) fn state(
     kernel: &dyn crate::identity::Kernel,
     pgid: i32,
-    signal: Signal,
+    signal: Sig,
+    delivery: Delivery<'_>,
     root: Option<&dyn Root>,
-    killed: &mut Vec<crate::identity::ProcessId>,
+    delivered: &mut Vec<crate::identity::ProcessId>,
 ) -> GroupState {
     debug_assert!(
         pgid > 0,
         "group::state called with a non-positive pgid ({pgid}); the real guard belongs in the \
-         caller, before any signal is sent — see unix.rs::signal_group"
+         caller, before any signal is sent — see unix.rs::signal_group_sent"
     );
-    match converge(kernel, pgid, signal, root, killed) {
+    match converge(kernel, pgid, signal, delivery, root, delivered) {
         Ok(gs) => gs,
         Err(e) => GroupState::Unlistable {
-            detail: format!("process group {pgid} could not be listed after {signal}"),
+            detail: unlistable_detail(pgid, signal, delivery),
             source: e,
         },
+    }
+}
+
+/// What an [`Unlistable`](GroupState::Unlistable) group's answer says of the group `pgid`: after a group
+/// send, that the signal went out before the listing failed; in place of one, that nothing was sent.
+fn unlistable_detail(pgid: i32, signal: Sig, delivery: Delivery<'_>) -> String {
+    match delivery {
+        Delivery::AfterGroupSend => format!("process group {pgid} could not be listed after {signal}"),
+        Delivery::InPlaceOfGroupSend { .. } => {
+            format!("process group {pgid} could not be listed, so {signal} was not sent to its members")
+        }
     }
 }
 

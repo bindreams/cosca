@@ -870,8 +870,9 @@ struct SweepState<'k> {
     /// The group signals' result across passes: a later pass's success does not erase an earlier
     /// failure, and two failures fold together (`combine_group_errors`).
     group_result: Result<(), Error>,
-    /// Whether a cooperative group signal went unsent: its failure is in `group_result`, and the pass went
-    /// on through the other channels.
+    /// Whether a cooperative signal went unsent through the group: the group's number could not be used (an
+    /// invalid group id, a failed check of the root) or it could not be listed, so no member was sent
+    /// the signal by it. The failure is in `group_result`, and the pass went on through the other channels.
     group_unsent: bool,
     /// Whether any signal reached a member by identity or a marker holder.
     delivered: bool,
@@ -1238,7 +1239,8 @@ impl Marker {
     /// against a member that traps it and keeps forking on every delivery, hanging
     /// `terminate_tree()` — a blocking API with no timeout — forever. One pass, matching
     /// `term_group`'s own cooperative, best-effort contract; `hard_kill` (`kill_tree`) is the
-    /// guaranteed sweep.
+    /// guaranteed sweep. A cooperative signal's group channel is a listing of the group that sends to each
+    /// member in it, not a `killpg` ([`sweep_pass`](Self::sweep_pass)).
     fn terminate(&self, root: Option<&dyn Root>, how: TreeStop) -> Result<Result<(), Error>, Error> {
         self.terminate_impl(Scope::Full(root), how)
     }
@@ -1273,9 +1275,9 @@ impl Marker {
     }
 
     /// One pass of `scope` with the stop `how`'s signal: `Err` is a signal never sent (a read end that no longer names
-    /// its pipe, or a group that cannot be signalled while no other channel sent anything), `Ok` what
-    /// the pass found. A group that cannot be signalled is one failed channel: when another channel
-    /// sent, its failure is among what the pass found.
+    /// its pipe, or a group that cannot be signalled, or listed for a cooperative signal, while no other channel sent
+    /// anything), `Ok` what the pass found. A group that cannot be signalled is one failed channel: when another
+    /// channel sent, its failure is among what the pass found.
     fn terminate_impl(&self, scope: Scope<'_>, how: TreeStop) -> Result<Result<(), Error>, Error> {
         self.check_read_end_still_valid()?;
         // A cooperative signal is not a kill: nothing it reaches is waited for.
@@ -1412,7 +1414,32 @@ impl Marker {
     /// Each channel covers a gap the others have: a member that lost the marker but kept its
     /// ppid chain is caught by the walk; a member that left the group and was reparented is
     /// caught only by the marker; a member that lost the marker AND was reparented but stayed in
-    /// the group is caught only by `killpg`.
+    /// the group is caught only by `killpg` (a `SIGKILL`) or by the group's listing (a cooperative
+    /// signal).
+    ///
+    /// **A cooperative signal goes through one channel: each member's own send.** It is not sent to
+    /// the group. The group is listed (`term_group_members`, right after the root's check) and each listed
+    /// member that no earlier pass sent to is sent the signal by its identity, once, by the group machinery
+    /// itself (`group::converge`): its liveness gate (a member that has died is not asked), its
+    /// classification of the answer, its second look at a refuser, its exclusion of pid 1 and system
+    /// processes, and its naming of refusing and unassessable members are the group's own. A handler that
+    /// keeps running does not run for a second delivery.
+    ///
+    /// **Which channel sends to a member.** The group's listing sends to a member that is in it; the walk
+    /// or the holder scan sends to one that is not. A walked member or a holder the listing delivered to is
+    /// dropped from this pass's `new_walk`/`new_holders` before their sends (the one place a duplicate is
+    /// dropped), and a member only the listing found counts as found. One the listing did not deliver to
+    /// (refused, not assessed, or a root check that failed) stays with its own channel, which tries it: a
+    /// walked member is still reached when the listing could not be made. A member that joins the group, or
+    /// is forked into the tree, after the listing is not sent the signal. `SIGKILL` keeps the group send
+    /// and both other channels: it is idempotent, and the group's one send reaches every member at once.
+    ///
+    /// A member of the group that the OS refuses the signal is named in the answer (`Error::Containment`,
+    /// "pid N: refused the signal", the OS code below it), and one that could not be assessed is named
+    /// beside it, as the group's own check names them. A walked member that left the group, or a holder,
+    /// whose send is refused makes the answer `incomplete`, as on every route; so does a refused member of
+    /// the group that the walk then tries again. A listing that fails, or a check of the root before it,
+    /// answers as a group send that failed does: the pass goes on through the other channels.
     ///
     /// **The group signal's re-fire gate.** Pass 1 fires unconditionally, carrying exactly
     /// today's baseline `killpg`/`ProcessGroup` pgid-reuse risk (`src/containment/unix.rs`) — a
@@ -1460,6 +1487,9 @@ impl Marker {
             killed,
             ..
         } = state;
+        // What earlier passes found and sent to, before this pass adds to it: the group's listing sends to
+        // every other member of the group, this pass's walked members and holders included.
+        let sent_earlier = seen.clone();
         let walk = matches!(scope, Scope::Full(_));
         let group_root = match scope {
             Scope::Full(root) => root,
@@ -1478,9 +1508,15 @@ impl Marker {
             *incomplete = true;
             if first_pass {
                 let still = match scope {
-                    Scope::Full(_) => {
-                        "the group signal and root kill below still run, since neither needs the process table"
-                    }
+                    Scope::Full(_) => match signal {
+                        Sig::Kill => {
+                            "the group signal and root kill below still run, since neither needs the process table"
+                        }
+                        Sig::Graceful(_) => {
+                            "the group's listing, which sends the signal to each member in it, and the root's send \
+                             below still run, since neither needs the process table"
+                        }
+                    },
                     Scope::HoldersOnly { .. } => "nothing else runs, so nothing is signalled this pass",
                 };
                 log::warn!(
@@ -1613,6 +1649,10 @@ impl Marker {
         // `group_result` folds together across passes (a later pass's success does not erase an
         // earlier failure, and vice versa) so a transient failure on one pass is not silently
         // dropped by the next pass's success.
+        //
+        // A cooperative signal is not sent to the group: the group is listed, and each member of it that
+        // earlier passes did not send to is sent the signal by the listing (`by_group`), once.
+        let mut by_group: Vec<ProcessId> = Vec::new();
         {
             // `!blind &&`, not merely an empty `this_pass_holders`: a blind pass never ran the
             // scan at all ("not observed"), which must not read the same as a genuine scan that
@@ -1627,14 +1667,21 @@ impl Marker {
             let should_fire = first_pass || live_holder_confirms_pgid;
             if !walk {
             } else if should_fire {
-                // `kill_group`/`term_group` already return `crate::error::Error`, carrying
+                // `kill_group`/`term_group_members` already return `crate::error::Error`, carrying
                 // #61's own `Error::Containment`/`Error::Unassessable` distinction for an
                 // ordinary refusal — preserved as-is here, NOT collapsed into a stringified
                 // `io::Error` (see this fn's doc, and `combine_group_errors`).
                 let this_pass_group_result: Result<(), Error> = match (self.pgid, signal) {
                     (Some(pgid), Sig::Kill) => crate::containment::unix::kill_group(pgid, group_root, killed),
                     (Some(pgid), Sig::Graceful(signal)) => {
-                        match crate::containment::unix::term_group_sent(pgid, group_root, signal) {
+                        match crate::containment::unix::term_group_members(
+                            &*self.kernel,
+                            pgid,
+                            signal,
+                            group_root,
+                            &sent_earlier,
+                            &mut by_group,
+                        ) {
                             Ok(checked) => checked,
                             Err(unsent) => {
                                 *group_unsent = true;
@@ -1667,10 +1714,18 @@ impl Marker {
             }
         }
 
-        let found = new_walk.len() + new_holders.len();
+        // A member the listing delivered to is sent to by the listing alone: the one place a duplicate is
+        // dropped. One that no other channel found is new to the sweep, and counts as found.
+        let by_group: std::collections::HashSet<ProcessId> = by_group.into_iter().collect();
+        let found = new_walk.len() + new_holders.len() + by_group.iter().filter(|id| seen.insert(**id)).count();
         if found == 0 {
             return 0;
         }
+        if !by_group.is_empty() {
+            state.delivered = true;
+        }
+        new_walk.retain(|id| !by_group.contains(id));
+        new_holders.retain(|id| !by_group.contains(id));
         for id in new_walk {
             // Test-only fault seam: skip the root's identity kill (take semantics — see
             // `fault`), mirroring `treewalk::hard_kill`'s own seam so a test can force the

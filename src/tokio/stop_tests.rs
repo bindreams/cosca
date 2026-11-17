@@ -144,14 +144,14 @@ async fn async_an_actions_error_is_terminates_error() {
 /// can report the end of its input first.
 #[cfg(unix)]
 fn signalling_then_ending_the_input(
-    held: &Arc<Mutex<Option<crate::tokio::ChildStdin>>>,
+    held: &test_child::HeldStdin<crate::tokio::ChildStdin>,
 ) -> impl for<'t, 'c> Fn(&'t StopTarget<'c>) -> StopFuture<'t> + Send + Sync + 'static {
-    let held = Arc::clone(held);
+    let held = held.clone();
     move |target| {
-        let held = Arc::clone(&held);
+        let held = held.clone();
         Box::pin(async move {
             stop::send_signal(target, crate::Signal::Usr1).await?;
-            drop(held.lock().unwrap().take());
+            held.end();
             Ok(())
         })
     }
@@ -172,14 +172,14 @@ async fn async_a_chosen_signal_reaches_every_member_of_the_tree() {
 
     assert_current_thread();
     for shutdown in [false, true] {
-        let held = Arc::new(Mutex::new(None));
+        let held = test_child::HeldStdin::default();
         let (mut child, stdin, mut stdout) =
             test_child::ready_tree_async(test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
                 test_child::contain_without_cgroup_async(cmd);
                 cmd.graceful_stop(signalling_then_ending_the_input(&held));
             })
             .await;
-        *held.lock().unwrap() = Some(stdin);
+        held.hold(stdin);
         if shutdown {
             never_blocking(child.graceful_shutdown_tree(Duration::MAX))
                 .await
@@ -277,7 +277,7 @@ async fn async_an_action_may_compose_sends_with_a_wait() {
     for tree in [false, true] {
         let waited = Arc::new(Mutex::new(Vec::new()));
         let reports = Arc::new(::tokio::sync::Mutex::new(None::<Reports>));
-        let held = Arc::new(Mutex::new(None::<crate::tokio::ChildStdin>));
+        let held = test_child::HeldStdin::default();
         let (first, last): (&'static [&'static str], &'static [&'static str]) = if tree {
             (&["root SIGUSR1", "leaf SIGUSR1"], &["root SIGTERM", "leaf SIGTERM"])
         } else {
@@ -287,18 +287,22 @@ async fn async_an_action_may_compose_sends_with_a_wait() {
             if tree {
                 test_child::contain_without_cgroup_async(cmd);
             }
-            let (waited, reports, held) = (Arc::clone(&waited), Arc::clone(&reports), Arc::clone(&held));
+            let (waited, reports, held) = (Arc::clone(&waited), Arc::clone(&reports), held.clone());
             cmd.graceful_stop(move |target| {
-                let (waited, reports, held) = (Arc::clone(&waited), Arc::clone(&reports), Arc::clone(&held));
+                let (waited, reports, held) = (Arc::clone(&waited), Arc::clone(&reports), held.clone());
                 Box::pin(async move {
+                    let sent = crate::send_log::Capture::start();
                     stop::send_signal(target, crate::Signal::Usr1).await?;
+                    // A send that sent nothing would leave the wait for the members' reports below for
+                    // ever: it fails the call here instead.
+                    sent.require_a_send(libc::SIGUSR1)?;
                     // The members keep running: the root is looked at once, and every member reports
                     // the signal before the second goes out.
                     let running = stop::wait_exit(target, Duration::ZERO).await?;
                     waited.lock().unwrap().push(running);
                     reports.lock().await.as_mut().expect("the reports").until(first).await;
                     stop::send_signal(target, crate::Signal::Term).await?;
-                    drop(held.lock().unwrap().take());
+                    held.end();
                     reports.lock().await.as_mut().expect("the reports").until(last).await;
                     // The root exits on the second signal: the wait ends on its exit.
                     let exited = stop::wait_exit(target, Duration::MAX).await?;
@@ -308,7 +312,7 @@ async fn async_an_action_may_compose_sends_with_a_wait() {
             });
         })
         .await;
-        *held.lock().unwrap() = Some(stdin);
+        held.hold(stdin);
         *reports.lock().await = Some(Reports::new(stdout));
         if tree {
             never_blocking(child.terminate_tree()).await.expect("the composed stop");
@@ -360,21 +364,21 @@ async fn async_graceful_shutdown_tree_keeps_an_error_after_a_send_that_went_out(
     assert_current_thread();
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let held = Arc::new(Mutex::new(None));
+    let held = test_child::HeldStdin::default();
     let (mut child, stdin, mut stdout) = test_child::ready_tree_async(test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
         test_child::contain_without_cgroup_async(cmd);
-        let held = Arc::clone(&held);
+        let held = held.clone();
         cmd.graceful_stop(move |target| {
-            let held = Arc::clone(&held);
+            let held = held.clone();
             Box::pin(async move {
                 prepared_send(target).await?;
-                drop(held.lock().unwrap().take());
+                held.end();
                 Err(refused())
             })
         });
     })
     .await;
-    *held.lock().unwrap() = Some(stdin);
+    held.hold(stdin);
     let _armed = crate::child::graceful::fault::ArmedKillTreeError::arm();
     let err = never_blocking(child.graceful_shutdown_tree(Duration::MAX))
         .await

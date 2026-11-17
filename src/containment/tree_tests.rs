@@ -346,12 +346,14 @@ fn terminate_sends_the_signal_it_is_given(mode: crate::ContainMode, gives: Conta
         };
         assert_eq!(earlier.as_deref(), Some("the SIGUSR1"));
     }
+    // The stdin's end makes a member the signal missed report `eof`, so a miss fails the assertion and
+    // the read does not wait on it.
+    drop(stdin);
     assert_eq!(
-        crate::test_child::two_signal_reports(stdout),
+        crate::test_child::signal_reports_to_end(stdout),
         ["leaf SIGUSR1", "root SIGUSR1"]
     );
     child.wait().expect("the root exited on its handler");
-    drop(stdin);
 }
 
 /// Mutant: the leaf sends `SIGTERM` whatever it is given.

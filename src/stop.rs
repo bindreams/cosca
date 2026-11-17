@@ -33,8 +33,9 @@
 //! A stop is a request, which a process may handle or ignore. What it is sent to depends on the target
 //! and, on Unix, on the child's containment mechanism.
 //!
-//! **Unix.** A route that lists the tree (`CgroupV2`, `TreeWalk`) signals the members it listed when the
-//! pass began; a process that enters the tree later is not signalled.
+//! **Unix.** A route that lists the tree (`CgroupV2`, `TreeWalk`, and `FdMarker`'s cooperative signal)
+//! signals the members it listed when the pass began; a process that enters the tree later is not
+//! signalled.
 //!
 //! | Target | Containment | The signal reaches |
 //! |---|---|---|
@@ -42,7 +43,7 @@
 //! | tree (`terminate_tree`, `graceful_shutdown_tree`) | [`CgroupV2`](crate::Containment::CgroupV2) | the processes in the leaf itself, each pinned by a pidfd before it is signalled; not one in a cgroup under the leaf, nor one in a pid namespace this process cannot see (that one makes the call an error), which `kill_tree` reaches |
 //! | tree | [`ProcessGroup`](crate::Containment::ProcessGroup), [`Session`](crate::Containment::Session) | the members of the process group the root leads (for a session, its first group) when the signal is sent; a member that left the group, as a `setsid` child does, is not reached |
 //! | tree | [`TreeWalk`](crate::Containment::TreeWalk) | the root and every descendant the walk finds from the root's identity; a process reparented away from the tree, or whose identity cannot be read, is not reached |
-//! | tree | [`FdMarker`](crate::Containment::FdMarker) (macOS) | the process group, the root's descendants and the marker's holders; how often each is sent the signal is in the doc of [`Containment::FdMarker`](crate::Containment::FdMarker) |
+//! | tree | [`FdMarker`](crate::Containment::FdMarker) (macOS) | the members of the root's process group, the root's descendants and the marker's holders, listed when the pass began, each sent the signal once by its identity (not by a send to the group); one that joins later is not reached. The doc of [`Containment::FdMarker`](crate::Containment::FdMarker) has the contract |
 //!
 //! A tree call on a child that owns no tree (uncontained, or a member of an ancestor's containment) is
 //! [`Error::Unsupported`] before the action runs.
@@ -235,7 +236,9 @@ pub(crate) async fn default_with<D: StopWaits>(driver: &D, target: &StopTarget<'
 ///
 /// On a tree target the signal goes to every member of the contained tree, by the mechanism's own route
 /// (a cgroup leaf's listing, a process group, a session, a walk, an fd marker's sweep; see the module
-/// doc for what the calling tree call does with the outcome).
+/// doc for what the calling tree call does with the outcome). Each member listed when the pass began (the
+/// ones the mechanism walked, the marker holders, and the group's listing) is sent the signal once; a
+/// process that enters the tree after that listing is not sent it.
 ///
 /// # Elevation fronts
 ///

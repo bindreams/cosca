@@ -641,10 +641,22 @@ pub(crate) async fn held_blocker_async(
 /// was the cause must check the status's `.signal()` and deliver the signal BEFORE `wait()`.
 #[cfg(unix)]
 pub(crate) fn member_command(pgid: i32) -> std::process::Command {
+    member_running("echo $$; read _ignored", pgid)
+}
+
+/// [`member_command`] that ignores `SIGUSR1`, from before it announces itself: the signal is delivered and
+/// the member runs on, so a second send of it is a second send to a live member, which the send log shows.
+#[cfg(target_os = "macos")]
+pub(crate) fn usr1_ignoring_member_command(pgid: i32) -> std::process::Command {
+    member_running("trap '' USR1; echo $$; read _ignored", pgid)
+}
+
+#[cfg(unix)]
+fn member_running(script: &str, pgid: i32) -> std::process::Command {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new("/bin/sh");
     cmd.arg("-c")
-        .arg("echo $$; read _ignored")
+        .arg(script)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .process_group(pgid);
@@ -1757,10 +1769,16 @@ pub(crate) const CAT_TREE_ARGV: &[&str] = &[
 ];
 
 /// A root and one descendant (a subshell) on one stdin pipe, each handling `SIGHUP`, `SIGTERM`,
-/// `SIGUSR1` and `SIGUSR2` by printing `<root|leaf> SIG<NAME>` and exiting. The descendant prints `r`
-/// once both have installed their handlers. A signal only the handlers see is reported by name, so a
-/// test learns which signal each of the two received. When none arrives the stdin's end makes each
-/// print `<root|leaf> eof` instead.
+/// `SIGUSR1` and `SIGUSR2` by printing `<root|leaf> SIG<NAME>` and exiting, each with a `cat` of its own
+/// on that pipe. The descendant prints `r` once all four processes exist and both shells have installed
+/// their handlers, so a signal sent after `r` finds every member of the tree. A signal only the handlers
+/// see is reported by name, so a test learns which signal each of the two received. When none arrives the
+/// stdin's end makes each print `<root|leaf> eof` instead.
+///
+/// The `cat`s ignore the four signals, set before each is forked (an ignored disposition survives the
+/// `exec`): no signal can end one or be lost in its start, and its exit never wakes its shell ahead of
+/// the shell's own handler. They end only with the stdin, so a test that waits for the tree to drain
+/// ends the stdin after its send.
 #[cfg(unix)]
 pub(crate) const SIGNAL_REPORTING_TREE_ARGV: &[&str] = &[
     "sh",
@@ -1768,9 +1786,10 @@ pub(crate) const SIGNAL_REPORTING_TREE_ARGV: &[&str] = &[
     "exec 3<&0; \
      traps() { trap \"echo $1 SIGHUP; exit 0\" HUP; trap \"echo $1 SIGTERM; exit 0\" TERM; \
                trap \"echo $1 SIGUSR1; exit 0\" USR1; trap \"echo $1 SIGUSR2; exit 0\" USR2; }; \
-     traps root; \
-     { traps leaf; echo r; cat <&3 3<&- & wait; echo 'leaf eof'; } & \
-     cat <&3 3<&- & wait; echo 'root eof'",
+     quiet() { trap '' HUP TERM USR1 USR2; }; \
+     quiet; cat <&3 3<&- & traps root; \
+     { quiet; cat <&3 3<&- & traps leaf; echo r; wait; echo 'leaf eof'; } & \
+     wait; echo 'root eof'",
 ];
 
 /// [`SIGNAL_REPORTING_TREE_ARGV`] where `SIGUSR1` is only reported and the process goes on, so a stop
@@ -1781,7 +1800,10 @@ pub(crate) const SIGNAL_REPORTING_TREE_ARGV: &[&str] = &[
 ///
 /// Every member handles the first signal and keeps running, whichever of them the signal reaches: the
 /// shells by their traps, and the two `cat`s by ignoring it (an ignored signal stays ignored across
-/// `exec`, and is set before the `cat` is forked, so there is no window in which it would kill one).
+/// `exec`, and is set before the `cat` is forked, so there is no window in which it would kill one). The
+/// `cat`s ignore `SIGTERM` too, and end only with the stdin: a signal sent to each member in turn, not to
+/// the group at once, would otherwise end a shell's `cat` before the shell's own `SIGTERM` came, and the
+/// shell would report its end of input in place of the signal.
 /// A shell waits for its `cat` and goes back to waiting while the `cat` still lives, so a trap's
 /// interruption of `wait` neither ends the shell nor makes it spin, in any `sh`. The leaf prints `r`
 /// once everything is in place.
@@ -1792,8 +1814,8 @@ pub(crate) const SIGNAL_THEN_TERM_TREE_ARGV: &[&str] = &[
     "exec 3<&0; \
      traps() { trap \"echo $1 SIGUSR1\" USR1; trap \"echo $1 SIGTERM; exit 0\" TERM; }; \
      hold() { while :; do wait $1; kill -0 $1 2>/dev/null || break; done; }; \
-     trap '' USR1; cat <&3 3<&- & c=$!; traps root; \
-     { trap '' USR1; cat <&3 3<&- & d=$!; traps leaf; echo r; hold $d; echo 'leaf eof'; } & \
+     trap '' USR1 TERM; cat <&3 3<&- & c=$!; traps root; \
+     { trap '' USR1 TERM; cat <&3 3<&- & d=$!; traps leaf; echo r; hold $d; echo 'leaf eof'; } & \
      hold $c; echo 'root eof'",
 ];
 
@@ -1847,22 +1869,51 @@ pub(crate) async fn ready_tree_async(
     (child, stdin, stdout)
 }
 
-/// The two report lines of a [`SIGNAL_REPORTING_TREE_ARGV`] tree (one per process), sorted. Blocks
-/// until both have been printed.
+/// The report lines of a [`SIGNAL_REPORTING_TREE_ARGV`] tree (one per process), read to the end of its
+/// stdout and sorted. The caller has ended the tree's stdin, so a member the signal missed reports its end
+/// of input (`<member> eof`) instead: the lines say who was reached, and no read waits on a member that
+/// reports nothing.
 #[cfg(unix)]
-pub(crate) fn two_signal_reports(stdout: crate::PipeReader) -> Vec<String> {
-    use std::io::BufRead as _;
-
-    let mut stdout = std::io::BufReader::new(stdout);
-    let mut reports: Vec<String> = (0..2)
-        .map(|_| {
-            let mut line = String::new();
-            stdout.read_line(&mut line).expect("a report line");
-            line.trim_end().to_owned()
-        })
-        .collect();
+pub(crate) fn signal_reports_to_end(mut stdout: crate::PipeReader) -> Vec<String> {
+    let mut said = String::new();
+    std::io::Read::read_to_string(&mut stdout, &mut said).expect("the tree's stdout, to its end");
+    let mut reports: Vec<String> = said.lines().map(str::to_owned).collect();
     reports.sort();
     reports
+}
+
+/// The write end of a tree's stdin (`W`: a [`PipeWriter`](crate::PipeWriter), or an async child's stdin),
+/// held for a stop action that ends it right after its send: the tree drains whichever member the signal
+/// missed, which then reports its end of input ([`signal_reports_to_end`]), so a miss fails an assertion
+/// and no read or grace waits on it.
+#[cfg(unix)]
+pub(crate) struct HeldStdin<W>(std::sync::Arc<std::sync::Mutex<Option<W>>>);
+
+#[cfg(unix)]
+impl<W> Clone for HeldStdin<W> {
+    fn clone(&self) -> Self {
+        HeldStdin(std::sync::Arc::clone(&self.0))
+    }
+}
+
+#[cfg(unix)]
+impl<W> Default for HeldStdin<W> {
+    fn default() -> Self {
+        HeldStdin(std::sync::Arc::default())
+    }
+}
+
+#[cfg(unix)]
+impl<W> HeldStdin<W> {
+    /// Takes `stdin`, once the tree is spawned.
+    pub(crate) fn hold(&self, stdin: W) {
+        *self.0.lock().unwrap() = Some(stdin);
+    }
+
+    /// Ends the stdin: the action's last step after its send.
+    pub(crate) fn end(&self) {
+        drop(self.0.lock().unwrap().take());
+    }
 }
 
 /// Three processes that ignore `SIGTERM` (an ignored disposition survives `exec`) and block on one
