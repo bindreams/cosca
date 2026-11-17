@@ -40,13 +40,81 @@ use proxy::protocol::CtrlEvent;
 
 use crate::error::Error;
 
-/// The stop a child does when its command set none: on Unix, `send_signal` with
-/// `Signal::Term`; on Windows, `send_ctrl_break_to_group`.
+/// The stop a child does when its command set none: on Unix, `send_signal` with `Signal::Term`; on
+/// Windows, `CTRL_BREAK`, sent the way that can reach the child, which what the spawn recorded of its
+/// console decides (`StopTarget::leads_group_on_our_console` and what it reads). A child is *created on this
+/// process's console* when it was spawned with none of [`no_window`](crate::Command::no_window),
+/// `detached` and a console of its own, by a process that had a console.
+///
+/// 1. The child was created on this process's console and leads a console process group there (a child
+///    spawned with [`contain`](crate::Command::contain) does by default, a nested contained one too, and an
+///    uncontained child only if `Command::new_process_group(true)` asked for it):
+///    `send_ctrl_break_to_group`, which reaches every member of that group.
+/// 2. The child was created on this process's console and leads no group (an uncontained child by default,
+///    a contained one given `Command::new_process_group(false)`): `send_ctrl_break_to_group` too, which
+///    refuses it. No proxy is started.
+/// 3. Any other child (one created with `no_window`, `detached` or a console of its own, a child of a
+///    caller that had no console, a child cosca did not create): `send_console_event_via_proxy` with
+///    `CtrlEvent::CtrlBreak`, which blocks the calling thread for the proxy's answer and reaches every
+///    process on the child's console. It needs the host program to have called
+///    [`cosca::init()`](crate::init) (see `send_console_event_via_proxy`).
+///
+/// The second case cannot be written with the public functions (`leads_group_on_our_console` is the only
+/// public fact), so a hand-written `if leads { direct } else { proxy }` sends that child to the proxy.
+///
+/// # Refusals on Windows
+///
+/// Each is an [`Error::Unsupported`] with nothing sent and nothing killed. [`Child::kill`](crate::Child::kill)
+/// is the always-available alternative, and [`graceful_shutdown`](crate::Child::graceful_shutdown) and
+/// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) end at a refusal with the child running,
+/// without going on to the kill.
+///
+/// - Case 2: the error names `Command::new_process_group`, because no console event can be addressed to the
+///   child alone, and one sent to the console would reach this process as well. No proxy is started, so
+///   `init` is not needed. The direct send refuses before it looks at the child, so the refusal is the same
+///   for a child that has exited, where every other child that has exited is answered `Ok` (see
+///   [`Child::terminate`](crate::Child::terminate)).
+/// - Case 3, the host program has not called `init` and the command names no `CtrlProxy::Executable`: the
+///   error names `cosca::init()` and the `Executable` setting. Nothing is started.
+/// - Case 3, the child has no identity to name it by: the error names `Child::kill`. Nothing is started.
+/// - Case 3, a child a system elevation service created on a UAC consent: the error names `kill()`. Nothing
+///   is started.
+/// - Case 3, the child has no console to attach to (`detached()`, or a GUI-subsystem program given
+///   `no_window`), or has not set one up yet: the proxy finds none and the error names `Child::kill`.
+///
+/// **Before the child has run.** A child that has not set its console up yet looks like one without a
+/// console, so a stop sent to a just-spawned child of case 3 can be refused as the last item says, and
+/// the graceful calls end there with the child running. A caller that has observed output or a handshake
+/// from the child is past that window. A caller that wants the child gone before it has run at all uses
+/// `Child::kill`.
+///
+/// The route is chosen from what was true at the spawn, so a caller that changes its own console
+/// afterwards (frees it, attaches another) sets an explicit action. A child that was created on this
+/// process's console and later moved to a console of its own is not reached: the default refuses one that
+/// leads no group, and sends one that leads a group a break that reaches nobody (see
+/// `send_ctrl_break_to_group`). It stays reachable through an explicit
+/// `graceful_stop(|t| stop::send_console_event_via_proxy(t, CtrlEvent::CtrlBreak))`.
 pub fn default(target: &StopTarget<'_>) -> Result<(), Error> {
     #[cfg(unix)]
     return send_signal(target, crate::Signal::Term);
     #[cfg(windows)]
-    return send_ctrl_break_to_group(target);
+    return crate::child::graceful::shutdown::run_ready(default_with(
+        &crate::child::graceful::shutdown::BlockingDriver(target.child()),
+        target,
+    ));
+}
+
+/// Windows: the one body of [`default`], for the driver that blocks (`stop::default`) and the one that awaits
+/// (`tokio::stop::default`): the two cannot differ. A child created on our console is sent the direct break
+/// whether it leads a group (the send) or not (the send's refusal, which names the setter); any other goes
+/// through the proxy, whose waits are the driver's.
+#[cfg(windows)]
+pub(crate) async fn default_with<D: StopWaits>(driver: &D, target: &StopTarget<'_>) -> Result<(), Error> {
+    if target.created_on_our_console() {
+        send_ctrl_break_to_group(target)
+    } else {
+        proxy::send(driver, target, CtrlEvent::CtrlBreak).await
+    }
 }
 
 /// Unix: sends `signal`, and does not wait.
@@ -252,7 +320,8 @@ fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Res
 ///
 /// # Errors
 ///
-/// [`Error::Unsupported`], with nothing sent and, for the first three, nothing started:
+/// [`Error::Unsupported`], with nothing sent and, for the first three, nothing started (for a child that
+/// has not exited; see below):
 /// - the child is one a system service created on a UAC consent;
 /// - the child has no identity ([`Child::id`](crate::Child::id) is `None`), which the proxy names its
 ///   target by, so that a reused pid is never sent an event;
@@ -278,11 +347,16 @@ fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Res
 ///
 /// # A child that has exited
 ///
-/// When the proxy cannot attach and cosca's look finds the child exited, nothing was sent. On a root
-/// target the answer is `Ok`, as [`send_ctrl_break_to_group`] answers an exited child. On a tree target
-/// `terminate_tree` answers an error, and `graceful_shutdown_tree` goes on to its grace, sweep and
-/// reap with no event sent: members that outlived the root are ended by the sweep without a console
-/// event, where the direct send to the group would have reached them.
+/// The call's first act is one look at the child through its handle, which reaps nothing. A child that
+/// has exited is answered then, before any rule above and with nothing started (so a host that has not
+/// called `init` gets the answer too): nothing was sent. On a root target the answer is `Ok`, as
+/// [`send_ctrl_break_to_group`] answers an exited child that leads a group. On a tree target `terminate_tree` answers an
+/// error, and `graceful_shutdown_tree` goes on to its grace, sweep and reap with no event sent: members
+/// that outlived the root are ended by the sweep without a console event, where the direct send to the
+/// group would have reached them.
+///
+/// A child that exits after that look is answered the same way when the proxy cannot attach and cosca's
+/// look at the proxy's answer finds the child exited.
 #[cfg(windows)]
 pub fn send_console_event_via_proxy(target: &StopTarget<'_>, event: CtrlEvent) -> Result<(), Error> {
     crate::child::graceful::shutdown::run_ready(proxy::send(

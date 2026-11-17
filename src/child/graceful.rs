@@ -79,29 +79,42 @@ impl Child {
     ///
     /// What the rest of this documentation says is what the default does. On Unix it is an
     /// identity-bound `SIGTERM` to this process alone, so it cannot race a concurrent reap onto a
-    /// recycled pid. On Windows it is `CTRL_BREAK` to the child's own **console process group**, which
-    /// a child spawned with [`contain`](crate::Command::contain) leads by default (a nested
-    /// [`Delegated`](crate::Containment::Delegated) one too) and an uncontained child leads only if
-    /// `new_process_group(true)` asked for it. A child that leads no group of its own (an uncontained
-    /// spawn by default, or one given `new_process_group(false)`) is refused with `Unsupported`; `kill`
-    /// is the always-available alternative.
+    /// recycled pid. On Windows it is `CTRL_BREAK`, sent directly from this process to the child's
+    /// console process group, or by the console-event proxy: a helper process, with no console of its
+    /// own, that attaches to the child's console and sends the event to it
+    /// (`stop::send_console_event_via_proxy`). [`stop::default`](crate::stop::default) says which child
+    /// gets which, which are refused, and what a caller that changes its own console afterwards sets.
     ///
-    /// **Windows blast radius.** The event reaches the child's whole console group, so an
-    /// ordinary descendant that stayed in that group is signalled too, while a nested
-    /// *contained* descendant — which by default leads a group of its own — is not.
+    /// **What it reaches on Windows.** The proxy reaches every process on the child's console: the
+    /// child, its descendants that share the console (a nested *contained* one too, which by default
+    /// leads a group of its own), and any other process attached to it. The direct send reaches every
+    /// member of the child's console process group: a descendant that stayed in the group, and not a
+    /// nested contained descendant. Neither reaches a descendant that has a console of its own or was
+    /// started detached.
     ///
-    /// **The caller must hold a console** ([`Error::NoConsole`](crate::error::Error::NoConsole)
-    /// otherwise: a GUI-subsystem binary, a service, or a detached spawn cannot deliver console
-    /// control events). A child that owns its own console instead needs a process attached to
-    /// *that* console to signal it — it is not beyond a polite shutdown, just beyond this
-    /// process's reach.
+    /// **The proxy waits.** The default blocks the calling thread until the proxy answers, with no cap;
+    /// see `stop::send_console_event_via_proxy`.
     ///
-    /// **Success does not prove delivery on Windows.** Windows reports success for an event
-    /// aimed at a group in another console and delivers nothing, and this process cannot rule
-    /// that case out: absence from its console list is equally the answer for a healthy child.
-    /// Each such call also leaves a dead entry in the caller's console process list.
+    /// **A child that has exited is `Ok`**, as on every platform, except a child created on this
+    /// process's console that leads no group: the direct send refuses it with
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported), before and after its exit. A child the
+    /// default sends through the proxy is looked at first (one look through its handle): an exited one is
+    /// answered `Ok` with nothing started, whether or not the host called `init`.
     ///
-    /// **Every error of the default means nothing was sent and nothing was killed.**
+    /// **The direct send can report success for a child that left our console.** Windows reports
+    /// success for an event aimed at a group in another console and delivers nothing, and this process
+    /// cannot rule that case out: a GUI-subsystem child never attaches to this process's console
+    /// whatever its flags say, and any child may free or change its console after it starts. The proxy
+    /// has no such gap: it attaches to the child's own console and answers what it found. Each direct
+    /// send also leaves a dead entry in the caller's console process list.
+    ///
+    /// **Every error of the default means nothing was killed, and that nothing was sent, except on
+    /// Windows through the proxy:** an [`Error::Unassessable`](crate::error::Error::Unassessable) (the
+    /// proxy ended without a known answer, or sent the event and did not see its own copy) and an
+    /// [`Error::MayHaveStarted`](crate::error::Error::MayHaveStarted) from the proxy's start say whether
+    /// it was sent is unknown. The refusals on Windows, each an
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported), are listed by
+    /// [`stop::default`](crate::stop::default).
     ///
     /// **A macOS graphically-elevated child** ([`ElevatedVia::MacosOsascript`](crate::elevation::ElevatedVia::MacosOsascript))
     /// is refused while osascript runs, as its kill is (see [`kill`](Child::kill)): a `SIGTERM`
@@ -109,13 +122,10 @@ impl Child {
     /// the front does not relay: see `stop::send_signal`.
     ///
     /// **Windows, before the child has run.** Between the spawn returning and the child
-    /// executing its first instructions it has not yet registered with any console; an event
-    /// delivered in that window ends it during loader init rather than through its own handler.
-    /// That is an abrupt end, not a failed one, and it is reported `Ok`. A caller that has
-    /// observed anything from the child — a byte of output, a handshake, an exit-status check —
-    /// is past the window and gets a real cooperative signal; a caller that wants the child gone
-    /// before it has run at all should use [`kill`](Child::kill), which is honest about being
-    /// forced.
+    /// executing its first instructions it has not yet registered with any console. A direct send in
+    /// that window ends the child during loader init rather than through its own handler: an abrupt
+    /// end, not a failed one, reported `Ok`. For a send through the proxy in that window see
+    /// [`stop::default`](crate::stop::default).
     ///
     /// **macOS, a root launchd holds** is refused with nothing sent, and an `Unknown` root is signalled
     /// through the handle, as for [`kill`](Child::kill).
@@ -166,16 +176,16 @@ impl Child {
     ///
     /// The grace starts when the stop action returns: an action that does not return holds the call.
     ///
-    /// **Windows: the two halves have different radii.** The cooperative half reaches the
-    /// child's whole console group; the forced half reaches only the child. So a descendant
-    /// that stayed in the child's group can be left told-to-exit but not killed: if the child
-    /// itself exits within `grace`, this returns `Ok` while that descendant — possibly hung
-    /// mid-shutdown — keeps running, with no hard backstop and no error. For a leaf child, the
-    /// common case, the two radii are identical. Two routes give matched radii: the tree
-    /// variants on a contained root ([`graceful_shutdown_tree`](Child::graceful_shutdown_tree)
-    /// plus [`kill_tree`](Child::kill_tree)), or each level shutting down its own children,
-    /// which works because a child that owns a console can politely signal its own
-    /// group-leading children.
+    /// **Windows: the two halves have different radii.** The cooperative half reaches the child's whole
+    /// console group when it is sent directly, and every process on the child's console when it goes
+    /// through the proxy (see [`terminate`](Child::terminate)); the forced half reaches only the
+    /// child. So a descendant that stayed in the child's group, or on its console, can be left
+    /// told-to-exit but not killed: if the child itself exits within `grace`, this returns `Ok` while
+    /// that descendant — possibly hung mid-shutdown — keeps running, with no hard backstop and no
+    /// error. For a leaf child, the common case, the two radii are identical. Two routes give matched
+    /// radii: the tree variants on a contained root
+    /// ([`graceful_shutdown_tree`](Child::graceful_shutdown_tree) plus [`kill_tree`](Child::kill_tree)),
+    /// or each level shutting down its own children.
     ///
     /// **Neither route is available to the holder of a nested contained child.** Its `_tree`
     /// ops are `Unsupported` by design, and the root that owns its teardown lives in the
@@ -228,45 +238,24 @@ impl Child {
     /// descendants draining, so the wait watches the **root only** and the sweep always runs
     /// afterward regardless of what it saw.
     ///
-    /// **Windows: what the default action signals, and what the grace costs.** `CTRL_BREAK` goes
-    /// to the root's **process group** only (an action that sends through the proxy, as
-    /// `stop::send_console_event_via_proxy`, reaches every process on the child's console instead). A
-    /// nested contained descendant that leads its own
-    /// group never receives it — so it does not exit during the grace, idles through the
-    /// whole window, and is then killed by the sweep (a job object *is* drain-observable, so
-    /// this shows up as `grace` fully elapsing rather than draining early, not as a skipped
-    /// wait). The call reports no error either way: on Windows the grace is spent regardless
-    /// of how much of the tree the signal reached. Size it accordingly, and treat
-    /// [`kill_tree`](Child::kill_tree) as the only op that reaches every member FROM THIS
-    /// HANDLE. The layers the group signal skips are not beyond a polite shutdown: the holder
-    /// of a nested descendant's own `Child` can drain it with
-    /// [`graceful_shutdown`](Child::graceful_shutdown) before this root is torn down, and a
-    /// chain in which each level shuts down its own children drains completely, because a
-    /// child that owns a console can politely signal its own group-leading children.
+    /// **Windows: what the default action signals, and what the grace costs.** For a root that leads
+    /// its group on this process's console, `CTRL_BREAK` goes to the root's **process group** only: a
+    /// nested contained descendant that leads its own group never receives it — so it does not exit
+    /// during the grace, idles through the whole window, and is then killed by the sweep (a job object
+    /// *is* drain-observable, so this shows up as `grace` fully elapsing rather than draining early,
+    /// not as a skipped wait). For a root created outside this process's console the default sends it
+    /// through the proxy, which reaches every process on the root's console, a nested contained
+    /// descendant included, and no descendant that has a console of its own or was started detached. Either way the call reports no error for
+    /// a member the signal missed: on Windows the grace is spent regardless of how much of the tree the
+    /// signal reached. Size it accordingly, and treat [`kill_tree`](Child::kill_tree) as the only op
+    /// that reaches every member FROM THIS HANDLE. The layers the group signal skips are not beyond a
+    /// polite shutdown, though: the holder of a nested descendant's own `Child` can drain it with
+    /// [`graceful_shutdown`](Child::graceful_shutdown) before this root is torn down.
     ///
-    /// **A root created with `new_process_group(false)` is refused.** The default action returns
-    /// [`Error::Unsupported`](crate::error::Error::Unsupported): nothing is sent, nothing is waited for,
-    /// nothing is killed, and the tree keeps running. [`kill_tree`](Child::kill_tree) ends it.
-    ///
-    /// **And success here does not prove the event was delivered.** A root that shares no
-    /// console with the caller is reported as success and reaches nobody — including a root
-    /// spawned with [`no_window`](crate::Command::no_window) (a console of its own) or
-    /// `detached()` (none). For such a root
-    /// `StopTarget::leads_group_on_our_console` is
-    /// `false`: that is what cosca recorded about the *route* from this process, never an authority on
-    /// whether a signal will arrive. It is
-    /// also not "this child cannot be shut down politely" — a process attached to the child's own
-    /// console can deliver the event. The cooperative op returns `Ok` and delivers nothing; the
-    /// forced ops ([`kill`](Child::kill) / [`kill_tree`](Child::kill_tree), and the escalation
-    /// half of [`graceful_shutdown_tree`](Child::graceful_shutdown_tree)) are unaffected.
-    ///
-    /// **The caller must also have a console.** The event is deliverable only within the
-    /// *calling* process's console, so a GUI-subsystem binary, a service, or anything spawned
-    /// detached fails up front: no signal is sent, no grace is waited, and the tree is left
-    /// running for the caller to `kill_tree` (which needs no console). The cause is
-    /// classified best-effort — usually [`Error::NoConsole`](crate::error::Error::NoConsole),
-    /// but a raw `Error::Io` when the crate cannot confirm it — so treat **any** error here
-    /// as "not delivered, tree still running".
+    /// **A root that cannot be sent the event is refused, and the call ends there:** the refusals are
+    /// those of [`stop::default`](crate::stop::default), with nothing sent, no grace waited, nothing
+    /// killed and the tree running. [`kill_tree`](Child::kill_tree) ends it. A direct send's success does
+    /// not prove delivery: see [`terminate`](Child::terminate).
     ///
     /// The grace-wait is **non-reaping** (watches exit without collecting it), so a subsequent
     /// hard sweep runs while the root's pid — and thus the `killpg` group id — is still valid;
@@ -731,4 +720,8 @@ mod pidfd_shutdown_tests;
 
 #[cfg(all(test, windows))]
 #[path = "ctrl_break_tests.rs"]
-mod ctrl_break_tests;
+pub(crate) mod ctrl_break_tests;
+
+#[cfg(all(test, windows))]
+#[path = "ctrl_break_proxy_tests.rs"]
+mod ctrl_break_proxy_tests;

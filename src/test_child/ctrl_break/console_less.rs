@@ -1,22 +1,25 @@
-//! The graceful ops from a caller with no console. The checks run in a re-exec of this binary
-//! spawned `DETACHED_PROCESS`; the driver in `child::ctrl_break_tests` reads only whether the
-//! checks finished.
+//! The graceful ops from a caller with no console, with the proxy a fixture that sends nothing. The
+//! checks run in a re-exec of this binary spawned `DETACHED_PROCESS`; the driver in
+//! `child::ctrl_break_tests` reads only whether the checks finished.
 //!
 //! A target's reply cannot show that no break was sent: its handler thread may not have run yet.
 //! The proof is the sender's own record, empty after each op ([`assert_no_break_sent`]): with no
-//! console `GenerateConsoleCtrlEvent` fails at the syscall, so each op reports `NoConsole`. The
-//! members are GUI-subsystem images ([`spawn_consoleless_root`]), which no break reaches, so
-//! nothing else would reveal a break sent anyway.
-//!
-//! A console-subsystem member would open a visible console window (its parent has none);
-//! `CREATE_NO_WINDOW` would hide it but move the member out of the caller's console group, changing
-//! the asserted mechanism from `ConsoleGroup` to `OtherConsoleGroup`.
+//! console `GenerateConsoleCtrlEvent` fails at the syscall, so each op of the direct send reports
+//! `NoConsole`. The members are GUI-subsystem images ([`spawn_gui_root`]), which no break reaches, so
+//! nothing else would reveal a break sent anyway. A console-subsystem member would open a visible
+//! console window (its parent has none).
 
 use std::time::Duration;
 
-use super::{assert_no_break_sent, connect_reporter, kill_release_reap, report_done, spawn_consoleless_root};
+use super::{
+    assert_no_break_sent, assert_proxy_answered, connect_reporter, kill_release_reap, report_done, spawn_gui_root,
+};
+use crate::child::graceful::ctrl_break_tests::CALLS;
 use crate::error::Error;
+use crate::graceful_hooks::{release_at, HookPoint};
 use crate::identity::Liveness;
+use crate::stop::proxy::protocol::{CtrlEvent, ProxyAnswer};
+use crate::stop::proxy::proxy_tests::Fixture;
 use crate::{Containment, StopTarget};
 
 /// The fully-qualified libtest path of [`fixture_console_less_reporter`].
@@ -96,20 +99,17 @@ fn assert_refused_sends_are_not_sent() {
     assert_no_break_sent();
 }
 
-/// Runs the tree ops and then the lone ops against a contained member that cannot be signalled, from
-/// a caller with no console: each cooperative op fails with `NoConsole` and leaves the member
-/// running, and the forced ops still end it. No op sends a break, and the sends beneath them, to a
-/// group the reporter leads, are refused.
-#[skuld::test]
-fn fixture_console_less_reporter() {
-    let Some(mut report) = connect_reporter(ADDR_ENV) else {
-        return;
-    };
-    assert_no_console();
-    assert_refused_sends_are_not_sent();
+/// A stop action that sends the direct break, as a caller who chose it would write it.
+fn direct(target: &StopTarget<'_>) -> Result<(), Error> {
+    crate::stop::send_ctrl_break_to_group(target)
+}
 
+/// The direct send, which every cooperative op of a child that chose it makes, from a caller with no
+/// console: each op fails with `NoConsole` and leaves the member running, and the forced ops still end
+/// it. No op sends a break, and the sends beneath them, to a group the reporter leads, are refused.
+fn assert_the_direct_send_has_no_console() {
     // The tree ops.
-    let (child, sock) = spawn_consoleless_root();
+    let (child, sock) = spawn_gui_root(|cmd| _ = cmd.graceful_stop(direct));
     assert_eq!(child.containment(), Containment::JobObject);
     assert!(
         matches!(child.terminate_tree(), Err(Error::NoConsole { .. })),
@@ -136,17 +136,8 @@ fn fixture_console_less_reporter() {
     );
     kill_release_reap(&child, sock, true);
 
-    // The lone ops. The child's own flags do not exclude delivery; it is the caller that cannot send.
-    let (child, sock) = spawn_consoleless_root();
-    let console = child.console;
-    assert!(
-        console.group && !console.own_console_flags,
-        "the flags do not exclude delivery: {console:?}"
-    );
-    assert!(
-        !StopTarget::from(&child).leads_group_on_our_console(),
-        "the caller had no console at the spawn, so there is no route from it"
-    );
+    // The lone ops.
+    let (child, sock) = spawn_gui_root(|cmd| _ = cmd.graceful_stop(direct));
     assert!(
         matches!(child.terminate(), Err(Error::NoConsole { .. })),
         "terminate must report NoConsole"
@@ -168,6 +159,64 @@ fn fixture_console_less_reporter() {
         "graceful_shutdown must fail before signalling, not after hard-killing"
     );
     kill_release_reap(&child, sock, false);
+}
+
+/// The default of a caller with no console asks the proxy for every call, as no group of a console
+/// the caller does not have can be sent an event: the fixture proxy answers `Sent`, the stops are `Ok`
+/// and leave the member running, and the graceful calls go on to their kill, whose exit status (1) shows
+/// it was made: the release that follows it would give a member the kill missed the status 0.
+fn assert_the_default_asks_the_proxy() {
+    for call in CALLS {
+        let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+        let (child, sock) = spawn_gui_root(|cmd| _ = cmd.ctrl_proxy(fixture.setting()));
+        assert!(
+            !StopTarget::from(&child).leads_group_on_our_console(),
+            "the caller had no console at the spawn, so there is no route from it"
+        );
+        if call.escalates() {
+            let _release = release_at(HookPoint::BeforeReap, sock);
+            let status = call
+                .run(&child, Duration::ZERO)
+                .unwrap_or_else(|e| panic!("{call:?}: {e:?}"));
+            assert_the_proxy_was_asked(call, call.escalates(), child.pid(), status);
+        } else {
+            let status = call
+                .run(&child, Duration::ZERO)
+                .unwrap_or_else(|e| panic!("{call:?}: {e:?}"));
+            assert_the_proxy_was_asked(call, call.escalates(), child.pid(), status);
+            kill_release_reap(&child, sock, false);
+        }
+    }
+}
+
+/// What a call of the default left, from a caller with no console and a proxy that answers `Sent`: the
+/// proxy was asked for `pid`, and a graceful call (`escalates`), whose `status` is the root's, went on to
+/// the kill (the release that follows it would give a root the kill missed the status 0). Shared by the
+/// sync and the async checks.
+pub(crate) fn assert_the_proxy_was_asked(
+    call: impl std::fmt::Debug,
+    escalates: bool,
+    pid: u32,
+    status: Option<std::process::ExitStatus>,
+) {
+    assert_proxy_answered(pid, CtrlEvent::CtrlBreak, ProxyAnswer::Sent);
+    if escalates {
+        let status = status.expect("a graceful call answers a status");
+        assert_eq!(status.code(), Some(1), "{call:?}: the escalation's kill: {status:?}");
+    }
+}
+
+/// From a caller with no console, the direct send fails with `NoConsole` and sends no break, and the
+/// default asks the proxy instead of failing: its stops answer what the proxy answers.
+#[skuld::test]
+fn fixture_console_less_reporter() {
+    let Some(mut report) = connect_reporter(ADDR_ENV) else {
+        return;
+    };
+    assert_no_console();
+    assert_refused_sends_are_not_sent();
+    assert_the_direct_send_has_no_console();
+    assert_the_default_asks_the_proxy();
 
     report_done(&mut report);
 }

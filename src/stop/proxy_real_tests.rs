@@ -119,23 +119,6 @@ fn a_gui_child_has_no_console_to_attach(#[fixture(ctrl_proxy)] _group: &Group) {
     kill_release_reap(&child, sock, false);
 }
 
-/// The proxy meets an exited process whose handle is held (the test first sees the exit through a
-/// non-reaping look), and the stop answers what `send_ctrl_break_to_group` answers for an exited child:
-/// `Ok`. Mutant: the exit is not looked at, so the refused attach is the stop's error.
-#[skuld::test]
-fn an_exited_child_is_answered_as_the_direct_send_answers_it(#[fixture(ctrl_proxy)] _group: &Group) {
-    let (child, sock, _) = spawn_member(Handler::Ignore, None, ContainMode::Strongest, |cmd| {
-        stops_through_the_proxy(cmd, CtrlEvent::CtrlBreak)
-    });
-    child.kill().expect("kill the member");
-    child.wait().expect("see its exit, reaping nothing");
-    drop(sock);
-    child.terminate().expect("an exited child is answered Ok");
-    // What the real proxy answers for an exited process whose handle is held, as measured
-    // (`.tmp/claude/findings/2026-11-17-997-measure3.md`).
-    assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::AttachDenied);
-}
-
 /// The tree calls take the proxy's answer as the direct send's, over a job object and over a tree walk:
 /// `terminate_tree` ends a root and a grandchild on its console that have no handler, and
 /// `graceful_shutdown_tree` does the same within its grace. The 30 s grace is a failure bound, not the

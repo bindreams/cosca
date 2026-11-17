@@ -609,7 +609,17 @@ pub fn spawn_control_with(
 /// [`spawn_control`] on this process's console, for a test of the console-group signals: a child
 /// with a window-less console of its own is outside the group those signals address.
 pub fn spawn_control_on_console(mode: &str, extra: &[&str], contain: bool) -> (cosca::Child, TcpStream) {
-    spawn_control_on(Console::Asked, mode, extra, contain, |_| {})
+    spawn_control_on_console_with(mode, extra, contain, |_| {})
+}
+
+/// [`spawn_control_on_console`] with the command further configured by `configure`.
+pub fn spawn_control_on_console_with(
+    mode: &str,
+    extra: &[&str],
+    contain: bool,
+    configure: impl FnOnce(&mut cosca::Command),
+) -> (cosca::Child, TcpStream) {
+    spawn_control_on(Console::Asked, mode, extra, contain, configure)
 }
 
 fn spawn_control_on(
@@ -909,7 +919,18 @@ pub async fn spawn_control_async_on_console(
     extra: &[&str],
     contain: bool,
 ) -> (cosca::tokio::Child, TcpStream) {
-    spawn_control_async_on(Console::Asked, mode, extra, contain, |_| {}).await
+    spawn_control_async_on_console_with(mode, extra, contain, |_| {}).await
+}
+
+/// [`spawn_control_async_on_console`] with the command further configured by `configure`.
+#[cfg(feature = "tokio")]
+pub async fn spawn_control_async_on_console_with(
+    mode: &str,
+    extra: &[&str],
+    contain: bool,
+    configure: impl FnOnce(&mut cosca::tokio::Command),
+) -> (cosca::tokio::Child, TcpStream) {
+    spawn_control_async_on(Console::Asked, mode, extra, contain, configure).await
 }
 
 #[cfg(feature = "tokio")]

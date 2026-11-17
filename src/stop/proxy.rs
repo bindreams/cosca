@@ -98,6 +98,21 @@ const ATTACH_DENIED_CAUSE: &str = "The child may still be running, on a console 
 /// documents it, for any [`StopWaits`]: the waits are the driver's.
 #[cfg(windows)]
 pub(crate) async fn send<D: StopWaits>(driver: &D, target: &StopTarget<'_>, event: CtrlEvent) -> Result<(), Error> {
+    // As on every platform, an exited child is answered before any gate.
+    match driver.root_exited(Duration::ZERO).await {
+        Ok(false) => {}
+        Ok(true) => {
+            return conclude(
+                target,
+                event,
+                SendOutcome::RootExited(root_exited(&format!(
+                    "the child (pid {}) had exited when cosca looked, before the console-event proxy was started",
+                    target.pid()
+                ))),
+            )
+        }
+        Err(look_failed) => return conclude(target, event, SendOutcome::NotSent(look_failed)),
+    }
     let console = target.child().console;
     if console.elevated {
         return Err(refuse(target, ELEVATED_REFUSAL));
@@ -114,6 +129,16 @@ pub(crate) async fn send<D: StopWaits>(driver: &D, target: &StopTarget<'_>, even
         CtrlProxy::Executable(exe) => exe.clone(),
     };
     conclude(target, event, ask(driver, target, event, &id, &exe).await)
+}
+
+/// The error of a tree call whose root had exited when cosca looked, with nothing sent: `cause` says
+/// where the look was.
+#[cfg(windows)]
+fn root_exited(cause: &str) -> Error {
+    Error::Unassessable {
+        detail: format!("{cause}: nothing was sent, and the proxy cannot reach a member of its tree that outlived it"),
+        source: None,
+    }
 }
 
 /// Starts `exe` as the proxy for `event` to the console of the child `id` names, waits for its
@@ -259,15 +284,11 @@ async fn result_of<D: StopWaits>(
         ProxyAnswer::TargetGone | ProxyAnswer::AttachDenied | ProxyAnswer::TargetHasNoConsole => {
             match driver.root_exited(Duration::ZERO).await {
                 Err(look_failed) => not_sent(look_failed),
-                Ok(true) => SendOutcome::RootExited(Error::Unassessable {
-                    detail: format!(
-                        "the console-event proxy's attach to the console of the child (pid {}) did not succeed \
-                         (answer {answer:?}, exit {code}), and the child had exited when cosca looked: nothing \
-                         was sent, and the proxy cannot reach a member of its tree that outlived it",
-                        target.pid()
-                    ),
-                    source: None,
-                }),
+                Ok(true) => SendOutcome::RootExited(root_exited(&format!(
+                    "the console-event proxy's attach to the console of the child (pid {}) did not succeed \
+                     (answer {answer:?}, exit {code}), and the child had exited when cosca looked",
+                    target.pid()
+                ))),
                 Ok(false) => attach_refused(match answer {
                     ProxyAnswer::TargetHasNoConsole => NO_CONSOLE_CAUSES,
                     _ => ATTACH_DENIED_CAUSE,

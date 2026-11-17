@@ -78,8 +78,8 @@ enum Intent {
 }
 
 #[cfg(windows)]
-/// What a probe saw: the child's own report, and what `terminate()` answered once the report was in.
-/// The answer is what the child's RECORDED console facts decide: `Ok` when they say it leads a group
+/// What a probe saw: the child's own report, and what `terminate()` answered once the report was in, the
+/// child stopping by the direct send. The answer is what the child's RECORDED console facts decide: `Ok` when they say it leads a group
 /// (the break was sent to it), `Unsupported` when they say it leads none. It is not evidence of the
 /// flag the OS got.
 struct Probed {
@@ -123,6 +123,9 @@ fn probe(backend: Backend, intent: Intent) -> Probed {
                 }
             }
             cmd.env(common::ACK_ENV, "1");
+            // The recorded facts decide the direct send: the default asks the proxy for a child that
+            // leads no group.
+            cmd.graceful_stop(cosca::stop::send_ctrl_break_to_group);
             let mut child = cmd.spawn().expect("spawn creation-flag probe child");
             let sock = common::accept_or_die(&listener, &mut child);
             let report = read_report_line(&sock);
@@ -164,6 +167,7 @@ fn probe(backend: Backend, intent: Intent) -> Probed {
                     }
                 }
                 cmd.env(common::ACK_ENV, "1");
+                cmd.graceful_stop(|target| Box::pin(cosca::tokio::stop::send_ctrl_break_to_group(target)));
                 let mut child = cmd.spawn().await.expect("spawn async creation-flag probe child");
                 let sock = common::accept_or_die_async(&listener, &mut child).await;
                 let report = read_report_line(&sock);

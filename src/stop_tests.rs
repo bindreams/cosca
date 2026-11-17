@@ -813,3 +813,32 @@ fn a_prepared_send_refuses_a_child_cosca_did_not_create() {
     assert!(!detail.contains("  "), "a run of spaces: {detail:?}");
     crate::test_child::ctrl_break::assert_no_break_sent();
 }
+
+/// The default refuses a child a system service created whichever send it would have made: the direct
+/// one (the caller had a console and the facts lead a group) or the proxy's (they do not). Nothing is
+/// sent and no proxy is asked; the refusal is the prepared sends' own.
+#[cfg(windows)]
+#[skuld::test]
+fn the_default_refuses_a_child_cosca_did_not_create() {
+    use crate::containment::windows::ConsoleFacts;
+
+    for caller_had_console in [true, false] {
+        let mut child = test_child::over_fake::child_over(&crate::os_process::fake::FakeProcess::new([
+            crate::os_process::fake::Answer::Running,
+        ]));
+        child.console = ConsoleFacts {
+            group: true,
+            caller_had_console,
+            ..ConsoleFacts::uac_elevated()
+        };
+        let err = stop::default(&StopTarget::from(&child)).expect_err("not created by cosca");
+        let Error::Unsupported { detail, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            detail.contains("did not create this child"),
+            "caller_had_console {caller_had_console}: {detail}"
+        );
+        crate::test_child::ctrl_break::assert_no_break_sent();
+    }
+}

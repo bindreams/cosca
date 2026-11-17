@@ -6,9 +6,14 @@ use std::time::Duration;
 
 use crate::child::graceful::fault as term_fault;
 use crate::containment::Containment;
+use crate::error::Error;
+use crate::stop::proxy::protocol::{CtrlEvent, ProxyAnswer};
+use crate::stop::proxy::proxy_tests::Fixture;
 use crate::test_child::ctrl_break::{
-    self, assert_acked, assert_in_our_console, kill_release_reap_async, Grandchild, Handler, STATUS_CONTROL_C_EXIT,
+    self, assert_acked, assert_in_our_console, assert_proxy_answered, console_less, kill_release_reap_async,
+    Grandchild, Handler, STATUS_CONTROL_C_EXIT,
 };
+use crate::tokio::test_runtime::never_blocking;
 use crate::StopTarget;
 
 async fn spawn_root(handler: Handler) -> (crate::tokio::Child, TcpStream) {
@@ -143,7 +148,194 @@ async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     assert_eq!(exit.wait_for_exit_code(), 1, "the sweep must kill the grandchild");
 }
 
-// A root outside our console =====
+// A child outside our group or console: the default asks the proxy =====
+//
+// The proxy here is the fixture of `stop::proxy::proxy_tests`: it answers what its name says and sends
+// nothing, so none of these tests is in the `CTRL_PROXY` group. What a real proxy delivers is in
+// `ctrl_break_proxy_tests.rs`. Each awaited call runs under `never_blocking`.
+
+/// The four calls that run the child's stop action.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Call {
+    Terminate,
+    TerminateTree,
+    GracefulShutdown,
+    GracefulShutdownTree,
+}
+
+pub(super) const CALLS: [Call; 4] = [
+    Call::Terminate,
+    Call::TerminateTree,
+    Call::GracefulShutdown,
+    Call::GracefulShutdownTree,
+];
+
+impl Call {
+    /// The call on `child`, with `grace` for a graceful one, which answers the root's status.
+    pub(super) async fn run(
+        self,
+        child: &mut crate::tokio::Child,
+        grace: Duration,
+    ) -> Result<Option<std::process::ExitStatus>, Error> {
+        never_blocking(async {
+            match self {
+                Call::Terminate => child.terminate().await.map(|()| None),
+                Call::TerminateTree => child.terminate_tree().await.map(|()| None),
+                Call::GracefulShutdown => child.graceful_shutdown(grace).await.map(Some),
+                Call::GracefulShutdownTree => child.graceful_shutdown_tree(grace).await.map(Some),
+            }
+        })
+        .await
+    }
+
+    /// Whether the call goes on to a kill when its stop did not end the root.
+    pub(super) fn escalates(self) -> bool {
+        matches!(self, Call::GracefulShutdown | Call::GracefulShutdownTree)
+    }
+}
+
+/// A contained root that stops by the default, whose proxy is `fixture`, with `configure` applied to
+/// its command last.
+async fn root_stopping_through(
+    fixture: &Fixture,
+    mode: crate::ContainMode,
+    configure: impl FnOnce(&mut crate::tokio::Command),
+) -> (crate::tokio::Child, TcpStream) {
+    spawn_root_configured(Handler::Ignore, mode, |cmd| {
+        cmd.ctrl_proxy(fixture.setting());
+        configure(cmd);
+    })
+    .await
+}
+
+/// The detail of an `Unsupported`; any other error is a panic.
+fn unsupported_detail(err: &Error) -> &str {
+    match err {
+        Error::Unsupported { detail, .. } => detail,
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// Async twin of the sync `the_default_asks_the_proxy_for_a_no_window_contained_root`; see there.
+#[skuld::test]
+async fn the_async_default_asks_the_proxy_for_a_no_window_contained_root() {
+    crate::tokio::test_runtime::assert_current_thread();
+    for (mode, expected) in [
+        (crate::ContainMode::Strongest, Containment::JobObject),
+        (crate::ContainMode::TreeWalk, Containment::TreeWalk),
+    ] {
+        for call in CALLS {
+            let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+            let (mut child, sock) = root_stopping_through(&fixture, mode, |cmd| _ = cmd.no_window()).await;
+            assert_own_console_route(&child, expected);
+            if call.escalates() {
+                let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
+                let status = call
+                    .run(&mut child, Duration::ZERO)
+                    .await
+                    .unwrap_or_else(|e| panic!("{mode:?} {call:?}: {e:?}"))
+                    .expect("a graceful call answers a status");
+                assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::Sent);
+                // The release comes after the kill, so a root the call did not kill leaves with 0.
+                assert_eq!(
+                    status.code(),
+                    Some(1),
+                    "{mode:?} {call:?}: the escalation's kill: {status:?}"
+                );
+            } else {
+                call.run(&mut child, Duration::ZERO)
+                    .await
+                    .unwrap_or_else(|e| panic!("{mode:?} {call:?}: {e:?}"));
+                assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::Sent);
+                kill_release_reap_async(&mut child, sock, false).await;
+            }
+        }
+    }
+}
+
+/// Async twin of the sync `a_detached_contained_root_is_refused_for_having_no_console`; see there.
+#[skuld::test]
+async fn an_async_detached_contained_root_is_refused_for_having_no_console() {
+    crate::tokio::test_runtime::assert_current_thread();
+    for call in CALLS {
+        let fixture = Fixture::answering(ProxyAnswer::TargetHasNoConsole.code());
+        let (mut child, sock) =
+            root_stopping_through(&fixture, crate::ContainMode::Strongest, |cmd| _ = cmd.detached()).await;
+        let err = call
+            .run(&mut child, Duration::ZERO)
+            .await
+            .expect_err("the call is refused");
+        let detail = unsupported_detail(&err);
+        assert!(detail.contains("answer TargetHasNoConsole"), "{call:?}: {detail}");
+        let (kill, graceful_stop) = (detail.find("Child::kill"), detail.find("Command::graceful_stop"));
+        assert!(
+            matches!((kill, graceful_stop), (Some(k), Some(g)) if k < g),
+            "{call:?}: the remedies, in order: {detail}"
+        );
+        assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::TargetHasNoConsole);
+        assert_eq!(
+            child.is_alive(),
+            crate::identity::Liveness::Alive,
+            "{call:?}: the call ended with the root running"
+        );
+        kill_release_reap_async(&mut child, sock, false).await;
+    }
+}
+
+/// Async twin of the sync `a_child_on_our_console_without_a_group_is_refused_by_the_direct_send_without_the_proxy`;
+/// see there.
+#[skuld::test]
+async fn an_async_child_on_our_console_without_a_group_is_refused_by_the_direct_send_without_the_proxy() {
+    crate::tokio::test_runtime::assert_current_thread();
+    for call in CALLS {
+        let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+        let (mut child, sock) = root_stopping_through(&fixture, crate::ContainMode::Strongest, |cmd| {
+            _ = cmd.new_process_group(false)
+        })
+        .await;
+        assert_in_our_console(child.pid(), "the contained member");
+        assert!(!StopTarget::from(&child.inner).leads_group_on_our_console());
+        let err = call
+            .run(&mut child, Duration::ZERO)
+            .await
+            .expect_err("the call is refused");
+        ctrl_break::assert_refused_by_the_direct_send_for_no_group(&err);
+        assert!(fixture.ran().is_none(), "{call:?}: the proxy was started");
+        assert_eq!(
+            child.is_alive(),
+            crate::identity::Liveness::Alive,
+            "{call:?}: the call ended with the root running"
+        );
+        kill_release_reap_async(&mut child, sock, false).await;
+    }
+}
+
+/// Async twin of the sync `an_uncontained_child_on_our_console_is_refused_by_the_direct_send_without_the_proxy`.
+#[skuld::test]
+async fn an_async_uncontained_child_on_our_console_is_refused_by_the_direct_send_without_the_proxy() {
+    crate::tokio::test_runtime::assert_current_thread();
+    for call in [Call::Terminate, Call::GracefulShutdown] {
+        let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+        let (mut child, sock, _) =
+            ctrl_break::spawn_member_async(Handler::Ignore, None, None, |cmd| _ = cmd.ctrl_proxy(fixture.setting()))
+                .await;
+        assert_eq!(child.containment(), Containment::None);
+        assert_in_our_console(child.pid(), "the uncontained member");
+        assert!(!StopTarget::from(&child.inner).leads_group_on_our_console());
+        let err = call
+            .run(&mut child, Duration::ZERO)
+            .await
+            .expect_err("the call is refused");
+        ctrl_break::assert_refused_by_the_direct_send_for_no_group(&err);
+        assert!(fixture.ran().is_none(), "{call:?}: the proxy was started");
+        assert_eq!(
+            child.is_alive(),
+            crate::identity::Liveness::Alive,
+            "{call:?}: the call ended with the root running"
+        );
+        kill_release_reap_async(&mut child, sock, false).await;
+    }
+}
 
 /// Async twin of `child::ctrl_break_tests::assert_own_console_route`: the async derivation must
 /// read the composed creation-flag word too.
@@ -160,71 +352,48 @@ fn assert_own_console_route(child: &crate::tokio::Child, expected_containment: C
     );
 }
 
-/// Async twin of the sync `assert_false_success`; see there.
-async fn assert_false_success(
-    expected_containment: Containment,
-    mode: crate::ContainMode,
-    configure: impl Fn(&mut crate::tokio::Command),
-) {
-    use std::io::Write as _;
+/// The fully-qualified libtest path of [`fixture_async_console_less_reporter`].
+const CONSOLE_LESS_TEST: &str = "tokio::child::graceful::ctrl_break_tests::fixture_async_console_less_reporter";
 
-    crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, mut sock) = spawn_root_configured(Handler::Default, mode, &configure).await;
-    assert_own_console_route(&child, expected_containment);
-    child
-        .terminate_tree()
-        .await
-        .expect("the cooperative op reports success");
-    ctrl_break::assert_break_sent_to(child.pid());
-    assert_eq!(
-        child.is_alive(),
-        crate::identity::Liveness::Alive,
-        "nothing was delivered, so the root must still be running"
-    );
-    sock.write_all(b"x").expect("release the root through its own socket");
-    let status = child.wait().await.expect("reap");
-    assert_eq!(
-        status.code(),
-        Some(0),
-        "the root exited on OUR release byte, so the cooperative op delivered nothing, got {status:?}"
-    );
-    drop(sock);
-
-    let (mut child, sock) = spawn_root_configured(Handler::Default, mode, &configure).await;
-    assert_own_console_route(&child, expected_containment);
-    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
-    let status = child
-        .graceful_shutdown_tree(Duration::ZERO)
-        .await
-        .expect("the forced half tears the tree down");
-    assert_eq!(
-        status.code(),
-        Some(1),
-        "the forced half must kill the root, got {status:?}"
-    );
-    assert_eq!(child.is_alive(), crate::identity::Liveness::Dead);
+/// Async twin of the sync `a_console_less_callers_default_asks_the_proxy_and_its_direct_send_has_no_console`:
+/// from a caller with no console, the async default asks the proxy for every call, whose answers are the
+/// proxy's. The checks run in a re-exec of this binary spawned detached. Mutant: `tokio::stop::default`
+/// sends the direct break (`NoConsole`, and no proxy asked).
+#[skuld::test]
+fn an_async_console_less_callers_default_asks_the_proxy() {
+    ctrl_break::drive_reporter(CONSOLE_LESS_TEST, console_less::ADDR_ENV, |cmd| _ = cmd.detached());
 }
 
+/// The reporter of [`an_async_console_less_callers_default_asks_the_proxy`], inert unless that test
+/// spawned it.
 #[skuld::test]
-async fn an_async_no_window_contained_root_gets_a_false_success() {
-    assert_false_success(Containment::JobObject, crate::ContainMode::Strongest, |c| {
-        c.no_window();
-    })
-    .await;
-}
-
-#[skuld::test]
-async fn an_async_detached_contained_root_gets_a_false_success() {
-    assert_false_success(Containment::JobObject, crate::ContainMode::Strongest, |c| {
-        c.detached();
-    })
-    .await;
-}
-
-#[skuld::test]
-async fn an_async_treewalk_contained_root_gets_a_false_success_too() {
-    assert_false_success(Containment::TreeWalk, crate::ContainMode::TreeWalk, |c| {
-        c.no_window();
-    })
-    .await;
+async fn fixture_async_console_less_reporter() {
+    let Some(mut report) = ctrl_break::connect_reporter(console_less::ADDR_ENV) else {
+        return;
+    };
+    console_less::assert_no_console();
+    for call in CALLS {
+        let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+        let (mut child, sock) = ctrl_break::spawn_gui_root_async(|cmd| _ = cmd.ctrl_proxy(fixture.setting())).await;
+        assert!(
+            !StopTarget::from(&child.inner).leads_group_on_our_console(),
+            "the caller had no console at the spawn, so there is no route from it"
+        );
+        if call.escalates() {
+            let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
+            let status = call
+                .run(&mut child, Duration::ZERO)
+                .await
+                .unwrap_or_else(|e| panic!("{call:?}: {e:?}"));
+            console_less::assert_the_proxy_was_asked(call, true, child.pid(), status);
+        } else {
+            let status = call
+                .run(&mut child, Duration::ZERO)
+                .await
+                .unwrap_or_else(|e| panic!("{call:?}: {e:?}"));
+            console_less::assert_the_proxy_was_asked(call, false, child.pid(), status);
+            kill_release_reap_async(&mut child, sock, false).await;
+        }
+    }
+    ctrl_break::report_done(&mut report);
 }

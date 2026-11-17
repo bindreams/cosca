@@ -390,7 +390,8 @@ impl Child {
     ///
     /// # Runtime
     ///
-    /// As [`terminate`](Child::terminate): the default action waits for nothing and needs no driver; an
+    /// As [`terminate`](Child::terminate): the default action on Unix waits for nothing and needs no driver,
+    /// and on Windows may await the console-event proxy's exit, which occupies no runtime thread; an
     /// action that awaits [`tokio::stop::wait_exit`](crate::tokio::stop::wait_exit) with a non-zero grace
     /// needs, on Unix, a runtime with the IO **and** time drivers enabled.
     pub async fn terminate_tree(&self) -> Result<(), Error> {
