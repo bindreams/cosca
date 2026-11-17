@@ -87,6 +87,8 @@ pub(crate) struct FakeKernel<'a> {
     kinfos: Rows<RawPid, KinfoAnswer>,
     /// `Err`: the registration is refused with this errno. `Ok`: it is made and never fires.
     subscribes: Rows<Subscription, Result<(), i32>>,
+    /// `Err`: the listing fails with this errno. `Ok`: the pids it lists.
+    pids: Rows<(), Result<Vec<libc::c_int>, i32>>,
     peek_reads: Mutex<Vec<(RawPid, usize)>>,
     /// How many `kinfo_proc` reads each pid has had, whoever answered them.
     kinfo_reads: Mutex<Vec<(RawPid, usize)>>,
@@ -124,6 +126,7 @@ impl<'a> FakeKernel<'a> {
             bsd_infos: Rows::new(),
             kinfos: Rows::new(),
             subscribes: Rows::new(),
+            pids: Rows::new(),
             peek_reads: Mutex::new(Vec::new()),
             kinfo_reads: Mutex::new(Vec::new()),
             unique_info_reads: Mutex::new(Vec::new()),
@@ -274,6 +277,15 @@ impl<'a> FakeKernel<'a> {
         self
     }
 
+    /// The next record read of `pid` is refused on both paths, as for a cross-user process in a
+    /// sandbox: its `proc_pidinfo` is refused (`EPERM`) and so is the sysctl it falls back to, which
+    /// leaves the record `Unknown`. The record is the one behind a pid's parent and its identity. Every
+    /// such read, not the next only, is [`unreadable`](crate::identity::unreadable)'s.
+    pub(crate) fn on_record_refused(self, pid: RawPid) -> Self {
+        self.on_bsd_info(pid, Err(ReadErr::Refused(libc::EPERM)))
+            .on_kinfo_refused(pid, libc::EPERM)
+    }
+
     /// The next registration `what` is made and never fires.
     pub(crate) fn on_subscribe(self, what: Subscription) -> Self {
         self.subscribes.push(what, Ok(()));
@@ -284,6 +296,19 @@ impl<'a> FakeKernel<'a> {
     pub(crate) fn on_subscribe_refused(self, what: Subscription, errno: i32) -> Self {
         self.subscribes.push(what, Err(errno));
         self
+    }
+
+    /// The next pid listing answers `answer`: the pids, or the errno it fails with. One row answers one
+    /// listing; a sweep that lists twice is stated twice.
+    pub(crate) fn on_pids(self, answer: Result<&[libc::c_int], i32>) -> Self {
+        self.state_pids(answer);
+        self
+    }
+
+    /// [`on_pids`](Self::on_pids) after the kernel is shared; see
+    /// [`state_unique_info`](Self::state_unique_info).
+    pub(crate) fn state_pids(&self, answer: Result<&[libc::c_int], i32>) {
+        self.pids.push((), answer.map(<[libc::c_int]>::to_vec));
     }
 
     /// How many peeks of `pid` the kernel has been asked for, whoever answered them.
@@ -331,6 +356,7 @@ impl<'a> FakeKernel<'a> {
             && self.bsd_infos.spent()
             && self.kinfos.spent()
             && self.subscribes.spent()
+            && self.pids.spent()
     }
 
     /// The kernel that answers a call no row answers; `asked` says what the call was.
@@ -388,6 +414,13 @@ impl Kernel for FakeKernel<'_> {
             Some(Ok(())) => Ok(()),
             Some(Err(errno)) => Err(io::Error::from_raw_os_error(errno)),
             None => self.real(format_args!("the registration {what:?}")).subscribe(kq, what),
+        }
+    }
+
+    fn pids(&self) -> io::Result<Vec<libc::c_int>> {
+        match self.pids.take(&()) {
+            Some(answer) => answer.map_err(io::Error::from_raw_os_error),
+            None => self.real(format_args!("a pid listing")).pids(),
         }
     }
 }

@@ -355,7 +355,7 @@ pub(crate) fn holds_marker_query(pid: RawPid, handle: u64) -> MarkerQuery {
 /// than the answer. Re-read with a doubled capacity until it is — a truncated fd list means a
 /// holder silently missed.
 /// The `proc_pidinfo` buffer-size argument for `cap` `proc_fdinfo` entries. Mirrors
-/// `size_argument_for` in `enumerate/macos.rs`, guarding the identical hazard: `cap` doubles
+/// `size_argument_for` in `identity/macos/pids.rs`, guarding the identical hazard: `cap` doubles
 /// unbounded in `pipe_fds_of`'s retry loop below, and an unchecked `as libc::c_int` cast wraps
 /// once `cap * entry` passes `i32::MAX`, producing an arbitrary size that no longer describes
 /// the buffer `fds` actually is — the exact correspondence the caller's `// SAFETY:` comment
@@ -1375,7 +1375,7 @@ impl Marker {
     ///
     /// **A blind pass, an unresolvable holder, and a refused signal are all real teardown gaps
     /// — none of them is convergence, and NONE of them may be reported as `Ok(())`.**
-    /// `enumerate::snapshot()` returns an empty pid list on its own internal failure (logged
+    /// `enumerate::snapshot()` returns an empty pid list when the kernel's pid listing fails (logged
     /// there) — never on a genuinely converged pass (there is always at least launchd and this
     /// process on a real host). Neither the root (`self.root`, already a resolved `ProcessId`)
     /// nor the process group (`self.pgid`, a plain integer) needs a snapshot, so a blind FIRST
@@ -1472,7 +1472,7 @@ impl Marker {
         // Snapshot FIRST, always — the group-signal-ordering invariant below depends on this
         // pass's snapshot (when one is obtained) predating any signal sent this pass.
         // `_ppid_denied` is intentionally NOT folded into `incomplete` — see this fn's doc.
-        let (pids, parents, _ppid_denied) = crate::containment::enumerate::snapshot();
+        let (pids, parents, _ppid_denied) = crate::containment::enumerate::snapshot(&*self.kernel);
         let blind = pids.is_empty();
         if blind {
             *incomplete = true;

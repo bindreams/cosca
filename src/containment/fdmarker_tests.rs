@@ -1,5 +1,7 @@
-//! Sweep tests. Every one runs against the real host process table with real descriptors —
-//! nothing here is faked, because a sweep fired at a synthetic table proves nothing.
+//! Sweep tests. They run against the real host process table with real descriptors, because a
+//! sweep fired at a synthetic table proves nothing. A test states `FakeKernel` rows over the host's
+//! only to make one read fail or be refused, which the host cannot be made to do on demand; every
+//! other read is the host's.
 //!
 //! Three rules these tests obey, because trials overlap in one process under `--nocapture`
 //! with `--test-threads` > 1 (nextest runs each test in its own process):
@@ -70,7 +72,7 @@ fn reading_through(
 }
 
 fn all_pids() -> Vec<crate::identity::RawPid> {
-    crate::containment::enumerate::snapshot().0
+    crate::containment::enumerate::snapshot(&crate::identity::HostKernel).0
 }
 
 /// See the module docs above: held for the WHOLE body of every test that both installs a
@@ -706,7 +708,7 @@ fn hard_kill_reaches_a_setsid_double_forked_orphan_the_ppid_walk_cannot() {
     let orphan: crate::identity::RawPid = line.trim().parse().expect("orphan pid");
     child.wait().expect("reap sh"); // sh's exit is what reparents the orphan
 
-    let (_, parents, _) = crate::containment::enumerate::snapshot();
+    let (_, parents, _) = crate::containment::enumerate::snapshot(&crate::identity::HostKernel);
     let ppid = parents.iter().find(|(p, _)| *p == orphan).map(|(_, pp)| *pp);
     assert_eq!(ppid, Some(1), "precondition: the orphan must be reparented to launchd");
 
@@ -1218,11 +1220,11 @@ fn a_pass_counts_only_the_identities_no_earlier_pass_had_seen() {
 
 /// `Marker::sweep`'s top-level `incomplete`/`Err` return, end to end through the REAL public
 /// `hard_kill()` — not a synthetic check of the `incomplete` bool in isolation. Forces a
-/// genuinely blind pass via the enumerate backend's test-only fault seam (module docs at the
-/// top of `enumerate/macos.rs`), NOT by naming an unkillable real pid as `root`: an unprivileged
-/// but real identity like pid 1 cannot be used as `root` here, because the sweep's
-/// `treewalk::walk_from` would then walk pid 1's ENTIRE real ppid subtree — every process on the host, launchd being
-/// everyone's eventual ancestor — and this sweep would attempt to SIGKILL every one of them.
+/// genuinely blind pass by stating a failed pid listing on the kernel the marker reads through, NOT
+/// by naming an unkillable real pid as `root`: an unprivileged but real identity like pid 1 cannot
+/// be used as `root` here, because the sweep's `treewalk::walk_from` would then walk pid 1's ENTIRE
+/// real ppid subtree — every process on the host, launchd being everyone's eventual ancestor — and
+/// this sweep would attempt to SIGKILL every one of them.
 /// `inert_root()` and `pgid: None` keep every channel this test does not need inert, so the blind
 /// pass is the ONLY source of `incomplete` — no real process is signalled by this test at all.
 #[skuld::test]
@@ -1233,9 +1235,14 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
     // The write end closes with the command: pass 1 finds the root, so a second, seeing pass
     // follows, and it must not find this process holding its own marker.
     drop(cmd);
-    let marker = super::Marker::new(prepared, inert_root(), None);
+    let kernel =
+        std::sync::Arc::new(crate::identity::FakeKernel::over(&crate::identity::HostKernel).on_pids(Err(libc::EIO)));
+    let marker = super::Marker::new(
+        reading_through(prepared, std::sync::Arc::clone(&kernel)),
+        inert_root(),
+        None,
+    );
 
-    crate::containment::enumerate::force_blind_snapshots(1);
     let result = marker.hard_kill(
         Some(&crate::test_support::stated_root::StatedRoot::unreaped()),
         &mut Vec::new(),
@@ -1244,6 +1251,10 @@ fn hard_kill_reports_err_on_a_genuinely_blind_pass() {
     assert!(
         result.is_err(),
         "a sweep whose only pass was blind must report Err, not silently converge as Ok(())"
+    );
+    assert!(
+        kernel.all_rows_taken(),
+        "the failed listing was the pass the sweep read"
     );
 }
 
@@ -1293,10 +1304,12 @@ fn a_pass_whose_root_cannot_be_read_skips_the_walk_and_is_incomplete() {
 }
 
 /// A pass whose walk cannot read a live child of its live root (its kernel refuses the child's
-/// record, as the OS can) does not signal it and is `incomplete`: not observed is not
-/// observed absent. The root is already in `seen`, so the child is the only candidate and nothing
-/// is signalled. Mutant: the sweep takes the walk's members and ignores `unassessed`: the pass
-/// reports complete.
+/// record after the snapshot has read it, as the OS can) does not signal it and is `incomplete`: not
+/// observed is not observed absent. The root is already in `seen`, so the child is the only candidate
+/// and nothing is signalled. The snapshot's read of the child is the kernel's one answered row,
+/// asserted taken, so the child has an edge, and the walk's read of it is refused.
+///
+/// Mutant: the sweep takes the walk's members and ignores `unassessed`: the pass reports complete.
 #[skuld::test]
 fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete() {
     use std::io::Read as _;
@@ -1329,7 +1342,8 @@ fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete(
     let [child] = children[..] else {
         panic!("the root has exactly one child, got {children:?}");
     };
-    let marker = super::Marker::new(refusing_reads_of(prepared, child.pid()), root, None);
+    let kernel = std::sync::Arc::new(crate::identity::unreadable_anchor(child.pid()));
+    let marker = super::Marker::new(reading_through(prepared, std::sync::Arc::clone(&kernel)), root, None);
 
     let mut reached = Vec::new();
     let mut state = super::SweepState::new(&mut reached);
@@ -1341,6 +1355,10 @@ fn a_pass_with_a_child_that_cannot_be_read_does_not_signal_it_and_is_incomplete(
         super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
     );
 
+    assert!(
+        kernel.all_rows_taken(),
+        "the snapshot read the child through the marker's kernel"
+    );
     assert!(
         state.incomplete,
         "a child the walk could not read is not a complete walk"
@@ -1377,24 +1395,19 @@ fn held_child() -> (std::process::Child, super::PreparedMarker) {
     (child, prepared)
 }
 
-/// A marker holder that the marker's kernel cannot read (its record is refused, as the OS can, while
-/// the host reads it) is not signalled, and the sweep is `incomplete`: the holder's identity is read
-/// through the marker's kernel. The rows are asserted taken.
+/// A marker holder that the marker's kernel cannot read (its record is refused after the snapshot has
+/// read it, as the OS can, while the host reads it) is not signalled, and the sweep is `incomplete`:
+/// the holder's identity is read through the marker's kernel. The snapshot's read of the holder is the
+/// kernel's one answered row, asserted taken.
 ///
-/// Mutant: the sweep reads the holder through `HostKernel`: the host finds it, the sweep signals it,
-/// and the rows are left.
+/// Mutants: the sweep reads the holder's identity through `HostKernel`: the host finds it and the sweep
+/// signals it; the snapshot reads through `HostKernel`: the row is left.
 #[skuld::test]
 fn a_holder_its_kernel_cannot_read_is_not_signalled_and_the_sweep_is_incomplete() {
-    use crate::identity::{FakeKernel, HostKernel, ReadErr};
-
     let _serialize = test_spawn_lock();
     let (holder, prepared) = held_child();
     let pid = holder.id();
-    let kernel = std::sync::Arc::new(
-        FakeKernel::over(&HostKernel)
-            .on_bsd_info(pid, Err(ReadErr::Refused(libc::EPERM)))
-            .on_kinfo_refused(pid, libc::EPERM),
-    );
+    let kernel = std::sync::Arc::new(crate::identity::unreadable_anchor(pid));
     let root = inert_root();
     let marker = super::Marker::new(reading_through(prepared, std::sync::Arc::clone(&kernel)), root, None);
 
@@ -1410,7 +1423,7 @@ fn a_holder_its_kernel_cannot_read_is_not_signalled_and_the_sweep_is_incomplete(
 
     assert!(
         kernel.all_rows_taken(),
-        "the holder was read through the marker's kernel"
+        "the snapshot read the holder through the marker's kernel"
     );
     assert!(state.incomplete, "a holder that cannot be read is not a complete sweep");
     assert_eq!(found, 0, "nothing was found or signalled");

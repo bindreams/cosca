@@ -1,7 +1,7 @@
 //! What cosca asks Darwin about a process, and nothing else: the counterpart of
 //! `identity::linux::kernel`. [`HostKernel`] makes the calls (`waitid`, `proc_pidinfo`,
-//! `sysctl(KERN_PROC_PID)` and the kqueue registration); the test `FakeKernel` answers from a table of
-//! stated answers and models no kernel.
+//! `sysctl(KERN_PROC_PID)`, `proc_listallpids` and the kqueue registration); the test `FakeKernel`
+//! answers from a table of stated answers and models no kernel.
 //!
 //! Every decision stays in a function above the trait, over a `&dyn Kernel` or a kernel the
 //! caller owns.
@@ -38,6 +38,12 @@ pub(crate) trait Kernel: Sync {
     /// The registration [`Kqueue::subscribe`] makes, through the kernel: every registration (exit
     /// watch, reap waiter, tracer arm) goes here.
     fn subscribe(&self, kq: &Kqueue, what: Subscription) -> io::Result<()>;
+
+    /// `proc_listallpids`: every pid the kernel lists, in one answer. The sizing call, the fill and the
+    /// growth of the buffer until the kernel reports fewer pids than it holds are steps of the real
+    /// kernel's read, behind this one. The list holds the pids as the kernel gave them, the kernel
+    /// process's (not positive) included.
+    fn pids(&self) -> io::Result<Vec<libc::c_int>>;
 }
 
 /// The real kernel.
@@ -90,6 +96,10 @@ impl Kernel for HostKernel {
     fn subscribe(&self, kq: &Kqueue, what: Subscription) -> io::Result<()> {
         kq.subscribe(what).map_err(crate::error::Error::into_io)
     }
+
+    fn pids(&self) -> io::Result<Vec<libc::c_int>> {
+        super::pids::host_pids()
+    }
 }
 
 /// One `waitid(P_PID, pid, options)`. `Ok(None)` when nothing matched: XNU leaves a `siginfo_t`
@@ -133,6 +143,7 @@ forward_kernel! {
     fn bsd_info(&self, pid: RawPid) -> Result<libc::proc_bsdinfo, ReadErr>;
     fn kinfo(&self, pid: RawPid) -> (Resolved<kinfo_proc>, Option<io::Error>);
     fn subscribe(&self, kq: &Kqueue, what: Subscription) -> io::Result<()>;
+    fn pids(&self) -> io::Result<Vec<libc::c_int>>;
 }
 
 #[cfg(test)]

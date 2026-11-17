@@ -1,8 +1,8 @@
 //! The ppid join: `join_edges`, `process_parents`, and `ppid_of`'s failure branches.
 
-use crate::identity::{HostKernel, Resolved};
+use crate::identity::{FakeKernel, HostKernel, Resolved};
 
-use super::super::{join_edges, ppid_of, process_parents, push_denied_sample, DENIED_SAMPLE_CAP};
+use super::super::{join_edges, ppid_of, process_parents, push_denied_sample, snapshot, DENIED_SAMPLE_CAP};
 
 /// The `pid <= 0` filter, pinned deterministically with a synthetic pid list rather than a
 /// live one: depending on a live run to happen to contain pid 0 (a kernel-internal fact
@@ -16,7 +16,7 @@ fn join_edges_filters_non_positive_pids() {
     // Read before and after, same reasoning as `parents_contains_this_process_edge`:
     // nothing holds this process's real parent fixed across the call.
     let parent_before = std::os::unix::process::parent_id();
-    let (out, denied, sample) = join_edges(&HostKernel, &[0, -1, me]).expect("edge buffer");
+    let (out, denied, sample) = join_edges(&HostKernel, &[0, -1, me]);
     let parent_after = std::os::unix::process::parent_id();
     assert_eq!(denied, 0, "0 and -1 must not be counted as denied ppid lookups");
     assert!(
@@ -38,7 +38,7 @@ fn join_edges_filters_non_positive_pids() {
 #[skuld::test]
 fn join_edges_does_not_count_gone_pids_as_denied() {
     let unresolvable = vec![libc::c_int::MAX; 8];
-    let (out, denied, sample) = join_edges(&HostKernel, &unresolvable).expect("edge buffer");
+    let (out, denied, sample) = join_edges(&HostKernel, &unresolvable);
     assert!(out.is_empty(), "none of these pids can resolve to an edge");
     assert_eq!(denied, 0, "a pid that is simply gone must not be counted as denied");
     assert!(
@@ -47,12 +47,8 @@ fn join_edges_does_not_count_gone_pids_as_denied() {
     );
 }
 
-/// The denied-sample cap, pinned directly against [`push_denied_sample`] rather than through
-/// a live `join_edges` call: there is no deterministic way to force `Resolved::Unknown` from
-/// a real `ppid_of` call (see `snapshot`'s doc), so this is the only way to exercise the cap
-/// at all. Pushing `DENIED_SAMPLE_CAP + 2` entries must still keep exactly the first
-/// `DENIED_SAMPLE_CAP` of them — capped, not merely bounded by coincidence, and not silently
-/// replacing earlier entries with later ones.
+/// The denied-sample cap, pinned against [`push_denied_sample`]: `DENIED_SAMPLE_CAP + 2` pushes keep
+/// exactly the first `DENIED_SAMPLE_CAP`, not a later window.
 #[skuld::test]
 fn push_denied_sample_caps_at_the_limit() {
     let mut sample = Vec::new();
@@ -75,7 +71,7 @@ fn push_denied_sample_caps_at_the_limit() {
 ///
 /// This is the only edge that can be asserted unconditionally: `proc_pidinfo` on SELF is
 /// always permitted, so `ppid_of(getpid())` cannot be denied. A broader assertion — every
-/// same-uid pid in `all_pids()` has an edge — would be flaky, because a same-uid process
+/// same-uid pid in the listing has an edge — would be flaky, because a same-uid process
 /// that exits between the two calls is a legitimate ESRCH drop. The EPERM gap that bounds
 /// this layer is pinned separately, in `ppid_of_resolves_a_different_users_process_via_the_sysctl_fallback`.
 ///
@@ -140,28 +136,29 @@ fn ppid_of_reports_gone_for_an_unallocatable_pid() {
 }
 
 /// A failed `proc_listallpids` is `Unassessable` naming the call, not an empty snapshot a tree
-/// walk would read as "no descendants". Mutant: "`process_parents` reads `all_pids()`" (a failure
-/// becomes an empty list).
+/// walk would read as "no descendants". Mutants: "a failure becomes an empty list";
+/// "`process_parents` lists through the host's kernel" (the row is left, and the listing succeeds).
 #[skuld::test]
 fn a_failed_pid_listing_is_unassessable_not_an_empty_snapshot() {
-    super::super::force_blind_snapshots(1);
-    match process_parents(&HostKernel) {
+    let kernel = FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO));
+    match process_parents(&kernel) {
         Err(crate::error::Error::Unassessable { detail, source }) => {
             assert!(detail.contains("proc_listallpids"), "{detail}");
             assert!(source.is_some());
         }
         other => panic!("expected Unassessable, got {other:?}"),
     }
+    assert!(kernel.all_rows_taken());
 }
 
 /// A pid denied its ppid read leaves its subtree out of the edges, and a walk over them would skip
-/// it: `process_parents` is `Unassessable` naming the denied count and a sample. Mutant: "`denied >
-/// 0` still returns `Ok`".
+/// it: `process_parents` is `Unassessable` naming the denied count and a sample. Mutants: "`denied >
+/// 0` still returns `Ok`"; "a persistent refusal is retried" (a second read reaches the host's,
+/// which resolves it).
 #[skuld::test]
 fn a_denied_ppid_read_is_unassessable_naming_the_count_and_a_sample() {
     let me = std::process::id() as libc::c_int;
-    let _forced = super::super::fault::force_denied(&[me]);
-    match process_parents(&HostKernel) {
+    match process_parents(&FakeKernel::over(&HostKernel).on_record_refused(me as u32)) {
         Err(crate::error::Error::Unassessable { detail, source }) => {
             assert!(detail.contains("1 of "), "{detail}");
             assert!(detail.contains(&format!("sample: [{me}]")), "{detail}");
@@ -171,48 +168,68 @@ fn a_denied_ppid_read_is_unassessable_naming_the_count_and_a_sample() {
     }
 }
 
-/// `snapshot` keeps its own policy for the same denial: the fd-marker sweep folds the count into
-/// its `incomplete` accounting, so it gets the edges it could read and the count. Mutant:
-/// "`snapshot` fails like `process_parents`".
+/// `snapshot` keeps its own policy for the same denial: it returns the edges it could read and the
+/// count. Mutant: "`snapshot` fails like `process_parents`".
 #[skuld::test]
 fn snapshot_reports_a_denied_ppid_read_as_a_count_not_an_error() {
     let me = std::process::id() as libc::c_int;
-    let _forced = super::super::fault::force_denied(&[me]);
-    let (pids, edges, denied) = super::super::snapshot();
+    let (pids, edges, denied) = snapshot(&FakeKernel::over(&HostKernel).on_record_refused(me as u32));
     assert_eq!(denied, 1);
     assert!(pids.contains(&(me as u32)));
     assert!(!edges.iter().any(|&(pid, _)| pid == me as u32));
 }
 
-/// A failed edge allocation is `Unassessable`, not an empty tree. Mutant: "`join_edges`' failure is
-/// an empty snapshot".
+/// A failed listing is an empty table and a zero count, which the fd-marker sweep reads as an
+/// incomplete pass. Mutants: "a failed listing returns the host's"; "a failed listing is a list of
+/// no edges and a count of the pids".
 #[skuld::test]
-fn a_failed_edge_allocation_is_unassessable_not_an_empty_snapshot() {
-    let _forced = super::super::fault::force_join_alloc_failure();
-    match process_parents(&HostKernel) {
-        Err(crate::error::Error::Unassessable { detail, source }) => {
-            assert!(detail.contains("the process snapshot could not be taken"), "{detail}");
-            let cause = source.expect("the failed allocation is the source");
-            let said = crate::error::said(&*cause);
-            assert!(said.contains("an edge buffer could not be allocated"), "{said}");
-        }
-        other => panic!("expected Unassessable, got {other:?}"),
-    }
+fn snapshot_is_an_empty_blind_pass_when_the_listing_fails() {
+    let kernel = FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO));
+    assert_eq!(snapshot(&kernel), (Vec::new(), Vec::new(), 0));
+    assert!(kernel.all_rows_taken());
 }
 
-/// `snapshot`'s blind-pass arm: a failed join is an empty table and a zero count, which the
-/// fd-marker sweep reads as an incomplete pass. Mutant: "a failed join returns the pid list".
+/// `process_parents` and `snapshot` join the pids the kernel lists, and only those: a non-positive pid
+/// is dropped, and each edge is the parent that a stated row gives a listed pid. The kernel has no
+/// other row, so a read of any other pid panics. Mutants: the listing is read from the host (the row is
+/// left, and the host's pids have no rows); a non-positive pid is joined.
 #[skuld::test]
-fn snapshot_is_an_empty_blind_pass_when_the_edge_allocation_fails() {
-    let _forced = super::super::fault::force_join_alloc_failure();
-    assert_eq!(super::super::snapshot(), (Vec::new(), Vec::new(), 0));
+fn the_snapshot_joins_the_list_the_kernel_states() {
+    use crate::identity::Kernel;
+    let me = std::process::id() as libc::c_int;
+    let Ok(record) = HostKernel.bsd_info(me as u32) else {
+        panic!("this process has a record");
+    };
+    let with_parent = |ppid| {
+        let mut record = record;
+        record.pbi_ppid = ppid;
+        Ok(record)
+    };
+    let listing = [0, -1, 100, 200];
+    let stated = || {
+        FakeKernel::new()
+            .on_pids(Ok(&listing))
+            .on_bsd_info(100, with_parent(7))
+            .on_bsd_info(200, with_parent(100))
+    };
+
+    let kernel = stated();
+    assert_eq!(
+        process_parents(&kernel).expect("the stated listing"),
+        [(100, 7), (200, 100)]
+    );
+    assert!(kernel.all_rows_taken());
+
+    let kernel = stated();
+    assert_eq!(snapshot(&kernel), (vec![100, 200], vec![(100, 7), (200, 100)], 0));
+    assert!(kernel.all_rows_taken());
 }
 
 /// `fork()` in progress is transient: it resolves inside the read, so it is neither a denial nor
 /// an error. Mutant: "transient counted as denied".
 #[skuld::test]
 fn a_fork_in_progress_resolves_and_is_not_counted_as_denied() {
-    use crate::identity::{FakeKernel, Kernel};
+    use crate::identity::Kernel;
     let me = std::process::id() as libc::c_int;
     let Ok(record) = HostKernel.bsd_info(me as u32) else {
         panic!("this process has a record");
@@ -228,25 +245,7 @@ fn a_fork_in_progress_resolves_and_is_not_counted_as_denied() {
         .on_bsd_info(me as u32, with_parent(0))
         .on_bsd_info(me as u32, with_parent(0))
         .on_bsd_info(me as u32, with_parent(1));
-    let (edges, denied, _) = join_edges(&kernel, &[me]).expect("edge buffer");
+    let (edges, denied, _) = join_edges(&kernel, &[me]);
     assert_eq!(denied, 0);
     assert_eq!(edges, [(me as u32, 1)]);
-}
-
-/// A persistent refusal is a denial, read once. Mutant: "a persistent refusal is retried" (a second
-/// read reaches the real one, which resolves it).
-#[skuld::test]
-fn a_persistent_refusal_is_a_denial_after_one_read() {
-    use crate::identity::{FakeKernel, ReadErr};
-    let me = std::process::id() as libc::c_int;
-    // libproc misses (`EPERM`, as for a cross-user process) and the sysctl fallback is refused.
-    let kernel = FakeKernel::over(&HostKernel)
-        .on_bsd_info(me as u32, Err(ReadErr::Refused(libc::EPERM)))
-        .on_kinfo_refused(me as u32, libc::EPERM);
-    match process_parents(&kernel) {
-        Err(crate::error::Error::Unassessable { detail, .. }) => {
-            assert!(detail.contains(&format!("sample: [{me}]")), "{detail}")
-        }
-        other => panic!("expected Unassessable, got {other:?}"),
-    }
 }

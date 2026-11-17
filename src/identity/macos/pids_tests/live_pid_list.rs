@@ -9,7 +9,7 @@
 //! `snapshot_count_agrees_with_the_kernels_sizing_answer` checks the delivered LIST against
 //! a second source.
 
-use super::super::{all_pids, allocate_pids, capacity_for, collect_pids, fill_from_kernel};
+use super::super::{allocate_pids, capacity_for, collect_pids, fill_from_kernel, host_pids};
 
 fn sizing_answer() -> usize {
     // SAFETY: the sizing form of proc_listallpids takes a null buffer and a zero size.
@@ -53,7 +53,7 @@ fn the_first_buffer_is_large_enough() {
 #[skuld::test]
 fn snapshot_count_agrees_with_the_kernels_sizing_answer() {
     let before = sizing_answer();
-    let pids = all_pids();
+    let pids = host_pids().expect("the live pid listing");
     let after = sizing_answer();
     let expected = before.min(after);
     assert!(

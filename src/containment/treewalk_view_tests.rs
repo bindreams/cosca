@@ -7,11 +7,11 @@
 //! status.
 
 use crate::child::front_cgroup_tests::pidfd_of;
-use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
+use crate::containment::dispatch::TreeKillOutcome;
 use crate::containment::mechanism::Contains;
 use crate::error::Error;
 use crate::identity::{
-    ticks_host, ticks_id, unreadable, FakeKernel, HostKernel, Kernel, Key, ProcessId, UNREADABLE_STATUS_REASON,
+    ticks_host, ticks_id, unreadable, FakeKernel, HostKernel, Key, ProcessId, UNREADABLE_STATUS_REASON,
 };
 use crate::test_child::{
     live_exiting_member as live_member, open_live, release_unsignalled as release, stat_of_a_new_owner, StdChild,
@@ -20,6 +20,7 @@ use crate::test_groups::{pidfd_group_signal, Group};
 use crate::Recursive;
 
 use super::treewalk_pidfs_tests::{children_of, descendants};
+use super::treewalk_walks_tests::{children_queries, id_walks, walks, Query};
 
 /// `result` is the error of a walk that left `pid` unkilled because its identity could not be read
 /// ([`Error::Unassessable`]), and its message says each of `causes`.
@@ -80,40 +81,6 @@ impl View {
 }
 
 const VIEWS: [View; 2] = [View::Diverged, View::Unreadable];
-
-pub(super) type Walk = fn(&dyn Kernel, ProcessId) -> Result<(), Error>;
-
-/// The walks that take an identity.
-pub(super) fn id_walks() -> [(&'static str, Walk); 2] {
-    [
-        ("hard_kill", |k, id| {
-            super::hard_kill(k, id, &super::ByIdentity::new(k, id))
-                .outcome()
-                .into_result()
-                .map_err(Unkilled::into_error)
-        }),
-        ("terminate", |k, id| {
-            super::terminate(
-                k,
-                id,
-                &super::ByIdentity::new(k, id),
-                crate::containment::TreeStop::default(),
-            )
-            .and_then(super::Terminated::into_result)
-        }),
-    ]
-}
-
-/// Every walk, `Process`'s included, over an open handle on the live `id`.
-pub(super) fn walks() -> [(&'static str, Walk); 4] {
-    let [hard_kill, terminate] = id_walks();
-    [
-        hard_kill,
-        terminate,
-        ("kill_tree", |k, id| open_live(id).kill_tree_with("kill_tree", k)),
-        ("terminate_tree", |k, id| open_live(id).terminate_tree_with(k)),
-    ]
-}
 
 // An untrusted view =====
 
@@ -177,16 +144,6 @@ fn a_walkers_kill_over_an_untrusted_view_walks_nothing_and_kills_nothing() {
 }
 
 // The snapshot precedes the anchor =====
-
-type Query = fn(&ProcessId, &dyn Kernel) -> Result<(), Error>;
-
-/// The queries that take the process snapshot. `parent` does not: it reads `self` alone.
-fn children_queries() -> [(&'static str, Query); 2] {
-    [
-        ("children(No)", |p, k| p.children_with(k, Recursive::No).map(|_| ())),
-        ("children(Yes)", |p, k| p.children_with(k, Recursive::Yes).map(|_| ())),
-    ]
-}
 
 /// The snapshot is the first view read, so the anchor that follows it vouches for the pid across
 /// the whole snapshot. Mutant: "the anchor is checked before the snapshot" - the failing view lands

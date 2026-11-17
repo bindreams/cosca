@@ -1,5 +1,7 @@
 //! Completeness of the macOS host snapshot, pinned against two independent sources.
 
+use crate::identity::HostKernel;
+
 use super::super::snapshot;
 
 /// The pid list must be complete, not merely non-empty. The oracle is `proc_listallpids`'
@@ -11,7 +13,7 @@ fn the_pid_list_is_at_least_as_large_as_the_kernels_own_sizing_return() {
     // SAFETY: the sizing form of proc_listallpids takes a null buffer.
     let needed = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     assert!(needed > 0, "the sizing call must report a positive count");
-    let (pids, _, _) = snapshot();
+    let (pids, _, _) = snapshot(&HostKernel);
     // The sizing call over-reports headroom, and some process churn between THIS test's own
     // sizing call and `snapshot()`'s internal one is normal — neither is a fixed quantity this
     // test can derive in advance, so equality is wrong and an unexplained additive constant
@@ -33,7 +35,7 @@ fn the_pid_list_is_at_least_as_large_as_the_kernels_own_sizing_return() {
 /// Two pids that provably exist for the whole test must both be present.
 #[skuld::test]
 fn the_pid_list_contains_launchd_and_this_process() {
-    let (pids, _, _) = snapshot();
+    let (pids, _, _) = snapshot(&HostKernel);
     assert!(pids.contains(&1), "launchd must be in the pid list");
     assert!(
         pids.contains(&std::process::id()),
@@ -42,8 +44,10 @@ fn the_pid_list_contains_launchd_and_this_process() {
 }
 
 /// `ps` is an independent implementation of "list every pid". Every pid it reports that is
-/// STILL alive when we look must be in ours — a pid that exited in between is legitimately
-/// absent, and re-resolving its identity (rather than a timed re-check) distinguishes the two.
+/// STILL alive when the snapshot is taken must be in ours. A pid that exited in between is
+/// legitimately absent, and so is one whose number was reused: the identity read before the snapshot
+/// is compared with the identity read after it, and only the SAME identity still there is a pid the
+/// listing missed.
 ///
 /// `.output()` forks+execs `/bin/ps`, so it takes production's `spawn_lock()` for the same
 /// reason every fdmarker test that spawns does: an unlocked fork here is a bystander that could
@@ -58,16 +62,20 @@ fn every_still_live_pid_that_ps_reports_is_in_the_snapshot() {
         .filter_map(|s| s.parse().ok())
         .collect();
     assert!(!ps_pids.is_empty(), "ps reported no processes; the oracle is broken");
-    let (pids, _, _) = snapshot();
+    let before: Vec<(u32, crate::identity::ProcessId)> = ps_pids
+        .into_iter()
+        .filter_map(|pid| crate::identity::ProcessId::of(pid).found().map(|id| (pid, id)))
+        .collect();
+    let (pids, _, _) = snapshot(&HostKernel);
     let set: std::collections::HashSet<u32> = pids.into_iter().collect();
-    for pid in ps_pids {
+    for (pid, id) in before {
         if set.contains(&pid) {
             continue;
         }
-        // Not in our list: it must be because it has since exited.
-        let gone = matches!(crate::identity::ProcessId::of(pid), crate::identity::Resolved::Gone);
+        // Not in our list: it must be because that process has since exited, or its pid was reused.
+        let missed = crate::identity::ProcessId::of(pid).found() == Some(id);
         assert!(
-            gone,
+            !missed,
             "pid {pid} is live and reported by ps but missing from the snapshot"
         );
     }
@@ -76,7 +84,7 @@ fn every_still_live_pid_that_ps_reports_is_in_the_snapshot() {
 /// The ppid pairs are a subset of the pid list: every edge names a pid the sweep will visit.
 #[skuld::test]
 fn every_ppid_edge_names_a_pid_from_the_same_snapshot() {
-    let (pids, parents, _) = snapshot();
+    let (pids, parents, _) = snapshot(&HostKernel);
     let set: std::collections::HashSet<u32> = pids.into_iter().collect();
     for (pid, _) in &parents {
         assert!(

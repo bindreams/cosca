@@ -10,7 +10,8 @@ use crate::containment::dispatch::{TreeKillOutcome, TreeKilled};
 use crate::identity::{FakeKernel, HostKernel, ProcessId};
 use crate::test_child::{live_exiting_member as live_member, release_unsignalled as release, StdChild};
 
-use super::treewalk_view_tests::{assert_unassessable_naming, live_member_with_descendant, walks};
+use super::treewalk_view_tests::{assert_unassessable_naming, live_member_with_descendant};
+use super::treewalk_walks_tests::walks;
 
 /// The flags of a thread inside `do_exit`, as measured on Linux 6.12.113: `PF_EXITING`, and `0x8` with it.
 const EXITING: u32 = 0x40_014c;
