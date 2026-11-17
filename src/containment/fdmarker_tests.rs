@@ -1022,6 +1022,56 @@ fn sweep_pass_refires_the_group_signal_on_a_later_pass_that_confirms_a_new_live_
     _ = t_child.wait();
 }
 
+/// A cooperative signal reaches a member of the tree's group that neither the root's walk nor the marker
+/// names: the group send is the only channel that finds Q, a member of the group that never held the marker
+/// and is no descendant of the root (`inert_root` has no child). P, which holds the marker, is a member of
+/// the group too.
+/// `SIGUSR1`'s default action ends each member, so its status says the signal was delivered.
+///
+/// Mutant: the cooperative pass does not signal the group (Q is not sent it).
+#[skuld::test]
+fn a_cooperative_signal_reaches_a_group_member_only_the_group_send_names() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _serialize = test_spawn_lock();
+
+    let mut p_cmd = member_command(0); // pgid == P's own pid.
+    let prepared = install_on(&mut p_cmd, &[]).expect("install the marker on P");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
+    let mut p = p_cmd.spawn().expect("spawn P");
+    drop(p_cmd);
+    await_member_ready(&mut p);
+    let pgid = p.id() as i32;
+
+    let mut q_cmd = member_command(pgid);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test holds spawn_lock for its whole body via `_serialize`"
+    )]
+    let mut q = q_cmd.spawn().expect("spawn Q");
+    drop(q_cmd);
+    await_member_ready(&mut q);
+
+    let marker = super::Marker::new(prepared, inert_root(), Some(pgid));
+    let mut reached = Vec::new();
+    let mut state = super::SweepState::new(&mut reached);
+    marker.sweep_pass(
+        crate::signal::Sig::Graceful(crate::Signal::Usr1),
+        &mut state,
+        true,
+        super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
+    );
+
+    assert!(state.group_result.is_ok(), "{:?}", state.group_result);
+    for (name, child) in [("P", &mut p), ("Q", &mut q)] {
+        let status = child.wait().expect("reap");
+        assert_eq!(status.signal(), Some(libc::SIGUSR1), "{name}: {status:?}");
+    }
+}
+
 /// `kill_holder`'s `MarkerQuery::Denied` arm, end to end: a KNOWN holder that becomes
 /// unqueryable at re-check time must be left unsignalled AND reported as a kill not attempted,
 /// never silently treated as resolved. `id` names pid 1 (launchd) — the same real,
@@ -1738,4 +1788,35 @@ fn a_sweep_warns_once_of_a_member_that_refuses_the_kill(#[fixture(setuid)] _grou
     assert_eq!(warned.len(), 1, "{warned:?}");
     drop(stdin);
     assert!(child.wait().expect("the helper exits on EOF").success());
+}
+
+/// A tree send of a chosen signal that a member of the tree's group refuses (a setuid-root helper under a
+/// plain root) answers an error, and the error names that member with the refusal's `EPERM`, as the
+/// group's own check does. The helper is also a walked member whose send is refused, so the answer is
+/// `incomplete` too, as on every route.
+///
+/// Mutant: a member whose send was refused is dropped from the report.
+#[skuld::test]
+fn a_chosen_signal_sent_to_a_tree_names_a_group_member_the_caller_may_not_signal(#[fixture(setuid)] _group: &Group) {
+    let (child, stdin) = crate::test_privilege::root_over_setuid_blockers(1, |cmd| {
+        cmd.contain();
+        cmd.graceful_stop(|target| crate::stop::send_signal(target, crate::Signal::Usr1));
+    });
+    assert_eq!(child.containment(), crate::Containment::FdMarker);
+    let (_, parents, _) = crate::containment::enumerate::snapshot(&crate::identity::HostKernel);
+    let helper = parents
+        .iter()
+        .find_map(|&(pid, parent)| (parent == child.pid()).then_some(pid))
+        .expect("the root's one child is the helper");
+
+    let err = child
+        .terminate_tree()
+        .expect_err("the helper refuses the signal, and the tree send says so");
+
+    assert!(matches!(err, crate::error::Error::Containment { .. }), "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
+    let said = crate::error::said(&err);
+    assert!(said.contains(&format!("pid {helper}: refused the signal")), "{said}");
+    drop(stdin);
+    child.wait().expect("reap the root");
 }

@@ -42,7 +42,7 @@
 //! | tree (`terminate_tree`, `graceful_shutdown_tree`) | [`CgroupV2`](crate::Containment::CgroupV2) | the processes in the leaf itself, each pinned by a pidfd before it is signalled; not one in a cgroup under the leaf, nor one in a pid namespace this process cannot see (that one makes the call an error), which `kill_tree` reaches |
 //! | tree | [`ProcessGroup`](crate::Containment::ProcessGroup), [`Session`](crate::Containment::Session) | the members of the process group the root leads (for a session, its first group) when the signal is sent; a member that left the group, as a `setsid` child does, is not reached |
 //! | tree | [`TreeWalk`](crate::Containment::TreeWalk) | the root and every descendant the walk finds from the root's identity; a process reparented away from the tree, or whose identity cannot be read, is not reached |
-//! | tree | [`FdMarker`](crate::Containment::FdMarker) (macOS) | the process group, the root's descendants and the marker's holders; how often each is sent the signal is in the doc of [`Containment::FdMarker`](crate::Containment::FdMarker) |
+//! | tree | [`FdMarker`](crate::Containment::FdMarker) (macOS) | the process group, the root's descendants and the marker's holders; a member of the group that is also a descendant or a holder is sent the signal twice (see [`Containment::FdMarker`](crate::Containment::FdMarker)) |
 //!
 //! A tree call on a child that owns no tree (uncontained, or a member of an ancestor's containment) is
 //! [`Error::Unsupported`] before the action runs.
@@ -236,6 +236,10 @@ pub(crate) async fn default_with<D: StopWaits>(driver: &D, target: &StopTarget<'
 /// On a tree target the signal goes to every member of the contained tree, by the mechanism's own route
 /// (a cgroup leaf's listing, a process group, a session, a walk, an fd marker's sweep; see the module
 /// doc for what the calling tree call does with the outcome).
+///
+/// On a macOS [`FdMarker`](crate::Containment::FdMarker) tree that has a process group, a member can be sent
+/// the signal twice (see there). A handler that must run once per request tolerates a repeat, or the caller
+/// sends to the root target.
 ///
 /// # Elevation fronts
 ///

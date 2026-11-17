@@ -86,16 +86,11 @@ fn assert_nothing_was_sent(child: &crate::Child, stdin: crate::PipeWriter) {
 #[cfg(unix)]
 #[skuld::test]
 fn the_default_action_is_what_terminate_sent_before() {
-    let (child, stdin, mut stdout) = test_child::ready_tree(test_child::SIGNAL_REPORTING_TREE_ARGV, |_| {});
+    let (child, stdin, stdout) = test_child::ready_tree(test_child::SIGNAL_REPORTING_TREE_ARGV, |_| {});
     child.terminate().expect("the default stop");
     drop(stdin);
-    let mut said = String::new();
-    std::io::Read::read_to_string(&mut stdout, &mut said).expect("the tree's stdout, to its end");
-    // Two processes write these lines, so their order is not fixed.
-    let mut reports: Vec<&str> = said.lines().collect();
-    reports.sort_unstable();
     assert_eq!(
-        reports,
+        test_child::signal_reports_to_end(stdout),
         ["leaf eof", "root SIGTERM"],
         "only the root was sent the signal"
     );
@@ -165,7 +160,8 @@ fn an_actions_error_is_terminates_error() {
 // A chosen signal (Unix) =====
 
 /// A [`SIGNAL_THEN_TERM_TREE_ARGV`](test_child::SIGNAL_THEN_TERM_TREE_ARGV) tree's stdout, read as its
-/// members report: each wait is for the members' own lines, a real condition with no time in it.
+/// members report: each wait is for the members' own lines, or the end of the stream once the tree's stdin
+/// has ended, a real condition with no time in it.
 #[cfg(unix)]
 struct Reports {
     stdout: std::io::BufReader<crate::PipeReader>,
@@ -198,6 +194,15 @@ impl Reports {
         }
     }
 
+    /// Reads the rest of the stream: every member has reported, and ended, once the tree's stdin has.
+    fn read_rest(&mut self) {
+        use std::io::BufRead as _;
+
+        for line in (&mut self.stdout).lines() {
+            self.lines.push(line.expect("a report line"));
+        }
+    }
+
     /// Every line `member` reported, in the order it reported them.
     fn of(&self, member: &str) -> Vec<&str> {
         self.lines
@@ -215,18 +220,13 @@ impl Reports {
 #[cfg(unix)]
 #[skuld::test]
 fn a_chosen_signal_reaches_the_root() {
-    let (child, stdin, mut stdout) = test_child::ready_tree(test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
+    let (child, stdin, stdout) = test_child::ready_tree(test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
         cmd.graceful_stop(|target| stop::send_signal(target, crate::Signal::Usr1));
     });
     child.terminate().expect("the chosen signal was sent");
     drop(stdin);
-    let mut said = String::new();
-    std::io::Read::read_to_string(&mut stdout, &mut said).expect("the tree's stdout, to its end");
-    // Two processes write these lines, so their order is not fixed.
-    let mut reports: Vec<&str> = said.lines().collect();
-    reports.sort_unstable();
     assert_eq!(
-        reports,
+        test_child::signal_reports_to_end(stdout),
         ["leaf eof", "root SIGUSR1"],
         "only the root was sent the signal"
     );
@@ -241,36 +241,46 @@ fn a_chosen_signal_reaches_the_root() {
 #[skuld::test]
 fn a_chosen_signal_reaches_every_member_of_the_tree() {
     for shutdown in [false, true] {
-        let (child, stdin, mut stdout) = test_child::ready_tree(test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
+        let held = test_child::HeldStdin::default();
+        let ending = held.clone();
+        let (child, stdin, stdout) = test_child::ready_tree(test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
             test_child::contain_without_cgroup(cmd);
-            cmd.graceful_stop(|target| stop::send_signal(target, crate::Signal::Usr1));
+            cmd.graceful_stop(move |target| {
+                stop::send_signal(target, crate::Signal::Usr1)?;
+                ending.end();
+                Ok(())
+            });
         });
-        if shutdown {
-            // The root exits on its handler, within the grace; the sweep then ends what is left, so a
-            // member may be killed before it reports: the root's own report is what is asserted.
-            let status = child
-                .graceful_shutdown_tree(Duration::from_secs(3600))
-                .expect("the chosen signal ended the tree");
+        held.hold(stdin);
+        let status = if shutdown {
+            Some(
+                child
+                    .graceful_shutdown_tree(Duration::from_secs(3600))
+                    .expect("the chosen signal ended the tree"),
+            )
+        } else {
+            child.terminate_tree().expect("the chosen signal was sent to the tree");
+            None
+        };
+        // Two processes write these lines, so their order is not fixed: the reports are sorted.
+        let reports = test_child::signal_reports_to_end(stdout);
+        if let Some(status) = status {
+            // The root exits on its handler, within the grace; a mechanism whose sweep then ends what is
+            // left may kill a member before it reports: the root's own report is what is required.
             assert!(status.success(), "the root exited on its handler: {status:?}");
-            let mut said = String::new();
-            std::io::Read::read_to_string(&mut stdout, &mut said).expect("the tree's stdout, to its end");
-            let mut reports: Vec<&str> = said.lines().collect();
-            reports.sort_unstable();
-            assert!(reports.contains(&"root SIGUSR1"), "{reports:?}");
+            assert!(reports.iter().any(|line| line == "root SIGUSR1"), "{reports:?}");
             assert!(
                 reports.iter().all(|line| line.ends_with("SIGUSR1")),
                 "only the chosen signal was sent: {reports:?}"
             );
         } else {
-            child.terminate_tree().expect("the chosen signal was sent to the tree");
             assert_eq!(
-                test_child::two_signal_reports(stdout),
+                reports,
                 ["leaf SIGUSR1", "root SIGUSR1"],
                 "both members got the chosen signal"
             );
             child.wait().expect("the root exited on its handler");
         }
-        drop(stdin);
     }
 }
 
@@ -363,7 +373,14 @@ fn a_prepared_tree_send_keeps_the_front_gate() {
 /// signals that are pending together in signal-number order, not in the order they arrived (`SIGTERM`
 /// is 15 and `SIGUSR1` 30 on macOS), so two sends with nothing between them can lose the first report.
 ///
-/// Mutants: `wait_exit` answers `true` whatever the root did; the chosen signal is replaced by `SIGTERM`.
+/// Mutants: `wait_exit` answers `true` whatever the root did; the chosen signal is replaced by `SIGTERM`;
+/// the first send sends nothing (an assertion on the send log, not a wait for a report that never comes).
+///
+/// The tree's stdin ends after the second send, and the members' lines are read to the end of the stream: a member
+/// the second signal missed reports the end of its input, and a signal reported three times, which no route
+/// sends, is a line too, so each fails by assertion. A member the first signal misses is failed by
+/// `a_chosen_signal_reaches_every_member_of_the_tree`, not here. The macOS fd marker's route, which may send
+/// a member a signal twice, is allowed one or two reports of each.
 #[cfg(unix)]
 #[skuld::test]
 fn an_action_may_compose_sends_with_a_wait() {
@@ -371,23 +388,28 @@ fn an_action_may_compose_sends_with_a_wait() {
         let waited = Arc::new(Mutex::new(Vec::new()));
         let record = Arc::clone(&waited);
         let reports = Arc::new(Mutex::new(None::<Reports>));
-        let (first, last): (&[&str], &[&str]) = if tree {
-            (&["root SIGUSR1", "leaf SIGUSR1"], &["root SIGTERM", "leaf SIGTERM"])
+        let held = test_child::HeldStdin::default();
+        let first: &[&str] = if tree {
+            &["root SIGUSR1", "leaf SIGUSR1"]
         } else {
-            (&["root SIGUSR1"], &["root SIGTERM"])
+            &["root SIGUSR1"]
         };
         let (child, stdin, stdout) = test_child::ready_tree(test_child::SIGNAL_THEN_TERM_TREE_ARGV, |cmd| {
             if tree {
                 test_child::contain_without_cgroup(cmd);
             }
-            let reports = Arc::clone(&reports);
+            let (reports, held) = (Arc::clone(&reports), held.clone());
             cmd.graceful_stop(move |target| {
+                let sent = crate::send_log::Capture::start();
                 stop::send_signal(target, crate::Signal::Usr1)?;
+                // Fails here, not in the wait below, if nothing was sent.
+                sent.require_a_send(libc::SIGUSR1)?;
                 // The members keep running: the root is looked at once, and every member reports the signal
                 // before the second goes out.
                 record.lock().unwrap().push(target.wait_exit(Duration::ZERO)?);
                 reports.lock().unwrap().as_mut().expect("the reports").until(first);
                 stop::send_signal(target, crate::Signal::Term)?;
+                held.end();
                 // The root exits on the second signal: the wait ends on its exit.
                 record
                     .lock()
@@ -396,6 +418,7 @@ fn an_action_may_compose_sends_with_a_wait() {
                 Ok(())
             });
         });
+        held.hold(stdin);
         *reports.lock().unwrap() = Some(Reports::new(stdout));
         if tree {
             child.terminate_tree().expect("the composed stop");
@@ -404,12 +427,12 @@ fn an_action_may_compose_sends_with_a_wait() {
         }
         assert_eq!(*waited.lock().unwrap(), [false, true], "tree: {tree}");
         let mut reports = reports.lock().unwrap().take().expect("the reports");
-        reports.until(last);
-        assert_eq!(reports.of("root"), ["root SIGUSR1", "root SIGTERM"], "tree: {tree}");
+        reports.read_rest();
+        let repeat = child.containment() == crate::Containment::FdMarker;
+        test_child::assert_reported_usr1_then_term("root", &reports.of("root"), repeat);
         if tree {
-            assert_eq!(reports.of("leaf"), ["leaf SIGUSR1", "leaf SIGTERM"], "tree: {tree}");
+            test_child::assert_reported_usr1_then_term("leaf", &reports.of("leaf"), repeat);
         }
-        drop(stdin);
         child.wait().expect("the root had exited, and is reaped once");
     }
 }
@@ -442,13 +465,17 @@ fn graceful_shutdown_tree_goes_on_after_a_callers_own_action() {
 fn graceful_shutdown_tree_keeps_an_error_after_a_send_that_went_out() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
+    let held = test_child::HeldStdin::default();
+    let ending = held.clone();
     let (child, stdin, stdout) = test_child::ready_tree(test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
         test_child::contain_without_cgroup(cmd);
-        cmd.graceful_stop(|target| {
+        cmd.graceful_stop(move |target| {
             prepared_send(target)?;
+            ending.end();
             Err(refused())
         });
     });
+    held.hold(stdin);
     let _armed = crate::child::graceful::fault::ArmedKillTreeError::arm();
     let err = child
         .graceful_shutdown_tree(Duration::from_secs(3600))
@@ -464,11 +491,10 @@ fn graceful_shutdown_tree_keeps_an_error_after_a_send_that_went_out() {
         "the action's error is the call's cooperative error: {logged:?}"
     );
     assert_eq!(
-        test_child::two_signal_reports(stdout),
+        test_child::signal_reports_to_end(stdout),
         ["leaf SIGUSR1", "root SIGUSR1"],
         "the send that went out reached the tree"
     );
-    drop(stdin);
 }
 
 /// [`graceful_shutdown_tree_keeps_an_error_after_a_send_that_went_out`] on Windows: the `CTRL_BREAK` ends a
