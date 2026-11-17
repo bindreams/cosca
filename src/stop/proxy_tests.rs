@@ -22,26 +22,120 @@ use crate::test_child::IDENTITY_READ;
 use crate::{Child, Command, ContainMode};
 
 /// A fixture proxy that answers `code`: a copy of the testbin in a directory of its own.
-struct Fixture {
+pub(crate) struct Fixture {
     _dir: tempfile::TempDir,
     exe: PathBuf,
 }
 
 impl Fixture {
-    fn answering(code: i32) -> Fixture {
+    pub(crate) fn answering(code: i32) -> Fixture {
         let dir = tempfile::tempdir().expect("a directory for the fixture proxy");
         let exe = dir.path().join(crate::proxy_fixture::exe_name(code));
         std::fs::copy(crate::test_child::testbin("cosca_testbin"), &exe).expect("copy the testbin");
         Fixture { _dir: dir, exe }
     }
 
-    fn setting(&self) -> CtrlProxy {
+    /// A fixture that reports its pid on the returned listener and answers `code` only once the test
+    /// writes a byte to that connection.
+    pub(crate) fn answering_when_told(code: i32) -> (Fixture, std::net::TcpListener) {
+        let fixture = Fixture::answering(code);
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listen for the fixture proxy");
+        std::fs::write(
+            crate::proxy_fixture::port_path(&fixture.exe),
+            listener
+                .local_addr()
+                .expect("the listener's address")
+                .port()
+                .to_string(),
+        )
+        .expect("tell the fixture proxy where to report");
+        (fixture, listener)
+    }
+
+    pub(crate) fn setting(&self) -> CtrlProxy {
         CtrlProxy::Executable(self.exe.clone())
     }
 
     /// What the fixture recorded; `None` when it never ran.
     fn ran(&self) -> Option<crate::proxy_fixture::Ran> {
         crate::proxy_fixture::read_record(&self.exe)
+    }
+}
+
+/// The proxy's own program, held: the fixture proxy reports its pid and answers `Sent` only once told.
+/// Both ends are real conditions with no time in them.
+pub(crate) mod held_proxy {
+    use std::io::{BufRead as _, Write as _};
+    use std::sync::mpsc;
+
+    use ::tokio::sync::oneshot;
+
+    use super::Fixture;
+    use crate::stop::proxy::protocol::ProxyAnswer;
+
+    /// A fixture proxy that answers `Sent` once [`release`](Self::release) is called (or the test
+    /// ends), and the pid it reports when it starts.
+    pub(crate) struct Held {
+        pub(crate) fixture: Fixture,
+        pid: Option<oneshot::Receiver<u32>>,
+        go: mpsc::Sender<()>,
+    }
+
+    impl Held {
+        pub(crate) fn new() -> Held {
+            let (fixture, listener) = Fixture::answering_when_told(ProxyAnswer::Sent.code());
+            let (pid_tx, pid) = oneshot::channel();
+            let (go, go_rx) = mpsc::channel::<()>();
+            // A thread of the test, not a task: it blocks in `accept` and in `recv`, which must not be the
+            // runtime's, and ends when the fixture has been told or the test is over.
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("the fixture proxy connects");
+                let mut line = String::new();
+                std::io::BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .expect("the fixture proxy reports its pid");
+                _ = pid_tx.send(line.trim().parse().expect("a pid"));
+                // A release, or the test's end: either way the fixture is told to answer.
+                _ = go_rx.recv();
+                _ = (&stream).write_all(b"x");
+            });
+            Held {
+                fixture,
+                pid: Some(pid),
+                go,
+            }
+        }
+
+        /// The pid the proxy reported when it started.
+        #[cfg(feature = "tokio")]
+        pub(crate) async fn started(&mut self) -> u32 {
+            self.pid
+                .take()
+                .expect("asked once")
+                .await
+                .expect("the proxy reports its pid")
+        }
+
+        /// The pid the proxy reported when it started, for a caller that is no task.
+        pub(crate) fn started_blocking(&mut self) -> u32 {
+            self.pid
+                .take()
+                .expect("asked once")
+                .blocking_recv()
+                .expect("the proxy reports its pid")
+        }
+
+        /// A handle that tells the proxy to answer, which a hook that runs at a block can hold.
+        pub(crate) fn releaser(&self) -> mpsc::Sender<()> {
+            self.go.clone()
+        }
+
+        /// Tells the proxy to answer. A proxy already told (by a hook that ran at a block) is not an error:
+        /// the assertion about that block is the test's.
+        #[cfg(feature = "tokio")]
+        pub(crate) fn release(&self) {
+            _ = self.go.send(());
+        }
     }
 }
 
@@ -452,7 +546,9 @@ fn a_root_records_a_send_that_may_have_gone_out_as_made() {
                 Ok(())
             });
         });
-        let (acted, said) = child.stop_root();
+        let (acted, said) = crate::child::graceful::shutdown::run_ready(crate::child::graceful::shutdown::stop_root(
+            &crate::child::graceful::shutdown::BlockingDriver(&child),
+        ));
         acted.expect("the action ignored the send's answer");
         assert_eq!(said, earlier, "{answer:?}");
         assert_proxy_answered(child.pid(), CtrlEvent::CtrlC, answer);
@@ -647,4 +743,45 @@ fn an_unreadable_host_path_sends_nothing_and_keeps_the_os_error() {
     assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(io.to_string().contains("nothing was sent"), "{io}");
     assert!(std::error::Error::source(&io).is_some(), "the OS's error is the source");
+}
+
+// A proxy that has not answered =====
+
+/// The warning for a proxy that has not answered by the threshold: logged once, naming the proxy's pid and
+/// the child, and the call goes on waiting for the answer. The proxy is held until the wait is at its
+/// unbounded block, which only comes after the threshold passed, and is released from that block: a call
+/// that never warned still returns there, and fails on the record, not on a hang.
+///
+/// Mutants: the warning is never made; it is made twice.
+#[skuld::test]
+fn a_proxy_that_has_not_answered_is_warned_of_once_and_waited_for() {
+    use crate::wait::block_probe::{on_each_block, WaitObject};
+
+    crate::log_capture::install();
+    let mut held = held_proxy::Held::new();
+    let (child, sock) = hidden_member(&held.fixture);
+    let marker = format!("for child {} has not answered", child.pid());
+    let mark = crate::log_capture::mark();
+    let releaser = held.releaser();
+    let release_at_the_unbounded_block = on_each_block(move |block| {
+        if matches!(block.on, WaitObject::Handles) && block.armed.is_none() {
+            _ = releaser.send(());
+        }
+    });
+    let sent = stop::send_console_event_via_proxy(&StopTarget::from(&child), CtrlEvent::CtrlBreak);
+    drop(release_at_the_unbounded_block);
+    sent.expect("the proxy answered Sent, once told");
+    assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::Sent);
+    let proxy = held.started_blocking();
+    let warned = crate::log_capture::records_since(mark, &marker);
+    assert_eq!(
+        warned.len(),
+        1,
+        "one warning for the proxy that had not answered: {warned:?}"
+    );
+    assert!(
+        warned[0].contains(&format!("(pid {proxy})")),
+        "the warning names the proxy: {warned:?}"
+    );
+    kill_release_reap(&child, sock, false);
 }

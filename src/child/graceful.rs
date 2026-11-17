@@ -8,7 +8,7 @@ use super::Child;
 #[cfg(unix)]
 use crate::containment::{Skip, SkipCall};
 use crate::error::Error;
-use crate::stop::{RootRecord, StopTarget, TreeCall, TreeRecord};
+use crate::stop::{RootRecord, StopTarget, TreeRecord};
 
 /// What an action's own sends are called when it recorded none: a caller's own action, or one that
 /// failed before it sent.
@@ -41,7 +41,7 @@ fn take_forced_sweep() -> Option<crate::containment::dispatch::SweepFailure> {
     None
 }
 
-/// What [`Child::signal_tree_cooperatively`] decided: the cooperative signal of
+/// What [`shutdown::signal_tree_cooperatively`] decided: the cooperative signal of
 /// `graceful_shutdown_tree`, which the caller then follows with the grace and the sweep.
 pub(crate) enum SignalTreeCooperativelyOutcome {
     /// The cooperative signal went out, and `result` is what the check after it found; the sweep says
@@ -120,15 +120,18 @@ impl Child {
     /// **macOS, a root launchd holds** is refused with nothing sent, and an `Unknown` root is signalled
     /// through the handle, as for [`kill`](Child::kill).
     pub fn terminate(&self) -> Result<(), Error> {
-        self.stop.run(&StopTarget::root(self))
+        shutdown::run_ready(shutdown::terminate(&shutdown::BlockingDriver(self)))
     }
 
-    /// [`terminate`](Child::terminate), with what the action said it sent, for a call that kills after it
-    /// ([`kill_after`](Child::kill_after)): the last prepared send's stop, or [`STOP_ACTION`] when the
-    /// action's last send went nowhere or it made none.
-    pub(crate) fn stop_root(&self) -> (Result<(), Error>, String) {
-        let target = StopTarget::root(self);
-        let stopped = self.stop.run(&target);
+    /// What a call that kills after the stop says the action sent ([`kill_after`](Child::kill_after)), from
+    /// the record the action's last prepared send left on `target`: that send's stop, or [`STOP_ACTION`] when
+    /// the action's last send went nowhere or it made none. `stopped` is what the action answered, which is
+    /// the call's answer.
+    pub(crate) fn after_root_stop(
+        &self,
+        target: StopTarget<'_>,
+        stopped: Result<(), Error>,
+    ) -> (Result<(), Error>, String) {
         let earlier = match target.into_root_record() {
             Some(RootRecord::Sent(name)) => crate::containment::earlier_of(name),
             Some(RootRecord::Refused(report)) => {
@@ -357,12 +360,18 @@ impl Child {
         shutdown::run_ready(shutdown::shutdown_tree(&mut shutdown::BlockingDriver(self), grace))
     }
 
-    /// `graceful_shutdown_tree`'s cooperative signal, for the sync and the async call alike: the child's
-    /// stop action, run on a target that stands for the tree, and what the call goes on from. A plain `fn`:
-    /// the root a prepared send holds must not live in an async caller's state, so it is dropped with the
-    /// send, before the grace.
-    ///
-    /// The action's own `Result` and the record of its last prepared send decide what follows:
+    /// The armed forced failure ([`fault`]) in place of `graceful_shutdown_tree`'s cooperative stop, which is
+    /// then not run.
+    #[cfg(test)]
+    pub(crate) fn forced_in_place_of_the_stop(&self) -> Option<SignalTreeCooperativelyOutcome> {
+        let root_handle = self.proc.hold(self.pid());
+        let root: Option<&dyn crate::containment::Root> = Some(&root_handle);
+        fault::forced_in_place_of_the_signal(root)
+    }
+
+    /// What `graceful_shutdown_tree` goes on from, once the child's stop action has run on `target` (a tree
+    /// target) and answered `acted`: the record of its last prepared send and the action's own `Result`
+    /// decide what follows. The action itself runs in [`shutdown::signal_tree_cooperatively`].
     ///
     /// | Tree record (the last prepared send) | Action returned `Ok` | Action returned `Err` |
     /// |---|---|---|
@@ -370,18 +379,11 @@ impl Child {
     /// | sent, or root exited | grace, sweep, reap | grace, sweep, reap; the error is the call's cooperative error |
     /// | not sent, or nothing names the tree | grace, sweep, reap; nothing assumed sent | the call ends with that error |
     /// | pidfd-only, holders-only | that outcome's own path | that path; the error joins its |
-    pub(crate) fn signal_tree_cooperatively(&self) -> SignalTreeCooperativelyOutcome {
-        #[cfg(test)]
-        {
-            let root_handle = self.proc.hold(self.pid());
-            let root: Option<&dyn crate::containment::Root> = Some(&root_handle);
-            if let Some(forced) = fault::forced_in_place_of_the_signal(root) {
-                return forced;
-            }
-        }
-        let call = crate::containment::treewalk::WalkToken::new();
-        let target = StopTarget::tree(self, TreeCall::Shutdown(&call));
-        let acted = self.stop.run(&target);
+    pub(crate) fn after_tree_stop(
+        &self,
+        target: StopTarget<'_>,
+        acted: Result<(), Error>,
+    ) -> SignalTreeCooperativelyOutcome {
         let sent_by_the_action = || Some(STOP_ACTION.to_owned());
         match (target.into_tree_record(), acted) {
             (Some(TreeRecord::Sent { earlier, walk }), result) => {
@@ -575,7 +577,7 @@ impl PidfdShutdown {
 
 /// Test-only fault-injection seam for a forced `terminate_tree` failure inside
 /// `graceful_shutdown_tree`, mirroring `crate::wait::fault`'s shape. The sync and the async call
-/// share it: both read it through [`Child::signal_tree_cooperatively`] and the sweep.
+/// share it: both read it through [`shutdown::signal_tree_cooperatively`] and the sweep.
 #[cfg(test)]
 pub(crate) mod fault {
     use std::cell::Cell;

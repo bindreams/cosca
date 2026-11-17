@@ -34,6 +34,9 @@ root's reap and its leaf's drain, and dropped mid-wait it finishes as the `Drop`
 whose drain cannot be watched (the reactor refuses the registration, or the handle reports an
 error) is left to the leaf's `Drop`, which waits for it in place instead of giving up a leaf that
 is ours. Both warn past 1 s, as principle 3 says.
+So is the console-event proxy's `tokio::Child` inside `terminate` and `graceful_shutdown*` (Windows):
+when the wait for it fails, or the call's future is dropped while it holds the proxy, its armed drop
+kills it and blocks until it is reaped.
 
 The async `spawn` and `spawn_suspended` are `async fn`s that run the whole sync spawn on tokio's
 blocking pool: the elevation setup, the wait for `exec`, and a failed spawn's teardown all wait

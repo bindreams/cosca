@@ -10,6 +10,7 @@ use crate::containment::{Root, TerminateOutcome, TreeStop};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::signal::Sig;
+use crate::stop::StopWaits as _;
 
 /// What a stop action acts on: a child's process, or its whole tree, and what the spawn recorded about
 /// the child.
@@ -186,8 +187,13 @@ impl<'a> StopTarget<'a> {
     ///
     /// `grace` is the caller's own bound: the wait ends when the root has exited, or when `grace` is
     /// over, whichever comes first. `Duration::ZERO` is one look.
+    ///
+    /// This blocks the calling thread for up to `grace`. An async action awaits
+    /// `cosca::tokio::stop::wait_exit` (feature `tokio`) instead.
     pub fn wait_exit(&self, grace: Duration) -> Result<bool, Error> {
-        self.child.proc.exited_by(crate::wait::deadline_from(grace))
+        crate::child::graceful::shutdown::run_ready(
+            crate::child::graceful::shutdown::BlockingDriver(self.child).root_exited(grace),
+        )
     }
 
     /// Windows: which program a send through the proxy starts, as the child's command set it.
@@ -362,6 +368,14 @@ impl<'a> From<&'a Child> for StopTarget<'a> {
     /// The target that stands for `child`'s root, for a prepared function to be called on its own.
     fn from(child: &'a Child) -> StopTarget<'a> {
         StopTarget::root(child)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<'a> From<&'a crate::tokio::Child> for StopTarget<'a> {
+    /// The target that stands for `child`'s root, for a prepared function to be called on its own.
+    fn from(child: &'a crate::tokio::Child) -> StopTarget<'a> {
+        StopTarget::root(&child.inner)
     }
 }
 

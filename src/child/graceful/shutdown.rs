@@ -1,5 +1,6 @@
-//! `graceful_shutdown` and `graceful_shutdown_tree`, each written once for the sync and the async
-//! `Child`; a [`Waits`] supplies each wait ([`BlockingDriver`] blocks, `tokio::Child` awaits).
+//! `terminate`, `graceful_shutdown`, `terminate_tree` and `graceful_shutdown_tree`, each written once for the
+//! sync and the async `Child`; a [`Waits`] supplies the stop action's run and each wait ([`BlockingDriver`]
+//! blocks, `tokio::Child` awaits).
 
 use std::future::Future;
 use std::pin::pin;
@@ -16,20 +17,21 @@ use crate::containment::TreeDrain;
 use crate::error::Error;
 #[cfg(target_os = "macos")]
 use crate::os_process::child::Foreign;
+use crate::stop::{StopTarget, StopWaits, TreeCall};
 
-/// The waits [`shutdown_lone`] and [`shutdown_tree`] make. A deadline is a `Duration` from the wait's start, which each
-/// driver turns into an instant on its own clock.
-pub(crate) trait Waits {
+/// What the four stop calls need of a driver: the stop action's run, and the waits [`shutdown_lone`] and
+/// [`shutdown_tree`] make, beside the root's exit look of [`StopWaits`]. A deadline is a `Duration` from the
+/// wait's start, which each driver turns into an instant on its own clock.
+pub(crate) trait Waits: StopWaits {
     /// The child the call acts on: its gates, signals, tree and pid.
     fn child(&self) -> &Child;
+
+    /// Runs the child's stop action on `target`: the sync driver calls it, the async driver awaits it.
+    async fn stop(&self, target: &StopTarget<'_>) -> Result<(), Error>;
 
     /// Until every member of the tree has exited (not reaped), or `grace` is over: the public
     /// `wait_tree_timeout`, through the tree's drain edge, or `Unsupported` where the mechanism has none.
     async fn tree_drained(&self, grace: Duration) -> Result<TreeDrain, Error>;
-
-    /// Whether the root has exited within `within`, looked at through its handle. Non-reaping, so its
-    /// pid stays pinned.
-    async fn root_exited(&self, within: Duration) -> Result<bool, Error>;
 
     /// The sweep's answer once every member its kill reached has exited.
     async fn sweep(&self, swept: Swept<'_>) -> Result<(), SweepFailure>;
@@ -45,19 +47,50 @@ pub(crate) trait Waits {
 }
 
 /// The sync `Child`'s waits.
-pub(crate) struct BlockingDriver<'a>(pub(super) &'a Child);
+pub(crate) struct BlockingDriver<'a>(pub(crate) &'a Child);
+
+impl StopWaits for BlockingDriver<'_> {
+    async fn root_exited(&self, within: Duration) -> Result<bool, Error> {
+        self.0.proc.exited_by(crate::wait::deadline_from(within))
+    }
+
+    #[cfg(windows)]
+    type Proxy = Child;
+
+    #[cfg(windows)]
+    async fn start_proxy(
+        &self,
+        exe: &std::path::Path,
+        args: &crate::stop::proxy::protocol::ProxyArgs,
+    ) -> Result<(u32, Child), Error> {
+        let mut command = crate::Command::new();
+        crate::stop::proxy::configure_start(&mut command, exe, args)?;
+        let proxy = command.spawn()?;
+        Ok((proxy.pid(), proxy))
+    }
+
+    #[cfg(windows)]
+    async fn wait_proxy(
+        &self,
+        proxy: &mut Child,
+        after: Duration,
+        late: impl FnOnce(Duration) + Send,
+    ) -> Result<std::process::ExitStatus, Error> {
+        proxy.wait_saying(after, late)
+    }
+}
 
 impl Waits for BlockingDriver<'_> {
     fn child(&self) -> &Child {
         self.0
     }
 
-    async fn tree_drained(&self, grace: Duration) -> Result<TreeDrain, Error> {
-        self.0.wait_tree_timeout(grace)
+    async fn stop(&self, target: &StopTarget<'_>) -> Result<(), Error> {
+        self.0.stop.run(target)
     }
 
-    async fn root_exited(&self, within: Duration) -> Result<bool, Error> {
-        self.0.proc.exited_by(crate::wait::deadline_from(within))
+    async fn tree_drained(&self, grace: Duration) -> Result<TreeDrain, Error> {
+        self.0.wait_tree_timeout(grace)
     }
 
     async fn sweep(&self, swept: Swept<'_>) -> Result<(), SweepFailure> {
@@ -115,11 +148,46 @@ fn graceful_status_of_reap(pid: u32, op: &str, outcome: Result<ChildWaitOutcome,
     }
 }
 
+/// [`Child::terminate`](crate::Child::terminate), for any [`Waits`].
+pub(crate) async fn terminate<W: Waits>(w: &W) -> Result<(), Error> {
+    w.stop(&StopTarget::root(w.child())).await
+}
+
+/// [`Child::terminate_tree`](crate::Child::terminate_tree), for any [`Waits`].
+pub(crate) async fn terminate_tree<W: Waits>(w: &W) -> Result<(), Error> {
+    w.child().require_contained()?;
+    // A separate `terminate_tree` is no call that sweeps: it holds its members for the next kill.
+    w.stop(&StopTarget::tree(w.child(), TreeCall::SignalOnly)).await
+}
+
+/// [`terminate`] with what the action said it sent, for the kill after the grace; see
+/// [`Child::after_root_stop`].
+pub(crate) async fn stop_root<W: Waits>(w: &W) -> (Result<(), Error>, String) {
+    let target = StopTarget::root(w.child());
+    let stopped = w.stop(&target).await;
+    w.child().after_root_stop(target, stopped)
+}
+
+/// `graceful_shutdown_tree`'s cooperative stop: the child's stop action, run on a target that stands for the
+/// tree, and what the call goes on from. Only [`Child::after_tree_stop`] reads the record, once the action
+/// has returned, awaited or not: the root a prepared send holds is dropped with the send, before the
+/// grace, and never lives in an async caller's state.
+pub(crate) async fn signal_tree_cooperatively<W: Waits>(w: &W) -> SignalTreeCooperativelyOutcome {
+    #[cfg(test)]
+    if let Some(forced) = w.child().forced_in_place_of_the_stop() {
+        return forced;
+    }
+    let call = crate::containment::treewalk::WalkToken::new();
+    let target = StopTarget::tree(w.child(), TreeCall::Shutdown(&call));
+    let acted = w.stop(&target).await;
+    w.child().after_tree_stop(target, acted)
+}
+
 /// [`Child::graceful_shutdown`](crate::Child::graceful_shutdown), for any [`Waits`]: the signal, the
 /// grace, the kill unless the root exited, and the reap.
 pub(crate) async fn shutdown_lone<W: Waits>(w: &mut W, grace: Duration) -> Result<ExitStatus, Error> {
     // What the stop sent is what a refused kill after it says was sent.
-    let (stopped, earlier) = w.child().stop_root();
+    let (stopped, earlier) = stop_root(&*w).await;
     stopped?;
     #[cfg(test)]
     fault::run_hook(fault::HookPoint::AfterTerminate);
@@ -149,7 +217,7 @@ pub(crate) async fn shutdown_tree<W: Waits>(w: &mut W, grace: Duration) -> Resul
 
     // The mechanism's look at the root decides the cooperative signal (see `terminate_tree`), and
     // what the sweep may say was sent before it.
-    let (term, earlier, walk) = match w.child().signal_tree_cooperatively() {
+    let (term, earlier, walk) = match signal_tree_cooperatively(&*w).await {
         SignalTreeCooperativelyOutcome::Sent { result, earlier, walk } => (result, earlier, walk),
         SignalTreeCooperativelyOutcome::End(e) => return Err(e),
         #[cfg(target_os = "linux")]

@@ -220,7 +220,7 @@ jobs:
           SKULD_LABELS: ctrl_proxy
         run: >-
           ${{ matrix.nextest }} ctrl-proxy
-          cargo nextest run --locked --target ${{ matrix.target }}
+          cargo nextest run --locked --features tokio --target ${{ matrix.target }}
           --lib --test ctrl_proxy_bin --no-tests=fail
 
       # `pty` is an additive feature flag; exercise the feature-gated code paths.

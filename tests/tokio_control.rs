@@ -56,7 +56,7 @@ async fn async_tree_ops_unsupported_when_uncontained() {
     let (mut child, sock) = common::spawn_blocker_async().await;
     let err = child.kill_tree().await.expect_err("uncontained kill_tree");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
-    let err = child.terminate_tree().expect_err("uncontained terminate_tree");
+    let err = child.terminate_tree().await.expect_err("uncontained terminate_tree");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     common::kill_release_reap_async(&mut child, sock).await;
 }
@@ -98,7 +98,7 @@ async fn terminate_tree_soft_kills_the_group(_warns: common::WarnWatch) {
     // exits at the test's byte, so a root the SIGTERM missed exits by itself: the wait cannot hang,
     // and its status shows no signal.
     let (mut child, mut sock) = common::spawn_control_async("control-block", &["R"], true).await;
-    child.terminate_tree().expect("terminate_tree");
+    child.terminate_tree().await.expect("terminate_tree");
     _ = std::io::Write::write_all(&mut sock, b"x");
     let status = child.wait().await.expect("reap");
     assert_eq!(
@@ -160,7 +160,7 @@ async fn async_contain_with_treewalk_tears_down_tree() {
 async fn async_terminate_sends_sigterm() {
     use std::os::unix::process::ExitStatusExt;
     let (mut child, sock) = common::spawn_blocker_async().await;
-    child.terminate().expect("terminate sends SIGTERM");
+    child.terminate().await.expect("terminate sends SIGTERM");
     // Released after the signal: a terminate that sent nothing exits 0.
     drop(sock);
     let status = child.wait().await.expect("reap");
@@ -178,6 +178,7 @@ async fn async_terminate_unsupported_for_an_uncontained_child_on_windows() {
     let (mut child, sock) = common::spawn_blocker_async().await;
     let err = child
         .terminate()
+        .await
         .expect_err("a child that leads no group cannot be addressed");
     common::assert_refused_for_no_group(&err);
     common::kill_release_reap_async(&mut child, sock).await;
@@ -348,7 +349,7 @@ async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
     let (mut child, sock) = common::spawn_control_async_on_console("control-block", &["R"], true).await;
     // `kill_tree`, not `kill`: reaping a contained root first and then dropping it warns (#382).
     common::kill_tree_release_reap_async(&mut child, sock).await;
-    child.terminate().expect("already-dead must be Ok");
+    child.terminate().await.expect("already-dead must be Ok");
 }
 
 #[cfg(feature = "tokio")]
@@ -364,12 +365,12 @@ async fn async_refusals_match_the_sync_surface() {
     // Windows refuses a child that leads no group, and sends nothing: both mirrors, alive.
     #[cfg(windows)]
     assert_eq!(
-        refusal_shape(&uncontained.terminate()),
+        refusal_shape(&uncontained.terminate().await),
         refusal_shape(&sync_uncontained.terminate()),
         "uncontained: the two mirrors answer with different error shapes"
     );
     assert_eq!(
-        refusal_shape(&uncontained.terminate_tree()),
+        refusal_shape(&uncontained.terminate_tree().await),
         refusal_shape(&sync_uncontained.terminate_tree()),
         "uncontained terminate_tree: the two mirrors answer with different error shapes"
     );
@@ -405,7 +406,7 @@ async fn async_refusals_match_the_sync_surface() {
     drop(sync_stdin);
     common::assert_killed("the sync child", sync_reaped.wait().expect("reap"));
     assert_eq!(
-        refusal_shape(&async_reaped.terminate()),
+        refusal_shape(&async_reaped.terminate().await),
         refusal_shape(&sync_reaped.terminate()),
         "uncontained, after a reap: the two mirrors answer with different error shapes"
     );

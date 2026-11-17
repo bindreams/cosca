@@ -100,7 +100,9 @@ fn run(
             LiveBox::SudoOutsideACgroup => TrackedKind::Front(Front::Sudo),
         },
     ));
-    let outcome = child.signal_tree_cooperatively();
+    let outcome = super::shutdown::run_ready(super::shutdown::signal_tree_cooperatively(
+        &super::shutdown::BlockingDriver(&child),
+    ));
     if !root.signal_calls().is_empty() {
         sent.borrow_mut().push("term");
     }

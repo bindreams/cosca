@@ -288,6 +288,20 @@ impl Child {
         self.inner.wait_async().await
     }
 
+    /// [`wait`](Child::wait), which calls `warn` once, with `after`, if the child has not exited `after` into
+    /// the wait, and goes on waiting (no cap). An error from the look ends the wait and is returned.
+    #[cfg(windows)]
+    pub(crate) async fn wait_saying(
+        &mut self,
+        after: std::time::Duration,
+        warn: impl FnOnce(std::time::Duration),
+    ) -> Result<ExitStatus, Error> {
+        if !crate::tokio::drive::exited_held(self.inner.proc.os_process(), Some(after)).await? {
+            warn(after);
+        }
+        self.wait().await
+    }
+
     /// The root's reap, as [`crate::Child::reap_outcome`] answers it, awaited: closes an untaken stdin first.
     pub(crate) async fn reap_outcome(&mut self) -> Result<crate::child::owned::ChildWaitOutcome, Error> {
         drop(self.inner.pipes.remove(&Fd::STDIN));
@@ -368,9 +382,19 @@ impl Child {
     /// descendant whose identity transiently fails to resolve is intentionally left
     /// unsignaled; [`kill_tree`](Child::kill_tree) is the guaranteed hard teardown.
     ///
-    /// The sync [`Child::terminate_tree`](crate::Child::terminate_tree), with every case it documents.
-    pub fn terminate_tree(&self) -> Result<(), Error> {
-        self.inner.terminate_tree()
+    /// The sync [`Child::terminate_tree`](crate::Child::terminate_tree), with every case it documents: it
+    /// awaits the child's stop action
+    /// ([`Command::graceful_stop`](crate::tokio::Command::graceful_stop), else
+    /// [`stop::default`](crate::tokio::stop::default)) on a target that stands for the tree, and answers what
+    /// the action answers.
+    ///
+    /// # Runtime
+    ///
+    /// As [`terminate`](Child::terminate): the default action waits for nothing and needs no driver; an
+    /// action that awaits [`tokio::stop::wait_exit`](crate::tokio::stop::wait_exit) with a non-zero grace
+    /// needs, on Unix, a runtime with the IO **and** time drivers enabled.
+    pub async fn terminate_tree(&self) -> Result<(), Error> {
+        crate::child::graceful::shutdown::terminate_tree(self).await
     }
 
     /// Block until the contained tree's drain is observed: a cgroup leaf with no process left, a

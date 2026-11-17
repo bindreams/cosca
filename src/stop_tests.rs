@@ -535,7 +535,7 @@ fn graceful_shutdown_tree_ends_on_an_error_with_nothing_sent() {
 
 /// What a call that goes on after the action's last send says was sent before its kill is that send's stop,
 /// by name, or "the stop action" when the last send was refused or the action made none: for the lone
-/// shutdown's escalation ([`Child::stop_root`](crate::Child)) and for the tree shutdown's sweep
+/// shutdown's escalation (`stop_root`) and for the tree shutdown's sweep
 /// (the `earlier` its cooperative signal hands it). An action that goes on after a refused send leaves a
 /// trace of the refusal at `debug`.
 ///
@@ -575,7 +575,9 @@ fn a_call_words_what_the_action_sent_before_its_kill() {
     for (what, action, says, logs_a_refusal) in rows {
         let (child, stdin) = blocker_stopping_by(action, true);
         let mark = crate::log_capture::mark();
-        let (answer, earlier) = child.stop_root();
+        let (answer, earlier) = crate::child::graceful::shutdown::run_ready(
+            crate::child::graceful::shutdown::stop_root(&crate::child::graceful::shutdown::BlockingDriver(&child)),
+        );
         answer.unwrap_or_else(|e| panic!("{what}: {e:?}"));
         assert_eq!(earlier, says, "the lone shutdown's kill, after {what}");
         assert_eq!(
@@ -620,7 +622,9 @@ fn a_tree_call_words_what_the_action_sent_before_its_sweep() {
     for (what, action, says, logs_a_refusal) in rows {
         let (child, stdin) = blocker_stopping_by(action, true);
         let mark = crate::log_capture::mark();
-        match child.signal_tree_cooperatively() {
+        match crate::child::graceful::shutdown::run_ready(crate::child::graceful::shutdown::signal_tree_cooperatively(
+            &crate::child::graceful::shutdown::BlockingDriver(&child),
+        )) {
             SignalTreeCooperativelyOutcome::Sent {
                 result: Ok(()),
                 earlier: Some(earlier),

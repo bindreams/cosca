@@ -654,7 +654,7 @@ impl Command {
         &mut self,
         action: impl Fn(&crate::StopTarget<'_>) -> Result<(), Error> + Send + Sync + 'static,
     ) -> &mut Command {
-        self.stop = crate::stop::StopAction::Sync(std::sync::Arc::new(action));
+        self.stop = crate::stop::StopAction::sync(action);
         self
     }
 
@@ -1070,6 +1070,13 @@ impl Command {
 
     pub(crate) fn kill_on_drop_flag(&self) -> bool {
         self.kill_on_drop
+    }
+
+    /// Sets the stop action itself: the async `Command`'s own kind, which the public setter of this
+    /// one does not take.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn set_stop_action(&mut self, stop: crate::stop::StopAction) {
+        self.stop = stop;
     }
 
     /// What the child this command spawns does to stop cooperatively.
