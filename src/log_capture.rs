@@ -6,11 +6,13 @@
 //! earlier test (e.g. a same-shape marker under OS pid reuse) can never satisfy an
 //! assertion, and no test can erase another's records.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::ThreadId;
 
 struct CaptureLog;
 static RECORDS: Mutex<Vec<(log::Level, String, ThreadId)>> = Mutex::new(Vec::new());
+/// Signalled at every record, for [`wait_for_since`].
+static RECORDED: Condvar = Condvar::new();
 static INSTALLED: OnceLock<()> = OnceLock::new();
 
 impl log::Log for CaptureLog {
@@ -22,6 +24,7 @@ impl log::Log for CaptureLog {
             .lock()
             .unwrap()
             .push((record.level(), record.args().to_string(), std::thread::current().id()));
+        RECORDED.notify_all();
     }
     fn flush(&self) {}
 }
@@ -44,6 +47,23 @@ pub(crate) fn contains_since(mark: usize, marker: &str) -> bool {
     RECORDS.lock().unwrap()[mark..]
         .iter()
         .any(|(_, m, _)| m.contains(marker))
+}
+
+/// Blocks until a record emitted at or after `mark` contains `marker`, and returns its text. The wait is on
+/// the log's own condition: no time is chosen, so a record that never comes holds the caller.
+#[cfg(all(test, windows, feature = "tokio"))]
+pub(crate) fn wait_for_since(mark: usize, marker: &str) -> String {
+    let records = RECORDS.lock().unwrap();
+    let records = RECORDED
+        .wait_while(records, |records| {
+            !records[mark..].iter().any(|(_, m, _)| m.contains(marker))
+        })
+        .unwrap();
+    let (_, text, _) = records[mark..]
+        .iter()
+        .find(|(_, m, _)| m.contains(marker))
+        .expect("the wait ended on this record");
+    text.clone()
 }
 
 /// The text of every record emitted at or after `mark` that contains `marker`.

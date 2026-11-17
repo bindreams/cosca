@@ -86,6 +86,22 @@ pub(crate) fn assert_current_thread() {
     );
 }
 
+/// Awaits `f` and fails if it blocked its thread on an OS wait: a driver wait that called its blocking
+/// twin would stall every task on this runtime thread.
+pub(crate) async fn never_blocking<F: std::future::Future>(f: F) -> F::Output {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let blocked = Rc::new(Cell::new(false));
+    let _hook = crate::wait::block_probe::on_blocking({
+        let blocked = blocked.clone();
+        move || blocked.set(true)
+    });
+    let output = f.await;
+    assert!(!blocked.get(), "the call blocked a runtime thread");
+    output
+}
+
 /// A waker that sends once for each wake, for a test that polls a future by hand and needs to know
 /// when it is woken.
 struct Woken(std::sync::Mutex<std::sync::mpsc::Sender<()>>);

@@ -11,22 +11,37 @@ use crate::child::graceful::HoldersShutdown;
 use crate::containment::dispatch::{SweepFailure, Swept};
 use crate::containment::TreeDrain;
 use crate::error::Error;
+use crate::stop::{StopTarget, StopWaits};
+use crate::tokio::stop::AsyncDriver;
 
 impl Child {
     /// Send the child its cooperative shutdown signal — a request to exit, not an order.
     /// Signal-only: does not wait or reap.
     ///
-    /// Runs the child's stop action, which for a child of the async `Command` is
-    /// [`stop::default`](crate::stop::default), on a [`StopTarget`](crate::StopTarget) that stands for the
-    /// root alone: the sync [`Child::terminate`](crate::Child::terminate) with the same default. On Unix it
-    /// is an identity-bound `SIGTERM` to this process alone, so it cannot race a concurrent reap onto a
-    /// recycled pid.
+    /// Awaits the child's stop action
+    /// ([`Command::graceful_stop`](crate::tokio::Command::graceful_stop); [`stop::default`](crate::tokio::stop::default)
+    /// when none was set) on a [`StopTarget`] that stands for the root alone, and answers
+    /// what the action answers: the sync [`Child::terminate`](crate::Child::terminate) with the same
+    /// default, awaited. The prepared functions of [`tokio::stop`](crate::tokio::stop) apply the rules of
+    /// the sync ones, whoever calls them. After a future dropped while it holds the Windows console-event
+    /// proxy, the proxy is ended and whether the event was sent is unknown (see
+    /// `tokio::stop::send_console_event_via_proxy` for a drop during the proxy's start).
+    ///
+    /// On Unix the default is an identity-bound `SIGTERM` to this process alone, so it cannot race a
+    /// concurrent reap onto a recycled pid.
     /// On Windows it is `CTRL_BREAK` to the child's own **console process group**, which a child
     /// spawned with [`contain`](crate::tokio::Command::contain) leads by default (a nested
     /// [`Delegated`](crate::Containment::Delegated) one too) and an uncontained child leads only if
     /// `new_process_group(true)` asked for it. A child that leads no group of its own (an uncontained
     /// spawn by default, or one given `new_process_group(false)`) is refused with `Unsupported`; `kill`
     /// is the always-available alternative.
+    ///
+    /// # Runtime
+    ///
+    /// The default action waits for nothing and needs no driver. An action that awaits
+    /// [`tokio::stop::wait_exit`](crate::tokio::stop::wait_exit) with a non-zero grace needs, on Unix, a
+    /// runtime with the IO **and** time drivers enabled, as that function documents; a stop through the
+    /// Windows console-event proxy starts it on the blocking pool.
     ///
     /// **Windows blast radius.** The event reaches the child's whole console group, so an
     /// ordinary descendant that stayed in that group is signalled too, while a nested
@@ -67,14 +82,8 @@ impl Child {
     ///
     /// **macOS, a root launchd holds** is refused with nothing sent, and an `Unknown` root is signalled
     /// through the handle, as for the sync [`Child::kill`](crate::Child::kill).
-    pub fn terminate(&self) -> Result<(), Error> {
-        self.inner.terminate()
-    }
-
-    /// Whether the child has exited by the time `timeout` is over (`None`: until it does), looked at
-    /// through the held handle. Non-reaping, so the pid stays pinned.
-    async fn exited_through_handle(&self, timeout: Option<Duration>) -> Result<bool, Error> {
-        crate::tokio::drive::exited_held(self.inner.proc.os_process(), timeout).await
+    pub async fn terminate(&self) -> Result<(), Error> {
+        crate::child::graceful::shutdown::terminate(self).await
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
@@ -86,8 +95,8 @@ impl Child {
     /// polls once, then escalates.
     ///
     /// The cooperative half is [`terminate`](Child::terminate): the child's stop action
-    /// ([`stop::default`](crate::stop::default): the async `Command` sets none) run on a root target, and
-    /// every caveat on it applies. An
+    /// ([`Command::graceful_stop`](crate::tokio::Command::graceful_stop), else
+    /// [`stop::default`](crate::tokio::stop::default)) awaited on a root target, and every caveat on it applies. An
     /// error of the action propagates immediately: no grace is waited, nothing is killed, and the child
     /// is left running for the caller to `kill`. The escalation after the grace names what was sent
     /// before it as what the action's last prepared send sent, or "the stop action" when it sent none.
@@ -137,7 +146,8 @@ impl Child {
     }
 
     /// Cooperative-then-forced shutdown of the contained tree: run the child's stop action
-    /// ([`stop::default`](crate::stop::default): the async `Command` sets none) on a tree target, which sends the group its
+    /// ([`Command::graceful_stop`](crate::tokio::Command::graceful_stop), else
+    /// [`stop::default`](crate::tokio::stop::default)) awaited on a tree target, which by default sends the group its
     /// graceful signal (`SIGTERM` via `killpg`/cgroup, or `CTRL_BREAK` to the job/console group), wait
     /// up to `grace`, then hard-sweep any survivors and reap the root. Returns the root's
     /// `ExitStatus`. Requires an actionable containment mechanism (errors `Unsupported`
@@ -255,6 +265,34 @@ impl Child {
     }
 }
 
+impl StopWaits for Child {
+    async fn root_exited(&self, within: Duration) -> Result<bool, Error> {
+        AsyncDriver(&self.inner).root_exited(within).await
+    }
+
+    #[cfg(windows)]
+    type Proxy = Child;
+
+    #[cfg(windows)]
+    async fn start_proxy(
+        &self,
+        exe: &std::path::Path,
+        args: &crate::stop::proxy::protocol::ProxyArgs,
+    ) -> Result<(u32, Child), Error> {
+        AsyncDriver(&self.inner).start_proxy(exe, args).await
+    }
+
+    #[cfg(windows)]
+    async fn wait_proxy(
+        &self,
+        proxy: &mut Child,
+        after: Duration,
+        late: impl FnOnce(Duration) + Send,
+    ) -> Result<std::process::ExitStatus, Error> {
+        AsyncDriver(&self.inner).wait_proxy(proxy, after, late).await
+    }
+}
+
 /// The async `Child`'s waits for `graceful_shutdown` and `graceful_shutdown_tree`: each is awaited, on
 /// tokio's clock.
 impl Waits for Child {
@@ -262,12 +300,12 @@ impl Waits for Child {
         &self.inner
     }
 
-    async fn tree_drained(&self, grace: Duration) -> Result<TreeDrain, Error> {
-        self.wait_tree_timeout(grace).await
+    async fn stop(&self, target: &StopTarget<'_>) -> Result<(), Error> {
+        self.inner.stop.run_async(target).await
     }
 
-    async fn root_exited(&self, within: Duration) -> Result<bool, Error> {
-        self.exited_through_handle(Some(within)).await
+    async fn tree_drained(&self, grace: Duration) -> Result<TreeDrain, Error> {
+        self.wait_tree_timeout(grace).await
     }
 
     async fn sweep(&self, swept: Swept<'_>) -> Result<(), SweepFailure> {

@@ -182,10 +182,11 @@ In order:
    async waits' primitives in `tokio/wait.rs` (the clock, the armed deadline, the readiness loop).
 4. **The `Child` core:** the sync and async `Child` are one policy and two drivers: the async
    `Child` holds the sync one and only drives its waits (`wait_async`, `settle_async`).
-   `graceful_shutdown` and `graceful_shutdown_tree` are each one `async fn` (`shutdown_lone` and
-   `shutdown_tree`, in `child/graceful/shutdown.rs`) over a `Waits` trait of their waits: the sync
-   `Child` runs them with blocking waits through `run_ready` (one poll, a panic on `Pending`), and
-   the async `Child` awaits them. The root's identity read by number, which a drop uses to catch a
+   The four stop calls (`terminate`, `graceful_shutdown` and the two tree calls) are each one `async fn`
+   over a `Waits` trait (`child/graceful/shutdown.rs`): the sync `Child` runs them with blocking waits
+   through `run_ready` (one poll, a panic on `Pending`), and the async `Child` awaits them. `Waits`
+   extends `StopWaits` (`stop/waits.rs`), the waits a stop action makes: `BlockingDriver` blocks,
+   `tokio::stop::AsyncDriver` awaits. The root's identity read by number, which a drop uses to catch a
    reap by another that the handle cannot report, is `OsChild::number_holder`. The OS box reads the
    number through the kernel it owns (`OsChild::kernel()`), and `OwnedChild` asks the box. A test
    states the read on the fake of the layer it holds, as it states peeks. For a spawned child that

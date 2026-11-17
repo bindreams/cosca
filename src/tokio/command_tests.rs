@@ -53,7 +53,7 @@ fn a_spawn_outside_a_runtime_did_not_start_the_program() {
     assert!(matches!(refused.expect_not_started(), crate::error::Error::Io(_)));
 }
 
-/// The graceful futures are `Send`, so a caller can `tokio::spawn` them: neither the look at the
+/// The graceful and `terminate` futures are `Send`, so a caller can `tokio::spawn` them: neither the look at the
 /// root's group nor the root handle borrowing the child is in the future's state.
 ///
 /// Mutant: a borrow of the child held across the future's awaits (fails to compile).
@@ -65,6 +65,8 @@ async fn graceful_futures_are_send() {
         crate::test_child::held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {}).await;
     assert_send(child.graceful_shutdown(grace));
     assert_send(child.graceful_shutdown_tree(grace));
+    assert_send(child.terminate());
+    assert_send(child.terminate_tree());
 }
 
 /// The `kill_tree` futures and the foreign `Process`'s graceful tree shutdown, which awaits the same

@@ -41,13 +41,19 @@ pub(crate) fn child_over(fake: &FakeProcess) -> Child {
 
 /// The stop of a child over a fake. Unix: the default, which sends through the fake's tables. Windows: the
 /// default would send a `CTRL_BREAK` to a pid no process has, through the OS, so the action states a break
-/// that went out: a tree target hands the fake mechanism the answer of that send, and a root target
-/// sends nothing.
+/// that went out ([`stated_break`]).
 fn stop_over_a_fake() -> crate::stop::StopAction {
     #[cfg(unix)]
     return crate::stop::StopAction::default();
     #[cfg(windows)]
-    return crate::stop::StopAction::Sync(std::sync::Arc::new(|target| match target.scope() {
+    return crate::stop::StopAction::sync(stated_break);
+}
+
+/// Windows: a break that went out, as a stop over a fake states it: a tree target hands the fake mechanism
+/// the answer of that send, and a root target sends nothing.
+#[cfg(windows)]
+fn stated_break(target: &crate::StopTarget<'_>) -> Result<(), crate::error::Error> {
+    match target.scope() {
         crate::stop::Scope::Root => Ok(()),
         crate::stop::Scope::Tree(call) => target.send_tree(
             call,
@@ -56,7 +62,7 @@ fn stop_over_a_fake() -> crate::stop::StopAction {
                 crate::containment::SendOutcome::Sent(Ok(())),
             ),
         ),
-    }));
+    }
 }
 
 /// A root of stated answers: its kill is delivered, and its looks answer `exits`.
@@ -96,9 +102,13 @@ pub(crate) fn holders_only_skip(child: &Child) -> crate::containment::Skip {
 /// [`child_reaching`], as a tokio `Child`.
 #[cfg(feature = "tokio")]
 pub(crate) fn tokio_child_reaching(root: &FakeProcess, members: &[ProcessId]) -> crate::tokio::Child {
-    crate::tokio::Child {
-        inner: child_reaching(root, members),
+    #[cfg_attr(unix, allow(unused_mut, reason = "only Windows swaps the stop for an async one"))]
+    let mut inner = child_reaching(root, members);
+    #[cfg(windows)]
+    {
+        inner.stop = crate::stop::StopAction::asynchronous(|target| Box::pin(async move { stated_break(target) }));
     }
+    crate::tokio::Child { inner }
 }
 
 /// A live held member and the write end of its stdin, which ends it.

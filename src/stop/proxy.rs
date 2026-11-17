@@ -5,7 +5,8 @@
 //! [`protocol`] is the argv a caller starts it with and the exit codes it answers with; [`run`] is
 //! its own sequence; the rest of this file is the caller's side (Windows): the program a stop starts
 //! ([`CtrlProxy`]), and [`send`], which starts it, waits for its answer and maps the answer to the stop's
-//! result.
+//! result. `send` is written once, over the `StopWaits` that start and wait for the proxy: the sync
+//! stop blocks, the async stop awaits.
 
 pub(crate) mod protocol;
 #[cfg(windows)]
@@ -22,7 +23,7 @@ use std::time::Duration;
 use protocol::{CtrlEvent, ProxyAnswer, ProxyArgs, VERSION};
 
 #[cfg(windows)]
-use super::{conclude, refuse, unsupported, StopTarget, ELEVATED_REFUSAL};
+use super::{conclude, refuse, unsupported, StopTarget, StopWaits, ELEVATED_REFUSAL};
 #[cfg(windows)]
 use crate::containment::SendOutcome;
 #[cfg(windows)]
@@ -94,9 +95,9 @@ const NO_CONSOLE_CAUSES: &str =
 const ATTACH_DENIED_CAUSE: &str = "The child may still be running, on a console that refused the proxy.";
 
 /// The proxy's send, as [`send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy)
-/// documents it.
+/// documents it, for any [`StopWaits`]: the waits are the driver's.
 #[cfg(windows)]
-pub(crate) fn send(target: &StopTarget<'_>, event: CtrlEvent) -> Result<(), Error> {
+pub(crate) async fn send<D: StopWaits>(driver: &D, target: &StopTarget<'_>, event: CtrlEvent) -> Result<(), Error> {
     let console = target.child().console;
     if console.elevated {
         return Err(refuse(target, ELEVATED_REFUSAL));
@@ -112,13 +113,19 @@ pub(crate) fn send(target: &StopTarget<'_>, event: CtrlEvent) -> Result<(), Erro
         },
         CtrlProxy::Executable(exe) => exe.clone(),
     };
-    conclude(target, event, ask(target, event, &id, &exe))
+    conclude(target, event, ask(driver, target, event, &id, &exe).await)
 }
 
 /// Starts `exe` as the proxy for `event` to the console of the child `id` names, waits for its
 /// answer, and returns what it came to.
 #[cfg(windows)]
-fn ask(target: &StopTarget<'_>, event: CtrlEvent, id: &ProcessId, exe: &Path) -> SendOutcome {
+async fn ask<D: StopWaits>(
+    driver: &D,
+    target: &StopTarget<'_>,
+    event: CtrlEvent,
+    id: &ProcessId,
+    exe: &Path,
+) -> SendOutcome {
     let record = match id.to_record() {
         Ok(record) => record,
         Err(e) => return SendOutcome::NotSent(e),
@@ -132,14 +139,19 @@ fn ask(target: &StopTarget<'_>, event: CtrlEvent, id: &ProcessId, exe: &Path) ->
     };
     // The target borrows the child, which holds its process handle: the pid stays this child's until
     // the call returns, whatever the child does.
-    let proxy = match start(exe, &args) {
-        Ok(proxy) => proxy,
+    let (proxy_pid, mut proxy) = match driver.start_proxy(exe, &args).await {
+        Ok(started) => started,
         Err(e) => return start_failed(exe, e),
     };
-    let proxy_pid = proxy.pid();
-    let status = match proxy.wait_saying(crate::wait::teardown_warn::LATE, |after| {
-        warn_still_waiting(Some(proxy_pid), record.pid, event, after)
-    }) {
+    // The wait is the driver's; the warning is this body's policy.
+    let status = driver
+        .wait_proxy(&mut proxy, crate::wait::teardown_warn::LATE, |after| {
+            warn_still_waiting(Some(proxy_pid), record.pid, event, after)
+        })
+        .await;
+    // Dropped before the match so a failed wait has ended the proxy before the error returns.
+    drop(proxy);
+    let status = match status {
         Ok(status) => status,
         Err(e) => return wait_failed(proxy_pid, event, e),
     };
@@ -170,21 +182,20 @@ fn ask(target: &StopTarget<'_>, event: CtrlEvent, id: &ProcessId, exe: &Path) ->
         event,
         answer,
     });
-    result_of(target, event, exe, answer)
+    result_of(driver, target, event, exe, answer).await
 }
 
-/// Starts `exe` as the proxy for `args`: uncontained, with no console of its own (a process attached to
-/// one cannot attach to another), and null standard streams.
+/// Sets `command` up to start `exe` as the proxy for `args`: uncontained, with no console of its own (a
+/// process attached to one cannot attach to another), and null standard streams.
 #[cfg(windows)]
-fn start(exe: &Path, args: &ProxyArgs) -> Result<crate::Child, Error> {
-    let mut command = crate::Command::new();
+pub(crate) fn configure_start(command: &mut crate::Command, exe: &Path, args: &ProxyArgs) -> Result<(), Error> {
     command.raw_executable(exe).args(args.to_argv(exe.as_os_str()));
     command.detached();
     command
         .stdin(crate::Stdio::null())?
         .stdout(crate::Stdio::null())?
         .stderr(crate::Stdio::null())?;
-    command.spawn()
+    Ok(())
 }
 
 /// This program's own path cannot be read, to start it as the proxy.
@@ -225,7 +236,13 @@ fn wait_failed(proxy_pid: u32, event: CtrlEvent, e: Error) -> SendOutcome {
 
 /// What the proxy's `answer` came to as the stop's send.
 #[cfg(windows)]
-fn result_of(target: &StopTarget<'_>, event: CtrlEvent, exe: &Path, answer: ProxyAnswer) -> SendOutcome {
+async fn result_of<D: StopWaits>(
+    driver: &D,
+    target: &StopTarget<'_>,
+    event: CtrlEvent,
+    exe: &Path,
+    answer: ProxyAnswer,
+) -> SendOutcome {
     let code = answer.code();
     let sent = event.name();
     // The attach did not succeed, and the child had not exited when cosca looked: the child's own exit
@@ -240,7 +257,7 @@ fn result_of(target: &StopTarget<'_>, event: CtrlEvent, exe: &Path, answer: Prox
     match answer {
         ProxyAnswer::Sent => SendOutcome::Sent(Ok(())),
         ProxyAnswer::TargetGone | ProxyAnswer::AttachDenied | ProxyAnswer::TargetHasNoConsole => {
-            match target.wait_exit(Duration::ZERO) {
+            match driver.root_exited(Duration::ZERO).await {
                 Err(look_failed) => not_sent(look_failed),
                 Ok(true) => SendOutcome::RootExited(Error::Unassessable {
                     detail: format!(
@@ -298,7 +315,7 @@ fn result_of(target: &StopTarget<'_>, event: CtrlEvent, exe: &Path, answer: Prox
 
 #[cfg(all(test, windows))]
 #[path = "proxy_tests.rs"]
-mod proxy_tests;
+pub(crate) mod proxy_tests;
 
 #[cfg(all(test, windows))]
 #[path = "proxy_real_tests.rs"]

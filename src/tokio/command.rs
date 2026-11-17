@@ -161,6 +161,36 @@ impl Command {
         self
     }
 
+    /// Sets what the child's cooperative stop does, as [`Command::graceful_stop`](crate::Command::graceful_stop)
+    /// does, with an async action: the function [`Child::terminate`](crate::tokio::Child::terminate),
+    /// [`graceful_shutdown`](crate::tokio::Child::graceful_shutdown),
+    /// [`terminate_tree`](crate::tokio::Child::terminate_tree) and
+    /// [`graceful_shutdown_tree`](crate::tokio::Child::graceful_shutdown_tree) await to ask the child to
+    /// stop, before they wait. Without it the child's stop is [`stop::default`](crate::tokio::stop::default).
+    ///
+    /// The action is given the same [`StopTarget`](crate::StopTarget) the sync one is. Compose it from the
+    /// prepared functions of [`tokio::stop`](crate::tokio::stop), and from
+    /// [`stop::wait_exit`](crate::tokio::stop::wait_exit). A child of this command holds this action and
+    /// never a sync one, and a child of the sync command never an async one: each command takes its own
+    /// kind. What the action answers is what the call answers, with the rules of the sync action. An example
+    /// is on [`StopFuture`](crate::tokio::StopFuture).
+    pub fn graceful_stop(
+        &mut self,
+        action: impl for<'t, 'c> Fn(&'t crate::StopTarget<'c>) -> super::StopFuture<'t> + Send + Sync + 'static,
+    ) -> &mut Command {
+        self.inner
+            .set_stop_action(crate::stop::StopAction::asynchronous(action));
+        self
+    }
+
+    /// Windows: sets which program the console-event proxy is, as
+    /// [`Command::ctrl_proxy`](crate::Command::ctrl_proxy) does.
+    #[cfg(windows)]
+    pub fn ctrl_proxy(&mut self, proxy: crate::CtrlProxy) -> &mut Command {
+        self.inner.ctrl_proxy(proxy);
+        self
+    }
+
     /// Mirrors [`new_process_group`](crate::Command::new_process_group).
     #[cfg(windows)]
     pub fn new_process_group(&mut self, group: bool) -> &mut Command {

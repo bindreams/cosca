@@ -47,7 +47,7 @@ async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
     let (mut child, mut sock) = spawn_root(Handler::Ack).await;
     assert!(StopTarget::from(&child.inner).leads_group_on_our_console());
     assert_in_our_console(child.pid(), "the root");
-    child.terminate().expect("terminate a console-group child");
+    child.terminate().await.expect("terminate a console-group child");
     ctrl_break::assert_break_sent_to(child.pid());
     assert_acked(&mut sock, "the root");
     assert_eq!(
@@ -69,7 +69,7 @@ async fn an_async_uncontained_child_given_a_group_is_stopped_directly() {
     assert_eq!(child.containment(), Containment::None);
     assert!(StopTarget::from(&child.inner).leads_group_on_our_console());
     assert_in_our_console(child.pid(), "the child");
-    child.terminate().expect("terminate a child created in a group");
+    child.terminate().await.expect("terminate a child created in a group");
     ctrl_break::assert_break_sent_to(child.pid());
     assert_acked(&mut sock, "the child");
     kill_release_reap_async(&mut child, sock, false).await;
@@ -82,7 +82,10 @@ async fn an_async_plain_contained_root_really_receives_the_break() {
     assert_eq!(child.containment(), Containment::JobObject);
     assert!(StopTarget::from(&child.inner).leads_group_on_our_console());
     assert_in_our_console(child.pid(), "the root");
-    child.terminate_tree().expect("terminate_tree on a contained root");
+    child
+        .terminate_tree()
+        .await
+        .expect("terminate_tree on a contained root");
     ctrl_break::assert_break_sent_to(child.pid());
     assert_acked(&mut sock, "the root");
     kill_release_reap_async(&mut child, sock, true).await;
@@ -168,7 +171,10 @@ async fn assert_false_success(
     crate::tokio::test_runtime::assert_current_thread();
     let (mut child, mut sock) = spawn_root_configured(Handler::Default, mode, &configure).await;
     assert_own_console_route(&child, expected_containment);
-    child.terminate_tree().expect("the cooperative op reports success");
+    child
+        .terminate_tree()
+        .await
+        .expect("the cooperative op reports success");
     ctrl_break::assert_break_sent_to(child.pid());
     assert_eq!(
         child.is_alive(),

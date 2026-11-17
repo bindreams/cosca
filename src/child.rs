@@ -988,10 +988,9 @@ impl Child {
     /// members the walk reached, and a later [`kill_tree`](Child::kill_tree) or the drop kills them by
     /// identity.
     pub fn terminate_tree(&self) -> Result<(), Error> {
-        self.require_contained()?;
-        // A separate `terminate_tree` is no call that sweeps: it holds its members for the next kill.
-        self.stop
-            .run(&crate::stop::StopTarget::tree(self, crate::stop::TreeCall::SignalOnly))
+        graceful::shutdown::run_ready(graceful::shutdown::terminate_tree(&graceful::shutdown::BlockingDriver(
+            self,
+        )))
     }
 
     /// A tree call on this child's tree that skipped what the root's number names ([`SkipCall`]).

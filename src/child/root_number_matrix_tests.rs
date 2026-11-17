@@ -347,12 +347,12 @@ impl Api {
     #[cfg(feature = "tokio")]
     const ALL: &[Api] = &[Api::Sync, Api::Tokio];
 
-    /// Whether the cell exists for `op`: the async `Child` calls the sync one's entry points through,
-    /// except the graceful shutdown, whose waits it makes itself.
+    /// Whether the cell exists for `op`: the async `Child` has its own cell only where it awaits the stop
+    /// action.
     fn runs(self, op: Op) -> bool {
         #[cfg(feature = "tokio")]
         if self == Api::Tokio {
-            return op == Op::GracefulShutdown;
+            return matches!(op, Op::Terminate | Op::GracefulShutdown);
         }
         let _ = op;
         true
@@ -779,11 +779,11 @@ fn finish_teardown(
     sent
 }
 
-/// Runs one tokio cell, the async graceful shutdown (the one entry point whose waits are the async
-/// driver's), and returns what it sent. The other entry points are the sync `Child`'s, which the
-/// async one calls through.
+/// Runs one tokio cell, the async `terminate_tree` or graceful shutdown (the entry points that await
+/// the stop action and the async driver's waits), and returns what it sent. The other entry points are
+/// the sync `Child`'s, which the async one calls through.
 #[cfg(feature = "tokio")]
-async fn run_tokio(mechanism: Mechanism, reap: Reap) -> Sent {
+async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     use ::tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
     let mut cmd = crate::test_child::tokio_command(Console::Hidden);
     mechanism.configure(cmd.as_sync_mut());
@@ -817,7 +817,11 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap) -> Sent {
     let _released_at_the_root_wait = crate::child::spawn::fault::release_when_a_teardown_waits(&stdin);
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
-    _ = child.graceful_shutdown_tree(Duration::ZERO).await;
+    _ = match op {
+        Op::Terminate => child.terminate_tree().await,
+        Op::GracefulShutdown => child.graceful_shutdown_tree(Duration::ZERO).await.map(drop),
+        Op::Kill | Op::Drop | Op::FinishElevated => unreachable!("{op:?} has no async cell"),
+    };
     reap.assert_script_used(scripted.as_ref());
     let mut sent = recorders.sent(root, cat);
     if reap.lift_before_cleanup() {
@@ -861,7 +865,7 @@ fn check_matrix(mechanisms: &[Mechanism]) {
                     let sent = match api {
                         Api::Sync => run_sync(mechanism, reap, op),
                         #[cfg(feature = "tokio")]
-                        Api::Tokio => runtime.block_on(run_tokio(mechanism, reap)),
+                        Api::Tokio => runtime.block_on(run_tokio(mechanism, reap, op)),
                     };
                     let want = expected(mechanism, reap, op);
                     let wrong = mismatches(&want, &sent);

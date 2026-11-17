@@ -167,7 +167,7 @@ fn probe(backend: Backend, intent: Intent) -> Probed {
                 let mut child = cmd.spawn().await.expect("spawn async creation-flag probe child");
                 let sock = common::accept_or_die_async(&listener, &mut child).await;
                 let report = read_report_line(&sock);
-                let terminate = child.terminate();
+                let terminate = child.terminate().await;
                 drop(sock);
                 let _ = child.kill();
                 child.wait().await.expect("reap async creation-flag probe child");
@@ -443,8 +443,7 @@ fn a_no_window_contained_child_reports_no_in_process_route_via_the_raw_backend()
 
 #[cfg(windows)]
 /// The async raw backend reads the composed word too: a contained child it spawns with `no_window` gets
-/// a console of its own, as the child itself reports, while a plain one shares ours. (What cosca
-/// recorded of the route is read through `StopTarget`, which a tokio child does not yet give.)
+/// a console of its own, as the child itself reports, while a plain one shares ours.
 #[cfg(feature = "tokio")]
 #[skuld::test]
 async fn an_async_no_window_contained_child_gets_a_console_of_its_own_via_the_raw_backend() {
@@ -482,11 +481,19 @@ async fn an_async_no_window_contained_child_gets_a_console_of_its_own_via_the_ra
         "1",
         "a plain contained child shares OUR console: {plain_report}"
     );
+    assert!(
+        cosca::StopTarget::from(&plain).leads_group_on_our_console(),
+        "cosca recorded the plain child as leading a group on our console"
+    );
     let (hidden, hidden_sock, hidden_report) = spawn_one(&listener, &addr, &me, true).await;
     assert_eq!(
         report_field(&hidden_report, "sees_caller"),
         "0",
         "the async raw backend must read the composed word: {hidden_report}"
+    );
+    assert!(
+        !cosca::StopTarget::from(&hidden).leads_group_on_our_console(),
+        "cosca recorded the hidden child as outside our console"
     );
 
     for (mut child, sock) in [(plain, plain_sock), (hidden, hidden_sock)] {

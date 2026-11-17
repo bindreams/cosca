@@ -6,6 +6,10 @@
 //! shared between tests. The testbin's `main` runs this before anything else, so the copy never plays
 //! the real proxy, which a `cosca::init()` first in `main` would.
 //!
+//! A fixture that finds `<its path>.port` holds its answer until it is told: it connects to that port on
+//! the loopback, reports its pid as a line, and exits with its code once the test writes a byte (or closes
+//! the connection). A test that must see the proxy running, to act while the caller waits for it, uses this.
+//!
 //! Compiled into the testbin, which runs it, and into the lib's unit tests, which name the copies and
 //! read the records.
 
@@ -29,6 +33,13 @@ pub fn exe_name(code: i32) -> String {
 pub fn record_path(exe: &Path) -> PathBuf {
     let mut path = exe.as_os_str().to_owned();
     path.push(".ran");
+    PathBuf::from(path)
+}
+
+/// Where a test that wants the fixture at `exe` held writes the loopback port it listens on.
+pub fn port_path(exe: &Path) -> PathBuf {
+    let mut path = exe.as_os_str().to_owned();
+    path.push(".port");
     PathBuf::from(path)
 }
 
@@ -69,7 +80,21 @@ pub fn run_if_named() {
         record.push('\n');
     }
     std::fs::write(record_path(&exe), record).expect("record that the fixture ran");
+    if let Ok(port) = std::fs::read_to_string(port_path(&exe)) {
+        hold_until_told(port.trim().parse().expect("the port the test listens on"));
+    }
     std::process::exit(code);
+}
+
+/// Reports this process's pid on `port`, then blocks until the test writes a byte or hangs up.
+fn hold_until_told(port: u16) {
+    use std::io::{Read as _, Write as _};
+
+    let mut test = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to the test");
+    writeln!(test, "{}", std::process::id()).expect("report the pid");
+    let mut told = [0u8; 1];
+    // Either answer, a byte or the hang-up, releases the fixture.
+    _ = test.read(&mut told);
 }
 
 fn has_console() -> bool {

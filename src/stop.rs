@@ -7,7 +7,9 @@
 //!
 //! An action is a function of a [`StopTarget`], which stands for the child's root or for its tree. The
 //! functions here are the prepared actions, each callable on its own from an action of the caller's:
-//! [`default`] is what a child does when none is set, and is written as a caller would write it.
+//! [`default`] is what a child does when none is set, and is written as a caller would write it. The
+//! functions here that wait block the calling thread; their awaited forms are in `cosca::tokio::stop`
+//! (feature `tokio`).
 //!
 //! A prepared function does the sending, inside the rules a child's `terminate` applies, whoever calls
 //! it: the same front gate meets a send to the root and a send to the tree. What a prepared send answers
@@ -24,10 +26,12 @@
 mod action;
 pub(crate) mod proxy;
 mod target;
+mod waits;
 
 pub(crate) use action::StopAction;
 pub use target::StopTarget;
 pub(crate) use target::{RootRecord, Scope, TreeCall, TreeRecord};
+pub(crate) use waits::StopWaits;
 
 #[cfg(windows)]
 use crate::containment::SendOutcome;
@@ -243,6 +247,9 @@ fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Res
 /// is not a proxy and does not exit holds the call, and [`Child::kill`](crate::Child::kill) does not
 /// release it: the wait is for the proxy, not for the child.
 ///
+/// The wait blocks the calling thread. An async action awaits
+/// `cosca::tokio::stop::send_console_event_via_proxy` (feature `tokio`) instead.
+///
 /// # Errors
 ///
 /// [`Error::Unsupported`], with nothing sent and, for the first three, nothing started:
@@ -278,7 +285,11 @@ fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Res
 /// event, where the direct send to the group would have reached them.
 #[cfg(windows)]
 pub fn send_console_event_via_proxy(target: &StopTarget<'_>, event: CtrlEvent) -> Result<(), Error> {
-    proxy::send(target, event)
+    crate::child::graceful::shutdown::run_ready(proxy::send(
+        &crate::child::graceful::shutdown::BlockingDriver(target.child()),
+        target,
+        event,
+    ))
 }
 
 #[cfg(test)]

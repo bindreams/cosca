@@ -9,22 +9,7 @@ use crate::test_child::Console;
 use crate::test_groups::{cgroup, Group};
 
 use crate::child::graceful::fault as term_fault;
-
-/// Awaits `f` and fails if it blocked its thread on an OS wait: a driver wait that called its blocking
-/// twin would stall every task on this runtime thread.
-async fn never_blocking<F: std::future::Future>(f: F) -> F::Output {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
-    let blocked = Rc::new(Cell::new(false));
-    let _hook = crate::wait::block_probe::on_blocking({
-        let blocked = blocked.clone();
-        move || blocked.set(true)
-    });
-    let output = f.await;
-    assert!(!blocked.get(), "the call blocked a runtime thread");
-    output
-}
+use crate::tokio::test_runtime::never_blocking;
 
 /// An untaken piped stdin stays open through the grace, so the signal or the kill, not an EOF on
 /// stdin, ends a child that reads it. The child ends on EOF with status 0 (Unix: it ignores `SIGTERM`
@@ -214,7 +199,7 @@ async fn async_the_root_through_its_pidfd_awaits_the_grace() {
         tree.answering_terminates([TerminateOutcome::RootThroughPidfd(skip)]),
     ));
     let SignalTreeCooperativelyOutcome::RootThroughPidfd(skip, started, _, acted) =
-        child.inner.signal_tree_cooperatively()
+        crate::child::graceful::shutdown::signal_tree_cooperatively(&child).await
     else {
         panic!("the default stop did not end on the root's pidfd");
     };
@@ -500,7 +485,7 @@ async fn async_graceful_tree_drained_skips_sweep_in_a_cgroup(#[fixture(cgroup)] 
 }
 
 // Async twin of `members_remain_still_reaps_an_already_exited_root`; see there for the fixture's
-// rationale (`exited_through_handle`, like the sync wait, does not reap) and for `mode` and `swept`.
+// rationale (`drive::exited_held`, like the sync wait, does not reap) and for `mode` and `swept`.
 #[cfg(unix)]
 async fn members_remain_still_reaps_an_already_exited_root(
     mode: crate::ContainMode,
@@ -535,7 +520,9 @@ async fn members_remain_still_reaps_an_already_exited_root(
     // reaping.
     exit_gate.write_all(b"x\n").await.expect("release the root's exit 0");
     drop(exit_gate);
-    child.exited_through_handle(None).await.expect("the root must exit");
+    crate::tokio::drive::exited_held(child.inner.proc.os_process(), None)
+        .await
+        .expect("the root must exit");
     assert_eq!(
         id.exists(),
         crate::identity::Existence::Present,
@@ -726,7 +713,10 @@ async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_re
     // Released only after the kill, so a no-op kill fails `assert_killed`.
     drop(stdin);
     crate::test_child::assert_killed("the blocker", child.wait().await.expect("reap"));
-    let err = child.terminate().expect_err("a child that leads no group is refused");
+    let err = child
+        .terminate()
+        .await
+        .expect_err("a child that leads no group is refused");
     assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
 }
 

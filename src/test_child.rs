@@ -1797,6 +1797,15 @@ pub(crate) const SIGNAL_THEN_TERM_TREE_ARGV: &[&str] = &[
      hold $c; echo 'root eof'",
 ];
 
+/// Sets `cmd` up to run `argv` with its stdin and stdout piped: the setup of [`ready_tree`] and
+/// [`ready_tree_async`].
+#[cfg(unix)]
+fn pipe_ready_tree(cmd: &mut crate::Command, argv: &[&str]) {
+    cmd.args(argv.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+}
+
 /// A tree of `argv` contained as `contain` asks, once it has printed `r\n`: the child, the write end
 /// of its stdin and its stdout, from which the readiness line has been read.
 #[cfg(unix)]
@@ -1807,15 +1816,33 @@ pub(crate) fn ready_tree(
     use std::io::Read as _;
 
     let mut cmd = command(Console::Hidden);
-    cmd.args(argv.iter().copied());
-    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
-    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    pipe_ready_tree(&mut cmd, argv);
     contain(&mut cmd);
     let mut child = cmd.spawn().expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     let mut stdout = child.stdout().expect("piped stdout");
     let mut ready = [0u8; 2];
     stdout.read_exact(&mut ready).expect("readiness line");
+    assert_eq!(&ready, b"r\n");
+    (child, stdin, stdout)
+}
+
+/// [`ready_tree`] for the tokio `Child`: its stdin and its stdout, from which the readiness line has been read.
+#[cfg(all(unix, feature = "tokio"))]
+pub(crate) async fn ready_tree_async(
+    argv: &[&str],
+    contain: impl FnOnce(&mut crate::tokio::Command),
+) -> (crate::tokio::Child, crate::tokio::ChildStdin, crate::tokio::ChildStdout) {
+    use ::tokio::io::AsyncReadExt as _;
+
+    let mut cmd = tokio_command(Console::Hidden);
+    pipe_ready_tree(cmd.as_sync_mut(), argv);
+    contain(&mut cmd);
+    let mut child = cmd.spawn().await.expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let mut stdout = child.stdout().expect("piped stdout");
+    let mut ready = [0u8; 2];
+    stdout.read_exact(&mut ready).await.expect("readiness line");
     assert_eq!(&ready, b"r\n");
     (child, stdin, stdout)
 }

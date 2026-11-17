@@ -14,6 +14,8 @@ mod pump;
 mod spawn;
 #[path = "tokio/stdio.rs"]
 mod stdio;
+#[path = "tokio/stop.rs"]
+pub mod stop;
 #[cfg(test)]
 #[path = "tokio/test_runtime.rs"]
 pub(crate) mod test_runtime;
@@ -26,6 +28,7 @@ pub use child::{Child, SuspendedChild};
 pub use command::Command;
 pub use process::Process;
 pub use stdio::{ChildStderr, ChildStdin, ChildStdout};
+pub use stop::StopFuture;
 
 /// Start building an async command from an argument vector.
 pub fn run<I, S>(args: I) -> Command
