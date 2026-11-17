@@ -52,42 +52,21 @@ fn started_with_a_proxy_invocation_it_runs_the_proxy() {
     assert_eq!(out.status.code(), Some(NO_SUCH_TARGET), "{out:?}");
 }
 
-/// Ctrl+Break to a child with a console of its own, which ends it by the default disposition. The
-/// answer is asserted first, so a proxy that sent nothing fails by assertion and not by waiting for
-/// the child.
+/// A stop through `CtrlProxy::Executable` of this executable sends Ctrl+Break to a child with a console
+/// of its own, which ends it by the default disposition. The stop's answer is asserted first (`Sent` is
+/// `Ok`), so a proxy that sent nothing fails by assertion and not by waiting for the child.
 #[cfg(windows)]
 #[skuld::test]
 fn the_cosca_ctrl_proxy_executable_plays_the_proxy(#[fixture(ctrl_proxy)] _group: &Group) {
     /// `STATUS_CONTROL_C_EXIT`: how a process with no handler ends on a delivered break.
     const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
-    /// `ProxyAnswer::Sent`.
-    const SENT: i32 = 150;
 
     // Uncontained, with a window-less console of its own: no group of ours reaches it.
-    let (child, sock) = common::spawn_control("control-block", &["R"], false);
-    let exe = proxy_exe();
-    // The target is named by its identity: the pid and the key that tells it from a later holder.
-    let target = child
-        .id()
-        .expect("the spawn read the child's identity")
-        .to_record()
-        .expect("a record");
-    let mut cmd = common::command(common::Console::Asked);
-    cmd.executable(exe.clone()).args([
-        exe.into_os_string(),
-        "--cosca-ctrl-proxy=1".into(),
-        target.pid.to_string().into(),
-        target.token.to_string().into(),
-        "break".into(),
-        std::process::id().to_string().into(),
-    ]);
-    // As cosca starts a proxy: no console of its own, so that it can attach to one.
-    cmd.detached();
-    common::silence(&mut cmd);
-    cmd.stdin(cosca::Stdio::null()).expect("null stdin");
-    let proxy = cmd.spawn().expect("start the proxy");
-    let answer = proxy.wait().expect("wait for the proxy");
-    assert_eq!(answer.code(), Some(SENT), "{answer:?}");
+    let (child, sock) = common::spawn_control_with("control-block", &["R"], false, |cmd| {
+        cmd.ctrl_proxy(cosca::CtrlProxy::Executable(proxy_exe()));
+    });
+    cosca::stop::send_console_event_via_proxy(&cosca::StopTarget::from(&child), cosca::CtrlEvent::CtrlBreak)
+        .expect("the executable plays the proxy and answers Sent");
 
     let status = child.wait().expect("the child's exit");
     assert_eq!(status.code(), Some(STATUS_CONTROL_C_EXIT), "{status:?}");

@@ -37,6 +37,8 @@ fn a_child_without_a_process() -> Child {
         None,
         SpawnPolicy::SYNC,
         crate::stop::StopAction::default(),
+        #[cfg(windows)]
+        Default::default(),
     ))
 }
 

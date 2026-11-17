@@ -33,6 +33,9 @@ pub struct Command {
     flags: FlagsRequest,
     /// What the child's cooperative stop does ([`Command::graceful_stop`]).
     stop: crate::stop::StopAction,
+    /// Which program the child's stop starts as the console-event proxy ([`Command::ctrl_proxy`]).
+    #[cfg(windows)]
+    ctrl_proxy: std::sync::Arc<crate::stop::proxy::CtrlProxy>,
     /// Files the spawn needs open until it runs: a pinned elevation backend exec'd through
     /// `/proc/self/fd/N`.
     held: Vec<std::sync::Arc<std::fs::File>>,
@@ -88,6 +91,8 @@ impl Default for Command {
             held: Vec::new(),
             flags: FlagsRequest::default(),
             stop: crate::stop::StopAction::default(),
+            #[cfg(windows)]
+            ctrl_proxy: Default::default(),
         }
     }
 }
@@ -653,6 +658,22 @@ impl Command {
         self
     }
 
+    /// Windows: sets which program [`stop::send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy)
+    /// starts as the console-event proxy for this command's child. The default is
+    /// [`CtrlProxy::HostExecutable`](crate::CtrlProxy::HostExecutable): the file at the host program's
+    /// path when the stop runs, which has called [`cosca::init()`](crate::init);
+    /// [`CtrlProxy::Executable`](crate::CtrlProxy::Executable) names a program of its own (the
+    /// `cosca-ctrl-proxy` executable, for a host that cannot call `init` or replaces its own image while
+    /// it runs).
+    ///
+    /// The setting is only read when a stop sends through the proxy: a child whose stop never does
+    /// ignores it.
+    #[cfg(windows)]
+    pub fn ctrl_proxy(&mut self, proxy: crate::CtrlProxy) -> &mut Command {
+        self.ctrl_proxy = std::sync::Arc::new(proxy);
+        self
+    }
+
     /// Contain the child's whole process tree using the strongest mechanism
     /// the host offers, so dropping or `kill_tree`-ing the child tears down every
     /// descendant. See [`crate::Containment`] for the per-OS mechanisms.
@@ -1024,6 +1045,8 @@ impl Command {
             elevation_report: Some(report),
             flags: self.flags,
             stop: self.stop.clone(),
+            #[cfg(windows)]
+            ctrl_proxy: std::sync::Arc::clone(&self.ctrl_proxy),
             held: Vec::new(),
         }
     }
@@ -1052,6 +1075,12 @@ impl Command {
     /// What the child this command spawns does to stop cooperatively.
     pub(crate) fn stop_action(&self) -> crate::stop::StopAction {
         self.stop.clone()
+    }
+
+    /// Which program the child this command spawns has its console events sent through.
+    #[cfg(windows)]
+    pub(crate) fn ctrl_proxy_setting(&self) -> std::sync::Arc<crate::stop::proxy::CtrlProxy> {
+        std::sync::Arc::clone(&self.ctrl_proxy)
     }
 }
 

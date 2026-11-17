@@ -183,6 +183,9 @@ pub struct Child {
     pub(crate) tree: crate::containment::Tree,
     /// What the child's cooperative stop does: the caller's own, or [`stop::default`](crate::stop::default).
     pub(crate) stop: crate::stop::StopAction,
+    /// Which program the child's stop starts as the console-event proxy.
+    #[cfg(windows)]
+    pub(crate) ctrl_proxy: std::sync::Arc<crate::stop::proxy::CtrlProxy>,
     /// What the spawn recorded about the child's console, which the Windows stop functions read.
     #[cfg(windows)]
     pub(crate) console: crate::containment::windows::ConsoleFacts,
@@ -223,6 +226,7 @@ impl Child {
         elevation: Option<crate::elevation::ElevationReport>,
         policy: SpawnPolicy,
         stop: crate::stop::StopAction,
+        #[cfg(windows)] ctrl_proxy: std::sync::Arc<crate::stop::proxy::CtrlProxy>,
     ) -> Child {
         debug_assert!(proc.pid().is_some(), "a child's process has the pid its spawn learned");
         debug_assert!(
@@ -244,6 +248,8 @@ impl Child {
             kill_on_drop,
             tree: attachment.tree,
             stop,
+            #[cfg(windows)]
+            ctrl_proxy,
             #[cfg(windows)]
             console: attachment.console,
             elevation,
@@ -917,9 +923,9 @@ impl Child {
     ///
     /// **And success here does not prove the event was delivered.** A root that shares no
     /// console with the caller is reported as success and reaches nobody — including a root
-    /// spawned with [`no_window`](crate::Command::no_window) or
-    /// `detached()`, which gets a console of its own. Whether the spawn recorded the child as leading
-    /// its group on this process's console is
+    /// spawned with [`no_window`](crate::Command::no_window) (a console of its own) or
+    /// `detached()` (none). Whether the
+    /// spawn recorded the child as leading its group on this process's console is
     /// `StopTarget::leads_group_on_our_console`: what
     /// cosca recorded about the *route* from this process, never an authority on whether a signal will
     /// arrive. It is also not "this child cannot be shut down politely" — a process attached to the

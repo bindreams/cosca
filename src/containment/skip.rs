@@ -123,9 +123,8 @@ pub(crate) enum TerminateOutcome {
     },
     /// Nothing was sent: the call ends with this error.
     NotSent(Error),
-    /// Nothing was sent: the root has exited and the walk found no member, so its children were
-    /// reparented at its exit.
-    #[cfg_attr(not(unix), allow(dead_code, reason = "only a Unix walk finds its root exited"))]
+    /// Nothing was sent: the root has exited, so its children were reparented at its exit (Unix: the walk
+    /// found no member), or no event can be named to a member that outlived it (Windows).
     RootExited(Error),
     /// Nothing is sent by the root's number, and nothing else names the tree: the call ends now.
     End(Skip),
@@ -143,29 +142,74 @@ pub(crate) enum TerminateOutcome {
 }
 
 impl TerminateOutcome {
-    /// The outcome of a send that answered as `sent`: the outer `Err` is a send that did not go out
+    /// Unix: the outcome of a send that answered as `sent`: the outer `Err` is a send that did not go out
     /// ([`NotSent`](Self::NotSent)), the `Ok` what the check after the send found
     /// ([`Sent`](Self::Sent)).
+    #[cfg(unix)]
     pub(crate) fn of(sent: Result<Result<(), Error>, Error>, earlier: Option<String>) -> TerminateOutcome {
         match sent {
             Ok(result) => TerminateOutcome::Sent { result, earlier },
             Err(not_sent) => TerminateOutcome::NotSent(not_sent),
         }
     }
+
+    /// Windows: the outcome of the send a stop function made, as the tree route takes it.
+    #[cfg(windows)]
+    pub(crate) fn of_send(sent: SendOutcome, earlier: Option<String>) -> TerminateOutcome {
+        match sent {
+            SendOutcome::NotSent(not_sent) => TerminateOutcome::NotSent(not_sent),
+            SendOutcome::RootExited(exited) => TerminateOutcome::RootExited(exited),
+            SendOutcome::Sent(result) => TerminateOutcome::Sent { result, earlier },
+        }
+    }
+}
+
+/// Windows: what a prepared send of a stop function came to. It is the one statement of what the
+/// send hands the call that runs it: the record of the last send, and the route a tree target takes.
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) enum SendOutcome {
+    /// No event was sent, for this reason: a refusal, or a failure before the event was generated. A
+    /// root target records a refusal, and a tree call ends with the error.
+    NotSent(Error),
+    /// No event was sent because the child had exited when cosca looked, and the proxy names a console
+    /// by a process of it, so nothing is addressed to a member that outlived it. A root target answers
+    /// `Ok`, as the direct send answers an exited child. A tree call ends as for any exited root:
+    /// `terminate_tree` answers the error, and `graceful_shutdown_tree` goes on to its grace, sweep and
+    /// reap with no event sent.
+    RootExited(Error),
+    /// The event went out, or may have. The `Err` is an answer that cannot say the event arrived: a
+    /// root target records the send as made, and a tree call goes on to its grace and sweep with that
+    /// error as its cooperative error.
+    Sent(Result<(), Error>),
+}
+
+#[cfg(windows)]
+impl SendOutcome {
+    /// The outcome of a send whose every error says nothing was sent (the direct `CTRL_BREAK` to a group).
+    pub(crate) fn direct(sent: Result<(), Error>) -> SendOutcome {
+        match sent {
+            Ok(()) => SendOutcome::Sent(Ok(())),
+            Err(not_sent) => SendOutcome::NotSent(not_sent),
+        }
+    }
 }
 
 /// The cooperative stop a tree route carries out.
 ///
-/// Unix: the signal the route sends to every member it reaches. Windows: the `CTRL_BREAK` the stop
-/// function already sent to the root's console group, which the route takes with the rest of what it
-/// does (the outcome, the tree walk's listing).
+/// Unix: the signal the route sends to every member it reaches. Windows: the console event the stop
+/// function already sent (`CTRL_BREAK` to the root's console group, or `CTRL_BREAK` or `CTRL_C` through
+/// the proxy), which the route takes with the rest of what it does (the outcome, the tree walk's
+/// listing).
 #[derive(Debug)]
 #[cfg_attr(unix, derive(Clone, Copy))]
 pub(crate) struct TreeStop {
     #[cfg(unix)]
     signal: crate::signal::Signal,
     #[cfg(windows)]
-    sent: Result<(), Error>,
+    event: crate::stop::proxy::protocol::CtrlEvent,
+    #[cfg(windows)]
+    sent: SendOutcome,
 }
 
 #[cfg(unix)]
@@ -182,15 +226,15 @@ impl TreeStop {
         TreeStop { signal }
     }
 
-    /// The stop of a `CTRL_BREAK` whose send answered `sent`.
+    /// The stop of `event`, whose send came to `sent`.
     #[cfg(windows)]
-    pub(crate) fn of_break(sent: Result<(), Error>) -> TreeStop {
-        TreeStop { sent }
+    pub(crate) fn of_event(event: crate::stop::proxy::protocol::CtrlEvent, sent: SendOutcome) -> TreeStop {
+        TreeStop { event, sent }
     }
 
-    /// What the send the stop function made answered.
+    /// What the send the stop function made came to.
     #[cfg(windows)]
-    pub(crate) fn into_sent(self) -> Result<(), Error> {
+    pub(crate) fn into_sent(self) -> SendOutcome {
         self.sent
     }
 
@@ -205,12 +249,12 @@ impl TreeStop {
         crate::signal::Sig::Graceful(self.signal)
     }
 
-    /// The stop's name: "SIGTERM", "CTRL_BREAK".
+    /// The stop's name: "SIGTERM", "CTRL_BREAK", "CTRL_C".
     pub(crate) fn name(&self) -> &'static str {
         #[cfg(unix)]
         return self.signal.name();
         #[cfg(windows)]
-        CTRL_BREAK
+        self.event.name()
     }
 
     /// [`name`](Self::name) as a sentence fragment: "the SIGTERM".
@@ -218,10 +262,6 @@ impl TreeStop {
         earlier_of(self.name())
     }
 }
-
-/// What the Windows stop sends: its name, as [`TreeStop::name`] answers it.
-#[cfg(windows)]
-pub(crate) const CTRL_BREAK: &str = "CTRL_BREAK";
 
 /// A stop's `name` as a sentence fragment: "the SIGTERM". The one wording of what a sweep's error says
 /// was sent before it.

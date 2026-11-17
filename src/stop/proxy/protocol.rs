@@ -13,15 +13,31 @@ pub(crate) const VERSION: u32 = 1;
 /// What `argv[1]` of a proxy invocation starts with, whatever the version.
 const FLAG_PREFIX: &str = "--cosca-ctrl-proxy";
 
-/// The console control event a proxy sends.
+/// A console control event that can be sent to a child's console: Ctrl+C or Ctrl+Break.
+///
+/// What [`stop::send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy) sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CtrlEvent {
+pub enum CtrlEvent {
+    /// `CTRL_C_EVENT`.
     CtrlC,
+    /// `CTRL_BREAK_EVENT`.
     CtrlBreak,
 }
 
 impl CtrlEvent {
-    #[allow(dead_code, reason = "used by the caller side, not yet written")]
+    /// The event's Win32 name, as an error or a log says what was sent: "CTRL_C", "CTRL_BREAK".
+    #[cfg_attr(not(windows), allow(dead_code, reason = "only a Windows stop names its event"))]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            CtrlEvent::CtrlC => "CTRL_C",
+            CtrlEvent::CtrlBreak => "CTRL_BREAK",
+        }
+    }
+
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only the Windows caller side starts a proxy")
+    )]
     fn token(self) -> &'static str {
         match self {
             CtrlEvent::CtrlC => "c",
@@ -83,7 +99,10 @@ impl ProxyArgsError {
 impl ProxyArgs {
     /// The full argv, `argv[0]` included: `[exe, "--cosca-ctrl-proxy=1", target, target_key, "c" |
     /// "break", caller]`.
-    #[allow(dead_code, reason = "used by the caller side, not yet written")]
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only the Windows caller side starts a proxy")
+    )]
     pub(crate) fn to_argv(self, exe: &OsStr) -> Vec<OsString> {
         vec![
             exe.to_owned(),
@@ -172,7 +191,10 @@ impl ProxyAnswer {
         self as i32
     }
 
-    #[allow(dead_code, reason = "used by the caller side, not yet written")]
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only the Windows caller side reads a proxy's answer")
+    )]
     pub(crate) fn from_code(code: i32) -> Option<ProxyAnswer> {
         [
             ProxyAnswer::Sent,

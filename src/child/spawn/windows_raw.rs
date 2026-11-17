@@ -235,6 +235,7 @@ pub(crate) fn spawn_raw(
         cmd.elevation_report().cloned(),
         policy,
         cmd.stop_action(),
+        cmd.ctrl_proxy_setting(),
     ))
 }
 

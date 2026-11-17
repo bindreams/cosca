@@ -210,6 +210,15 @@ impl Wording {
 /// unbounded wait run.
 pub(super) fn wait_to_exit(proc: &OwnedChild, due: Option<Due>) -> Result<ChildWaitOutcome, Error> {
     let pid = proc.pid();
+    wait_to_exit_saying(proc, due, |after| crate::child::spawn::warn_still_waiting(pid, after))
+}
+
+/// [`wait_to_exit`] that says `warn` where it warns, for a wait that is not a teardown's.
+fn wait_to_exit_saying(
+    proc: &OwnedChild,
+    due: Option<Due>,
+    warn: impl FnOnce(Duration),
+) -> Result<ChildWaitOutcome, Error> {
     // The state carries the bounded wait's answer to `wait` when it is the result.
     let answer = wait_warning(
         (proc, None),
@@ -222,7 +231,7 @@ pub(super) fn wait_to_exit(proc: &OwnedChild, due: Option<Due>) -> Result<ChildW
             }
             ended
         },
-        |after| crate::child::spawn::warn_still_waiting(pid, after),
+        warn,
         |(proc, answer)| answer.unwrap_or_else(|| proc.wait(None)),
     );
     debug_assert!(
@@ -330,6 +339,14 @@ impl Child {
     /// zombie launchd holds is warned of, a root reaped elsewhere is `ECHILD`.
     pub(crate) fn status_of_reap(&self, outcome: ChildWaitOutcome) -> Result<ExitStatus, Error> {
         unbounded_status(self.proc.pid(), outcome, Orphaned::Warn)
+    }
+
+    /// [`wait`](Child::wait), which calls `warn` once, with the threshold, if the wait is still going
+    /// `after` into it, and goes on waiting (no cap).
+    #[cfg(windows)]
+    pub(crate) fn wait_saying(&self, after: Duration, warn: impl FnOnce(Duration)) -> Result<ExitStatus, Error> {
+        let outcome = wait_to_exit_saying(&self.proc, Due::in_(Some(after)), warn)?;
+        self.status_of_reap(outcome)
     }
 
     /// One wait on the root through its handle, until `deadline` (`None`: for ever). `Ok(None)` is

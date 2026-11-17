@@ -998,6 +998,8 @@ fn spawn_reported(
         elevation,
         policy,
         cmd.stop_action(),
+        #[cfg(windows)]
+        cmd.ctrl_proxy_setting(),
     ))
 }
 

@@ -1312,29 +1312,24 @@ pub(crate) mod fault {
 /// ([`Walk::unassessed`]), nor a member whose signal was not sent: they are warned of and not
 /// signalled, and the result is still `Ok`.
 ///
-/// Windows: sends nothing, and walks nothing. The caller's stop function has already sent
-/// `CTRL_BREAK_EVENT` to the root's process group, and `how` carries the answer of that send,
-/// which is this function's. The event is cooperative only and reaches only processes that share the
-/// root's console group; a nested *contained* descendant spawned with its own process group does NOT
-/// receive it. THIS WALK cannot reach those nested groups — but their own holder can, through the
-/// nested child's own handle (see [`Child::terminate`](crate::Child::terminate)). From a single handle, the
-/// identity `hard_kill` (`kill_tree`) remains the only op that reaches every member.
+/// Not on Windows, where the caller's stop function sends the event and [`terminate_tree`] takes its
+/// answer from `how`: the walk lists no member there.
+///
 /// Best-effort by design.
 ///
 /// # Errors
 ///
-/// As [`hard_kill`] on Unix. Windows: the answer of the caller's own send of the `CTRL_BREAK`, which the
-/// stop carries.
+/// As [`hard_kill`].
 ///
-/// On Unix the root's signal goes through [`Root::signal`] of `held`, as [`hard_kill`]'s kill does;
-/// Windows sends nothing.
+/// The root's signal goes through [`Root::signal`] of `held`, as [`hard_kill`]'s kill does.
 ///
-/// The members it found, the root apart, are its [`Listing`] (none on Windows): once the root exits
+/// The members it found, the root apart, are its [`Listing`]: once the root exits
 /// they are reparented out of every later walk, so a later kill can reach them only by these
 /// identities. A root whose exit has begun, reaped or not, and whose walk finds no member sends
 /// nothing ([`Terminated::RootExited`], see the module doc); one whose walk finds members signals
 /// them, and its [`Listing`] is not complete. So is the listing of a walk whose members were signalled
 /// though the flag could not be read; with no member found, that error is the walk's.
+#[cfg(not(windows))]
 pub(crate) fn terminate(
     kernel: &dyn Kernel,
     root: ProcessId,
@@ -1385,18 +1380,7 @@ pub(crate) fn terminate(
             members: walk.members,
         }))
     }
-    #[cfg(windows)]
-    {
-        let _ = (kernel, root, held);
-        // The `CTRL_BREAK` is the caller's stop function's send: the walk lists no member.
-        how.into_sent().map(|()| {
-            Terminated::Walked(Listing {
-                members: Vec::new(),
-                complete: true,
-            })
-        })
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         let _ = (kernel, root, held, how);
         Ok(Terminated::Walked(Listing {
@@ -1416,14 +1400,14 @@ pub(crate) struct Listing {
 }
 
 /// What [`terminate`]'s walk did, once the process table was read (an unreadable table is its `Err`).
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "Windows sends no walk: terminate_tree takes the stop's send")
+)]
 pub(crate) enum Terminated {
     /// The signals went out to the root and to the members of the listing.
     Walked(Listing),
     /// Nothing was sent: the root has exited and the walk found no member.
-    #[cfg_attr(
-        windows,
-        allow(dead_code, reason = "Windows never reparents, so an exited root's walk stands")
-    )]
     RootExited(Error),
 }
 
@@ -1500,10 +1484,23 @@ pub(crate) fn terminate_tree(
     match skipped_walk(owner) {
         Some(skip) => (TerminateOutcome::End(skip), None),
         None => {
-            // `NotSent` is an error that comes before the first signal: the process table could not be
-            // read or the walk made (Unix), or the break could not be sent (Windows). A failed signal to
-            // the root or a member is only warned of, so it is `Sent { Ok }`.
             let earlier = how.earlier();
+            // Windows: the event is the caller's stop function's send, which the walk neither makes nor
+            // lists a member for.
+            #[cfg(windows)]
+            {
+                let _ = (kernel, root, owner);
+                let outcome = TerminateOutcome::of_send(how.into_sent(), Some(earlier));
+                let listing = matches!(outcome, TerminateOutcome::Sent { .. }).then(|| Listing {
+                    members: Vec::new(),
+                    complete: true,
+                });
+                (outcome, listing)
+            }
+            // `NotSent` is an error that comes before the first signal: the process table could not be
+            // read or the walk made. A failed signal to the root or a member is only warned of, so it
+            // is `Sent { Ok }`.
+            #[cfg(not(windows))]
             match terminate(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root)), how) {
                 Ok(Terminated::Walked(listing)) => (
                     TerminateOutcome::Sent {

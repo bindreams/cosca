@@ -124,14 +124,12 @@ impl<'a> StopTarget<'a> {
         self.scope
     }
 
-    /// Leaves a send to the root that answered `sent` as what the last send did: the stop it sent
-    /// (`name`), or the refusal.
-    pub(crate) fn note_root_send(&self, name: &'static str, sent: &Result<(), Error>) {
+    /// Leaves a send of the stop `name` to the root that went out, or may have, as what the last send
+    /// did, whatever it answered: an answer that is an error but cannot say the stop did not arrive
+    /// is not a refusal.
+    pub(crate) fn note_root_went_out(&self, name: &'static str) {
         debug_assert!(!self.covers_tree(), "a tree target records its sends as tree records");
-        *lock(&self.root_record) = Some(match sent {
-            Ok(()) => RootRecord::Sent(name),
-            Err(refusal) => RootRecord::Refused(crate::error::Report(refusal).to_string()),
-        });
+        *lock(&self.root_record) = Some(RootRecord::Sent(name));
     }
 
     /// Leaves a send that was refused (a rule's refusal, or an early refusal of a prepared function) as
@@ -192,6 +190,12 @@ impl<'a> StopTarget<'a> {
         self.child.proc.exited_by(crate::wait::deadline_from(grace))
     }
 
+    /// Windows: which program a send through the proxy starts, as the child's command set it.
+    #[cfg(windows)]
+    pub(crate) fn ctrl_proxy(&self) -> &crate::stop::proxy::CtrlProxy {
+        &self.child.ctrl_proxy
+    }
+
     /// Windows: whether the spawn recorded that a console event addressed to the child's process
     /// group is delivered from this process: the child was created with the group flag and none of
     /// `DETACHED_PROCESS`, `CREATE_NEW_CONSOLE` and `CREATE_NO_WINDOW`, and this process had a console
@@ -223,6 +227,7 @@ impl<'a> StopTarget<'a> {
             TreeCall::Shutdown(token) => Some(token),
         };
         // What the answers read of the stop is taken before the route consumes it.
+        let name = how.name();
         #[cfg(unix)]
         let sig = how.sig();
         let (outcome, walk) = child.tree.terminate(child.pid(), root, token, how);
@@ -235,6 +240,7 @@ impl<'a> StopTarget<'a> {
             TreeCall::Shutdown(_) => self.shutdown_answer(
                 outcome,
                 walk,
+                name,
                 #[cfg(unix)]
                 sig,
             ),
@@ -247,9 +253,7 @@ impl<'a> StopTarget<'a> {
     fn signal_only_answer(&self, outcome: TerminateOutcome, #[cfg(unix)] sig: Sig) -> Result<(), Error> {
         match outcome {
             TerminateOutcome::Sent { result, .. } => result,
-            TerminateOutcome::NotSent(not_sent) => Err(not_sent),
-            #[cfg(unix)]
-            TerminateOutcome::RootExited(not_sent) => Err(not_sent),
+            TerminateOutcome::NotSent(not_sent) | TerminateOutcome::RootExited(not_sent) => Err(not_sent),
             // A signal settles nothing, so nothing is killed again and nothing waited for.
             #[cfg(unix)]
             TerminateOutcome::End(skip) | TerminateOutcome::HoldersOnly(skip) => {
@@ -263,11 +267,8 @@ impl<'a> StopTarget<'a> {
                 call.answer(&self.child.tree, skip, Some(sent)).answer
             }
             #[cfg(not(unix))]
-            TerminateOutcome::RootExited(_)
-            | TerminateOutcome::End(_)
-            | TerminateOutcome::HoldersOnly(_)
-            | TerminateOutcome::RootThroughPidfd(_) => {
-                unreachable!("only a Unix mechanism skips by the root's number or finds its root exited")
+            TerminateOutcome::End(_) | TerminateOutcome::HoldersOnly(_) | TerminateOutcome::RootThroughPidfd(_) => {
+                unreachable!("only a Unix mechanism skips by the root's number")
             }
         }
     }
@@ -278,6 +279,7 @@ impl<'a> StopTarget<'a> {
         &self,
         outcome: TerminateOutcome,
         walk: Option<WalkToken>,
+        name: &str,
         #[cfg(unix)] sig: Sig,
     ) -> Result<(), Error> {
         match outcome {
@@ -289,10 +291,9 @@ impl<'a> StopTarget<'a> {
                 self.note_tree(TreeRecord::not_sent(&not_sent));
                 Err(not_sent)
             }
-            #[cfg(unix)]
             TerminateOutcome::RootExited(exited) => {
                 log::debug!(
-                    "graceful_shutdown_tree({}): sent no {sig}: {report}",
+                    "graceful_shutdown_tree({}): sent no {name}: {report}",
                     self.child.pid(),
                     report = crate::error::Report(&exited)
                 );
@@ -346,11 +347,8 @@ impl<'a> StopTarget<'a> {
                 Ok(())
             }
             #[cfg(not(unix))]
-            TerminateOutcome::RootExited(_)
-            | TerminateOutcome::End(_)
-            | TerminateOutcome::RootThroughPidfd(_)
-            | TerminateOutcome::HoldersOnly(_) => {
-                unreachable!("only a Unix mechanism skips by the root's number or finds its root exited")
+            TerminateOutcome::End(_) | TerminateOutcome::RootThroughPidfd(_) | TerminateOutcome::HoldersOnly(_) => {
+                unreachable!("only a Unix mechanism skips by the root's number")
             }
         }
     }

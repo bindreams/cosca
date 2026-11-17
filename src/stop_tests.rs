@@ -778,6 +778,12 @@ fn a_prepared_send_on_a_child_without_the_group_flag_is_unsupported() {
             panic!("{err:?}");
         };
         assert!(detail.contains("contain"), "the refusal names the remedy: {detail}");
+        assert!(
+            detail.contains("kill()"),
+            "the refusal names the other remedy: {detail}"
+        );
+        // A lost line continuation in the source leaves a run of spaces.
+        assert!(!detail.contains("  "), "a run of spaces: {detail:?}");
     }
     assert_nothing_was_sent(&child, stdin);
 }
@@ -799,5 +805,7 @@ fn a_prepared_send_refuses_a_child_cosca_did_not_create() {
     };
     assert!(detail.contains("did not create this child"), "{detail}");
     assert!(detail.contains("kill()"), "the refusal names the remedy: {detail}");
+    // A lost line continuation in the source leaves a run of spaces.
+    assert!(!detail.contains("  "), "a run of spaces: {detail:?}");
     crate::test_child::ctrl_break::assert_no_break_sent();
 }

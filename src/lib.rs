@@ -184,6 +184,17 @@
 //! that names its pid and `exec` version, so the kernel never signals a process that took a reused
 //! pid. Earlier versions are unsupported, with no fallback.
 //!
+//! # A console event to a Windows child: the proxy
+//!
+//! A Windows process can send a console event (Ctrl+C, Ctrl+Break) only to the console it is attached
+//! to. `stop::send_console_event_via_proxy` (Windows) reaches a child on another console, or from a
+//! caller with none (a service), through a helper process, the proxy, that has no console of its own.
+//! The proxy is a role of the host program: call [`init`] first thing in `main`, and the default
+//! (`CtrlProxy::HostExecutable`) starts the file at the host's path, when the stop runs, as the proxy.
+//! A host that cannot call `init`, or that replaces its own image while it runs, installs the
+//! `cosca-ctrl-proxy` executable (`cargo install cosca --bin cosca-ctrl-proxy`) and names it with
+//! `Command::ctrl_proxy`. A host that did neither is refused, with nothing started.
+//!
 //! # A child under a debugger
 //!
 //! A debugger that traces a [`Child`] owns its signal delivery: a graceful signal, such as the
@@ -229,6 +240,10 @@ pub use elevation::{Auth, Backend, ElevatedStdio, ElevatedVia, ElevationReport, 
 #[cfg(unix)]
 pub use signal::Signal;
 pub use stdio::{Fd, Stdio};
+#[cfg(windows)]
+pub use stop::proxy::protocol::CtrlEvent;
+#[cfg(windows)]
+pub use stop::proxy::CtrlProxy;
 pub use stop::StopTarget;
 
 mod init;
@@ -391,6 +406,11 @@ pub fn run_line(line: impl Into<std::ffi::OsString>) -> Command {
 #[cfg(all(test, unix))]
 #[path = "../testbin/shim_hooks.rs"]
 mod shim_env_hooks;
+
+/// The stand-in for the console-event proxy, which the caller side's tests name and read.
+#[cfg(all(test, windows))]
+#[path = "../testbin/proxy_fixture.rs"]
+mod proxy_fixture;
 
 #[cfg(test)]
 fn main() {

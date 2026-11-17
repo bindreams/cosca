@@ -34,6 +34,8 @@ pub(crate) fn child_over(fake: &FakeProcess) -> Child {
         None,
         SpawnPolicy::SYNC,
         stop_over_a_fake(),
+        #[cfg(windows)]
+        Default::default(),
     )
 }
 
@@ -47,7 +49,13 @@ fn stop_over_a_fake() -> crate::stop::StopAction {
     #[cfg(windows)]
     return crate::stop::StopAction::Sync(std::sync::Arc::new(|target| match target.scope() {
         crate::stop::Scope::Root => Ok(()),
-        crate::stop::Scope::Tree(call) => target.send_tree(call, crate::containment::TreeStop::of_break(Ok(()))),
+        crate::stop::Scope::Tree(call) => target.send_tree(
+            call,
+            crate::containment::TreeStop::of_event(
+                crate::stop::proxy::protocol::CtrlEvent::CtrlBreak,
+                crate::containment::SendOutcome::Sent(Ok(())),
+            ),
+        ),
     }));
 }
 

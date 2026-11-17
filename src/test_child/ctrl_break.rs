@@ -14,7 +14,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use super::{accept_or_die, ack, fixture_argv, Console, IDENTITY_READ};
-use crate::stop::proxy::protocol::CtrlEvent;
+use crate::containment::windows::observe::CtrlSend;
+use crate::stop::proxy::protocol::{CtrlEvent, ProxyAnswer};
 
 pub(crate) mod console_less;
 pub(crate) mod nested;
@@ -365,19 +366,29 @@ pub(crate) async fn spawn_member_async(
 /// Assert that the call under test sent exactly one `CTRL_BREAK`, to the group led by `group`.
 pub(crate) fn assert_break_sent_to(group: u32) {
     assert_eq!(
-        crate::containment::windows::observe::take_ctrl_breaks(),
-        [group],
+        crate::containment::windows::observe::take_ctrl_sends(),
+        [CtrlSend::Direct { group }],
         "the call must send one CTRL_BREAK, to the group led by {group}"
     );
 }
 
-/// Assert that no `CTRL_BREAK` was sent since the last read of the sender's record. This, and not
-/// a target's silence, is what shows an op sent nothing.
+/// Assert that the call under test asked the proxy to send `event` to the console of `target`, and
+/// that the proxy answered `answer`, and nothing else was sent.
+pub(crate) fn assert_proxy_answered(target: u32, event: CtrlEvent, answer: ProxyAnswer) {
+    assert_eq!(
+        crate::containment::windows::observe::take_ctrl_sends(),
+        [CtrlSend::Proxy { target, event, answer }],
+        "the call must record one answer of the proxy, for {event:?} to {target}"
+    );
+}
+
+/// Assert that no console event was sent since the last read of the sender's record, directly or
+/// through the proxy. This, and not a target's silence, is what shows an op sent nothing.
 pub(crate) fn assert_no_break_sent() {
     assert_eq!(
-        crate::containment::windows::observe::take_ctrl_breaks(),
-        Vec::<u32>::new(),
-        "the call must send no CTRL_BREAK"
+        crate::containment::windows::observe::take_ctrl_sends(),
+        Vec::<CtrlSend>::new(),
+        "the call must send no console event"
     );
 }
 
