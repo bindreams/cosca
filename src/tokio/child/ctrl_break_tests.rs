@@ -37,7 +37,7 @@ async fn spawn(
     mode: crate::ContainMode,
     configure: impl FnOnce(&mut crate::tokio::Command),
 ) -> (crate::tokio::Child, TcpStream, Option<Grandchild>) {
-    ctrl_break::spawn_member_async(handler, grandchild, mode, configure).await
+    ctrl_break::spawn_member_async(handler, grandchild, Some(mode), configure).await
 }
 
 #[skuld::test]
@@ -55,6 +55,23 @@ async fn async_child_terminate_delivers_ctrl_break_to_a_contained_root() {
         crate::identity::Liveness::Alive,
         "the root handles the break and keeps running"
     );
+    kill_release_reap_async(&mut child, sock, false).await;
+}
+
+/// Async twin of the sync `an_uncontained_child_given_a_group_is_stopped_directly`: the setter on the
+/// tokio `Command` reaches the child. Mutants: the tokio setter dropping the request (the call is
+/// refused, not sent); the break sent to another group.
+#[skuld::test]
+async fn an_async_uncontained_child_given_a_group_is_stopped_directly() {
+    crate::tokio::test_runtime::assert_current_thread();
+    let (mut child, mut sock, _) =
+        ctrl_break::spawn_member_async(Handler::Ack, None, None, |cmd| _ = cmd.new_process_group(true)).await;
+    assert_eq!(child.containment(), Containment::None);
+    assert!(StopTarget::from(&child.inner).leads_group_on_our_console());
+    assert_in_our_console(child.pid(), "the child");
+    child.terminate().expect("terminate a child created in a group");
+    ctrl_break::assert_break_sent_to(child.pid());
+    assert_acked(&mut sock, "the child");
     kill_release_reap_async(&mut child, sock, false).await;
 }
 

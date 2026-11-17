@@ -1313,13 +1313,11 @@ pub(crate) mod fault {
 /// signalled, and the result is still `Ok`.
 ///
 /// Windows: sends nothing, and walks nothing. The caller's stop function has already sent
-/// `CTRL_BREAK_EVENT` to the root's process group (the root was spawned with
-/// `CREATE_NEW_PROCESS_GROUP`), and `how` carries the answer of that send, which is this
-/// function's. The event is cooperative only and reaches only processes that share the root's
-/// console group; a nested *contained* descendant is spawned into its OWN process group
-/// (`CREATE_NEW_PROCESS_GROUP`) and therefore does NOT receive it. THIS WALK cannot reach those
-/// nested groups — but their own holder can, through the nested child's own handle
-/// (see [`Child::terminate`](crate::Child::terminate)). From a single handle, the
+/// `CTRL_BREAK_EVENT` to the root's process group, and `how` carries the answer of that send,
+/// which is this function's. The event is cooperative only and reaches only processes that share the
+/// root's console group; a nested *contained* descendant spawned with its own process group does NOT
+/// receive it. THIS WALK cannot reach those nested groups — but their own holder can, through the
+/// nested child's own handle (see [`Child::terminate`](crate::Child::terminate)). From a single handle, the
 /// identity `hard_kill` (`kill_tree`) remains the only op that reaches every member.
 /// Best-effort by design.
 ///

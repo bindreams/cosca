@@ -1877,8 +1877,24 @@ fn a_different_failure_code_stays_io_whatever_the_probe_says() {
 // group flag there is nothing to address, whatever the console situation. The probe's answer is the
 // caller's: it passes through whatever the word says.
 mod console_facts_tests {
-    use crate::containment::windows::{group_flags, root_flags, ConsoleFacts};
+    use crate::command::flags::flags_tests::{contained, uncontained, word};
+    use crate::command::flags::{FlagsRequest, SpawnBackend};
+    use crate::containment::windows::ConsoleFacts;
     use windows::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, DETACHED_PROCESS};
+
+    /// The word of an uncontained spawn asked for a group: the group bit alone.
+    fn group_flags() -> u32 {
+        let group = FlagsRequest {
+            process_group: Some(true),
+            ..Default::default()
+        };
+        word(&uncontained(), group, false, SpawnBackend::Std)
+    }
+
+    /// The word of a contained root: the group bit and the suspend.
+    fn root_flags() -> u32 {
+        word(&contained(), FlagsRequest::default(), true, SpawnBackend::Std)
+    }
 
     fn facts(word: u32) -> (bool, bool) {
         let facts = ConsoleFacts::of(word, true);

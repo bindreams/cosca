@@ -71,12 +71,26 @@ enum Intent {
     None,
     NoWindow,
     Detached,
+    /// `new_process_group(true)` on an uncontained spawn.
+    Group,
+    /// `contain()` with `new_process_group(false)`.
+    ContainedWithoutGroup,
 }
 
 #[cfg(windows)]
-/// Spawn a `report-console-identity` child through `backend`, read its report, tear it down, and
-/// return the report line.
-fn probe(backend: Backend, intent: Intent) -> String {
+/// What a probe saw: the child's own report, and what `terminate()` answered once the report was in.
+/// The answer is what the child's RECORDED console facts decide: `Ok` when they say it leads a group
+/// (the break was sent to it), `Unsupported` when they say it leads none. It is not evidence of the
+/// flag the OS got.
+struct Probed {
+    report: String,
+    terminate: Result<(), cosca::error::Error>,
+}
+
+#[cfg(windows)]
+/// Spawn a `report-console-identity` child through `backend`, read its report, `terminate()` it, tear
+/// it down, and return what was seen.
+fn probe(backend: Backend, intent: Intent) -> Probed {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind report listener");
     let addr = listener.local_addr().unwrap().to_string();
     let me = std::process::id().to_string();
@@ -101,15 +115,22 @@ fn probe(backend: Backend, intent: Intent) -> String {
                 Intent::Detached => {
                     cmd.detached();
                 }
+                Intent::Group => {
+                    cmd.new_process_group(true);
+                }
+                Intent::ContainedWithoutGroup => {
+                    cmd.contain().new_process_group(false);
+                }
             }
             cmd.env(common::ACK_ENV, "1");
             let mut child = cmd.spawn().expect("spawn creation-flag probe child");
             let sock = common::accept_or_die(&listener, &mut child);
             let report = read_report_line(&sock);
+            let terminate = child.terminate();
             drop(sock);
             let _ = child.kill();
             child.wait().expect("reap creation-flag probe child");
-            report
+            Probed { report, terminate }
         }
         #[cfg(feature = "tokio")]
         Backend::AsyncArgv | Backend::AsyncExecutable => {
@@ -135,15 +156,22 @@ fn probe(backend: Backend, intent: Intent) -> String {
                     Intent::Detached => {
                         cmd.detached();
                     }
+                    Intent::Group => {
+                        cmd.new_process_group(true);
+                    }
+                    Intent::ContainedWithoutGroup => {
+                        cmd.contain().new_process_group(false);
+                    }
                 }
                 cmd.env(common::ACK_ENV, "1");
                 let mut child = cmd.spawn().await.expect("spawn async creation-flag probe child");
                 let sock = common::accept_or_die_async(&listener, &mut child).await;
                 let report = read_report_line(&sock);
+                let terminate = child.terminate();
                 drop(sock);
                 let _ = child.kill();
                 child.wait().await.expect("reap async creation-flag probe child");
-                report
+                Probed { report, terminate }
             })
         }
     }
@@ -166,7 +194,7 @@ fn assert_backend(backend: Backend, report: &str) {
 
 #[cfg(windows)]
 fn assert_no_window(backend: Backend) {
-    let report = probe(backend, Intent::NoWindow);
+    let report = probe(backend, Intent::NoWindow).report;
     assert_eq!(
         report_field(&report, "console"),
         "1",
@@ -182,7 +210,7 @@ fn assert_no_window(backend: Backend) {
 
 #[cfg(windows)]
 fn assert_detached(backend: Backend) {
-    let report = probe(backend, Intent::Detached);
+    let report = probe(backend, Intent::Detached).report;
     // A MEASURED absence, so a broken probe reports `?` and fails rather than passing.
     assert_eq!(
         report_field(&report, "console"),
@@ -193,8 +221,33 @@ fn assert_detached(backend: Backend) {
 }
 
 #[cfg(windows)]
+/// `new_process_group(true)` reaches the child's recorded console facts through `backend`: they say it
+/// leads a group, so `terminate()` sends the break to it. Without the request an uncontained child's
+/// facts say none and the same call is refused.
+fn assert_group(backend: Backend) {
+    let probed = probe(backend, Intent::Group);
+    probed.terminate.unwrap_or_else(|e| {
+        panic!("{backend:?} recorded no process group for a child given new_process_group(true): {e:?}")
+    });
+    assert_backend(backend, &probed.report);
+}
+
+#[cfg(windows)]
+/// `new_process_group(false)` reaches the child's recorded console facts through `backend` on a
+/// contained spawn, which leads a group by default: they say none, so `terminate()` is refused with
+/// the setter named.
+fn assert_no_group(backend: Backend) {
+    let probed = probe(backend, Intent::ContainedWithoutGroup);
+    let err = probed
+        .terminate
+        .expect_err("a contained child told to lead no group must be refused the group break");
+    common::assert_refused_for_no_group(&err);
+    assert_backend(backend, &probed.report);
+}
+
+#[cfg(windows)]
 fn assert_plain_control(backend: Backend) {
-    let report = probe(backend, Intent::None);
+    let report = probe(backend, Intent::None).report;
     assert_eq!(
         report_field(&report, "sees_caller"),
         "1",
@@ -253,6 +306,58 @@ fn detached_reaches_the_child_via_async_argv() {
 #[skuld::test]
 fn detached_reaches_the_child_via_async_executable() {
     assert_detached(Backend::AsyncExecutable);
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_child_given_a_process_group_is_sent_the_break_via_sync_argv() {
+    assert_group(Backend::SyncArgv);
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_child_given_a_process_group_is_sent_the_break_via_sync_executable() {
+    assert_group(Backend::SyncExecutable);
+}
+
+#[cfg(windows)]
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn a_child_given_a_process_group_is_sent_the_break_via_async_argv() {
+    assert_group(Backend::AsyncArgv);
+}
+
+#[cfg(windows)]
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn a_child_given_a_process_group_is_sent_the_break_via_async_executable() {
+    assert_group(Backend::AsyncExecutable);
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_contained_child_without_a_process_group_is_refused_the_break_via_sync_argv() {
+    assert_no_group(Backend::SyncArgv);
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_contained_child_without_a_process_group_is_refused_the_break_via_sync_executable() {
+    assert_no_group(Backend::SyncExecutable);
+}
+
+#[cfg(windows)]
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn a_contained_child_without_a_process_group_is_refused_the_break_via_async_argv() {
+    assert_no_group(Backend::AsyncArgv);
+}
+
+#[cfg(windows)]
+#[cfg(feature = "tokio")]
+#[skuld::test]
+fn a_contained_child_without_a_process_group_is_refused_the_break_via_async_executable() {
+    assert_no_group(Backend::AsyncExecutable);
 }
 
 #[cfg(windows)]

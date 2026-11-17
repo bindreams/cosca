@@ -21,15 +21,16 @@ impl Child {
     /// root alone: the sync [`Child::terminate`](crate::Child::terminate) with the same default. On Unix it
     /// is an identity-bound `SIGTERM` to this process alone, so it cannot race a concurrent reap onto a
     /// recycled pid.
-    /// On Windows it is `CTRL_BREAK` to the child's own **console process group** — every child
-    /// spawned with [`contain`](crate::tokio::Command::contain), including a nested
-    /// [`Delegated`](crate::Containment::Delegated) one. A child that leads no group of its own
-    /// (an uncontained Windows spawn) is refused with `Unsupported`; `kill` is the
-    /// always-available alternative.
+    /// On Windows it is `CTRL_BREAK` to the child's own **console process group**, which a child
+    /// spawned with [`contain`](crate::tokio::Command::contain) leads by default (a nested
+    /// [`Delegated`](crate::Containment::Delegated) one too) and an uncontained child leads only if
+    /// `new_process_group(true)` asked for it. A child that leads no group of its own (an uncontained
+    /// spawn by default, or one given `new_process_group(false)`) is refused with `Unsupported`; `kill`
+    /// is the always-available alternative.
     ///
     /// **Windows blast radius.** The event reaches the child's whole console group, so an
     /// ordinary descendant that stayed in that group is signalled too, while a nested
-    /// *contained* descendant — which leads a group of its own — is not.
+    /// *contained* descendant — which by default leads a group of its own — is not.
     ///
     /// **The caller must hold a console** ([`Error::NoConsole`](crate::error::Error::NoConsole)
     /// otherwise: a GUI-subsystem binary, a service, or a detached spawn cannot deliver console
@@ -58,7 +59,7 @@ impl Child {
     /// pid alone. This handle pins the child's pid for its whole life, as the sync
     /// [`Child`](crate::Child) does, so the call answers `Ok` before and after the exit has been
     /// observed, and never reaches a reissued pid. A mechanism that addresses no pid keeps its
-    /// own answer: an uncontained Windows child is `Unsupported` before and after the reap alike,
+    /// own answer: a Windows child that leads no group is `Unsupported` before and after the reap alike,
     /// because nothing was ever going to be sent to a pid in the first place.
     ///
     /// **A macOS graphically-elevated child** is refused, as for the sync
@@ -151,8 +152,8 @@ impl Child {
     /// afterward regardless of what it saw.
     ///
     /// **Windows: what this actually signals, and what the grace costs.** `CTRL_BREAK` goes
-    /// to the root's **process group** only. A nested contained descendant leads its own
-    /// group and never receives it — so it does not exit during the grace, idles through the
+    /// to the root's **process group** only. A nested contained descendant that leads its own
+    /// group never receives it — so it does not exit during the grace, idles through the
     /// whole window, and is then killed by the sweep (a job object *is* drain-observable, so
     /// this shows up as `grace` fully elapsing rather than draining early, not as a skipped
     /// wait). The call reports no error either way: on Windows the grace is spent regardless
@@ -163,6 +164,10 @@ impl Child {
     /// [`graceful_shutdown`](Child::graceful_shutdown) before this root is torn down, and a
     /// chain in which each level shuts down its own children drains completely, because a
     /// child that owns a console can politely signal its own group-leading children.
+    ///
+    /// **A root created with `new_process_group(false)` is refused.** The default action returns
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported): nothing is sent, nothing is waited for,
+    /// nothing is killed, and the tree keeps running. [`kill_tree`](Child::kill_tree) ends it.
     ///
     /// **And success here does not prove the event was delivered.** A root that shares no
     /// console with the caller is reported as success and reaches nobody — including a root

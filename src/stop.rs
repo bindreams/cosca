@@ -104,7 +104,7 @@ pub fn send_signal(target: &StopTarget<'_>, signal: crate::Signal) -> Result<(),
 /// Windows: sends `CTRL_BREAK` to the child's console process group from this process, and does not wait.
 ///
 /// The event reaches every process in the group, so a descendant that stayed in the group is told to stop
-/// too, and a nested contained descendant, which leads a group of its own, is not. Windows reports
+/// too, and a nested contained descendant, which by default leads a group of its own, is not. Windows reports
 /// success for an event aimed at a group in another console and delivers nothing, and this process
 /// cannot rule that case out: a child created with `no_window`, or `detached`, has a console of its own,
 /// and the send answers `Ok` and reaches nobody. Each call also leaves a dead entry in the caller's
@@ -119,7 +119,8 @@ pub fn send_signal(target: &StopTarget<'_>, signal: crate::Signal) -> Result<(),
 ///
 /// # Errors
 ///
-/// [`Error::Unsupported`] for a child created without the process-group flag, which can be sent no
+/// [`Error::Unsupported`] for a child created without the process-group flag (set it with
+/// [`Command::new_process_group`](crate::Command::new_process_group)), which can be sent no
 /// console event alone, and for a child a system service created on a UAC consent (cosca cannot know
 /// whether it leads a group of its own); [`Error::NoConsole`] as above.
 #[cfg(windows)]
@@ -137,8 +138,8 @@ pub fn send_ctrl_break_to_group(target: &StopTarget<'_>) -> Result<(), Error> {
         Some(
             "this child leads no console process group of its own, so no console control \
              event can be addressed to it by any process; group leadership is fixed at \
-             creation. Spawn it with contain() to give it one, or use kill() for a hard \
-             teardown.",
+             creation. Spawn it with Command::new_process_group(true) (contain() sets it \
+             unless told otherwise) to give it one, or use kill() for a hard teardown.",
         )
     } else {
         None

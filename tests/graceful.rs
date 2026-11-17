@@ -127,9 +127,9 @@ fn process_soft_tree_unsupported_on_windows() {
 
 // The recorded console route =====
 
-/// On Windows the two must DISAGREE: containment is what sets `CREATE_NEW_PROCESS_GROUP`, so an
-/// uncontained child leads no group while a contained one does, on our console. A hardcoded return
-/// value fails one of the two.
+/// On Windows the two must DISAGREE: the group is the spawn's recorded fact, and by default only a
+/// contained spawn leads one, so an uncontained child leads none while a contained one does, on our
+/// console. A hardcoded return value fails one of the two.
 #[cfg(windows)]
 #[skuld::test]
 fn the_recorded_route_distinguishes_contained_from_uncontained_on_windows() {

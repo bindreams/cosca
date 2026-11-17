@@ -13,21 +13,22 @@ use super::{windows_spawn, FlagsRequest, SpawnBackend};
 use crate::containment::{ContainMode, ContainRequest, Nesting};
 use crate::error::Error;
 
-fn uncontained() -> ContainRequest {
+pub(crate) fn uncontained() -> ContainRequest {
     ContainRequest {
         mode: None,
         nesting: Nesting::Mark,
     }
 }
 
-fn contained() -> ContainRequest {
+pub(crate) fn contained() -> ContainRequest {
     ContainRequest {
         mode: Some(ContainMode::Strongest),
         nesting: Nesting::Mark,
     }
 }
 
-fn word(contain: &ContainRequest, flags: FlagsRequest, is_root: bool, backend: SpawnBackend) -> u32 {
+/// The word a spawn of this shape composes: the one source the other test modules take theirs from.
+pub(crate) fn word(contain: &ContainRequest, flags: FlagsRequest, is_root: bool, backend: SpawnBackend) -> u32 {
     windows_spawn(contain, flags, is_root, backend)
         .expect("this request shape is allowed")
         .creation_flags
@@ -256,6 +257,43 @@ fn the_composed_word_records_different_console_facts_for_each_containment_shape(
         },
         "window suppression puts the child's group in a console of its own"
     );
+}
+
+/// The process-group bit is decided in one place, from the request: unset follows containment (on for
+/// a contained spawn, root, nested or `TreeWalk`, off for an uncontained one), and a set request
+/// overrides either way. Mutants: unset ignoring containment; the setter ignored for one containment
+/// shape; a set request that also drops or adds `CREATE_SUSPENDED`.
+#[skuld::test]
+fn the_process_group_bit_follows_the_request_and_defaults_to_containment() {
+    let treewalk = ContainRequest {
+        mode: Some(ContainMode::TreeWalk),
+        nesting: Nesting::Mark,
+    };
+    // (request, is_root, contained by default, suspended by containment)
+    let shapes = [
+        (uncontained(), false, false, false),
+        (contained(), true, true, true),
+        (contained(), false, true, false),
+        (treewalk, true, true, false),
+    ];
+    for backend in [SpawnBackend::Std, SpawnBackend::Raw] {
+        for (contain, is_root, contained_by_default, suspended) in &shapes {
+            for (process_group, group) in [(None, *contained_by_default), (Some(true), true), (Some(false), false)] {
+                let flags = FlagsRequest {
+                    process_group,
+                    ..Default::default()
+                };
+                let w = word(contain, flags, *is_root, backend);
+                let shape = format!("{process_group:?} on {contain:?}, root {is_root}, {backend:?}");
+                assert_eq!(w & CREATE_NEW_PROCESS_GROUP.0 != 0, group, "the group bit: {shape}");
+                assert_eq!(
+                    w & CREATE_SUSPENDED.0 != 0,
+                    *suspended,
+                    "containment's own bit: {shape}"
+                );
+            }
+        }
+    }
 }
 
 // ===== breakaway: the pre-spawn rule and the post-failure classifier =====

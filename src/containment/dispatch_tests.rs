@@ -448,7 +448,18 @@ fn attach_trivial(
         #[cfg(target_os = "macos")]
         marker: None,
         #[cfg(windows)]
-        console: crate::containment::windows::ConsoleFacts::of(crate::containment::windows::group_flags(), true),
+        console: crate::containment::windows::ConsoleFacts::of(
+            crate::command::flags::flags_tests::word(
+                &crate::containment::ContainRequest {
+                    mode: Some(mode),
+                    nesting: crate::containment::Nesting::Mark,
+                },
+                crate::command::flags::FlagsRequest::default(),
+                is_root,
+                crate::command::flags::SpawnBackend::Std,
+            ),
+            true,
+        ),
         #[cfg(windows)]
         frozen: false,
         kernel,

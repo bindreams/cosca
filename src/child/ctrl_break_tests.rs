@@ -83,6 +83,46 @@ fn a_plain_contained_root_really_receives_the_break() {
     kill_release_reap(&child, sock, true);
 }
 
+/// An uncontained child created with `new_process_group(true)` leads a group on our console, so
+/// `terminate` sends the break to it directly and its handler answers. Mutants: the setter ignored
+/// for an uncontained spawn (the call is refused, not sent); the break sent to another group.
+#[skuld::test]
+fn an_uncontained_child_given_a_group_is_stopped_directly() {
+    let (child, mut sock) = ctrl_break::spawn_uncontained_member(Handler::Ack, |cmd| _ = cmd.new_process_group(true));
+    assert_eq!(child.containment(), Containment::None);
+    assert!(StopTarget::from(&child).leads_group_on_our_console());
+    assert_in_our_console(child.pid(), "the child");
+    child.terminate().expect("terminate a child created in a group");
+    ctrl_break::assert_break_sent_to(child.pid());
+    assert_acked(&mut sock, "the child");
+    kill_release_reap(&child, sock, false);
+}
+
+/// A contained child created with `new_process_group(false)` is still contained but leads no group, so
+/// `terminate` refuses it by naming the setter, and no break was sent. Mutants: `contain()` forcing the
+/// group on; the refusal not naming the setter; a break sent to the group the child is not the leader of.
+#[skuld::test]
+fn a_contained_child_without_a_group_is_refused_the_group_break() {
+    let (child, sock) = spawn_root_configured(Handler::Ack, crate::ContainMode::Strongest, |cmd| {
+        _ = cmd.new_process_group(false)
+    });
+    assert_eq!(
+        child.containment(),
+        Containment::JobObject,
+        "the job does not depend on the group"
+    );
+    assert!(!StopTarget::from(&child).leads_group_on_our_console());
+    let err = child
+        .terminate()
+        .expect_err("a child that leads no group cannot be addressed");
+    assert!(
+        matches!(&err, crate::error::Error::Unsupported { detail, .. } if detail.contains("Command::new_process_group")),
+        "the refusal names the setter: {err:?}"
+    );
+    ctrl_break::assert_no_break_sent();
+    kill_release_reap(&child, sock, false);
+}
+
 /// The graceful path end to end: no handler, so the default disposition applies and the child dies
 /// to the console event. [`STATUS_CONTROL_C_EXIT`] tells it from `1` (the escalation). The break is
 /// asserted sent as soon as `terminate` returns, so a missing one fails there, not when the grace
@@ -457,6 +497,21 @@ fn nested_delegated_child_can_be_gracefully_terminated() {
     ctrl_break::drive_reporter(ctrl_break::nested::REPORTER_TEST, ctrl_break::nested::ADDR_ENV, |cmd| {
         _ = cmd.contain()
     });
+}
+
+/// The setter reaches a nested contained child too: given `new_process_group(false)` it leads no
+/// group, so `terminate` is refused by naming the setter and no break is sent. It stays in its
+/// spawner's group (the reporter's, a contained root leading one by default), so the break of the
+/// spawner's own `terminate` reaches it. Mutants: a nested spawn that ignores the setter and leads
+/// a group anyway (`terminate` succeeds); the refusal not naming the setter. The checks run in
+/// `test_child::ctrl_break::nested`.
+#[skuld::test]
+fn a_nested_contained_child_without_a_group_is_refused_the_group_break() {
+    ctrl_break::drive_reporter(
+        ctrl_break::nested::NO_GROUP_REPORTER_TEST,
+        ctrl_break::nested::NO_GROUP_ADDR_ENV,
+        |cmd| _ = cmd.contain(),
+    );
 }
 
 /// From a caller with no console, the cooperative ops fail with `NoConsole` and send no break, and a
