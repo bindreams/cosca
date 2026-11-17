@@ -4,9 +4,11 @@
 //! `child::ctrl_break_tests` reads only whether the checks finished.
 
 use super::{
-    assert_acked, assert_break_sent_to, assert_in_our_console, assert_no_break_sent, connect_reporter,
-    kill_release_reap, report_done, spawn_member, Handler,
+    assert_acked, assert_break_sent_to, assert_in_our_console, assert_refused_by_the_direct_send_for_no_group,
+    connect_reporter, kill_release_reap, report_done, spawn_member, Handler,
 };
+use crate::stop::proxy::protocol::ProxyAnswer;
+use crate::stop::proxy::proxy_tests::Fixture;
 use crate::{Containment, StopTarget};
 
 /// The fully-qualified libtest path of [`fixture_nested_terminate_reporter`].
@@ -59,9 +61,8 @@ pub(crate) const NO_GROUP_REPORTER_TEST: &str = "test_child::ctrl_break::nested:
 pub(crate) const NO_GROUP_ADDR_ENV: &str = "COSCA_FIXTURE_NESTED_NO_GROUP_ADDR";
 
 /// Spawns a nested member given `new_process_group(false)`: [`Containment::Delegated`] still, but it
-/// leads no group, so `terminate` is refused by naming the setter and sends no break. The member stays
-/// in its spawner's group, which is this reporter's: a break the driver sends to the reporter's group
-/// reaches it too, so the root's own `terminate` is what stops it.
+/// leads no group, so the default stop is the direct send's refusal naming the setter. No proxy is started
+/// and no event is sent. The member stays in its spawner's group, which is this reporter's.
 #[skuld::test]
 fn fixture_nested_without_group_reporter() {
     let Some(mut report) = connect_reporter(NO_GROUP_ADDR_ENV) else {
@@ -69,8 +70,10 @@ fn fixture_nested_without_group_reporter() {
     };
     let _warns = crate::log_capture::warn_watch();
 
+    let fixture = Fixture::answering(ProxyAnswer::Sent.code());
     let (child, sock, _) = spawn_member(Handler::Ack, None, crate::ContainMode::Strongest, |cmd| {
-        _ = cmd.new_process_group(false)
+        _ = cmd.new_process_group(false);
+        cmd.ctrl_proxy(fixture.setting());
     });
     assert_eq!(
         child.containment(),
@@ -80,12 +83,9 @@ fn fixture_nested_without_group_reporter() {
     assert!(!StopTarget::from(&child).leads_group_on_our_console());
     let err = child
         .terminate()
-        .expect_err("a nested member that leads no group cannot be addressed");
-    assert!(
-        matches!(&err, crate::error::Error::Unsupported { detail, .. } if detail.contains("Command::new_process_group")),
-        "the refusal names the setter: {err:?}"
-    );
-    assert_no_break_sent();
+        .expect_err("a nested member that leads no group is refused by the direct send");
+    assert_refused_by_the_direct_send_for_no_group(&err);
+    assert!(fixture.ran().is_none(), "the proxy was started");
 
     kill_release_reap(&child, sock, false);
 

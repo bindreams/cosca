@@ -23,10 +23,12 @@ fn child_terminate_sends_sigterm() {
     );
 }
 
+/// An uncontained child on our console, which leads no group: the default is the direct send's refusal, in
+/// this host, which never called `cosca::init()`, and so does not need the proxy.
 #[cfg(windows)]
 #[skuld::test]
 fn child_terminate_unsupported_for_an_uncontained_child_on_windows() {
-    let (child, sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_control_on_console("control-block", &["R"], false);
     let err = child
         .terminate()
         .expect_err("a child that leads no group cannot be addressed");
@@ -38,7 +40,7 @@ fn child_terminate_unsupported_for_an_uncontained_child_on_windows() {
 #[skuld::test]
 fn child_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
     use std::time::Duration;
-    let (child, sock) = common::spawn_blocker();
+    let (child, sock) = common::spawn_control_on_console("control-block", &["R"], false);
     let err = child
         .graceful_shutdown(Duration::from_secs(1))
         .expect_err("a child that leads no group cannot be addressed");
@@ -147,7 +149,10 @@ fn the_recorded_route_distinguishes_contained_from_uncontained_on_windows() {
 
 /// The parity contract, deliberately not `cfg`-gated so it is one test rather than two: the
 /// `Child` pins the pid for its whole life, so an already-exited child is `Ok` on every
-/// platform.
+/// platform: on our console, on a console of its own (which on Windows the default asks the proxy for,
+/// and this host never called `cosca::init()`, so a call that asked first would be refused), and
+/// uncontained. The one exception is a Windows child created on our console that leads no group: the
+/// direct send refuses it before and after its exit, which the last block pins.
 #[skuld::test]
 fn child_terminate_reports_ok_for_an_already_exited_child() {
     let _warns = common::warn_watch();
@@ -155,6 +160,29 @@ fn child_terminate_reports_ok_for_an_already_exited_child() {
     // `kill_tree`, not `kill`: reaping a contained root first and then dropping it warns (#382).
     common::kill_tree_release_reap(&child, sock);
     child.terminate().expect("already-dead must be Ok");
+
+    let (child, sock) = common::spawn_control_with("control-block", &["R"], true, |_| {});
+    common::kill_tree_release_reap(&child, sock);
+    child
+        .terminate()
+        .expect("already-dead, on a console of its own, must be Ok");
+
+    let (child, sock) = common::spawn_control_with("control-block", &["R"], false, |_| {});
+    common::kill_release_reap(&child, sock);
+    child
+        .terminate()
+        .expect("already-dead, uncontained, on a console of its own, must be Ok");
+
+    // The exception: the direct send's refusal of a child that leads no group does not look at the exit.
+    #[cfg(windows)]
+    {
+        let (child, sock) = common::spawn_control_on_console("control-block", &["R"], false);
+        common::kill_release_reap(&child, sock);
+        let err = child
+            .terminate()
+            .expect_err("a child on our console that leads no group is refused, exited or not");
+        common::assert_refused_for_no_group(&err);
+    }
 }
 
 #[path = "../src/test_harness.rs"]

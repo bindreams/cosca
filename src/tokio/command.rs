@@ -148,7 +148,7 @@ impl Command {
 
     /// Do not put a console window on the user's screen — mirrors
     /// [`no_window`](crate::Command::no_window), including the per-path lowering and the
-    /// one-directional console consequence documented there.
+    /// consequence for the cooperative stop documented there.
     pub fn no_window(&mut self) -> &mut Command {
         self.inner.no_window();
         self

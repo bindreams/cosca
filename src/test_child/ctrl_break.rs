@@ -290,16 +290,35 @@ pub(crate) fn spawn_consoleless_root() -> (crate::Child, TcpStream) {
 pub(crate) fn spawn_gui_root(configure: impl FnOnce(&mut crate::Command)) -> (crate::Child, TcpStream) {
     let (listener, addr) = crate::test_child::registration_rendezvous();
     let mut cmd = crate::test_child::command(Console::Asked);
-    // `args` is the whole argv, program name included.
-    cmd.executable(super::testbin("cosca_testbin_gui"))
-        .args(["cosca_testbin_gui", addr.as_str()]);
-    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
-    cmd.env(ack::ACK_ENV, "1");
-    cmd.contain();
+    gui_root_command(&mut cmd, &addr);
     configure(&mut cmd);
     let child = cmd.spawn().expect("spawn the GUI-subsystem root");
     let sock = accept_tagged(&listener, child.id().expect(IDENTITY_READ), b'G');
     (child, sock)
+}
+
+/// [`spawn_gui_root`] for the tokio `Child`.
+#[cfg(feature = "tokio")]
+pub(crate) async fn spawn_gui_root_async(
+    configure: impl FnOnce(&mut crate::tokio::Command),
+) -> (crate::tokio::Child, TcpStream) {
+    let (listener, addr) = crate::test_child::registration_rendezvous();
+    let mut cmd = crate::test_child::tokio_command(Console::Asked);
+    gui_root_command(cmd.as_sync_mut(), &addr);
+    configure(&mut cmd);
+    let child = cmd.spawn().await.expect("spawn the GUI-subsystem root");
+    let sock = accept_tagged(&listener, child.id().expect(IDENTITY_READ), b'G');
+    (child, sock)
+}
+
+/// What a command needs to start the GUI-subsystem testbin as a contained root that reports to `addr`.
+fn gui_root_command(cmd: &mut crate::Command, addr: &str) {
+    // `args` is the whole argv, program name included.
+    cmd.executable(super::testbin("cosca_testbin_gui"))
+        .args(["cosca_testbin_gui", addr]);
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
+    cmd.env(ack::ACK_ENV, "1");
+    cmd.contain();
 }
 
 /// The grandchild a root member started: its control socket, which keeps it running while held,
@@ -390,6 +409,23 @@ pub(crate) fn assert_no_break_sent() {
         Vec::<CtrlSend>::new(),
         "the call must send no console event"
     );
+}
+
+/// Assert that `err` is the direct send's refusal of a child that leads no console process group
+/// (`Unsupported`, naming `Command::new_process_group` and not the proxy's `cosca::init()`), and that
+/// nothing was sent since the last read of the sender's record, directly or through the proxy.
+#[track_caller]
+pub(crate) fn assert_refused_by_the_direct_send_for_no_group(err: &crate::error::Error) {
+    let crate::error::Error::Unsupported { detail, .. } = err else {
+        panic!("expected Unsupported, got {err:?}")
+    };
+    assert!(detail.contains("leads no console process group"), "{detail}");
+    assert!(detail.contains("Command::new_process_group"), "{detail}");
+    assert!(
+        !detail.contains("cosca::init()"),
+        "the proxy's refusal, not the direct send's: {detail}"
+    );
+    assert_no_break_sent();
 }
 
 /// Kill the member (its whole tree when `tree`), then release it: a released member leaves with 0,

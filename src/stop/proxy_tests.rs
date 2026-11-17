@@ -57,7 +57,7 @@ impl Fixture {
     }
 
     /// What the fixture recorded; `None` when it never ran.
-    fn ran(&self) -> Option<crate::proxy_fixture::Ran> {
+    pub(crate) fn ran(&self) -> Option<crate::proxy_fixture::Ran> {
         crate::proxy_fixture::read_record(&self.exe)
     }
 }
@@ -217,29 +217,135 @@ fn a_sent_answer_is_ok_and_the_proxy_is_asked_for_this_child_and_event() {
 
 // What each answer means =====
 
-/// A child that exited is answered as `send_ctrl_break_to_group` answers one: `Ok`. The proxy cannot
-/// attach to an exited process whose handle is held (`AttachDenied`), finds no such identity
-/// (`TargetGone`), or finds the process has no console (`TargetHasNoConsole`). Mutants: the answer is
-/// always an error; the exit is not looked at, for one of the three.
+/// Connects to a listener when dropped, which releases a thread blocked in its `accept`.
+struct AcceptRelease(std::net::SocketAddr);
+
+impl Drop for AcceptRelease {
+    fn drop(&mut self) {
+        drop(TcpStream::connect(self.0));
+    }
+}
+
+/// The proxy's own program, held, while `ask` runs on this thread: a fixture that answers `answer` once told.
+/// The child is ended and its exit seen after the proxy has started and before it answers, which is the one
+/// thing cosca's look at the start of the call could not have seen. Fails by assertion if `ask` ends without
+/// having started the proxy.
+fn asking_while_the_child_exits<T>(
+    child: &Child,
+    held: &(Fixture, std::net::TcpListener),
+    ask: impl FnOnce() -> T,
+) -> T {
+    use std::io::{BufRead as _, Write as _};
+
+    let listener = &held.1;
+    std::thread::scope(|scope| {
+        let ender = scope.spawn(|| {
+            let (stream, _) = listener.accept().expect("a connection to the fixture's listener");
+            let mut line = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut line)
+                .expect("the fixture proxy reports its pid");
+            assert!(!line.is_empty(), "the call ended without having started the proxy");
+            child.kill().expect("kill the member");
+            child.wait().expect("see its exit, reaping nothing");
+            (&stream).write_all(b"x").expect("tell the fixture proxy to answer");
+        });
+        // A call that never started the proxy, or panicked, has left the thread above in `accept`: a
+        // connection ends it, made on unwind too, which the scope's join would otherwise wait on for ever.
+        let release = AcceptRelease(listener.local_addr().expect("the listener's address"));
+        let asked = ask();
+        drop(release);
+        ender.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        asked
+    })
+}
+
+/// A child that exits while the proxy is being asked is answered as `send_ctrl_break_to_group` answers one:
+/// `Ok`. The proxy cannot attach to an exited process whose handle is held (`AttachDenied`), finds no such
+/// identity (`TargetGone`), or finds the process has no console (`TargetHasNoConsole`), and cosca's look
+/// after the answer finds the exit. Mutants: the answer is always an error; the exit is not looked at, for
+/// one of the three.
 #[skuld::test]
-fn a_refused_attach_to_an_exited_child_is_ok() {
+fn a_refused_attach_by_a_child_that_exits_during_the_ask_is_ok() {
     for answer in [
         ProxyAnswer::AttachDenied,
         ProxyAnswer::TargetGone,
         ProxyAnswer::TargetHasNoConsole,
     ] {
-        let fixture = Fixture::answering(answer.code());
-        let (child, sock) = hidden_member(&fixture);
-        child.kill().expect("kill the member");
-        child.wait().expect("see its exit, reaping nothing");
-        drop(sock);
-        stop::send_console_event_via_proxy(&StopTarget::from(&child), CtrlEvent::CtrlBreak)
-            .unwrap_or_else(|e| panic!("{answer:?} for an exited child is Ok: {e:?}"));
+        let held = Fixture::answering_when_told(answer.code());
+        let (child, sock) = hidden_member(&held.0);
+        asking_while_the_child_exits(&child, &held, || {
+            stop::send_console_event_via_proxy(&StopTarget::from(&child), CtrlEvent::CtrlBreak)
+        })
+        .unwrap_or_else(|e| panic!("{answer:?} for a child that exited is Ok: {e:?}"));
         assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, answer);
-        assert!(
-            fixture.ran().is_some(),
-            "the proxy was asked, as the child's exit was not assumed"
-        );
+        drop(sock);
+    }
+}
+
+/// A child that has exited before the call is answered at the first look, and the proxy is not started: a
+/// root target answers `Ok` as every platform does for an exited child, `terminate_tree` the "root
+/// exited" error that claims no event went out, and `graceful_shutdown_tree` goes on to its grace and
+/// sweep with the debug line that it sent no event. The fixture answers `Sent`, so a call that asked it
+/// would record an answer. Mutants: the look comes after the gates or the start (the fixture ran, an answer
+/// is recorded); a root target answers the tree's error.
+#[skuld::test]
+fn a_child_that_has_exited_is_answered_before_the_proxy_is_started() {
+    crate::log_capture::install();
+    for (tree, mode) in [
+        (false, ContainMode::Strongest),
+        (true, ContainMode::Strongest),
+        (true, ContainMode::TreeWalk),
+    ] {
+        let exited = |fixture: &Fixture| {
+            let (child, sock) = stopping_member(fixture, mode);
+            child.kill().expect("kill the member");
+            child.wait().expect("see its exit, reaping nothing");
+            drop(sock);
+            child
+        };
+
+        let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+        let child = exited(&fixture);
+        if tree {
+            let err = child
+                .terminate_tree()
+                .expect_err("nothing was sent to a tree whose root had exited");
+            let Error::Unassessable { detail, .. } = &err else {
+                panic!("{mode:?}: {err:?}")
+            };
+            assert!(detail.contains("nothing was sent"), "{mode:?}: {detail}");
+            assert!(!detail.contains("CTRL_C"), "{mode:?}: no event went out: {detail}");
+        } else {
+            child
+                .terminate()
+                .unwrap_or_else(|e| panic!("an exited child is Ok: {e:?}"));
+            stop::send_console_event_via_proxy(&StopTarget::from(&child), CtrlEvent::CtrlBreak)
+                .unwrap_or_else(|e| panic!("an exited child is Ok: {e:?}"));
+        }
+        assert_no_break_sent();
+        assert!(fixture.ran().is_none(), "{mode:?}, tree {tree}: the proxy was started");
+
+        if tree {
+            let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+            let child = exited(&fixture);
+            let mark = crate::log_capture::mark();
+            child
+                .graceful_shutdown_tree(std::time::Duration::ZERO)
+                .unwrap_or_else(|e| panic!("{mode:?}: the call goes on and ends the tree: {e:?}"));
+            assert_no_break_sent();
+            assert!(fixture.ran().is_none(), "{mode:?}: the proxy was started");
+            let logged = crate::log_capture::records_since_on_current_thread(
+                mark,
+                &format!("graceful_shutdown_tree({})", child.pid()),
+            );
+            assert!(
+                logged
+                    .iter()
+                    .any(|(level, text)| *level == log::Level::Debug && text.contains("sent no CTRL_C")),
+                "{mode:?}: the call says it sent no event: {logged:?}"
+            );
+        }
     }
 }
 
@@ -414,7 +520,9 @@ fn a_detached_child_is_asked_and_gets_the_proxys_no_console_answer() {
 #[skuld::test]
 fn a_child_with_no_identity_is_refused_before_the_proxy_starts() {
     let fixture = Fixture::answering(ProxyAnswer::Sent.code());
-    let mut child = crate::test_child::over_fake::child_over(&crate::os_process::fake::FakeProcess::new([]));
+    let mut child = crate::test_child::over_fake::child_over(&crate::os_process::fake::FakeProcess::new([
+        crate::os_process::fake::Answer::Running,
+    ]));
     child.id = None;
     child.ctrl_proxy = std::sync::Arc::new(fixture.setting());
     let err = send_err(&child, CtrlEvent::CtrlBreak);
@@ -436,7 +544,9 @@ fn an_elevated_child_is_refused_before_anything_starts() {
     use crate::containment::windows::ConsoleFacts;
 
     let fixture = Fixture::answering(ProxyAnswer::Sent.code());
-    let mut child = crate::test_child::over_fake::child_over(&crate::os_process::fake::FakeProcess::new([]));
+    let mut child = crate::test_child::over_fake::child_over(&crate::os_process::fake::FakeProcess::new([
+        crate::os_process::fake::Answer::Running,
+    ]));
     child.console = ConsoleFacts {
         group: true,
         ..ConsoleFacts::uac_elevated()
@@ -588,15 +698,15 @@ fn a_proxy_that_cannot_be_started_says_so_and_names_its_path() {
 
 // A tree whose root has exited =====
 
-/// The proxy cannot attach, and cosca's look finds the tree's root exited: nothing was sent, for either
-/// tree call and both mechanisms, whichever of the three answers the proxy gave. `terminate_tree` ends
-/// with an error that says so and claims no event went out; `graceful_shutdown_tree` goes on, with the
-/// debug line that it sent no event, and answers `Ok`. The proxy is asked in each case.
+/// The proxy cannot attach, and cosca's look after its answer finds the tree's root exited (it exited
+/// while the proxy was being asked): nothing was sent, for either tree call and both mechanisms, whichever
+/// of the three answers the proxy gave. `terminate_tree` ends with an error that says so and claims no event
+/// went out; `graceful_shutdown_tree` goes on, with the debug line that it sent no event, and answers `Ok`.
 ///
 /// Mutants: the exit is answered `Ok` as for a root target (`terminate_tree` is `Ok`, the debug line is
 /// missing); the error says the event was sent.
 #[skuld::test]
-fn a_tree_call_whose_root_has_exited_sends_nothing_and_says_so() {
+fn a_tree_call_whose_root_exited_during_the_ask_sends_nothing_and_says_so() {
     crate::log_capture::install();
     for mode in [ContainMode::Strongest, ContainMode::TreeWalk] {
         for answer in [
@@ -604,19 +714,11 @@ fn a_tree_call_whose_root_has_exited_sends_nothing_and_says_so() {
             ProxyAnswer::TargetGone,
             ProxyAnswer::TargetHasNoConsole,
         ] {
-            let exited = |fixture: &Fixture| {
-                let (child, sock) = stopping_member(fixture, mode);
-                child.kill().expect("kill the member");
-                child.wait().expect("see its exit, reaping nothing");
-                drop(sock);
-                child
-            };
-
-            let fixture = Fixture::answering(answer.code());
-            let child = exited(&fixture);
-            let err = child
-                .terminate_tree()
+            let held = Fixture::answering_when_told(answer.code());
+            let (child, sock) = stopping_member(&held.0, mode);
+            let err = asking_while_the_child_exits(&child, &held, || child.terminate_tree())
                 .expect_err("nothing was sent to a tree whose root had exited");
+            drop(sock);
             let Error::Unassessable { detail, .. } = &err else {
                 panic!("{mode:?}, {answer:?}: {err:?}")
             };
@@ -627,12 +729,14 @@ fn a_tree_call_whose_root_has_exited_sends_nothing_and_says_so() {
             );
             assert_proxy_answered(child.pid(), CtrlEvent::CtrlC, answer);
 
-            let fixture = Fixture::answering(answer.code());
-            let child = exited(&fixture);
+            let held = Fixture::answering_when_told(answer.code());
+            let (child, sock) = stopping_member(&held.0, mode);
             let mark = crate::log_capture::mark();
-            child
-                .graceful_shutdown_tree(std::time::Duration::ZERO)
-                .unwrap_or_else(|e| panic!("{mode:?}, {answer:?}: the call goes on and ends the tree: {e:?}"));
+            asking_while_the_child_exits(&child, &held, || {
+                child.graceful_shutdown_tree(std::time::Duration::ZERO)
+            })
+            .unwrap_or_else(|e| panic!("{mode:?}, {answer:?}: the call goes on and ends the tree: {e:?}"));
+            drop(sock);
             assert_proxy_answered(child.pid(), CtrlEvent::CtrlC, answer);
             let logged = crate::log_capture::records_since_on_current_thread(
                 mark,

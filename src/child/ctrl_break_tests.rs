@@ -12,8 +12,12 @@ use std::time::Duration;
 
 use super::fault as term_fault;
 use crate::containment::Containment;
+use crate::error::Error;
+use crate::stop::proxy::protocol::{CtrlEvent, ProxyAnswer};
+use crate::stop::proxy::proxy_tests::Fixture;
 use crate::test_child::ctrl_break::{
-    self, assert_acked, assert_in_our_console, kill_release_reap, Grandchild, Handler, STATUS_CONTROL_C_EXIT,
+    self, assert_acked, assert_in_our_console, assert_proxy_answered, kill_release_reap, Grandchild, Handler,
+    STATUS_CONTROL_C_EXIT,
 };
 use crate::StopTarget;
 
@@ -95,31 +99,6 @@ fn an_uncontained_child_given_a_group_is_stopped_directly() {
     child.terminate().expect("terminate a child created in a group");
     ctrl_break::assert_break_sent_to(child.pid());
     assert_acked(&mut sock, "the child");
-    kill_release_reap(&child, sock, false);
-}
-
-/// A contained child created with `new_process_group(false)` is still contained but leads no group, so
-/// `terminate` refuses it by naming the setter, and no break was sent. Mutants: `contain()` forcing the
-/// group on; the refusal not naming the setter; a break sent to the group the child is not the leader of.
-#[skuld::test]
-fn a_contained_child_without_a_group_is_refused_the_group_break() {
-    let (child, sock) = spawn_root_configured(Handler::Ack, crate::ContainMode::Strongest, |cmd| {
-        _ = cmd.new_process_group(false)
-    });
-    assert_eq!(
-        child.containment(),
-        Containment::JobObject,
-        "the job does not depend on the group"
-    );
-    assert!(!StopTarget::from(&child).leads_group_on_our_console());
-    let err = child
-        .terminate()
-        .expect_err("a child that leads no group cannot be addressed");
-    assert!(
-        matches!(&err, crate::error::Error::Unsupported { detail, .. } if detail.contains("Command::new_process_group")),
-        "the refusal names the setter: {err:?}"
-    );
-    ctrl_break::assert_no_break_sent();
     kill_release_reap(&child, sock, false);
 }
 
@@ -329,9 +308,256 @@ fn graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
     assert_eq!(exit.wait_for_exit_code(), 1, "the sweep must kill the grandchild");
 }
 
-// A root outside our console =====
+// A child outside our group or console: the default asks the proxy =====
+//
+// The proxy here is the fixture of `stop::proxy::proxy_tests`: it answers what its name says and sends
+// nothing, so none of these tests is in the `CTRL_PROXY` group. What a real proxy delivers is in
+// `ctrl_break_proxy_tests.rs`.
 
-/// Require of a root spawned for [`assert_false_success`] the containment the leg is about, and the
+/// The four calls that run the child's stop action.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Call {
+    Terminate,
+    TerminateTree,
+    GracefulShutdown,
+    GracefulShutdownTree,
+}
+
+pub(crate) const CALLS: [Call; 4] = [
+    Call::Terminate,
+    Call::TerminateTree,
+    Call::GracefulShutdown,
+    Call::GracefulShutdownTree,
+];
+
+impl Call {
+    /// The call on `child`, with `grace` for a graceful one, which answers the root's status.
+    pub(crate) fn run(self, child: &crate::Child, grace: Duration) -> Result<Option<std::process::ExitStatus>, Error> {
+        match self {
+            Call::Terminate => child.terminate().map(|()| None),
+            Call::TerminateTree => child.terminate_tree().map(|()| None),
+            Call::GracefulShutdown => child.graceful_shutdown(grace).map(Some),
+            Call::GracefulShutdownTree => child.graceful_shutdown_tree(grace).map(Some),
+        }
+    }
+
+    /// Whether the call goes on to a kill when its stop did not end the root.
+    pub(crate) fn escalates(self) -> bool {
+        matches!(self, Call::GracefulShutdown | Call::GracefulShutdownTree)
+    }
+}
+
+/// A contained root that stops by the default, whose proxy is `fixture`, with `configure` applied to
+/// its command last.
+fn root_stopping_through(
+    fixture: &Fixture,
+    mode: crate::ContainMode,
+    configure: impl FnOnce(&mut crate::Command),
+) -> (crate::Child, TcpStream) {
+    spawn_root_configured(Handler::Ignore, mode, |cmd| {
+        cmd.ctrl_proxy(fixture.setting());
+        configure(cmd);
+    })
+}
+
+/// The detail of an `Unsupported`; any other error is a panic.
+fn unsupported_detail(err: &Error) -> &str {
+    match err {
+        Error::Unsupported { detail, .. } => detail,
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// A root that has a console of its own leads no group of the caller's console, so the default asks the
+/// proxy, in every call and under both mechanisms that contain a root. The fixture answers `Sent`: the
+/// stops answer `Ok` and leave the root running, and the graceful calls go on to escalate (the kill
+/// ends the root, which the exit status shows). Mutants: the default sends the direct break (the record is a
+/// direct send, and the proxy is not asked); a call does not run the default; a graceful call skips its kill
+/// after the stop (the status is the release's, 0).
+#[skuld::test]
+fn the_default_asks_the_proxy_for_a_no_window_contained_root() {
+    for (mode, expected) in [
+        (crate::ContainMode::Strongest, Containment::JobObject),
+        (crate::ContainMode::TreeWalk, Containment::TreeWalk),
+    ] {
+        for call in CALLS {
+            let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+            let (child, sock) = root_stopping_through(&fixture, mode, |cmd| _ = cmd.no_window());
+            assert_own_console_route(&child, expected);
+            if call.escalates() {
+                let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
+                let status = call
+                    .run(&child, Duration::ZERO)
+                    .unwrap_or_else(|e| panic!("{mode:?} {call:?}: {e:?}"))
+                    .expect("a graceful call answers a status");
+                assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::Sent);
+                // The release comes after the kill, so a root the call did not kill leaves with 0.
+                assert_eq!(
+                    status.code(),
+                    Some(1),
+                    "{mode:?} {call:?}: the escalation's kill: {status:?}"
+                );
+            } else {
+                call.run(&child, Duration::ZERO)
+                    .unwrap_or_else(|e| panic!("{mode:?} {call:?}: {e:?}"));
+                assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::Sent);
+                kill_release_reap(&child, sock, false);
+            }
+        }
+    }
+}
+
+/// An uncontained child with a console of its own, which `terminate` refused before the proxy: the
+/// default asks the proxy for it too. Mutant: the default refuses a child that leads no group before
+/// asking.
+#[skuld::test]
+fn the_default_asks_the_proxy_for_an_uncontained_no_window_child() {
+    let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+    let (child, sock) = ctrl_break::spawn_uncontained_member(Handler::Ignore, |cmd| {
+        cmd.ctrl_proxy(fixture.setting());
+        cmd.no_window();
+    });
+    assert_eq!(child.containment(), Containment::None);
+    assert!(!StopTarget::from(&child).leads_group_on_our_console());
+    child.terminate().expect("the proxy answered Sent");
+    assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::Sent);
+    kill_release_reap(&child, sock, false);
+}
+
+/// A root created with `detached()` is not refused up front: the proxy is asked, and its answer for a
+/// child with no console is the stop's `Unsupported`, naming `Child::kill` before `Command::graceful_stop`.
+/// Every call ends there with the root running, `graceful_shutdown` and `graceful_shutdown_tree` before
+/// their grace and their kill. Mutants: the default sends the direct break (`Ok` for a root it
+/// reached nobody with); a graceful call goes on to its kill after the refusal.
+#[skuld::test]
+fn a_detached_contained_root_is_refused_for_having_no_console() {
+    for call in CALLS {
+        let fixture = Fixture::answering(ProxyAnswer::TargetHasNoConsole.code());
+        let (child, sock) = root_stopping_through(&fixture, crate::ContainMode::Strongest, |cmd| _ = cmd.detached());
+        let err = call.run(&child, Duration::ZERO).expect_err("the call is refused");
+        let detail = unsupported_detail(&err);
+        assert!(detail.contains("answer TargetHasNoConsole"), "{call:?}: {detail}");
+        let (kill, graceful_stop) = (detail.find("Child::kill"), detail.find("Command::graceful_stop"));
+        assert!(
+            matches!((kill, graceful_stop), (Some(k), Some(g)) if k < g),
+            "{call:?}: the remedies, in order: {detail}"
+        );
+        assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::TargetHasNoConsole);
+        assert_eq!(
+            child.is_alive(),
+            crate::identity::Liveness::Alive,
+            "{call:?}: the call ended with the root running"
+        );
+        kill_release_reap(&child, sock, false);
+    }
+}
+
+/// A child created on our console without a group (a contained one given `new_process_group(false)`, an
+/// uncontained one by default) is refused by the direct send's own refusal, in every call: `Unsupported`
+/// naming `Command::new_process_group`, with nothing sent, no proxy started (the fixture, which answers
+/// `Sent`, never ran, and no answer is recorded) and the root running. The default does not need the
+/// proxy for it, so the refusal does not name `cosca::init()`. Mutants: the default takes the proxy (the
+/// fixture runs and answers `Sent`); `contain()` forces the group on (the default sends directly); a
+/// graceful call goes on to its kill.
+#[skuld::test]
+fn a_child_on_our_console_without_a_group_is_refused_by_the_direct_send_without_the_proxy() {
+    for call in CALLS {
+        let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+        let (child, sock) = root_stopping_through(&fixture, crate::ContainMode::Strongest, |cmd| {
+            _ = cmd.new_process_group(false)
+        });
+        assert_eq!(
+            child.containment(),
+            Containment::JobObject,
+            "the job does not depend on the group"
+        );
+        assert_in_our_console(child.pid(), "the contained member");
+        assert!(!StopTarget::from(&child).leads_group_on_our_console());
+        let err = call.run(&child, Duration::ZERO).expect_err("the call is refused");
+        ctrl_break::assert_refused_by_the_direct_send_for_no_group(&err);
+        assert!(fixture.ran().is_none(), "{call:?}: the proxy was started");
+        assert_eq!(
+            child.is_alive(),
+            crate::identity::Liveness::Alive,
+            "{call:?}: the call ended with the root running"
+        );
+        kill_release_reap(&child, sock, false);
+    }
+}
+
+/// The uncontained child of a console program, which `contain()` does not give a group: the same refusal
+/// for the calls that run its action (an uncontained child has no tree), with no proxy started. Mutant: the
+/// default takes the proxy for it.
+#[skuld::test]
+fn an_uncontained_child_on_our_console_is_refused_by_the_direct_send_without_the_proxy() {
+    for call in [Call::Terminate, Call::GracefulShutdown] {
+        let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+        let (child, sock) = ctrl_break::spawn_uncontained_member(Handler::Ignore, |cmd| {
+            cmd.ctrl_proxy(fixture.setting());
+        });
+        assert_eq!(child.containment(), Containment::None);
+        assert_in_our_console(child.pid(), "the uncontained member");
+        assert!(!StopTarget::from(&child).leads_group_on_our_console());
+        let err = call.run(&child, Duration::ZERO).expect_err("the call is refused");
+        ctrl_break::assert_refused_by_the_direct_send_for_no_group(&err);
+        assert!(fixture.ran().is_none(), "{call:?}: the proxy was started");
+        assert_eq!(
+            child.is_alive(),
+            crate::identity::Liveness::Alive,
+            "{call:?}: the call ended with the root running"
+        );
+        kill_release_reap(&child, sock, false);
+    }
+}
+
+/// `send_ctrl_break_to_group`, called as an explicit action for a child that has a console of its own
+/// (`no_window`) or none (`detached`), answers `Ok` and reaches nobody, as its doc says: Windows reports
+/// success for an event aimed at a group in another console, and this process cannot rule the case out.
+/// The default never takes this route for such a child; this is the one test of what a caller who chose
+/// the direct send gets.
+///
+/// The root has no handler, so a delivered break would end it with [`STATUS_CONTROL_C_EXIT`]. It is
+/// released through its own socket after the call, and must then leave with `0`: it ended on the release,
+/// having received nothing. The break is asserted sent before the release, so that does not depend on
+/// timing; the exit code alone cannot rule out a break that lands after the release.
+///
+/// Mutants: the send refuses a child whose flags put it outside our console (`Err`); it sends nothing
+/// (the record is empty); it delivers the break to the child (the exit code).
+#[skuld::test]
+fn an_explicit_direct_send_answers_ok_for_a_child_outside_our_console_and_reaches_nobody() {
+    use std::io::Write as _;
+
+    for detached in [false, true] {
+        let (child, mut sock) = spawn_root_configured(Handler::Default, crate::ContainMode::Strongest, |cmd| {
+            if detached {
+                cmd.detached();
+            } else {
+                cmd.no_window();
+            }
+            cmd.graceful_stop(crate::stop::send_ctrl_break_to_group);
+        });
+        child
+            .terminate()
+            .unwrap_or_else(|e| panic!("detached {detached}: the documented false success: {e:?}"));
+        ctrl_break::assert_break_sent_to(child.pid());
+        assert_eq!(
+            child.is_alive(),
+            crate::identity::Liveness::Alive,
+            "detached {detached}: nothing was delivered, so the root must still be running"
+        );
+        sock.write_all(b"x").expect("release the root through its own socket");
+        let status = child.wait().expect("reap");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "detached {detached}: the root exited on OUR release byte, so the direct send delivered nothing; \
+             a delivered break would have ended it with STATUS_CONTROL_C_EXIT ({STATUS_CONTROL_C_EXIT:#x}), \
+             got {status:?}"
+        );
+    }
+}
+
+/// Require of a root spawned for the tests below the containment the leg is about, and the
 /// route that reads its creation flags whole: a derivation reading only the containment half of the
 /// word says `ConsoleGroup` here.
 fn assert_own_console_route(child: &crate::Child, expected_containment: Containment) {
@@ -345,93 +571,6 @@ fn assert_own_console_route(child: &crate::Child, expected_containment: Containm
         console.group && console.own_console_flags && !StopTarget::from(child).leads_group_on_our_console(),
         "cosca's honest report of the route: a group in a console of its own, {console:?}"
     );
-}
-
-/// A root whose creation flags put it in a console of its own gets a false success from the
-/// cooperative ops: they return `Ok` having sent a break that reached nobody. The subject is HOW
-/// the root ended, so the assertions are on its exit code.
-///
-/// The root has no handler, so a delivered break would end it with [`STATUS_CONTROL_C_EXIT`]. It is
-/// released through its own socket after the cooperative op, and must then leave with `0`: it ended
-/// on the release, having received nothing. The exit code alone cannot rule out a break that lands
-/// after the release (no ordering exists for a negative claim). The send record is read before the
-/// release, so it does not depend on that timing; the liveness read cannot fail on a build that
-/// delivers the break, and is not what carries the claim. A second root checks the
-/// other half: the forced `graceful_shutdown_tree` still ends such a tree, and its release comes
-/// after the sweep, so a sweep that sent nothing yields `0` instead of a hang on the held root.
-///
-/// Mutants caught deterministically: `terminate_tree` sends nothing (the break assertion); the sweep
-/// sends nothing (the code of the second root). A break delivered outside the console is not among
-/// them, for the ordering reason above.
-fn assert_false_success(
-    expected_containment: Containment,
-    mode: crate::ContainMode,
-    configure: impl Fn(&mut crate::Command),
-) {
-    use std::io::Write as _;
-
-    let (child, mut sock) = spawn_root_configured(Handler::Default, mode, &configure);
-    assert_own_console_route(&child, expected_containment);
-    child
-        .terminate_tree()
-        .expect("the cooperative op reports success: that is the gap this pins");
-    ctrl_break::assert_break_sent_to(child.pid());
-    assert_eq!(
-        child.is_alive(),
-        crate::identity::Liveness::Alive,
-        "nothing was delivered, so the root must still be running"
-    );
-    sock.write_all(b"x").expect("release the root through its own socket");
-    let status = child.wait().expect("reap");
-    assert_eq!(
-        status.code(),
-        Some(0),
-        "the root exited on OUR release byte, so the cooperative op delivered nothing; a delivered break would have ended it with STATUS_CONTROL_C_EXIT ({STATUS_CONTROL_C_EXIT:#x}), got {status:?}"
-    );
-    drop(sock);
-
-    // A second root, because the first is already gone.
-    let (child, sock) = spawn_root_configured(Handler::Default, mode, &configure);
-    assert_own_console_route(&child, expected_containment);
-    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, sock);
-    let status = child
-        .graceful_shutdown_tree(Duration::ZERO)
-        .expect("the forced half tears the tree down");
-    assert_eq!(
-        status.code(),
-        Some(1),
-        "the forced half must kill the root, got {status:?}"
-    );
-    assert_eq!(
-        child.is_alive(),
-        crate::identity::Liveness::Dead,
-        "the forced half really ended it"
-    );
-}
-
-#[skuld::test]
-fn a_no_window_contained_root_gets_a_false_success() {
-    assert_false_success(Containment::JobObject, crate::ContainMode::Strongest, |c| {
-        c.no_window();
-    });
-}
-
-/// As [`a_no_window_contained_root_gets_a_false_success`], for `detached`.
-#[skuld::test]
-fn a_detached_contained_root_gets_a_false_success() {
-    assert_false_success(Containment::JobObject, crate::ContainMode::Strongest, |c| {
-        c.detached();
-    });
-}
-
-/// A distinct route into the same call site: on Windows a tree walk reaches
-/// `containment::windows::terminate` through `treewalk::terminate`, so a change made in one arm
-/// only would miss it.
-#[skuld::test]
-fn a_treewalk_contained_root_gets_a_false_success_too() {
-    assert_false_success(Containment::TreeWalk, crate::ContainMode::TreeWalk, |c| {
-        c.no_window();
-    });
 }
 
 /// A child that shares no console with us is signalled with a success Windows reports for an event
@@ -500,13 +639,12 @@ fn nested_delegated_child_can_be_gracefully_terminated() {
 }
 
 /// The setter reaches a nested contained child too: given `new_process_group(false)` it leads no
-/// group, so `terminate` is refused by naming the setter and no break is sent. It stays in its
-/// spawner's group (the reporter's, a contained root leading one by default), so the break of the
-/// spawner's own `terminate` reaches it. Mutants: a nested spawn that ignores the setter and leads
-/// a group anyway (`terminate` succeeds); the refusal not naming the setter. The checks run in
-/// `test_child::ctrl_break::nested`.
+/// group, so the default is the direct send's refusal naming the setter, with no proxy started and no break
+/// sent. Mutants: a nested spawn that ignores the setter and leads a group anyway (`terminate` sends
+/// directly and succeeds); the default takes the proxy; the refusal not naming the setter. The checks run
+/// in `test_child::ctrl_break::nested`.
 #[skuld::test]
-fn a_nested_contained_child_without_a_group_is_refused_the_group_break() {
+fn a_nested_contained_child_without_a_group_is_refused_by_the_direct_send() {
     ctrl_break::drive_reporter(
         ctrl_break::nested::NO_GROUP_REPORTER_TEST,
         ctrl_break::nested::NO_GROUP_ADDR_ENV,
@@ -514,12 +652,12 @@ fn a_nested_contained_child_without_a_group_is_refused_the_group_break() {
     );
 }
 
-/// From a caller with no console, the cooperative ops fail with `NoConsole` and send no break, and a
-/// job's or a walker's send to a group the caller leads is `NotSent`. The checks, including the
-/// sender's empty break record, run in `test_child::ctrl_break::console_less` in a re-exec of this
-/// binary spawned detached.
+/// From a caller with no console, the direct send fails with `NoConsole` and sends no break, and the
+/// default asks the proxy instead: its stops answer what the proxy answered. The checks, including the
+/// sender's record, run in `test_child::ctrl_break::console_less` in a re-exec of this binary spawned
+/// detached. Mutant: the default sends the direct break (`NoConsole`, and no proxy asked).
 #[skuld::test]
-fn console_less_caller_sends_no_break() {
+fn a_console_less_callers_default_asks_the_proxy_and_its_direct_send_has_no_console() {
     ctrl_break::drive_reporter(
         ctrl_break::console_less::REPORTER_TEST,
         ctrl_break::console_less::ADDR_ENV,

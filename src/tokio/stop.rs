@@ -8,8 +8,8 @@
 //! runtime thread blocks and no wait for a process uses the blocking pool. That holds for these
 //! functions, not for an action that also calls the blocking ones of [`cosca::stop`](crate::stop) over
 //! the same target. A prepared function that sends and does not wait (`send_signal`,
-//! `send_ctrl_break_to_group`, [`default`]) is the sync function made `async`, so an action composes it
-//! as it composes the others.
+//! `send_ctrl_break_to_group`) is the sync function made `async`, so an action composes it as it
+//! composes the others.
 //!
 //! [`tokio::Child::terminate`]: crate::tokio::Child::terminate
 
@@ -71,9 +71,13 @@ impl StopWaits for AsyncDriver<'_> {
     }
 }
 
-/// The stop a child does when its command set none. As [`stop::default`](crate::stop::default).
+/// The stop a child does when its command set none. As [`stop::default`](crate::stop::default), with the
+/// proxy's wait awaited on Windows; an async action calls this one, not the sync one.
 pub async fn default(target: &StopTarget<'_>) -> Result<(), Error> {
-    crate::stop::default(target)
+    #[cfg(unix)]
+    return crate::stop::default(target);
+    #[cfg(windows)]
+    return crate::stop::default_with(&AsyncDriver(target.child()), target).await;
 }
 
 /// Unix: sends `signal`, and does not wait. As [`stop::send_signal`](crate::stop::send_signal), with the

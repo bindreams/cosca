@@ -666,8 +666,9 @@ impl Command {
     /// `cosca-ctrl-proxy` executable, for a host that cannot call `init` or replaces its own image while
     /// it runs).
     ///
-    /// The setting is only read when a stop sends through the proxy: a child whose stop never does
-    /// ignores it.
+    /// The setting is only read when a stop sends through the proxy: the default stop does for a child
+    /// it cannot send directly ([`stop::default`](crate::stop::default)), and a child whose stop never
+    /// does ignores it.
     #[cfg(windows)]
     pub fn ctrl_proxy(&mut self, proxy: crate::CtrlProxy) -> &mut Command {
         self.ctrl_proxy = std::sync::Arc::new(proxy);
@@ -685,8 +686,11 @@ impl Command {
     /// terminated and reaped before it runs, and the error names the Job Object.
     ///
     /// # Windows: the child's process group
-    /// On Windows a contained child also leads a console process group by default; see
-    /// `new_process_group`.
+    /// On Windows a contained child also leads a console process group by default, which lets the
+    /// default stop send it Ctrl+Break directly from a caller that has a console; see
+    /// `new_process_group`. A contained child with a console of its own (see
+    /// [`no_window`](Self::no_window)), or one of a caller with no console, is stopped through the
+    /// console-event proxy instead, as [`stop::default`](crate::stop::default) says.
     ///
     /// # A child reaped by something else
     /// [`wait`](crate::Child::wait) reaps nothing: the root stays a zombie, which pins its number,
@@ -784,20 +788,19 @@ impl Command {
     ///
     /// # Consequence for cooperative shutdown
     ///
-    /// The child gets a console of its own rather than joining this process's, so a console-group
-    /// signal sent from this process cannot reach it. Not requesting this does not establish the
-    /// reverse — whether a child shares this process's console also depends on the child image's
-    /// subsystem and on what the child does with its own console. What cosca recorded about the
-    /// route is
-    /// `StopTarget::leads_group_on_our_console`; it is
-    /// a statement about the route, never an authority on whether a signal will arrive.
+    /// The child gets a console of its own rather than joining this process's, so a console event sent
+    /// from this process to a group cannot reach it. The default stop therefore does not send it
+    /// directly: it asks the console-event proxy, a helper process that attaches to the child's console
+    /// and sends Ctrl+Break to it there ([`stop::default`](crate::stop::default)), which reaches every
+    /// process on that console. That needs the host program to have called [`cosca::init()`](crate::init)
+    /// (or `Command::ctrl_proxy` to name a proxy program). A child that would have no console anyway,
+    /// such as a windows-subsystem image, has none for the proxy to attach to, and its stop is
+    /// [`Error::Unsupported`] naming `Child::kill`, with nothing sent.
     ///
-    /// This is not "such a child cannot be shut down politely" — a process attached to the child's
-    /// own console can deliver the event. Nor does cosca report an error for one: the cooperative
-    /// ops ([`terminate`](crate::Child::terminate),
-    /// [`terminate_tree`](crate::Child::terminate_tree)) return `Ok` and deliver nothing, which is
-    /// the gap this crate documents rather than the behaviour it wants. The forced ops
-    /// ([`kill`](crate::Child::kill) / [`kill_tree`](crate::Child::kill_tree)) are unaffected.
+    /// Not requesting this does not establish the reverse: whether a child shares this process's
+    /// console also depends on the child image's subsystem and on what the child does with its own
+    /// console. The forced ops ([`kill`](crate::Child::kill) / [`kill_tree`](crate::Child::kill_tree)) are
+    /// unaffected.
     pub fn no_window(&mut self) -> &mut Command {
         self.flags.no_window = true;
         self
@@ -809,10 +812,13 @@ impl Command {
     /// child still writes to the handles it inherited. It also does not leave a job; that is
     /// [`breakaway_from_job`](Self::breakaway_from_job).
     ///
-    /// Same one-directional console consequence as [`no_window`](Self::no_window): a
-    /// console-group signal sent from this process cannot reach such a child, while *not*
-    /// detaching establishes nothing about the reverse — and the cooperative ops return `Ok` and
-    /// deliver nothing rather than reporting an error.
+    /// A console event sent from this process cannot reach such a child directly, and the
+    /// console-event proxy has no console of the child's to attach to either. The default stop asks it
+    /// anyway, as the child may have allocated or attached a console itself, and finding none answers
+    /// [`Error::Unsupported`] naming `Child::kill`, with nothing sent: `terminate` and
+    /// `terminate_tree` return it, and `graceful_shutdown` and `graceful_shutdown_tree` end there with the
+    /// child running. *Not* detaching establishes nothing about the reverse (see
+    /// [`no_window`](Self::no_window)).
     #[cfg(windows)]
     pub fn detached(&mut self) -> &mut Command {
         self.flags.detached = true;
@@ -824,13 +830,17 @@ impl Command {
     ///
     /// The group is what lets a console event be addressed to the child alone:
     /// [`stop::send_ctrl_break_to_group`](crate::stop::send_ctrl_break_to_group), which the default
-    /// stop action uses, refuses a child that leads none with [`Error::Unsupported`], because the
-    /// event would otherwise reach its spawner's whole group. Leadership is fixed at creation.
+    /// stop action uses for a child that leads one on this process's console, refuses a child that
+    /// leads none with [`Error::Unsupported`], because the event would otherwise reach its spawner's
+    /// whole group. Leadership is fixed at creation.
     ///
     /// Unset, the child leads a group when it is contained ([`contain`](Self::contain), root and
     /// nested) and none otherwise. `true` gives one to an uncontained child; `false` takes it from a
     /// contained one, which stays contained and is killed as before, and cannot be sent a console
-    /// event alone.
+    /// event alone. The default stop refuses such a child while it is on this process's own console, with
+    /// the direct send's refusal that names this setter (the event would reach this process too), and
+    /// starts no proxy for it; where it has a console of its own, the default sends Ctrl+Break through the
+    /// console-event proxy, which reaches it with everything else there.
     ///
     /// A child created with the group starts with `Ctrl+C` ignored, which its descendants inherit
     /// unless one re-enables it. `Ctrl+Break` is the event that reaches such a child.

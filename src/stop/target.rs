@@ -212,8 +212,16 @@ impl<'a> StopTarget<'a> {
     /// console after it starts. See `stop::send_ctrl_break_to_group`.
     #[cfg(windows)]
     pub fn leads_group_on_our_console(&self) -> bool {
+        self.child.console.group && self.created_on_our_console()
+    }
+
+    /// Windows: whether the spawn recorded that the child was created on this process's console: none of
+    /// `DETACHED_PROCESS`, `CREATE_NEW_CONSOLE` and `CREATE_NO_WINDOW`, and this process had a console when
+    /// it created it. A child cosca did not create (a UAC elevation's) records no console, so it was not.
+    #[cfg(windows)]
+    pub(crate) fn created_on_our_console(&self) -> bool {
         let console = self.child.console;
-        console.group && !console.own_console_flags && console.caller_had_console
+        !console.own_console_flags && console.caller_had_console
     }
 
     /// The mechanism's own cooperative route, sent the stop `how`, answering what the tree call that runs

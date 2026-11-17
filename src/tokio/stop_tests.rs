@@ -780,3 +780,82 @@ async fn async_wait_saying_calls_late_once_for_a_running_root_only() {
         .await
         .expect("the exited root is reaped");
 }
+
+/// Async twin of the sync `a_child_that_has_exited_is_answered_before_the_proxy_is_started`: a child that has
+/// exited is answered at the first look, `Ok` for a root target and the "root exited" error for
+/// `terminate_tree`, and the proxy (the fixture, which answers `Sent`) is not started.
+///
+/// Mutants: the look comes after the gates or the start (the fixture ran, an answer is recorded); a root
+/// target answers the tree's error.
+#[cfg(windows)]
+#[skuld::test]
+async fn async_a_child_that_has_exited_is_answered_before_the_proxy_is_started() {
+    use crate::stop::proxy::protocol::ProxyAnswer;
+    use crate::stop::proxy::proxy_tests::Fixture;
+    use crate::test_child::ctrl_break::{assert_no_break_sent, spawn_member_async, Handler};
+
+    assert_current_thread();
+    for tree in [false, true] {
+        let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+        let (mut child, sock, _) =
+            spawn_member_async(Handler::Ignore, None, Some(crate::ContainMode::Strongest), |cmd| {
+                cmd.no_window();
+                cmd.ctrl_proxy(fixture.setting());
+            })
+            .await;
+        child.kill().expect("kill the member");
+        child.wait().await.expect("see its exit");
+        drop(sock);
+        if tree {
+            let err = never_blocking(child.terminate_tree())
+                .await
+                .expect_err("nothing was sent to a tree whose root had exited");
+            assert!(
+                matches!(&err, Error::Unassessable { detail, .. } if detail.contains("nothing was sent") && !detail.contains("CTRL_BREAK")),
+                "{err:?}"
+            );
+            never_blocking(child.graceful_shutdown_tree(Duration::ZERO))
+                .await
+                .expect("the call goes on and ends the tree");
+        } else {
+            never_blocking(child.terminate()).await.expect("an exited child is Ok");
+        }
+        assert_no_break_sent();
+        assert!(fixture.ran().is_none(), "tree {tree}: the proxy was started");
+    }
+}
+
+/// Async twin of the sync `the_default_refuses_a_child_cosca_did_not_create`: `tokio::stop::default` refuses a
+/// child a system service created whichever send it would have made, the direct one (the caller had a console
+/// and the facts lead a group) or the proxy's (they do not). Nothing is sent and no proxy is asked.
+///
+/// Mutant: the async default does not refuse such a child (it answers `Ok`, or sends or asks past the refusal,
+/// which the record of sends shows).
+#[cfg(windows)]
+#[skuld::test]
+async fn async_the_default_refuses_a_child_cosca_did_not_create() {
+    use crate::containment::windows::ConsoleFacts;
+
+    assert_current_thread();
+    for caller_had_console in [true, false] {
+        let mut child = test_child::over_fake::child_over(&crate::os_process::fake::FakeProcess::new([
+            crate::os_process::fake::Answer::Running,
+        ]));
+        child.console = ConsoleFacts {
+            group: true,
+            caller_had_console,
+            ..ConsoleFacts::uac_elevated()
+        };
+        let err = never_blocking(stop::default(&StopTarget::from(&child)))
+            .await
+            .expect_err("not created by cosca");
+        let Error::Unsupported { detail, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            detail.contains("did not create this child"),
+            "caller_had_console {caller_had_console}: {detail}"
+        );
+        crate::test_child::ctrl_break::assert_no_break_sent();
+    }
+}

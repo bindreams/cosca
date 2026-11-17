@@ -175,7 +175,7 @@ async fn async_terminate_sends_sigterm() {
 #[cfg(windows)]
 #[skuld::test]
 async fn async_terminate_unsupported_for_an_uncontained_child_on_windows() {
-    let (mut child, sock) = common::spawn_blocker_async().await;
+    let (mut child, sock) = common::spawn_control_async_on_console("control-block", &["R"], false).await;
     let err = child
         .terminate()
         .await
@@ -315,7 +315,7 @@ async fn async_graceful_tree_cancel_does_not_escalate() {
 #[skuld::test]
 async fn async_graceful_shutdown_unsupported_for_an_uncontained_child_on_windows() {
     use std::time::Duration;
-    let (mut child, sock) = common::spawn_blocker_async().await;
+    let (mut child, sock) = common::spawn_control_async_on_console("control-block", &["R"], false).await;
     let err = child
         .graceful_shutdown(Duration::from_secs(1))
         .await
@@ -342,7 +342,8 @@ async fn async_graceful_tree_unsupported_when_uncontained() {
 #[cfg(feature = "tokio")]
 /// Async twin of `child_terminate_reports_ok_for_an_already_exited_child`. The async `Child` pins
 /// its pid for its whole life, as the sync one does, so the already-exited answer is `Ok` on
-/// Windows too.
+/// Windows too, except for a child created on our console that leads no group, which the direct send
+/// refuses before and after its exit, which the last block pins.
 #[skuld::test]
 async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
     let _warns = common::warn_watch();
@@ -350,25 +351,82 @@ async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
     // `kill_tree`, not `kill`: reaping a contained root first and then dropping it warns (#382).
     common::kill_tree_release_reap_async(&mut child, sock).await;
     child.terminate().await.expect("already-dead must be Ok");
+
+    // Off our console too: on Windows the default asks the proxy for these, and this host never called
+    // `cosca::init()`, so a call that asked first would be refused.
+    let (mut child, sock) = common::spawn_control_async_with("control-block", &["R"], true, |_| {}).await;
+    common::kill_tree_release_reap_async(&mut child, sock).await;
+    child
+        .terminate()
+        .await
+        .expect("already-dead, on a console of its own, must be Ok");
+
+    let (mut child, sock) = common::spawn_control_async_with("control-block", &["R"], false, |_| {}).await;
+    common::kill_release_reap_async(&mut child, sock).await;
+    child
+        .terminate()
+        .await
+        .expect("already-dead, uncontained, on a console of its own, must be Ok");
+
+    // The exception: the direct send's refusal of a child that leads no group does not look at the exit.
+    #[cfg(windows)]
+    {
+        let (mut child, sock) = common::spawn_control_async_on_console("control-block", &["R"], false).await;
+        common::kill_release_reap_async(&mut child, sock).await;
+        let err = child
+            .terminate()
+            .await
+            .expect_err("a child on our console that leads no group is refused, exited or not");
+        common::assert_refused_for_no_group(&err);
+    }
+}
+
+/// Async twin of `an_exited_child_the_default_sends_through_the_proxy_is_answered_without_init`
+/// (`ctrl_proxy_host.rs`): this binary's `main` does not call `cosca::init()` either, so an exited child
+/// that the default sends through the proxy is `Ok` only if the look at its exit comes first.
+#[cfg(feature = "tokio")]
+#[cfg(windows)]
+#[skuld::test]
+async fn async_an_exited_child_the_default_sends_through_the_proxy_is_answered_without_init() {
+    assert!(
+        !cosca::installed(),
+        "this binary's `main` must not call `cosca::init()`"
+    );
+    for contain in [false, true] {
+        let (mut child, sock) = common::spawn_control_async_with("control-block", &["R"], contain, |_| {}).await;
+        child.kill().expect("kill the child");
+        child.wait().await.expect("see its exit");
+        drop(sock);
+
+        child
+            .terminate()
+            .await
+            .unwrap_or_else(|e| panic!("contained {contain}: an exited child is Ok: {e:?}"));
+        if contain {
+            let err = child.terminate_tree().await.expect_err("nothing was sent to the tree");
+            assert!(
+                matches!(&err, cosca::error::Error::Unassessable { detail, .. } if detail.contains("nothing was sent")),
+                "{err:?}"
+            );
+            child
+                .graceful_shutdown_tree(std::time::Duration::ZERO)
+                .await
+                .unwrap_or_else(|e| panic!("the call goes on to its sweep: {e:?}"));
+        }
+    }
 }
 
 #[cfg(feature = "tokio")]
 /// The one assertion that catches a future divergence between the two hand-mirrored surfaces:
 /// the async child must refuse an uncontained child exactly as the sync side does, alive and after a
 /// reap. (A contained child is not compared here: its soft stop ends it, and a contained root reaped
-/// before its drop warns, per host, #382.)
+/// before its drop warns, per host. On Windows the default's answers for a child on our console
+/// are compared by `async_default_answers_match_the_sync_surface_on_our_console`.)
 #[skuld::test]
 async fn async_refusals_match_the_sync_surface() {
     let _warns = common::warn_watch();
     let (mut uncontained, s1) = common::spawn_blocker_async().await;
     let (sync_uncontained, s3) = common::spawn_blocker();
-    // Windows refuses a child that leads no group, and sends nothing: both mirrors, alive.
-    #[cfg(windows)]
-    assert_eq!(
-        refusal_shape(&uncontained.terminate().await),
-        refusal_shape(&sync_uncontained.terminate()),
-        "uncontained: the two mirrors answer with different error shapes"
-    );
     assert_eq!(
         refusal_shape(&uncontained.terminate_tree().await),
         refusal_shape(&sync_uncontained.terminate_tree()),
@@ -415,12 +473,79 @@ async fn async_refusals_match_the_sync_surface() {
     common::kill_release_reap_all(vec![(sync_uncontained, s3)]);
 }
 
+/// Windows: the default stop's answers for a child on our console that needs no proxy (a contained child that
+/// leads a group, which gets the direct send, and a contained and an uncontained child that lead none, which
+/// get the direct send's refusal) are the same from the sync and the async `Child`, alive and after the
+/// reap. A proxy that the default started would answer a refusal of its own (this host never called
+/// `cosca::init()`), so a mirror that took it for any of the three differs by the shape of its error.
+#[cfg(feature = "tokio")]
+#[cfg(windows)]
+#[skuld::test]
+async fn async_default_answers_match_the_sync_surface_on_our_console() {
+    let _warns = common::warn_watch();
+    // (name, contained, leads no group)
+    for (name, contain, no_group) in [
+        ("uncontained", false, false),
+        ("contained, no group", true, true),
+        ("contained, leads a group", true, false),
+    ] {
+        let configure = |cmd: &mut cosca::Command| _ = cmd.new_process_group(!no_group && contain);
+        let configure_async = |cmd: &mut cosca::tokio::Command| _ = cmd.new_process_group(!no_group && contain);
+        let (sync_child, sync_sock) =
+            common::spawn_control_on_console_with("control-block-ignore-break", &["R"], contain, configure);
+        let (mut async_child, async_sock) =
+            common::spawn_control_async_on_console_with("control-block-ignore-break", &["R"], contain, configure_async)
+                .await;
+        let alive = (
+            refusal_shape(&async_child.terminate().await),
+            refusal_shape(&sync_child.terminate()),
+        );
+        assert_eq!(alive.0, alive.1, "{name}, alive: the mirrors' terminate");
+        if !contain {
+            assert_eq!(alive.1, "unsupported (no group)", "{name}: the direct send's refusal");
+        } else if no_group {
+            assert_eq!(alive.1, "unsupported (no group)", "{name}: the direct send's refusal");
+            assert_eq!(
+                refusal_shape(&async_child.terminate_tree().await),
+                refusal_shape(&sync_child.terminate_tree()),
+                "{name}, alive: the mirrors' terminate_tree"
+            );
+        } else {
+            assert_eq!(alive.1, "ok", "{name}: the direct send");
+        }
+        if contain {
+            common::kill_tree_release_reap(&sync_child, sync_sock);
+            common::kill_tree_release_reap_async(&mut async_child, async_sock).await;
+        } else {
+            common::kill_release_reap(&sync_child, sync_sock);
+            common::kill_release_reap_async(&mut async_child, async_sock).await;
+        }
+        assert_eq!(
+            refusal_shape(&async_child.terminate().await),
+            refusal_shape(&sync_child.terminate()),
+            "{name}, after the reap: the mirrors' terminate"
+        );
+        if contain {
+            assert_eq!(
+                refusal_shape(&async_child.terminate_tree().await),
+                refusal_shape(&sync_child.terminate_tree()),
+                "{name}, after the reap: the mirrors' terminate_tree"
+            );
+        }
+    }
+}
+
 #[cfg(feature = "tokio")]
 /// The comparable shape of a cooperative-signal outcome: `Error` is `#[non_exhaustive]` and not
-/// `PartialEq`, and the detail strings legitimately differ between the two surfaces.
+/// `PartialEq`, and the detail strings legitimately differ between the two surfaces. An `Unsupported` that
+/// names `Command::new_process_group` is the refusal of a child that leads no group, which is told from any
+/// other refusal.
 fn refusal_shape(result: &Result<(), cosca::error::Error>) -> &'static str {
     match result {
         Ok(()) => "ok",
+        Err(cosca::error::Error::Unsupported { detail, .. }) if detail.contains("Command::new_process_group") => {
+            "unsupported (no group)"
+        }
         Err(cosca::error::Error::Unsupported { .. }) => "unsupported",
         Err(cosca::error::Error::Unassessable { .. }) => "unassessable",
         Err(_) => "other",

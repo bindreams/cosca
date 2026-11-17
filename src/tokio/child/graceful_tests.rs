@@ -62,6 +62,10 @@ async fn contained_child_ignoring_the_signal(contain: impl FnOnce(&mut crate::to
         cmd.stdout(crate::Stdio::null()).expect("null stdout");
     }
     contain(&mut cmd);
+    // The child's console is its own, which the default would reach through the proxy and end by the
+    // break: the subject of these rows is the grace and the stdin, so the stop sends nothing.
+    #[cfg(windows)]
+    cmd.graceful_stop(|_| Box::pin(async { Ok(()) }));
     cmd.stdin(crate::Stdio::pipe_in()).expect("set stdin pipe");
     #[cfg_attr(
         windows,
@@ -696,15 +700,19 @@ async fn windows_async_treewalk_grants_no_grace_window_once_the_root_has_been_wa
 }
 
 // A refusal that never addresses a pid survives the reap. An uncontained Windows child records
-// no group — permanent and pid-independent — so it keeps answering `Unsupported`
+// no group — permanent and pid-independent — so the direct send keeps answering `Unsupported`
 // (what its own doc promises, and what the sync mirror returns for the identical child) after the
 // reap, not `Unassessable`, which is documented as a transient could-not-determine condition a
-// caller may retry.
+// caller may retry. The child stops by the direct send: the default asks the proxy for it, which finds
+// a reaped root gone.
 #[cfg(windows)]
 #[skuld::test]
 async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_reap() {
     // Uncontained: leads no group of its own.
-    let (mut child, stdin) = crate::test_child::held_blocker_async(crate::Stdio::null(), Console::Asked, |_| {}).await;
+    let (mut child, stdin) = crate::test_child::held_blocker_async(crate::Stdio::null(), Console::Asked, |cmd| {
+        cmd.graceful_stop(|target| Box::pin(crate::tokio::stop::send_ctrl_break_to_group(target)));
+    })
+    .await;
     assert!(
         !child.inner.console.group,
         "the subject must be a child whose refusal is permanent, not pid-dependent"

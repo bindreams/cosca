@@ -907,38 +907,28 @@ impl Child {
     /// what `stop::send_signal` does on a tree target with its signal. An
     /// action of the caller's own answers as it chooses: the call does nothing else.
     ///
-    /// **Windows: what the default actually signals.** `CTRL_BREAK` is delivered to the root's
-    /// **process group**, not to the tree. A nested contained descendant that leads its own
-    /// group never receives it, so from THIS handle only
-    /// [`kill_tree`](Child::kill_tree) reaches every member. The layers this skips are not
-    /// beyond a polite shutdown, though: the holder of a nested descendant's own `Child` can
-    /// drain it with [`terminate`](Child::terminate) or
-    /// [`graceful_shutdown`](Child::graceful_shutdown) before this root is torn down, and a
-    /// chain in which each level shuts down its own children drains completely, because a
-    /// child that owns a console can politely signal its own group-leading children.
+    /// **Windows: what the default signals.** For a root that leads its group on this process's console
+    /// (see [`stop::default`](crate::stop::default)), `CTRL_BREAK` is delivered to the root's **process
+    /// group**, not to the tree. A nested contained descendant that leads its own group never receives it,
+    /// so from THIS handle only [`kill_tree`](Child::kill_tree) reaches every member. For a root created
+    /// outside this process's console the default sends it through the proxy
+    /// (`stop::send_console_event_via_proxy`), which reaches every process on the root's console, a nested
+    /// contained descendant included, and no descendant that has a console of its own or was started
+    /// detached. The layers the group signal skips are not beyond a polite shutdown, though: the holder of
+    /// a nested descendant's own `Child` can drain it with [`terminate`](Child::terminate) or
+    /// [`graceful_shutdown`](Child::graceful_shutdown) before this root is torn down.
     ///
-    /// **A root created with `new_process_group(false)` is refused.** The default action returns
-    /// [`Error::Unsupported`](crate::error::Error::Unsupported): nothing is sent, nothing is waited for,
-    /// nothing is killed, and the tree keeps running. [`kill_tree`](Child::kill_tree) ends it.
+    /// **A root that cannot be sent the event is refused:** the refusals, and the remedy each error
+    /// names, are those of [`stop::default`](crate::stop::default), with nothing sent and the tree
+    /// running. [`kill_tree`](Child::kill_tree) ends it. A direct send's success does not prove delivery:
+    /// see [`terminate`](Child::terminate).
     ///
-    /// **And success here does not prove the event was delivered.** A root that shares no
-    /// console with the caller is reported as success and reaches nobody — including a root
-    /// spawned with [`no_window`](crate::Command::no_window) (a console of its own) or
-    /// `detached()` (none). Whether the
-    /// spawn recorded the child as leading its group on this process's console is
-    /// `StopTarget::leads_group_on_our_console`: what
-    /// cosca recorded about the *route* from this process, never an authority on whether a signal will
-    /// arrive. It is also not "this child cannot be shut down politely" — a process attached to the
-    /// child's own console can deliver the event. The cooperative op returns `Ok` and delivers nothing; the
-    /// forced ops ([`kill`](Child::kill) / [`kill_tree`](Child::kill_tree), and the escalation
-    /// half of [`graceful_shutdown_tree`](Child::graceful_shutdown_tree)) are unaffected.
-    ///
-    /// **And it needs the caller to have a console.** The event is deliverable only within
-    /// the *calling* process's console, so a GUI-subsystem binary, a service, or anything
-    /// spawned detached cannot deliver it. The failure is classified best-effort: usually
-    /// [`Error::NoConsole`](crate::error::Error::NoConsole), but a raw `Error::Io` when the
-    /// crate cannot confirm the cause. Treat **any** error here as "no signal was sent, the
-    /// tree is still running" rather than keying a fallback on the variant alone.
+    /// **What an error of the default says on Windows.** As for [`terminate`](Child::terminate). One more
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) says the opposite of the proxy's: a root
+    /// the default sends through the proxy had exited when the call looked, and nothing was sent (the proxy
+    /// cannot name a member that outlived the root), with no proxy started, so `init` is not needed for it
+    /// either. The variant alone cannot tell the two apart; a caller that only wants the tree gone calls
+    /// [`kill_tree`](Child::kill_tree) after any error.
     ///
     /// **macOS `Containment::FdMarker` is stricter than the paragraph above:** `Err` there
     /// means at least one known or suspected tree member could not be assessed or signalled
@@ -947,8 +937,6 @@ impl Child {
     /// still be partially alive after such an `Err`. This is a real, expected outcome on a
     /// real host (e.g. a member that `exec`s a setuid binary becomes unqueryable), not a bug
     /// to route around by ignoring the `Result`.
-    ///
-    /// Attach a console before spawning the tree, or use `kill_tree`, which needs none.
     ///
     /// On the Unix process-group and session mechanisms this returns
     /// [`Error::Containment`](crate::error::Error::Containment) when a live member of the
