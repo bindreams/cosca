@@ -1523,6 +1523,10 @@ pub(crate) fn terminate_tree(
 #[path = "treewalk_tests.rs"]
 mod treewalk_tests;
 
+#[cfg(all(test, unix))]
+#[path = "treewalk_walks_tests.rs"]
+mod treewalk_walks_tests;
+
 #[cfg(all(test, target_os = "linux"))]
 #[path = "treewalk_view_tests.rs"]
 mod treewalk_view_tests;

@@ -4,7 +4,7 @@
 //! for a candidate and its parent that run on every platform are in `identity::tree_tests`.
 
 use super::{read_ppid_once, resolve_ppid, trusted_ppid, PpidRead};
-use crate::identity::{FakeKernel, HostKernel, Kernel, Key, ProcessId, ReadErr, Resolved};
+use crate::identity::{FakeKernel, HostKernel, Kernel, Key, ProcessId, Resolved};
 use crate::test_child::{live_exiting_member, release_unsignalled};
 
 /// The start key of the record the ppid was read from, as a stated value.
@@ -76,9 +76,7 @@ fn a_refused_sysctl_is_unknown_after_one_read() {
 fn a_candidate_whose_parent_read_is_refused_is_unknown() {
     let (child, kid) = live_exiting_member();
     // libproc misses (`EPERM`, as for a cross-user process) and the sysctl fallback is refused.
-    let kernel = FakeKernel::over(&HostKernel)
-        .on_bsd_info(kid.pid(), Err(ReadErr::Refused(libc::EPERM)))
-        .on_kinfo_refused(kid.pid(), libc::EPERM);
+    let kernel = FakeKernel::over(&HostKernel).on_record_refused(kid.pid());
     let parent = Some(ProcessId::current());
     let (read, cause) = ProcessId::of_ordered_with(&kernel, kid.pid(), parent, None, None);
     release_unsignalled(child);

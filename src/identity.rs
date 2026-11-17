@@ -1078,8 +1078,8 @@ pub(crate) use backend::kinfo;
 /// Linux: a `stat` row for `pid` answering `EACCES`, which fails for every read through the kernel,
 /// a table scan's too. macOS: rows refusing every `proc_pidinfo` and `sysctl` read of the record,
 /// so `ppid_of`, `is_running`, `exit_begun` and a process snapshot fail for `pid` too, not only
-/// the identity read. A children walk's snapshot therefore fails first on macOS: a walk whose
-/// anchor is `pid` takes [`unreadable_anchor`].
+/// the identity read. A snapshot therefore fails for `pid` first on macOS: a walk or sweep that
+/// reads `pid` after its snapshot takes [`unreadable_anchor`].
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn unreadable(pid: RawPid) -> impl Kernel {
     ticks_host(pid).on_read(&format!("{pid}/stat"), Err(libc::EACCES))
@@ -1113,7 +1113,7 @@ pub(crate) fn ticks_id(pid: RawPid) -> ProcessId {
         .expect("a live pid has a starttime")
 }
 
-/// [`unreadable`] on macOS: the record read `EPERM`s on both paths, as a sandbox refuses it (a
+/// [`unreadable`] on macOS: every record read `EPERM`s on both paths, as a sandbox refuses it (a
 /// cross-user read is refused by `proc_pidinfo` only).
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn unreadable(pid: RawPid) -> FakeKernel<'static> {
@@ -1122,18 +1122,16 @@ pub(crate) fn unreadable(pid: RawPid) -> FakeKernel<'static> {
         .on_every_kinfo_refused(pid, libc::EPERM)
 }
 
-/// [`unreadable_anchor`] on macOS: the snapshot reads every pid's parent, the anchor's too, before
-/// the walk reads the anchor, so the first record read of `pid` answers with the host's, and every
-/// later one is refused: the refusal is the anchor's and not the snapshot's. `pid` must be live.
+/// [`unreadable_anchor`] on macOS: the snapshot reads every pid's parent, `pid`'s too, before the
+/// walk or sweep reads `pid` (as its anchor, a candidate or a marker holder), so the first record read
+/// of `pid` answers with the host's, and every later one is [`unreadable`]: the refusal is the walk's
+/// or the sweep's and not the snapshot's. `pid` must be live.
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) fn unreadable_anchor(pid: RawPid) -> impl Kernel {
+pub(crate) fn unreadable_anchor(pid: RawPid) -> FakeKernel<'static> {
     let Ok(record) = HostKernel.bsd_info(pid) else {
         panic!("pid {pid} is live and has a record");
     };
-    FakeKernel::over(&HostKernel)
-        .on_bsd_info(pid, Ok(record))
-        .on_every_bsd_info_failing(pid, ReadErr::Refused(libc::EPERM))
-        .on_every_kinfo_refused(pid, libc::EPERM)
+    unreadable(pid).on_bsd_info(pid, Ok(record))
 }
 
 /// The assert-free identity reads every `exit_only` check uses.

@@ -775,6 +775,7 @@ fn refused_kqueue_of_a_late_child() {
         late: true,
         killed: true,
         kill_read: None,
+        listing_fails: false,
     };
     let refused = refused_kqueue_spawn(cmd, await_grandchild_before(&tree), (), how);
     let tree = tree.borrow_mut().take().expect("the tree");
@@ -833,12 +834,11 @@ fn refused_kqueue_whose_holders_sweep_fails() {
     let (cmd, tree) = tree_spawn();
     let awaited = await_grandchild_before(&tree);
     // The marker has no root, so its sweep takes one pass, which is blind.
-    let before = move || {
-        awaited();
-        crate::containment::enumerate::force_blind_snapshots(1);
+    let how = Refusing {
+        listing_fails: true,
+        ..Refusing::KILLS
     };
-    let refused = refused_kqueue_spawn(cmd, before, (), Refusing::KILLS);
-    crate::containment::enumerate::assert_blind_snapshots_consumed();
+    let refused = refused_kqueue_spawn(cmd, awaited, (), how);
     // Released whatever the blind sweep did to it.
     _ = tree.borrow_mut().take().expect("the tree").grandchild_survived();
     assert!(
@@ -864,6 +864,8 @@ struct Refusing {
     /// What the kill's id read of the child answers, a row of the spawn's kernel stated once the
     /// child exists; `None`: the host's.
     kill_read: Option<UniqRead>,
+    /// The spawn's one pid listing fails, a row of the spawn's kernel: its marker's sweep is blind.
+    listing_fails: bool,
 }
 
 impl Refusing {
@@ -871,11 +873,13 @@ impl Refusing {
         late: false,
         killed: true,
         kill_read: None,
+        listing_fails: false,
     };
     const SENDS_NOTHING: Refusing = Refusing {
         late: false,
         killed: false,
         kill_read: None,
+        listing_fails: false,
     };
 }
 
@@ -949,6 +953,9 @@ fn refused_kqueue_spawn<E>(mut cmd: crate::Command, before: impl Fn() + 'static,
             if let Some(read) = how.kill_read {
                 kernel.state_unique_info(fault::spawn_pid(), read);
             }
+            if how.listing_fails {
+                kernel.state_pids(Err(libc::EIO));
+            }
             *refused.borrow_mut() = Some(crate::test_child::refuse_new_descriptors());
         }
     });
@@ -958,7 +965,7 @@ fn refused_kqueue_spawn<E>(mut cmd: crate::Command, before: impl Fn() + 'static,
     let error = spawned.expect_err("a refused kqueue fails the spawn");
     assert!(
         kernel.all_rows_taken(),
-        "the kill made the id read its row answers (a row stated by `kill_read`)"
+        "the spawn made every read its rows answer (`kill_read`, `listing_fails`)"
     );
     let pid = pid.get().expect("the first-read hook ran");
     let warns = crate::log_capture::warns_since(mark, "could not be watched");

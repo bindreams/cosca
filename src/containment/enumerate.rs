@@ -71,28 +71,13 @@ impl Table {
 }
 
 /// Every listable pid plus the `(pid, ppid)` edges plus the denied-ppid-read count, from one
-/// enumeration (macOS only — the fd-marker sweep needs all three, consistently, so it cannot
-/// disagree with the ppid-walk channel about the host).
+/// enumeration read through `kernel` (macOS only: the fd-marker sweep needs all three, consistently,
+/// so it cannot disagree with the ppid-walk channel about the host).
 #[cfg(target_os = "macos")]
-pub(crate) fn snapshot() -> (Vec<RawPid>, Vec<(RawPid, RawPid)>, usize) {
-    backend::snapshot()
-}
-
-/// Test-only re-export of the macOS backend's blind-snapshot fault seam — `fdmarker_tests.rs`
-/// (a different module) needs it to exercise `Marker::sweep`'s `incomplete`/`Err` path
-/// end-to-end, and `backend` is private to this file.
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) fn force_blind_snapshots(count: usize) {
-    backend::force_blind_snapshots(count)
-}
-
-/// Test-only: panics unless every blind snapshot [`force_blind_snapshots`] armed was consumed.
-#[cfg(all(test, target_os = "macos"))]
-#[track_caller]
-pub(crate) fn assert_blind_snapshots_consumed() {
-    backend::assert_blind_snapshots_consumed()
+pub(crate) fn snapshot(kernel: &dyn Kernel) -> (Vec<RawPid>, Vec<(RawPid, RawPid)>, usize) {
+    backend::snapshot(kernel)
 }
 
 /// Test-only re-export of the backend's fault seams, for the tree-walk propagation tests.
-#[cfg(all(test, any(target_os = "macos", windows)))]
+#[cfg(all(test, windows))]
 pub(crate) use backend::fault as backend_fault;

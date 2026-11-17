@@ -471,9 +471,12 @@ fn macos_sync_spawn_of_a_late_contained_child_kills_its_tree() {
 }
 
 /// A late [`TREE_ARGV`] child under `TreeWalk` without a marker, whose first tree sweep is spoiled by
-/// `spoil`, armed once the grandchild runs. Answers the root's pid, its fate, whether the grandchild
-/// survived the teardown, the log mark taken before the spawn, and the `cleanup` of the spawn's error.
-fn late_tree_walk(spoil: impl FnOnce() + 'static) -> (u32, ChildFate, bool, usize, Option<crate::error::Failures>) {
+/// `spoil`, run once the grandchild runs, which may state rows on the kernel the spawn was started with.
+/// Answers the root's pid, its fate, whether the grandchild survived the teardown, the log mark taken
+/// before the spawn, and the `cleanup` of the spawn's error.
+fn late_tree_walk(
+    spoil: impl FnOnce(&FakeKernel<'static>) + 'static,
+) -> (u32, ChildFate, bool, usize, Option<crate::error::Failures>) {
     use crate::containment::ContainMode;
     crate::log_capture::install();
     let (tree, ends) = tree_pipes();
@@ -484,18 +487,20 @@ fn late_tree_walk(spoil: impl FnOnce() + 'static) -> (u32, ChildFate, bool, usiz
         cmd.fd(fd, end).expect("set the fd");
     }
     let tree = Rc::new(std::cell::RefCell::new(Some(tree)));
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
     let _hook = crate::child::spawn::fault::set_at(crate::child::spawn::fault::SpawnPoint::BeforeLateTeardown, {
-        let tree = Rc::clone(&tree);
+        let (tree, kernel) = (Rc::clone(&tree), Arc::clone(&kernel));
         move || {
             tree.borrow_mut().as_mut().expect("the tree").await_grandchild();
-            spoil();
+            spoil(&kernel);
         }
     });
     let mark = crate::log_capture::mark();
     let err = {
         let _late = unique_report::seams::find_the_report_unwritten();
-        cmd.spawn().expect_err("a late child is not adopted")
+        spawn_over(&mut cmd, Arc::clone(&kernel)).expect_err("a late child is not adopted")
     };
+    assert!(kernel.all_rows_taken(), "the teardown made every read its rows answer");
     let cleanup = match &err {
         crate::error::Error::MayHaveStarted { cleanup, .. } => cleanup.clone(),
         other => panic!("expected MayHaveStarted, got {other:?}"),
@@ -515,23 +520,22 @@ fn late_tree_walk(spoil: impl FnOnce() + 'static) -> (u32, ChildFate, bool, usiz
 /// The failed sweep is also the spawn's `cleanup`, as an error: the walk's own failure, not its text.
 ///
 /// Mutants: a walk from the zombie root runs and overwrites the first one's result; the failure is
-/// only in the warn's text.
+/// only in the warn's text; the walk lists through the host's kernel (the row is left).
 #[skuld::test]
 fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_was_not_fully_killed() {
-    let (pid, fate, survived, mark, cleanup) =
-        late_tree_walk(|| crate::containment::enumerate::force_blind_snapshots(1));
+    let (pid, fate, survived, mark, cleanup) = late_tree_walk(|kernel| kernel.state_pids(Err(libc::EIO)));
     assert!(survived, "a walk that could not take its snapshot kills nothing");
     assert_eq!(fate, ChildFate::Reaped, "the root is killed and reaped");
     assert_one_warn(
         pid,
         mark,
-        &[SAID_REAPED, "its tree was not fully killed", "test fault injected"],
+        &[SAID_REAPED, "its tree was not fully killed", "proc_listallpids failed"],
         &[],
     );
     let cleanup = cleanup.expect("the failed sweep is the cleanup");
     assert_eq!(cleanup.iter().len(), 1, "{cleanup:?}");
     assert!(
-        crate::error::said(&**cleanup.first()).contains("test fault injected"),
+        crate::error::said(&**cleanup.first()).contains("proc_listallpids failed"),
         "{cleanup:?}"
     );
 }
@@ -542,7 +546,7 @@ fn macos_late_tree_walk_that_fails_before_the_root_kill_says_its_tree_was_not_fu
 /// Mutant: a later walk's answer overwrites the error of the first.
 #[skuld::test]
 fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_was_not_fully_killed() {
-    let (pid, fate, _, mark, cleanup) = late_tree_walk(|| {
+    let (pid, fate, _, mark, cleanup) = late_tree_walk(|_| {
         crate::containment::treewalk::fault::force_incomplete_once(
             crate::containment::treewalk::fault::LeftBehind::Descendant,
         );
@@ -570,7 +574,7 @@ fn macos_late_tree_walk_that_leaves_a_member_says_its_tree_was_not_fully_killed(
 /// its `NoRoot` is held as a failed sweep.
 #[skuld::test]
 fn macos_late_tree_walk_that_leaves_only_the_root_is_settled_by_the_root_kill() {
-    let (pid, fate, survived, mark, cleanup) = late_tree_walk(|| {
+    let (pid, fate, survived, mark, cleanup) = late_tree_walk(|_| {
         crate::containment::treewalk::fault::force_incomplete_once(
             crate::containment::treewalk::fault::LeftBehind::Root,
         );
@@ -987,7 +991,8 @@ fn macos_late_teardown_with_a_refused_kill_hands_it_back_and_says_so() {
 /// fate names it by that identity. Both of the tree's walks (before the root's kill, and after it,
 /// the root still alive and ours) are forced blind, so they kill nothing.
 ///
-/// Mutant: the teardown drops the attach's identity (`Running { id: None }`).
+/// Mutants: the teardown drops the attach's identity (`Running { id: None }`); a walk lists through
+/// the host's kernel (a failed-listing row is left, and the host kills the child's tree).
 #[skuld::test]
 fn macos_late_teardown_of_a_contained_child_with_a_refused_kill_names_it_running() {
     let (blocker, unique) = std_blocker_with_unique();
@@ -996,6 +1001,9 @@ fn macos_late_teardown_of_a_contained_child_with_a_refused_kill_names_it_running
     let pid = child.id();
     // The tree's reads of the root come before the kill's, and how many is the walk's business.
     let (kernel, _refused) = refused_kill(pid);
+    // One listing for each of the tree's two walks; `tear_down_over` fails the test if either is not read.
+    kernel.state_pids(Err(libc::EIO));
+    kernel.state_pids(Err(libc::EIO));
     let (fate, _warns, sent) = tear_down_over(
         kernel,
         Some(crate::containment::ContainMode::TreeWalk),
@@ -1003,12 +1011,8 @@ fn macos_late_teardown_of_a_contained_child_with_a_refused_kill_names_it_running
         &stdin,
         unique,
         || {},
-        |_| {
-            crate::containment::enumerate::force_blind_snapshots(2);
-            vec![]
-        },
+        |_| vec![],
     );
-    crate::containment::enumerate::assert_blind_snapshots_consumed();
     assert!(
         matches!(fate, ChildFate::Running { id: Some(id) } if id.pid() == pid),
         "{fate:?}"
@@ -1173,11 +1177,12 @@ enum Elsewhere {
 
 /// A late [`TREE_ARGV`] child contained as `contain` sets, whose root `elsewhere` after its kill, so
 /// the root is not shown an unreaped zombie. `spoil` runs once the grandchild runs, before the first
-/// sweep. A root held by launchd is left a zombie, which this reaps.
+/// sweep, and may state rows on the kernel the spawn was started with. A root held by launchd is left a
+/// zombie, which this reaps.
 fn late_tree_not_zombie(
     contain: impl FnOnce(&mut crate::Command),
     elsewhere: Elsewhere,
-    spoil: impl FnOnce() + 'static,
+    spoil: impl FnOnce(&FakeKernel<'static>) + 'static,
 ) -> NotZombie {
     use crate::child::spawn::fault::{set_at, set_between_kill_and_wait, SpawnPoint};
     use std::cell::RefCell;
@@ -1192,15 +1197,15 @@ fn late_tree_not_zombie(
     let tree = Rc::new(RefCell::new(Some(tree)));
     let walks = Rc::new(crate::containment::treewalk::fault::record_walks());
     let holders = crate::containment::fdmarker::fault::record_holder_kills();
+    let kernel = Arc::new(FakeKernel::over(&HostKernel));
     let _first = set_at(SpawnPoint::BeforeLateTeardown, {
-        let tree = Rc::clone(&tree);
+        let (tree, kernel) = (Rc::clone(&tree), Arc::clone(&kernel));
         move || {
             tree.borrow_mut().as_mut().expect("the tree").await_grandchild();
-            spoil();
+            spoil(&kernel);
         }
     });
     let marks = Rc::new(Cell::new((0, 0)));
-    let kernel = Arc::new(FakeKernel::over(&HostKernel));
     let root = Rc::new(Cell::new(0));
     let looks_before = Rc::new(Cell::new(0));
     let _second = set_at(SpawnPoint::BeforeLateRootKill, {
@@ -1259,7 +1264,7 @@ fn late_tree_not_zombie(
 const NOT_SWEPT_AGAIN: &str = "not shown an unreaped zombie, so its tree was not killed again by its pid";
 
 /// A marked tree whose root is not shown a zombie after its kill: its marker's holders are still
-/// swept, and the root's pid is not walked again. The first sweep is spoiled (blind snapshots for
+/// swept, and the root's pid is not walked again. The first sweep is spoiled (failed pid listings for
 /// both of its passes, the second following a first that found the root, and no kill of the root by
 /// its identity), so only that holders' sweep can reach the grandchild.
 ///
@@ -1272,9 +1277,10 @@ fn macos_late_marked_tree_whose_root_is_not_shown_a_zombie_still_sweeps_its_hold
             cmd.contain_with(ContainMode::TreeWalk);
         },
         Elsewhere::Reaped,
-        || {
-            // Two blind snapshots: pass 1 finds the root (not killed), so a second pass follows.
-            crate::containment::enumerate::force_blind_snapshots(2);
+        |kernel| {
+            // Two failed listings: pass 1 finds the root (not killed), so a second pass follows.
+            kernel.state_pids(Err(libc::EIO));
+            kernel.state_pids(Err(libc::EIO));
             crate::containment::fdmarker::fault::set_force_root_kill_noop(true);
         },
     );
@@ -1310,7 +1316,7 @@ fn macos_late_walked_tree_whose_root_is_not_shown_a_zombie_is_not_walked_again()
             cmd.contain_with(ContainMode::TreeWalk).suppress_fd_marker();
         },
         Elsewhere::HeldByLaunchd,
-        || {},
+        |_| {},
     );
     assert!(!seen.survived, "the first sweep kills the grandchild");
     assert_eq!(
@@ -1335,7 +1341,7 @@ fn macos_late_session_tree_whose_root_was_reaped_elsewhere_after_its_kill_says_i
             cmd.contain_with(ContainMode::Session).suppress_fd_marker();
         },
         Elsewhere::Reaped,
-        || {},
+        |_| {},
     );
     assert!(!seen.survived, "the first sweep kills the grandchild");
     assert_eq!(seen.fate, ChildFate::Killed);

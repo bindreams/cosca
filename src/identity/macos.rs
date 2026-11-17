@@ -26,6 +26,8 @@ use kernel::Kernel;
 pub(crate) mod kernel;
 #[path = "macos/kinfo.rs"]
 pub(crate) mod kinfo;
+#[path = "macos/pids.rs"]
+mod pids;
 
 /// The shared contract-violation disposition for BOTH identity sources, libproc ([`libproc_record`],
 /// for an errno it does not expect or a partial record) and the sysctl (`kinfo`): trace FIRST (so

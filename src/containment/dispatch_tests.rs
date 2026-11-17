@@ -514,8 +514,8 @@ fn nested_attach_is_delegated() {
 
 /// A tree-walk root's tree holds the kernel its `Prepared` carries (the same `Arc`), on every platform:
 /// the Linux and non-Linux Unix arms, and the Windows arm that takes a tree walk by request. (A macOS
-/// root with an fd marker gets the marker, and a Windows root that falls back to a tree walk because no
-/// job could be made is not driven here.)
+/// root with an fd marker gets the marker, and a Windows root that falls back to a tree walk because
+/// no job could be made is not driven here.)
 ///
 /// Mutant: an `attach_tree` arm builds its `Walker` over a kernel other than `prepared.kernel`.
 #[skuld::test]
@@ -535,6 +535,48 @@ fn a_tree_walk_root_holds_the_kernel_its_prepared_carries() {
     );
     drop(tree);
     assert_eq!(std::sync::Arc::strong_count(&kernel), 1, "the tree held the other");
+}
+
+/// A contained macOS spawn's fd-marker sweep lists processes through the kernel the spawn was started
+/// with: a failed listing stated on it is the sweep's pass, which is blind, so the kill is an error and
+/// the row is taken. The root is still killed, since neither its kill nor the group signal needs the
+/// process table, and the root's handle kills it after the sweep: it ends by SIGKILL, sent before its
+/// stdin is closed, so the stdin's end is not what ended it. The test does not tell those three killers
+/// apart.
+///
+/// Mutants: the sweep lists through the host's kernel (the row is left, and the host's listing finds the
+/// tree); a blind kill sends nothing to the root (the blocker ends at its stdin's end, by exit and not
+/// by signal).
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn a_spawns_fd_marker_sweep_lists_processes_through_the_kernel_the_spawn_started_with() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let kernel = std::sync::Arc::new(crate::identity::FakeKernel::over(&crate::identity::HostKernel));
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let mut child =
+        crate::child::spawn::identity_macos_tests::spawn_over(&mut cmd, std::sync::Arc::clone(&kernel)).expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    kernel.state_pids(Err(libc::EIO));
+
+    let result = child.kill_tree();
+
+    assert!(
+        kernel.all_rows_taken(),
+        "the sweep did not list processes through the spawn's kernel"
+    );
+    assert!(result.is_err(), "a blind sweep is not a converged kill: {result:?}");
+    // The signal was sent inside `kill_tree`, before the stdin closes here.
+    drop(stdin);
+    let status = child.wait().expect("reap");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the blind kill did not end the root by a signal: {status:?}"
+    );
 }
 
 // kill_tree handle-backstop (treewalk / macOS fd-marker fault seam) =====
