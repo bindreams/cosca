@@ -119,6 +119,13 @@
 //! }
 //! ```
 //!
+//! # Asking a child to stop: [`stop`]
+//!
+//! [`Child::terminate`], [`graceful_shutdown`](Child::graceful_shutdown) and their `_tree` forms ask the
+//! child to stop: `SIGTERM` on Unix, `Ctrl+Break` on Windows, as [`stop::default`] says.
+//! [`Command::graceful_stop`] replaces what is sent with an action composed from the functions of the
+//! [`stop`] module, whose docs say what a stop reaches on each platform and how to choose one.
+//!
 //! # Platform requirements
 //!
 //! **Linux 5.6 or newer**, with `pidfd_open` and `openat2` not blocked by a seccomp profile or an

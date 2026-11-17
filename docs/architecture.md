@@ -71,6 +71,28 @@ The public types follow the same line:
 - a consumer's own knowledge (cgroup membership, Job Object assignment), which stays with that
   consumer and uses the borrowed handle.
 
+## The stop action
+
+What a child's cooperative stop sends is an action it stores, not a rule inside the call that runs it:
+
+- **The calls run the action and add no send.** `terminate`, `graceful_shutdown`, `terminate_tree` and
+  `graceful_shutdown_tree` run the child's action (`Command::graceful_stop`, default `stop::default`) on a
+  `StopTarget` that stands for the root or for the tree. The graceful shutdowns go on from what its last
+  prepared send recorded: the grace, the sweep and the reap are the call's, never the action's.
+- **A prepared send carries its own gates.** Each function of `cosca::stop` applies the rules a send to
+  this child is subject to inside itself, so one called directly from an action of the caller's cannot skip
+  a gate; the doc of each says which gate applies to which target (`send_signal` for the Unix ones). The
+  calls check only that a tree call has a tree, before the action runs.
+- **A tree send is the mechanism's route.** A prepared send to a tree target hands the containment
+  mechanism its stop; the mechanism does not know an action exists. Under `graceful_shutdown_tree` the
+  mechanism's outcome is left as a record on the target, which the call goes on from. On Windows no
+  mechanism sends a console event: the prepared send makes it and hands the mechanism its result.
+- **The proxy is a role, with one contract.** The console-event proxy is the host program started with the
+  proxy's arguments after `cosca::init()`, or the `cosca-ctrl-proxy` executable. Its arguments and exit codes
+  are the only thing the caller's side and the proxy's own sequence share. The caller names the target by
+  identity, so a reused pid is never sent an event, and cosca starts a copy of the host as the proxy only
+  when the host has called `init`.
+
 ## Boundaries still to draw
 
 Each one gets the same treatment before any code:
