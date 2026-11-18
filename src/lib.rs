@@ -432,6 +432,8 @@ fn main() {
     elevation::shim::owner_helper::run_if_requested();
     #[cfg(unix)]
     test_child::blocked_tree_root::run_if_requested();
+    #[cfg(unix)]
+    test_child::signal_tree::run_if_requested();
     #[cfg(target_os = "linux")]
     test_child::zombie_leader_root::run_if_requested();
     let mut runner = skuld::TestRunner::new();

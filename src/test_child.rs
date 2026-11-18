@@ -31,6 +31,9 @@ pub(crate) mod unwaitable;
 #[cfg(unix)]
 pub(crate) mod blocked_tree_root;
 
+#[cfg(unix)]
+pub(crate) mod signal_tree;
+
 #[cfg(target_os = "linux")]
 pub(crate) mod zombie_leader_root;
 
@@ -1756,60 +1759,38 @@ pub(crate) const CAT_TREE_ARGV: &[&str] = &[
     "exec 3<&0; { cat <&3 3<&- && echo eof; } & echo r; exec cat",
 ];
 
-/// A root and one descendant (a subshell) on one stdin pipe, each handling `SIGHUP`, `SIGTERM`,
-/// `SIGUSR1` and `SIGUSR2` by printing `<root|leaf> SIG<NAME>` and exiting, each with a `cat` of its own
-/// on that pipe. The descendant prints `r` once all four processes exist and both shells have installed
-/// their handlers, so a signal sent after `r` finds every member of the tree. A signal only the handlers
-/// see is reported by name, so a test learns which signal each of the two received. When none arrives the
-/// stdin's end makes each print `<root|leaf> eof` instead.
-///
-/// The `cat`s ignore the four signals, set before each is forked (an ignored disposition survives the
-/// `exec`), so a signal cannot end one before its shell's handler runs. They end only with the stdin, so a
-/// test that waits for the tree to drain ends the stdin after its send.
 #[cfg(unix)]
-pub(crate) const SIGNAL_REPORTING_TREE_ARGV: &[&str] = &[
-    "sh",
-    "-c",
-    "exec 3<&0; \
-     traps() { trap \"echo $1 SIGHUP; exit 0\" HUP; trap \"echo $1 SIGTERM; exit 0\" TERM; \
-               trap \"echo $1 SIGUSR1; exit 0\" USR1; trap \"echo $1 SIGUSR2; exit 0\" USR2; }; \
-     quiet() { trap '' HUP TERM USR1 USR2; }; \
-     quiet; cat <&3 3<&- & traps root; \
-     { quiet; cat <&3 3<&- & traps leaf; echo r; wait; echo 'leaf eof'; } & \
-     wait; echo 'root eof'",
-];
+fn signal_tree_argv(mode: signal_tree::Mode) -> Vec<std::ffi::OsString> {
+    std::iter::once(std::env::current_exe().expect("current_exe").into_os_string())
+        .chain(signal_tree::argv(mode).map(std::ffi::OsString::from))
+        .collect()
+}
 
-/// [`SIGNAL_REPORTING_TREE_ARGV`] where `SIGUSR1` is only reported and the process goes on, so a stop
-/// can send a second signal: `SIGTERM` is reported and ends it, as there. Each process prints
-/// `<root|leaf> SIGUSR1` and `<root|leaf> SIGTERM` in the order its shell runs the traps of signals
-/// pending together, which is ascending signal number (dash and bash), not arrival order. The two are the
-/// same only when the first report has been read before the second signal is sent.
-///
-/// Every member handles the first signal and keeps running, whichever of them the signal reaches: the
-/// shells by their traps, and the two `cat`s by ignoring it (an ignored signal stays ignored across
-/// `exec`, and is set before the `cat` is forked, so there is no window in which it would kill one). The
-/// `cat`s ignore `SIGTERM` too and end only with the stdin, so a per-member send cannot end one before its
-/// shell's handler runs.
-/// A shell waits for its `cat` and goes back to waiting while the `cat` still lives, so a trap's
-/// interruption of `wait` neither ends the shell nor makes it spin, in any `sh`. The leaf prints `r`
-/// once everything is in place.
+/// The argv of a [`signal_tree`] whose root and leaf, on one stdin pipe and in one process group, each
+/// report `SIGHUP`, `SIGTERM`, `SIGUSR1` or `SIGUSR2` by name and exit. Its lines, its readiness line and
+/// `eof` are described there.
 #[cfg(unix)]
-pub(crate) const SIGNAL_THEN_TERM_TREE_ARGV: &[&str] = &[
-    "sh",
-    "-c",
-    "exec 3<&0; \
-     traps() { trap \"echo $1 SIGUSR1\" USR1; trap \"echo $1 SIGTERM; exit 0\" TERM; }; \
-     hold() { while :; do wait $1; kill -0 $1 2>/dev/null || break; done; }; \
-     trap '' USR1 TERM; cat <&3 3<&- & c=$!; traps root; \
-     { trap '' USR1 TERM; cat <&3 3<&- & d=$!; traps leaf; echo r; hold $d; echo 'leaf eof'; } & \
-     hold $c; echo 'root eof'",
-];
+pub(crate) fn signal_reporting_tree_argv() -> Vec<std::ffi::OsString> {
+    signal_tree_argv(signal_tree::Mode::Reporting)
+}
+
+/// [`signal_reporting_tree_argv`] where `SIGUSR1` is only reported and the member goes on, so a stop
+/// can send a second signal: `SIGTERM` is reported and ends it, as there. A member prints
+/// `<root|leaf> SIGUSR1` and `<root|leaf> SIGTERM`: signals it has seen together are reported in that
+/// order, `SIGUSR1` first, however they arrived, and a signal sent before the stdin ended is reported
+/// before `eof`. The reports are in the order sent only when the first has been read before the second
+/// signal is sent.
+#[cfg(unix)]
+pub(crate) fn signal_then_term_tree_argv() -> Vec<std::ffi::OsString> {
+    signal_tree_argv(signal_tree::Mode::ThenTerm)
+}
 
 /// Sets `cmd` up to run `argv` with its stdin and stdout piped: the setup of [`ready_tree`] and
 /// [`ready_tree_async`].
 #[cfg(unix)]
-fn pipe_ready_tree(cmd: &mut crate::Command, argv: &[&str]) {
-    cmd.args(argv.iter().copied());
+fn pipe_ready_tree<S: Into<std::ffi::OsString>>(cmd: &mut crate::Command, argv: impl IntoIterator<Item = S>) {
+    cmd.args(argv);
+    crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
     cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
 }
@@ -1817,8 +1798,8 @@ fn pipe_ready_tree(cmd: &mut crate::Command, argv: &[&str]) {
 /// A tree of `argv` contained as `contain` asks, once it has printed `r\n`: the child, the write end
 /// of its stdin and its stdout, from which the readiness line has been read.
 #[cfg(unix)]
-pub(crate) fn ready_tree(
-    argv: &[&str],
+pub(crate) fn ready_tree<S: Into<std::ffi::OsString>>(
+    argv: impl IntoIterator<Item = S>,
     contain: impl FnOnce(&mut crate::Command),
 ) -> (crate::Child, crate::PipeWriter, crate::PipeReader) {
     use std::io::Read as _;
@@ -1837,8 +1818,8 @@ pub(crate) fn ready_tree(
 
 /// [`ready_tree`] for the tokio `Child`: its stdin and its stdout, from which the readiness line has been read.
 #[cfg(all(unix, feature = "tokio"))]
-pub(crate) async fn ready_tree_async(
-    argv: &[&str],
+pub(crate) async fn ready_tree_async<S: Into<std::ffi::OsString>>(
+    argv: impl IntoIterator<Item = S>,
     contain: impl FnOnce(&mut crate::tokio::Command),
 ) -> (crate::tokio::Child, crate::tokio::ChildStdin, crate::tokio::ChildStdout) {
     use ::tokio::io::AsyncReadExt as _;
@@ -1855,7 +1836,7 @@ pub(crate) async fn ready_tree_async(
     (child, stdin, stdout)
 }
 
-/// The report lines of a [`SIGNAL_REPORTING_TREE_ARGV`] tree (one per process), read to the end of its
+/// The report lines of a [`signal_reporting_tree_argv`] tree (one per member), read to the end of its
 /// stdout and sorted. The caller has ended the tree's stdin, so a member the signal missed reports its end
 /// of input (`<member> eof`) instead: the lines say who was reached, and no read waits on a member that
 /// reports nothing.
@@ -1900,7 +1881,7 @@ impl<W> HeldStdin<W> {
     }
 }
 
-/// Asserts `lines`, the lines one member of a [`SIGNAL_THEN_TERM_TREE_ARGV`] tree reported, in the order it
+/// Asserts `lines`, the lines one member of a [`signal_then_term_tree_argv`] tree reported, in the order it
 /// reported them: its `SIGUSR1` report, then its `SIGTERM` report, and nothing else. With `repeat` (a
 /// route that sends a member each signal twice, which merge when pending together: the macOS fd marker) each
 /// report is one line or two; without it, one.

@@ -174,7 +174,7 @@ async fn async_a_chosen_signal_reaches_every_member_of_the_tree() {
     for shutdown in [false, true] {
         let held = test_child::HeldStdin::default();
         let (mut child, stdin, mut stdout) =
-            test_child::ready_tree_async(test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
+            test_child::ready_tree_async(test_child::signal_reporting_tree_argv(), |cmd| {
                 test_child::contain_without_cgroup_async(cmd);
                 cmd.graceful_stop(signalling_then_ending_the_input(&held));
             })
@@ -209,14 +209,14 @@ async fn async_a_chosen_signal_reaches_every_member_of_the_tree() {
                 ["leaf SIGUSR1", "root SIGUSR1"],
                 "both members got the chosen signal"
             );
-            child.wait().await.expect("the root exited on its handler");
+            child.wait().await.expect("the root reported the signal and exited");
         }
     }
 }
 
 // Composing sends with a wait =====
 
-/// A [`SIGNAL_THEN_TERM_TREE_ARGV`](test_child::SIGNAL_THEN_TERM_TREE_ARGV) tree's stdout, read as its
+/// A [`signal_then_term_tree_argv`](test_child::signal_then_term_tree_argv) tree's stdout, read as its
 /// members report: each wait is for the members' own lines, or the end of the stream once the tree's stdin
 /// has ended, a real condition with no time in it.
 #[cfg(unix)]
@@ -297,33 +297,34 @@ async fn async_an_action_may_compose_sends_with_a_wait() {
         } else {
             &["root SIGUSR1"]
         };
-        let (mut child, stdin, stdout) = test_child::ready_tree_async(test_child::SIGNAL_THEN_TERM_TREE_ARGV, |cmd| {
-            if tree {
-                test_child::contain_without_cgroup_async(cmd);
-            }
-            let (waited, reports, held) = (Arc::clone(&waited), Arc::clone(&reports), held.clone());
-            cmd.graceful_stop(move |target| {
+        let (mut child, stdin, stdout) =
+            test_child::ready_tree_async(test_child::signal_then_term_tree_argv(), |cmd| {
+                if tree {
+                    test_child::contain_without_cgroup_async(cmd);
+                }
                 let (waited, reports, held) = (Arc::clone(&waited), Arc::clone(&reports), held.clone());
-                Box::pin(async move {
-                    let sent = crate::send_log::Capture::start();
-                    stop::send_signal(target, crate::Signal::Usr1).await?;
-                    // Fails here, not in the wait below, if nothing was sent.
-                    sent.require_a_send(libc::SIGUSR1)?;
-                    // The members keep running: the root is looked at once, and every member reports
-                    // the signal before the second goes out.
-                    let running = stop::wait_exit(target, Duration::ZERO).await?;
-                    waited.lock().unwrap().push(running);
-                    reports.lock().await.as_mut().expect("the reports").until(first).await;
-                    stop::send_signal(target, crate::Signal::Term).await?;
-                    held.end();
-                    // The root exits on the second signal: the wait ends on its exit.
-                    let exited = stop::wait_exit(target, Duration::MAX).await?;
-                    waited.lock().unwrap().push(exited);
-                    Ok(())
-                })
-            });
-        })
-        .await;
+                cmd.graceful_stop(move |target| {
+                    let (waited, reports, held) = (Arc::clone(&waited), Arc::clone(&reports), held.clone());
+                    Box::pin(async move {
+                        let sent = crate::send_log::Capture::start();
+                        stop::send_signal(target, crate::Signal::Usr1).await?;
+                        // Fails here, not in the wait below, if nothing was sent.
+                        sent.require_a_send(libc::SIGUSR1)?;
+                        // The members keep running: the root is looked at once, and every member reports
+                        // the signal before the second goes out.
+                        let running = stop::wait_exit(target, Duration::ZERO).await?;
+                        waited.lock().unwrap().push(running);
+                        reports.lock().await.as_mut().expect("the reports").until(first).await;
+                        stop::send_signal(target, crate::Signal::Term).await?;
+                        held.end();
+                        // The root exits on the second signal: the wait ends on its exit.
+                        let exited = stop::wait_exit(target, Duration::MAX).await?;
+                        waited.lock().unwrap().push(exited);
+                        Ok(())
+                    })
+                });
+            })
+            .await;
         held.hold(stdin);
         *reports.lock().await = Some(Reports::new(stdout));
         if tree {
@@ -379,19 +380,20 @@ async fn async_graceful_shutdown_tree_keeps_an_error_after_a_send_that_went_out(
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
     let held = test_child::HeldStdin::default();
-    let (mut child, stdin, mut stdout) = test_child::ready_tree_async(test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
-        test_child::contain_without_cgroup_async(cmd);
-        let held = held.clone();
-        cmd.graceful_stop(move |target| {
+    let (mut child, stdin, mut stdout) =
+        test_child::ready_tree_async(test_child::signal_reporting_tree_argv(), |cmd| {
+            test_child::contain_without_cgroup_async(cmd);
             let held = held.clone();
-            Box::pin(async move {
-                prepared_send(target).await?;
-                held.end();
-                Err(refused())
-            })
-        });
-    })
-    .await;
+            cmd.graceful_stop(move |target| {
+                let held = held.clone();
+                Box::pin(async move {
+                    prepared_send(target).await?;
+                    held.end();
+                    Err(refused())
+                })
+            });
+        })
+        .await;
     held.hold(stdin);
     let _armed = crate::child::graceful::fault::ArmedKillTreeError::arm();
     let err = never_blocking(child.graceful_shutdown_tree(Duration::MAX))

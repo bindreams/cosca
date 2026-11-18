@@ -321,16 +321,17 @@ fn a_child_over_a_stated_mechanism_reports_and_signals_through_it() {
 }
 
 /// A tree whose root and descendant each report the signal they receive
-/// ([`SIGNAL_REPORTING_TREE_ARGV`](crate::test_child::SIGNAL_REPORTING_TREE_ARGV)), sent `SIGUSR1` by the
+/// ([`signal_reporting_tree_argv`](crate::test_child::signal_reporting_tree_argv)), sent `SIGUSR1` by the
 /// tree's own terminate: both report `SIGUSR1`, and the outcome's `earlier` names it.
 #[cfg(unix)]
 fn terminate_sends_the_signal_it_is_given(mode: crate::ContainMode, gives: Containment) {
     use crate::containment::{TerminateOutcome, TreeStop};
     use crate::signal::Signal;
 
-    let (child, stdin, stdout) = crate::test_child::ready_tree(crate::test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
-        cmd.contain_with(mode);
-    });
+    let (child, stdin, stdout) =
+        crate::test_child::ready_tree(crate::test_child::signal_reporting_tree_argv(), |cmd| {
+            cmd.contain_with(mode);
+        });
     assert_eq!(child.containment(), gives);
     {
         let root = child.proc.hold(child.pid());
@@ -353,7 +354,7 @@ fn terminate_sends_the_signal_it_is_given(mode: crate::ContainMode, gives: Conta
         crate::test_child::signal_reports_to_end(stdout),
         ["leaf SIGUSR1", "root SIGUSR1"]
     );
-    child.wait().expect("the root exited on its handler");
+    child.wait().expect("the root reported the signal and exited");
 }
 
 /// Mutant: the leaf sends `SIGTERM` whatever it is given.
