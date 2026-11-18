@@ -173,6 +173,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shared_child",
+ "signal-hook",
  "skuld",
  "static_assertions",
  "tempfile",

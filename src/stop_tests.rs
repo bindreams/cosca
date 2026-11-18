@@ -86,7 +86,7 @@ fn assert_nothing_was_sent(child: &crate::Child, stdin: crate::PipeWriter) {
 #[cfg(unix)]
 #[skuld::test]
 fn the_default_action_is_what_terminate_sent_before() {
-    let (child, stdin, stdout) = test_child::ready_tree(test_child::SIGNAL_REPORTING_TREE_ARGV, |_| {});
+    let (child, stdin, stdout) = test_child::ready_tree(test_child::signal_reporting_tree_argv(), |_| {});
     child.terminate().expect("the default stop");
     drop(stdin);
     assert_eq!(
@@ -94,7 +94,7 @@ fn the_default_action_is_what_terminate_sent_before() {
         ["leaf eof", "root SIGTERM"],
         "only the root was sent the signal"
     );
-    child.wait().expect("the root exited on its handler");
+    child.wait().expect("the root reported the signal and exited");
 }
 
 /// Windows: the default is the `CTRL_BREAK` to the child's group, called on its own as a caller would.
@@ -159,7 +159,7 @@ fn an_actions_error_is_terminates_error() {
 
 // A chosen signal (Unix) =====
 
-/// A [`SIGNAL_THEN_TERM_TREE_ARGV`](test_child::SIGNAL_THEN_TERM_TREE_ARGV) tree's stdout, read as its
+/// A [`signal_then_term_tree_argv`](test_child::signal_then_term_tree_argv) tree's stdout, read as its
 /// members report: each wait is for the members' own lines, or the end of the stream once the tree's stdin
 /// has ended, a real condition with no time in it.
 #[cfg(unix)]
@@ -220,7 +220,7 @@ impl Reports {
 #[cfg(unix)]
 #[skuld::test]
 fn a_chosen_signal_reaches_the_root() {
-    let (child, stdin, stdout) = test_child::ready_tree(test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
+    let (child, stdin, stdout) = test_child::ready_tree(test_child::signal_reporting_tree_argv(), |cmd| {
         cmd.graceful_stop(|target| stop::send_signal(target, crate::Signal::Usr1));
     });
     child.terminate().expect("the chosen signal was sent");
@@ -230,7 +230,7 @@ fn a_chosen_signal_reaches_the_root() {
         ["leaf eof", "root SIGUSR1"],
         "only the root was sent the signal"
     );
-    child.wait().expect("the root exited on its handler");
+    child.wait().expect("the root reported the signal and exited");
 }
 
 /// A prepared send to a tree target reaches every member the mechanism names, with the signal it is
@@ -243,7 +243,7 @@ fn a_chosen_signal_reaches_every_member_of_the_tree() {
     for shutdown in [false, true] {
         let held = test_child::HeldStdin::default();
         let ending = held.clone();
-        let (child, stdin, stdout) = test_child::ready_tree(test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
+        let (child, stdin, stdout) = test_child::ready_tree(test_child::signal_reporting_tree_argv(), |cmd| {
             test_child::contain_without_cgroup(cmd);
             cmd.graceful_stop(move |target| {
                 stop::send_signal(target, crate::Signal::Usr1)?;
@@ -265,9 +265,9 @@ fn a_chosen_signal_reaches_every_member_of_the_tree() {
         // Two processes write these lines, so their order is not fixed: the reports are sorted.
         let reports = test_child::signal_reports_to_end(stdout);
         if let Some(status) = status {
-            // The root exits on its handler, within the grace; a mechanism whose sweep then ends what is
+            // The root reports the signal and exits, within the grace; a mechanism whose sweep then ends what is
             // left may kill a member before it reports: the root's own report is what is required.
-            assert!(status.success(), "the root exited on its handler: {status:?}");
+            assert!(status.success(), "the root reported the signal and exited: {status:?}");
             assert!(reports.iter().any(|line| line == "root SIGUSR1"), "{reports:?}");
             assert!(
                 reports.iter().all(|line| line.ends_with("SIGUSR1")),
@@ -279,7 +279,7 @@ fn a_chosen_signal_reaches_every_member_of_the_tree() {
                 ["leaf SIGUSR1", "root SIGUSR1"],
                 "both members got the chosen signal"
             );
-            child.wait().expect("the root exited on its handler");
+            child.wait().expect("the root reported the signal and exited");
         }
     }
 }
@@ -369,9 +369,8 @@ fn a_prepared_tree_send_keeps_the_front_gate() {
 /// target, and sends again: each member reports both signals in order, and the wait answers what the root
 /// did meanwhile (kept running, then exited). The same for a root target and a tree target.
 ///
-/// The second signal is not sent before every member has reported the first: a shell runs the traps of
-/// signals that are pending together in signal-number order, not in the order they arrived (`SIGTERM`
-/// is 15 and `SIGUSR1` 30 on macOS), so two sends with nothing between them can lose the first report.
+/// The second signal waits for every member's first report, so the test is of the composed action, not of
+/// how a member orders signals seen together.
 ///
 /// Mutants: `wait_exit` answers `true` whatever the root did; the chosen signal is replaced by `SIGTERM`;
 /// the first send sends nothing (an assertion on the send log, not a wait for a report that never comes).
@@ -394,7 +393,7 @@ fn an_action_may_compose_sends_with_a_wait() {
         } else {
             &["root SIGUSR1"]
         };
-        let (child, stdin, stdout) = test_child::ready_tree(test_child::SIGNAL_THEN_TERM_TREE_ARGV, |cmd| {
+        let (child, stdin, stdout) = test_child::ready_tree(test_child::signal_then_term_tree_argv(), |cmd| {
             if tree {
                 test_child::contain_without_cgroup(cmd);
             }
@@ -467,7 +466,7 @@ fn graceful_shutdown_tree_keeps_an_error_after_a_send_that_went_out() {
     let mark = crate::log_capture::mark();
     let held = test_child::HeldStdin::default();
     let ending = held.clone();
-    let (child, stdin, stdout) = test_child::ready_tree(test_child::SIGNAL_REPORTING_TREE_ARGV, |cmd| {
+    let (child, stdin, stdout) = test_child::ready_tree(test_child::signal_reporting_tree_argv(), |cmd| {
         test_child::contain_without_cgroup(cmd);
         cmd.graceful_stop(move |target| {
             prepared_send(target)?;
