@@ -933,9 +933,11 @@ jobs:
           COSCA_TESTCFG_ELEVATION_PASSWORD: ${{ steps.mac_elev_user.outputs.password }}
           SELECTION: binary(=elevation)
         # The forwarder runs as root (`sudo -E`), so the step's bound can signal the user's whole process tree.
+        # System `PATH` only: the runner's lists directories under its home that this user cannot search, and cosca's
+        # lookup of `sudo` errors at an entry it cannot examine.
         run: |
           exec python3 .github/scripts/run-nextest.py elevation sudo -E "$(command -v python3)" .github/scripts/forward.py \
-            sudo -u coscaelev -H env \
+            sudo -u coscaelev -H env PATH=/usr/bin:/bin:/usr/sbin:/sbin \
             COSCA_TEST_ELEVATION=1 COSCA_TEST_ELEVATION_CONSENT=1 SKULD_LABELS=elevation \
             COSCA_TESTCFG_ELEVATION_PASSWORD="$COSCA_TESTCFG_ELEVATION_PASSWORD" NEXTEST_PROFILE=ci-elevation \
             "$(command -v cargo-nextest)" nextest run --archive-file "$RUNNER_TEMP/elevation.tar.zst" \
