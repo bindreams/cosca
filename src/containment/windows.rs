@@ -389,7 +389,7 @@ impl crate::containment::Contains for JobHandle {
         Option<crate::containment::treewalk::Listing>,
     ) {
         let earlier = how.earlier();
-        let sent = crate::containment::TerminateOutcome::of_send(how.into_sent(), Some(earlier));
+        let sent = crate::containment::TerminateOutcome::of(how.into_sent(), Some(earlier));
         (sent, None)
     }
 

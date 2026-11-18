@@ -247,10 +247,12 @@ fn terminate_over_an_exited_root_with_an_unreadable_candidate_sends_nothing() {
         root,
         &super::ByIdentity::new(&kernel, root),
         crate::containment::TreeStop::default(),
-    )
-    .expect("the table reads");
+    );
 
-    assert!(matches!(walked, super::Terminated::RootExited(_)), "nothing is sent");
+    assert!(
+        matches!(walked, (super::SendOutcome::RootExited(_), None)),
+        "nothing is sent"
+    );
     release(child);
 }
 
@@ -649,6 +651,8 @@ fn a_descendant_that_cannot_be_read_makes_hard_kill_and_kill_tree_err_naming_it_
         &super::ByIdentity::new(&kernel, root),
         crate::containment::TreeStop::default(),
     )
+    .0
+    .into_tree_result()
     .expect("best effort");
     release_with_a_signalled_root("terminate", child, libc::SIGTERM);
 }
@@ -696,6 +700,8 @@ fn a_descendant_that_cannot_be_read_is_reported_once() {
         &super::ByIdentity::new(&kernel, root),
         crate::containment::TreeStop::default(),
     )
+    .0
+    .into_tree_result()
     .expect("best effort");
     let warned = warns_naming(mark, descendant);
     assert_eq!(warned.len(), 1, "{warned:?}");

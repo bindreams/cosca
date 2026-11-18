@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::containment::tree_kill::Unnamed;
+use crate::containment::SendOutcome;
 use crate::identity::ProcessId;
 
 #[cfg(target_os = "linux")]
@@ -806,24 +807,22 @@ impl CgroupLeaf {
     /// pinned or placed, a listed pid `0` (a member in a pid namespace this process cannot see), or
     /// a `cgroup.procs` line that is no pid.
     ///
-    /// The outer `Err` is a `cgroup.procs` that could not be read: no member was listed, so nothing
-    /// was sent. Past it the signal went out, and the inner result is what the sends found.
-    pub(crate) fn terminate(
-        &self,
-        signal: crate::signal::Signal,
-    ) -> Result<Result<(), crate::error::Error>, crate::error::Error> {
+    /// [`NotSent`](SendOutcome::NotSent) is a `cgroup.procs` that could not be read: no member was
+    /// listed, so nothing was sent. Past it the signal went out, and [`Sent`](SendOutcome::Sent) is what
+    /// the sends found. Never [`RootExited`](SendOutcome::RootExited): the leaf looks at no walk.
+    pub(crate) fn terminate(&self, signal: crate::signal::Signal) -> SendOutcome {
         let path = self.leaf_path.join("cgroup.procs");
         let content = match self.dir.read("cgroup.procs") {
             Ok(c) => c,
             Err(e) if removed_after_drain(&e) => {
                 log::debug!("cgroup terminate: leaf {} is already gone", path.display());
-                return Ok(Ok(()));
+                return SendOutcome::Sent(Ok(()));
             }
-            Err(e) => return Err(crate::error::Error::Io(e)),
+            Err(e) => return SendOutcome::NotSent(crate::error::Error::Io(e)),
         };
         #[cfg(test)]
         fault::run_after_procs_read();
-        Ok(self.terminate_listed(&content, signal))
+        SendOutcome::Sent(self.terminate_listed(&content, signal))
     }
 
     /// [`terminate`](Self::terminate) for the members `procs` lists, in `cgroup.procs`' format.

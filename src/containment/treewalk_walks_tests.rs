@@ -26,7 +26,8 @@ pub(super) fn id_walks() -> [(&'static str, Walk); 2] {
                 &super::ByIdentity::new(k, id),
                 crate::containment::TreeStop::default(),
             )
-            .and_then(super::Terminated::into_result)
+            .0
+            .into_tree_result()
         }),
     ]
 }

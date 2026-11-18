@@ -9,8 +9,8 @@ use std::time::Duration;
 use super::Process;
 use crate::containment::dispatch::Keeping;
 use crate::containment::mechanism::Mechanism;
-use crate::containment::treewalk::{Terminated, WalkToken, Walker};
-use crate::containment::Tree;
+use crate::containment::treewalk::{Listing, WalkToken, Walker};
+use crate::containment::{SendOutcome, Tree};
 use crate::error::Error;
 use crate::identity::SpawnKernel;
 
@@ -184,12 +184,12 @@ impl Process {
 
     /// [`terminate_tree`](Self::terminate_tree), reading through `kernel`.
     pub(crate) fn terminate_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
-        self.terminate_walk(kernel).and_then(Terminated::into_result)
+        self.terminate_walk(kernel).0.into_tree_result()
     }
 
     /// The `SIGTERM` walk of [`terminate_tree`](Self::terminate_tree), with what it found: the members it
     /// listed, which a graceful shutdown stands on ([`sweep`](Self::sweep)).
-    pub(crate) fn terminate_walk(&self, kernel: &dyn crate::identity::Kernel) -> Result<Terminated, Error> {
+    pub(crate) fn terminate_walk(&self, kernel: &dyn crate::identity::Kernel) -> (SendOutcome, Option<Listing>) {
         #[cfg(unix)]
         {
             crate::containment::treewalk::terminate(kernel, self.id, self, crate::containment::TreeStop::default())
@@ -197,23 +197,29 @@ impl Process {
         #[cfg(windows)]
         {
             let _ = (kernel, self.id);
-            Err(Error::Unsupported {
-                op: "foreign tree graceful terminate".into(),
-                platform: "windows",
-                detail: "Windows has no per-process graceful signal, and a foreign process \
-                         shares no addressable process group with us; use kill_tree for a hard \
-                         identity-walk sweep"
-                    .into(),
-                source: None,
-            })
+            (
+                SendOutcome::NotSent(Error::Unsupported {
+                    op: "foreign tree graceful terminate".into(),
+                    platform: "windows",
+                    detail: "Windows has no per-process graceful signal, and a foreign process \
+                             shares no addressable process group with us; use kill_tree for a hard \
+                             identity-walk sweep"
+                        .into(),
+                    source: None,
+                }),
+                None,
+            )
         }
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (kernel, self.id);
-            Ok(Terminated::Walked(crate::containment::treewalk::Listing {
-                members: Vec::new(),
-                complete: true,
-            }))
+            (
+                SendOutcome::Sent(Ok(())),
+                Some(Listing {
+                    members: Vec::new(),
+                    complete: true,
+                }),
+            )
         }
     }
 
@@ -225,17 +231,27 @@ impl Process {
     /// As [`terminate_tree`](Process::terminate_tree) for a walk that could not be made: nothing is
     /// signalled. Windows: `Unsupported`.
     pub(crate) fn begin_graceful(&self, kernel: &crate::identity::SpawnKernel) -> Result<Settling, Error> {
-        let walked = self.terminate_walk(&**kernel)?;
-        let tree = Tree::contained(Mechanism::Walk(Walker::new(self.id, Arc::clone(kernel))));
-        let walk = match walked {
-            Terminated::Walked(listing) => tree.hold_walked(listing, Some(&WalkToken::new())),
-            Terminated::RootExited(exited) => {
+        let (sent, listing) = self.terminate_walk(&**kernel);
+        let contained = || Tree::contained(Mechanism::Walk(Walker::new(self.id, Arc::clone(kernel))));
+        let (tree, walk) = match sent {
+            SendOutcome::NotSent(not_sent) => return Err(not_sent),
+            SendOutcome::Sent(Err(failed)) => {
+                debug_assert!(false, "a walk's send is never `Sent(Err)`: {failed}");
+                return Err(failed);
+            }
+            SendOutcome::Sent(Ok(())) => {
+                debug_assert!(listing.is_some(), "a walk that sent returns its listing");
+                let tree = contained();
+                let walk = listing.and_then(|listing| tree.hold_walked(listing, Some(&WalkToken::new())));
+                (tree, walk)
+            }
+            SendOutcome::RootExited(exited) => {
                 log::debug!(
                     "graceful_shutdown_tree({}): sent no SIGTERM: {report}",
                     self.id.pid(),
                     report = crate::error::Report(&exited)
                 );
-                None
+                (contained(), None)
             }
         };
         Ok(Settling {

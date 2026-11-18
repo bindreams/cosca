@@ -400,9 +400,7 @@ pub(crate) use root::Root;
 pub(crate) use root::Seen;
 #[cfg(unix)]
 pub(crate) use root::{check_number, NotItsGroup};
-#[cfg(windows)]
-pub(crate) use skip::SendOutcome;
-pub(crate) use skip::{earlier_of, Skip, TerminateOutcome, TreeStop};
+pub(crate) use skip::{earlier_of, SendOutcome, Skip, TerminateOutcome, TreeStop};
 #[cfg(unix)]
 pub(crate) use skip::{SkipCall, Why};
 pub(crate) use tree::Tree;
