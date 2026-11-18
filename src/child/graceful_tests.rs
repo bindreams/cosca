@@ -1242,7 +1242,7 @@ impl Drop for TreeStandIn<'_> {
 /// `graceful_shutdown_tree` ends the call on, with no grace waited and no sweep, so the tree is left
 /// running. Here `cgroup.procs` is a directory, which a real read of it fails on (`EISDIR`).
 ///
-/// Mutant: the leaf's outer `Err` is read as a send that went out (`Sent { result: Err(..) }`), so the call
+/// Mutant: the leaf's `NotSent` is read as a send that went out (`Sent { result: Err(..) }`), so the call
 /// holds and sweeps and the child is dead.
 #[cfg(target_os = "linux")]
 #[skuld::test]

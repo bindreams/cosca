@@ -1,4 +1,4 @@
-use super::{Skip, Why};
+use super::{SendOutcome, Skip, Why};
 use crate::containment::dispatch::TreeKillOutcome;
 use crate::containment::{Refusal, Tree};
 
@@ -880,4 +880,38 @@ fn a_pidfd_shutdown_that_failed_takes_the_reason_as_a_peer() {
         );
         assert_eq!(codes_below(&answer), [Some(libc::EACCES), Some(libc::EPERM)]);
     }
+}
+
+/// A tree call that makes one send answers `Err` for a send that did not go out (not sent, or the
+/// root had exited) and what the send answered for one that did.
+///
+/// Mutant: a `RootExited` is answered `Ok`, or a `Sent(Err)` loses its error.
+#[skuld::test]
+fn a_tree_calls_answer_is_the_sends_unless_nothing_was_sent() {
+    use crate::error::Error;
+
+    let error = |detail: &str| Error::Unassessable {
+        detail: detail.to_owned(),
+        source: None,
+    };
+    let detail = |answer: Result<(), Error>| match answer {
+        Err(Error::Unassessable { detail, .. }) => detail,
+        other => panic!("{other:?}"),
+    };
+
+    assert_eq!(
+        detail(SendOutcome::NotSent(error("not sent")).into_tree_result()),
+        "not sent"
+    );
+    assert_eq!(
+        detail(SendOutcome::RootExited(error("exited")).into_tree_result()),
+        "exited"
+    );
+    assert_eq!(
+        detail(SendOutcome::Sent(Err(error("unverified"))).into_tree_result()),
+        "unverified"
+    );
+    SendOutcome::Sent(Ok(()))
+        .into_tree_result()
+        .expect("a send that went out and checked");
 }

@@ -10,6 +10,15 @@ use crate::test_groups::{cgroup, Group};
 #[cfg(target_os = "linux")]
 use crate::wait::block_probe::{on_drain_block, on_each_drain_block};
 
+/// What a `terminate` that went out found. A `cgroup.procs` that could not be read, or a walk's
+/// `RootExited`, fails the test.
+fn sent(outcome: crate::containment::SendOutcome) -> Result<(), crate::error::Error> {
+    match outcome {
+        crate::containment::SendOutcome::Sent(found) => found,
+        other => panic!("cgroup.procs is readable: {other:?}"),
+    }
+}
+
 // removed_after_drain tests -----
 // Linux-only: the function itself is `#[cfg(target_os = "linux")]` (it interprets raw kernel
 // errno values that only mean anything against a real cgroupfs).
@@ -1411,9 +1420,7 @@ fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(std::path::PathBuf::from(
         "/nonexistent/cosca-terminate-already-gone",
     ));
-    leaf.terminate(crate::signal::Signal::Term)
-        .expect("an already-removed leaf lists no member")
-        .expect("an already-removed leaf has no member left to signal");
+    sent(leaf.terminate(crate::signal::Signal::Term)).expect("an already-removed leaf has no member left to signal");
 
     let tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(leaf));
     assert!(
@@ -1656,9 +1663,7 @@ fn a_disarmed_leaf_whose_tree_survived_terminate_is_not_reported_as_a_leak(#[fix
         .expect("the member reports that it ignores SIGTERM");
     leaf.disarm();
     crate::containment::cgroup::fault::take_member_terms();
-    leaf.terminate(crate::signal::Signal::Term)
-        .expect("cgroup.procs is readable")
-        .expect("terminate the leaf");
+    sent(leaf.terminate(crate::signal::Signal::Term)).expect("terminate the leaf");
     assert_eq!(
         crate::containment::cgroup::fault::take_member_terms(),
         [(Some(pid), crate::send_log::Via::Pidfd, libc::SIGTERM)],
@@ -3595,9 +3600,7 @@ fn terminate_reports_a_member_it_could_not_signal(how: Unsignalled) {
     // Neither route can place the member: `/proc` hides it, and no pidfd gives its cgroup. The row
     // covers the `terminate` call alone, not the leaf's drop.
     let hidden = matches!(how, Unsignalled::Unplaced).then(|| kernel.hide_every_pid_cgroup());
-    let result = leaf
-        .terminate(crate::signal::Signal::Term)
-        .expect("cgroup.procs is readable");
+    let result = sent(leaf.terminate(crate::signal::Signal::Term));
     drop(hidden);
     drop(guard);
     // No send was made, so none is noted, a refused one included.
@@ -3662,9 +3665,7 @@ fn cgroup_terminate_leaves_alone_a_member_that_left_after_the_listing(#[fixture(
         crate::child::front_cgroup_tests::move_out_of_its_leaf(pid);
     });
     crate::containment::cgroup::fault::take_member_terms();
-    leaf.terminate(crate::signal::Signal::Term)
-        .expect("cgroup.procs is readable")
-        .expect("terminate");
+    sent(leaf.terminate(crate::signal::Signal::Term)).expect("terminate");
     assert_eq!(crate::containment::cgroup::fault::take_member_terms(), []);
     let status = member.wait().expect("reap the member");
     assert_eq!(status.signal(), None, "the member exited on its own EOF: {status:?}");
@@ -3681,9 +3682,7 @@ fn cgroup_terminate_sends_a_member_its_sigterm(#[fixture(cgroup)] _group: &Group
     let (leaf, mut member) = entered_real_leaf();
     let pid = member.id();
     crate::containment::cgroup::fault::take_member_terms();
-    let result = leaf
-        .terminate(crate::signal::Signal::Term)
-        .expect("cgroup.procs is readable");
+    let result = sent(leaf.terminate(crate::signal::Signal::Term));
     let noted = crate::containment::cgroup::fault::take_member_terms();
     let status = member.wait().expect("reap the member");
     drop(leaf);
@@ -3721,9 +3720,7 @@ fn cgroup_terminate_counts_a_member_reaped_after_its_pin_as_gone(#[fixture(cgrou
     });
     crate::containment::cgroup::fault::take_member_terms();
     let mark = crate::log_capture::mark();
-    let result = leaf
-        .terminate(crate::signal::Signal::Term)
-        .expect("cgroup.procs is readable");
+    let result = sent(leaf.terminate(crate::signal::Signal::Term));
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
     let gone = crate::log_capture::records_since_on_current_thread(mark, "exited before it was placed");
     assert_eq!(crate::containment::cgroup::fault::take_member_terms(), []);
@@ -3755,9 +3752,7 @@ fn cgroup_terminate_signals_a_member_when_the_leafs_id_cannot_be_read(#[fixture(
     let _no_id = crate::containment::cgroup::fault::fail_cgroup_id(libc::EPERM);
     crate::containment::cgroup::fault::take_member_terms();
     let mark = crate::log_capture::mark();
-    let result = leaf
-        .terminate(crate::signal::Signal::Term)
-        .expect("cgroup.procs is readable");
+    let result = sent(leaf.terminate(crate::signal::Signal::Term));
     let noted = crate::containment::cgroup::fault::take_member_terms();
     let records = crate::log_capture::records_since_on_current_thread(mark, &leaf_name);
     let status = member.wait().expect("reap the member");
@@ -3961,9 +3956,7 @@ fn cgroup_terminate_reports_a_member_whose_exit_could_not_be_read(#[fixture(cgro
     take_member_terms();
     let mark = crate::log_capture::mark();
     let guard = fail_terminate(TerminateStep::Exited, libc::EIO);
-    let result = leaf
-        .terminate(crate::signal::Signal::Term)
-        .expect("cgroup.procs is readable");
+    let result = sent(leaf.terminate(crate::signal::Signal::Term));
     drop(guard);
     let noted = take_member_terms();
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
@@ -4005,9 +3998,7 @@ fn cgroup_terminate_reports_a_member_whose_place_and_exit_cannot_be_read(#[fixtu
         fail_terminate(TerminateStep::Exited, libc::EIO),
     );
     let hidden = kernel.hide_every_pid_cgroup();
-    let result = leaf
-        .terminate(crate::signal::Signal::Term)
-        .expect("cgroup.procs is readable");
+    let result = sent(leaf.terminate(crate::signal::Signal::Term));
     drop(hidden);
     drop(guard);
     let noted = take_member_terms();
@@ -4244,9 +4235,7 @@ fn cgroup_terminate_counts_a_member_gone_at_its_send_as_gone(#[fixture(cgroup)] 
     take_member_terms();
     let mark = crate::log_capture::mark();
     let guard = fail_terminate(TerminateStep::Send, libc::ESRCH);
-    let result = leaf
-        .terminate(crate::signal::Signal::Term)
-        .expect("cgroup.procs is readable");
+    let result = sent(leaf.terminate(crate::signal::Signal::Term));
     drop(guard);
     let noted = take_member_terms();
     let exited =
@@ -4286,9 +4275,7 @@ fn cgroup_terminate_counts_a_member_reaped_after_its_pin_as_gone_through_proc(#[
     crate::containment::cgroup::fault::take_member_terms();
     let _no_info = crate::containment::cgroup::fault::miss_pidfd_info();
     let mark = crate::log_capture::mark();
-    let result = leaf
-        .terminate(crate::signal::Signal::Term)
-        .expect("cgroup.procs is readable");
+    let result = sent(leaf.terminate(crate::signal::Signal::Term));
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
     let gone =
         crate::log_capture::records_since_on_current_thread(mark, &format!("pid {pid} exited before it was placed"));

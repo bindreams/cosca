@@ -57,7 +57,9 @@ use crate::containment::drain_edge::DrainEdge;
 use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::treewalk::Listing;
-use crate::containment::{check_number, Containment, Root, Skip, TerminateOutcome, TreeKill, TreeStop, Why};
+use crate::containment::{
+    check_number, Containment, Root, SendOutcome, Skip, TerminateOutcome, TreeKill, TreeStop, Why,
+};
 use crate::error::{Error, Failures};
 use std::sync::Arc;
 
@@ -351,19 +353,15 @@ pub(crate) mod fault {
 /// member refused it. See [`signal_group`].
 #[cfg(test)]
 pub(crate) fn term_group(pgid: i32, root: Option<&dyn Root>) -> Result<(), Error> {
-    term_group_sent(pgid, root, crate::signal::Signal::Term).flatten()
+    term_group_sent(pgid, root, crate::signal::Signal::Term).into_tree_result()
 }
 
-/// [`term_group`], saying whether the signal went out: `Err` is a send that did not happen, `Ok` what the
-/// check after the send found.
-pub(crate) fn term_group_sent(
-    pgid: i32,
-    root: Option<&dyn Root>,
-    signal: crate::signal::Signal,
-) -> Result<Result<(), Error>, Error> {
+/// [`term_group`], saying whether the signal went out: [`NotSent`](SendOutcome::NotSent) is a send that
+/// did not happen, [`Sent`](SendOutcome::Sent) what the check after the send found.
+pub(crate) fn term_group_sent(pgid: i32, root: Option<&dyn Root>, signal: crate::signal::Signal) -> SendOutcome {
     #[cfg(test)]
     if fault::intercept_term_group(pgid) {
-        return Ok(Ok(()));
+        return SendOutcome::Sent(Ok(()));
     }
     // A cooperative signal is only probed, never resent: no member is reached by a handle of its own.
     signal_group_sent(pgid, signal.as_nix(), root, &mut Vec::new())
@@ -474,11 +472,13 @@ fn signal_group(
     root: Option<&dyn Root>,
     killed: &mut Vec<crate::identity::ProcessId>,
 ) -> Result<(), Error> {
-    signal_group_sent(pgid, signal, root, killed).flatten()
+    signal_group_sent(pgid, signal, root, killed).into_tree_result()
 }
 
-/// [`signal_group`], saying whether the signal went out: `Err` is a send that did not happen (an
-/// invalid `pgid`, a failed check of the root, a failed `killpg`), `Ok` what `verify` found after it.
+/// [`signal_group`], saying whether the signal went out: [`NotSent`](SendOutcome::NotSent) is a send that
+/// did not happen (an invalid `pgid`, a failed check of the root, a failed `killpg`),
+/// [`Sent`](SendOutcome::Sent) what `verify` found after it. Never [`RootExited`](SendOutcome::RootExited):
+/// a group's send looks at no walk.
 ///
 /// **The `pgid` guard lives HERE, before any signal is sent — not only in `group::state`.**
 /// A `pgid` of `0` signals the CALLER's own process group (per POSIX); a negative one risks
@@ -489,13 +489,13 @@ fn signal_group_sent(
     signal: Signal,
     root: Option<&dyn Root>,
     killed: &mut Vec<crate::identity::ProcessId>,
-) -> Result<Result<(), Error>, Error> {
+) -> SendOutcome {
     // NOT a debug_assert!: an invalid `pgid` reaching this function is a directly and deliberately
     // TESTED, ordinary input-validation outcome, not a "should never happen" internal contract —
     // `kill_group_and_term_group_reject_non_positive_pgid` (this file) calls this path with
     // `0`/`-1`/`i32::MIN` on purpose and asserts a plain `Err`, not a panic.
     if pgid <= 0 {
-        return Err(Error::Unassessable {
+        return SendOutcome::NotSent(Error::Unassessable {
             detail: format!(
                 "process group {pgid} is not a valid group id to signal (0 addresses this \
                  process's own group; negative wraps to a broadcast or double-negation hazard)"
@@ -503,7 +503,11 @@ fn signal_group_sent(
             source: None,
         });
     }
-    match send_to_group(pgid, signal, root)? {
+    let sent = match send_to_group(pgid, signal, root) {
+        Ok(sent) => sent,
+        Err(unchecked) => return SendOutcome::NotSent(unchecked),
+    };
+    match sent {
         Ok(()) => {}
         // NOT trusted as "definitely empty": Linux's __kill_pgrp_info returns the LAST
         // per-member error once none succeed, so ESRCH can mean "empty" or "a departed member
@@ -516,13 +520,13 @@ fn signal_group_sent(
             _ = signal_direct(pgid, signal, root);
         }
         Err(e) => {
-            return Err(Error::Containment {
+            return SendOutcome::NotSent(Error::Containment {
                 detail: format!("{signal} could not be sent to process group {pgid}"),
                 source: Some(Error::io_cause(io::Error::from(e))),
             })
         }
     }
-    Ok(verify(pgid, signal, root, killed))
+    SendOutcome::Sent(verify(pgid, signal, root, killed))
 }
 
 /// The send to the whole group, and the kernel's answer to it. On Linux it goes through the root's

@@ -53,9 +53,9 @@
 //! A kill or [`terminate`] whose root's exit had begun when its walk ended, or whose flag could not be
 //! read, never answers `Ok`:
 //!
-//! - **No member found:** [`TreeKillOutcome::NoRoot`] and [`Terminated::RootExited`], nothing sent. With
-//!   the flag unreadable, [`TreeKillOutcome::Unwalked`] (a [`terminate`]'s `Err`): nothing is sent, and a
-//!   retry can read it.
+//! - **No member found:** [`TreeKillOutcome::NoRoot`] and [`SendOutcome::RootExited`], nothing sent. With
+//!   the flag unreadable, [`TreeKillOutcome::Unwalked`] (a [`terminate`]'s [`SendOutcome::NotSent`]):
+//!   nothing is sent, and a retry can read it.
 //! - **Members found:** they are killed or signalled all the same. A [`hard_kill`] that left nothing is
 //!   [`TreeKillOutcome::RootExiting`], settled as a gone root is (a graceful call's own complete
 //!   `SIGTERM` listing may vouch for the tree, as it does a moment later, when the root is a zombie); one
@@ -123,6 +123,8 @@ use crate::containment::enumerate::Table;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{Contains, KillLeftOutcome};
+#[cfg(not(windows))]
+use crate::containment::SendOutcome;
 #[cfg(target_os = "macos")]
 use crate::containment::Why;
 use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill, TreeStop};
@@ -1307,42 +1309,48 @@ pub(crate) mod fault {
 ///
 /// Unix: the same snapshot + identity walk with the signal `how` carries (root then descendants) —
 /// cooperative shutdown that still re-verifies identity before each signal, so it
-/// reaches the whole genuine tree that the walk could assess, and errors as `hard_kill` does
-/// (`# Errors`). Unlike `hard_kill` it does not report a candidate the walk could not assess
-/// ([`Walk::unassessed`]), nor a member whose signal was not sent: they are warned of and not
-/// signalled, and the result is still `Ok`.
+/// reaches the whole genuine tree that the walk could assess. A walk that cannot be made sends nothing
+/// ([`SendOutcome::NotSent`], as [`hard_kill`]'s walk errors). Unlike `hard_kill` it does not report a
+/// candidate the walk could not assess ([`Walk::unassessed`]), nor a member whose signal was not
+/// sent: they are warned of and not signalled, and the send is still `Sent(Ok(()))`.
 ///
 /// Not on Windows, where the caller's stop function sends the event and [`terminate_tree`] takes its
 /// answer from `how`: the walk lists no member there.
 ///
 /// Best-effort by design.
 ///
-/// # Errors
-///
-/// As [`hard_kill`].
-///
 /// The root's signal goes through [`Root::signal`] of `held`, as [`hard_kill`]'s kill does.
 ///
 /// The members it found, the root apart, are its [`Listing`]: once the root exits
 /// they are reparented out of every later walk, so a later kill can reach them only by these
 /// identities. A root whose exit has begun, reaped or not, and whose walk finds no member sends
-/// nothing ([`Terminated::RootExited`], see the module doc); one whose walk finds members signals
+/// nothing ([`SendOutcome::RootExited`], see the module doc); one whose walk finds members signals
 /// them, and its [`Listing`] is not complete. So is the listing of a walk whose members were signalled
 /// though the flag could not be read; with no member found, that error is the walk's.
+///
+/// How the send went is a [`SendOutcome`]. The [`Listing`] is beside it exactly when it is
+/// [`Sent`](SendOutcome::Sent), and that is always `Sent(Ok(()))`: a failed signal to the root or a
+/// member is only warned of. Asserted in debug before the pair is handed on.
 #[cfg(not(windows))]
 pub(crate) fn terminate(
     kernel: &dyn Kernel,
     root: ProcessId,
     held: &dyn Root,
     how: TreeStop,
-) -> Result<Terminated, Error> {
+) -> (SendOutcome, Option<Listing>) {
     debug_assert_eq!(held.pid(), root.pid(), "the held root is not the walk's root");
     #[cfg(unix)]
-    {
+    let paired = 'walk: {
+        let not_sent = |error| (SendOutcome::NotSent(error), None);
         let signal = how.signal();
-        let table = crate::containment::enumerate::process_table(kernel)?;
-        let Some(walk) = walk_from(kernel, root, &table.parents, Recursive::Yes)? else {
-            return Ok(Terminated::RootExited(exited_root_error(root.pid())));
+        let table = match crate::containment::enumerate::process_table(kernel) {
+            Ok(table) => table,
+            Err(unreadable) => break 'walk not_sent(unreadable),
+        };
+        let walk = match walk_from(kernel, root, &table.parents, Recursive::Yes) {
+            Ok(Some(walk)) => walk,
+            Ok(None) => break 'walk (SendOutcome::RootExited(exited_root_error(root.pid())), None),
+            Err(unwalkable) => break 'walk not_sent(unwalkable),
         };
         #[cfg(test)]
         fault::note_walk(root.pid());
@@ -1351,10 +1359,10 @@ pub(crate) fn terminate(
         // reparented every child. Read before the root's own signal, which would begin its exit.
         let begun = match exit_begun(kernel, &table, root) {
             Ok(true) if walk.members.is_empty() => {
-                return Ok(Terminated::RootExited(exited_root_error(root.pid())));
+                break 'walk (SendOutcome::RootExited(exited_root_error(root.pid())), None);
             }
             Ok(begun) => begun,
-            Err(unreadable) if walk.members.is_empty() => return Err(unreadable),
+            Err(unreadable) if walk.members.is_empty() => break 'walk not_sent(unreadable),
             // The members are signalled as before the flag was read; the listing cannot vouch for the tree.
             Err(unreadable) => {
                 log::warn!(
@@ -1373,21 +1381,33 @@ pub(crate) fn terminate(
         for id in &walk.members {
             warn_if_not_attempted(*id, sig, &kill_by_identity(kernel, *id, sig));
         }
-        Ok(Terminated::Walked(Listing {
-            // A root whose exit had begun, or whose flag could not be read, may have had children
-            // reparented out of the walk.
-            complete: walk.unassessed.is_empty() && !begun,
-            members: walk.members,
-        }))
-    }
+        (
+            SendOutcome::Sent(Ok(())),
+            Some(Listing {
+                // A root whose exit had begun, or whose flag could not be read, may have had children
+                // reparented out of the walk.
+                complete: walk.unassessed.is_empty() && !begun,
+                members: walk.members,
+            }),
+        )
+    };
     #[cfg(not(unix))]
-    {
+    let paired = {
         let _ = (kernel, root, held, how);
-        Ok(Terminated::Walked(Listing {
-            members: Vec::new(),
-            complete: true,
-        }))
-    }
+        (
+            SendOutcome::Sent(Ok(())),
+            Some(Listing {
+                members: Vec::new(),
+                complete: true,
+            }),
+        )
+    };
+    debug_assert!(
+        paired.1.is_some() == matches!(paired.0, SendOutcome::Sent(Ok(()))),
+        "a walk's listing is beside `Sent(Ok(()))` and beside no other outcome: {:?}",
+        paired.0
+    );
+    paired
 }
 
 /// The members a cooperative walk found and signalled, the root apart.
@@ -1397,29 +1417,6 @@ pub(crate) struct Listing {
     /// The walk assessed every candidate, so `members` list the tree whole as the walk saw it; one it
     /// could not read is warned of, and a listing without it cannot vouch for the tree.
     pub(crate) complete: bool,
-}
-
-/// What [`terminate`]'s walk did, once the process table was read (an unreadable table is its `Err`).
-#[cfg_attr(
-    windows,
-    allow(dead_code, reason = "Windows sends no walk: terminate_tree takes the stop's send")
-)]
-pub(crate) enum Terminated {
-    /// The signals went out to the root and to the members of the listing.
-    Walked(Listing),
-    /// Nothing was sent: the root has exited and the walk found no member.
-    RootExited(Error),
-}
-
-impl Terminated {
-    /// The answer of a `terminate_tree` call: `Ok` once the signals went out, the error of a root that
-    /// had exited otherwise.
-    pub(crate) fn into_result(self) -> Result<(), Error> {
-        match self {
-            Terminated::Walked(_) => Ok(()),
-            Terminated::RootExited(exited) => Err(exited),
-        }
-    }
 }
 
 /// The error of a cooperative signal that sent nothing because the root `pid` has exited.
@@ -1490,7 +1487,7 @@ pub(crate) fn terminate_tree(
             #[cfg(windows)]
             {
                 let _ = (kernel, root, owner);
-                let outcome = TerminateOutcome::of_send(how.into_sent(), Some(earlier));
+                let outcome = TerminateOutcome::of(how.into_sent(), Some(earlier));
                 let listing = matches!(outcome, TerminateOutcome::Sent { .. }).then(|| Listing {
                     members: Vec::new(),
                     complete: true,
@@ -1501,16 +1498,9 @@ pub(crate) fn terminate_tree(
             // read or the walk made. A failed signal to the root or a member is only warned of, so it
             // is `Sent { Ok }`.
             #[cfg(not(windows))]
-            match terminate(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root)), how) {
-                Ok(Terminated::Walked(listing)) => (
-                    TerminateOutcome::Sent {
-                        result: Ok(()),
-                        earlier: Some(earlier),
-                    },
-                    Some(listing),
-                ),
-                Ok(Terminated::RootExited(error)) => (TerminateOutcome::RootExited(error), None),
-                Err(not_sent) => (TerminateOutcome::NotSent(not_sent), None),
+            {
+                let (sent, listing) = terminate(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root)), how);
+                (TerminateOutcome::of(sent, Some(earlier)), listing)
             }
         }
     }

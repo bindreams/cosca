@@ -142,20 +142,9 @@ pub(crate) enum TerminateOutcome {
 }
 
 impl TerminateOutcome {
-    /// Unix: the outcome of a send that answered as `sent`: the outer `Err` is a send that did not go out
-    /// ([`NotSent`](Self::NotSent)), the `Ok` what the check after the send found
-    /// ([`Sent`](Self::Sent)).
-    #[cfg(unix)]
-    pub(crate) fn of(sent: Result<Result<(), Error>, Error>, earlier: Option<String>) -> TerminateOutcome {
-        match sent {
-            Ok(result) => TerminateOutcome::Sent { result, earlier },
-            Err(not_sent) => TerminateOutcome::NotSent(not_sent),
-        }
-    }
-
-    /// Windows: the outcome of the send a stop function made, as the tree route takes it.
-    #[cfg(windows)]
-    pub(crate) fn of_send(sent: SendOutcome, earlier: Option<String>) -> TerminateOutcome {
+    /// The outcome of a stop's send that went as `sent`, as the tree route takes it. `earlier` names
+    /// what a later sweep's error says was sent before it.
+    pub(crate) fn of(sent: SendOutcome, earlier: Option<String>) -> TerminateOutcome {
         match sent {
             SendOutcome::NotSent(not_sent) => TerminateOutcome::NotSent(not_sent),
             SendOutcome::RootExited(exited) => TerminateOutcome::RootExited(exited),
@@ -164,33 +153,45 @@ impl TerminateOutcome {
     }
 }
 
-/// Windows: what a prepared send of a stop function came to. It is the one statement of what the
-/// send hands the call that runs it: the record of the last send, and the route a tree target takes.
-#[cfg(windows)]
+/// How a stop's send went: the one statement of what a send hands the call that runs it.
 #[derive(Debug)]
 pub(crate) enum SendOutcome {
-    /// No event was sent, for this reason: a refusal, or a failure before the event was generated. A
-    /// root target records a refusal, and a tree call ends with the error.
+    /// Nothing was sent, for this reason: a refusal, or a failure before the send was made. A root
+    /// target records a refusal, and a tree call ends with the error.
     NotSent(Error),
-    /// No event was sent because the child had exited when cosca looked, and the proxy names a console
-    /// by a process of it, so nothing is addressed to a member that outlived it. A root target answers
-    /// `Ok`, as the direct send answers an exited child. A tree call ends as for any exited root:
-    /// `terminate_tree` answers the error, and `graceful_shutdown_tree` goes on to its grace, sweep and
-    /// reap with no event sent.
+    /// Nothing was sent because the root had exited when cosca looked. A tree call ends as for any
+    /// exited root: `terminate_tree` answers the error, and `graceful_shutdown_tree` goes on to its
+    /// grace, sweep and reap with nothing sent.
+    ///
+    /// Unix: the walk found no member, so the children were reparented at the root's exit. Windows: the
+    /// proxy names a console by a process of the root, so nothing is addressed to a member that
+    /// outlived it; a root target answers `Ok`, as the direct send answers an exited child.
     RootExited(Error),
-    /// The event went out, or may have. The `Err` is an answer that cannot say the event arrived: a
-    /// root target records the send as made, and a tree call goes on to its grace and sweep with that
-    /// error as its cooperative error.
+    /// The send went out, or may have. The `Err` is an answer that cannot say it arrived: a tree call
+    /// goes on to its grace and sweep with that error as its cooperative error, and on Windows a root
+    /// target records the send as made. Unix: the `Err` is what the check after the send found
+    /// (`verify`, the marker's sweep).
     Sent(Result<(), Error>),
 }
 
-#[cfg(windows)]
 impl SendOutcome {
-    /// The outcome of a send whose every error says nothing was sent (the direct `CTRL_BREAK` to a group).
+    /// Windows: the outcome of a send whose every error says nothing was sent (the direct `CTRL_BREAK`
+    /// to a group).
+    #[cfg(windows)]
     pub(crate) fn direct(sent: Result<(), Error>) -> SendOutcome {
         match sent {
             Ok(()) => SendOutcome::Sent(Ok(())),
             Err(not_sent) => SendOutcome::NotSent(not_sent),
+        }
+    }
+
+    /// The answer of a tree call that makes this send and nothing else (the Unix group send,
+    /// `terminate_tree`): `Err` when nothing was sent (not sent, or the root had exited), else what the
+    /// send answered. Not for a root target: on Windows it answers an exited root `Ok`.
+    pub(crate) fn into_tree_result(self) -> Result<(), Error> {
+        match self {
+            SendOutcome::NotSent(error) | SendOutcome::RootExited(error) => Err(error),
+            SendOutcome::Sent(result) => result,
         }
     }
 }

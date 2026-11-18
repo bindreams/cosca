@@ -1467,6 +1467,8 @@ fn terminate_warns_once_of_a_member_that_refuses_the_signal(#[fixture(setuid)] _
         &super::ByIdentity::new(&kernel, id),
         crate::containment::TreeStop::default(),
     )
+    .0
+    .into_tree_result()
     .expect("best effort");
 
     let os = std::io::Error::from_raw_os_error(libc::EPERM);
