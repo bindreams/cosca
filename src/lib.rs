@@ -229,6 +229,12 @@
 #[cfg(all(target_os = "linux", target_pointer_width = "32"))]
 compile_error!("cosca does not support 32-bit Linux (see \"Platform requirements\" in the crate docs)");
 
+// The README as the doc of an item only rustdoc's test pass sees, so the doctest step compiles its Rust
+// examples.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme_examples {}
+
 pub mod containment;
 pub mod elevation;
 pub mod error;
