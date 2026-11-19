@@ -461,7 +461,6 @@ fn a_skipped_kill_whose_holders_failed_leaves_the_drop_a_warn_in_either_order() 
 /// control is moot.
 #[skuld::test]
 fn a_skipped_call_over_a_killed_tree_is_moot_when_a_kill_does_not_outlive_its_reason() {
-    use crate::signal::Sig;
     crate::log_capture::install();
     type Case = (&'static str, fn() -> Why, bool);
     let cases: [Case; 2] = [
@@ -477,7 +476,7 @@ fn a_skipped_call_over_a_killed_tree_is_moot_when_a_kill_does_not_outlive_its_re
         ),
     ];
     for (name, why, moot) in cases {
-        for signal in [Sig::Kill, Sig::Graceful(crate::signal::Signal::Term)] {
+        for signal in crate::test_support::kill_and_two_graceful_signals() {
             let mark = crate::log_capture::mark();
             let answer = super::SkipCall {
                 op: "skip_moot_probe_g1",

@@ -228,30 +228,38 @@ mod macos {
     /// Mutant: the errno is wrapped with context, which drops `raw_os_error`.
     #[skuld::test]
     fn a_refused_send_keeps_its_raw_errno() {
-        let child = blocker();
-        let identity = read_identity(&HostKernel, child.id()).expect("readable");
-        let refused = crate::signal::seams::refuse_kills();
-        let err = via_audit_token(&HostKernel, child.id(), identity, Sig::Kill).expect_err("refused");
-        drop(refused);
-        assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
+        for sig in crate::test_support::kill_and_two_graceful_signals() {
+            let child = blocker();
+            let identity = read_identity(&HostKernel, child.id()).expect("readable");
+            let refused = crate::signal::seams::refuse_kills();
+            let err = via_audit_token(&HostKernel, child.id(), identity, sig).expect_err("refused");
+            drop(refused);
+            assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{sig}: {err}");
+        }
     }
 
     /// A child whose exit has begun and that is not yet a zombie answers the token send `EPERM`; it is
-    /// ours and on its way out, so the kill is `Delivered`, as for a zombie.
+    /// ours and on its way out, so the send is `Delivered`, as for a zombie.
     ///
-    /// Mutant: the `EPERM` is surfaced raw, so `Child::kill` of a child that is exiting is an error.
+    /// Mutant: the `EPERM` is surfaced raw, so a stop of a child that is exiting is an error.
     #[skuld::test]
     fn a_child_whose_exit_began_is_delivered() {
-        let child = blocker();
-        let identity = read_identity(&HostKernel, child.id()).expect("readable");
-        let kernel = FakeKernel::over(&HostKernel).on_kinfo(
-            child.id(),
-            crate::identity::kinfo::kinfo_proc::of_host_with_exit(child.id(), true),
-        );
-        let refused = crate::signal::seams::refuse_kills();
-        let sent = via_audit_token(&kernel, child.id(), identity, Sig::Kill);
-        drop(refused);
-        assert_eq!(sent.expect("an exiting child is no refuser"), Sent::Delivered);
+        for sig in crate::test_support::kill_and_two_graceful_signals() {
+            let child = blocker();
+            let identity = read_identity(&HostKernel, child.id()).expect("readable");
+            let kernel = FakeKernel::over(&HostKernel).on_kinfo(
+                child.id(),
+                crate::identity::kinfo::kinfo_proc::of_host_with_exit(child.id(), true),
+            );
+            let refused = crate::signal::seams::refuse_kills();
+            let sent = via_audit_token(&kernel, child.id(), identity, sig);
+            drop(refused);
+            assert_eq!(
+                sent.unwrap_or_else(|e| panic!("{sig}: an exiting child is no refuser: {e}")),
+                Sent::Delivered,
+                "{sig}"
+            );
+        }
     }
 
     /// Mutant: the send is not recorded, or nothing is sent.

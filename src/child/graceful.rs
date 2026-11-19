@@ -43,6 +43,7 @@ fn take_forced_sweep() -> Option<crate::containment::dispatch::SweepFailure> {
 
 /// What [`shutdown::signal_tree_cooperatively`] decided: the cooperative signal of
 /// `graceful_shutdown_tree`, which the caller then follows with the grace and the sweep.
+#[derive(Debug)]
 pub(crate) enum SignalTreeCooperativelyOutcome {
     /// The cooperative signal went out, and `result` is what the check after it found; the sweep says
     /// `earlier` was sent before it. `walk`: the token of this call's own complete `SIGTERM` walk, which
@@ -472,6 +473,7 @@ impl HoldersShutdown<'_> {
 /// The caller [`start`](Self::start)s it, waits the grace when [`needs_grace`](Self::needs_grace),
 /// and [`finish`](Self::finish)es it with the wait's outcome.
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 pub(crate) struct PidfdShutdown {
     term: Result<crate::signal::Sent, Error>,
 }

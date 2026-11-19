@@ -1072,6 +1072,45 @@ fn a_cooperative_signal_reaches_a_group_member_only_the_group_send_names() {
     }
 }
 
+/// A cooperative sweep pass over a marker holder that is exiting: the holder's identity send is refused
+/// with `EPERM` (the refused-kills seam) while the kernel states its exit begun (`P_WEXIT`, not yet a
+/// zombie), as the group signal just before it can leave a member that handled the signal by exiting.
+/// The holder is delivered, the pass is not `incomplete`, and `finish_sweep` answers `Ok`, not
+/// "teardown may be incomplete". The marker has no group, so the identity send is the pass's only send.
+///
+/// Mutant: the exit is read for a `SIGKILL`'s `EPERM` only (`signal_by_token`'s old `Sig::Kill` guard):
+/// the holder reads `NotAttempted`, and the sweep is `incomplete`.
+#[skuld::test]
+fn a_cooperative_pass_over_a_holder_whose_exit_began_is_a_complete_sweep() {
+    use crate::identity::{FakeKernel, HostKernel};
+
+    let _serialize = test_spawn_lock();
+    let (holder, prepared) = held_child();
+    let pid = holder.id();
+    let kernel = FakeKernel::over(&HostKernel).on_every_kinfo(pid, move || {
+        crate::identity::kinfo::kinfo_proc::of_host_with_exit(pid, true)
+    });
+    let marker = super::Marker::new(reading_through(prepared, kernel), inert_root(), None);
+
+    let mut reached = Vec::new();
+    let mut state = super::SweepState::new(&mut reached);
+    let refused = crate::signal::seams::refuse_kills();
+    let found = marker.sweep_pass(
+        crate::signal::Sig::Graceful(crate::Signal::Usr1),
+        &mut state,
+        true,
+        super::Scope::Full(Some(&crate::test_support::stated_root::StatedRoot::unreaped())),
+    );
+    drop(refused);
+
+    assert!(found >= 1, "the pass found the holder");
+    assert!(state.delivered, "the holder's send is read as delivered");
+    assert!(!state.incomplete, "a holder that is exiting is no gap in the sweep");
+    let swept = super::Marker::finish_sweep(marker.handle, state.group_result, state.incomplete, false);
+    assert!(swept.is_ok(), "{swept:?}");
+    crate::child::spawn::identity_macos_tests::end_unsignalled_and_reap(pid);
+}
+
 /// `kill_holder`'s `MarkerQuery::Denied` arm, end to end: a KNOWN holder that becomes
 /// unqueryable at re-check time must be left unsignalled AND reported as a kill not attempted,
 /// never silently treated as resolved. `id` names pid 1 (launchd) — the same real,

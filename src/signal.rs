@@ -59,7 +59,7 @@ impl std::fmt::Display for Sig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sent {
     /// The signal was handed to the OS for the child. It also covers a target whose exit had begun
-    /// when the send was refused (macOS: a `SIGKILL` answered `EPERM`, `P_WEXIT` set): nothing was
+    /// when the send was refused (macOS: a signal answered `EPERM`, `P_WEXIT` set): nothing was
     /// delivered, and the exit is on its way.
     Delivered,
     /// Nothing was delivered because the child is gone: reaped, or its pid no longer names it. Not
