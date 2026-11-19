@@ -94,7 +94,10 @@ What a child's cooperative stop sends is an action it stores, not a rule inside 
   not run). The variable is only read (a helper launch starts no process). The proxy's arguments and
   exit codes are the only thing the caller's side and the proxy's own sequence share. The
   caller names the target by identity, so a reused pid is never sent an event, and cosca starts a copy
-  of the host as the proxy only when the host has called `init_helpers`. The Unix elevation shim is the
+  of the host as the proxy only when the host has called `init_helpers`: on Windows, a stop that would
+  start this program as the proxy (the child is outside the caller's console, cosca created it and read
+  its identity, and the command's proxy is the default `CtrlProxy::HostExecutable`) panics in a host
+  that has not, as its first act, because a missing call is a bug of the program. The Unix elevation shim is the
   exception to the variable: the tools that start it reset the environment, so it is still recognised
   by its first argument.
 

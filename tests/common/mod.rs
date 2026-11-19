@@ -1091,7 +1091,7 @@ pub async fn spawn_tree_async_ending_a_failure(mode: &str) -> (cosca::tokio::Chi
 
 /// Awaits `fut`, returning the payload of a panic it raised instead of unwinding.
 #[cfg(feature = "tokio")]
-async fn catching<F: std::future::Future>(fut: F) -> Result<F::Output, Box<dyn std::any::Any + Send>> {
+pub async fn catching<F: std::future::Future>(fut: F) -> Result<F::Output, Box<dyn std::any::Any + Send>> {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::task::Poll;
 

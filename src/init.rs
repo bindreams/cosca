@@ -34,6 +34,9 @@ static HELPERS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// runs as itself. The one exception is the Unix elevation shim, which is still recognised by its first
 /// argument, because the tools that start it (`sudo`, `doas`, `pkexec`) reset the environment.
 ///
+/// On Windows, a stop that would start this program as the console-event proxy panics when this was never
+/// called, as a broken contract of the program: see [`stop::default`](crate::stop::default#panics).
+///
 /// - **The shim** runs on Linux. macOS has no shim: `init_helpers` reports that and does not start the
 ///   program (exit 120).
 /// - **The proxy** runs on Windows: it attaches to another process's console, sends it Ctrl+C or
