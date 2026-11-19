@@ -18,7 +18,7 @@ The design rules every change follows are in [docs/principles.md](docs/principle
 
 On Unix, a chosen signal, to the child or its whole tree:
 
-```rust
+```rust,ignore-windows
 let mut command = cosca::run(["my-service"]);
 command.contain().graceful_stop(|target| cosca::stop::send_signal(target, cosca::Signal::Int));
 ```
@@ -53,6 +53,10 @@ and needs no build of the crate, so it runs in about a second as a prek hook and
 
 nextest doesn't run doctests, so CI runs them separately with `cargo test --doc`. An example that would act on a real process (spawn, open, kill) is `no_run`: it compiles and never runs. Claude Code agents in this repo deny plain
 `cargo test` (`.claude/settings.json`), so an agent can't run that step locally either.
+
+This file's Rust blocks are doctests too. Every fenced block names its language (rustdoc reads a fence
+with none as Rust), and a block for one platform is tagged for the others to skip (`rust,ignore-windows`),
+since a hidden `# ` line would show in the README.
 
 ### Test groups
 
