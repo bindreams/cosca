@@ -10,6 +10,7 @@ use crate::os_process::drive::exited_held;
 use crate::os_process::{kill, open, terminate, Exit, OsProcess};
 use crate::signal::{Sent, Sig};
 use crate::test_child::{wait_until_zombie, StdChild};
+use crate::test_support::kill_and_two_graceful_signals;
 use crate::wait::exit_only::macos_tests::unique_of;
 use crate::wait::macos::reap_registration;
 
@@ -252,48 +253,53 @@ fn a_refused_reread_after_esrch_keeps_the_errno() {
 
 /// The token send answers `EPERM` to a process whose exit has begun and that is not yet a zombie
 /// (`P_WEXIT` set, `p_stat` `SRUN`). The send is not an error then, and not a refusal: the process is
-/// on its way out.
+/// on its way out. Every signal gets the same answer, not only `SIGKILL`.
 ///
 /// The `EPERM` and the record are stated here, not read from a really exiting child: the window is
 /// too narrow for a host test of it to be deterministic.
 ///
 /// Mutants: the `EPERM` is surfaced raw whether or not the exit has begun; the exit is read from
-/// `p_stat` alone (`SZOMB`), which is not set in this window.
+/// `p_stat` alone (`SZOMB`), which is not set in this window; the exit is read for a `SIGKILL` only.
 #[skuld::test]
 fn a_token_send_refused_while_the_exit_has_begun_is_exiting() {
-    let (_child, id) = blocker();
-    let known = own_unique_info(id);
-    let kernel = FakeKernel::over(&HostKernel).on_kinfo(id.pid(), kinfo_proc::of_host_with_exit(id.pid(), true));
-    let mut idversion = known.id_version;
-    let refused = crate::signal::seams::refuse_kills();
-    let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, Sig::Kill);
-    drop(refused);
-    assert_eq!(
-        outcome.expect("an exiting process is no refuser"),
-        SignalByTokenOutcome::Exiting
-    );
-    assert!(
-        kernel.all_rows_taken(),
-        "the exit was read once, from the kernel the send was given"
-    );
+    for sig in kill_and_two_graceful_signals() {
+        let (_child, id) = blocker();
+        let known = own_unique_info(id);
+        let kernel = FakeKernel::over(&HostKernel).on_kinfo(id.pid(), kinfo_proc::of_host_with_exit(id.pid(), true));
+        let mut idversion = known.id_version;
+        let refused = crate::signal::seams::refuse_kills();
+        let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, sig);
+        drop(refused);
+        assert_eq!(
+            outcome.unwrap_or_else(|e| panic!("{sig}: an exiting process is no refuser: {e}")),
+            SignalByTokenOutcome::Exiting,
+            "{sig}"
+        );
+        assert!(
+            kernel.all_rows_taken(),
+            "{sig}: the exit was read once, from the kernel the send was given"
+        );
+    }
 }
 
-/// An `EPERM` from a process whose exit has not begun is a refusal, and stays the raw errno
-/// (`Process::kill` and `Child::kill` promise it).
+/// An `EPERM` from a process whose exit has not begun is a refusal, and stays
+/// the raw errno (`Process::kill` and `Child::kill` promise it).
 ///
 /// Mutant: any `EPERM` is read as an exit.
 #[skuld::test]
 fn a_token_send_refused_with_no_exit_begun_keeps_the_raw_eperm() {
-    let (_child, id) = blocker();
-    let known = own_unique_info(id);
-    let kernel = FakeKernel::over(&HostKernel).on_kinfo(id.pid(), kinfo_proc::of_host_with_exit(id.pid(), false));
-    let mut idversion = known.id_version;
-    let refused = crate::signal::seams::refuse_kills();
-    let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, Sig::Kill);
-    drop(refused);
-    let err = outcome.expect_err("a live refuser is an error");
-    assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
-    assert!(kernel.all_rows_taken(), "the exit was read, and found running");
+    for sig in kill_and_two_graceful_signals() {
+        let (_child, id) = blocker();
+        let known = own_unique_info(id);
+        let kernel = FakeKernel::over(&HostKernel).on_kinfo(id.pid(), kinfo_proc::of_host_with_exit(id.pid(), false));
+        let mut idversion = known.id_version;
+        let refused = crate::signal::seams::refuse_kills();
+        let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, sig);
+        drop(refused);
+        let err = outcome.expect_err("a live refuser is an error");
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{sig}: {err}");
+        assert!(kernel.all_rows_taken(), "{sig}: the exit was read, and found running");
+    }
 }
 
 /// An exit that cannot be read leaves the `EPERM` as it was answered.
@@ -301,40 +307,18 @@ fn a_token_send_refused_with_no_exit_begun_keeps_the_raw_eperm() {
 /// Mutant: an unreadable exit is read as begun.
 #[skuld::test]
 fn a_token_send_refused_with_an_unreadable_exit_keeps_the_raw_eperm() {
-    let (_child, id) = blocker();
-    let known = own_unique_info(id);
-    let kernel = FakeKernel::over(&HostKernel).on_kinfo_refused(id.pid(), libc::EACCES);
-    let mut idversion = known.id_version;
-    let refused = crate::signal::seams::refuse_kills();
-    let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, Sig::Kill);
-    drop(refused);
-    let err = outcome.expect_err("an unreadable exit settles nothing");
-    assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
-    assert!(kernel.all_rows_taken(), "the exit was read, and refused");
-}
-
-/// Only a `SIGKILL` is read for an exit: any other signal refused with `EPERM` keeps the raw errno,
-/// and the process's record is never read.
-///
-/// Mutant: the `EPERM` of a `SIGTERM` is read as an exit, so the refusal reads as delivered.
-#[skuld::test]
-fn a_sigterm_refused_with_eperm_keeps_the_raw_eperm_whatever_the_exit() {
-    let (_child, id) = blocker();
-    let known = own_unique_info(id);
-    let kernel = FakeKernel::over(&HostKernel).on_kinfo(id.pid(), kinfo_proc::of_host_with_exit(id.pid(), true));
-    let mut idversion = known.id_version;
-    let refused = crate::signal::seams::refuse_kills();
-    let outcome = signal_by_token(
-        &kernel,
-        id.pid(),
-        known.unique_id,
-        &mut idversion,
-        Sig::Graceful(crate::signal::Signal::Term),
-    );
-    drop(refused);
-    let err = outcome.expect_err("only a SIGKILL's refusal is read for an exit");
-    assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
-    assert_eq!(kernel.kinfo_reads(id.pid()), 0, "the record is never read");
+    for sig in kill_and_two_graceful_signals() {
+        let (_child, id) = blocker();
+        let known = own_unique_info(id);
+        let kernel = FakeKernel::over(&HostKernel).on_kinfo_refused(id.pid(), libc::EACCES);
+        let mut idversion = known.id_version;
+        let refused = crate::signal::seams::refuse_kills();
+        let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, sig);
+        drop(refused);
+        let err = outcome.expect_err("an unreadable exit settles nothing");
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{sig}: {err}");
+        assert!(kernel.all_rows_taken(), "{sig}: the exit was read, and refused");
+    }
 }
 
 /// The exit is read between two unique-id reads. The first matches and the `kinfo_proc` read between
@@ -351,46 +335,54 @@ fn a_pid_taken_or_a_read_refused_after_the_exit_was_read_settles_nothing() {
         (|_| UniqRead::Gone, Some(SignalByTokenOutcome::Gone)),
         (|_| UniqRead::Refused(libc::EACCES), None),
     ];
-    for (second, expected) in cases {
-        let (_child, id) = blocker();
-        let known = own_unique_info(id);
-        let kernel = FakeKernel::over(&HostKernel)
-            .on_unique_info(id.pid(), UniqRead::Found(known))
-            .on_kinfo(id.pid(), kinfo_proc::of_host_with_exit(id.pid(), true))
-            .on_unique_info(id.pid(), second(id.pid()));
-        let mut idversion = known.id_version;
-        let refused = crate::signal::seams::refuse_kills();
-        let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, Sig::Kill);
-        drop(refused);
-        match expected {
-            Some(expected) => assert_eq!(outcome.expect("answered"), expected),
-            None => {
-                let err = outcome.expect_err("a refused read settles nothing");
-                assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
+    for sig in kill_and_two_graceful_signals() {
+        for (second, expected) in cases {
+            let (_child, id) = blocker();
+            let known = own_unique_info(id);
+            let kernel = FakeKernel::over(&HostKernel)
+                .on_unique_info(id.pid(), UniqRead::Found(known))
+                .on_kinfo(id.pid(), kinfo_proc::of_host_with_exit(id.pid(), true))
+                .on_unique_info(id.pid(), second(id.pid()));
+            let mut idversion = known.id_version;
+            let refused = crate::signal::seams::refuse_kills();
+            let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, sig);
+            drop(refused);
+            match expected {
+                Some(expected) => assert_eq!(outcome.expect("answered"), expected, "{sig}"),
+                None => {
+                    let err = outcome.expect_err("a refused read settles nothing");
+                    assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{sig}: {err}");
+                }
             }
+            assert!(
+                kernel.all_rows_taken(),
+                "{sig}: both id reads and the exit read were made"
+            );
         }
-        assert!(kernel.all_rows_taken(), "both id reads and the exit read were made");
     }
 }
 
-/// An `EPERM` from a pid that is gone by the time the exit is read is a process that is gone. The
-/// kernel states the pid gone, so the test does not rely on a freed pid staying unused.
+/// An `EPERM` from a pid that is gone by the time the exit is read is a process that is gone.
+/// The kernel states the pid gone, so the test does not rely on a freed pid staying unused.
 ///
 /// Mutant: the `EPERM` is surfaced for a pid no process holds.
 #[skuld::test]
 fn a_token_send_refused_for_a_pid_that_is_gone_is_gone() {
-    let (_child, id) = blocker();
-    let known = own_unique_info(id);
-    let kernel = FakeKernel::over(&HostKernel).on_unique_info(id.pid(), UniqRead::Gone);
-    let mut idversion = known.id_version;
-    let refused = crate::signal::seams::refuse_kills();
-    let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, Sig::Kill);
-    drop(refused);
-    assert_eq!(
-        outcome.expect("a gone process is no refuser"),
-        SignalByTokenOutcome::Gone
-    );
-    assert!(kernel.all_rows_taken());
+    for sig in kill_and_two_graceful_signals() {
+        let (_child, id) = blocker();
+        let known = own_unique_info(id);
+        let kernel = FakeKernel::over(&HostKernel).on_unique_info(id.pid(), UniqRead::Gone);
+        let mut idversion = known.id_version;
+        let refused = crate::signal::seams::refuse_kills();
+        let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, sig);
+        drop(refused);
+        assert_eq!(
+            outcome.unwrap_or_else(|e| panic!("{sig}: a gone process is no refuser: {e}")),
+            SignalByTokenOutcome::Gone,
+            "{sig}"
+        );
+        assert!(kernel.all_rows_taken(), "{sig}");
+    }
 }
 
 /// An `EPERM` whose pid names another process by the time the exit is read is a process that is gone:
@@ -399,24 +391,27 @@ fn a_token_send_refused_for_a_pid_that_is_gone_is_gone() {
 /// Mutant: the exit is read by bare pid, so the other process's `P_WEXIT` reads as ours (`Exiting`).
 #[skuld::test]
 fn a_token_send_refused_for_a_pid_that_names_another_process_is_gone() {
-    let (_child, id) = blocker();
-    let known = own_unique_info(id);
-    let kernel = FakeKernel::over(&HostKernel)
-        .on_unique_info(id.pid(), other_unique_id(id.pid()))
-        .on_kinfo(id.pid(), kinfo_proc::of_host_with_exit(id.pid(), true));
-    let mut idversion = known.id_version;
-    let refused = crate::signal::seams::refuse_kills();
-    let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, Sig::Kill);
-    drop(refused);
-    assert_eq!(
-        outcome.expect("another process's pid is no refuser"),
-        SignalByTokenOutcome::Gone
-    );
-    assert_eq!(
-        kernel.kinfo_reads(id.pid()),
-        0,
-        "another process's record is never read"
-    );
+    for sig in kill_and_two_graceful_signals() {
+        let (_child, id) = blocker();
+        let known = own_unique_info(id);
+        let kernel = FakeKernel::over(&HostKernel)
+            .on_unique_info(id.pid(), other_unique_id(id.pid()))
+            .on_kinfo(id.pid(), kinfo_proc::of_host_with_exit(id.pid(), true));
+        let mut idversion = known.id_version;
+        let refused = crate::signal::seams::refuse_kills();
+        let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, sig);
+        drop(refused);
+        assert_eq!(
+            outcome.unwrap_or_else(|e| panic!("{sig}: another process's pid is no refuser: {e}")),
+            SignalByTokenOutcome::Gone,
+            "{sig}"
+        );
+        assert_eq!(
+            kernel.kinfo_reads(id.pid()),
+            0,
+            "{sig}: another process's record is never read"
+        );
+    }
 }
 
 /// An `EPERM` from a zombie is a process that has exited and is not reaped, as `ESRCH` from one is:
@@ -426,39 +421,44 @@ fn a_token_send_refused_for_a_pid_that_names_another_process_is_gone() {
 /// of no child waits for an exit that has happened.
 #[skuld::test]
 fn a_token_send_refused_by_a_zombie_is_exited_unreaped() {
-    let (_child, id) = blocker();
-    let known = own_unique_info(id);
-    let mut zombie = kinfo_proc::of_host_with_exit(id.pid(), true);
-    zombie.kp_proc.p_stat = libc::SZOMB as libc::c_char;
-    let kernel = FakeKernel::over(&HostKernel).on_kinfo(id.pid(), zombie);
-    let mut idversion = known.id_version;
-    let refused = crate::signal::seams::refuse_kills();
-    let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, Sig::Kill);
-    drop(refused);
-    assert_eq!(
-        outcome.expect("a zombie is no refuser"),
-        SignalByTokenOutcome::ExitedUnreaped
-    );
+    for sig in kill_and_two_graceful_signals() {
+        let (_child, id) = blocker();
+        let known = own_unique_info(id);
+        let mut zombie = kinfo_proc::of_host_with_exit(id.pid(), true);
+        zombie.kp_proc.p_stat = libc::SZOMB as libc::c_char;
+        let kernel = FakeKernel::over(&HostKernel).on_kinfo(id.pid(), zombie);
+        let mut idversion = known.id_version;
+        let refused = crate::signal::seams::refuse_kills();
+        let outcome = signal_by_token(&kernel, id.pid(), known.unique_id, &mut idversion, sig);
+        drop(refused);
+        assert_eq!(
+            outcome.unwrap_or_else(|e| panic!("{sig}: a zombie is no refuser: {e}")),
+            SignalByTokenOutcome::ExitedUnreaped,
+            "{sig}"
+        );
+    }
 }
 
-/// A held process whose exit has begun reads as signalled: its exit is what the kill is for, and the
-/// kill's wait goes on to wait for it. A zombie, which is gone to a holder of no child, stays `Gone`
-/// (`signal_to_a_zombie_is_gone_after_one_attempt`).
+/// A held process whose exit has begun reads as signalled: its exit is what the
+/// stop is for, and a kill's wait goes on to wait for it. A zombie, which is gone to a holder of no
+/// child, stays `Gone` (`signal_to_a_zombie_is_gone_after_one_attempt`).
 ///
 /// Mutant: an exiting process is read as `Gone`, so the wait skips it.
 #[skuld::test]
 fn signal_to_a_process_whose_exit_began_is_delivered() {
     use crate::os_process::open_with;
 
-    let (_child, id) = blocker();
-    let kernel = FakeKernel::over(&HostKernel)
-        .on_unique_info(id.pid(), UniqRead::Found(own_unique_info(id)))
-        .on_kinfo(id.pid(), kinfo_proc::of_host_with_exit(id.pid(), true));
-    let p = open_with(kernel, id).unwrap().expect("a live process opens");
-    let refused = crate::signal::seams::refuse_kills();
-    let sent = p.signal(Sig::Kill);
-    drop(refused);
-    assert_eq!(sent.unwrap(), Sent::Delivered);
+    for sig in kill_and_two_graceful_signals() {
+        let (_child, id) = blocker();
+        let kernel = FakeKernel::over(&HostKernel)
+            .on_unique_info(id.pid(), UniqRead::Found(own_unique_info(id)))
+            .on_kinfo(id.pid(), kinfo_proc::of_host_with_exit(id.pid(), true));
+        let p = open_with(kernel, id).unwrap().expect("a live process opens");
+        let refused = crate::signal::seams::refuse_kills();
+        let sent = p.signal(sig);
+        drop(refused);
+        assert_eq!(sent.unwrap_or_else(|e| panic!("{sig}: {e}")), Sent::Delivered, "{sig}");
+    }
 }
 
 /// Mutant: the open arms the watch, so it costs a descriptor and a send can fail for want of one.

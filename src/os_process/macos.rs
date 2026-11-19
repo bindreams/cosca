@@ -149,14 +149,15 @@ pub(crate) enum SignalByTokenOutcome {
     /// The kernel took the signal.
     Delivered,
     /// The process has exited and is not reaped: `ESRCH`, and the pid still has the same unique id
-    /// at the same `p_idversion`; or a `SIGKILL` was refused with `EPERM` and the process is a
-    /// zombie. Nothing was delivered. A caller that owns the child reads this as delivered, as a
-    /// zombie it owns is on Linux; a caller that holds no child reads it as gone.
+    /// at the same `p_idversion`; or a signal was refused with `EPERM` and the process is a zombie.
+    /// Nothing was delivered. A caller that owns the child reads this as delivered, as a zombie it
+    /// owns is on Linux; a caller that holds no child reads it as gone.
     ExitedUnreaped,
-    /// A `SIGKILL` was refused with `EPERM` and the process's exit has begun (`P_WEXIT`, with
-    /// `p_stat` not yet `SZOMB`). Nothing was delivered. The kernel answers `EPERM` to a send in that
-    /// window, so it is no refusal. Every caller reads it as delivered, a holder of no child too,
-    /// since the exit is still to come.
+    /// A signal was refused with `EPERM` and the process's exit has begun (`P_WEXIT`, with `p_stat`
+    /// not yet `SZOMB`). The kernel answers `EPERM` to a send in that window, so it is no refusal.
+    /// Measured for `SIGKILL`, `SIGTERM` and `SIGUSR1`; other signals are not measured. Nothing was
+    /// delivered. Every caller, a holder of no child too, reads it as delivered: the exit is what a
+    /// stop asked for.
     Exiting,
     /// The process is gone, or its pid names another process.
     Gone,
@@ -179,9 +180,9 @@ pub(crate) fn read_version(kernel: &dyn Kernel, pid: u32, unique: u64, sig: Sig)
 /// follows the process across an `exec` and is left at the version it was last sent at. The kernel
 /// checks the pid with its `p_idversion` and signals while it holds a reference, so only the
 /// documented 2^32 version wrap can redirect it. A refused send is the bare errno, so an `EPERM`
-/// stays raw for the callers that promise it. The one exception is a `SIGKILL` (any other signal
-/// keeps the raw `EPERM`): a read of the process `unique` names, taken after the `EPERM`, finds how
-/// it ended:
+/// stays raw for the callers that promise it. The one exception is an `EPERM` that the process's
+/// exit may have caused (see [`SignalByTokenOutcome::Exiting`] for the signals measured to get it):
+/// a read of the process `unique` names, taken after the `EPERM`, finds how it ended:
 ///
 /// - exit begun, not yet a zombie: [`SignalByTokenOutcome::Exiting`];
 /// - a zombie: [`SignalByTokenOutcome::ExitedUnreaped`], as `ESRCH` from a zombie is;
@@ -202,7 +203,7 @@ pub(crate) fn signal_by_token(
             Ok(()) => return Ok(SignalByTokenOutcome::Delivered),
             Err(libc::ESRCH) => {}
             // `P_WEXIT` is never cleared, so an `EPERM` that came from the exit shows it at this read.
-            Err(libc::EPERM) if sig == Sig::Kill => {
+            Err(libc::EPERM) => {
                 return match exit_state_of(kernel, pid, unique) {
                     Resolved::Found(ExitState::Exiting) => {
                         log::debug!("{sig} to pid {pid}: refused with EPERM, its exit has begun");

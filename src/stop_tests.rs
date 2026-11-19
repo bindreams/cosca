@@ -655,7 +655,7 @@ fn a_tree_call_words_what_the_action_sent_before_its_sweep() {
                 earlier: Some(earlier),
                 ..
             } => assert_eq!(earlier, says, "the sweep's error, after {what}"),
-            _ => panic!("{what}: the cooperative signal did not go on to the sweep"),
+            other => panic!("{what}: the cooperative signal did not go on to the sweep: {other:?}"),
         }
         let logged = crate::log_capture::records_since_on_current_thread(
             mark,

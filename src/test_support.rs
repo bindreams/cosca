@@ -15,6 +15,13 @@ pub(crate) mod foreign_tracer;
 #[cfg(target_os = "linux")]
 pub(crate) mod own_tracer;
 
+#[cfg(unix)]
+pub(crate) fn kill_and_two_graceful_signals() -> [crate::signal::Sig; 3] {
+    use crate::signal::{Sig, Signal};
+
+    [Sig::Kill, Sig::Graceful(Signal::Term), Sig::Graceful(Signal::Usr1)]
+}
+
 /// Blocks until the spawn core's status has said all it will: a failure record, or the end.
 #[cfg(target_os = "linux")]
 pub(crate) fn settled(status: &mut crate::child::spawn::fork_exec::Status) -> crate::child::spawn::fork_exec::Progress {
