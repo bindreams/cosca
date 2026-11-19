@@ -100,7 +100,7 @@ impl Child {
     /// process's console that leads no group: the direct send refuses it with
     /// [`Error::Unsupported`](crate::error::Error::Unsupported), before and after its exit. A child the
     /// default sends through the proxy is looked at first (one look through its handle): an exited one is
-    /// answered `Ok` with nothing started, whether or not the host called `init_helpers`.
+    /// answered `Ok` with nothing started.
     ///
     /// **The direct send can report success for a child that left our console.** Windows reports
     /// success for an event aimed at a group in another console and delivers nothing, and this process
@@ -130,6 +130,10 @@ impl Child {
     ///
     /// **macOS, a root launchd holds** is refused with nothing sent, and an `Unknown` root is signalled
     /// through the handle, as for [`kill`](Child::kill).
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub fn terminate(&self) -> Result<(), Error> {
         shutdown::run_ready(shutdown::terminate(&shutdown::BlockingDriver(self)))
     }
@@ -217,6 +221,10 @@ impl Child {
     /// on, and nothing warns. If its exit was seen, the call returns `Unassessable` saying its exit
     /// status cannot be collected. If it was orphaned after the grace ran out, the escalation returns
     /// `Unassessable` saying the kill sent nothing though the `SIGTERM` was sent.
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<ExitStatus, Error> {
         shutdown::run_ready(shutdown::shutdown_lone(&mut shutdown::BlockingDriver(self), grace))
     }
@@ -346,6 +354,10 @@ impl Child {
     /// waited. A root launchd holds has no exit status to collect: once the tree is down this returns
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) instead of waiting on a zombie that
     /// is not this process's to reap.
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<ExitStatus, Error> {
         shutdown::run_ready(shutdown::shutdown_tree(&mut shutdown::BlockingDriver(self), grace))
     }

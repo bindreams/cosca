@@ -221,6 +221,31 @@ fn a_sent_answer_is_ok_and_the_proxy_is_asked_for_this_child_and_event() {
     }
 }
 
+/// The hook has run in this test binary (its `main` calls it), so the default setting,
+/// `HostExecutable`, panics nowhere: the default stop and the proxy send answer an exited child `Ok`, and
+/// the exit is looked at before a proxy is started (a started proxy is this test binary playing the proxy,
+/// and its answer is recorded: [`assert_no_break_sent`] sees it). The panic is the other side of the same
+/// check, in `tests/ctrl_proxy_host.rs`. Mutants: the check panics whatever the hook says; the look at the
+/// exit is skipped, so the proxy is started and answers.
+#[skuld::test]
+fn nothing_panics_once_the_hook_has_run_and_an_exited_child_starts_no_proxy() {
+    assert!(crate::helpers_initialized(), "the test binary's `main` calls the hook");
+    let (child, sock, _) = spawn_member(Handler::Ignore, None, ContainMode::Strongest, |cmd| {
+        cmd.no_window().ctrl_proxy(CtrlProxy::HostExecutable);
+    });
+    assert_eq!(StopTarget::from(&child).ctrl_proxy(), &CtrlProxy::HostExecutable);
+    child.kill().expect("kill the member");
+    child.wait().expect("see its exit, reaping nothing");
+    drop(sock);
+
+    child
+        .terminate()
+        .unwrap_or_else(|e| panic!("an exited child is Ok: {e:?}"));
+    stop::send_console_event_via_proxy(&StopTarget::from(&child), CtrlEvent::CtrlBreak)
+        .unwrap_or_else(|e| panic!("an exited child is Ok: {e:?}"));
+    assert_no_break_sent();
+}
+
 // What each answer means =====
 
 /// Connects to a listener when dropped, which releases a thread blocked in its `accept`.
@@ -582,6 +607,80 @@ fn an_elevated_child_is_refused_before_anything_starts() {
     assert!(!detail.contains("  "), "a run of spaces: {detail:?}");
     assert_no_break_sent();
     assert!(fixture.ran().is_none(), "the proxy was started for an elevated child");
+}
+
+/// `plan` maps the facts fixed at the spawn to the plan `send` acts on (and decides the missing-hook panic
+/// by): with the default proxy an elevated child is `RefuseElevated`, one with no identity is
+/// `RefuseNoIdentity`, a plain child is `StartHost`; with an `Executable` setting a plain child is
+/// `StartExecutable`. Built on the existing `child_over` fakes. Mutant: `plan` looks at the setting before the
+/// elevated fact (an elevated child under `HostExecutable` is `StartHost`), or before the identity.
+#[skuld::test]
+fn the_plan_of_a_send_follows_the_facts_fixed_at_the_spawn() {
+    use super::{plan, Plan};
+    use crate::containment::windows::ConsoleFacts;
+
+    let child_with = |configure: &dyn Fn(&mut Child)| {
+        let mut child = crate::test_child::over_fake::child_over(&crate::os_process::fake::FakeProcess::new([
+            crate::os_process::fake::Answer::Running,
+        ]));
+        child.ctrl_proxy = std::sync::Arc::new(CtrlProxy::HostExecutable);
+        configure(&mut child);
+        child
+    };
+
+    let plain = child_with(&|_| {});
+    assert!(matches!(plan(&StopTarget::from(&plain)), Plan::StartHost(_)));
+    let elevated = child_with(&|child| {
+        child.console = ConsoleFacts {
+            group: true,
+            ..ConsoleFacts::uac_elevated()
+        }
+    });
+    assert!(matches!(plan(&StopTarget::from(&elevated)), Plan::RefuseElevated));
+    let no_identity = child_with(&|child| child.id = None);
+    assert!(matches!(plan(&StopTarget::from(&no_identity)), Plan::RefuseNoIdentity));
+    let named = child_with(&|child| child.ctrl_proxy = std::sync::Arc::new(CtrlProxy::Executable("proxy.exe".into())));
+    assert!(matches!(
+        plan(&StopTarget::from(&named)),
+        Plan::StartExecutable(_, exe) if exe == std::path::Path::new("proxy.exe")
+    ));
+}
+
+/// Decided here because the hook-less binary cannot build an elevated or identity-less child. With the
+/// hook not called: panics only for the plan that starts this program; with it called, none. Mutants: every
+/// plan panics; a refusal plan panics. Which facts give which plan is pinned by
+/// `the_plan_of_a_send_follows_the_facts_fixed_at_the_spawn`.
+#[skuld::test]
+fn only_a_plan_that_starts_this_program_panics_without_the_hook() {
+    use super::{require_helpers_initialized, Plan};
+    use crate::identity::ProcessId;
+
+    let panics = |plan: Plan, hook_called: bool| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            require_helpers_initialized(&plan, hook_called)
+        }))
+        .is_err()
+    };
+    let id = ProcessId::current();
+
+    assert!(panics(Plan::StartHost(id), false), "this program would be the proxy");
+    assert!(
+        !panics(Plan::StartExecutable(id, std::path::Path::new("proxy.exe")), false),
+        "a named executable is no copy of this program"
+    );
+    assert!(!panics(Plan::RefuseElevated, false), "an elevated child is refused");
+    assert!(
+        !panics(Plan::RefuseNoIdentity, false),
+        "a child with no identity is refused"
+    );
+    for plan in [
+        Plan::StartHost(id),
+        Plan::StartExecutable(id, std::path::Path::new("proxy.exe")),
+        Plan::RefuseElevated,
+        Plan::RefuseNoIdentity,
+    ] {
+        assert!(!panics(plan, true), "the hook was called");
+    }
 }
 
 // What a call does with the answer =====

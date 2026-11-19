@@ -73,6 +73,10 @@ impl StopWaits for AsyncDriver<'_> {
 
 /// The stop a child does when its command set none. As [`stop::default`](crate::stop::default), with the
 /// proxy's wait awaited on Windows; an async action calls this one, not the sync one.
+///
+/// # Panics
+///
+/// On Windows: see [`stop::default`](crate::stop::default#panics).
 pub async fn default(target: &StopTarget<'_>) -> Result<(), Error> {
     #[cfg(unix)]
     return crate::stop::default(target);
@@ -105,6 +109,11 @@ pub async fn send_ctrl_break_to_group(target: &StopTarget<'_>) -> Result<(), Err
 /// drop, which kills and reaps it before returning, when the call already held it; by the start, when it
 /// completes on the pool, if the drop came during the start (the proxy has run since it was created, so it
 /// may have attached and sent before it was ended).
+///
+/// # Panics
+///
+/// On Windows: see
+/// [`stop::send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy#panics).
 #[cfg(windows)]
 pub async fn send_console_event_via_proxy(target: &StopTarget<'_>, event: crate::CtrlEvent) -> Result<(), Error> {
     crate::stop::proxy::send(&AsyncDriver(target.child()), target, event).await

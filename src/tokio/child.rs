@@ -394,6 +394,10 @@ impl Child {
     /// and on Windows may await the console-event proxy's exit, which occupies no runtime thread; an
     /// action that awaits [`tokio::stop::wait_exit`](crate::tokio::stop::wait_exit) with a non-zero grace
     /// needs, on Unix, a runtime with the IO **and** time drivers enabled.
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub async fn terminate_tree(&self) -> Result<(), Error> {
         crate::child::graceful::shutdown::terminate_tree(self).await
     }

@@ -117,7 +117,8 @@
 //! Each is stated in full where it is linked.
 //!
 //! - **The proxy needs a host that called [`init_helpers`](crate::init_helpers)**, or a
-//!   `Command::ctrl_proxy` naming the `cosca-ctrl-proxy` executable: see `CtrlProxy`.
+//!   `Command::ctrl_proxy` naming the `cosca-ctrl-proxy` executable. A stop that would start the host as
+//!   the proxy panics in a host that did neither: see [`default`]'s `# Panics`.
 //! - **A stop sent before the child has set its console up.** A proxy-routed child can look like one with
 //!   no console: see [`default`].
 //! - **The wait for the proxy has no cap, and the grace starts when the action returns:** see
@@ -161,7 +162,7 @@ use crate::error::Error;
 ///    caller that had no console, a child cosca did not create): `send_console_event_via_proxy` with
 ///    `CtrlEvent::CtrlBreak`, which blocks the calling thread for the proxy's answer and reaches every
 ///    process on the child's console. It needs the host program to have called
-///    [`cosca::init_helpers()`](crate::init_helpers) (see `send_console_event_via_proxy`).
+///    [`cosca::init_helpers()`](crate::init_helpers) (see `# Panics`).
 ///
 /// The second case cannot be written with the public functions (`leads_group_on_our_console` is the only
 /// public fact), so a hand-written `if leads { direct } else { proxy }` sends that child to the proxy.
@@ -174,13 +175,10 @@ use crate::error::Error;
 /// without going on to the kill.
 ///
 /// - Case 2: the error names `Command::new_process_group`, because no console event can be addressed to the
-///   child alone, and one sent to the console would reach this process as well. No proxy is started, so
-///   `init_helpers` is not needed. The direct send refuses before it looks at the child, so the refusal
-///   is the same for a child that has exited, where every other child that has exited is answered `Ok`
-///   (see [`Child::terminate`](crate::Child::terminate)).
-/// - Case 3, the host program has not called `init_helpers` and the command names no
-///   `CtrlProxy::Executable`: the error names `cosca::init_helpers()` and the `Executable` setting.
-///   Nothing is started.
+///   child alone, and one sent to the console would reach this process as well. No proxy is started. The
+///   direct send refuses before it looks at the child, so the refusal is the same for a child that has
+///   exited, where every other child that has exited is answered `Ok` (see
+///   [`Child::terminate`](crate::Child::terminate)).
 /// - Case 3, the child has no identity to name it by: the error names `Child::kill`. Nothing is started.
 /// - Case 3, a child a system elevation service created on a UAC consent: the error names `kill()`. Nothing
 ///   is started.
@@ -202,6 +200,23 @@ use crate::error::Error;
 /// leads no group, and sends one that leads a group a break that reaches nobody (see
 /// `send_ctrl_break_to_group`). It stays reachable through an explicit
 /// `graceful_stop(|t| stop::send_console_event_via_proxy(t, CtrlEvent::CtrlBreak))`.
+///
+/// # Panics
+///
+/// On Windows, panics when the stop would start this program as the console-event proxy and the program
+/// never called [`cosca::init_helpers()`](crate::init_helpers). The stop would do that when the child is
+/// outside the caller's console (case 3), cosca created it and read its identity, and the command's proxy
+/// is the default `CtrlProxy::HostExecutable`: the proxy would be a second copy of this program running as
+/// itself. That is a broken contract of the program, not a refusal, so it is a panic in every build
+/// profile.
+///
+/// The check is the first thing the proxy route does, before it looks at whether the child has exited,
+/// so the missing call shows by the route alone and not by the child's timing. It does not panic for a stop
+/// that starts no copy of this program: a child on our console (which gets the direct send or its refusal),
+/// a child cosca did not create or one without an identity, and a command that sets
+/// `Command::ctrl_proxy(CtrlProxy::Executable(..))`. Call `cosca::init_helpers()` first thing in `main`, or
+/// set the `Executable` proxy to the `cosca-ctrl-proxy` executable. Other platforms have no proxy and
+/// nothing here panics.
 pub fn default(target: &StopTarget<'_>) -> Result<(), Error> {
     #[cfg(unix)]
     return send_signal(target, crate::Signal::Term);
@@ -436,13 +451,11 @@ fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Res
 ///
 /// # Errors
 ///
-/// [`Error::Unsupported`], with nothing sent and, for the first three, nothing started (for a child that
+/// [`Error::Unsupported`], with nothing sent and, for the first two, nothing started (for a child that
 /// has not exited; see below):
 /// - the child is one a system service created on a UAC consent;
 /// - the child has no identity ([`Child::id`](crate::Child::id) is `None`), which the proxy names its
 ///   target by, so that a reused pid is never sent an event;
-/// - [`CtrlProxy::HostExecutable`](crate::CtrlProxy::HostExecutable) is set and the host program has
-///   not called [`init_helpers`](crate::init_helpers);
 /// - the proxy found no console to attach to for the child (the child has none, as a child created
 ///   with [`detached`](crate::Command::detached) has none, or has not set it up yet), and the child had
 ///   not exited when cosca looked;
@@ -463,9 +476,9 @@ fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Res
 ///
 /// # A child that has exited
 ///
-/// The call's first act is one look at the child through its handle, which reaps nothing. A child that
-/// has exited is answered then, before any rule above and with nothing started (so a host that has not
-/// called `init_helpers` gets the answer too): nothing was sent. On a root target the answer is `Ok`, as
+/// After the check under `# Panics`, the call's first act is one look at the child through its handle,
+/// which reaps nothing. A child that has exited is answered then, before any rule above and with nothing
+/// started: nothing was sent. On a root target the answer is `Ok`, as
 /// [`send_ctrl_break_to_group`] answers an exited child that leads a group. On a tree target
 /// `terminate_tree` answers an error, and `graceful_shutdown_tree` goes on to its grace, sweep and reap
 /// with no event sent: members that outlived the root are ended by the sweep without a console event,
@@ -473,6 +486,11 @@ fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Res
 ///
 /// A child that exits after that look is answered the same way when the proxy cannot attach and cosca's
 /// look at the proxy's answer finds the child exited.
+///
+/// # Panics
+///
+/// Panics when this call would start this program as the proxy and `init_helpers` was never called; see
+/// [`default`](crate::stop::default#panics) for the condition.
 #[cfg(windows)]
 pub fn send_console_event_via_proxy(target: &StopTarget<'_>, event: CtrlEvent) -> Result<(), Error> {
     crate::child::graceful::shutdown::run_ready(proxy::send(

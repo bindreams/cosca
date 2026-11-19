@@ -67,6 +67,10 @@ impl Child {
     /// OS, which occupies no runtime thread and needs neither driver. An action that awaits
     /// [`tokio::stop::wait_exit`](crate::tokio::stop::wait_exit) with a non-zero grace needs, on Unix, a
     /// runtime with the IO **and** time drivers enabled, as that function documents.
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub async fn terminate(&self) -> Result<(), Error> {
         crate::child::graceful::shutdown::terminate(self).await
     }
@@ -126,6 +130,10 @@ impl Child {
     /// rather than returning a typed error.
     ///
     /// Behaves as the sync [`graceful_shutdown`](crate::Child::graceful_shutdown), awaiting each wait.
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
         crate::child::graceful::shutdown::shutdown_lone(self, grace).await
     }
@@ -208,6 +216,10 @@ impl Child {
     /// **A root reaped by something else, a root its handle cannot vouch for, and one launchd
     /// holds** are answered as for the sync
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree), with the grace awaited.
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub async fn graceful_shutdown_tree(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
         crate::child::graceful::shutdown::shutdown_tree(self, grace).await
     }

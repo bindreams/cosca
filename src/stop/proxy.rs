@@ -45,15 +45,16 @@ pub enum CtrlProxy {
     /// The file at the host program's path ([`std::env::current_exe`]) when the stop runs, started as the
     /// proxy. The host must have called [`cosca::init_helpers()`](crate::init_helpers) first thing in
     /// `main`: the copy then plays the proxy and exits instead of running the host's own `main`. A host
-    /// that has not called `init_helpers` is refused, with nothing started
-    /// ([`helpers_initialized`](crate::helpers_initialized) says whether it has). So cosca never starts a
-    /// second copy of a program that would run as itself, while the file at that path is the one this
-    /// process was loaded from: a program that replaces its own image while it runs sets
-    /// [`Executable`](CtrlProxy::Executable).
+    /// that has not called `init_helpers` panics in a stop that would start it as the proxy
+    /// ([`stop::default`](crate::stop::default#panics)); [`helpers_initialized`](crate::helpers_initialized)
+    /// says whether it has called it. So cosca never starts a second copy of a program that would run as
+    /// itself, while the file at that path is the one this process was loaded from: a program that replaces
+    /// its own image while it runs sets [`Executable`](CtrlProxy::Executable).
     #[default]
     HostExecutable,
     /// This file, which is the `cosca-ctrl-proxy` executable (`cargo install cosca --bin
-    /// cosca-ctrl-proxy`) or another program that calls `cosca::init_helpers()` first thing in `main`. It is
+    /// cosca-ctrl-proxy`) or another program that calls `cosca::init_helpers()` first thing in `main`. The
+    /// host program itself needs no call. It is
     /// loaded exactly as written, as [`Command::raw_executable`](crate::Command::raw_executable) does:
     /// no `PATH` search and no `.exe` appended, and a relative path is read against this process's
     /// working directory.
@@ -76,12 +77,6 @@ const NO_IDENTITY_REFUSAL: &str = "this child has no identity (Child::id() is No
      target by identity, so that a pid the system has reused is never sent an event: it cannot be named \
      exactly. Use Child::kill for a hard teardown, or Command::graceful_stop with a stop of your own.";
 
-#[cfg(windows)]
-const NOT_INITIALIZED_REFUSAL: &str = "CtrlProxy::HostExecutable starts a copy of this program as the proxy, \
-     and this program has not called cosca::init_helpers(), so a copy would run as itself. Call \
-     cosca::init_helpers() first thing in main, or set Command::ctrl_proxy(CtrlProxy::Executable(..)) \
-     to the cosca-ctrl-proxy executable.";
-
 /// The remedy for a program that is no proxy of this cosca's protocol.
 #[cfg(windows)]
 const SAME_COSCA_PROXY: &str = "Start a proxy built from the same cosca: CtrlProxy::HostExecutable, or the \
@@ -102,11 +97,57 @@ const NO_CONSOLE_CAUSES: &str =
 #[cfg(windows)]
 const ATTACH_DENIED_CAUSE: &str = "The child may still be running, on a console that refused the proxy.";
 
+/// What `send` would do with a target, decided by the facts fixed at the spawn (so not by the child's
+/// timing): the one classification both the missing-hook panic and `send`'s refusals read.
+#[cfg(windows)]
+enum Plan<'a> {
+    /// A child a system service created on a UAC consent.
+    RefuseElevated,
+    /// A child with no identity to name it by.
+    RefuseNoIdentity,
+    /// Start this program ([`CtrlProxy::HostExecutable`]) as the proxy for the child `ProcessId` names.
+    StartHost(ProcessId),
+    /// Start the program a command named ([`CtrlProxy::Executable`]).
+    StartExecutable(ProcessId, &'a Path),
+}
+
+/// Classifies what `send` would do with `target`.
+#[cfg(windows)]
+fn plan<'a>(target: &'a StopTarget<'_>) -> Plan<'a> {
+    if target.child().console.elevated {
+        return Plan::RefuseElevated;
+    }
+    let Some(id) = target.id() else {
+        return Plan::RefuseNoIdentity;
+    };
+    match target.ctrl_proxy() {
+        CtrlProxy::HostExecutable => Plan::StartHost(id),
+        CtrlProxy::Executable(exe) => Plan::StartExecutable(id, exe),
+    }
+}
+
+/// Panics when `plan` starts this program as its own proxy and the program never called
+/// `init_helpers`: the copy would run as the program. Other plans pass through. `send` calls it before
+/// looking at the child.
+#[cfg(windows)]
+fn require_helpers_initialized(plan: &Plan<'_>, helpers_initialized: bool) {
+    if matches!(plan, Plan::StartHost(_)) && !helpers_initialized {
+        panic!(
+            "CtrlProxy::HostExecutable starts a copy of this program as the console-event proxy, and this \
+             program did not call cosca::init_helpers(), so the copy would run as the program itself. Call \
+             cosca::init_helpers() first thing in main, or set Command::ctrl_proxy(CtrlProxy::Executable(..)) \
+             to the cosca-ctrl-proxy executable."
+        );
+    }
+}
+
 /// The proxy's send, as [`send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy)
 /// documents it, for any [`StopWaits`]: the waits are the driver's.
 #[cfg(windows)]
 pub(crate) async fn send<D: StopWaits>(driver: &D, target: &StopTarget<'_>, event: CtrlEvent) -> Result<(), Error> {
-    // As on every platform, an exited child is answered before any gate.
+    let plan = plan(target);
+    require_helpers_initialized(&plan, crate::helpers_initialized());
+    // An exited child is answered before any refusal.
     match driver.root_exited(Duration::ZERO).await {
         Ok(false) => {}
         Ok(true) => {
@@ -121,22 +162,14 @@ pub(crate) async fn send<D: StopWaits>(driver: &D, target: &StopTarget<'_>, even
         }
         Err(look_failed) => return conclude(target, event, SendOutcome::NotSent(look_failed)),
     }
-    let console = target.child().console;
-    if console.elevated {
-        return Err(refuse(target, ELEVATED_REFUSAL));
-    }
-    let Some(id) = target.id() else {
-        return Err(refuse(target, NO_IDENTITY_REFUSAL));
-    };
-    let exe = match target.ctrl_proxy() {
-        CtrlProxy::HostExecutable if !crate::helpers_initialized() => {
-            return Err(refuse(target, NOT_INITIALIZED_REFUSAL))
-        }
-        CtrlProxy::HostExecutable => match std::env::current_exe() {
-            Ok(exe) => exe,
+    let (id, exe): (ProcessId, std::borrow::Cow<'_, Path>) = match plan {
+        Plan::RefuseElevated => return Err(refuse(target, ELEVATED_REFUSAL)),
+        Plan::RefuseNoIdentity => return Err(refuse(target, NO_IDENTITY_REFUSAL)),
+        Plan::StartHost(id) => match std::env::current_exe() {
+            Ok(exe) => (id, exe.into()),
             Err(e) => return conclude(target, event, exe_unreadable(e)),
         },
-        CtrlProxy::Executable(exe) => exe.clone(),
+        Plan::StartExecutable(id, exe) => (id, exe.into()),
     };
     conclude(target, event, ask(driver, target, event, &id, &exe).await)
 }

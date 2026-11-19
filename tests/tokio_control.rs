@@ -352,8 +352,8 @@ async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
     common::kill_tree_release_reap_async(&mut child, sock).await;
     child.terminate().await.expect("already-dead must be Ok");
 
-    // Off our console too: on Windows the default asks the proxy for these, and this host never called
-    // `cosca::init_helpers()`, so a call that asked first would be refused.
+    // Off our console too: on Windows the default asks the proxy for these (this host's `main` calls the
+    // hook, so the proxy route is open), and an exited child is answered `Ok`.
     let (mut child, sock) = common::spawn_control_async_with("control-block", &["R"], true, |_| {}).await;
     common::kill_tree_release_reap_async(&mut child, sock).await;
     child
@@ -378,41 +378,6 @@ async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
             .await
             .expect_err("a child on our console that leads no group is refused, exited or not");
         common::assert_refused_for_no_group(&err);
-    }
-}
-
-/// Async twin of `an_exited_child_the_default_sends_through_the_proxy_is_answered_without_init`
-/// (`ctrl_proxy_host.rs`): this binary's `main` does not call `cosca::init_helpers()` either, so an exited child
-/// that the default sends through the proxy is `Ok` only if the look at its exit comes first.
-#[cfg(feature = "tokio")]
-#[cfg(windows)]
-#[skuld::test]
-async fn async_an_exited_child_the_default_sends_through_the_proxy_is_answered_without_init() {
-    assert!(
-        !cosca::helpers_initialized(),
-        "this binary's `main` must not call `cosca::init_helpers()`"
-    );
-    for contain in [false, true] {
-        let (mut child, sock) = common::spawn_control_async_with("control-block", &["R"], contain, |_| {}).await;
-        child.kill().expect("kill the child");
-        child.wait().await.expect("see its exit");
-        drop(sock);
-
-        child
-            .terminate()
-            .await
-            .unwrap_or_else(|e| panic!("contained {contain}: an exited child is Ok: {e:?}"));
-        if contain {
-            let err = child.terminate_tree().await.expect_err("nothing was sent to the tree");
-            assert!(
-                matches!(&err, cosca::error::Error::Unassessable { detail, .. } if detail.contains("nothing was sent")),
-                "{err:?}"
-            );
-            child
-                .graceful_shutdown_tree(std::time::Duration::ZERO)
-                .await
-                .unwrap_or_else(|e| panic!("the call goes on to its sweep: {e:?}"));
-        }
     }
 }
 
@@ -476,8 +441,9 @@ async fn async_refusals_match_the_sync_surface() {
 /// Windows: the default stop's answers for a child on our console that needs no proxy (a contained child that
 /// leads a group, which gets the direct send, and a contained and an uncontained child that lead none, which
 /// get the direct send's refusal) are the same from the sync and the async `Child`, alive and after the
-/// reap. A proxy that the default started would answer a refusal of its own (this host never called
-/// `cosca::init_helpers()`), so a mirror that took it for any of the three differs by the shape of its error.
+/// reap. This host calls the hook, so a proxy the default took for a no-group child would run and refuse it
+/// in words of its own (`ConsoleIsCallers`); [`refusal_shape`] tells the direct send's refusal from that
+/// by its text. Mutant: the default routes a no-group child on our console through the proxy.
 #[cfg(feature = "tokio")]
 #[cfg(windows)]
 #[skuld::test]
@@ -538,12 +504,15 @@ async fn async_default_answers_match_the_sync_surface_on_our_console() {
 #[cfg(feature = "tokio")]
 /// The comparable shape of a cooperative-signal outcome: `Error` is `#[non_exhaustive]` and not
 /// `PartialEq`, and the detail strings legitimately differ between the two surfaces. An `Unsupported` that
-/// names `Command::new_process_group` is the refusal of a child that leads no group, which is told from any
-/// other refusal.
+/// says the child "leads no console process group" is the direct send's refusal of a child that leads no
+/// group; the proxy's own refusal (`ConsoleIsCallers`) names `Command::new_process_group` too, and is told
+/// from it by that phrase.
 fn refusal_shape(result: &Result<(), cosca::error::Error>) -> &'static str {
     match result {
         Ok(()) => "ok",
-        Err(cosca::error::Error::Unsupported { detail, .. }) if detail.contains("Command::new_process_group") => {
+        Err(cosca::error::Error::Unsupported { detail, .. })
+            if detail.contains("leads no console process group") && detail.contains("Command::new_process_group") =>
+        {
             "unsupported (no group)"
         }
         Err(cosca::error::Error::Unsupported { .. }) => "unsupported",
@@ -556,6 +525,8 @@ fn refusal_shape(result: &Result<(), cosca::error::Error>) -> &'static str {
 mod test_harness;
 
 fn main() {
+    #[cfg(windows)]
+    cosca::init_helpers();
     #[cfg(feature = "tokio")]
     common::install_log_capture();
     let mut runner = skuld::TestRunner::new();

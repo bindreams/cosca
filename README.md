@@ -23,7 +23,7 @@ let mut command = cosca::run(["my-service"]);
 command.contain().graceful_stop(|target| cosca::stop::send_signal(target, cosca::Signal::Int));
 ```
 
-On Windows, Ctrl+C in place of Ctrl+Break goes through a helper process, and reaches a child only if its Ctrl+C is not ignored, which a console process group (`contain` makes one) and a creator that ignores Ctrl+C both cause. The `cosca::stop` docs have the example, with `cosca::init_helpers()` first thing in `main`.
+On Windows, Ctrl+C in place of Ctrl+Break goes through a helper process, and reaches a child only if its Ctrl+C is not ignored, which a console process group (`contain` makes one) and a creator that ignores Ctrl+C both cause. The `cosca::stop` docs have the example, with `cosca::init_helpers()` first thing in `main`: a Windows stop that would start the program as its own proxy panics if the program never called it.
 
 ## Running tests
 

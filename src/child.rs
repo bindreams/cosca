@@ -926,9 +926,9 @@ impl Child {
     /// **What an error of the default says on Windows.** As for [`terminate`](Child::terminate). One more
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) says the opposite of the proxy's: a root
     /// the default sends through the proxy had exited when the call looked, and nothing was sent (the proxy
-    /// cannot name a member that outlived the root), with no proxy started, so `init_helpers` is not needed for it
-    /// either. The variant alone cannot tell the two apart; a caller that only wants the tree gone calls
-    /// [`kill_tree`](Child::kill_tree) after any error.
+    /// cannot name a member that outlived the root), with no proxy started. The variant alone cannot tell
+    /// the two apart; a caller that only wants the tree gone calls [`kill_tree`](Child::kill_tree) after any
+    /// error.
     ///
     /// **macOS `Containment::FdMarker` is stricter than the paragraph above:** `Err` there
     /// means at least one known or suspected tree member could not be assessed or signalled
@@ -975,6 +975,10 @@ impl Child {
     /// them and is `Ok`, but the handle does not take them for the whole tree. The handle holds the
     /// members the walk reached, and a later [`kill_tree`](Child::kill_tree) or the drop kills them by
     /// identity.
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub fn terminate_tree(&self) -> Result<(), Error> {
         graceful::shutdown::run_ready(graceful::shutdown::terminate_tree(&graceful::shutdown::BlockingDriver(
             self,

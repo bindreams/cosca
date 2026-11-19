@@ -200,7 +200,8 @@
 //! (`CtrlProxy::HostExecutable`) starts the file at the host's path, when the stop runs, as the proxy.
 //! A host that cannot call `init_helpers`, or that replaces its own image while it runs, installs the
 //! `cosca-ctrl-proxy` executable (`cargo install cosca --bin cosca-ctrl-proxy`) and names it with
-//! `Command::ctrl_proxy`. A host that did neither is refused, with nothing started.
+//! `Command::ctrl_proxy`. A Windows stop that would start the host as the proxy panics in a host that did
+//! neither; see [`stop::default`](stop::default#panics).
 //!
 //! # A child under a debugger
 //!

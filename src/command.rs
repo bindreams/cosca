@@ -682,9 +682,12 @@ impl Command {
     /// `cosca-ctrl-proxy` executable, for a host that cannot call `init_helpers` or replaces its own image
     /// while it runs).
     ///
-    /// The setting is only read when a stop sends through the proxy: the default stop does for a child
-    /// it cannot send directly ([`stop::default`](crate::stop::default)), and a child whose stop never
-    /// does ignores it.
+    /// The setting is read only when a stop goes through the proxy: [`stop::default`](crate::stop::default)
+    /// does for a child outside this process's console, and
+    /// [`stop::send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy) always; a child
+    /// whose stop never does ignores it. With the default setting, a stop that would start this program as
+    /// the proxy panics when the program never called [`cosca::init_helpers()`](crate::init_helpers) (see
+    /// [`stop::default`](crate::stop::default#panics)); `CtrlProxy::Executable(..)` needs no call.
     #[cfg(windows)]
     pub fn ctrl_proxy(&mut self, proxy: crate::CtrlProxy) -> &mut Command {
         self.ctrl_proxy = std::sync::Arc::new(proxy);
@@ -809,9 +812,10 @@ impl Command {
     /// directly: it asks the console-event proxy, a helper process that attaches to the child's console
     /// and sends Ctrl+Break to it there ([`stop::default`](crate::stop::default)), which reaches every
     /// process on that console. That needs the host program to have called
-    /// [`cosca::init_helpers()`](crate::init_helpers) (or `Command::ctrl_proxy` to name a proxy program).
-    /// A child that would have no console anyway, such as a windows-subsystem image, has none for the proxy
-    /// to attach to, and its stop is [`Error::Unsupported`] naming `Child::kill`, with nothing sent.
+    /// [`cosca::init_helpers()`](crate::init_helpers) (or `Command::ctrl_proxy` to name a proxy program): see
+    /// [`stop::default`](crate::stop::default#panics). A child that would have no console anyway, such as a
+    /// windows-subsystem image, has none for the proxy to attach to, and its stop is
+    /// [`Error::Unsupported`] naming `Child::kill`, with nothing sent.
     ///
     /// Not requesting this does not establish the reverse: whether a child shares this process's
     /// console also depends on the child image's subsystem and on what the child does with its own
