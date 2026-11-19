@@ -394,7 +394,7 @@ name = "posix_path_resolution"
 path = "tests/posix_path_resolution.rs"
 harness = false
 
-# The console-event proxy for a host that does not call `cosca::init()` (see `src/init.rs`).
+# The console-event proxy for a host that does not call `cosca::init_helpers()` (see `src/init.rs`).
 [[bin]]
 name = "cosca-ctrl-proxy"
 path = "src/bin/cosca-ctrl-proxy.rs"

@@ -1,6 +1,9 @@
 //! The console-event proxy's wire format: its argv and its exit codes. Pure: no I/O, no system
 //! calls.
 //!
+//! Whether a process is a proxy is not in the argv: a caller says so with the environment variable
+//! [`role::HELPER_ENV`](crate::role::HELPER_ENV), and the argv is then data only.
+//!
 //! Every value has exactly one encoding, so a decoder never accepts two spellings of one thing.
 
 use std::ffi::{OsStr, OsString};
@@ -8,10 +11,7 @@ use std::ffi::{OsStr, OsString};
 use crate::role::decimal;
 
 /// The protocol version this cosca speaks.
-pub(crate) const VERSION: u32 = 1;
-
-/// What `argv[1]` of a proxy invocation starts with, whatever the version.
-const FLAG_PREFIX: &str = "--cosca-ctrl-proxy";
+pub(crate) const VERSION: u32 = 2;
 
 /// A console control event that can be sent to a child's console: Ctrl+C or Ctrl+Break.
 ///
@@ -71,14 +71,14 @@ pub(crate) struct ProxyArgs {
     pub(crate) caller: u32,
 }
 
-/// Why argv is not a valid proxy invocation.
+/// Why argv is not a valid proxy argv.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ProxyArgsError {
     #[error("the caller speaks protocol version {theirs}, this proxy {ours}")]
     VersionMismatch { ours: u32, theirs: u32 },
-    #[error("the flag is not `{FLAG_PREFIX}=<version>`")]
-    BadFlag,
-    #[error("expected a target pid, its key, an event and a caller pid after the flag")]
+    #[error("the first argument is not a protocol version (a decimal number)")]
+    BadVersion,
+    #[error("expected a protocol version, a target pid, its key, an event and a caller pid")]
     WrongArgumentCount,
     #[error("a pid or a key is not a decimal number")]
     BadNumber,
@@ -97,8 +97,8 @@ impl ProxyArgsError {
 }
 
 impl ProxyArgs {
-    /// The full argv, `argv[0]` included: `[exe, "--cosca-ctrl-proxy=1", target, target_key, "c" |
-    /// "break", caller]`.
+    /// The full argv, `argv[0]` included: `[exe, version, target, target_key, "c" | "break", caller]`,
+    /// the version a plain decimal.
     #[cfg_attr(
         not(windows),
         allow(dead_code, reason = "only the Windows caller side starts a proxy")
@@ -106,7 +106,7 @@ impl ProxyArgs {
     pub(crate) fn to_argv(self, exe: &OsStr) -> Vec<OsString> {
         vec![
             exe.to_owned(),
-            format!("{FLAG_PREFIX}={VERSION}").into(),
+            VERSION.to_string().into(),
             self.target.to_string().into(),
             self.target_key.to_string().into(),
             self.event.token().into(),
@@ -114,21 +114,18 @@ impl ProxyArgs {
         ]
     }
 
-    /// `Ok(None)` when `argv` is not a proxy invocation at all (`argv[1]` does not start with the
-    /// flag); an error when it claims to be one and is not valid. `argv` includes `argv[0]`.
-    pub(crate) fn parse(argv: &[OsString]) -> Result<Option<ProxyArgs>, ProxyArgsError> {
-        let Some(flag) = argv.get(1) else { return Ok(None) };
-        let flag = flag.to_string_lossy();
-        let Some(version) = flag.strip_prefix(FLAG_PREFIX) else {
-            return Ok(None);
+    /// Reads `argv` (`argv[0]` included), the arguments of a process that the environment said is a proxy.
+    /// The version is judged before the rest: another version may lay its tail out differently.
+    pub(crate) fn parse(argv: &[OsString]) -> Result<ProxyArgs, ProxyArgsError> {
+        let Some(version) = argv.get(1) else {
+            return Err(ProxyArgsError::WrongArgumentCount);
         };
-        // The version is judged before the rest: another version may lay its tail out differently.
-        match version.strip_prefix('=').and_then(|v| decimal::<u32>(v.as_bytes())) {
+        match version.to_str().and_then(|v| decimal::<u32>(v.as_bytes())) {
             Some(VERSION) => {}
             Some(theirs) => return Err(ProxyArgsError::VersionMismatch { ours: VERSION, theirs }),
-            None => return Err(ProxyArgsError::BadFlag),
+            None => return Err(ProxyArgsError::BadVersion),
         }
-        let [_exe, _flag, target, target_key, event, caller] = argv else {
+        let [_exe, _version, target, target_key, event, caller] = argv else {
             return Err(ProxyArgsError::WrongArgumentCount);
         };
         let number = |a: &OsString| {
@@ -141,12 +138,12 @@ impl ProxyArgs {
             .to_str()
             .and_then(CtrlEvent::from_token)
             .ok_or(ProxyArgsError::BadEvent)?;
-        Ok(Some(ProxyArgs {
+        Ok(ProxyArgs {
             target: pid(target)?,
             target_key: number(target_key)?,
             event,
             caller: pid(caller)?,
-        }))
+        })
     }
 }
 

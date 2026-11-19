@@ -1,4 +1,4 @@
-//! The shim as a host ships it: `cosca::init()` with no hooks. The other tests run it with the test
+//! The shim as a host ships it: `cosca::init_helpers()` with no hooks. The other tests run it with the test
 //! seams, which change what the shim does, so what a host really gets is checked here.
 
 use super::*;

@@ -22,11 +22,12 @@ fn argv_round_trips_for_both_events() {
             caller: 7,
         };
         let argv = args.to_argv(OsStr::new(EXE));
-        assert_eq!(ProxyArgs::parse(&argv), Ok(Some(args)), "{argv:?}");
+        assert_eq!(ProxyArgs::parse(&argv), Ok(args), "{argv:?}");
     }
 }
 
-/// The wire form is fixed, so a proxy of another build reads it.
+/// The wire form is fixed, so a proxy of another build reads it: the version first, as a plain decimal
+/// and no flag. Mutant: a flag in front of the version, or another version number.
 #[skuld::test]
 fn argv_has_the_stated_layout() {
     let args = ProxyArgs {
@@ -35,80 +36,73 @@ fn argv_has_the_stated_layout() {
         event: CtrlEvent::CtrlBreak,
         caller: 7,
     };
-    assert_eq!(
-        args.to_argv(OsStr::new(EXE)),
-        argv(&["--cosca-ctrl-proxy=1", "4242", "99", "break", "7"])
-    );
+    assert_eq!(args.to_argv(OsStr::new(EXE)), argv(&["2", "4242", "99", "break", "7"]));
     let args = ProxyArgs {
         event: CtrlEvent::CtrlC,
         ..args
     };
-    assert_eq!(
-        args.to_argv(OsStr::new(EXE)),
-        argv(&["--cosca-ctrl-proxy=1", "4242", "99", "c", "7"])
-    );
-}
-
-/// Mutant: any argv is taken for an invocation.
-#[skuld::test]
-fn an_argv_without_the_flag_is_not_an_invocation() {
-    assert_eq!(ProxyArgs::parse(&argv(&[])), Ok(None));
-    assert_eq!(ProxyArgs::parse(&argv(&["--help"])), Ok(None));
-    assert_eq!(ProxyArgs::parse(&argv(&["4242", "99", "break", "7"])), Ok(None));
-    assert_eq!(ProxyArgs::parse(&argv(&["--cosca-elevation-shim=1", "x"])), Ok(None));
-    assert_eq!(ProxyArgs::parse(&[]), Ok(None));
+    assert_eq!(args.to_argv(OsStr::new(EXE)), argv(&["2", "4242", "99", "c", "7"]));
+    assert_eq!(VERSION, 2);
 }
 
 /// Mutant: the version is ignored, or judged after the tail (another version's tail may differ).
 #[skuld::test]
 fn another_version_is_a_mismatch_whatever_follows() {
     for tail in [
-        &["--cosca-ctrl-proxy=2", "4242", "99", "break", "7"][..],
-        &["--cosca-ctrl-proxy=2"],
+        &["1", "4242", "99", "break", "7"][..],
+        &["3"],
+        &["3", "x"],
+        &["99999", "-1"],
     ] {
+        let theirs = tail[0].parse().expect("a number");
         assert_eq!(
             ProxyArgs::parse(&argv(tail)),
-            Err(ProxyArgsError::VersionMismatch {
-                ours: VERSION,
-                theirs: 2
-            }),
+            Err(ProxyArgsError::VersionMismatch { ours: VERSION, theirs }),
             "{tail:?}"
         );
     }
-    assert_eq!(VERSION, 1);
 }
 
-/// Mutant: a flag that names no version number is read as a version.
+/// Mutant: a first argument that is no version number is read as a version, or as a tail error.
 #[skuld::test]
-fn a_flag_without_a_version_number_is_malformed() {
-    for flag in [
-        "--cosca-ctrl-proxy",
-        "--cosca-ctrl-proxy=",
-        "--cosca-ctrl-proxy=x",
-        "--cosca-ctrl-proxy=01",
-        "--cosca-ctrl-proxy=+1",
-        "--cosca-ctrl-proxy-1",
-        "--cosca-ctrl-proxy=99999999999",
+fn a_first_argument_that_is_no_version_number_is_malformed() {
+    for version in [
+        "",
+        "x",
+        "02",
+        "+2",
+        "-2",
+        " 2",
+        "2 ",
+        "--cosca-ctrl-proxy=2",
+        "99999999999",
     ] {
         assert_eq!(
-            ProxyArgs::parse(&argv(&[flag, "4242", "99", "break", "7"])),
-            Err(ProxyArgsError::BadFlag),
-            "{flag}"
+            ProxyArgs::parse(&argv(&[version, "4242", "99", "break", "7"])),
+            Err(ProxyArgsError::BadVersion),
+            "{version:?}"
         );
     }
+}
+
+/// Mutant: an argv with nothing after the program's name is read, or indexes out of range.
+#[skuld::test]
+fn an_argv_without_a_version_is_the_wrong_count() {
+    assert_eq!(ProxyArgs::parse(&argv(&[])), Err(ProxyArgsError::WrongArgumentCount));
+    assert_eq!(ProxyArgs::parse(&[]), Err(ProxyArgsError::WrongArgumentCount));
 }
 
 /// Mutant: a missing or non-numeric pid or key is read as 0, or a short argv indexes out of range.
 #[skuld::test]
 fn a_malformed_tail_is_an_error() {
-    let flag = "--cosca-ctrl-proxy=1";
+    let version = "2";
     for tail in [
-        &[flag][..],
-        &[flag, "4242"],
-        &[flag, "4242", "99"],
-        &[flag, "4242", "99", "break"],
-        &[flag, "4242", "break", "7"],
-        &[flag, "4242", "99", "break", "7", "extra"],
+        &[version][..],
+        &[version, "4242"],
+        &[version, "4242", "99"],
+        &[version, "4242", "99", "break"],
+        &[version, "4242", "break", "7"],
+        &[version, "4242", "99", "break", "7", "extra"],
     ] {
         assert_eq!(
             ProxyArgs::parse(&argv(tail)),
@@ -132,14 +126,14 @@ fn a_malformed_tail_is_an_error() {
         ("4242", "99", "y"),
     ] {
         assert_eq!(
-            ProxyArgs::parse(&argv(&[flag, target, key, "break", caller])),
+            ProxyArgs::parse(&argv(&[version, target, key, "break", caller])),
             Err(ProxyArgsError::BadNumber),
             "{target:?} {key:?} {caller:?}"
         );
     }
     for event in ["", "C", "Break", "ctrl-c", "ctrl_break"] {
         assert_eq!(
-            ProxyArgs::parse(&argv(&[flag, "4242", "99", event, "7"])),
+            ProxyArgs::parse(&argv(&[version, "4242", "99", event, "7"])),
             Err(ProxyArgsError::BadEvent),
             "{event:?}"
         );
@@ -150,11 +144,11 @@ fn a_malformed_tail_is_an_error() {
 #[skuld::test]
 fn errors_answer_by_kind() {
     assert_eq!(
-        ProxyArgsError::VersionMismatch { ours: 1, theirs: 2 }.answer(),
+        ProxyArgsError::VersionMismatch { ours: 2, theirs: 3 }.answer(),
         ProxyAnswer::VersionMismatch
     );
     for error in [
-        ProxyArgsError::BadFlag,
+        ProxyArgsError::BadVersion,
         ProxyArgsError::WrongArgumentCount,
         ProxyArgsError::BadNumber,
         ProxyArgsError::BadEvent,
@@ -188,7 +182,7 @@ fn each_answer_has_its_code_and_maps_back() {
 /// 125) or a Windows `STATUS_CONTROL_C_EXIT` is read as an answer.
 #[skuld::test]
 fn other_codes_are_not_answers() {
-    for code in [0, 1, 110, 117, 120, 125, 149, 161, 0xC000_013A_u32 as i32, -1] {
+    for code in [0, 1, 100, 110, 117, 120, 125, 149, 161, 0xC000_013A_u32 as i32, -1] {
         assert_eq!(ProxyAnswer::from_code(code), None, "{code}");
     }
 }

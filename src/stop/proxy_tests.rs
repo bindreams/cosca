@@ -188,8 +188,9 @@ fn names_in_order(text: &str, first: &str, second: &str) {
 // What the proxy is asked =====
 
 /// `Sent` is `Ok`, and the proxy is started with the child's identity, the event and this process as the
-/// caller, with no console of its own. Mutants: the other event, the pid with another key, another
-/// caller, the proxy started attached to a console, `Sent` not `Ok`.
+/// caller, with no console of its own, told it is the proxy by the environment. Mutants: the other event,
+/// the pid with another key, another caller, the proxy started attached to a console, the variable not
+/// set or set to another role, `Sent` not `Ok`.
 #[skuld::test]
 fn a_sent_answer_is_ok_and_the_proxy_is_asked_for_this_child_and_event() {
     for event in [CtrlEvent::CtrlBreak, CtrlEvent::CtrlC] {
@@ -201,13 +202,18 @@ fn a_sent_answer_is_ok_and_the_proxy_is_asked_for_this_child_and_event() {
         let record = child.id().expect(IDENTITY_READ).to_record().expect("a record");
         assert_eq!(
             ProxyArgs::parse(&ran.argv),
-            Ok(Some(ProxyArgs {
+            Ok(ProxyArgs {
                 target: record.pid,
                 target_key: record.token,
                 event,
                 caller: std::process::id(),
-            })),
+            }),
             "{ran:?}"
+        );
+        assert_eq!(
+            ran.helper.as_deref(),
+            Some(std::ffi::OsStr::new(crate::role::CTRL_PROXY)),
+            "the proxy is started as a helper in the proxy role: {ran:?}"
         );
         assert_eq!(std::path::Path::new(&ran.argv[0]), fixture.exe, "{ran:?}");
         assert!(!ran.had_console, "the proxy has no console of its own: {ran:?}");
@@ -432,6 +438,23 @@ fn a_version_the_proxy_does_not_speak_names_ours() {
         assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, answer);
         kill_release_reap(&child, sock, false);
     }
+}
+
+/// A helper that refuses the role cosca named (its exit is `role::UNKNOWN_HELPER_ROLE`: it never played
+/// one) is `Unsupported`, nothing sent, naming the program and the same-cosca remedy, as for a version the
+/// proxy does not speak. Mutants: the code is read as "no answer, the event may have been sent"
+/// (`Unassessable`); the program or the remedy is not named.
+#[skuld::test]
+fn a_helper_that_refuses_the_role_sent_nothing_and_names_the_remedy() {
+    let fixture = Fixture::answering(crate::role::UNKNOWN_HELPER_ROLE);
+    let (child, sock) = hidden_member(&fixture);
+    let err = send_err(&child, CtrlEvent::CtrlBreak);
+    let detail = unsupported_detail(&err);
+    assert!(detail.contains(&fixture.exe.display().to_string()), "{detail}");
+    assert!(detail.contains("nothing was sent"), "{detail}");
+    assert!(detail.contains("built from the same cosca"), "{detail}");
+    assert_no_break_sent();
+    kill_release_reap(&child, sock, false);
 }
 
 /// A program that says it has no proxy is `Unsupported` naming the program that was started. Mutants:

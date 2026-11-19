@@ -2,7 +2,7 @@
 //! or with one that sends nothing, and (Windows, the `CTRL_PROXY` group) that it plays the proxy
 //! for a child on a console of its own.
 //!
-//! The argv below is the protocol's wire form, spelled out: the protocol is crate-private.
+//! The argv and the variable below are the protocol's wire form, spelled out: the protocol is crate-private.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -29,6 +29,7 @@ fn proxy_exe() -> std::path::PathBuf {
 #[skuld::test]
 fn started_without_a_proxy_invocation_it_answers_usage() {
     let mut cmd = std::process::Command::new(proxy_exe());
+    cmd.env_remove("__COSCA_HELPER");
     let out = common::output_locked(&mut cmd).expect("run the executable");
     assert_eq!(out.status.code(), Some(USAGE), "{out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -36,13 +37,13 @@ fn started_without_a_proxy_invocation_it_answers_usage() {
     assert!(stderr.starts_with("cosca-ctrl-proxy: "), "{stderr:?}");
 }
 
-/// A target that has no process: the executable runs `cosca::init()`, which answers for it, and
-/// sends nothing. Mutant: `main` does not call `init`, so the invocation is taken for a missing one.
+/// A target that has no process: the executable runs `cosca::init_helpers()`, which answers for it, and
+/// sends nothing. Mutant: `main` does not call `init_helpers`, so the invocation is taken for a missing one.
 #[skuld::test]
 fn started_with_a_proxy_invocation_it_runs_the_proxy() {
     let mut cmd = std::process::Command::new(proxy_exe());
-    cmd.args([
-        "--cosca-ctrl-proxy=1".to_owned(),
+    cmd.env("__COSCA_HELPER", "ctrl-proxy").args([
+        "2".to_owned(),
         NO_SUCH_PID.to_string(),
         "0".to_owned(),
         "break".to_owned(),

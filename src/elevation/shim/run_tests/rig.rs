@@ -1,5 +1,5 @@
 //! A real [`ShimLink`](super::super::link::ShimLink) and the real shim as its peer: the lib's own
-//! test binary re-executed with the shim's arguments (its `main` calls `init_with_test_hooks`).
+//! test binary re-executed with the shim's arguments (its `main` calls `init_helpers_with_test_hooks`).
 //! The seams come from the environment, as `testbin/shim_hooks.rs` reads them.
 //!
 //! Every wait here is on an event a mutant of the code under test cannot suppress: a line the
@@ -135,7 +135,7 @@ impl Spec {
         self
     }
 
-    /// The shim runs as a host ships it: through `cosca::init()`, with no hooks, so none of the
+    /// The shim runs as a host ships it: through `cosca::init_helpers()`, with no hooks, so none of the
     /// seams the other settings ask for exists.
     pub(super) fn shipped(mut self) -> Spec {
         self.shipped = true;

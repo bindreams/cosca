@@ -375,12 +375,12 @@ fn main() {
     // The elevation shim, when this process was started as one; its test seams come from the environment.
     #[cfg(unix)]
     shim_hooks::init();
-    // Before `init()`, so a copy named for the fixture never plays the real proxy.
+    // Before `init_helpers()`, so a copy named for the fixture never plays the real proxy.
     #[cfg(windows)]
     proxy_fixture::run_if_named();
     // The console-event proxy, which a test may start as a copy of this binary.
     #[cfg(windows)]
-    cosca::init();
+    cosca::init_helpers();
     let args: Vec<String> = std::env::args().collect();
     #[cfg(target_os = "linux")]
     if std::fs::read_link("/proc/self/exe").is_ok_and(|exe| exe.file_name() == Some("pkexec-impl".as_ref())) {

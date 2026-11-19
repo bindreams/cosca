@@ -2,9 +2,10 @@
 //!
 //! A copy of the testbin named `cosca-proxy-fixture-<code>.exe` answers `<code>` to whatever it is
 //! asked, and before it exits it records what it was started with in `<its path>.ran`: whether it
-//! had a console, and its argv. The code is in the name so that each test chooses its own with no state
-//! shared between tests. The testbin's `main` runs this before anything else, so the copy never plays
-//! the real proxy, which a `cosca::init()` first in `main` would.
+//! had a console, the helper variable and its argv. The code is in the name so that each test chooses its
+//! own with no state shared between tests. The testbin's `main` runs this before anything else, so the copy
+//! never plays the real proxy, which a `cosca::init_helpers()` first in `main` would. It records the value
+//! of `__COSCA_HELPER` it found.
 //!
 //! A fixture that finds `<its path>.port` holds its answer until it is told: it connects to that port on
 //! the loopback, reports its pid as a line, and exits with its code once the test writes a byte (or closes
@@ -48,17 +49,43 @@ pub fn port_path(exe: &Path) -> PathBuf {
 pub struct Ran {
     /// The fixture was attached to a console when it started.
     pub had_console: bool,
+    /// The value of `__COSCA_HELPER` in its environment; `None` when unset.
+    pub helper: Option<OsString>,
     /// Its argv, `argv[0]` included.
     pub argv: Vec<OsString>,
 }
 
-/// What the fixture at `exe` recorded; `None` when it never ran.
+/// What the fixture at `exe` recorded; `None` when it never ran. An unreadable record panics, so it never
+/// reads as "never ran".
 pub fn read_record(exe: &Path) -> Option<Ran> {
-    let text = std::fs::read_to_string(record_path(exe)).ok()?;
+    let path = record_path(exe);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!("the fixture's record {} cannot be read: {e}", path.display()),
+    };
     let mut lines = text.lines();
-    let had_console = lines.next()? == "console=true";
+    let had_console = match lines.next() {
+        Some("console=true") => true,
+        Some("console=false") => false,
+        other => panic!(
+            "the fixture's record {} has no `console=` line first: {other:?}",
+            path.display()
+        ),
+    };
+    let helper = match lines.next().and_then(|line| line.strip_prefix("helper=")) {
+        Some("unset") => None,
+        Some(set) => Some(OsString::from(set.strip_prefix("set:").unwrap_or_else(|| {
+            panic!(
+                "the fixture's record {} has a `helper=` line that is neither `unset` nor `set:..`: {set:?}",
+                path.display()
+            )
+        }))),
+        None => panic!("the fixture's record {} has no `helper=` line second", path.display()),
+    };
     Some(Ran {
         had_console,
+        helper,
         argv: lines.map(OsString::from).collect(),
     })
 }
@@ -75,6 +102,12 @@ pub fn run_if_named() {
         return;
     };
     let mut record = format!("console={}\n", has_console());
+    // The variable's name is spelled out: the testbin cannot name the lib's constant, and a test that reads
+    // the record compares the value with it, so a name that drifted records `unset`.
+    match std::env::var_os("__COSCA_HELPER") {
+        Some(value) => record.push_str(&format!("helper=set:{}\n", value.to_string_lossy())),
+        None => record.push_str("helper=unset\n"),
+    }
     for arg in std::env::args_os() {
         record.push_str(&arg.to_string_lossy());
         record.push('\n');

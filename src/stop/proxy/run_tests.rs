@@ -1,7 +1,7 @@
 //! The proxy's sequence, against real consoles.
 //!
-//! Every test but the first starts the proxy for real: this test binary re-executed with the proxy's
-//! arguments (its `main` calls `init` first), as cosca starts it, `detached()` with null stdio. A
+//! Every test but the first starts the proxy for real: this test binary started as the proxy
+//! (its `main` calls `init_helpers` first), as cosca starts it, `detached()` with null stdio. A
 //! wrong proxy sends Ctrl+C or Ctrl+Break to every process on the console it attached to, so those
 //! tests are the `CTRL_PROXY` group: they run on CI, and a host runs them only after consenting
 //! (`COSCA_TEST_CTRL_PROXY_CONSENT=1`) or turns them off (`COSCA_TEST_CTRL_PROXY=0`).
@@ -46,7 +46,9 @@ fn ask_proxy_with(args: ProxyArgs) -> ProxyAnswer {
     let exe = std::env::current_exe().expect("current_exe");
     let argv = args.to_argv(exe.as_os_str());
     let mut cmd = crate::test_child::command(crate::test_child::Console::Asked);
-    cmd.executable(exe).args(argv);
+    cmd.executable(exe)
+        .args(argv)
+        .env(crate::role::HELPER_ENV, crate::role::CTRL_PROXY);
     // As cosca starts it: no console of its own, so that it can attach to one.
     cmd.detached();
     cmd.stdin(crate::Stdio::null()).expect("null stdin");

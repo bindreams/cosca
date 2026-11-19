@@ -1,5 +1,5 @@
-//! The caller's side of the console-event proxy against the real proxy: this test binary re-executed
-//! with the proxy's arguments (its `main` calls `init` first), started by a stop action of
+//! The caller's side of the console-event proxy against the real proxy: this test binary started as the proxy
+//! (its `main` calls `init_helpers` first), started by a stop action of
 //! `stop::send_console_event_via_proxy`. A wrong proxy sends Ctrl+C or Ctrl+Break to every process on the
 //! console it attached to, so these tests are the `CTRL_PROXY` group: they run on CI, and a host runs them
 //! only after consenting (`COSCA_TEST_CTRL_PROXY_CONSENT=1`) or turns them off
