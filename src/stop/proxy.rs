@@ -1,6 +1,7 @@
-//! The console-event proxy: a role of the host program (`cosca::init()`) or of the
-//! `cosca-ctrl-proxy` executable. It attaches to a child's console, sends Ctrl+C or Ctrl+Break to
-//! that whole console, and answers by exit code.
+//! The console-event proxy: a role of the host program (`cosca::init_helpers()`) or of the
+//! `cosca-ctrl-proxy` executable, which a caller starts with the environment variable
+//! [`HELPER_ENV`](crate::role::HELPER_ENV) set to `ctrl-proxy`. It attaches to a child's console, sends
+//! Ctrl+C or Ctrl+Break to that whole console, and answers by exit code.
 //!
 //! [`protocol`] is the argv a caller starts it with and the exit codes it answers with; [`run`] is
 //! its own sequence; the rest of this file is the caller's side (Windows): the program a stop starts
@@ -36,22 +37,23 @@ use crate::identity::ProcessId;
 /// [`Command::ctrl_proxy`](crate::Command::ctrl_proxy) sets it.
 ///
 /// The proxy needs no console of its own, and attaches to the child's. It is cosca's own code, started
-/// from a program that carries it: the host program, which plays the role when it is started with the
-/// proxy's arguments, or the `cosca-ctrl-proxy` executable.
+/// from a program that carries it: the host program, which plays the role when it is started with
+/// `__COSCA_HELPER=ctrl-proxy`, or the `cosca-ctrl-proxy` executable.
 #[cfg(windows)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum CtrlProxy {
     /// The file at the host program's path ([`std::env::current_exe`]) when the stop runs, started as the
-    /// proxy. The host must have called [`cosca::init()`](crate::init) first thing in `main`: the copy
-    /// then plays the proxy and exits instead of running the host's own `main`. A host that has not
-    /// called `init` is refused, with nothing started ([`installed`](crate::installed) says whether it
-    /// has). So cosca never starts a second copy of a program that would run as itself, while the file at
-    /// that path is the one this process was loaded from: a program that replaces its own image while
-    /// it runs sets [`Executable`](CtrlProxy::Executable).
+    /// proxy. The host must have called [`cosca::init_helpers()`](crate::init_helpers) first thing in
+    /// `main`: the copy then plays the proxy and exits instead of running the host's own `main`. A host
+    /// that has not called `init_helpers` is refused, with nothing started
+    /// ([`helpers_initialized`](crate::helpers_initialized) says whether it has). So cosca never starts a
+    /// second copy of a program that would run as itself, while the file at that path is the one this
+    /// process was loaded from: a program that replaces its own image while it runs sets
+    /// [`Executable`](CtrlProxy::Executable).
     #[default]
     HostExecutable,
     /// This file, which is the `cosca-ctrl-proxy` executable (`cargo install cosca --bin
-    /// cosca-ctrl-proxy`) or another program that calls `cosca::init()` first thing in `main`. It is
+    /// cosca-ctrl-proxy`) or another program that calls `cosca::init_helpers()` first thing in `main`. It is
     /// loaded exactly as written, as [`Command::raw_executable`](crate::Command::raw_executable) does:
     /// no `PATH` search and no `.exe` appended, and a relative path is read against this process's
     /// working directory.
@@ -75,9 +77,15 @@ const NO_IDENTITY_REFUSAL: &str = "this child has no identity (Child::id() is No
      exactly. Use Child::kill for a hard teardown, or Command::graceful_stop with a stop of your own.";
 
 #[cfg(windows)]
-const NOT_INSTALLED_REFUSAL: &str = "CtrlProxy::HostExecutable starts a copy of this program as the proxy, and \
-     this program has not called cosca::init(), so a copy would run as itself. Call cosca::init() first \
-     thing in main, or set Command::ctrl_proxy(CtrlProxy::Executable(..)) to the cosca-ctrl-proxy executable.";
+const NOT_INITIALIZED_REFUSAL: &str = "CtrlProxy::HostExecutable starts a copy of this program as the proxy, \
+     and this program has not called cosca::init_helpers(), so a copy would run as itself. Call \
+     cosca::init_helpers() first thing in main, or set Command::ctrl_proxy(CtrlProxy::Executable(..)) \
+     to the cosca-ctrl-proxy executable.";
+
+/// The remedy for a program that is no proxy of this cosca's protocol.
+#[cfg(windows)]
+const SAME_COSCA_PROXY: &str = "Start a proxy built from the same cosca: CtrlProxy::HostExecutable, or the \
+     cosca-ctrl-proxy executable that belongs to it.";
 
 /// The remedies a refusal that leaves the child running names, in this order.
 #[cfg(windows)]
@@ -121,7 +129,9 @@ pub(crate) async fn send<D: StopWaits>(driver: &D, target: &StopTarget<'_>, even
         return Err(refuse(target, NO_IDENTITY_REFUSAL));
     };
     let exe = match target.ctrl_proxy() {
-        CtrlProxy::HostExecutable if !crate::installed() => return Err(refuse(target, NOT_INSTALLED_REFUSAL)),
+        CtrlProxy::HostExecutable if !crate::helpers_initialized() => {
+            return Err(refuse(target, NOT_INITIALIZED_REFUSAL))
+        }
         CtrlProxy::HostExecutable => match std::env::current_exe() {
             Ok(exe) => exe,
             Err(e) => return conclude(target, event, exe_unreadable(e)),
@@ -190,6 +200,15 @@ async fn ask<D: StopWaits>(
             source: None,
         }));
     };
+    if code == crate::role::UNKNOWN_HELPER_ROLE {
+        // The helper refused the role cosca named: it never played one, so nothing was sent.
+        return SendOutcome::NotSent(unsupported(format!(
+            "the program started as the console-event proxy ({}) refused the helper role this cosca named \
+             (exit {code}): it knows no `{}` role, so nothing was sent. {SAME_COSCA_PROXY}",
+            exe.display(),
+            crate::role::CTRL_PROXY
+        )));
+    }
     let Some(answer) = ProxyAnswer::from_code(code) else {
         return SendOutcome::Sent(Err(Error::Unassessable {
             detail: format!(
@@ -210,11 +229,15 @@ async fn ask<D: StopWaits>(
     result_of(driver, target, event, exe, answer).await
 }
 
-/// Sets `command` up to start `exe` as the proxy for `args`: uncontained, with no console of its own (a
-/// process attached to one cannot attach to another), and null standard streams.
+/// Sets `command` up to start `exe` as the proxy for `args`: told by the environment that it is the
+/// proxy, uncontained, with no console of its own (a process attached to one cannot attach to another),
+/// and null standard streams.
 #[cfg(windows)]
 pub(crate) fn configure_start(command: &mut crate::Command, exe: &Path, args: &ProxyArgs) -> Result<(), Error> {
-    command.raw_executable(exe).args(args.to_argv(exe.as_os_str()));
+    command
+        .raw_executable(exe)
+        .args(args.to_argv(exe.as_os_str()))
+        .env(crate::role::HELPER_ENV, crate::role::CTRL_PROXY);
     command.detached();
     command
         .stdin(crate::Stdio::null())?
@@ -308,8 +331,7 @@ async fn result_of<D: StopWaits>(
         ProxyAnswer::VersionMismatch | ProxyAnswer::Usage => not_sent(unsupported(format!(
             "the program started as the console-event proxy ({}) did not accept this cosca's invocation \
              (answer {answer:?}, exit {code}); this cosca speaks proxy protocol version {VERSION}, so \
-             nothing was sent. Start a proxy built from the same cosca: CtrlProxy::HostExecutable, or the \
-             cosca-ctrl-proxy executable that belongs to it.",
+             nothing was sent. {SAME_COSCA_PROXY}",
             exe.display()
         ))),
         ProxyAnswer::NoProxyHere => not_sent(unsupported(format!(

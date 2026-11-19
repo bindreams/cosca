@@ -24,7 +24,7 @@ fn child_terminate_sends_sigterm() {
 }
 
 /// An uncontained child on our console, which leads no group: the default is the direct send's refusal, in
-/// this host, which never called `cosca::init()`, and so does not need the proxy.
+/// this host, which never called `cosca::init_helpers()`, and so does not need the proxy.
 #[cfg(windows)]
 #[skuld::test]
 fn child_terminate_unsupported_for_an_uncontained_child_on_windows() {
@@ -150,7 +150,7 @@ fn the_recorded_route_distinguishes_contained_from_uncontained_on_windows() {
 /// The parity contract, deliberately not `cfg`-gated so it is one test rather than two: the
 /// `Child` pins the pid for its whole life, so an already-exited child is `Ok` on every
 /// platform: on our console, on a console of its own (which on Windows the default asks the proxy for,
-/// and this host never called `cosca::init()`, so a call that asked first would be refused), and
+/// and this host never called `cosca::init_helpers()`, so a call that asked first would be refused), and
 /// uncontained. The one exception is a Windows child created on our console that leads no group: the
 /// direct send refuses it before and after its exit, which the last block pins.
 #[skuld::test]

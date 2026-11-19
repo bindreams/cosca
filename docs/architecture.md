@@ -87,11 +87,16 @@ What a child's cooperative stop sends is an action it stores, not a rule inside 
   mechanism its stop; the mechanism does not know an action exists. Under `graceful_shutdown_tree` the
   mechanism's outcome is left as a record on the target, which the call goes on from. On Windows no
   mechanism sends a console event: the prepared send makes it and hands the mechanism its result.
-- **The proxy is a role, with one contract.** The console-event proxy is the host program started with the
-  proxy's arguments after `cosca::init()`, or the `cosca-ctrl-proxy` executable. Its arguments and exit codes
-  are the only thing the caller's side and the proxy's own sequence share. The caller names the target by
-  identity, so a reused pid is never sent an event, and cosca starts a copy of the host as the proxy only
-  when the host has called `init`.
+- **The proxy is a role, with one contract.** The console-event proxy is the host program, or the
+  `cosca-ctrl-proxy` executable, started with the environment variable `__COSCA_HELPER=ctrl-proxy`. The
+  variable, never the program's arguments, says a process is a helper: `cosca::init_helpers()`, first in
+  `main`, reads it, and plays the role the value names (an unknown value is refused, and the program does
+  not run). The variable is only read (a helper launch starts no process). The proxy's arguments and
+  exit codes are the only thing the caller's side and the proxy's own sequence share. The
+  caller names the target by identity, so a reused pid is never sent an event, and cosca starts a copy
+  of the host as the proxy only when the host has called `init_helpers`. The Unix elevation shim is the
+  exception to the variable: the tools that start it reset the environment, so it is still recognised
+  by its first argument.
 
 ## Boundaries still to draw
 

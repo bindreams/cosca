@@ -163,8 +163,8 @@
 //!   process group or the process table, and a start time (`created_at`), still do.
 //!   [`ProcessId::current`](identity::ProcessId::current) needs only a readable `/proc/self/stat`
 //!   before 6.9, and on 6.9+ no `/proc` at all.
-//! - The elevation shim (`cosca::init`) runs on Linux. macOS has no shim; `init` reports that and does
-//!   not start the program. Windows has none. It needs `/proc` mounted: it reaches cosca's socket through
+//! - The elevation shim (`cosca::init_helpers`) runs on Linux. macOS has no shim; `init_helpers` reports that
+//!   and does not start the program. Windows has none. It needs `/proc` mounted: it reaches cosca's socket through
 //!   `/proc/thread-self/fd`. Without it the shim refuses, saying so, and the program is not started.
 //!
 //! 32-bit Linux is unsupported: cosca does not compile there. Before Linux 6.14 a 32-bit kernel gives
@@ -196,9 +196,9 @@
 //! A Windows process can send a console event (Ctrl+C, Ctrl+Break) only to the console it is attached
 //! to. `stop::send_console_event_via_proxy` (Windows) reaches a child on another console, or from a
 //! caller with none (a service), through a helper process, the proxy, that has no console of its own.
-//! The proxy is a role of the host program: call [`init`] first thing in `main`, and the default
+//! The proxy is a role of the host program: call [`init_helpers`] first thing in `main`, and the default
 //! (`CtrlProxy::HostExecutable`) starts the file at the host's path, when the stop runs, as the proxy.
-//! A host that cannot call `init`, or that replaces its own image while it runs, installs the
+//! A host that cannot call `init_helpers`, or that replaces its own image while it runs, installs the
 //! `cosca-ctrl-proxy` executable (`cargo install cosca --bin cosca-ctrl-proxy`) and names it with
 //! `Command::ctrl_proxy`. A host that did neither is refused, with nothing started.
 //!
@@ -265,8 +265,8 @@ mod role;
 pub use init::ctrl_proxy_main;
 #[doc(hidden)]
 #[cfg(unix)]
-pub use init::init_with_test_hooks;
-pub use init::{init, installed};
+pub use init::init_helpers_with_test_hooks;
+pub use init::{helpers_initialized, init_helpers};
 
 mod child;
 pub use child::{Child, SuspendedChild, Unreaped};
@@ -433,7 +433,7 @@ fn main() {
     shim_env_hooks::init();
     // And the console-event proxy, which the proxy's tests start as a copy of this binary.
     #[cfg(windows)]
-    init();
+    init_helpers();
     #[cfg(target_os = "linux")]
     elevation::shim::owner_helper::run_if_requested();
     #[cfg(unix)]

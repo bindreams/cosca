@@ -1,7 +1,7 @@
 //! The shim's test seams, read from the environment.
 //!
 //! Compiled into the test binary and the lib's unit-test binary, never into the library: a host
-//! that calls `cosca::init()` has no way to reach a seam, whatever the environment says. Through a
+//! that calls `cosca::init_helpers()` has no way to reach a seam, whatever the environment says. Through a
 //! front that strips the environment (sudo's `env_reset`, doas, pkexec) a test names a wrapper script
 //! that sets these variables and execs the test binary. A seam the environment asks for and that
 //! cannot be honoured panics, naming the path or the name and the error.
@@ -17,10 +17,10 @@
 //!
 //! [`init`] is what the test binaries call first in `main`. Two variables change what it does:
 //!
-//! - [`SHIM_SHIPPED_ENV`] (`COSCA_TESTCFG_SHIM_SHIPPED`): the process runs the shim as a host ships it, through `cosca::init()`
-//!   with no hooks, whatever else the environment says.
-//! - [`INIT_PROBE_ENV`] (`COSCA_TESTCFG_INIT_PROBE`): the process prints whether `cosca::installed()` held before and after
-//!   `cosca::init()`, and exits.
+//! - [`SHIM_SHIPPED_ENV`] (`COSCA_TESTCFG_SHIM_SHIPPED`): the process runs the shim as a host ships it,
+//!   through `cosca::init_helpers()` with no hooks, whatever else the environment says.
+//! - [`INIT_PROBE_ENV`] (`COSCA_TESTCFG_INIT_PROBE`): the process prints whether
+//!   `cosca::helpers_initialized()` held before and after `cosca::init_helpers()`, and exits.
 
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -34,8 +34,8 @@ use cosca::{Gate, Inject, ShimTestHooks};
 
 /// Set in a process's environment to make [`init`] start the shim as a host ships it.
 pub const SHIM_SHIPPED_ENV: &str = "COSCA_TESTCFG_SHIM_SHIPPED";
-/// Set in a process's environment to make [`init`] print whether `cosca::installed()` held before and
-/// after `cosca::init()`, and exit.
+/// Set in a process's environment to make [`init`] print whether `cosca::helpers_initialized()` held
+/// before and after `cosca::init_helpers()`, and exit.
 pub const INIT_PROBE_ENV: &str = "COSCA_TESTCFG_INIT_PROBE";
 
 // The seam variables, as the module doc describes them -----
@@ -74,12 +74,18 @@ fn flag(name: &str) -> bool {
 /// Starts the shim if this process was started as one, and otherwise returns.
 pub fn init() {
     if var(INIT_PROBE_ENV).is_some() {
-        let before = cosca::installed();
-        cosca::init();
+        let before = cosca::helpers_initialized();
+        cosca::init_helpers();
         // Not `quiet_io`: the lib's unit-test binary includes this file too. A closed stdout is a
         // normal end here, as in every testbin mode.
         let mut out = std::io::stdout().lock();
-        match writeln!(out, "installed before={before} after={}", cosca::installed()).and_then(|()| out.flush()) {
+        match writeln!(
+            out,
+            "helpers_initialized before={before} after={}",
+            cosca::helpers_initialized()
+        )
+        .and_then(|()| out.flush())
+        {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
             Err(e) => panic!("{INIT_PROBE_ENV}: write stdout: {e}"),
@@ -87,9 +93,9 @@ pub fn init() {
         std::process::exit(0);
     }
     if var(SHIM_SHIPPED_ENV).is_some() {
-        cosca::init();
+        cosca::init_helpers();
     } else {
-        cosca::init_with_test_hooks(&HOOKS);
+        cosca::init_helpers_with_test_hooks(&HOOKS);
     }
 }
 

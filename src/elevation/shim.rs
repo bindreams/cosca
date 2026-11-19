@@ -33,7 +33,7 @@ use std::ffi::OsString;
 use protocol::ShimArgs;
 
 /// Runs the shim to its end and exits the process when `argv` is a shim invocation, valid or not;
-/// returns otherwise. [`init`](crate::init) calls it.
+/// returns otherwise. [`init_helpers`](crate::init_helpers) calls it.
 pub(crate) fn run_if_invoked(argv: &[OsString], hooks: Option<&'static dyn ShimTestHooks>) {
     match ShimArgs::parse(argv) {
         Ok(None) => {}

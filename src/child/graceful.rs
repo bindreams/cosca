@@ -100,7 +100,7 @@ impl Child {
     /// process's console that leads no group: the direct send refuses it with
     /// [`Error::Unsupported`](crate::error::Error::Unsupported), before and after its exit. A child the
     /// default sends through the proxy is looked at first (one look through its handle): an exited one is
-    /// answered `Ok` with nothing started, whether or not the host called `init`.
+    /// answered `Ok` with nothing started, whether or not the host called `init_helpers`.
     ///
     /// **The direct send can report success for a child that left our console.** Windows reports
     /// success for an event aimed at a group in another console and delivers nothing, and this process

@@ -412,7 +412,7 @@ pub(crate) fn assert_no_break_sent() {
 }
 
 /// Assert that `err` is the direct send's refusal of a child that leads no console process group
-/// (`Unsupported`, naming `Command::new_process_group` and not the proxy's `cosca::init()`), and that
+/// (`Unsupported`, naming `Command::new_process_group` and not the proxy's `cosca::init_helpers()`), and that
 /// nothing was sent since the last read of the sender's record, directly or through the proxy.
 #[track_caller]
 pub(crate) fn assert_refused_by_the_direct_send_for_no_group(err: &crate::error::Error) {
@@ -422,7 +422,7 @@ pub(crate) fn assert_refused_by_the_direct_send_for_no_group(err: &crate::error:
     assert!(detail.contains("leads no console process group"), "{detail}");
     assert!(detail.contains("Command::new_process_group"), "{detail}");
     assert!(
-        !detail.contains("cosca::init()"),
+        !detail.contains("cosca::init_helpers()"),
         "the proxy's refusal, not the direct send's: {detail}"
     );
     assert_no_break_sent();

@@ -456,7 +456,7 @@ fn a_detached_contained_root_is_refused_for_having_no_console() {
 /// uncontained one by default) is refused by the direct send's own refusal, in every call: `Unsupported`
 /// naming `Command::new_process_group`, with nothing sent, no proxy started (the fixture, which answers
 /// `Sent`, never ran, and no answer is recorded) and the root running. The default does not need the
-/// proxy for it, so the refusal does not name `cosca::init()`. Mutants: the default takes the proxy (the
+/// proxy for it, so the refusal does not name `cosca::init_helpers()`. Mutants: the default takes the proxy (the
 /// fixture runs and answers `Sent`); `contain()` forces the group on (the default sends directly); a
 /// graceful call goes on to its kill.
 #[skuld::test]

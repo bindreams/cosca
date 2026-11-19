@@ -105,7 +105,7 @@
 //! # #[cfg(windows)] fn demo() {
 //! use cosca::{stop, Command, CtrlEvent};
 //!
-//! // `cosca::init()` is the first call of this program's `main`.
+//! // `cosca::init_helpers()` is the first call of this program's `main`.
 //! let mut command = Command::new();
 //! command.arg("worker.exe").contain().no_window().new_process_group(false);
 //! command.graceful_stop(|target| stop::send_console_event_via_proxy(target, CtrlEvent::CtrlC));
@@ -116,8 +116,8 @@
 //!
 //! Each is stated in full where it is linked.
 //!
-//! - **The proxy needs a host that called [`init`](crate::init)**, or a `Command::ctrl_proxy` naming the
-//!   `cosca-ctrl-proxy` executable: see `CtrlProxy`.
+//! - **The proxy needs a host that called [`init_helpers`](crate::init_helpers)**, or a
+//!   `Command::ctrl_proxy` naming the `cosca-ctrl-proxy` executable: see `CtrlProxy`.
 //! - **A stop sent before the child has set its console up.** A proxy-routed child can look like one with
 //!   no console: see [`default`].
 //! - **The wait for the proxy has no cap, and the grace starts when the action returns:** see
@@ -161,7 +161,7 @@ use crate::error::Error;
 ///    caller that had no console, a child cosca did not create): `send_console_event_via_proxy` with
 ///    `CtrlEvent::CtrlBreak`, which blocks the calling thread for the proxy's answer and reaches every
 ///    process on the child's console. It needs the host program to have called
-///    [`cosca::init()`](crate::init) (see `send_console_event_via_proxy`).
+///    [`cosca::init_helpers()`](crate::init_helpers) (see `send_console_event_via_proxy`).
 ///
 /// The second case cannot be written with the public functions (`leads_group_on_our_console` is the only
 /// public fact), so a hand-written `if leads { direct } else { proxy }` sends that child to the proxy.
@@ -175,11 +175,12 @@ use crate::error::Error;
 ///
 /// - Case 2: the error names `Command::new_process_group`, because no console event can be addressed to the
 ///   child alone, and one sent to the console would reach this process as well. No proxy is started, so
-///   `init` is not needed. The direct send refuses before it looks at the child, so the refusal is the same
-///   for a child that has exited, where every other child that has exited is answered `Ok` (see
-///   [`Child::terminate`](crate::Child::terminate)).
-/// - Case 3, the host program has not called `init` and the command names no `CtrlProxy::Executable`: the
-///   error names `cosca::init()` and the `Executable` setting. Nothing is started.
+///   `init_helpers` is not needed. The direct send refuses before it looks at the child, so the refusal
+///   is the same for a child that has exited, where every other child that has exited is answered `Ok`
+///   (see [`Child::terminate`](crate::Child::terminate)).
+/// - Case 3, the host program has not called `init_helpers` and the command names no
+///   `CtrlProxy::Executable`: the error names `cosca::init_helpers()` and the `Executable` setting.
+///   Nothing is started.
 /// - Case 3, the child has no identity to name it by: the error names `Child::kill`. Nothing is started.
 /// - Case 3, a child a system elevation service created on a UAC consent: the error names `kill()`. Nothing
 ///   is started.
@@ -441,7 +442,7 @@ fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Res
 /// - the child has no identity ([`Child::id`](crate::Child::id) is `None`), which the proxy names its
 ///   target by, so that a reused pid is never sent an event;
 /// - [`CtrlProxy::HostExecutable`](crate::CtrlProxy::HostExecutable) is set and the host program has
-///   not called [`init`](crate::init);
+///   not called [`init_helpers`](crate::init_helpers);
 /// - the proxy found no console to attach to for the child (the child has none, as a child created
 ///   with [`detached`](crate::Command::detached) has none, or has not set it up yet), and the child had
 ///   not exited when cosca looked;
@@ -464,11 +465,11 @@ fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Res
 ///
 /// The call's first act is one look at the child through its handle, which reaps nothing. A child that
 /// has exited is answered then, before any rule above and with nothing started (so a host that has not
-/// called `init` gets the answer too): nothing was sent. On a root target the answer is `Ok`, as
-/// [`send_ctrl_break_to_group`] answers an exited child that leads a group. On a tree target `terminate_tree` answers an
-/// error, and `graceful_shutdown_tree` goes on to its grace, sweep and reap with no event sent: members
-/// that outlived the root are ended by the sweep without a console event, where the direct send to the
-/// group would have reached them.
+/// called `init_helpers` gets the answer too): nothing was sent. On a root target the answer is `Ok`, as
+/// [`send_ctrl_break_to_group`] answers an exited child that leads a group. On a tree target
+/// `terminate_tree` answers an error, and `graceful_shutdown_tree` goes on to its grace, sweep and reap
+/// with no event sent: members that outlived the root are ended by the sweep without a console event,
+/// where the direct send to the group would have reached them.
 ///
 /// A child that exits after that look is answered the same way when the proxy cannot attach and cosca's
 /// look at the proxy's answer finds the child exited.

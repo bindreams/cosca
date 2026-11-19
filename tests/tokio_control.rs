@@ -353,7 +353,7 @@ async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
     child.terminate().await.expect("already-dead must be Ok");
 
     // Off our console too: on Windows the default asks the proxy for these, and this host never called
-    // `cosca::init()`, so a call that asked first would be refused.
+    // `cosca::init_helpers()`, so a call that asked first would be refused.
     let (mut child, sock) = common::spawn_control_async_with("control-block", &["R"], true, |_| {}).await;
     common::kill_tree_release_reap_async(&mut child, sock).await;
     child
@@ -382,15 +382,15 @@ async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
 }
 
 /// Async twin of `an_exited_child_the_default_sends_through_the_proxy_is_answered_without_init`
-/// (`ctrl_proxy_host.rs`): this binary's `main` does not call `cosca::init()` either, so an exited child
+/// (`ctrl_proxy_host.rs`): this binary's `main` does not call `cosca::init_helpers()` either, so an exited child
 /// that the default sends through the proxy is `Ok` only if the look at its exit comes first.
 #[cfg(feature = "tokio")]
 #[cfg(windows)]
 #[skuld::test]
 async fn async_an_exited_child_the_default_sends_through_the_proxy_is_answered_without_init() {
     assert!(
-        !cosca::installed(),
-        "this binary's `main` must not call `cosca::init()`"
+        !cosca::helpers_initialized(),
+        "this binary's `main` must not call `cosca::init_helpers()`"
     );
     for contain in [false, true] {
         let (mut child, sock) = common::spawn_control_async_with("control-block", &["R"], contain, |_| {}).await;
@@ -477,7 +477,7 @@ async fn async_refusals_match_the_sync_surface() {
 /// leads a group, which gets the direct send, and a contained and an uncontained child that lead none, which
 /// get the direct send's refusal) are the same from the sync and the async `Child`, alive and after the
 /// reap. A proxy that the default started would answer a refusal of its own (this host never called
-/// `cosca::init()`), so a mirror that took it for any of the three differs by the shape of its error.
+/// `cosca::init_helpers()`), so a mirror that took it for any of the three differs by the shape of its error.
 #[cfg(feature = "tokio")]
 #[cfg(windows)]
 #[skuld::test]

@@ -8,7 +8,7 @@ pub(crate) enum ShimChoice {
     Direct,
     /// The host binary, re-executed as the shim.
     HostExecutable,
-    /// A binary whose `main` calls `cosca::init()`.
+    /// A binary whose `main` calls `cosca::init_helpers()`.
     Executable(PathBuf),
 }
 
