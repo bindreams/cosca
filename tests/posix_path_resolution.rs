@@ -201,7 +201,7 @@ fn a_spawn_stops_at_an_unexaminable_path_entry_with_an_error_naming_it() {
     };
     assert_eq!(e.raw_os_error(), None, "the code is down the chain: {e:?}");
     assert_eq!(e.kind(), cause.kind(), "{e:?}");
-    assert_eq!(common::os_code(&error), Some(libc::ELOOP), "{error:?}");
+    assert_eq!(cosca::error::first_os_code(&error), Some(libc::ELOOP), "{error:?}");
     let report = cosca::error::Report::new(&error).to_string();
     for named in [&looping, &candidate] {
         assert!(

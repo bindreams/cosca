@@ -298,8 +298,9 @@ impl Command {
     ///   `/bin/sh`.)
     /// - A candidate that cannot be examined (`EACCES` on a `PATH` directory, `ELOOP`, an I/O error) ends
     ///   the search with an error that names the entry and the candidate, even if a later directory holds
-    ///   the program. Its OS code is found down the error's `source()` chain, not on the top
-    ///   [`std::io::Error`]; its [`kind`](std::io::Error::kind) is the cause's. Only a definite
+    ///   the program. The top [`std::io::Error`] has no OS code of its own
+    ///   ([`first_os_code`](crate::error::first_os_code) finds the cause's) and takes its
+    ///   [`kind`](std::io::Error::kind) from the cause. Only a definite
     ///   absence, `ENOENT` or `ENOTDIR`, goes on. A name given with a path has no `PATH` entry to name,
     ///   so its error is the OS's own, with the code on the error. On Linux, if the found file is gone
     ///   by the time the child starts and a later candidate cannot be examined, the child's own walk

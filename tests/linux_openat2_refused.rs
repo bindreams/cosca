@@ -10,8 +10,6 @@ use cosca::identity::{Existence, Liveness, ProcessId, Resolved};
 mod common;
 
 #[cfg(target_os = "linux")]
-use common::os_code;
-#[cfg(target_os = "linux")]
 use common::seccomp::OPENAT2_REFUSALS as REFUSALS;
 
 #[cfg(target_os = "linux")]
@@ -132,7 +130,7 @@ fn assert_unsupported_naming(result: Result<(), cosca::error::Error>, refusal: (
     };
     assert_eq!(detail, &refused_detail(name), "{what} under {name}");
     assert_eq!(
-        os_code(&err),
+        cosca::error::first_os_code(&err),
         Some(errno),
         "{what} under {name}: the errno is the source"
     );
@@ -216,7 +214,7 @@ fn a_seccomp_refused_openat2_with_eacces_is_unassessable_carrying_eacces_for_the
     let result = with_openat2_refused(libc::EACCES, || me.children(Recursive::No).map(drop));
     let err = result.expect_err("a /proc that cannot be opened cannot be listed");
     assert!(matches!(err, cosca::error::Error::Unassessable { .. }), "{err:?}");
-    assert_eq!(os_code(&err), Some(libc::EACCES), "{err:?}");
+    assert_eq!(cosca::error::first_os_code(&err), Some(libc::EACCES), "{err:?}");
 }
 
 /// A `Process` kills and terminates its tree by walking the snapshot, so both say the refusal and
@@ -297,7 +295,7 @@ fn a_seccomp_refused_openat2_with_eacces_is_unassessable_carrying_eacces_for_a_s
     let result = with_openat2_refused(libc::EACCES, || child.kill_tree());
     let err = result.expect_err("a group that cannot be listed was reported as killed");
     assert!(matches!(err, cosca::error::Error::Unassessable { .. }), "{err:?}");
-    assert_eq!(os_code(&err), Some(libc::EACCES), "{err:?}");
+    assert_eq!(cosca::error::first_os_code(&err), Some(libc::EACCES), "{err:?}");
     common::kill_tree_release_reap(&child, control);
 }
 

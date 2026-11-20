@@ -26,7 +26,7 @@ fn assert_refused(result: Result<impl std::fmt::Debug, Error>, op: &str, (code, 
                 )
             );
             assert_eq!(
-                common::os_code(&e),
+                cosca::error::first_os_code(&e),
                 Some(code),
                 "{op} under {errno}: the errno is the source"
             );
@@ -191,7 +191,11 @@ fn a_root_only_graceful_shutdown_needs_no_pidfd_open_to_see_the_root_exit() {
             &format!("cosca requires pidfd_open (Linux \u{2265} 5.3), refused here: pidfd_open answered {name}"),
             "{name}"
         );
-        assert_eq!(common::os_code(&err), Some(code), "{name}: the errno is the source");
+        assert_eq!(
+            cosca::error::first_os_code(&err),
+            Some(code),
+            "{name}: the errno is the source"
+        );
         let status = child.wait().expect("reap the root");
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {status:?}");
     }
@@ -438,7 +442,11 @@ fn assert_clone_refused<C: Send, T: std::fmt::Debug + Send>(
                         release.trim_end()
                     )
                 );
-                assert_eq!(common::os_code(&e), Some(code), "{name}: the errno is the source");
+                assert_eq!(
+                    cosca::error::first_os_code(&e),
+                    Some(code),
+                    "{name}: the errno is the source"
+                );
             }
             Err(Error::Io(e)) if !refusal => assert_eq!(e.raw_os_error(), Some(code), "{name}: {e:?}"),
             other => panic!("a clone answering {name}: unexpected {other:?}"),

@@ -3,6 +3,7 @@
 #[cfg(target_os = "linux")]
 use super::ListingFailure;
 use super::{members, state, GroupState, Member};
+use crate::error::first_os_code;
 #[cfg(target_os = "linux")]
 use crate::identity::{FakeKernel, UNREADABLE_STATUS_REASON};
 use crate::identity::{HostKernel, Liveness, ProcessId};
@@ -252,10 +253,6 @@ fn classify_member_is_total_over_liveness_and_reached() {
 /// An error that says what a member's signal or probe answered: the OS error `code`.
 fn cause(code: i32) -> crate::error::Error {
     crate::error::Error::Io(std::io::Error::from_raw_os_error(code))
-}
-
-fn first_os_code(error: &crate::error::Error) -> Option<i32> {
-    crate::error::first_os_code(error)
 }
 
 /// `reconfirm_survivor`'s pure re-check, isolated from any real signal delivery: a
@@ -744,7 +741,7 @@ fn members_is_an_error_naming_the_cause_when_the_proc_view_is_unassessable() {
     let err = failed(members(&kernel, i32::MAX), "an unassessable view lists nothing");
     assert!(err.to_string().contains(UNREADABLE_STATUS_REASON), "{err}");
     // The view's read error is the source, with its code, and not repeated in the text.
-    assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
+    assert_eq!(first_os_code(&err), Some(libc::EIO), "{err:?}");
     let os_error = std::io::Error::from_raw_os_error(libc::EIO).to_string();
     assert!(!err.to_string().contains(&os_error), "{err}");
 }
@@ -780,7 +777,7 @@ fn members_is_an_error_naming_pid_and_errno_for_any_other_stat_read_failure() {
         let own = err.to_string();
         assert!(!own.contains("/stat"), "{errno}: {own}");
         // The read's error is below the `Unreadable` layer, with its code.
-        assert_eq!(crate::error::first_os_code(&err), Some(errno), "{errno}: {err:?}");
+        assert_eq!(first_os_code(&err), Some(errno), "{errno}: {err:?}");
         let text = crate::error::said(&err);
         if matches!(errno, libc::EXDEV | libc::ELOOP) {
             assert!(text.contains("beyond a mount"), "{errno}: {text}");
@@ -808,7 +805,7 @@ fn members_keeps_the_pids_eperm_when_the_checked_directory_fails_without_refusin
     let text = crate::error::said(&err);
     assert!(text.contains("re-check of self/stat failed"), "{text}");
     let members = crate::error::several_in(&err).unwrap_or_else(|| panic!("a list of both failures: {text}"));
-    let codes: Vec<_> = members.iter().map(|m| crate::error::first_os_code(*m)).collect();
+    let codes: Vec<_> = members.iter().map(|m| first_os_code(*m)).collect();
     assert_eq!(codes, [Some(libc::EMFILE), Some(libc::EPERM)], "{text}");
 }
 
@@ -837,11 +834,7 @@ fn members_is_unsupported_when_the_scan_meets_a_refused_openat2() {
         let err = refused(members(&kernel, i32::MAX), "a refused openat2 lists nothing");
         let text = crate::error::said(&err);
         assert!(text.contains("requires openat2"), "{stat}/{recheck:?}: {text}");
-        assert_eq!(
-            crate::error::first_os_code(&err),
-            Some(refusing),
-            "{stat}/{recheck:?}: {text}"
-        );
+        assert_eq!(first_os_code(&err), Some(refusing), "{stat}/{recheck:?}: {text}");
         match (recheck, text.split_once("(2) ")) {
             (Some(_), Some((_, second))) => {
                 assert!(second.contains(&format!("{PID}/stat")), "{stat}/{recheck:?}: {text}");
@@ -889,11 +882,7 @@ fn members_is_unsupported_when_the_members_own_stat_read_is_refused() {
         let err = refused(members(&kernel, 1234), "a refused own read lists nothing");
         let text = crate::error::Report(&err).to_string();
         assert!(text.contains("requires openat2"), "{stat}/{recheck:?}: {text}");
-        assert_eq!(
-            crate::error::first_os_code(&err),
-            Some(refusing),
-            "{stat}/{recheck:?}: {text}"
-        );
+        assert_eq!(first_os_code(&err), Some(refusing), "{stat}/{recheck:?}: {text}");
         match (recheck, text.split_once("(2) ")) {
             (Some(_), Some((_, second))) => {
                 assert!(second.contains(&format!("{PID}/stat")), "{stat}/{recheck:?}: {text}");
@@ -939,11 +928,7 @@ fn members_fails_when_the_members_own_stat_read_is_unreadable() {
         let err = failed(members(&kernel, 1234), "an unreadable own read lists nothing");
         let text = crate::error::Report(&err).to_string();
         assert!(text.contains(&format!("pid {PID}")), "{stat}/{recheck:?}: {text}");
-        assert_eq!(
-            crate::error::first_os_code(&err),
-            Some(below),
-            "{stat}/{recheck:?}: {text}"
-        );
+        assert_eq!(first_os_code(&err), Some(below), "{stat}/{recheck:?}: {text}");
     }
 }
 
@@ -992,7 +977,7 @@ fn members_is_unsupported_when_the_listing_or_the_view_read_is_refused() {
         let err = refused(members(&kernel, i32::MAX), "a refused openat2 lists nothing");
         let text = crate::error::Report(&err).to_string();
         assert!(text.contains("requires openat2"), "{what}: {text}");
-        assert_eq!(crate::error::first_os_code(&err), Some(errno), "{what}: {text}");
+        assert_eq!(first_os_code(&err), Some(errno), "{what}: {text}");
         assert_eq!(
             crate::log_capture::warns_since(mark, "").len(),
             1,
@@ -1001,7 +986,7 @@ fn members_is_unsupported_when_the_listing_or_the_view_read_is_refused() {
     }
     let kernel = FakeKernel::over(&HostKernel).same_view().on_pids(Err(libc::EIO));
     let err = failed(members(&kernel, i32::MAX), "an unlistable /proc lists nothing");
-    assert_eq!(crate::error::first_os_code(&err), Some(libc::EIO), "{err:?}");
+    assert_eq!(first_os_code(&err), Some(libc::EIO), "{err:?}");
 }
 
 /// A listing that fails after `/proc` opened is no `openat2` refusal, whatever its errno: its own
@@ -1017,7 +1002,7 @@ fn members_is_not_unsupported_when_the_listing_fails_after_the_open() {
         let err = failed(members(&kernel, i32::MAX), "an unlistable /proc lists nothing");
         let text = crate::error::Report(&err).to_string();
         assert!(!text.contains("requires openat2"), "{errno}: {text}");
-        assert_eq!(crate::error::first_os_code(&err), Some(errno), "{errno}: {text}");
+        assert_eq!(first_os_code(&err), Some(errno), "{errno}: {text}");
     }
 }
 
