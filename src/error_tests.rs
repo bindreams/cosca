@@ -383,6 +383,98 @@ fn first_os_code_walks_the_chain_of_any_variant() {
     assert_eq!(first_os_code(&no_code), None, "no code anywhere");
 }
 
+/// std's `io::Error::source()` skips the error it holds as its payload, so the payload's own code is
+/// not a layer of the walk. What the payload's `source()` holds is.
+///
+/// Mutant: the walk follows `io::Error::get_ref()`, or stops at an `io::Error` without a code.
+#[skuld::test]
+fn first_os_code_does_not_see_the_code_of_an_io_error_held_as_a_payload() {
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let os = || std::io::Error::from_raw_os_error(code);
+
+    let held = std::io::Error::other(os());
+    assert_eq!(
+        held.raw_os_error(),
+        None,
+        "precondition: the held error is not the top layer"
+    );
+    assert_eq!(first_os_code(&held), None, "bare");
+    assert_eq!(first_os_code(&Error::Io(held)), None, "under Error::Io");
+
+    let held_error = std::io::Error::other(Error::Containment {
+        detail: "d".into(),
+        source: Some(Arc::new(Error::Io(os()))),
+    });
+    assert_eq!(
+        first_os_code(&held_error),
+        Some(code),
+        "a payload that is no io::Error is skipped, and its source is a layer"
+    );
+}
+
+/// A consumer's cloneable error lends its cause as an `Arc<io::Error>`, and a boxed one as a
+/// `Box<io::Error>`: the layer is the `io::Error` it holds, as the argument itself or on the chain.
+///
+/// Mutant: only a bare `io::Error` is a layer.
+#[skuld::test]
+fn first_os_code_sees_an_io_error_held_in_an_arc_or_a_box() {
+    #[derive(Debug)]
+    struct Lends<E>(E);
+    impl<E> std::fmt::Display for Lends<E> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a consumer's error")
+        }
+    }
+    impl<E: std::error::Error + 'static> std::error::Error for Lends<E> {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    let code = if cfg!(windows) { 5 } else { 13 };
+    let os = || std::io::Error::from_raw_os_error(code);
+    let no_code = || std::io::Error::other("no code");
+
+    assert_eq!(first_os_code(&Arc::new(os())), Some(code), "an Arc argument");
+    assert_eq!(first_os_code(&Box::new(os())), Some(code), "a Box argument");
+    assert_eq!(first_os_code(&Lends(Arc::new(os()))), Some(code), "an Arc layer");
+    assert_eq!(first_os_code(&Lends(Box::new(os()))), Some(code), "a Box layer");
+    assert_eq!(
+        first_os_code(&Lends(Arc::new(Error::Io(os())))),
+        Some(code),
+        "an Arc of a cosca error still works"
+    );
+    assert_eq!(
+        first_os_code(&Lends(Arc::new(no_code()))),
+        None,
+        "an Arc layer without a code"
+    );
+    assert_eq!(
+        first_os_code(&Lends(Box::new(no_code()))),
+        None,
+        "a Box layer without a code"
+    );
+    let outer = Lends(Arc::new(crate::error::io_context("ctx", os())));
+    assert_eq!(first_os_code(&outer), Some(code), "an Arc of an io_context");
+}
+
+/// What an error keeps beside its `source()` is not on the chain: `MayHaveStarted`'s `cleanup` and
+/// `MembersLeft`'s `others`, whose failures the walk never reads even when the cause has no code.
+///
+/// Mutant: the walk also reads `cleanup` or `others`.
+#[skuld::test]
+fn first_os_code_does_not_read_what_an_error_keeps_beside_its_source() {
+    let no_code = || Arc::new(Error::Io(std::io::Error::other("no code")));
+
+    let started = may_have_started(no_code(), Some(failures_of([coded(CODES[1])])));
+    assert_eq!(first_os_code(&started), None, "cleanup");
+
+    let left = Error::MembersLeft {
+        members: failures_of([not_killed(7, no_code())]),
+        others: Some(coded(CODES[1])),
+    };
+    assert_eq!(first_os_code(&left), None, "others");
+}
+
 /// Where the OS code sits below an `Error::Io`: its own `source()` is the wrapper cosca added, which
 /// has no code, and the code is on the error the wrapper holds.
 #[skuld::test]
@@ -1268,6 +1360,8 @@ fn one_peer_and_no_own_cause_makes_the_peer_the_cause() {
         matches!(&**source, Error::Io(io) if io.raw_os_error() == Some(CODES[1])),
         "{source:?}"
     );
+    // So the error's first code is the peer's.
+    assert_eq!(first_os_code(&e), Some(CODES[1]), "{e:?}");
 }
 
 #[skuld::test]

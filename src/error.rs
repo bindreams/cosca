@@ -218,10 +218,8 @@ impl Failures {
 /// # The OS code
 ///
 /// The OS code of a failure may sit on an `io::Error` down the `source()` chain of any variant,
-/// below context cosca added: walk `source()` and take the first `io::Error` whose
-/// `raw_os_error()` is `Some`. A [`Error::Several`] and an [`Error::MembersLeft`] give their first
-/// member as the `source`, so the walk finds the first member's code. The `cleanup` of an
-/// [`Error::MayHaveStarted`] is not on the walk: the code it finds is the cause's.
+/// below context cosca added. [`first_os_code`] reads it, and says which code it gives for an error
+/// that holds several causes.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
@@ -234,7 +232,7 @@ pub enum Error {
     ///
     /// A call is refused when it answers an errno that only a seccomp filter or an LSM can produce
     /// for that call (or `ENOSYS`, an old kernel). Each call has its own set, below. The errno is
-    /// the error's `source`, so `raw_os_error` finds it.
+    /// the error's `source`, so [`first_os_code`] finds it.
     ///
     /// ## `pidfd_open`
     ///
@@ -376,7 +374,7 @@ pub enum Error {
     /// A member a tree-walk kill left running, and why it was not killed: its identity could not be
     /// read, at the walk or when the kill came ([`Error::Unassessable`], or [`Error::Unsupported`] when
     /// the OS refuses the pidfd the identity is read through), or the OS refused the kill
-    /// ([`Error::Io`], whose [`raw_os_error`](std::io::Error::raw_os_error) is the refusal's code, as
+    /// ([`Error::Io`], whose OS code, which [`first_os_code`] reads, is the refusal's, as
     /// for [`Process::kill`](crate::Process::kill)). On Linux, any other error that opening the
     /// member's pidfd finishes with is wrapped as [`Error::Unassessable`], the error its source. It is a member of an
     /// [`Error::MembersLeft`]. It also names the root that a [`Child::kill_tree`](crate::Child::kill_tree)'s
@@ -394,7 +392,7 @@ pub enum Error {
     /// The pid names a live thread that is not its process's thread-group leader, so it is not
     /// a process that can be waited on or signalled as one (on Linux, `pidfd_open` refuses it).
     /// Not "gone": the thread is running. `source` is the refusal, an [`Error::Io`]; compare its OS
-    /// code (`raw_os_error` down the chain), not the message.
+    /// code ([`first_os_code`]), not the message.
     NotThreadGroupLeader {
         pid: u32,
         detail: String,
@@ -747,14 +745,49 @@ pub(crate) fn chain<'a>(
     std::iter::successors(Some(error), |e| e.source())
 }
 
-/// The OS code of a failure, for a look whose failure is told apart by it: the first `io::Error`
-/// down `error`'s [`chain`] that has one. `None` when the chain holds none. The one getter of the
-/// code, for any error: an `io_context` error has none of its own, and its cause below it does.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
-pub(crate) fn first_os_code(error: &(dyn std::error::Error + 'static)) -> Option<i32> {
-    chain(error)
-        .filter_map(|layer| layer.downcast_ref::<std::io::Error>())
-        .find_map(std::io::Error::raw_os_error)
+/// The [`raw_os_error`](std::io::Error::raw_os_error) of the first layer of `error`'s chain that is
+/// an [`io::Error`](std::io::Error) (or an `Arc<io::Error>` or a `Box<io::Error>`) and has one,
+/// outermost first; `None` when no layer has one.
+///
+/// The walk reads only what `source()` lends. std's `io::Error` lends its payload's `source()` and
+/// not the payload itself; an error that holds several causes lends its `source()` only (for a list, the
+/// first member; [`Failures::iter`] walks a list's members); and what an error keeps beside its
+/// `source()` is not read (`MayHaveStarted`'s `cleanup` failures, `MembersLeft`'s `others`).
+///
+/// The code is whatever the `io::Error` holds. For the errors cosca builds on Windows that is the
+/// Win32 code (what [`GetLastError`] reports, or what an `NTSTATUS` maps to), or the `HRESULT` itself
+/// for a failure that came as an `HRESULT` with no Win32 code. The function converts nothing: a consumer's own
+/// `io::Error::from(windows::core::Error)` keeps its `HRESULT`.
+///
+/// ```
+/// use std::sync::Arc;
+/// use cosca::error::{first_os_code, Error};
+///
+/// // The code is on the `io::Error` below a layer cosca added.
+/// let cause = Error::Io(std::io::Error::from_raw_os_error(13));
+/// let e = Error::Containment {
+///     detail: "could not place the child".into(),
+///     source: Some(Arc::new(cause)),
+/// };
+/// assert_eq!(first_os_code(&e), Some(13));
+///
+/// let no_code = Error::Io(std::io::Error::other("no code"));
+/// assert_eq!(first_os_code(&no_code), None);
+/// ```
+///
+/// [`GetLastError`]: https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-getlasterror
+pub fn first_os_code(error: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    chain(error).filter_map(io_error).find_map(std::io::Error::raw_os_error)
+}
+
+/// The `io::Error` a chain layer is: a bare one, or the one in the `Arc` or `Box` a holder lends as
+/// its `source()` (the `Arc` or `Box` forwards its own `source()` past the error it holds, so this
+/// layer is the only place that error shows).
+fn io_error<'a>(layer: &'a (dyn std::error::Error + 'static)) -> Option<&'a std::io::Error> {
+    layer
+        .downcast_ref::<std::io::Error>()
+        .or_else(|| layer.downcast_ref::<Arc<std::io::Error>>().map(|held| &**held))
+        .or_else(|| layer.downcast_ref::<Box<std::io::Error>>().map(|held| &**held))
 }
 
 /// The [`Error`] a layer of a chain is: an `Error`, or the `Arc<Error>` a holder keeps its cause as
@@ -1220,7 +1253,7 @@ impl Error {
     /// comes below it.
     #[cfg(test)]
     pub(crate) fn io_errors(&self) -> impl Iterator<Item = &std::io::Error> {
-        chain(self).filter_map(|s| s.downcast_ref::<std::io::Error>())
+        chain(self).filter_map(io_error)
     }
 
     /// This error with `note` added, variant and kind kept. A variant with a `detail` gets the note
