@@ -1,6 +1,8 @@
 use std::ffi::{OsStr, OsString};
 
-use super::{CtrlEvent, ProxyAnswer, ProxyArgs, ProxyArgsError, VERSION};
+use std::num::NonZeroU16;
+
+use super::{Cause, CtrlEvent, ProxyAnswer, ProxyArgs, ProxyArgsError, ProxyExit, Step, VERSION};
 
 const EXE: &str = "cosca-ctrl-proxy";
 
@@ -36,13 +38,13 @@ fn argv_has_the_stated_layout() {
         event: CtrlEvent::CtrlBreak,
         caller: 7,
     };
-    assert_eq!(args.to_argv(OsStr::new(EXE)), argv(&["2", "4242", "99", "break", "7"]));
+    assert_eq!(args.to_argv(OsStr::new(EXE)), argv(&["3", "4242", "99", "break", "7"]));
     let args = ProxyArgs {
         event: CtrlEvent::CtrlC,
         ..args
     };
-    assert_eq!(args.to_argv(OsStr::new(EXE)), argv(&["2", "4242", "99", "c", "7"]));
-    assert_eq!(VERSION, 2);
+    assert_eq!(args.to_argv(OsStr::new(EXE)), argv(&["3", "4242", "99", "c", "7"]));
+    assert_eq!(VERSION, 3);
 }
 
 /// Mutant: the version is ignored, or judged after the tail (another version's tail may differ).
@@ -50,8 +52,8 @@ fn argv_has_the_stated_layout() {
 fn another_version_is_a_mismatch_whatever_follows() {
     for tail in [
         &["1", "4242", "99", "break", "7"][..],
-        &["3"],
-        &["3", "x"],
+        &["4"],
+        &["4", "x"],
         &["99999", "-1"],
     ] {
         let theirs = tail[0].parse().expect("a number");
@@ -95,7 +97,7 @@ fn an_argv_without_a_version_is_the_wrong_count() {
 /// Mutant: a missing or non-numeric pid or key is read as 0, or a short argv indexes out of range.
 #[skuld::test]
 fn a_malformed_tail_is_an_error() {
-    let version = "2";
+    let version = "3";
     for tail in [
         &[version][..],
         &[version, "4242"],
@@ -167,22 +169,139 @@ fn each_answer_has_its_code_and_maps_back() {
         (ProxyAnswer::TargetGone, 153),
         (ProxyAnswer::TargetHasNoConsole, 154),
         (ProxyAnswer::ConsoleIsCallers, 155),
-        (ProxyAnswer::NothingSent, 156),
         (ProxyAnswer::AttachDenied, 157),
         (ProxyAnswer::Unconfirmed, 158),
         (ProxyAnswer::NoProxyHere, 159),
-        (ProxyAnswer::TargetUnreadable, 160),
     ] {
         assert_eq!(answer.code(), code, "{answer:?}");
         assert_eq!(ProxyAnswer::from_code(code), Some(answer), "{code}");
+        assert_eq!(ProxyExit::from_code(code), Some(ProxyExit::Answer(answer)), "{code}");
+        assert_eq!(ProxyExit::from(answer).code(), code);
     }
 }
 
 /// Mutant: 0 (a program that is not a proxy, or exits cleanly), a code of the elevation shim (112 to
-/// 125) or a Windows `STATUS_CONTROL_C_EXIT` is read as an answer.
+/// 125), a Windows `STATUS_CONTROL_C_EXIT`, or 156 or 160 (left unused: a failed step exits with its
+/// cause) is read as an exit of the protocol.
 #[skuld::test]
-fn other_codes_are_not_answers() {
-    for code in [0, 1, 100, 110, 117, 120, 125, 149, 161, 0xC000_013A_u32 as i32, -1] {
+fn other_codes_are_not_exits() {
+    for code in [
+        0,
+        1,
+        100,
+        110,
+        117,
+        120,
+        125,
+        149,
+        156,
+        160,
+        161,
+        0xC000_013A_u32 as i32,
+        -1,
+    ] {
         assert_eq!(ProxyAnswer::from_code(code), None, "{code}");
+        assert_eq!(ProxyExit::from_code(code), None, "{code}");
+    }
+}
+
+/// Mutant: a field of the cause code is shifted onto another, a step is lost, or a code is cut.
+#[skuld::test]
+fn a_cause_round_trips_for_every_step_with_and_without_a_code() {
+    for step in Step::ALL {
+        for code in [None, Some(5), Some(1450), Some(0xFFFF)] {
+            let cause = Cause::new(step, code);
+            assert_eq!(cause.os_code.map(|c| i32::from(c.get())), code, "{cause:?}");
+            let exit = cause.code();
+            assert_eq!(Cause::from_code(exit), Some(cause), "{cause:?} {exit:#x}");
+            assert_eq!(ProxyExit::from_code(exit), Some(ProxyExit::Cause(cause)), "{exit:#x}");
+            assert_eq!(ProxyExit::Cause(cause).code(), exit);
+        }
+    }
+}
+
+/// Only an OS code of 1 to 0xFFFF travels; the step travels whatever the error was. Mutants: 0 is kept
+/// as a code, a wider code is truncated into another one, or a negative one (a non-Win32 HRESULT that
+/// `win32_io_error` keeps whole) gives a code.
+#[skuld::test]
+fn only_a_win32_code_of_16_bits_travels() {
+    let step = Step::AttachConsole;
+    for (code, travels) in [
+        (0, None),
+        (1, Some(1)),
+        (5, Some(5)),
+        (0xFFFF, Some(0xFFFF)),
+        (0x1_0000, None),
+        (i32::MAX, None),
+        (-1, None),
+        (0x8000_4005_u32 as i32, None),
+    ] {
+        let cause = Cause::new(step, Some(code));
+        assert_eq!(cause.os_code, travels.and_then(NonZeroU16::new), "{code:#x}");
+    }
+    assert_eq!(Cause::new(step, None).os_code, None);
+}
+
+/// A cause code is a positive `i32` with the customer bit set and no crash status, and no cause code is
+/// an answer or the unknown-role code. Mutant: a layout that sets bit 31 or 30, or reaches 100 or an
+/// answer (150 to 159; 156 and 160 are unused).
+#[skuld::test]
+fn a_cause_code_collides_with_nothing() {
+    for step in Step::ALL {
+        for os_code in [None, Some(1), Some(0xFFFF)] {
+            let code = Cause::new(step, os_code).code();
+            assert!(code > 0, "positive: {code:#x}");
+            assert_eq!(code & 0x2000_0000, 0x2000_0000, "customer bit: {code:#x}");
+            assert_eq!(code & 0x4000_0000, 0, "{code:#x}");
+            assert_eq!(ProxyAnswer::from_code(code), None, "{code:#x}");
+            assert_ne!(code, crate::role::UNKNOWN_HELPER_ROLE);
+        }
+    }
+    assert_eq!(ProxyExit::from_code(crate::role::UNKNOWN_HELPER_ROLE), None);
+}
+
+/// A value of the cause field's range that is no cause is no exit of the protocol. Mutant: the decoder
+/// ignores one of the checks the cases name.
+#[skuld::test]
+fn a_malformed_cause_code_is_no_exit() {
+    let valid = Cause::new(Step::AttachConsole, Some(5)).code();
+    let no_code = Cause::new(Step::AttachConsole, None).code();
+    for bad in [
+        valid ^ 0x2000_0000,
+        valid | 0x4000_0000,
+        valid | i32::MIN,
+        valid | 0x0100_0000,
+        valid | 0x1000_0000,
+        // Step 0, and a step past the last one.
+        0x2000_0000,
+        0x2000_0000 | 0x1_0000,
+        0x2000_0000 | (0x7F << 17),
+        // A code with its flag clear has one spelling only: none.
+        no_code | 5,
+        // And so has a code of 0: the flag clear.
+        no_code | 0x1_0000,
+    ] {
+        assert_eq!(Cause::from_code(bad), None, "{bad:#x}");
+        assert_eq!(ProxyExit::from_code(bad), None, "{bad:#x}");
+    }
+}
+
+/// Answers and small codes are decimal; a cause, a malformed cause-range value and an NTSTATUS (negative as an
+/// `i32`) are hex. Mutant: a code in the other base, or the marker's own value read as small.
+#[skuld::test]
+fn an_exit_code_is_shown_in_decimal_unless_it_is_a_bit_pattern() {
+    for (code, shown) in [
+        (0, "0"),
+        (ProxyAnswer::Sent.code(), "150"),
+        (ProxyAnswer::NoProxyHere.code(), "159"),
+        (156, "156"),
+        (3, "3"),
+        (0x1FFF_FFFF, "536870911"),
+        (Cause::new(Step::AttachConsole, Some(5)).code(), "0x20090005"),
+        (0x2000_0000, "0x20000000"),
+        (0xC000_013A_u32 as i32, "0xc000013a"),
+        (-1, "0xffffffff"),
+    ] {
+        assert_eq!(super::exit_text(code), shown, "{code}");
     }
 }

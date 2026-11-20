@@ -1,6 +1,6 @@
 //! The proxy's sequence, against real consoles.
 //!
-//! Every test but the first starts the proxy for real: this test binary started as the proxy
+//! Every test but the first two starts the proxy for real: this test binary started as the proxy
 //! (its `main` calls `init_helpers` first), as cosca starts it, `detached()` with null stdio. A
 //! wrong proxy sends Ctrl+C or Ctrl+Break to every process on the console it attached to, so those
 //! tests are the `CTRL_PROXY` group: they run on CI, and a host runs them only after consenting
@@ -9,19 +9,18 @@
 //! Each asserts the proxy's answer before it reads anything from its target, so a proxy that ANSWERS
 //! wrongly fails by assertion; the `Mutant:` line of a test names only mutants its assertions catch.
 //! No test reaches the handler routine's close and shutdown branch, the closing check before the
-//! generate, `Unconfirmed`, or the `NothingSent` answers of the failed Win32 calls, and the runner's
-//! timeout is the only bound of a proxy that never generates, because the crate sets no timeout on
-//! its own waits. Targets are the `test_child::ctrl_break` members: a member's ack says which event
-//! reached its handler.
+//! generate, `Unconfirmed`, or the failed steps of the Win32 calls, and the runner's timeout is the
+//! only bound of a proxy that never generates.
+//! Targets are the `test_child::ctrl_break` members: a member's ack says which event reached its handler.
 
 use windows::core::HRESULT;
-use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER};
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, E_FAIL};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 
 use super::answer_for_failed_attach;
 use crate::identity::windows_fixture::{deny_every_open_by_pid, drop_se_debug_privilege};
 use crate::identity::{HostKernel, ProcessId, Resolved};
-use crate::stop::proxy::protocol::{CtrlEvent, ProxyAnswer, ProxyArgs};
+use crate::stop::proxy::protocol::{Cause, CtrlEvent, ProxyAnswer, ProxyArgs, ProxyExit, Step};
 use crate::test_child::ctrl_break::{
     self, assert_acked_event, assert_in_our_console, connect_reporter, kill_release_reap, report_done, spawn_gui_root,
     spawn_member, spawn_uncontained_member, Handler,
@@ -43,6 +42,14 @@ fn args_for(target: ProcessId, event: CtrlEvent, caller: u32) -> ProxyArgs {
 
 /// Starts the proxy as a copy of this test binary with `args`, and returns the answer it exits with.
 fn ask_proxy_with(args: ProxyArgs) -> ProxyAnswer {
+    match ask_proxy_exit_with(args) {
+        ProxyExit::Answer(answer) => answer,
+        ProxyExit::Cause(cause) => panic!("the proxy failed a step: {cause:?}"),
+    }
+}
+
+/// [`ask_proxy_with`], with the exit as it is: the answer, or the cause of a failed step.
+fn ask_proxy_exit_with(args: ProxyArgs) -> ProxyExit {
     let exe = std::env::current_exe().expect("current_exe");
     let argv = args.to_argv(exe.as_os_str());
     let mut cmd = crate::test_child::command(crate::test_child::Console::Asked);
@@ -60,7 +67,8 @@ fn ask_proxy_with(args: ProxyArgs) -> ProxyAnswer {
     let code = status
         .code()
         .unwrap_or_else(|| panic!("the proxy ended without a code: {status:?}"));
-    ProxyAnswer::from_code(code).unwrap_or_else(|| panic!("the proxy's exit code {code:#x} is not an answer"))
+    ProxyExit::from_code(code)
+        .unwrap_or_else(|| panic!("the proxy's exit code {code:#x} is not an exit of its protocol"))
 }
 
 /// Asks the proxy to send `event` to `child`'s console, on behalf of this process.
@@ -75,21 +83,37 @@ fn a_failed_attach_is_answered_by_its_error() {
     let win32 = |code: u32| HRESULT::from_win32(code);
     assert_eq!(
         answer_for_failed_attach(win32(ERROR_INVALID_HANDLE.0)),
-        ProxyAnswer::TargetHasNoConsole
+        Some(ProxyAnswer::TargetHasNoConsole)
     );
     assert_eq!(
         answer_for_failed_attach(win32(ERROR_ACCESS_DENIED.0)),
-        ProxyAnswer::AttachDenied
+        Some(ProxyAnswer::AttachDenied)
     );
     assert_eq!(
         answer_for_failed_attach(win32(ERROR_INVALID_PARAMETER.0)),
-        ProxyAnswer::TargetGone
+        Some(ProxyAnswer::TargetGone)
     );
-    // Any other refusal sent nothing: not ERROR_NOT_ENOUGH_MEMORY (8), and not an HRESULT of another
-    // facility.
+    // Any other refusal has no answer, and fails a step: not ERROR_NOT_ENOUGH_MEMORY (8), and not an
+    // HRESULT of another facility.
     for code in [HRESULT::from_win32(8), HRESULT(0x8000_4005_u32 as i32)] {
-        assert_eq!(answer_for_failed_attach(code), ProxyAnswer::NothingSent, "{code:?}");
+        assert_eq!(answer_for_failed_attach(code), None, "{code:?}");
     }
+}
+
+/// The cause of a failed Win32 call holds the call's Win32 code, and none for an HRESULT that is no Win32 code.
+/// Mutant: the raw HRESULT is passed on (the code 5 is lost: `0x80070005` is outside 16 bits). Not in the
+/// group: it sends nothing.
+#[skuld::test]
+fn a_failed_call_carries_its_win32_code() {
+    let win32 = windows::core::Error::from(HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
+    assert_eq!(
+        super::failed(Step::Generate, "a call", win32),
+        Cause::new(Step::Generate, Some(5))
+    );
+    let other = windows::core::Error::from(E_FAIL);
+    let cause = super::failed(Step::Generate, "a call", other);
+    assert_eq!(cause, Cause::new(Step::Generate, None));
+    assert_eq!(cause.os_code, None);
 }
 
 /// Ctrl+Break to a contained child with a console of its own, which no group of the caller's
@@ -245,7 +269,8 @@ fn a_pid_no_process_has_is_gone(#[fixture(ctrl_proxy)] _group: &Group) {
 /// A target that refuses every open by pid exists but cannot be checked, so the proxy answers before
 /// it attaches, and nothing is read from it. The target is live with a console of its own, and a break
 /// sent to it would be acked. Mutant: the refusal is answered as another row (`TargetGone`), or the
-/// proxy goes on without the check (the answer is `Sent`).
+/// proxy goes on without the check (the answer is `Sent`), or answers with no step or with the code of
+/// another failure.
 #[skuld::test]
 fn a_target_that_refuses_every_open_by_pid_is_unreadable(#[fixture(ctrl_proxy)] _group: &Group) {
     let Some(done) = crate::test_own_process::own_process(
@@ -264,9 +289,17 @@ fn a_target_that_refuses_every_open_by_pid_is_unreadable(#[fixture(ctrl_proxy)] 
         matches!(by_pid, Resolved::Unknown),
         "precondition: no open of the member by pid is granted: {by_pid:?}"
     );
+    // The open the proxy makes fails the same way here, with a Win32 code the proxy must carry.
+    let refused = crate::process::Process::open(target).expect_err("the open is refused");
+    let code = crate::error::first_os_code(&refused).expect("the refused open has a Win32 code");
+    let expected = Cause::new(Step::OpenTarget, Some(code));
+    assert!(
+        expected.os_code.is_some(),
+        "the code {code} must travel: it is outside 1 to 0xFFFF"
+    );
     assert_eq!(
-        ask_proxy_with(args_for(target, CtrlEvent::CtrlBreak, std::process::id())),
-        ProxyAnswer::TargetUnreadable
+        ask_proxy_exit_with(args_for(target, CtrlEvent::CtrlBreak, std::process::id())),
+        ProxyExit::Cause(expected)
     );
     kill_release_reap(&child, sock, false);
 }

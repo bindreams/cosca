@@ -15,7 +15,7 @@ use std::net::{TcpListener, TcpStream};
 
 use super::{accept_or_die, ack, fixture_argv, Console, IDENTITY_READ};
 use crate::containment::windows::observe::CtrlSend;
-use crate::stop::proxy::protocol::{CtrlEvent, ProxyAnswer};
+use crate::stop::proxy::protocol::{CtrlEvent, ProxyExit};
 
 pub(crate) mod console_less;
 pub(crate) mod nested;
@@ -392,11 +392,15 @@ pub(crate) fn assert_break_sent_to(group: u32) {
 }
 
 /// Assert that the call under test asked the proxy to send `event` to the console of `target`, and
-/// that the proxy answered `answer`, and nothing else was sent.
-pub(crate) fn assert_proxy_answered(target: u32, event: CtrlEvent, answer: ProxyAnswer) {
+/// that the proxy exited with `exit` (an answer or a cause), and nothing else was sent.
+pub(crate) fn assert_proxy_answered(target: u32, event: CtrlEvent, exit: impl Into<ProxyExit>) {
     assert_eq!(
         crate::containment::windows::observe::take_ctrl_sends(),
-        [CtrlSend::Proxy { target, event, answer }],
+        [CtrlSend::Proxy {
+            target,
+            event,
+            exit: exit.into()
+        }],
         "the call must record one answer of the proxy, for {event:?} to {target}"
     );
 }

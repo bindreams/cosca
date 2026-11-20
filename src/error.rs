@@ -701,7 +701,7 @@ pub(crate) fn io_context_over(context: impl Into<String>, cause: Error) -> std::
 
 /// [`io_context`] for a cause that may be absent: without one, an `io::Error` of kind
 /// [`Other`](std::io::ErrorKind::Other) that says `context`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn io_context_or_other(context: impl Into<String>, cause: Option<std::io::Error>) -> std::io::Error {
     match cause {
         Some(cause) => io_context(context, cause),
