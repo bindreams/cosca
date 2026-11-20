@@ -755,18 +755,18 @@ fn terminate_with(
 pub(crate) mod observe {
     use std::cell::{Cell, RefCell};
 
-    use crate::stop::proxy::protocol::{CtrlEvent, ProxyAnswer};
+    use crate::stop::proxy::protocol::{CtrlEvent, ProxyExit};
 
     /// A send of a console event, as the sender records it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum CtrlSend {
         /// `CTRL_BREAK` sent from this process to the console process group led by `group`.
         Direct { group: u32 },
-        /// The proxy answered `answer` to the request to send `event` to `target`'s console.
+        /// The proxy exited with `exit` to the request to send `event` to `target`'s console.
         Proxy {
             target: u32,
             event: CtrlEvent,
-            answer: ProxyAnswer,
+            exit: ProxyExit,
         },
     }
 

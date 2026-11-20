@@ -92,7 +92,8 @@ What a child's cooperative stop sends is an action it stores, not a rule inside 
   variable, never the program's arguments, says a process is a helper: `cosca::init_helpers()`, first in
   `main`, reads it, and plays the role the value names (an unknown value is refused, and the program does
   not run). The variable is only read (a helper launch starts no process). The proxy's arguments and
-  exit codes are the only thing the caller's side and the proxy's own sequence share. The
+  exit codes (a failed step's cause among them: the step and its Win32 error, in the code itself, so
+  that no pipe is read) are the only thing the caller's side and the proxy's own sequence share. The
   caller names the target by identity, so a reused pid is never sent an event, and cosca starts a copy
   of the host as the proxy only when the host has called `init_helpers`: on Windows, a stop that would
   start this program as the proxy (the child is outside the caller's console, cosca created it and read

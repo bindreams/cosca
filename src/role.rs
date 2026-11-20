@@ -17,8 +17,8 @@ pub(crate) const HELPER_ENV: &str = "__COSCA_HELPER";
 pub(crate) const CTRL_PROXY: &str = "ctrl-proxy";
 /// What a process exits with when [`HELPER_ENV`] names a role this build does not have. It is below the
 /// elevation shim's codes (112 to 125), which are below 126 so that no shell reads one as a signal death,
-/// and outside the proxy's answers (150 to 160), so no protocol reads it as an answer. A caller that
-/// started the helper reads it as "refused the role, nothing was sent".
+/// and outside the proxy's answers (150 to 159) and its cause codes (bit 29 set), so no protocol reads it
+/// as an answer.
 pub(crate) const UNKNOWN_HELPER_ROLE: i32 = 100;
 
 /// The name the elevation shim's stderr lines carry.

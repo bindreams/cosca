@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(windows)]
-use protocol::{CtrlEvent, ProxyAnswer, ProxyArgs, VERSION};
+use protocol::{exit_text, Cause, CtrlEvent, ProxyAnswer, ProxyArgs, ProxyExit, VERSION};
 
 #[cfg(windows)]
 use super::{conclude, refuse, unsupported, StopTarget, StopWaits, ELEVATED_REFUSAL};
@@ -242,12 +242,13 @@ async fn ask<D: StopWaits>(
             crate::role::CTRL_PROXY
         )));
     }
-    let Some(answer) = ProxyAnswer::from_code(code) else {
+    let Some(exit) = ProxyExit::from_code(code) else {
         return SendOutcome::Sent(Err(Error::Unassessable {
             detail: format!(
-                "the console-event proxy {} (pid {proxy_pid}) exited with code {code}, which is no answer of its \
+                "the console-event proxy {} (pid {proxy_pid}) exited with code {}, which is no answer of its \
                  protocol, so whether {} was sent is unknown",
                 exe.display(),
+                exit_text(code),
                 event.name()
             ),
             source: None,
@@ -257,9 +258,9 @@ async fn ask<D: StopWaits>(
     crate::containment::windows::observe::record_ctrl_send(crate::containment::windows::observe::CtrlSend::Proxy {
         target: record.pid,
         event,
-        answer,
+        exit,
     });
-    result_of(driver, target, event, exe, answer).await
+    result_of(driver, target, event, exe, exit).await
 }
 
 /// Sets `command` up to start `exe` as the proxy for `args`: told by the environment that it is the
@@ -315,17 +316,44 @@ fn wait_failed(proxy_pid: u32, event: CtrlEvent, e: Error) -> SendOutcome {
     }))
 }
 
-/// What the proxy's `answer` came to as the stop's send.
+/// The error of a proxy that sent nothing because a step failed. See [`send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy) for its text, kind
+/// and source.
+#[cfg(windows)]
+fn failed_step(cause: Cause, sent: &str) -> std::io::Error {
+    let text = format!(
+        "nothing was sent: the console-event proxy failed a step (exit {}), so no {sent} was sent; it \
+         failed at {}{}",
+        exit_text(cause.code()),
+        cause.step.name(),
+        if cause.os_code.is_some() {
+            ""
+        } else {
+            ", with no Win32 code the exit code can carry"
+        }
+    );
+    crate::error::io_context_or_other(
+        text,
+        cause
+            .os_code
+            .map(|code| std::io::Error::from_raw_os_error(i32::from(code.get()))),
+    )
+}
+
+/// What the proxy's `exit` came to as the stop's send.
 #[cfg(windows)]
 async fn result_of<D: StopWaits>(
     driver: &D,
     target: &StopTarget<'_>,
     event: CtrlEvent,
     exe: &Path,
-    answer: ProxyAnswer,
+    exit: ProxyExit,
 ) -> SendOutcome {
-    let code = answer.code();
     let sent = event.name();
+    let answer = match exit {
+        ProxyExit::Answer(answer) => answer,
+        ProxyExit::Cause(cause) => return SendOutcome::NotSent(Error::Io(failed_step(cause, sent))),
+    };
+    let code = answer.code();
     // The attach did not succeed, and the child had not exited when cosca looked: the child's own exit
     // is the one thing the proxy's answer cannot say.
     let attach_refused = |cause: &str| {
@@ -372,13 +400,6 @@ async fn result_of<D: StopWaits>(
              exit {code}), so nothing was sent",
             exe.display()
         ))),
-        // `io::ErrorKind::Other`: the proxy names no OS error of its own, and its reason is not available.
-        ProxyAnswer::NothingSent | ProxyAnswer::TargetUnreadable => {
-            not_sent(Error::Io(std::io::Error::other(format!(
-                "nothing was sent: the console-event proxy answered {answer:?} (exit {code}), so no {sent} was \
-             sent; the proxy's own reason is not available"
-            ))))
-        }
         ProxyAnswer::Unconfirmed => SendOutcome::Sent(Err(Error::Unassessable {
             detail: format!(
                 "the console-event proxy generated the {sent} and did not see its own copy of it (answer \

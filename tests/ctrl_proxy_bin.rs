@@ -43,7 +43,7 @@ fn started_without_a_proxy_invocation_it_answers_usage() {
 fn started_with_a_proxy_invocation_it_runs_the_proxy() {
     let mut cmd = std::process::Command::new(proxy_exe());
     cmd.env("__COSCA_HELPER", "ctrl-proxy").args([
-        "2".to_owned(),
+        "3".to_owned(),
         NO_SUCH_PID.to_string(),
         "0".to_owned(),
         "break".to_owned(),

@@ -10,8 +10,8 @@
 use std::net::TcpStream;
 use std::path::PathBuf;
 
-use super::protocol::{CtrlEvent, ProxyAnswer, ProxyArgs, VERSION};
-use super::{exe_unreadable, start_failed, wait_failed, CtrlProxy};
+use super::protocol::{exit_text, Cause, CtrlEvent, ProxyAnswer, ProxyArgs, ProxyExit, Step, VERSION};
+use super::{exe_unreadable, failed_step, start_failed, wait_failed, CtrlProxy};
 use crate::containment::SendOutcome;
 use crate::error::Error;
 use crate::stop::{self, StopTarget};
@@ -167,6 +167,11 @@ fn stopping_member(fixture: &Fixture, mode: ContainMode) -> (Child, TcpStream) {
 /// The error `send_console_event_via_proxy` answers to `child`.
 fn send_err(child: &Child, event: CtrlEvent) -> Error {
     stop::send_console_event_via_proxy(&StopTarget::from(child), event).expect_err("the send is refused")
+}
+
+/// The exit of a proxy that sent nothing because a step failed.
+fn nothing_sent() -> ProxyExit {
+    Cause::new(Step::Generate, Some(5)).into()
 }
 
 fn unsupported_detail(err: &Error) -> &str {
@@ -450,8 +455,7 @@ fn the_callers_console_names_the_direct_send_or_the_setter_by_the_childs_group()
 }
 
 /// A proxy of another version, or one that did not understand the arguments, is `Unsupported` naming
-/// the version this cosca speaks. Mutants: the version is not named; `Usage` is mapped as `NothingSent`
-/// (an I/O error).
+/// the version this cosca speaks. Mutant: `Usage` is mapped as a failed step.
 #[skuld::test]
 fn a_version_the_proxy_does_not_speak_names_ours() {
     for answer in [ProxyAnswer::VersionMismatch, ProxyAnswer::Usage] {
@@ -467,8 +471,7 @@ fn a_version_the_proxy_does_not_speak_names_ours() {
 
 /// A helper that refuses the role cosca named (its exit is `role::UNKNOWN_HELPER_ROLE`: it never played
 /// one) is `Unsupported`, nothing sent, naming the program and the same-cosca remedy, as for a version the
-/// proxy does not speak. Mutants: the code is read as "no answer, the event may have been sent"
-/// (`Unassessable`); the program or the remedy is not named.
+/// proxy does not speak. Mutant: the code is read as "no answer, the event may have been sent".
 #[skuld::test]
 fn a_helper_that_refuses_the_role_sent_nothing_and_names_the_remedy() {
     let fixture = Fixture::answering(crate::role::UNKNOWN_HELPER_ROLE);
@@ -495,36 +498,93 @@ fn a_program_with_no_proxy_is_named() {
     kill_release_reap(&child, sock, false);
 }
 
-/// A proxy that failed before it generated the event, or could not read its target: an I/O error of kind
-/// `Other` that says nothing was sent and gives the answer. Mutants: `Unassessable` (the event may have
-/// been sent); the answer not named.
+/// A proxy that failed a step says which, and the Win32 error it met: through a real send, the error is
+/// `Io` with the text naming the step, the code's `io::ErrorKind`, and an `io::Error` with that code as its
+/// source, and the proxy's exit is what the send records. Mutant: the code is dropped, truncated or folded
+/// into the text only.
 #[skuld::test]
-fn an_answer_that_sent_nothing_is_an_error_that_says_so() {
-    for answer in [ProxyAnswer::NothingSent, ProxyAnswer::TargetUnreadable] {
-        let fixture = Fixture::answering(answer.code());
-        let (child, sock) = hidden_member(&fixture);
-        let err = send_err(&child, CtrlEvent::CtrlBreak);
-        let Error::Io(io) = &err else { panic!("{err:?}") };
-        assert_eq!(io.kind(), std::io::ErrorKind::Other, "{err:?}");
+fn a_failed_step_is_an_error_that_names_the_step_and_holds_its_code() {
+    // ERROR_TIMEOUT: above 0xFF, and a kind other than `Other`.
+    const ERROR_TIMEOUT: i32 = 1460;
+    let kind = std::io::Error::from_raw_os_error(ERROR_TIMEOUT).kind();
+    assert_ne!(kind, std::io::ErrorKind::Other, "the code has a kind of its own");
+    let cause = Cause::new(Step::AttachConsole, Some(ERROR_TIMEOUT));
+    let fixture = Fixture::answering(cause.code());
+    let (child, sock) = hidden_member(&fixture);
+    let err = send_err(&child, CtrlEvent::CtrlBreak);
+    let Error::Io(io) = &err else { panic!("{err:?}") };
+    let text = io.to_string();
+    assert!(text.contains("nothing was sent"), "{text}");
+    assert!(text.contains(Step::AttachConsole.name()), "{text}");
+    assert_eq!(crate::error::first_os_code(&err), Some(ERROR_TIMEOUT), "{err:?}");
+    assert_eq!(io.kind(), kind, "{err:?}");
+    assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, cause);
+    kill_release_reap(&child, sock, false);
+}
+
+/// A step that failed with no Win32 code the exit code can carry is named, and the error says so: no code is
+/// invented, and the kind is `Other`. Mutant: a missing code reads as 0.
+#[skuld::test]
+fn a_failed_step_with_no_os_code_is_named_and_has_none() {
+    let cause = Cause::new(Step::ConsoleClosing, None);
+    let fixture = Fixture::answering(cause.code());
+    let (child, sock) = hidden_member(&fixture);
+    let err = send_err(&child, CtrlEvent::CtrlBreak);
+    let Error::Io(io) = &err else { panic!("{err:?}") };
+    let text = io.to_string();
+    assert!(text.contains(cause.step.name()), "{text}");
+    assert!(text.contains("no Win32 code the exit code can carry"), "{text}");
+    assert_eq!(io.kind(), std::io::ErrorKind::Other, "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), None, "{err:?}");
+    assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, cause);
+    kill_release_reap(&child, sock, false);
+}
+
+/// The error of every step, with codes below and above a byte and the widest: the text names the step and
+/// the exit as `exit_text` shows it, and the source holds the code. Mutant: the exit is dropped from the
+/// text, printed in decimal, or another cause's.
+#[skuld::test]
+fn every_failed_step_names_itself_and_holds_its_code() {
+    for step in Step::ALL {
+        for code in [5, 1168, 0xFFFF] {
+            let cause = Cause::new(step, Some(code));
+            let io = failed_step(cause, "CTRL_BREAK");
+            let text = io.to_string();
+            assert!(text.contains(step.name()), "{step:?}: {text}");
+            assert!(!text.contains("no Win32 code"), "{step:?}: {text}");
+            assert!(
+                text.contains(&format!("(exit {})", exit_text(cause.code()))),
+                "the exit: {step:?}: {text}"
+            );
+            assert_eq!(crate::error::first_os_code(&io), Some(code), "{step:?}: {io:?}");
+            assert_eq!(io.kind(), std::io::Error::from_raw_os_error(code).kind(), "{step:?}");
+        }
+        let cause = Cause::new(step, None);
+        let io = failed_step(cause, "CTRL_BREAK");
         let text = io.to_string();
-        assert!(text.contains("nothing was sent"), "{text}");
-        assert!(text.contains("the proxy's own reason is not available"), "{text}");
-        assert!(!text.contains("standard error"), "{text}");
+        assert!(text.contains(step.name()), "{step:?}: {text}");
         assert!(
-            text.contains(&format!("{answer:?}")) && text.contains(&format!("exit {}", answer.code())),
-            "{text}"
+            text.contains(&format!("(exit {})", exit_text(cause.code()))),
+            "the exit: {step:?}: {text}"
         );
-        assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, answer);
-        kill_release_reap(&child, sock, false);
+        assert_eq!(crate::error::first_os_code(&io), None, "{step:?}: {io:?}");
     }
 }
 
-/// Whether the event was sent is unknown: `Unassessable`, for the answer that says the event was
-/// generated and not confirmed, and for an exit that is no answer (0, and a code outside the
-/// protocol's) with the code. Mutants: `Ok`; an unknown code is an error that says nothing was sent.
+/// Whether the event was sent is unknown: `Unassessable`, for an exit that is no answer (0, a code outside
+/// the protocol's, the codes 156 and 160 that no proxy of it gives, a value of the cause range with no step,
+/// an NTSTATUS), with the code shown as `exit_text` shows it. Mutant: an unknown code is an error that says
+/// nothing was sent.
 #[skuld::test]
-fn an_unconfirmed_send_and_an_exit_that_is_no_answer_are_unassessable() {
-    for code in [ProxyAnswer::Unconfirmed.code(), 0, 3] {
+fn an_exit_that_is_no_answer_is_unassessable() {
+    for (code, shown) in [
+        (0, "0"),
+        (3, "3"),
+        (156, "156"),
+        (160, "160"),
+        (0x2000_0000, "0x20000000"),
+        (0xC000_013A_u32 as i32, "0xc000013a"),
+    ] {
         let fixture = Fixture::answering(code);
         let (child, sock) = hidden_member(&fixture);
         let err = send_err(&child, CtrlEvent::CtrlBreak);
@@ -532,13 +592,28 @@ fn an_unconfirmed_send_and_an_exit_that_is_no_answer_are_unassessable() {
             panic!("{err:?}")
         };
         assert!(detail.contains("unknown"), "{detail}");
-        assert!(detail.contains(&code.to_string()), "the code: {detail}");
-        match ProxyAnswer::from_code(code) {
-            Some(answer) => assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, answer),
-            None => assert_no_break_sent(),
-        }
+        assert!(
+            detail.contains(&format!("exited with code {shown},")),
+            "the code: {detail}"
+        );
+        assert_no_break_sent();
         kill_release_reap(&child, sock, false);
     }
+}
+
+/// `Unconfirmed` is `Unassessable` with the event possibly sent, and the answer is recorded. Mutants: `Ok`;
+/// an error that says nothing was sent.
+#[skuld::test]
+fn an_unconfirmed_answer_is_unassessable() {
+    let fixture = Fixture::answering(ProxyAnswer::Unconfirmed.code());
+    let (child, sock) = hidden_member(&fixture);
+    let err = send_err(&child, CtrlEvent::CtrlBreak);
+    let Error::Unassessable { detail, .. } = &err else {
+        panic!("{err:?}")
+    };
+    assert!(detail.contains("unknown"), "{detail}");
+    assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::Unconfirmed);
+    kill_release_reap(&child, sock, false);
 }
 
 /// A child created with `detached()` is asked through the proxy like any other, as it may allocate or
@@ -691,7 +766,7 @@ fn only_a_plan_that_starts_this_program_panics_without_the_hook() {
 /// is a root's); the action's error is dropped; one mechanism's route does not carry a `Sent`.
 #[skuld::test]
 fn the_calls_answer_what_the_proxy_answered() {
-    for (answer, ok) in [(ProxyAnswer::Sent, true), (ProxyAnswer::NothingSent, false)] {
+    for (answer, ok) in [(ProxyExit::from(ProxyAnswer::Sent), true), (nothing_sent(), false)] {
         for (tree, mode) in [
             (false, ContainMode::Strongest),
             (true, ContainMode::Strongest),
@@ -713,7 +788,7 @@ fn the_calls_answer_what_the_proxy_answered() {
 
 /// A proxy answer that may have sent the event (`Unconfirmed`) is a send that went out: a tree call
 /// goes on to its grace and sweep, which end the member, and keeps the answer as its cooperative error
-/// (a sweep that proves the tree clear discards it, saying so). One that sent nothing (`NothingSent`)
+/// (a sweep that proves the tree clear discards it, saying so). One that sent nothing (a failed step)
 /// is a refused send: the call ends with it, and the tree runs. Both mechanisms a Windows tree is
 /// signalled by are asked: a job object, and a tree walk.
 ///
@@ -723,7 +798,7 @@ fn the_calls_answer_what_the_proxy_answered() {
 fn a_tree_call_goes_on_after_a_send_that_may_have_gone_out_and_ends_after_one_that_did_not() {
     crate::log_capture::install();
     for mode in [ContainMode::Strongest, ContainMode::TreeWalk] {
-        for answer in [ProxyAnswer::Unconfirmed, ProxyAnswer::NothingSent] {
+        for answer in [ProxyExit::from(ProxyAnswer::Unconfirmed), nothing_sent()] {
             let fixture = Fixture::answering(answer.code());
             let (child, sock) = stopping_member(&fixture, mode);
             let mark = crate::log_capture::mark();
@@ -733,7 +808,7 @@ fn a_tree_call_goes_on_after_a_send_that_may_have_gone_out_and_ends_after_one_th
                 mark,
                 &format!("graceful_shutdown_tree({})", child.pid()),
             );
-            if answer == ProxyAnswer::Unconfirmed {
+            if answer == ProxyAnswer::Unconfirmed.into() {
                 called.unwrap_or_else(|e| panic!("{mode:?}: the sweep ends the member: {e:?}"));
                 assert!(
                     logged.iter().any(|(level, text)| *level == log::Level::Debug
@@ -765,8 +840,8 @@ fn a_tree_call_goes_on_after_a_send_that_may_have_gone_out_and_ends_after_one_th
 #[skuld::test]
 fn a_root_records_a_send_that_may_have_gone_out_as_made() {
     for (answer, earlier) in [
-        (ProxyAnswer::Unconfirmed, "the CTRL_C"),
-        (ProxyAnswer::NothingSent, "the stop action"),
+        (ProxyExit::from(ProxyAnswer::Unconfirmed), "the CTRL_C"),
+        (nothing_sent(), "the stop action"),
     ] {
         let fixture = Fixture::answering(answer.code());
         let (child, sock, _) = spawn_member(Handler::Ignore, None, ContainMode::Strongest, |cmd| {

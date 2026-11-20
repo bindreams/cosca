@@ -10,6 +10,8 @@ use std::ffi::{OsStr, OsString};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::role;
+#[cfg(windows)]
+use crate::stop::proxy::protocol::{exit_text, ProxyExit};
 use crate::stop::proxy::protocol::{ProxyAnswer, ProxyArgs};
 
 static HELPERS_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -40,8 +42,8 @@ static HELPERS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// - **The shim** runs on Linux. macOS has no shim: `init_helpers` reports that and does not start the
 ///   program (exit 120).
 /// - **The proxy** runs on Windows: it attaches to another process's console, sends it Ctrl+C or
-///   Ctrl+Break, and exits with its answer (150 to 160). Other platforms have no proxy:
-///   `init_helpers` reports that and exits 159.
+///   Ctrl+Break, and exits with its answer (a code from 150 to 159), or, when a step of its own failed before it sent
+///   anything, a code that carries the step and the Win32 error. Other platforms have no proxy: `init_helpers` reports that and exits 159.
 pub fn init_helpers() {
     #[cfg(unix)]
     start(None);
@@ -137,14 +139,22 @@ fn run_proxy(argv: &[OsString]) -> i32 {
 
 #[cfg(windows)]
 fn serve(args: &ProxyArgs) -> i32 {
-    let answer = crate::stop::proxy::run::run(args);
-    if answer != ProxyAnswer::Sent {
-        role::line(
+    let exit = crate::stop::proxy::run::run(args);
+    match exit {
+        ProxyExit::Answer(ProxyAnswer::Sent) => {}
+        ProxyExit::Answer(answer) => role::line(
             role::PROXY,
-            format_args!("answering {answer:?} (exit {})", answer.code()),
-        );
+            format_args!("answering {answer:?} (exit {})", exit_text(exit.code())),
+        ),
+        ProxyExit::Cause(cause) => role::line(
+            role::PROXY,
+            format_args!(
+                "failed a step, nothing sent: {cause:?} (exit {})",
+                exit_text(exit.code())
+            ),
+        ),
     }
-    answer.code()
+    exit.code()
 }
 
 /// Other platforms have no proxy; it reports that and sends nothing.

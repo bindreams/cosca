@@ -466,7 +466,15 @@ fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Res
 /// - the program started does not speak this cosca's protocol version, or is no proxy.
 ///
 /// An [`Error::Io`] says nothing was sent: the proxy could not be started, or it failed before it
-/// generated the event. [`Error::Unassessable`] says whether the event was sent is unknown: the proxy
+/// generated the event. For a proxy that failed a step (`FreeConsole`, `AttachConsole`, the generate, the
+/// open of the child, and the like), the error's text names the step. When the failure was a Win32
+/// error of 16 bits (nearly all are) that is not 0, it is the `source()` of the error, as an `io::Error`
+/// with that OS code, and the error has that code's [`io::ErrorKind`](std::io::ErrorKind);
+/// [`first_os_code`](crate::error::first_os_code) reads the code from the chain. A failure with no such
+/// code has the kind `Other` and no source. The proxy carries step
+/// and code in its exit code, so no output of the proxy is read.
+///
+/// [`Error::Unassessable`] says whether the event was sent is unknown: the proxy
 /// ended without a known answer, or generated the event and did not see its own copy. So does an
 /// [`Error::MayHaveStarted`] from the start of the proxy, which says the proxy may have run.
 ///
