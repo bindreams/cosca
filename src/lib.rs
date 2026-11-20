@@ -435,14 +435,9 @@ fn main() {
     // And the console-event proxy, which the proxy's tests start as a copy of this binary.
     #[cfg(windows)]
     init_helpers();
-    #[cfg(target_os = "linux")]
-    elevation::shim::owner_helper::run_if_requested();
+    // The fixture roles the tests re-run this binary as.
     #[cfg(unix)]
-    test_child::blocked_tree_root::run_if_requested();
-    #[cfg(unix)]
-    test_child::signal_tree::run_if_requested();
-    #[cfg(target_os = "linux")]
-    test_child::zombie_leader_root::run_if_requested();
+    test_child::fixture_role::run_if_requested();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

@@ -1,18 +1,20 @@
 //! A process whose leader thread has exited while another thread runs, as a process of its own: the
-//! lib's test binary re-run with [`argv`], dispatched from `main` before the runner starts so it is
-//! single-threaded. It spawns a `cat` on its own stdin, prints the `cat`'s pid, starts a thread that
-//! blocks on the stdin, and ends the leader thread alone (`SYS_exit`, not `pthread_exit`, which would
-//! unwind through Rust's frames). The kernel then shows the process as a zombie (`Z`) that still has a
-//! live thread, and keeps the `cat`'s parent number at the process's. The thread prints `exited` once
-//! the kernel reports the leader's end (see [`LEADER_TID`]), then blocks on the stdin. Closing the
-//! stdin ends the thread and the `cat`, and with them the process.
+//! lib's test binary re-run as [`ROLE`], dispatched from `main` before the runner starts, so it is
+//! single-threaded when it starts. It spawns a `cat` on its own stdin, prints the `cat`'s pid, starts a
+//! thread that blocks on the stdin, and ends the leader thread alone (`SYS_exit`, not `pthread_exit`,
+//! which would unwind through Rust's frames). The kernel then shows the process as a zombie (`Z`) that
+//! still has a live thread, and keeps the `cat`'s parent number at the process's. The thread prints
+//! `exited` once the kernel reports the leader's end (see [`LEADER_TID`]), then blocks on the stdin.
+//! Closing the stdin ends the thread and the `cat`, and with them the process.
 
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const FLAG: &str = "--cosca-zombie-leader-root";
+use super::fixture_role::FixtureRole;
+
+pub(crate) const ROLE: FixtureRole = FixtureRole::new("--cosca-zombie-leader-root", run);
 
 /// The leader thread's `clear_child_tid` word: its tid while it runs, and the kernel zeroes it and
 /// wakes its waiters as the thread exits. That is a step of the exit, taken before the kernel marks the
@@ -40,23 +42,10 @@ fn wait_for_the_leader_to_exit() {
     }
 }
 
-/// Runs the root and ends its leader thread, if this process was started as one.
-pub(crate) fn run_if_requested() {
-    let args: Vec<OsString> = std::env::args_os().collect();
-    if args.get(1).is_none_or(|a| a != FLAG) {
-        return;
-    }
-    run();
-}
-
-pub(crate) fn argv() -> [&'static str; 1] {
-    [FLAG]
-}
-
-fn run() -> ! {
+fn run(_: &[OsString]) -> ! {
     #[allow(
         clippy::disallowed_methods,
-        reason = "this process is single-threaded: nothing else forks, so there is no lock to hold"
+        reason = "no thread has started in this process yet: nothing else forks, so there is no lock to hold"
     )]
     let cat = Command::new("cat")
         .stdin(Stdio::inherit())

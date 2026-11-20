@@ -1,29 +1,18 @@
 //! The root of [`foreign::blocked_tree`](super::foreign::blocked_tree), as a process of its own: the
-//! lib's test binary re-run with [`argv`], dispatched from `main` before the runner starts so it
-//! is single-threaded. It spawns a `cat` on its own stdin and prints the `cat`'s pid, then how the
-//! `cat` ended (`128 + signal` or the exit code, as a shell reports it). It blocks `SIGTERM` so a
-//! send stays pending however it interleaves with the wait on the `cat`, and dies of it at the end.
+//! lib's test binary re-run as [`ROLE`], dispatched from `main` before the runner starts, so it is
+//! single-threaded. It spawns a `cat` on its own stdin and prints the `cat`'s
+//! pid, then how the `cat` ended (`128 + signal` or the exit code, as a shell reports it). It blocks
+//! `SIGTERM` so a send stays pending however it interleaves with the wait on the `cat`, and dies of it
+//! at the end.
 
 use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 
-const FLAG: &str = "--cosca-blocked-tree-root";
+use super::fixture_role::FixtureRole;
 
-/// Runs the root and exits, if this process was started as one.
-pub(crate) fn run_if_requested() {
-    let args: Vec<OsString> = std::env::args_os().collect();
-    if args.get(1).is_none_or(|a| a != FLAG) {
-        return;
-    }
-    run();
-    std::process::exit(0);
-}
-
-pub(crate) fn argv() -> [&'static str; 1] {
-    [FLAG]
-}
+pub(crate) const ROLE: FixtureRole = FixtureRole::new("--cosca-blocked-tree-root", run);
 
 fn shell_status(status: std::process::ExitStatus) -> i32 {
     status
@@ -31,10 +20,10 @@ fn shell_status(status: std::process::ExitStatus) -> i32 {
         .map_or_else(|| status.code().expect("exited"), |s| 128 + s)
 }
 
-fn run() {
+fn run(_: &[OsString]) -> ! {
     #[allow(
         clippy::disallowed_methods,
-        reason = "this process is single-threaded: nothing else forks, so there is no lock to hold"
+        reason = "this process runs no thread but its main one: nothing else forks, so there is no lock to hold"
     )]
     let mut cat = Command::new("cat")
         .stdin(Stdio::inherit())
@@ -78,6 +67,7 @@ fn run() {
         assert_eq!(rc, 0, "unblock SIGTERM: {}", std::io::Error::last_os_error());
         unreachable!("the pending SIGTERM kills this process");
     }
+    std::process::exit(0)
 }
 
 fn sigset_of_term() -> libc::sigset_t {

@@ -24,8 +24,8 @@ pub(crate) struct BlockedTree {
 /// gone. The grandchild's stdin is kept out of `root.stdin`, so `Child::wait` does not release it.
 pub(crate) fn blocked_tree() -> BlockedTree {
     let mut root = StdChild::spawn(
-        crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
-            .args(super::blocked_tree_root::argv())
+        super::blocked_tree_root::ROLE
+            .command(&[])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped()),
     );

@@ -16,8 +16,8 @@ use crate::Recursive;
 #[skuld::test]
 fn a_process_whose_leader_thread_exited_is_alive_and_keeps_its_children() {
     let mut root = crate::test_child::StdChild::spawn(
-        crate::test_reexec::command(std::env::current_exe().expect("current_exe"))
-            .args(crate::test_child::zombie_leader_root::argv())
+        crate::test_child::zombie_leader_root::ROLE
+            .command(&[])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped()),
     );

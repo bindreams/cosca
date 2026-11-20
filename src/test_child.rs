@@ -29,6 +29,9 @@ pub(crate) fn parent_handle(end: &crate::pipe::ParentEnd) -> std::os::windows::i
 pub(crate) mod unwaitable;
 
 #[cfg(unix)]
+pub(crate) mod fixture_role;
+
+#[cfg(unix)]
 pub(crate) mod blocked_tree_root;
 
 #[cfg(unix)]
@@ -1762,7 +1765,7 @@ pub(crate) const CAT_TREE_ARGV: &[&str] = &[
 #[cfg(unix)]
 fn signal_tree_argv(mode: signal_tree::Mode) -> Vec<std::ffi::OsString> {
     std::iter::once(std::env::current_exe().expect("current_exe").into_os_string())
-        .chain(signal_tree::argv(mode).map(std::ffi::OsString::from))
+        .chain(signal_tree::argv(mode))
         .collect()
 }
 

@@ -1,10 +1,10 @@
 //! A process that owns a [`ShimLink`](super::link::ShimLink) and can be ended on demand: cosca, for
 //! the tests that end it while a real shim runs.
 //!
-//! The lib's test binary is also this helper: its `main` calls [`run_if_requested`] first. It binds
-//! a link in the directory it is given, prints `dir=<link dir>` and `pid=<its pid>`, and then lives
-//! until its stdin ends or it is killed. Its stdout carries what it observes, one event per line. The
-//! line `fork` on its stdin makes a fork copy of it, as `hold-copy` does at the start; the line
+//! The lib's test binary is also this helper, as [`ROLE`]. It binds a link in the directory it is
+//! given, prints `dir=<link dir>` and `pid=<its pid>`, and then lives until its stdin ends or it is
+//! killed. Its stdout carries what it observes, one event per line. The line
+//! `fork` on its stdin makes a fork copy of it, as `hold-copy` does at the start; the line
 //! `send-exit <bytes>` sends each byte as a control byte to the shim and exits at once; the line
 //! `read-frames` makes a copy that reads the shim's connection until the shim ends it and then prints
 //! `frames <hex>`, so that a test can see what the shim said to a cosca that has been killed.
@@ -19,32 +19,29 @@
 //!   copied listener and writes `A` to it, right after accepting (`before`: ahead of the shim's
 //!   checks) or after reading the shim's hello (`after`).
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::Path;
+
+use crate::test_child::fixture_role::FixtureRole;
 
 use super::link::probe::Probe;
 use super::link::ShimLink;
 
-const FLAG: &str = "--cosca-shim-test-owner";
+pub(crate) const ROLE: FixtureRole = FixtureRole::new("--cosca-shim-test-owner", play);
 /// The stdin command that sends control bytes and exits, followed by the bytes.
 pub(crate) const SEND_EXIT: &str = "send-exit ";
 /// The stdin command that forks a copy holding the shim's connection and reading what the shim sends.
 pub(crate) const READ_FRAMES: &str = "read-frames";
 
-/// Runs the helper and exits, if this process was started as one.
-pub(crate) fn run_if_requested() {
-    let args: Vec<OsString> = std::env::args_os().collect();
-    if args.get(1).is_none_or(|a| a != FLAG) {
-        return;
-    }
-    let mode = args[2].to_string_lossy().into_owned();
-    std::process::exit(run(&mode, Path::new(&args[3])));
+fn play(rest: &[OsString]) -> ! {
+    let mode = rest[0].to_string_lossy().into_owned();
+    std::process::exit(run(&mode, Path::new(&rest[1])));
 }
 
 /// The argv (after the program name) that starts the helper.
 pub(crate) fn argv(mode: &str, work: &Path) -> Vec<OsString> {
-    vec![FLAG.into(), mode.into(), work.into()]
+    ROLE.argv(&[OsStr::new(mode), work.as_os_str()])
 }
 
 fn say(line: &str) {
