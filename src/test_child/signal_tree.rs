@@ -1,7 +1,8 @@
 //! A root and one leaf that report the signals they get, each a process of its own: the lib's test
-//! binary re-run with [`argv`], dispatched from `main` before the runner starts so it is
-//! single-threaded. The root starts the leaf, which shares its stdin and stdout, so a test sees both
-//! members' lines on one stream and can tell which signal each of them received.
+//! binary re-run as [`ROOT`], dispatched from `main` before the runner starts, so it is single-threaded
+//! when it starts the leaf (its reaper thread starts after). The root starts the leaf, which shares its
+//! stdin and stdout, so a test sees both members' lines on one stream and can tell which signal each of
+//! them received.
 //!
 //! A [`Mode`] names the signals a member reports. A member prints `<root|leaf> SIG<NAME>` for one, and
 //! then exits, except for [`Mode::ThenTerm`]'s `SIGUSR1`, after which it goes on. The leaf prints `r`
@@ -28,7 +29,7 @@
 //! the stdout, and a test that waits for the root's line waits on. A closed stdout is a normal end: the
 //! member exits with 0.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Write as _};
 use std::os::unix::net::UnixStream;
 use std::process::Stdio;
@@ -38,8 +39,10 @@ use std::sync::Arc;
 use nix::sys::signal::{SigSet, Signal};
 use rustix::event::{PollFd, PollFlags};
 
-const ROOT_FLAG: &str = "--cosca-signal-tree-root";
-const LEAF_FLAG: &str = "--cosca-signal-tree-leaf";
+use super::fixture_role::FixtureRole;
+
+pub(crate) const ROOT: FixtureRole = FixtureRole::new("--cosca-signal-tree-root", run_root);
+pub(crate) const LEAF: FixtureRole = FixtureRole::new("--cosca-signal-tree-leaf", run_leaf);
 
 /// The signals a tree reports.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -82,38 +85,40 @@ impl Mode {
 }
 
 #[derive(Clone, Copy)]
-enum Role {
+enum TreeMember {
     Root,
     Leaf,
 }
 
-impl Role {
+impl TreeMember {
     fn name(self) -> &'static str {
         match self {
-            Role::Root => "root",
-            Role::Leaf => "leaf",
+            TreeMember::Root => "root",
+            TreeMember::Leaf => "leaf",
         }
     }
 }
 
-/// Runs the member and exits, if this process was started as one.
-pub(crate) fn run_if_requested() {
-    let args: Vec<OsString> = std::env::args_os().collect();
-    let role = match args.get(1) {
-        Some(flag) if flag == ROOT_FLAG => Role::Root,
-        Some(flag) if flag == LEAF_FLAG => Role::Leaf,
-        _ => return,
-    };
-    let mode = args
-        .get(2)
+fn run_root(rest: &[OsString]) -> ! {
+    run(TreeMember::Root, mode_of(TreeMember::Root, rest))
+}
+
+fn run_leaf(rest: &[OsString]) -> ! {
+    run(TreeMember::Leaf, mode_of(TreeMember::Leaf, rest))
+}
+
+/// The mode `member` is started with: the first argument after its flag.
+fn mode_of(member: TreeMember, rest: &[OsString]) -> Mode {
+    let name = rest
+        .first()
         .and_then(|mode| mode.to_str())
-        .unwrap_or_else(|| die(&format!("no mode in {args:?}")));
-    run(role, Mode::parse(mode))
+        .unwrap_or_else(|| die(&format!("the {} has no mode in {rest:?}", member.name())));
+    Mode::parse(name)
 }
 
 /// The arguments, after the test binary's path, that start the root of a tree of `mode`.
-pub(crate) fn argv(mode: Mode) -> [&'static str; 2] {
-    [ROOT_FLAG, mode.name()]
+pub(crate) fn argv(mode: Mode) -> Vec<OsString> {
+    ROOT.argv(&[OsStr::new(mode.name())])
 }
 
 /// The exit code of a member that could not set itself up: a panic's.
@@ -183,9 +188,9 @@ fn blocks(signal: Signal) -> bool {
     unsafe { libc::sigismember(current.as_ptr(), signal as libc::c_int) == 1 }
 }
 
-fn run(role: Role, mode: Mode) -> ! {
-    let seen = match role {
-        Role::Root => {
+fn run(member: TreeMember, mode: Mode) -> ! {
+    let seen = match member {
+        TreeMember::Root => {
             // Blocked here, so the reaper inherits it and only the main thread has the signals.
             change_mask(libc::SIG_BLOCK, mode);
             let seen = register_handlers(mode);
@@ -204,7 +209,7 @@ fn run(role: Role, mode: Mode) -> ! {
             change_mask(libc::SIG_UNBLOCK, mode);
             seen
         }
-        Role::Leaf => {
+        TreeMember::Leaf => {
             let seen = register_handlers(mode);
             // The root's mask may have come with the exec: the handlers are in place, so unblock.
             change_mask(libc::SIG_UNBLOCK, mode);
@@ -216,11 +221,11 @@ fn run(role: Role, mode: Mode) -> ! {
         mode.signals().iter().all(|&signal| !blocks(signal)),
         "the main thread of a signal tree member must not block the mode's signals"
     );
-    serve(role, mode, &seen)
+    serve(member, mode, &seen)
 }
 
 /// Waits for the stdin and the wake pipe, and reports what it has seen, until the stdin ends.
-fn serve(role: Role, mode: Mode, seen: &Seen) -> ! {
+fn serve(member: TreeMember, mode: Mode, seen: &Seen) -> ! {
     let stdin = rustix::stdio::stdin();
     // The stdin is shared with the other member, so a read must not block on bytes the other took.
     let flags = rustix::fs::fcntl_getfl(stdin).unwrap_or_else(|e| die(&format!("fcntl(F_GETFL) on the stdin: {e}")));
@@ -234,12 +239,12 @@ fn serve(role: Role, mode: Mode, seen: &Seen) -> ! {
         crate::wait::poll_ready(&mut fds).unwrap_or_else(|e| die(&format!("poll: {e}")));
         let stdin_ready = !fds[0].revents().is_empty();
         empty_wake_pipe(seen);
-        report_seen(role, mode, seen);
+        report_seen(member, mode, seen);
         if stdin_ready && stdin_ended(stdin) {
             // A signal sent before the end has run its handler by now.
             empty_wake_pipe(seen);
-            report_seen(role, mode, seen);
-            report(&format!("{} eof\n", role.name()));
+            report_seen(member, mode, seen);
+            report(&format!("{} eof\n", member.name()));
             std::process::exit(0);
         }
     }
@@ -271,10 +276,10 @@ fn empty_wake_pipe(seen: &Seen) {
 }
 
 /// Reports the signals seen, in the mode's order.
-fn report_seen(role: Role, mode: Mode, seen: &Seen) {
+fn report_seen(member: TreeMember, mode: Mode, seen: &Seen) {
     for (signal, flag) in &seen.flags {
         if flag.swap(false, Ordering::SeqCst) {
-            report_signal(role, mode, *signal);
+            report_signal(member, mode, *signal);
         }
     }
 }
@@ -284,17 +289,15 @@ fn report_seen(role: Role, mode: Mode, seen: &Seen) {
     reason = "this process is single-threaded here: nothing else forks, so there is no lock to hold"
 )]
 fn start_leaf(mode: Mode) -> std::process::Child {
-    let exe = std::env::current_exe().unwrap_or_else(|e| die(&format!("current_exe: {e}")));
-    crate::test_reexec::command(exe)
-        .args([LEAF_FLAG, mode.name()])
+    LEAF.command(&[OsStr::new(mode.name())])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .spawn()
         .unwrap_or_else(|e| die(&format!("spawn the leaf: {e}")))
 }
 
-fn report_signal(role: Role, mode: Mode, signal: Signal) {
-    report(&format!("{} {}\n", role.name(), signal.as_str()));
+fn report_signal(member: TreeMember, mode: Mode, signal: Signal) {
+    report(&format!("{} {}\n", member.name(), signal.as_str()));
     if mode.ends_on(signal) {
         std::process::exit(0);
     }
