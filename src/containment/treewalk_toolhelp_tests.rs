@@ -109,3 +109,87 @@ fn a_failed_snapshot_is_unassessable_with_its_win32_code() {
     );
     assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied, "{source:?}");
 }
+
+/// A walk names the members of its tree for a send that reaches each by itself: the root, then the
+/// descendants a walk from its identity finds.
+///
+/// Mutants: the root is left out; the descendants are.
+#[skuld::test]
+fn a_walks_member_ids_are_the_root_and_its_descendants() {
+    use crate::containment::treewalk::Walker;
+    use crate::containment::Contains as _;
+    use crate::test_child::ctrl_break::{kill_release_reap, spawn_member, Handler};
+
+    let (child, sock, grand) = spawn_member(
+        Handler::Ignore,
+        Some(Handler::Ignore),
+        crate::ContainMode::TreeWalk,
+        |_| {},
+    );
+    let grand = grand.expect("a grandchild was asked for");
+    let root = child.id().expect("the root's identity");
+    let descendants = root.children(Recursive::Yes).expect("the descendants of the root");
+    assert!(!descendants.is_empty(), "the grandchild is a descendant");
+
+    let members = Walker::over(root, crate::identity::HostKernel)
+        .member_ids()
+        .expect("the walk lists its members");
+
+    assert_eq!(members.named[0], root, "{members:?}");
+    assert_eq!(members.named[1..], descendants[..], "{members:?}");
+    drop(grand);
+    kill_release_reap(&child, sock, false);
+}
+
+/// A walk anchors on the root's held handle, so it still finds the descendants of a root that has
+/// exited and is held, and names them; the root is not one of them (it has no windows to ask).
+///
+/// Mutant: the exited root is listed first, as a running one is.
+#[skuld::test]
+fn a_walks_member_ids_leave_out_a_root_that_has_exited_and_keep_its_descendants() {
+    use crate::containment::treewalk::Walker;
+    use crate::containment::Contains as _;
+    use crate::identity::Liveness;
+    use crate::test_child::ctrl_break::{spawn_member, Handler};
+
+    let (child, sock, grand) = spawn_member(
+        Handler::Ignore,
+        Some(Handler::Ignore),
+        crate::ContainMode::TreeWalk,
+        |_| {},
+    );
+    let grand = grand.expect("a grandchild was asked for");
+    let root = child.id().expect("the root's identity");
+    let descendants = root.children(Recursive::Yes).expect("the descendants of the root");
+    assert!(!descendants.is_empty(), "the grandchild is a descendant");
+    child.kill().expect("kill the root alone");
+    child.wait().expect("the root has exited, and the child still holds it");
+    assert_eq!(root.is_alive(), Liveness::Dead, "premise: the root has exited");
+
+    let members = Walker::over(root, crate::identity::HostKernel)
+        .member_ids()
+        .expect("the walk lists its members");
+
+    assert_eq!(members.named, descendants);
+    drop(sock);
+    drop(grand);
+}
+
+/// A root that is gone, or whose pid names another process now, names no member: a walk from it finds
+/// nothing. The pid here is this process's, with an identity it does not have.
+///
+/// Mutant: a gone root names itself.
+#[skuld::test]
+fn a_walks_member_ids_are_none_for_a_root_whose_pid_names_another_process() {
+    use crate::containment::treewalk::Walker;
+    use crate::containment::Contains as _;
+    use crate::identity::Key;
+
+    let another = ProcessId::from_parts_for_test(std::process::id(), Key::for_test(1));
+    let walker = Walker::over(another, crate::identity::HostKernel);
+
+    assert_eq!(
+        walker.member_ids().expect("a root that is gone lists nothing").named,
+        Vec::<ProcessId>::new()
+    );
+}

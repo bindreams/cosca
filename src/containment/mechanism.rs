@@ -45,6 +45,16 @@ pub(crate) fn root_left_alone(root: Error) -> Error {
     }
 }
 
+/// Windows: what [`Contains::member_ids`] names of a tree.
+#[cfg(windows)]
+#[derive(Debug, Default)]
+pub(crate) struct Members {
+    /// The members the mechanism named, by identity.
+    pub(crate) named: Vec<ProcessId>,
+    /// Each member, or pid that may be a member, it could not name, as the mechanism words it for a send.
+    pub(crate) unnamed: Vec<Error>,
+}
+
 /// One way the OS names a process tree. Implemented by the mechanism types (`CgroupLeaf`, `JobHandle`,
 /// `Group`, `Marker`, `Walker`) and by the test fake; a [`Tree`](crate::containment::Tree) holds one
 /// as a [`Mechanism`] and asks it nothing about which it is.
@@ -113,12 +123,23 @@ pub(crate) trait Contains: fmt::Debug {
 
     /// The cooperative stop `how` to every member it names, as [`send_kill`](Self::send_kill) decides
     /// it from `root`: on Unix the signal `how` carries; on Windows nothing is sent here, for the
-    /// caller's stop function already sent the `CTRL_BREAK` to the root's group `pid` and `how` carries
-    /// the answer of that send, which the mechanism takes with the rest of its bookkeeping. Signal-only.
+    /// caller's stop function already made its send (the `CTRL_BREAK` to the root's group `pid`, a
+    /// console event through the proxy, `WM_CLOSE` to the members' windows) and `how` carries the
+    /// answer of that send, which the mechanism takes with the rest of its bookkeeping. Signal-only.
     /// Beside the outcome, the listing of the walk that made it, which the settlement holds
     /// ([`Tree::terminate`](crate::containment::Tree::terminate)); `None` for a mechanism whose terminate
     /// holds no listing: one with no walk, and the macOS fd marker, which walks but keeps nothing.
     fn send_terminate(&self, pid: u32, root: Option<&dyn Root>, how: TreeStop) -> (TerminateOutcome, Option<Listing>);
+
+    /// Windows: the members of the tree, as the mechanism names them (the root among them while it is
+    /// one), for a send that must reach each member by itself (`WM_CLOSE` to its windows), and each member
+    /// it could not name ([`Members`]). It sends nothing and logs nothing: the send answers for each
+    /// member it could not name. The error is a listing that could not be made. A Job Object lists its
+    /// job, a tree walk walks from its root's identity, which the walk holds: a root whose pid names
+    /// another process names no member, and a root that has exited is left out while its descendants are
+    /// listed.
+    #[cfg(windows)]
+    fn member_ids(&self) -> Result<Members, Error>;
 
     /// The tree's own kernel edge for "no member runs" (a cgroup's `populated`, a job's process
     /// list, a marker pipe's EOF); `None` for a group, a session and a walk.
@@ -310,6 +331,16 @@ impl Contains for Mechanism {
             Mechanism::Walk(m) => m.send_terminate(pid, root, how),
             #[cfg(test)]
             Mechanism::Fake(m) => m.send_terminate(pid, root, how),
+        }
+    }
+
+    #[cfg(windows)]
+    fn member_ids(&self) -> Result<Members, Error> {
+        match self {
+            Mechanism::Job(m) => m.member_ids(),
+            Mechanism::Walk(m) => m.member_ids(),
+            #[cfg(test)]
+            Mechanism::Fake(m) => m.member_ids(),
         }
     }
 

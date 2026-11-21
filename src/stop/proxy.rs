@@ -24,7 +24,7 @@ use std::time::Duration;
 use protocol::{exit_text, Cause, CtrlEvent, ProxyAnswer, ProxyArgs, ProxyExit, VERSION};
 
 #[cfg(windows)]
-use super::{conclude, refuse, unsupported, StopTarget, StopWaits, ELEVATED_REFUSAL};
+use super::{conclude, refuse, root_exited, unsupported, StopTarget, StopWaits, ELEVATED_REFUSAL, REMEDIES};
 #[cfg(windows)]
 use crate::containment::SendOutcome;
 #[cfg(windows)]
@@ -73,18 +73,20 @@ fn warn_still_waiting(proxy: Option<u32>, child: u32, event: CtrlEvent, after: D
 }
 
 #[cfg(windows)]
-const NO_IDENTITY_REFUSAL: &str = "this child has no identity (Child::id() is None), and the proxy names its \
+const NO_IDENTITY_REASON: &str = "this child has no identity (Child::id() is None), and the proxy names its \
      target by identity, so that a pid the system has reused is never sent an event: it cannot be named \
-     exactly. Use Child::kill for a hard teardown, or Command::graceful_stop with a stop of your own.";
+     exactly.";
 
 /// The remedy for a program that is no proxy of this cosca's protocol.
 #[cfg(windows)]
 const SAME_COSCA_PROXY: &str = "Start a proxy built from the same cosca: CtrlProxy::HostExecutable, or the \
      cosca-ctrl-proxy executable that belongs to it.";
 
-/// The remedies a refusal that leaves the child running names, in this order.
+/// [`REMEDIES`] for the answer `TargetHasNoConsole`, whose child may be a GUI program, which has windows to
+/// ask instead.
 #[cfg(windows)]
-const REMEDIES: &str = "Use Child::kill for a hard teardown, or Command::graceful_stop with a stop of your own.";
+const NO_CONSOLE_REMEDIES: &str = "Use Child::kill for a hard teardown, stop::send_wm_close for a GUI child that \
+     shows a window, or Command::graceful_stop with a stop of your own.";
 
 /// The possible causes of the answer `TargetHasNoConsole`, which cosca cannot tell apart.
 #[cfg(windows)]
@@ -153,36 +155,33 @@ pub(crate) async fn send<D: StopWaits>(driver: &D, target: &StopTarget<'_>, even
         Ok(true) => {
             return conclude(
                 target,
-                event,
-                SendOutcome::RootExited(root_exited(&format!(
-                    "the child (pid {}) had exited when cosca looked, before the console-event proxy was started",
-                    target.pid()
-                ))),
+                event.name(),
+                SendOutcome::RootExited(root_exited(
+                    &format!(
+                        "the child (pid {}) had exited when cosca looked, before the console-event proxy was started",
+                        target.pid()
+                    ),
+                    PROXY_CANNOT_REACH_OUTLIVERS,
+                )),
             )
         }
-        Err(look_failed) => return conclude(target, event, SendOutcome::NotSent(look_failed)),
+        Err(look_failed) => return conclude(target, event.name(), SendOutcome::NotSent(look_failed)),
     }
     let (id, exe): (ProcessId, std::borrow::Cow<'_, Path>) = match plan {
         Plan::RefuseElevated => return Err(refuse(target, ELEVATED_REFUSAL)),
-        Plan::RefuseNoIdentity => return Err(refuse(target, NO_IDENTITY_REFUSAL)),
+        Plan::RefuseNoIdentity => return Err(refuse(target, format!("{NO_IDENTITY_REASON} {REMEDIES}"))),
         Plan::StartHost(id) => match std::env::current_exe() {
             Ok(exe) => (id, exe.into()),
-            Err(e) => return conclude(target, event, exe_unreadable(e)),
+            Err(e) => return conclude(target, event.name(), exe_unreadable(e)),
         },
         Plan::StartExecutable(id, exe) => (id, exe.into()),
     };
-    conclude(target, event, ask(driver, target, event, &id, &exe).await)
+    conclude(target, event.name(), ask(driver, target, event, &id, &exe).await)
 }
 
-/// The error of a tree call whose root had exited when cosca looked, with nothing sent: `cause` says
-/// where the look was.
+/// What an exited root's answer says the proxy cannot do for the root's descendants.
 #[cfg(windows)]
-fn root_exited(cause: &str) -> Error {
-    Error::Unassessable {
-        detail: format!("{cause}: nothing was sent, and the proxy cannot reach a member of its tree that outlived it"),
-        source: None,
-    }
-}
+const PROXY_CANNOT_REACH_OUTLIVERS: &str = "the proxy cannot reach a member of its tree that outlived it";
 
 /// Starts `exe` as the proxy for `event` to the console of the child `id` names, waits for its
 /// answer, and returns what it came to.
@@ -235,12 +234,15 @@ async fn ask<D: StopWaits>(
     };
     if code == crate::role::UNKNOWN_HELPER_ROLE {
         // The helper refused the role cosca named: it never played one, so nothing was sent.
-        return SendOutcome::NotSent(unsupported(format!(
-            "the program started as the console-event proxy ({}) refused the helper role this cosca named \
+        return SendOutcome::NotSent(unsupported(
+            format!(
+                "the program started as the console-event proxy ({}) refused the helper role this cosca named \
              (exit {code}): it knows no `{}` role, so nothing was sent. {SAME_COSCA_PROXY}",
-            exe.display(),
-            crate::role::CTRL_PROXY
-        )));
+                exe.display(),
+                crate::role::CTRL_PROXY
+            ),
+            None,
+        ));
     }
     let Some(exit) = ProxyExit::from_code(code) else {
         return SendOutcome::Sent(Err(Error::Unassessable {
@@ -356,11 +358,14 @@ async fn result_of<D: StopWaits>(
     let code = answer.code();
     // The attach did not succeed, and the child had not exited when cosca looked: the child's own exit
     // is the one thing the proxy's answer cannot say.
-    let attach_refused = |cause: &str| {
-        SendOutcome::NotSent(unsupported(format!(
-            "the console-event proxy's attach to the child's console did not succeed (answer {answer:?}, exit \
-             {code}), and the child had not exited when cosca looked, so nothing was sent. {cause} {REMEDIES}"
-        )))
+    let attach_refused = |cause: &str, remedies: &str| {
+        SendOutcome::NotSent(unsupported(
+            format!(
+                "the console-event proxy's attach to the child's console did not succeed (answer {answer:?}, exit \
+             {code}), and the child had not exited when cosca looked, so nothing was sent. {cause} {remedies}"
+            ),
+            None,
+        ))
     };
     let not_sent = |error: Error| SendOutcome::NotSent(error);
     match answer {
@@ -368,38 +373,50 @@ async fn result_of<D: StopWaits>(
         ProxyAnswer::TargetGone | ProxyAnswer::AttachDenied | ProxyAnswer::TargetHasNoConsole => {
             match driver.root_exited(Duration::ZERO).await {
                 Err(look_failed) => not_sent(look_failed),
-                Ok(true) => SendOutcome::RootExited(root_exited(&format!(
-                    "the console-event proxy's attach to the console of the child (pid {}) did not succeed \
-                     (answer {answer:?}, exit {code}), and the child had exited when cosca looked",
-                    target.pid()
-                ))),
-                Ok(false) => attach_refused(match answer {
-                    ProxyAnswer::TargetHasNoConsole => NO_CONSOLE_CAUSES,
-                    _ => ATTACH_DENIED_CAUSE,
-                }),
+                Ok(true) => SendOutcome::RootExited(root_exited(
+                    &format!(
+                        "the console-event proxy's attach to the console of the child (pid {}) did not succeed \
+                         (answer {answer:?}, exit {code}), and the child had exited when cosca looked",
+                        target.pid()
+                    ),
+                    PROXY_CANNOT_REACH_OUTLIVERS,
+                )),
+                Ok(false) => match answer {
+                    ProxyAnswer::TargetHasNoConsole => attach_refused(NO_CONSOLE_CAUSES, NO_CONSOLE_REMEDIES),
+                    _ => attach_refused(ATTACH_DENIED_CAUSE, REMEDIES),
+                },
             }
         }
-        ProxyAnswer::ConsoleIsCallers => not_sent(unsupported(format!(
-            "the child's console is this process's own, so an event sent there would reach this process and \
+        ProxyAnswer::ConsoleIsCallers => not_sent(unsupported(
+            format!(
+                "the child's console is this process's own, so an event sent there would reach this process and \
              everything attached to it as well: nothing was sent. {}",
-            if target.child().console.group {
-                "The child leads a console process group: send it Ctrl+Break with stop::send_ctrl_break_to_group."
-            } else {
-                "Create it with Command::new_process_group(true), and send it Ctrl+Break with \
+                if target.child().console.group {
+                    "The child leads a console process group: send it Ctrl+Break with stop::send_ctrl_break_to_group."
+                } else {
+                    "Create it with Command::new_process_group(true), and send it Ctrl+Break with \
                  stop::send_ctrl_break_to_group."
-            }
-        ))),
-        ProxyAnswer::VersionMismatch | ProxyAnswer::Usage => not_sent(unsupported(format!(
-            "the program started as the console-event proxy ({}) did not accept this cosca's invocation \
+                }
+            ),
+            None,
+        )),
+        ProxyAnswer::VersionMismatch | ProxyAnswer::Usage => not_sent(unsupported(
+            format!(
+                "the program started as the console-event proxy ({}) did not accept this cosca's invocation \
              (answer {answer:?}, exit {code}); this cosca speaks proxy protocol version {VERSION}, so \
              nothing was sent. {SAME_COSCA_PROXY}",
-            exe.display()
-        ))),
-        ProxyAnswer::NoProxyHere => not_sent(unsupported(format!(
-            "the program started as the console-event proxy ({}) has no proxy here (answer {answer:?}, \
+                exe.display()
+            ),
+            None,
+        )),
+        ProxyAnswer::NoProxyHere => not_sent(unsupported(
+            format!(
+                "the program started as the console-event proxy ({}) has no proxy here (answer {answer:?}, \
              exit {code}), so nothing was sent",
-            exe.display()
-        ))),
+                exe.display()
+            ),
+            None,
+        )),
         ProxyAnswer::Unconfirmed => SendOutcome::Sent(Err(Error::Unassessable {
             detail: format!(
                 "the console-event proxy generated the {sent} and did not see its own copy of it (answer \

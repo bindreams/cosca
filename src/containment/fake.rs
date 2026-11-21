@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
+#[cfg(windows)]
+use crate::containment::mechanism::Members;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{nothing_held, Contains, KillLeftOutcome};
@@ -36,6 +38,10 @@ pub(crate) struct FakeContains {
     unobserved: Vec<u32>,
     /// Whether its kill states that its walk was not made.
     unwalked: bool,
+    /// Windows: the members it states it names, and what it states it could not name or list
+    /// ([`Contains::member_ids`]).
+    #[cfg(windows)]
+    members: StatedMembers,
     /// What each [`send_kill`](Contains::send_kill) answers, in order, once; a send past them is the
     /// kill that leaves nothing running.
     kill_answers: Mutex<VecDeque<TreeKillOutcome>>,
@@ -43,6 +49,18 @@ pub(crate) struct FakeContains {
     /// is the signal that went out and found nothing wrong.
     terminate_answers: Mutex<VecDeque<TerminateOutcome>>,
     sends: Sends,
+}
+
+/// The members a [`FakeContains`] states it names, the ones it states it cannot name, and a listing it
+/// states it cannot make.
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct StatedMembers {
+    named: Vec<ProcessId>,
+    /// The detail of each member it could not name.
+    unnamed: Vec<String>,
+    /// The detail of a listing it cannot make.
+    unlistable: Option<String>,
 }
 
 impl FakeContains {
@@ -58,6 +76,8 @@ impl FakeContains {
             #[cfg(unix)]
             unobserved: Vec::new(),
             unwalked: false,
+            #[cfg(windows)]
+            members: StatedMembers::default(),
             kill_answers: Mutex::default(),
             terminate_answers: Mutex::default(),
             sends: sends.clone(),
@@ -119,6 +139,28 @@ impl FakeContains {
     #[cfg_attr(windows, allow(dead_code, reason = "only a Unix row states an unwalked walk"))]
     pub(crate) fn unwalked(mut self) -> FakeContains {
         self.unwalked = true;
+        self
+    }
+
+    /// Windows: a mechanism that states it names `members`.
+    #[cfg(windows)]
+    pub(crate) fn naming(mut self, members: impl IntoIterator<Item = ProcessId>) -> FakeContains {
+        self.members.named = members.into_iter().collect();
+        self
+    }
+
+    /// Windows: a mechanism that states it could not name a member, for `detail`: one more of the members
+    /// it lists.
+    #[cfg(windows)]
+    pub(crate) fn unable_to_name(mut self, detail: &str) -> FakeContains {
+        self.members.unnamed.push(detail.to_owned());
+        self
+    }
+
+    /// Windows: a mechanism that states its listing cannot be made, for `detail`.
+    #[cfg(windows)]
+    pub(crate) fn unable_to_list(mut self, detail: &str) -> FakeContains {
+        self.members.unlistable = Some(detail.to_owned());
         self
     }
 
@@ -191,6 +233,23 @@ impl Contains for FakeContains {
             earlier: Some(how.earlier()),
         });
         (sent, None)
+    }
+
+    /// What it states it names ([`naming`](FakeContains::naming), [`unable_to_name`](FakeContains::unable_to_name),
+    /// [`unable_to_list`](FakeContains::unable_to_list)).
+    #[cfg(windows)]
+    fn member_ids(&self) -> Result<Members, crate::error::Error> {
+        let unassessable = |detail: &String| crate::error::Error::Unassessable {
+            detail: detail.clone(),
+            source: None,
+        };
+        match &self.members.unlistable {
+            Some(detail) => Err(unassessable(detail)),
+            None => Ok(Members {
+                named: self.members.named.clone(),
+                unnamed: self.members.unnamed.iter().map(unassessable).collect(),
+            }),
+        }
     }
 
     /// It has no drain edge.

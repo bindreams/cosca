@@ -436,7 +436,6 @@ fn main() {
     #[cfg(windows)]
     init_helpers();
     // The fixture roles the tests re-run this binary as.
-    #[cfg(unix)]
     test_child::fixture_role::run_if_requested();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();

@@ -384,3 +384,43 @@ fn a_tree_walk_terminate_sends_the_signal_it_is_given() {
 fn an_fd_marker_terminate_sends_the_signal_it_is_given() {
     terminate_sends_the_signal_it_is_given(crate::ContainMode::Strongest, Containment::FdMarker);
 }
+
+/// Windows: a tree lists the members its mechanism names, as the mechanism states them.
+///
+/// Mutant: the tree answers its own list, or another mechanism's, or drops a member that was not named.
+#[cfg(windows)]
+#[skuld::test]
+fn a_tree_lists_the_members_its_mechanism_names() {
+    use crate::containment::Containment;
+    use crate::identity::{Key, ProcessId};
+
+    let members = [
+        ProcessId::from_parts_for_test(11, Key::for_test(1)),
+        ProcessId::from_parts_for_test(12, Key::for_test(2)),
+    ];
+    let (fake, _) = FakeContains::new(Containment::JobObject, false);
+    let tree = Tree::contained(Mechanism::Fake(
+        fake.naming(members).unable_to_name("pid 13 could not be named"),
+    ));
+
+    let listed = tree.member_ids().expect("a stated list");
+    assert_eq!(listed.named, members);
+    assert_eq!(listed.unnamed.len(), 1, "{:?}", listed.unnamed);
+}
+
+/// Windows: a tree that holds no mechanism has no members to list, which the tree calls rule out before an
+/// action runs: asked anyway, it asserts in debug.
+///
+/// Mutant: an uncontained tree answers an empty list.
+#[cfg(all(windows, debug_assertions))]
+#[skuld::test]
+fn listing_the_members_of_a_tree_that_holds_no_mechanism_asserts() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    for tree in [Tree::none(), Tree::delegated()] {
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| _ = tree.member_ids())).is_err(),
+            "member_ids did not assert"
+        );
+    }
+}

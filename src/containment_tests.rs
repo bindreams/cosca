@@ -11,25 +11,30 @@ fn the_default_tree_stop_names_the_platforms_graceful_signal() {
     assert_eq!(stop.sig(), crate::signal::Sig::Graceful(crate::signal::Signal::Term));
 }
 
-/// Windows: a tree stop is the console event its caller sent, named as the sweep's error words it, and
-/// hands back what that send answered. Mutant: the event is always named `CTRL_BREAK`.
+/// Windows: a tree stop is the send its caller made, named as the sweep's error words it, and hands back
+/// what that send answered: a console event's name and `WM_CLOSE` alike. Mutant: the name is always
+/// `CTRL_BREAK`.
 #[cfg(windows)]
 #[skuld::test]
-fn a_tree_stop_carries_the_event_and_the_answer_its_caller_sent() {
+fn a_tree_stop_carries_the_name_and_the_answer_its_caller_sent() {
     use super::SendOutcome;
     use crate::stop::proxy::protocol::CtrlEvent;
 
-    let stop = TreeStop::of_event(CtrlEvent::CtrlBreak, SendOutcome::Sent(Ok(())));
+    let stop = TreeStop::named(CtrlEvent::CtrlBreak.name(), SendOutcome::Sent(Ok(())));
     assert_eq!(stop.name(), "CTRL_BREAK");
     assert_eq!(stop.earlier(), "the CTRL_BREAK");
     assert!(matches!(stop.into_sent(), SendOutcome::Sent(Ok(()))));
 
-    let ctrl_c = TreeStop::of_event(CtrlEvent::CtrlC, SendOutcome::Sent(Ok(())));
+    let ctrl_c = TreeStop::named(CtrlEvent::CtrlC.name(), SendOutcome::Sent(Ok(())));
     assert_eq!(ctrl_c.name(), "CTRL_C");
     assert_eq!(ctrl_c.earlier(), "the CTRL_C");
 
-    let refused = TreeStop::of_event(
-        CtrlEvent::CtrlBreak,
+    let wm_close = TreeStop::named("WM_CLOSE", SendOutcome::Sent(Ok(())));
+    assert_eq!(wm_close.name(), "WM_CLOSE");
+    assert_eq!(wm_close.earlier(), "the WM_CLOSE");
+
+    let refused = TreeStop::named(
+        CtrlEvent::CtrlBreak.name(),
         SendOutcome::NotSent(crate::error::Error::NoConsole {
             detail: "the caller had none".into(),
         }),

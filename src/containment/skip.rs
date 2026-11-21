@@ -165,7 +165,9 @@ pub(crate) enum SendOutcome {
     ///
     /// Unix: the walk found no member, so the children were reparented at the root's exit. Windows: the
     /// proxy names a console by a process of the root, so nothing is addressed to a member that
-    /// outlived it; a root target answers `Ok`, as the direct send answers an exited child.
+    /// outlived it; `WM_CLOSE` asked no window and the root had exited when cosca looked, the members
+    /// the mechanism listed having been asked first. A root target answers `Ok`, as the direct send
+    /// answers an exited child.
     RootExited(Error),
     /// The send went out, or may have. The `Err` is an answer that cannot say it arrived: a tree call
     /// goes on to its grace and sweep with that error as its cooperative error, and on Windows a root
@@ -198,17 +200,17 @@ impl SendOutcome {
 
 /// The cooperative stop a tree route carries out.
 ///
-/// Unix: the signal the route sends to every member it reaches. Windows: the console event the stop
-/// function already sent (`CTRL_BREAK` to the root's console group, or `CTRL_BREAK` or `CTRL_C` through
-/// the proxy), which the route takes with the rest of what it does (the outcome, the tree walk's
-/// listing).
+/// Unix: the signal the route sends to every member it reaches. Windows: the send the stop function
+/// already made, by its name (a console event's: `CTRL_BREAK` to the root's console group, or
+/// `CTRL_BREAK` or `CTRL_C` through the proxy; or `WM_CLOSE` to the windows of the tree's members),
+/// which the route takes with the rest of what it does (the outcome, the tree walk's listing).
 #[derive(Debug)]
 #[cfg_attr(unix, derive(Clone, Copy))]
 pub(crate) struct TreeStop {
     #[cfg(unix)]
     signal: crate::signal::Signal,
     #[cfg(windows)]
-    event: crate::stop::proxy::protocol::CtrlEvent,
+    name: &'static str,
     #[cfg(windows)]
     sent: SendOutcome,
 }
@@ -227,10 +229,10 @@ impl TreeStop {
         TreeStop { signal }
     }
 
-    /// The stop of `event`, whose send came to `sent`.
+    /// The stop named `name`, whose send came to `sent`.
     #[cfg(windows)]
-    pub(crate) fn of_event(event: crate::stop::proxy::protocol::CtrlEvent, sent: SendOutcome) -> TreeStop {
-        TreeStop { event, sent }
+    pub(crate) fn named(name: &'static str, sent: SendOutcome) -> TreeStop {
+        TreeStop { name, sent }
     }
 
     /// What the send the stop function made came to.
@@ -250,12 +252,12 @@ impl TreeStop {
         crate::signal::Sig::Graceful(self.signal)
     }
 
-    /// The stop's name: "SIGTERM", "CTRL_BREAK", "CTRL_C".
+    /// The stop's name: "SIGTERM", "CTRL_BREAK", "CTRL_C", "WM_CLOSE".
     pub(crate) fn name(&self) -> &'static str {
         #[cfg(unix)]
         return self.signal.name();
         #[cfg(windows)]
-        self.event.name()
+        self.name
     }
 
     /// [`name`](Self::name) as a sentence fragment: "the SIGTERM".

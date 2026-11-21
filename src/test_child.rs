@@ -28,8 +28,10 @@ pub(crate) fn parent_handle(end: &crate::pipe::ParentEnd) -> std::os::windows::i
 #[cfg(windows)]
 pub(crate) mod unwaitable;
 
-#[cfg(unix)]
 pub(crate) mod fixture_role;
+
+#[cfg(windows)]
+pub(crate) mod wm_close_gui;
 
 #[cfg(unix)]
 pub(crate) mod blocked_tree_root;

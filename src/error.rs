@@ -688,7 +688,7 @@ pub(crate) fn io_context(context: impl Into<String>, source: std::io::Error) -> 
 /// cause, a list above all, is a layer of the chain, of kind [`Other`](std::io::ErrorKind::Other), so
 /// [`Report`] prints every member: std's `io::Error` skips its payload as a layer, and a list held
 /// as that payload would show its first member only.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn io_context_over(context: impl Into<String>, cause: Error) -> std::io::Error {
     match cause {
         Error::Io(source) => io_context(context, source),
@@ -928,8 +928,8 @@ struct IoContext {
 #[derive(Debug)]
 enum IoContextSource {
     Io(std::io::Error),
-    /// Linux only: [`io_context_over`]'s cause that is no [`Error::Io`].
-    #[cfg(target_os = "linux")]
+    /// Linux and Windows only: [`io_context_over`]'s cause that is no [`Error::Io`].
+    #[cfg(any(target_os = "linux", windows))]
     Cosca(Error),
 }
 
@@ -943,7 +943,7 @@ impl std::error::Error for IoContext {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(match &self.source {
             IoContextSource::Io(source) => source as &(dyn std::error::Error + 'static),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             IoContextSource::Cosca(source) => source,
         })
     }

@@ -46,11 +46,16 @@ impl FixtureRole {
 static ROLES: &[&FixtureRole] = &[
     #[cfg(target_os = "linux")]
     &crate::elevation::shim::owner_helper::ROLE,
+    #[cfg(unix)]
     &super::blocked_tree_root::ROLE,
+    #[cfg(unix)]
     &super::signal_tree::ROOT,
+    #[cfg(unix)]
     &super::signal_tree::LEAF,
     #[cfg(target_os = "linux")]
     &super::zombie_leader_root::ROLE,
+    #[cfg(windows)]
+    &super::wm_close_gui::ROLE,
 ];
 
 /// Plays the role named by argument 1, if any; does not return when it does.

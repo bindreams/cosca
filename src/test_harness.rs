@@ -94,6 +94,11 @@ pub const STRAY_SIGNAL: skuld::Label;
 #[skuld::label]
 pub const CTRL_PROXY: skuld::Label;
 
+/// Selects the `WM_CLOSE` group's tests: those that post `WM_CLOSE` to the top-level windows of a desktop,
+/// and open windows and a console of their own.
+#[skuld::label]
+pub const WM_CLOSE: skuld::Label;
+
 /// Selects the `UNPRIVILEGED` group's tests: those that mean something only when the process holds no
 /// privilege (for one, `RLIMIT_NPROC` does not bind root).
 #[skuld::label]

@@ -120,6 +120,8 @@
 use crate::containment::dispatch::{TreeKillOutcome, Unkilled};
 use crate::containment::drain_edge::DrainEdge;
 use crate::containment::enumerate::Table;
+#[cfg(windows)]
+use crate::containment::mechanism::Members;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{Contains, KillLeftOutcome};
@@ -208,6 +210,23 @@ impl Contains for Walker {
         how: TreeStop,
     ) -> (TerminateOutcome, Option<Listing>) {
         terminate_tree(&*self.kernel, self.root, root, how)
+    }
+
+    /// The root while it runs, then the descendants a walk from its identity finds: none for a root that
+    /// is gone or whose pid names another process. A root that has exited but is held still anchors the
+    /// walk, which finds its descendants, but is no member (it has no windows to ask), so it is left out;
+    /// one whose liveness cannot be read is kept, for the send to report. A candidate the walk could not
+    /// assess is unnamed ([`listed_members`]).
+    #[cfg(windows)]
+    fn member_ids(&self) -> Result<Members, Error> {
+        use crate::identity::Liveness;
+
+        let table = crate::containment::enumerate::process_table(&*self.kernel)?;
+        let Some(walk) = walk_from(&*self.kernel, self.root, &table.parents, Recursive::Yes)? else {
+            return Ok(Members::default());
+        };
+        let root = (self.root.is_alive_with(&*self.kernel) != Liveness::Dead).then_some(self.root);
+        Ok(listed_members(root, walk))
     }
 
     /// No kernel object says "every member has exited".
@@ -337,9 +356,32 @@ impl Walk {
     }
 }
 
+/// The members `Contains::member_ids` gives for a walk: `root` (`None` when it is not one) and the walk's
+/// members, and each candidate the walk could not assess as unnamed, worded for a send ([`not_asked`]).
+#[cfg(windows)]
+fn listed_members(root: Option<ProcessId>, walk: Walk) -> Members {
+    Members {
+        named: root.into_iter().chain(walk.members).collect(),
+        unnamed: walk
+            .unassessed
+            .into_iter()
+            .map(|(pid, why)| not_asked(pid, why))
+            .collect(),
+    }
+}
+
+/// What a send says of the candidate `pid`, which the walk could not read, for `why`: it is not asked.
+#[cfg(windows)]
+fn not_asked(pid: RawPid, why: Error) -> Error {
+    Error::Unassessable {
+        detail: format!("pid {pid} is a candidate member of the tree that could not be read, so it is not asked"),
+        source: Some(Arc::new(why)),
+    }
+}
+
 /// Warn of each candidate in `unassessed` the walk could not read, for a caller with no error to
 /// return for them (`terminate`, the fd marker's sweep). The others report theirs in the error
-/// ([`hard_kill`], `ProcessId::children`), so a member is reported once.
+/// ([`hard_kill`], `ProcessId::children`, `Contains::member_ids`), so a member is reported once.
 #[cfg(unix)]
 pub(crate) fn warn_unassessed(unassessed: &[(RawPid, Error)]) {
     for (pid, why) in unassessed {

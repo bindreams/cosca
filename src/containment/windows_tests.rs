@@ -744,6 +744,79 @@ fn a_snapshot_member_whose_identity_cannot_be_read_is_an_error() {
     );
 }
 
+/// A send that asks each member by itself, over a member whose identity cannot be read (a forced
+/// failure), lists it as unnamed, saying it is not asked: a send kills nothing, so no text says a pid "was
+/// killed". The member's own refusal is the cause.
+///
+/// Mutant: the error is the kill's wording ("pid N was killed, but its exit cannot be observed").
+#[skuld::test]
+fn a_member_a_send_cannot_name_is_not_asked_and_the_error_says_so() {
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    use crate::containment::Contains as _;
+
+    let Some(done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(a_member_a_send_cannot_name_is_not_asked_and_the_error_says_so),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
+    let member = crate::identity::windows_fixture::spawn_query_only_without_console(&done);
+    let pid = member.pid();
+    let job = super::JobHandle::create_empty_for_test();
+    job.assign_for_test(member.handle().0)
+        .expect("assign the restricted member to the job");
+    let _failed = super::fault::force_next_for_thread(super::fault::Step::Identity, ERROR_ACCESS_DENIED.0, pid);
+
+    let listed = job.member_ids().expect("the listing is made");
+    assert!(listed.named.is_empty(), "{listed:?}");
+    let [error] = &listed.unnamed[..] else {
+        panic!("the one member that could not be named: {listed:?}")
+    };
+
+    assert!(
+        matches!(error, crate::error::Error::Unassessable { detail, .. }
+            if *detail == format!("pid {pid} is a member of the job but could not be named, so it is not asked")),
+        "{error:?}"
+    );
+    assert_eq!(
+        crate::error::first_os_code(error),
+        Some(ERROR_ACCESS_DENIED.0 as i32),
+        "the refusal is the cause: {error:?}"
+    );
+}
+
+/// A send words a proved member whose identity could not be read apart from a listed pid whose membership
+/// could not be established, and says of both that it is not asked; a kill words both the same.
+///
+/// Mutants: the send calls the unproved pid "a member of the job"; the kill's wording differs for the two.
+#[skuld::test]
+fn a_gap_is_worded_for_a_send_by_what_is_known_of_its_pid_and_for_a_kill_alike() {
+    use super::Gap;
+    use crate::error::{said, Error};
+
+    let cause = || Error::Io(std::io::Error::from_raw_os_error(5));
+    let detail = |gap: Gap| match gap.for_send() {
+        Error::Unassessable { detail, .. } => detail,
+        other => panic!("{other:?}"),
+    };
+
+    assert_eq!(
+        detail(Gap::Unidentified { pid: 9, cause: cause() }),
+        "pid 9 is a member of the job but could not be named, so it is not asked"
+    );
+    assert_eq!(
+        detail(Gap::Unproved { pid: 9, cause: cause() }),
+        "pid 9 was listed by the job but its membership could not be established, so it is not asked"
+    );
+
+    let killed = |gap: Gap| said(gap.for_kill().why());
+    assert_eq!(
+        killed(Gap::Unidentified { pid: 9, cause: cause() }),
+        killed(Gap::Unproved { pid: 9, cause: cause() })
+    );
+}
+
 /// A member the listing could not name by identity is reported once by a kill's wait: the edge's
 /// confirmation finds the same member in the snapshot, its identity unreadable there too (a forced
 /// failure), and does not report it again.

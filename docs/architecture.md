@@ -86,7 +86,9 @@ What a child's cooperative stop sends is an action it stores, not a rule inside 
 - **A tree send is the mechanism's route.** A prepared send to a tree target hands the containment
   mechanism its stop; the mechanism does not know an action exists. Under `graceful_shutdown_tree` the
   mechanism's outcome is left as a record on the target, which the call goes on from. On Windows no
-  mechanism sends a console event: the prepared send makes it and hands the mechanism its result.
+  mechanism sends a console event or a window message: the prepared send makes it and hands the mechanism
+  its result. A `WM_CLOSE` send, which reaches only the windows it is given, first asks the mechanism for the
+  tree's members (`Contains::member_ids`: a job's listing, a tree walk's walk, a fake's stated table).
 - **The proxy is a role, with one contract.** The console-event proxy is the host program, or the
   `cosca-ctrl-proxy` executable, started with the environment variable `__COSCA_HELPER=ctrl-proxy`. The
   variable, never the program's arguments, says a process is a helper: `cosca::init_helpers()`, first in

@@ -387,7 +387,8 @@ fn a_child_that_has_exited_is_answered_before_the_proxy_is_started() {
 
 /// The same answers for a child that has not exited: the error says what was observed, the answer with
 /// its code and that the child had not exited when cosca looked, and lists the causes it cannot tell
-/// apart. Mutants: the exit is assumed; the code is dropped; the look is not mentioned; `Ok`.
+/// apart. A child that has a console is not offered `stop::send_wm_close`. Mutants: the exit is assumed; the
+/// code is dropped; the look is not mentioned; `Ok`; the shared remedies name `send_wm_close`.
 #[skuld::test]
 fn a_refused_attach_to_a_running_child_is_unsupported() {
     for answer in [ProxyAnswer::AttachDenied, ProxyAnswer::TargetGone] {
@@ -404,6 +405,7 @@ fn a_refused_attach_to_a_running_child_is_unsupported() {
             "the code: {detail}"
         );
         names_in_order(detail, "Child::kill", "Command::graceful_stop");
+        assert!(!detail.contains("send_wm_close"), "{detail}");
         assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, answer);
         kill_release_reap(&child, sock, false);
     }
@@ -411,8 +413,9 @@ fn a_refused_attach_to_a_running_child_is_unsupported() {
 
 /// A child the proxy found no console for, that had not exited: the error says what was observed and
 /// lists as possible causes that the child has none or has not set it up yet, and names `Child::kill`
-/// first and `Command::graceful_stop` second. Mutants: the text of `AttachDenied` is used (the missing
-/// console is not listed as a cause); the remedies swapped or dropped; a cause stated as the conclusion.
+/// first, `stop::send_wm_close` (the action that fits a GUI child) second and `Command::graceful_stop` last.
+/// Mutants: the text of `AttachDenied` is used (the missing console is not listed as a cause); the remedies
+/// swapped or dropped, or `send_wm_close` not named; a cause stated as the conclusion.
 #[skuld::test]
 fn a_target_with_no_console_is_unsupported_and_names_the_remedies() {
     let fixture = Fixture::answering(ProxyAnswer::TargetHasNoConsole.code());
@@ -424,7 +427,8 @@ fn a_target_with_no_console_is_unsupported_and_names_the_remedies() {
     assert!(detail.contains("had not exited when cosca looked"), "{detail}");
     assert!(detail.contains("may have no console"), "{detail}");
     assert!(detail.contains("may not have started running yet"), "{detail}");
-    names_in_order(detail, "Child::kill", "Command::graceful_stop");
+    names_in_order(detail, "Child::kill", "stop::send_wm_close");
+    names_in_order(detail, "stop::send_wm_close", "Command::graceful_stop");
     assert_proxy_answered(child.pid(), CtrlEvent::CtrlC, ProxyAnswer::TargetHasNoConsole);
     kill_release_reap(&child, sock, false);
 }

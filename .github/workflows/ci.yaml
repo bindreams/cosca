@@ -223,6 +223,20 @@ jobs:
           cargo nextest run --locked --features tokio --target ${{ matrix.target }}
           --lib --test ctrl_proxy_bin --no-tests=fail
 
+      # `stop::send_wm_close` posts `WM_CLOSE` to top-level windows of the desktop, and its tests open windows and a
+      # console: the `WM_CLOSE` group, off everywhere else. A CI runner is the sandbox, so this step consents.
+      - name: Run the WM_CLOSE tests (Windows)
+        if: matrix.os == 'windows'
+        timeout-minutes: 10
+        env:
+          COSCA_TEST_WM_CLOSE: "1"
+          COSCA_TEST_WM_CLOSE_CONSENT: "1"
+          SKULD_LABELS: wm_close
+        run: >-
+          ${{ matrix.nextest }} wm-close
+          cargo nextest run --locked --features tokio --target ${{ matrix.target }}
+          --lib --no-tests=fail
+
       # `pty` is an additive feature flag; exercise the feature-gated code paths.
       - name: Build tests (pty feature)
         run: cargo nextest run --locked --no-run --features pty --target ${{ matrix.target }} --profile ci
