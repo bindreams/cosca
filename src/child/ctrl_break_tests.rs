@@ -334,8 +334,8 @@ impl Call {
     /// The call on `child`, with `grace` for a graceful one, which answers the root's status.
     pub(crate) fn run(self, child: &crate::Child, grace: Duration) -> Result<Option<std::process::ExitStatus>, Error> {
         match self {
-            Call::Terminate => child.terminate().map(|()| None),
-            Call::TerminateTree => child.terminate_tree().map(|()| None),
+            Call::Terminate => child.terminate().map(|()| None).map_err(Error::from),
+            Call::TerminateTree => child.terminate_tree().map(|()| None).map_err(Error::from),
             Call::GracefulShutdown => child.graceful_shutdown(grace).map(Some),
             Call::GracefulShutdownTree => child.graceful_shutdown_tree(grace).map(Some),
         }

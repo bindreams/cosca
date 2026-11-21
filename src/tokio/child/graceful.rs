@@ -37,10 +37,15 @@ impl Child {
     /// **What it reaches, what it refuses, and what success proves on Windows** are those of the sync
     /// [`Child::terminate`](crate::Child::terminate).
     ///
-    /// **Every error means nothing was killed, and that nothing was sent, except on Windows through the
-    /// proxy:** an [`Error::Unassessable`](crate::error::Error::Unassessable) and an
+    /// **What a failure says of the send.** The error is a [`StopError`](crate::stop::StopError), as for the
+    /// sync [`Child::terminate`](crate::Child::terminate): the error the action answered, and how its last
+    /// prepared send went ([`outcome`](crate::stop::StopError::outcome)). `Sent` says the send went out, not
+    /// that the child took it.
+    ///
+    /// **Every error means nothing was killed, and that nothing was sent or that a check after the send failed,
+    /// except on Windows through the proxy:** an [`Error::Unassessable`](crate::error::Error::Unassessable) and an
     /// [`Error::MayHaveStarted`](crate::error::Error::MayHaveStarted) from the proxy's start say whether
-    /// it was sent is unknown. On Linux that includes a refused `pidfd_open`, which is `Unsupported` (see
+    /// it was sent is unknown ([`Unknown`](crate::stop::SendOutcome::Unknown)). On Linux that includes a refused `pidfd_open`, which is `Unsupported` (see
     /// [`Error::Unsupported`](crate::error::Error::Unsupported)).
     ///
     /// **Windows, before the child has run.** As for the sync [`Child::terminate`](crate::Child::terminate) and
@@ -71,7 +76,7 @@ impl Child {
     /// # Panics
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
-    pub async fn terminate(&self) -> Result<(), Error> {
+    pub async fn terminate(&self) -> Result<(), crate::stop::StopError> {
         crate::child::graceful::shutdown::terminate(self).await
     }
 

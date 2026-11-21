@@ -119,7 +119,7 @@ async fn async_an_actions_error_is_terminates_error() {
     let (mut child, stdin) = blocker_stopping_by(|_| Box::pin(async { Err(refused()) }), false).await;
     let err = never_blocking(child.terminate()).await.expect_err("the action refused");
     assert!(
-        matches!(&err, Error::Unsupported { detail, .. } if detail == "refused by the test action"),
+        matches!(err.error(), Error::Unsupported { detail, .. } if detail == "refused by the test action"),
         "{err:?}"
     );
     let err = never_blocking(child.graceful_shutdown(Duration::ZERO))
@@ -831,7 +831,7 @@ async fn async_a_child_that_has_exited_is_answered_before_the_proxy_is_started()
                 .await
                 .expect_err("nothing was sent to a tree whose root had exited");
             assert!(
-                matches!(&err, Error::Unassessable { detail, .. } if detail.contains("nothing was sent") && !detail.contains("CTRL_BREAK")),
+                matches!(err.error(), Error::Unassessable { detail, .. } if detail.contains("nothing was sent") && !detail.contains("CTRL_BREAK")),
                 "{err:?}"
             );
             never_blocking(child.graceful_shutdown_tree(Duration::ZERO))

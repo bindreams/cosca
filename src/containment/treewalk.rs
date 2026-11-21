@@ -1530,7 +1530,12 @@ pub(crate) fn terminate_tree(
             {
                 let _ = (kernel, root, owner);
                 let outcome = TerminateOutcome::of(how.into_sent(), Some(earlier));
-                let listing = matches!(outcome, TerminateOutcome::Sent { .. }).then(|| Listing {
+                // The event may have gone out for an `Unknown` too, so the listing is the call's.
+                let listing = matches!(
+                    outcome,
+                    TerminateOutcome::Sent { .. } | TerminateOutcome::Unknown { .. }
+                )
+                .then(|| Listing {
                     members: Vec::new(),
                     complete: true,
                 });

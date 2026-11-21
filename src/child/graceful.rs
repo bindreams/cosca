@@ -8,7 +8,7 @@ use super::Child;
 #[cfg(unix)]
 use crate::containment::{Skip, SkipCall};
 use crate::error::Error;
-use crate::stop::{RootRecord, StopTarget, TreeRecord};
+use crate::stop::{RootRecord, StopError, StopTarget, TreeRecord};
 
 /// What an action's own sends are called when it recorded none: a caller's own action, or one that
 /// failed before it sent.
@@ -78,6 +78,15 @@ impl Child {
     /// its own: the prepared functions of [`stop`](crate::stop) apply the rules below inside
     /// themselves, whoever calls them.
     ///
+    /// **What a failure says of the send.** The error is a [`StopError`](crate::stop::StopError): the
+    /// [`Error`](crate::error::Error) the action answered, and its
+    /// [`outcome`](crate::stop::StopError::outcome), how the action's last prepared send went:
+    /// - [`Sent`](crate::stop::SendOutcome::Sent): the send went out, whatever the error says of what a check after it found;
+    /// - [`NotSent`](crate::stop::SendOutcome::NotSent): nothing was sent, and nothing cosca knows of would change if it were asked again;
+    /// - [`Unknown`](crate::stop::SendOutcome::Unknown): whether it went out cannot be told, as for an action that made no prepared send and failed.
+    ///
+    /// `Sent` says the send went out, not that the child took it: a child that ignores Ctrl+C is `Ok`.
+    ///
     /// What the rest of this documentation says is what the default does. On Unix it is an
     /// identity-bound `SIGTERM` to this process alone, so it cannot race a concurrent reap onto a
     /// recycled pid. On Windows it is `CTRL_BREAK`, sent directly from this process to the child's
@@ -109,11 +118,13 @@ impl Child {
     /// has no such gap: it attaches to the child's own console and answers what it found. Each direct
     /// send also leaves a dead entry in the caller's console process list.
     ///
-    /// **Every error of the default means nothing was killed, and that nothing was sent, except on
-    /// Windows through the proxy:** an [`Error::Unassessable`](crate::error::Error::Unassessable) (the
-    /// proxy ended without a known answer, or sent the event and did not see its own copy) and an
-    /// [`Error::MayHaveStarted`](crate::error::Error::MayHaveStarted) from the proxy's start say whether
-    /// it was sent is unknown. The refusals on Windows, each an
+    /// **Every error of the default means nothing was killed, and, on Unix and on Windows for the direct
+    /// send, that nothing was sent or that a check after the send failed**
+    /// ([`outcome`](crate::stop::StopError::outcome) says which). Through the proxy on Windows an
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) (the proxy ended without a known answer, or
+    /// sent the event and did not see its own copy) and an
+    /// [`Error::MayHaveStarted`](crate::error::Error::MayHaveStarted) from the proxy's start leave
+    /// whether it was sent [`Unknown`](crate::stop::SendOutcome::Unknown). The refusals on Windows, each an
     /// [`Error::Unsupported`](crate::error::Error::Unsupported), are listed by
     /// [`stop::default`](crate::stop::default).
     ///
@@ -134,7 +145,7 @@ impl Child {
     /// # Panics
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
-    pub fn terminate(&self) -> Result<(), Error> {
+    pub fn terminate(&self) -> Result<(), StopError> {
         shutdown::run_ready(shutdown::terminate(&shutdown::BlockingDriver(self)))
     }
 
@@ -148,8 +159,8 @@ impl Child {
         stopped: Result<(), Error>,
     ) -> (Result<(), Error>, String) {
         let earlier = match target.into_root_record() {
-            Some(RootRecord::Sent(name)) => crate::containment::earlier_of(name),
-            Some(RootRecord::Refused(report)) => {
+            Some(RootRecord::Sent(name, _)) => crate::containment::earlier_of(name),
+            Some(RootRecord::NotSent(report)) => {
                 if stopped.is_ok() {
                     log::debug!(
                         "graceful_shutdown({}): the action went on after a refused send: {report}",
@@ -388,7 +399,7 @@ impl Child {
     ) -> SignalTreeCooperativelyOutcome {
         let sent_by_the_action = || Some(STOP_ACTION.to_owned());
         match (target.into_tree_record(), acted) {
-            (Some(TreeRecord::Sent { earlier, walk }), result) => {
+            (Some(TreeRecord::Sent { earlier, walk, .. }), result) => {
                 SignalTreeCooperativelyOutcome::Sent { result, earlier, walk }
             }
             (None, Ok(())) => SignalTreeCooperativelyOutcome::Sent {

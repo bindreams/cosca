@@ -4,6 +4,7 @@
 
 use crate::containment::root::Refusal;
 use crate::error::Error;
+use crate::stop::SendOutcome;
 
 /// What a kill or a terminate skipped because the root's number may not name the root.
 #[derive(Debug)]
@@ -126,6 +127,13 @@ pub(crate) enum TerminateOutcome {
     /// Nothing was sent: the root has exited, so its children were reparented at its exit (Unix: the walk
     /// found no member), or no event can be named to a member that outlived it (Windows).
     RootExited(Error),
+    /// The send may have gone out, and its answer cannot say (Windows: the console-event proxy's): `error` is
+    /// the answer, and a call that goes on to wait and sweep does, as for [`Sent`](Self::Sent).
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only the Windows console-event proxy's answer is unknown")
+    )]
+    Unknown { error: Error, earlier: Option<String> },
     /// Nothing is sent by the root's number, and nothing else names the tree: the call ends now.
     End(Skip),
     /// Linux: the root's number may name another process, but its handle names it exactly: the caller
@@ -149,6 +157,21 @@ impl TerminateOutcome {
             SendAnswer::NotSent(not_sent) => TerminateOutcome::NotSent(not_sent),
             SendAnswer::RootExited(exited) => TerminateOutcome::RootExited(exited),
             SendAnswer::Sent(result) => TerminateOutcome::Sent { result, earlier },
+            SendAnswer::Unknown(error) => TerminateOutcome::Unknown { error, earlier },
+        }
+    }
+
+    /// The outcome as the answer of a send. Not for a skip (`End`, `RootThroughPidfd`, `HoldersOnly`), which
+    /// no send answers: the caller handles those first.
+    pub(crate) fn into_answer(self) -> SendAnswer {
+        match self {
+            TerminateOutcome::Sent { result, .. } => SendAnswer::Sent(result),
+            TerminateOutcome::NotSent(not_sent) => SendAnswer::NotSent(not_sent),
+            TerminateOutcome::RootExited(exited) => SendAnswer::RootExited(exited),
+            TerminateOutcome::Unknown { error, .. } => SendAnswer::Unknown(error),
+            TerminateOutcome::End(_) | TerminateOutcome::RootThroughPidfd(_) | TerminateOutcome::HoldersOnly(_) => {
+                unreachable!("a skip is no send's answer")
+            }
         }
     }
 }
@@ -169,11 +192,18 @@ pub(crate) enum SendAnswer {
     /// the mechanism listed having been asked first. A root target answers `Ok`, as the direct send
     /// answers an exited child.
     RootExited(Error),
-    /// The send went out, or may have. The `Err` is an answer that cannot say it arrived: a tree call
-    /// goes on to its grace and sweep with that error as its cooperative error, and on Windows a root
-    /// target records the send as made. Unix: the `Err` is what the check after the send found
-    /// (`verify`, the marker's sweep).
+    /// The send went out. The `Err` is what a check after it found: a tree call goes on to its grace and
+    /// sweep with that error as its cooperative error. Unix: what `verify` or the marker's sweep found.
     Sent(Result<(), Error>),
+    /// The send may have gone out, and the answer cannot say: the error is that answer. A tree call goes
+    /// on to its grace and sweep with it as its cooperative error, as after [`Sent`](Self::Sent), and a
+    /// root target records the send as made, with an outcome of its own
+    /// ([`SendOutcome::Unknown`]). Only the Windows console-event proxy gives it.
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only the Windows console-event proxy's answer is unknown")
+    )]
+    Unknown(Error),
 }
 
 impl SendAnswer {
@@ -187,12 +217,22 @@ impl SendAnswer {
         }
     }
 
+    /// How the send went, as a stop's own error says it ([`SendOutcome`]).
+    pub(crate) fn outcome(&self) -> SendOutcome {
+        match self {
+            SendAnswer::NotSent(_) | SendAnswer::RootExited(_) => SendOutcome::NotSent,
+            SendAnswer::Sent(_) => SendOutcome::Sent,
+            SendAnswer::Unknown(_) => SendOutcome::Unknown,
+        }
+    }
+
     /// The answer of a tree call that makes this send and nothing else (the Unix group send,
-    /// `terminate_tree`): `Err` when nothing was sent (not sent, or the root had exited), else what the
-    /// send answered. Not for a root target: on Windows it answers an exited root `Ok`.
+    /// `terminate_tree`): `Err` when nothing was sent (not sent, or the root had exited) or the answer is
+    /// an error, else what the send answered. Not for a root target: on Windows it answers an exited root
+    /// `Ok`. The one flattening: `terminate_tree` of a `Child` and of a foreign `Process` both end in it.
     pub(crate) fn into_tree_result(self) -> Result<(), Error> {
         match self {
-            SendAnswer::NotSent(error) | SendAnswer::RootExited(error) => Err(error),
+            SendAnswer::NotSent(error) | SendAnswer::RootExited(error) | SendAnswer::Unknown(error) => Err(error),
             SendAnswer::Sent(result) => result,
         }
     }

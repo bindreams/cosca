@@ -17,7 +17,7 @@ use crate::containment::TreeDrain;
 use crate::error::Error;
 #[cfg(target_os = "macos")]
 use crate::os_process::child::Foreign;
-use crate::stop::{StopTarget, StopWaits, TreeCall};
+use crate::stop::{SendOutcome, StopError, StopTarget, StopWaits, TreeCall};
 
 /// What the four stop calls need of a driver: the stop action's run, and the waits [`shutdown_lone`] and
 /// [`shutdown_tree`] make, beside the root's exit look of [`StopWaits`]. A deadline is a `Duration` from the
@@ -148,16 +148,24 @@ fn graceful_status_of_reap(pid: u32, op: &str, outcome: Result<ChildWaitOutcome,
     }
 }
 
-/// [`Child::terminate`](crate::Child::terminate), for any [`Waits`].
-pub(crate) async fn terminate<W: Waits>(w: &W) -> Result<(), Error> {
-    w.stop(&StopTarget::root(w.child())).await
+/// [`Child::terminate`](crate::Child::terminate), for any [`Waits`]: the action's answer, with how its last
+/// prepared send went when it failed.
+pub(crate) async fn terminate<W: Waits>(w: &W) -> Result<(), StopError> {
+    let target = StopTarget::root(w.child());
+    let acted = w.stop(&target).await;
+    target.into_stop_result(acted)
 }
 
 /// [`Child::terminate_tree`](crate::Child::terminate_tree), for any [`Waits`].
-pub(crate) async fn terminate_tree<W: Waits>(w: &W) -> Result<(), Error> {
-    w.child().require_contained()?;
+pub(crate) async fn terminate_tree<W: Waits>(w: &W) -> Result<(), StopError> {
+    // Before the action runs, so nothing was sent.
+    w.child()
+        .require_contained()
+        .map_err(|refused| StopError::new(refused, SendOutcome::NotSent))?;
     // A separate `terminate_tree` is no call that sweeps: it holds its members for the next kill.
-    w.stop(&StopTarget::tree(w.child(), TreeCall::SignalOnly)).await
+    let target = StopTarget::tree(w.child(), TreeCall::SignalOnly);
+    let acted = w.stop(&target).await;
+    target.into_stop_result(acted)
 }
 
 /// [`terminate`] with what the action said it sent, for the kill after the grace; see

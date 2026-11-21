@@ -37,24 +37,128 @@ fn a_refused_send_replaces_the_record_of_an_earlier_one() {
     let child = child_over(&FakeProcess::new([]));
 
     let root = StopTarget::from(&child);
-    root.note_root_went_out("SIGTEST");
+    root.note_root_sent("SIGTEST", crate::stop::SendOutcome::Sent);
     assert!(matches!(
         &*root.root_record.lock().unwrap(),
-        Some(RootRecord::Sent("SIGTEST"))
+        Some(RootRecord::Sent("SIGTEST", crate::stop::SendOutcome::Sent))
     ));
-    root.note_refused(&refusal());
+    root.note_not_sent(&refusal());
     assert!(
-        matches!(root.into_root_record(), Some(RootRecord::Refused(report)) if report.contains("refused by the test"))
+        matches!(root.into_root_record(), Some(RootRecord::NotSent(report)) if report.contains("refused by the test"))
     );
 
     let tree = StopTarget::tree(&child, TreeCall::SignalOnly);
-    tree.note_tree(TreeRecord::Sent {
-        earlier: None,
-        walk: None,
-    });
-    tree.note_refused(&refusal());
+    tree.note_tree(TreeRecord::bare(crate::stop::SendOutcome::Sent));
+    tree.note_not_sent(&refusal());
     assert!(
         matches!(tree.into_tree_record(), Some(TreeRecord::NotSent(report)) if report.contains("refused by the test"))
+    );
+}
+
+/// What the route of a tree send answered, as the outcome the target records for the call to read back: a send
+/// that went out is `Sent` whatever a check after it found (`Err` included), one that sent nothing is
+/// `NotSent` (an exited root too, though `graceful_shutdown_tree` goes on past it), and one that may have gone
+/// out is `Unknown`; for `terminate_tree`'s answer and for `graceful_shutdown_tree`'s alike. The table states
+/// the route's answers; the routes' own tests say when each is given.
+///
+/// Mutants: a check's error reads the send as not made; an unknown answer reads as `Sent`; an exited root reads
+/// as `Sent` in the shutdown's record (it goes on, which is not a send); either call records nothing.
+#[skuld::test]
+fn a_tree_routes_answer_is_recorded_as_how_the_send_went() {
+    use crate::containment::TerminateOutcome;
+    use crate::error::Error;
+    use crate::stop::SendOutcome::{self, NotSent, Sent, Unknown};
+
+    let error = |detail: &str| Error::Unassessable {
+        detail: detail.to_owned(),
+        source: None,
+    };
+    type Route = fn(Error) -> TerminateOutcome;
+    // The route's answer, the outcome, and whether the shutdown's call goes on past it (`Ok`).
+    let rows: [(&str, Route, SendOutcome, bool); 5] = [
+        (
+            "sent, the check found nothing",
+            |_| TerminateOutcome::Sent {
+                result: Ok(()),
+                earlier: None,
+            },
+            Sent,
+            true,
+        ),
+        (
+            "sent, the check failed",
+            |e| TerminateOutcome::Sent {
+                result: Err(e),
+                earlier: None,
+            },
+            Sent,
+            false,
+        ),
+        ("not sent", TerminateOutcome::NotSent, NotSent, false),
+        ("root exited", TerminateOutcome::RootExited, NotSent, true),
+        (
+            "unknown",
+            |e| TerminateOutcome::Unknown {
+                error: e,
+                earlier: None,
+            },
+            Unknown,
+            false,
+        ),
+    ];
+    let child = child_over(&FakeProcess::new([]));
+    for (what, route, outcome, shutdown_goes_on) in rows {
+        let target = StopTarget::tree(&child, TreeCall::SignalOnly);
+        let answer = target.signal_only_answer(
+            route(error(what)),
+            #[cfg(unix)]
+            crate::signal::Sig::Graceful(crate::signal::Signal::Term),
+        );
+        assert_eq!(
+            answer.is_ok(),
+            what == "sent, the check found nothing",
+            "terminate_tree, {what}"
+        );
+        assert_eq!(
+            target.into_tree_record().map(|r| r.outcome()),
+            Some(outcome),
+            "terminate_tree, {what}"
+        );
+
+        let token = crate::containment::treewalk::WalkToken::new();
+        let target = StopTarget::tree(&child, TreeCall::Shutdown(&token));
+        let answer = target.shutdown_answer(
+            route(error(what)),
+            None,
+            "SIGTEST",
+            #[cfg(unix)]
+            crate::signal::Sig::Graceful(crate::signal::Signal::Term),
+        );
+        assert_eq!(answer.is_ok(), shutdown_goes_on, "graceful_shutdown_tree, {what}");
+        assert_eq!(
+            target.into_tree_record().map(|r| r.outcome()),
+            Some(outcome),
+            "graceful_shutdown_tree, {what}"
+        );
+    }
+}
+
+/// A signal through a root's handle is `Sent` only when it was delivered: a root that was gone, one the handle
+/// could not vouch for, and a refusal are not.
+///
+/// Mutant: any `Ok` answer of the handle reads as `Sent`.
+#[skuld::test]
+fn a_signal_through_a_handle_is_sent_only_when_delivered() {
+    use super::signal_outcome;
+    use crate::signal::Sent;
+    use crate::stop::SendOutcome;
+
+    assert_eq!(signal_outcome(&Ok(Sent::Delivered)), SendOutcome::Sent);
+    assert_eq!(signal_outcome(&Ok(Sent::Gone)), SendOutcome::NotSent);
+    assert_eq!(signal_outcome(&Ok(Sent::Unverified)), SendOutcome::NotSent);
+    assert_eq!(
+        signal_outcome(&Err(crate::error::Error::Io(std::io::Error::other("refused")))),
+        SendOutcome::NotSent
     );
 }
 

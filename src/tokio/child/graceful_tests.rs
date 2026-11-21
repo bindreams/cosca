@@ -725,7 +725,10 @@ async fn windows_async_lone_terminate_keeps_a_pid_independent_refusal_after_a_re
         .terminate()
         .await
         .expect_err("a child that leads no group is refused");
-    assert!(matches!(err, crate::error::Error::Unsupported { .. }), "got {err:?}");
+    assert!(
+        matches!(err.error(), crate::error::Error::Unsupported { .. }),
+        "got {err:?}"
+    );
 }
 
 /// The holders-only escalation of `graceful_shutdown_tree` (a macOS fd marker whose root's number may

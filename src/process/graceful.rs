@@ -235,8 +235,8 @@ impl Process {
         let contained = || Tree::contained(Mechanism::Walk(Walker::new(self.id, Arc::clone(kernel))));
         let (tree, walk) = match sent {
             SendAnswer::NotSent(not_sent) => return Err(not_sent),
-            SendAnswer::Sent(Err(failed)) => {
-                debug_assert!(false, "a walk's send is never `Sent(Err)`: {failed}");
+            SendAnswer::Sent(Err(failed)) | SendAnswer::Unknown(failed) => {
+                debug_assert!(false, "a walk's send is never `Sent(Err)` or unknown: {failed}");
                 return Err(failed);
             }
             SendAnswer::Sent(Ok(())) => {

@@ -364,7 +364,8 @@ fn terminate_of_an_orphaned_root_sends_nothing() {
         .expect_err("a root this process does not pin is not signalled");
 
     fake.assert_peeks_exhausted();
-    assert_refused(&err, "terminate");
+    assert_refused(err.error(), "terminate");
+    assert_eq!(err.outcome(), crate::stop::SendOutcome::NotSent);
     assert_nothing_sent(&sends);
     assert_eq!(warns_since(mark, ""), Vec::<String>::new());
 
@@ -531,7 +532,8 @@ fn terminate_tree_of_an_untrusted_walked_root_sends_nothing() {
             .expect_err("the walk names the tree by the root's number");
 
         fake.assert_peeks_exhausted();
-        assert_tree_refused(&err, "terminate_tree", state);
+        assert_tree_refused(err.error(), "terminate_tree", state);
+        assert_eq!(err.outcome(), crate::stop::SendOutcome::NotSent, "{state:?}");
         assert_nothing_sent(&sends);
         assert_eq!(walks.walked(), Vec::<u32>::new(), "{state:?}");
         assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}");
@@ -566,7 +568,8 @@ fn terminate_tree_of_an_untrusted_group_root_sends_no_killpg() {
             .expect_err("the group is named by the root's number");
 
         fake.assert_peeks_exhausted();
-        assert_tree_refused(&err, "terminate_tree", state);
+        assert_tree_refused(err.error(), "terminate_tree", state);
+        assert_eq!(err.outcome(), crate::stop::SendOutcome::NotSent, "{state:?}");
         assert_nothing_sent(&sends);
         assert_eq!(groups.termed(), Vec::<i32>::new(), "{state:?}");
         assert_eq!(warns_since(mark, ""), Vec::<String>::new(), "{state:?}");
@@ -769,7 +772,7 @@ fn an_uncontained_child_hears_why_it_has_no_tree_not_why_its_root_is_unpinned() 
 
     for (op, result) in [
         ("kill_tree", child.kill_tree()),
-        ("terminate_tree", child.terminate_tree()),
+        ("terminate_tree", child.terminate_tree().map_err(Error::from)),
         (
             "graceful_shutdown_tree",
             child.graceful_shutdown_tree(Duration::ZERO).map(drop),
@@ -817,7 +820,7 @@ fn a_closed_front_gate_outranks_an_unpinned_root() {
 
         let err = match op {
             "kill" => child.kill(),
-            "terminate" => child.terminate(),
+            "terminate" => child.terminate().map_err(Error::from),
             _ => child.kill_tree(),
         }
         .expect_err("the front is not signalled");

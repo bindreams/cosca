@@ -223,14 +223,14 @@ async fn ask<D: StopWaits>(
         Err(e) => return wait_failed(proxy_pid, event, e),
     };
     let Some(code) = status.code() else {
-        return SendAnswer::Sent(Err(Error::Unassessable {
+        return SendAnswer::Unknown(Error::Unassessable {
             detail: format!(
                 "the console-event proxy (pid {proxy_pid}) ended without an exit code ({status}), so whether {} \
                  was sent is unknown",
                 event.name()
             ),
             source: None,
-        }));
+        });
     };
     if code == crate::role::UNKNOWN_HELPER_ROLE {
         // The helper refused the role cosca named: it never played one, so nothing was sent.
@@ -245,7 +245,7 @@ async fn ask<D: StopWaits>(
         ));
     }
     let Some(exit) = ProxyExit::from_code(code) else {
-        return SendAnswer::Sent(Err(Error::Unassessable {
+        return SendAnswer::Unknown(Error::Unassessable {
             detail: format!(
                 "the console-event proxy {} (pid {proxy_pid}) exited with code {}, which is no answer of its \
                  protocol, so whether {} was sent is unknown",
@@ -254,7 +254,7 @@ async fn ask<D: StopWaits>(
                 event.name()
             ),
             source: None,
-        }));
+        });
     };
     #[cfg(test)]
     crate::containment::windows::observe::record_ctrl_send(crate::containment::windows::observe::CtrlSend::Proxy {
@@ -296,7 +296,7 @@ fn exe_unreadable(e: std::io::Error) -> SendAnswer {
 #[cfg(windows)]
 fn start_failed(exe: &Path, e: Error) -> SendAnswer {
     match e {
-        may_have_started @ Error::MayHaveStarted { .. } => SendAnswer::Sent(Err(may_have_started)),
+        may_have_started @ Error::MayHaveStarted { .. } => SendAnswer::Unknown(may_have_started),
         not_started => SendAnswer::NotSent(not_started.in_step(&format!(
             "nothing was sent: the console-event proxy {} could not be started",
             exe.display()
@@ -308,14 +308,14 @@ fn start_failed(exe: &Path, e: Error) -> SendAnswer {
 /// with the failure, which kills it.
 #[cfg(windows)]
 fn wait_failed(proxy_pid: u32, event: CtrlEvent, e: Error) -> SendAnswer {
-    SendAnswer::Sent(Err(Error::Unassessable {
+    SendAnswer::Unknown(Error::Unassessable {
         detail: format!(
             "the wait for the console-event proxy (pid {proxy_pid}) failed, so whether {} was sent is \
              unknown; cosca ended the proxy when the wait failed",
             event.name()
         ),
         source: Some(Arc::new(e)),
-    }))
+    })
 }
 
 /// The error of a proxy that sent nothing because a step failed. See [`send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy) for its text, kind
@@ -417,13 +417,13 @@ async fn result_of<D: StopWaits>(
             ),
             None,
         )),
-        ProxyAnswer::Unconfirmed => SendAnswer::Sent(Err(Error::Unassessable {
+        ProxyAnswer::Unconfirmed => SendAnswer::Unknown(Error::Unassessable {
             detail: format!(
                 "the console-event proxy generated the {sent} and did not see its own copy of it (answer \
                  {answer:?}, exit {code}), so whether the child received it is unknown"
             ),
             source: None,
-        })),
+        }),
     }
 }
 

@@ -139,7 +139,7 @@ fn an_actions_error_is_terminates_error() {
     let (child, stdin) = blocker_stopping_by(|_| Err(refused()), false);
     let err = child.terminate().expect_err("the action refused");
     assert!(
-        matches!(&err, Error::Unsupported { detail, .. } if detail == "refused by the test action"),
+        matches!(err.error(), Error::Unsupported { detail, .. } if detail == "refused by the test action"),
         "{err:?}"
     );
     let err = child
@@ -340,7 +340,13 @@ fn a_prepared_tree_send_keeps_the_front_gate() {
         let err = if shutdown {
             child.graceful_shutdown_tree(Duration::ZERO).expect_err("refused")
         } else {
-            child.terminate_tree().expect_err("refused")
+            let stopped = child.terminate_tree().expect_err("refused");
+            assert_eq!(
+                stopped.outcome(),
+                stop::SendOutcome::NotSent,
+                "the front's gate sent nothing to the tree"
+            );
+            stopped.into()
         };
         let Error::Unsupported { detail, .. } = &err else {
             panic!("shutdown: {shutdown}: {err:?}");
@@ -434,6 +440,106 @@ fn an_action_may_compose_sends_with_a_wait() {
         }
         child.wait().expect("the root had exited, and is reaped once");
     }
+}
+
+// What a failed `terminate` and `terminate_tree` say of the send =====
+
+/// Ends a blocker that an action's send may already have ended.
+fn end_blocker(child: &crate::Child, stdin: crate::PipeWriter) {
+    child.kill_tree().expect("kill_tree");
+    drop(stdin);
+    child.wait().expect("reap");
+}
+
+/// The outcome of a call's error, or `None` for `Ok`.
+fn outcome_of(result: Result<(), stop::StopError>) -> Option<stop::SendOutcome> {
+    result.err().map(|stopped| stopped.outcome())
+}
+
+/// A failed call answers how the action's LAST prepared send went, whatever the action did after it, for a
+/// root target and a tree target alike: an error after a send that went out is `Sent`; one after a refused
+/// send is `NotSent`; one from an action that made no prepared send is `Unknown`; the last of several sends
+/// decides; and an action that returns `Ok` is `Ok` whatever its sends did.
+///
+/// Mutants: the outcome is taken from the action's error and not from the record; the first send decides
+/// and not the last; an action with no send reads as `NotSent` or `Sent`; the tree call writes no record
+/// for a send that went out (it reads as `Unknown`).
+#[skuld::test]
+fn a_failed_call_answers_how_the_actions_last_prepared_send_went() {
+    use stop::SendOutcome::{NotSent, Sent, Unknown};
+
+    type Action = Box<dyn Fn(&StopTarget<'_>) -> Result<(), Error> + Send + Sync>;
+    // Built per use: an action is moved into the command.
+    let rows = || -> [(&str, Action, Option<stop::SendOutcome>); 6] {
+        [
+            (
+                "no prepared send, then an error",
+                Box::new(|_| Err(refused())),
+                Some(Unknown),
+            ),
+            (
+                "a send that went out, then an error",
+                Box::new(|target| {
+                    prepared_send(target)?;
+                    Err(refused())
+                }),
+                Some(Sent),
+            ),
+            (
+                "a send that went out, a refused send, then an error",
+                Box::new(|target| {
+                    prepared_send(target)?;
+                    target.note_not_sent(&refused());
+                    Err(refused())
+                }),
+                Some(NotSent),
+            ),
+            (
+                "a refused send, a send that went out, then an error",
+                Box::new(|target| {
+                    target.note_not_sent(&refused());
+                    prepared_send(target)?;
+                    Err(refused())
+                }),
+                Some(Sent),
+            ),
+            (
+                "a refused send, then Ok",
+                Box::new(|target| {
+                    target.note_not_sent(&refused());
+                    Ok(())
+                }),
+                None,
+            ),
+            ("a send that went out, then Ok", Box::new(prepared_send), None),
+        ]
+    };
+    for tree in [false, true] {
+        for (what, action, expected) in rows() {
+            // Contained, so that on Windows the direct send has a group to address.
+            let (child, stdin) = blocker_stopping_by(action, true);
+            let result = if tree {
+                child.terminate_tree()
+            } else {
+                child.terminate()
+            };
+            assert_eq!(outcome_of(result), expected, "tree: {tree}, {what}");
+            end_blocker(&child, stdin);
+        }
+    }
+}
+
+/// `terminate_tree` on a child that owns no tree fails before the action runs, so nothing was sent: the error
+/// is `Unsupported` and the outcome `NotSent`. Mutant: the refusal reads as `Unknown`.
+#[skuld::test]
+fn terminate_tree_on_an_uncontained_child_sent_nothing() {
+    let (child, stdin) = blocker_stopping_by(|_| panic!("the action must not run"), false);
+    let err = child.terminate_tree().expect_err("no tree to stop");
+    assert!(matches!(err.error(), Error::Unsupported { .. }), "{err:?}");
+    assert_eq!(err.outcome(), stop::SendOutcome::NotSent);
+    child.kill().expect("kill");
+    drop(stdin);
+    child.wait().expect("reap");
 }
 
 // What `graceful_shutdown_tree` goes on from =====
@@ -580,7 +686,7 @@ fn a_call_words_what_the_action_sent_before_its_kill() {
             "a prepared send, then one that was refused",
             Box::new(|target| {
                 prepared_send(target)?;
-                target.note_refused(&refused());
+                target.note_not_sent(&refused());
                 Ok(())
             }),
             "the stop action",
@@ -636,7 +742,7 @@ fn a_tree_call_words_what_the_action_sent_before_its_sweep() {
             "a prepared send, then one that was refused",
             Box::new(|target| {
                 prepared_send(target)?;
-                target.note_refused(&refused());
+                target.note_not_sent(&refused());
                 Ok(())
             }),
             "the stop action",
@@ -1051,7 +1157,7 @@ fn a_waiter_stays_blocked_when_terminate_tree_is_refused_and_gets_the_status_of_
         child.terminate_tree().expect_err("the action refused")
     };
     assert!(
-        matches!(&err, Error::Unsupported { detail, .. } if detail == "refused by the test action"),
+        matches!(err.error(), Error::Unsupported { detail, .. } if detail == "refused by the test action"),
         "{err:?}"
     );
     ctrl_break::assert_no_break_sent();

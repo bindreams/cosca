@@ -1267,8 +1267,9 @@ impl Marker {
             NumberLook::Untrusted(_) => TerminateOutcome::of(holders_only(except), earlier),
             look => match holders_only(None) {
                 SendAnswer::Sent(result) => TerminateOutcome::HoldersOnly(self.skip("signal", root_pid, look, result)),
-                // `terminate_impl` yields no `RootExited`.
+                // `terminate_impl` yields no `RootExited`, and no unknown answer.
                 SendAnswer::NotSent(not_sent) | SendAnswer::RootExited(not_sent) => TerminateOutcome::NotSent(not_sent),
+                SendAnswer::Unknown(_) => unreachable!("only the Windows console-event proxy's answer is unknown"),
             },
         }
     }
@@ -1640,10 +1641,13 @@ impl Marker {
                     (Some(pgid), Sig::Graceful(signal)) => {
                         match crate::containment::unix::term_group_sent(pgid, group_root, signal) {
                             SendAnswer::Sent(checked) => checked,
-                            // `term_group_sent` yields no `RootExited`.
+                            // `term_group_sent` yields no `RootExited`, and no unknown answer.
                             SendAnswer::NotSent(unsent) | SendAnswer::RootExited(unsent) => {
                                 *group_unsent = true;
                                 Err(unsent)
+                            }
+                            SendAnswer::Unknown(_) => {
+                                unreachable!("only the Windows console-event proxy's answer is unknown")
                             }
                         }
                     }

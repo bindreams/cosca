@@ -100,7 +100,7 @@ fn the_proxy_refuses_a_child_on_the_callers_console(#[fixture(ctrl_proxy)] _grou
     });
     assert_in_our_console(child.pid(), "the member");
     let err = child.terminate().expect_err("the child is on our console");
-    let Error::Unsupported { detail, .. } = &err else {
+    let Error::Unsupported { detail, .. } = err.error() else {
         panic!("{err:?}")
     };
     assert!(detail.contains("stop::send_ctrl_break_to_group"), "{detail}");
@@ -114,7 +114,7 @@ fn the_proxy_refuses_a_child_on_the_callers_console(#[fixture(ctrl_proxy)] _grou
 fn a_gui_child_has_no_console_to_attach(#[fixture(ctrl_proxy)] _group: &Group) {
     let (child, sock) = spawn_gui_root(|cmd| stops_through_the_proxy(cmd, CtrlEvent::CtrlBreak));
     let err = child.terminate().expect_err("a GUI child has no console");
-    assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+    assert!(matches!(err.error(), Error::Unsupported { .. }), "{err:?}");
     assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::TargetHasNoConsole);
     kill_release_reap(&child, sock, false);
 }

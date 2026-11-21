@@ -690,7 +690,7 @@ fn run_sync(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     // The cell checks what was sent, not what the call answered.
     _ = match op {
         Op::Kill => child.kill_tree(),
-        Op::Terminate => child.terminate_tree(),
+        Op::Terminate => child.terminate_tree().map_err(crate::error::Error::from),
         Op::GracefulShutdown => child.graceful_shutdown_tree(Duration::ZERO).map(drop),
         Op::Drop => {
             drop(child);
@@ -818,7 +818,7 @@ async fn run_tokio(mechanism: Mechanism, reap: Reap, op: Op) -> Sent {
     let recorders = Recorders::start();
     // The cell checks what was sent, not what the call answered.
     _ = match op {
-        Op::Terminate => child.terminate_tree().await,
+        Op::Terminate => child.terminate_tree().await.map_err(crate::error::Error::from),
         Op::GracefulShutdown => child.graceful_shutdown_tree(Duration::ZERO).await.map(drop),
         Op::Kill | Op::Drop | Op::FinishElevated => unreachable!("{op:?} has no async cell"),
     };

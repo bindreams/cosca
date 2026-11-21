@@ -48,7 +48,15 @@ fn terminate_tree_after_a_foreign_reap_sends_no_signal(#[fixture(stray_signal)] 
         .terminate_tree()
         .expect_err("a group whose root was reaped elsewhere is not assessable");
 
-    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert!(
+        matches!(err.error(), crate::error::Error::Unassessable { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.outcome(),
+        crate::stop::SendOutcome::NotSent,
+        "nothing names the tree, so nothing was sent"
+    );
     assert_eq!(
         recorder.termed(),
         Vec::<i32>::new(),
@@ -130,7 +138,15 @@ fn terminate_tree_of_a_root_its_handle_cannot_read_terms_it_through_its_pidfd_al
         .expect_err("a group whose root nothing can answer for is not assessable");
     fake.assert_peeks_exhausted();
 
-    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert!(
+        matches!(err.error(), crate::error::Error::Unassessable { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.outcome(),
+        crate::stop::SendOutcome::Sent,
+        "the root's SIGTERM went out through its pidfd, though the call's answer is an error"
+    );
     assert_eq!(
         termed.termed(),
         Vec::<i32>::new(),

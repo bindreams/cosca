@@ -1852,7 +1852,15 @@ fn a_chosen_signal_sent_to_a_tree_names_a_group_member_the_caller_may_not_signal
         .terminate_tree()
         .expect_err("the helper refuses the signal, and the tree send says so");
 
-    assert!(matches!(err, crate::error::Error::Containment { .. }), "{err:?}");
+    assert!(
+        matches!(err.error(), crate::error::Error::Containment { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.outcome(),
+        crate::stop::SendOutcome::Sent,
+        "the signal went out, and the check after it found the helper's refusal"
+    );
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
     let said = crate::error::said(&err);
     assert!(said.contains(&format!("pid {helper}: refused the signal")), "{said}");

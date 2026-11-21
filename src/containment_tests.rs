@@ -45,6 +45,46 @@ fn a_tree_stop_carries_the_name_and_the_answer_its_caller_sent() {
     ));
 }
 
+/// A send's answer says how it went as the public outcome, and flattens to the tree call's answer: `Err` for
+/// nothing sent, for an exited root and for an unknown answer, else what the send answered. A terminate
+/// outcome made of an answer gives the same answer back.
+///
+/// Mutants: an unknown answer reads as `Sent`; an exited root reads as `Sent` or `Unknown`; the flattening
+/// of an unknown answer is `Ok`; the terminate outcome loses the unknown answer's difference.
+#[skuld::test]
+fn a_send_answer_says_how_it_went_and_flattens_to_one_tree_answer() {
+    use super::{SendAnswer, TerminateOutcome};
+    use crate::error::Error;
+    use crate::stop::SendOutcome;
+
+    let error = |detail: &str| Error::Unassessable {
+        detail: detail.to_owned(),
+        source: None,
+    };
+    type Make = fn(Error) -> SendAnswer;
+    let rows: [(&str, Make, SendOutcome); 4] = [
+        ("not sent", SendAnswer::NotSent, SendOutcome::NotSent),
+        ("exited", SendAnswer::RootExited, SendOutcome::NotSent),
+        ("checked", |e| SendAnswer::Sent(Err(e)), SendOutcome::Sent),
+        ("unknown", SendAnswer::Unknown, SendOutcome::Unknown),
+    ];
+    for (detail, make, outcome) in rows {
+        let answer = make(error(detail));
+        assert_eq!(answer.outcome(), outcome, "{detail}");
+        let round_trip = TerminateOutcome::of(make(error(detail)), None).into_answer();
+        assert_eq!(round_trip.outcome(), outcome, "{detail}: through a terminate outcome");
+        let flat = answer.into_tree_result();
+        assert!(
+            matches!(&flat, Err(Error::Unassessable { detail: d, .. }) if d == detail),
+            "{detail}: {flat:?}"
+        );
+    }
+    assert_eq!(SendAnswer::Sent(Ok(())).outcome(), SendOutcome::Sent);
+    SendAnswer::Sent(Ok(()))
+        .into_tree_result()
+        .expect("a send that went out and checked");
+}
+
 /// A stop made of a signal carries and names that signal, not the default's.
 #[cfg(unix)]
 #[skuld::test]

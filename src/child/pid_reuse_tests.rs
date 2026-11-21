@@ -201,7 +201,10 @@ fn terminate_tree_after_a_foreign_reap_and_reuse_body() {
         .terminate_tree()
         .expect_err("a group whose root was reaped elsewhere is not assessable");
 
-    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert!(
+        matches!(err.error(), crate::error::Error::Unassessable { .. }),
+        "{err:?}"
+    );
     assert_eq!(
         recorder.termed(),
         Vec::<i32>::new(),

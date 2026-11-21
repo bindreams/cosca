@@ -703,7 +703,13 @@ fn a_failed_password_write_whose_exited_front_cannot_be_reaped_says_it_had_exite
 fn terminate_of_a_live_osascript_is_unkillable_and_sends_nothing() {
     let (child, stdin) = spawn_as(cat(), ElevatedVia::MacosOsascript);
     let pid = child.pid();
-    assert_refused_by(child.terminate(), &format!("pid {pid} is osascript"));
+    let refused = child.terminate();
+    assert_eq!(
+        refused.as_ref().err().map(crate::stop::StopError::outcome),
+        Some(crate::stop::SendOutcome::NotSent),
+        "the refusal sent nothing"
+    );
+    assert_refused_by(refused.map_err(Error::from), &format!("pid {pid} is osascript"));
     assert_ends_unsignalled(&child, stdin);
 }
 
