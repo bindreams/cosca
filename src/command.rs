@@ -703,7 +703,11 @@ impl Command {
     /// the spawn fails with [`Error::Containment`] before the program runs, and never falls back to
     /// a weaker one. `contain_with(ContainMode::BestEffort)` is the request that does. On Windows the
     /// mechanism is a Job Object, which is always offered: a child that cannot be put in it is
-    /// terminated and reaped before it runs, and the error names the Job Object.
+    /// terminated and reaped before it runs, and the error names the Job Object. It is an
+    /// [`Error::Containment`] when the spawn has proved the program never ran, and the source of an
+    /// [`Error::MayHaveStarted`] when it has not (see [`ContainMode::Strongest`]). A spawn made under
+    /// a contained root that marks its descendants is [`Containment::Delegated`](crate::Containment::Delegated)
+    /// whatever the mode, with no container of its own: see [`ContainMode`].
     ///
     /// # Windows: the child's process group
     /// On Windows a contained child also leads a console process group by default, which lets the

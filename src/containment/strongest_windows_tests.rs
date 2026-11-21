@@ -11,6 +11,9 @@ use crate::test_frozen::{InitialThread, Remote};
 use crate::{ContainMode, Containment};
 
 const ERROR_ACCESS_DENIED: u32 = 5;
+/// Distinct from the assignment's code, so a code read from the wrong layer is caught.
+const ERROR_READ_FAULT: u32 = 30;
+const ERROR_INVALID_HANDLE: u32 = 6;
 const BACKENDS: [bool; 2] = [false, true];
 
 /// A windowless command that creates `marker` when it runs: its absence shows the program did not
@@ -154,9 +157,24 @@ fn a_strict_spawn_whose_root_was_resumed_before_the_failed_assignment_may_have_s
             "raw {raw}: {error:?}"
         );
         assert_eq!(error.fate(), Some(ChildFate::Reaped), "raw {raw}: {error:?}");
+        let said = crate::error::said(&error);
         assert!(
-            !crate::error::said(&error).contains("did not run"),
+            !said.contains("so the program did not run"),
             "raw {raw}: the cause claims the program did not run: {error:?}"
+        );
+        // What the proof saw varies (a running root may have started threads); the assignment is the
+        // only failure below.
+        assert!(
+            said.contains("it could not be shown that the program did not run"),
+            "raw {raw}: {said}"
+        );
+        let Error::MayHaveStarted { source, .. } = &error else {
+            unreachable!("matched above")
+        };
+        assert_eq!(
+            source.failures_below().len(),
+            1,
+            "raw {raw}: the failed assignment alone, what the proof saw is in the detail: {said}"
         );
         assert!(
             watch.into_child().is_dead_now(),
@@ -183,7 +201,7 @@ fn a_strict_spawn_whose_root_has_a_second_thread_may_have_started() {
 
         assert!(matches!(error, Error::MayHaveStarted { .. }), "raw {raw}: {error:?}");
         assert!(
-            !crate::error::said(&error).contains("did not run"),
+            !crate::error::said(&error).contains("so the program did not run"),
             "raw {raw}: {error:?}"
         );
         assert!(watch.into_child().is_dead_now(), "raw {raw}: the child was torn down");
@@ -192,34 +210,107 @@ fn a_strict_spawn_whose_root_has_a_second_thread_may_have_started() {
 
 /// A strict spawn whose proof cannot be taken (the read of the root's thread, or of its loader's
 /// state, fails) cannot say the program did not run: it is `MayHaveStarted`, the child is torn down,
-/// and the spawn warns naming why.
+/// and the error says it could not be told whether the program ran, and why, with no logger
+/// installed: its cause holds the failed assignment first, as it does for a proved root, and the
+/// failed read beside it, each with its own OS code.
 ///
-/// Mutant: a failed read is taken as proof that the program did not run.
+/// Mutants: a failed read is taken as proof that the program did not run; the reason is only
+/// logged; the reason is dropped; the read's OS code is lost (folded into text, or replacing the
+/// assignment's as the cause's code); a failed read is worded as an observation that the program may
+/// have run.
 #[skuld::test]
-fn a_strict_spawn_whose_proof_cannot_be_read_may_have_started_and_warns() {
-    crate::log_capture::install();
+fn a_strict_spawn_whose_proof_cannot_be_read_may_have_started_and_says_why() {
     for raw in BACKENDS {
-        for unreadable in [Step::ResumeOpen, Step::LoaderRead] {
+        for (unreadable, call) in [
+            (Step::ResumeOpen, "OpenThread"),
+            (Step::LoaderRead, "the loader's state"),
+        ] {
             let dir = tempfile::tempdir().expect("tempdir");
             let marker = dir.path().join("ran");
             let watch = ChildWatch::arm();
             let _assign = force_next(Step::Assign, ERROR_ACCESS_DENIED);
-            let _unreadable = force_next(unreadable, ERROR_ACCESS_DENIED);
-            let mark = crate::log_capture::mark();
+            let _unreadable = force_next(unreadable, ERROR_READ_FAULT);
 
             let Err(error) = writes_marker(&marker, ContainMode::Strongest, raw).spawn() else {
                 panic!("raw {raw}, {unreadable:?}: a failed Job assignment must fail a strict spawn");
             };
 
             let which = format!("raw {raw}, {unreadable:?}: {error:?}");
-            assert!(matches!(error, Error::MayHaveStarted { .. }), "{which}");
-            assert!(!crate::error::said(&error).contains("did not run"), "{which}");
+            let Error::MayHaveStarted { source, .. } = &error else {
+                panic!("not proved, so MayHaveStarted: {which}");
+            };
+            let said = crate::error::said(&error);
+            assert!(!said.contains("so the program did not run"), "{which}");
+            assert!(
+                said.contains("whether the program ran could not be told"),
+                "the error says so: {which}: {said}"
+            );
+            assert!(
+                said.contains(call),
+                "the error names the read that failed: {which}: {said}"
+            );
+            let [assignment, read] = source.failures_below()[..] else {
+                panic!("the failed assignment and the failed read: {which}");
+            };
+            assert_eq!(
+                crate::error::first_os_code(assignment),
+                Some(ERROR_ACCESS_DENIED as i32),
+                "{which}"
+            );
+            assert_eq!(
+                crate::error::first_os_code(read),
+                Some(ERROR_READ_FAULT as i32),
+                "{which}"
+            );
+            assert_eq!(
+                crate::error::first_os_code(&error),
+                Some(ERROR_ACCESS_DENIED as i32),
+                "the failed assignment stays the source: {which}"
+            );
             assert!(watch.into_child().is_dead_now(), "{which}");
-            let warns = crate::log_capture::warns_since(mark, "may have run");
-            assert_eq!(warns.len(), 1, "{which}: {warns:?}");
-            let os_text = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32).to_string();
-            assert!(warns[0].contains(&os_text), "the warn names why: {which}: {warns:?}");
         }
+    }
+}
+
+/// A strict spawn whose proof cannot be read, and whose undo of the proof's suspend then fails too,
+/// has three failures of the call, in this order: the failed assignment, the failed read and the
+/// failed undo, each with its own OS code, and the assignment's code is still the error's.
+///
+/// Mutants: the undo's failure is dropped; it replaces the read's.
+#[skuld::test]
+fn a_strict_spawn_whose_proof_cannot_be_read_or_undone_has_all_three_failures_in_order() {
+    for raw in BACKENDS {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("ran");
+        let watch = ChildWatch::arm();
+        let _assign = force_next(Step::Assign, ERROR_ACCESS_DENIED);
+        let _read = force_next(Step::LoaderRead, ERROR_READ_FAULT);
+        let _undo = force_next(Step::Resume, ERROR_INVALID_HANDLE);
+
+        let Err(error) = writes_marker(&marker, ContainMode::Strongest, raw).spawn() else {
+            panic!("raw {raw}: a failed Job assignment must fail a strict spawn");
+        };
+
+        let which = format!("raw {raw}: {error:?}");
+        let Error::MayHaveStarted { source, .. } = &error else {
+            panic!("not proved, so MayHaveStarted: {which}");
+        };
+        let [assignment, read, undo] = source.failures_below()[..] else {
+            panic!("the assignment, the read and the undo: {which}");
+        };
+        for (failure, code) in [
+            (assignment, ERROR_ACCESS_DENIED),
+            (read, ERROR_READ_FAULT),
+            (undo, ERROR_INVALID_HANDLE),
+        ] {
+            assert_eq!(crate::error::first_os_code(failure), Some(code as i32), "{which}");
+        }
+        assert_eq!(
+            crate::error::first_os_code(&error),
+            Some(ERROR_ACCESS_DENIED as i32),
+            "the failed assignment stays the error's code: {which}"
+        );
+        assert!(watch.into_child().is_dead_now(), "{which}");
     }
 }
 

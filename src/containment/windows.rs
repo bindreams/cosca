@@ -2531,8 +2531,9 @@ pub(crate) fn resume_initial_threads(
 /// suspended, for the caller to terminate. The failure says the program never ran when
 /// [`prove_not_started`](not_started::prove_not_started) proves it from the process, and then holds the root's initial thread
 /// suspended ([`ProvenRoot`]) so nothing resumes it before the caller's termination. A root that may
-/// have run, or whose state cannot be read, fails as one that may have started, with a `warn` naming
-/// why.
+/// have run, or whose state cannot be read, fails as one that may have started: what the proof saw is
+/// in the error's detail, and the failed assignment stays its source, with a failed read and a failed
+/// undo of the proof's suspend beside it.
 /// Returns `Err` when resume fails — a frozen child is unacceptable; the
 /// child+job are killed and the failure propagates to fail the spawn. The resume failure is its
 /// cause; a failure of the job's kill after it is its cleanup (a teardown failure of the failed
@@ -2543,28 +2544,21 @@ pub(crate) fn attach_job(
 ) -> Result<Option<JobHandle>, crate::containment::dispatch::AttachFailure> {
     let job_result = match assign_held(proc_handle) {
         Err(e) if strict => {
-            let proven = match not_started::prove_not_started(proc_handle) {
-                Ok(proven) => Some(Box::new(proven)),
-                Err(why) => {
-                    log::warn!(
-                        "the child may have run, so its failed Job assignment is not a not-started failure: {why}"
-                    );
-                    None
-                }
-            };
             let detail = "the child could not be put in its Job Object";
-            return Err(crate::containment::dispatch::AttachFailure {
-                cause: crate::error::Error::Containment {
-                    detail: if proven.is_some() {
-                        format!("{detail}, so the program did not run")
-                    } else {
-                        detail.to_owned()
+            let source = crate::error::Error::io_cause(e);
+            return Err(match not_started::prove_not_started(proc_handle) {
+                Ok(proven) => crate::containment::dispatch::AttachFailure {
+                    cause: crate::error::Error::Containment {
+                        detail: format!("{detail}, so the program did not run"),
+                        source: Some(source),
                     },
-                    source: Some(crate::error::Error::io_cause(e)),
+                    cleanup: None,
+                    not_started: true,
+                    proven: Some(Box::new(proven)),
                 },
-                cleanup: None,
-                not_started: proven.is_some(),
-                proven,
+                Err(not_proved) => {
+                    crate::containment::dispatch::AttachFailure::from(not_proved.into_error(detail, source))
+                }
             });
         }
         other => other,

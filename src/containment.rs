@@ -7,7 +7,7 @@
 //! - [`Containment::ProcessGroup`]/[`Containment::Session`] (Unix): `killpg`.
 //! - [`Containment::FdMarker`] (macOS): inherited-fd marker sweep — survives setsid/reparenting.
 //! - [`Containment::TreeWalk`] (all): identity-aware descendant kill at teardown.
-//! - [`Containment::Delegated`]: a nested member — the outermost root tears it down.
+//! - [`Containment::Delegated`]: a nested member — it owns no tree.
 //! - [`Containment::None`]: not contained — lone-process semantics.
 //!
 //! This is NOT a security sandbox: a determined child escapes every mechanism
@@ -96,9 +96,9 @@ pub enum Containment {
     /// tree by the root's identity, so a spawn whose root's identity the OS refuses to report
     /// (see [`Child::id`](crate::Child::id)) fails with that error rather than returning one.
     TreeWalk,
-    /// A nested member of an ancestor's containment group/job: this child joined the
-    /// tree the outermost root owns, so it drives no teardown itself (`can_teardown()`
-    /// is `false`) and its `_tree` ops return `Unsupported`. The root tears the tree down.
+    /// A nested member of an ancestor's containment: the environment carries the mark of a root that
+    /// marks its descendants ([`Nesting::Mark`]), so this child owns no tree, drives no teardown
+    /// itself (`can_teardown()` is `false`) and its `_tree` ops return `Unsupported`.
     ///
     /// It is still independently signallable through its own handle, by its child's stop action
     /// ([`Child::terminate`](crate::Child::terminate)) — owning no tree is not the same as having no
@@ -197,13 +197,18 @@ impl fmt::Display for Containment {
 }
 
 /// The teardown strategy a caller *requests* via `Command::contain_with`.
+///
+/// What a spawn gets is the request's mechanism, except under a contained root that marks its
+/// descendants (see [`Nesting`]): that spawn is [`Containment::Delegated`] whatever the mode. It gets
+/// no container of its own and owns no tree, and [`Child::containment`](crate::Child::containment)
+/// reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ContainMode {
-    /// The strongest kernel container this host offers, or an error: the mechanism is chosen by
-    /// what the host offers, and a failure to set it up fails the spawn with [`Error::Containment`]
-    /// naming the mechanism and the cause, before the program runs. It never falls back to a
-    /// weaker one; [`ContainMode::BestEffort`] does.
+    /// The strongest kernel container this host offers, or an error: the mechanism is chosen by what
+    /// the host offers, and a failure to set it up fails the spawn with [`Error::Containment`] naming
+    /// the mechanism and the cause, before the program runs. It never falls back to a weaker one;
+    /// [`ContainMode::BestEffort`] does. A nested spawn is the exception: see [`Nesting`].
     ///
     /// - **Linux:** a cgroup v2 leaf, when the host offers one: `/proc/self/cgroup` names this
     ///   process's cgroup in the unified hierarchy, and the kernel lets this process use it. The
@@ -222,10 +227,13 @@ pub enum ContainMode {
     ///   installs the marker too, and degrades when it fails.
     /// - **Windows:** a Job Object, always offered. A failure to create the Job or assign the child
     ///   to it fails the spawn: the child, created suspended, is terminated and reaped before it
-    ///   runs, and the error names the Job Object, with the OS error as its source. The spawn
-    ///   answers not started only when it has proved that from the process: its initial thread is
-    ///   still suspended, it has no other thread, and the loader has not initialised it. Otherwise
-    ///   it answers [`Error::MayHaveStarted`].
+    ///   runs, and the error is an [`Error::Containment`] naming the Job Object, with the OS error as
+    ///   its source. The spawn answers not started only when it has proved that from the process: its
+    ///   initial thread is still suspended, it has no other thread, and the loader has not
+    ///   initialised it. Otherwise it answers [`Error::MayHaveStarted`], whose source is an
+    ///   [`Error::Containment`] naming the Job Object. That error's detail says that it could not be
+    ///   shown that the program did not run, and what the proof saw, or that it could not be told;
+    ///   its source is the failed assignment, with a failed read and a failed undo beside it.
     ///
     /// [`Error::Containment`]: crate::error::Error::Containment
     /// [`Error::MayHaveStarted`]: crate::error::Error::MayHaveStarted
@@ -234,7 +242,8 @@ pub enum ContainMode {
     /// A cgroup v2 leaf on Linux, a Job Object on Windows and the inherited-fd marker on macOS,
     /// each falling back (to a process group on Linux and macOS, to [`ContainMode::TreeWalk`] on
     /// Windows) rather than to no containment. A fallback is logged at `warn`, and
-    /// [`Child::containment`](crate::Child::containment) reports what the spawn got.
+    /// [`Child::containment`](crate::Child::containment) reports what the spawn got. A nested spawn is
+    /// the exception: see [`Nesting`].
     ///
     /// - **Linux:** a failed step of setting up the leaf (no cgroup offered, no `cgroup.kill`, the
     ///   leaf's directory, `cgroup.procs` or inotify watch), or a child whose placement write
@@ -294,7 +303,8 @@ pub enum Nesting {
     #[default]
     Mark,
     /// Leave descendants unmarked: a contained child's own contained spawns
-    /// create their own groups (which nest inside this one on Windows).
+    /// create their own groups (which nest inside this one on Windows). Where the host's containment
+    /// does not nest (a process group), this root's teardown does not reach what is in the inner group.
     Opaque,
 }
 

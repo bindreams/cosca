@@ -309,7 +309,9 @@ pub enum Error {
     /// [`Session`](crate::ContainMode::Session) one too) returns it when the mechanism the
     /// host offers cannot be set up (the cgroup leaf, the fd marker, or on Windows the Job Object
     /// the child cannot be assigned to): the program did not run, and `detail` names the
-    /// mechanism. A
+    /// mechanism. On Windows that holds when the spawn has proved from the process that the root never
+    /// ran; otherwise this error is the `source` of an [`Error::MayHaveStarted`], and its `detail`
+    /// says that it could not be shown that the program did not run. A
     /// [`BestEffort`](crate::ContainMode::BestEffort) spawn returns it on Linux too, for a child
     /// that sent no report of its placement in its cgroup leaf and so never ran the program.
     Containment {
@@ -422,6 +424,9 @@ pub enum Error {
     /// - every failure after `exec`, such as an identity read that finds the child gone, a
     ///   containment attach (one that needs the child's identity fails with the error of the read
     ///   the OS refused), or a password write to the elevation backend;
+    /// - on Windows, a strict spawn whose root cannot be put in its Job Object and is not proved never
+    ///   to have run: `source` is an [`Error::Containment`] naming the Job Object, whose own `detail`
+    ///   says what the proof saw (`detail` here is `None`) and whose source is the failed assignment;
     /// - on macOS, a child whose unique-id report was not yet written, or could not be read, when
     ///   the spawn looked.
     ///
