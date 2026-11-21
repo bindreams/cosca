@@ -291,7 +291,9 @@ reap everything are legitimate hosts.
 
 Defaults are safe: a child is killed on drop, and `contain()` picks the strongest mechanism the host
 offers by default, or fails the spawn before the program runs: it never falls back to a weaker one
-(`ContainMode::Strongest`; on Windows a Job Object, always offered). The fallback is the opt-in,
+(`ContainMode::Strongest`; on Windows a Job Object, always offered). A spawn under a contained root
+that marks its descendants (`Nesting::Mark`) gets no container of its own whatever the mode: it is
+`Containment::Delegated`. The fallback is the opt-in,
 `contain_with(ContainMode::BestEffort)`: the strongest that sets up, else the next one down, with
 a `warn` for each fallback. Don't forbid what advanced users legitimately need; document exactly what
 holds when they opt out.

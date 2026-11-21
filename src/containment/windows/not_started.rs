@@ -10,6 +10,7 @@
 //! [`AttachFailure::not_started`]: crate::containment::dispatch::AttachFailure
 
 use std::io;
+use std::sync::Arc;
 
 use windows::Wdk::System::Threading::ProcessBasicInformation;
 use windows::Win32::Foundation::HANDLE;
@@ -17,7 +18,7 @@ use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Threading::{PEB, PROCESS_BASIC_INFORMATION};
 
 use super::{open_for_resume, owner_of, process_pid_of, resume_thread, suspend_thread, thread_entries, ThreadHandle};
-use crate::error::{io_context, nt_io_error, win32_io_error, Report};
+use crate::error::{io_context, nt_io_error, win32_io_error, Error};
 
 /// A root proved not to have started: its initial thread, kept suspended by the suspend the proof
 /// took. Dropping it closes the handle and resumes nothing: the root is ended next, and a resume in
@@ -25,9 +26,52 @@ use crate::error::{io_context, nt_io_error, win32_io_error, Report};
 #[derive(Debug)]
 pub(crate) struct ProvenRoot(#[allow(dead_code, reason = "held for its suspend; closed on drop")] ThreadHandle);
 
+/// Why a root is not proved not to have started, and the failure of the undo the proof ran.
+#[derive(Debug)]
+pub(crate) struct NotProved {
+    pub(crate) reason: Reason,
+    /// The failure of undoing the read's suspend (`ResumeThread`), which leaves the root suspended once
+    /// more than it was found. Another failure of the call, never the cause of `reason`.
+    pub(crate) undo: Option<Arc<Error>>,
+}
+
+/// What stops the proof.
+#[derive(Debug)]
+pub(crate) enum Reason {
+    /// What the proof saw: the root may have run, or its process is not the one to read. The
+    /// words of the error that carries it, not a failure of any call.
+    Observed(String),
+    /// A read the proof needs failed (an [`Error::Unassessable`] naming the call, with the OS error as
+    /// its `source`), so the root's state is not known.
+    Unread(Error),
+}
+
+impl NotProved {
+    /// The spawn's [`Error::Containment`], sourced by the failed assignment. What the proof saw is in its
+    /// detail; a failed read and a failed undo are peers beside the assignment, in that order.
+    pub(crate) fn into_error(self, assignment_detail: &str, assignment: Arc<Error>) -> Error {
+        let (detail, read) = match self.reason {
+            Reason::Observed(saw) => (
+                format!("{assignment_detail}, and it could not be shown that the program did not run: {saw}"),
+                None,
+            ),
+            Reason::Unread(read) => (
+                format!("{assignment_detail}, and whether the program ran could not be told"),
+                Some(Arc::new(read)),
+            ),
+        };
+        Error::Containment {
+            detail,
+            source: Some(assignment),
+        }
+        .with_peers(read.into_iter().chain(self.undo))
+    }
+}
+
 /// Proves that the program of the process at `proc_handle`, created suspended, has not run, or says
-/// why it cannot. `Err` holds the reason: the root may have started, or a read the proof needs
-/// failed, which proves nothing. The proof holds when all of these do:
+/// why it cannot. `Err` is the [`NotProved`]: the root may have run, or its process is not the one to
+/// read (a [`Reason::Observed`]), or a read the proof needs failed, which proves nothing (a
+/// [`Reason::Unread`]). The proof holds when all of these do:
 ///
 /// - the snapshot lists exactly one thread for the pid;
 /// - its suspend count is not 0 (the read suspends it once, the one thing the OS offers, and the
@@ -39,59 +83,81 @@ pub(crate) struct ProvenRoot(#[allow(dead_code, reason = "held for its suspend; 
 ///
 /// `proc_handle` must be a live process handle with `PROCESS_QUERY_LIMITED_INFORMATION` and
 /// `PROCESS_VM_READ`, as `CreateProcess`'s is.
-pub(crate) fn prove_not_started(proc_handle: std::os::windows::io::RawHandle) -> Result<ProvenRoot, String> {
+pub(crate) fn prove_not_started(proc_handle: std::os::windows::io::RawHandle) -> Result<ProvenRoot, NotProved> {
     let process = HANDLE(proc_handle.cast());
-    let read = |what: &str, e: io::Error| format!("{what} failed: {report}", report = Report(&e));
-    let pid = process_pid_of(process).map_err(|e| read("GetProcessId", e))?;
-    let entries = thread_entries().map_err(|e| read("the thread snapshot", e))?;
+    let pid = process_pid_of(process).map_err(|e| read_failed("GetProcessId", e))?;
+    let entries = thread_entries().map_err(|e| read_failed("the thread snapshot", e))?;
     let own: Vec<u32> = entries
         .iter()
         .filter(|e| e.th32OwnerProcessID == pid)
         .map(|e| e.th32ThreadID)
         .collect();
     let [initial] = own[..] else {
-        return Err(format!(
+        return Err(saw(format!(
             "the snapshot lists {} threads for pid {pid}, not one",
             own.len()
-        ));
+        )));
     };
 
     let call = |call: &str, e: windows::core::Error| {
-        read(&format!("{call} for thread {initial} of pid {pid}"), win32_io_error(e))
+        read_failed(&format!("{call} for thread {initial} of pid {pid}"), win32_io_error(e))
     };
     let thread = open_for_resume(initial).map_err(|e| call("OpenThread(suspend/resume)", e))?;
     let owner = owner_of(&thread).map_err(|e| call("GetProcessIdOfThread", e))?;
     if owner != pid {
-        return Err(format!("thread {initial} belongs to pid {owner}, not to pid {pid}"));
+        return Err(saw(format!(
+            "thread {initial} belongs to pid {owner}, not to pid {pid}"
+        )));
     }
     let previous = suspend_thread(&thread).map_err(|e| call("SuspendThread", e))?;
-    let Some(why) = unproved(previous, || loader_started(process)) else {
+    let Some(reason) = unproved(previous, || loader_started(process)) else {
         return Ok(ProvenRoot(thread));
     };
     // Not proved: undo the read's suspend, so a root handed back is left as it was found.
-    match resume_thread(&thread) {
-        Ok(_) => Err(why),
-        Err(e) => Err(format!(
-            "{why}; undoing the read's suspend failed too: {}",
-            call("ResumeThread", e)
-        )),
+    let undo = resume_thread(&thread).err().map(|e| {
+        Error::io_cause(io_context(
+            format!("undoing the read's suspend (ResumeThread for thread {initial} of pid {pid}) failed"),
+            win32_io_error(e),
+        ))
+    });
+    Err(NotProved { reason, undo })
+}
+
+/// A failed read the proof needs: `what` failed with `source`, so the root's state is not known.
+fn read_failed(what: &str, source: io::Error) -> NotProved {
+    NotProved {
+        reason: unread(what, source),
+        undo: None,
+    }
+}
+
+fn unread(what: &str, source: io::Error) -> Reason {
+    Reason::Unread(Error::Unassessable {
+        detail: format!("{what} failed"),
+        source: Some(Error::io_cause(source)),
+    })
+}
+
+/// What the proof saw that shows the root may have run, or that the process is not the one it
+/// should read. Phrased as a whole sentence of the error's detail.
+fn saw(what: String) -> NotProved {
+    NotProved {
+        reason: Reason::Observed(what),
+        undo: None,
     }
 }
 
 /// Why a root whose initial thread had suspend count `previous` before the proof's suspend is not
 /// proved, or `None` when it is: a thread that was running, a loader that ran (`loader` reads it,
 /// and only when the thread was suspended), or a loader state that cannot be read.
-fn unproved(previous: u32, loader: impl FnOnce() -> io::Result<bool>) -> Option<String> {
+fn unproved(previous: u32, loader: impl FnOnce() -> io::Result<bool>) -> Option<Reason> {
     if previous == 0 {
-        return Some("its initial thread was running".to_owned());
+        return Some(Reason::Observed("the child's initial thread was running".to_owned()));
     }
     match loader() {
         Ok(false) => None,
-        Ok(true) => Some("the loader had initialised it".to_owned()),
-        Err(e) => Some(format!(
-            "reading the loader's state failed: {report}",
-            report = Report(&e)
-        )),
+        Ok(true) => Some(Reason::Observed("the loader had initialised the child".to_owned())),
+        Err(e) => Some(unread("reading the loader's state", e)),
     }
 }
 

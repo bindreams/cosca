@@ -3925,7 +3925,7 @@ mod frozen_attach {
         let Error::Containment { detail, .. } = &failure.cause else {
             panic!("got {:?}", failure.cause);
         };
-        assert!(!detail.contains("did not run"), "{detail}");
+        assert!(!detail.contains("so the program did not run"), "{detail}");
         assert_eq!(thread.suspend_count(), 0, "the read's suspend was undone");
     }
 
