@@ -1,4 +1,4 @@
-use super::{SendOutcome, Skip, Why};
+use super::{SendAnswer, Skip, Why};
 use crate::containment::dispatch::TreeKillOutcome;
 use crate::containment::{Refusal, Tree};
 
@@ -899,18 +899,18 @@ fn a_tree_calls_answer_is_the_sends_unless_nothing_was_sent() {
     };
 
     assert_eq!(
-        detail(SendOutcome::NotSent(error("not sent")).into_tree_result()),
+        detail(SendAnswer::NotSent(error("not sent")).into_tree_result()),
         "not sent"
     );
     assert_eq!(
-        detail(SendOutcome::RootExited(error("exited")).into_tree_result()),
+        detail(SendAnswer::RootExited(error("exited")).into_tree_result()),
         "exited"
     );
     assert_eq!(
-        detail(SendOutcome::Sent(Err(error("unverified"))).into_tree_result()),
+        detail(SendAnswer::Sent(Err(error("unverified"))).into_tree_result()),
         "unverified"
     );
-    SendOutcome::Sent(Ok(()))
+    SendAnswer::Sent(Ok(()))
         .into_tree_result()
         .expect("a send that went out and checked");
 }

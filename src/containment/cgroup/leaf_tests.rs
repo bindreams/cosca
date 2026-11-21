@@ -12,9 +12,9 @@ use crate::wait::block_probe::{on_drain_block, on_each_drain_block};
 
 /// What a `terminate` that went out found. A `cgroup.procs` that could not be read, or a walk's
 /// `RootExited`, fails the test.
-fn sent(outcome: crate::containment::SendOutcome) -> Result<(), crate::error::Error> {
+fn sent(outcome: crate::containment::SendAnswer) -> Result<(), crate::error::Error> {
     match outcome {
-        crate::containment::SendOutcome::Sent(found) => found,
+        crate::containment::SendAnswer::Sent(found) => found,
         other => panic!("cgroup.procs is readable: {other:?}"),
     }
 }

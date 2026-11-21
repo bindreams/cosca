@@ -73,7 +73,7 @@ fn assert_refused_sends_are_not_sent() {
     .expect("assign the group leader to a job");
     let broken = TreeStop::named(
         crate::stop::proxy::protocol::CtrlEvent::CtrlBreak.name(),
-        crate::containment::SendOutcome::direct(crate::containment::windows::terminate(leader.id())),
+        crate::containment::SendAnswer::direct(crate::containment::windows::terminate(leader.id())),
     );
     let (outcome, _) = job.send_terminate(leader.id(), None, broken);
     assert!(
@@ -89,7 +89,7 @@ fn assert_refused_sends_are_not_sent() {
         .expect("the live group leader resolves");
     let broken = TreeStop::named(
         crate::stop::proxy::protocol::CtrlEvent::CtrlBreak.name(),
-        crate::containment::SendOutcome::direct(crate::containment::windows::terminate(leader.id())),
+        crate::containment::SendAnswer::direct(crate::containment::windows::terminate(leader.id())),
     );
     let (outcome, _) = crate::containment::treewalk::terminate_tree(&crate::identity::HostKernel, id, None, broken);
     assert!(

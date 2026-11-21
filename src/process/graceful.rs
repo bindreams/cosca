@@ -10,7 +10,7 @@ use super::Process;
 use crate::containment::dispatch::Keeping;
 use crate::containment::mechanism::Mechanism;
 use crate::containment::treewalk::{Listing, WalkToken, Walker};
-use crate::containment::{SendOutcome, Tree};
+use crate::containment::{SendAnswer, Tree};
 use crate::error::Error;
 use crate::identity::SpawnKernel;
 
@@ -189,7 +189,7 @@ impl Process {
 
     /// The `SIGTERM` walk of [`terminate_tree`](Self::terminate_tree), with what it found: the members it
     /// listed, which a graceful shutdown stands on ([`sweep`](Self::sweep)).
-    pub(crate) fn terminate_walk(&self, kernel: &dyn crate::identity::Kernel) -> (SendOutcome, Option<Listing>) {
+    pub(crate) fn terminate_walk(&self, kernel: &dyn crate::identity::Kernel) -> (SendAnswer, Option<Listing>) {
         #[cfg(unix)]
         {
             crate::containment::treewalk::terminate(kernel, self.id, self, crate::containment::TreeStop::default())
@@ -198,7 +198,7 @@ impl Process {
         {
             let _ = (kernel, self.id);
             (
-                SendOutcome::NotSent(Error::Unsupported {
+                SendAnswer::NotSent(Error::Unsupported {
                     op: "foreign tree graceful terminate".into(),
                     platform: "windows",
                     detail: "Windows has no per-process graceful signal, and a foreign process \
@@ -214,7 +214,7 @@ impl Process {
         {
             let _ = (kernel, self.id);
             (
-                SendOutcome::Sent(Ok(())),
+                SendAnswer::Sent(Ok(())),
                 Some(Listing {
                     members: Vec::new(),
                     complete: true,
@@ -234,18 +234,18 @@ impl Process {
         let (sent, listing) = self.terminate_walk(&**kernel);
         let contained = || Tree::contained(Mechanism::Walk(Walker::new(self.id, Arc::clone(kernel))));
         let (tree, walk) = match sent {
-            SendOutcome::NotSent(not_sent) => return Err(not_sent),
-            SendOutcome::Sent(Err(failed)) => {
+            SendAnswer::NotSent(not_sent) => return Err(not_sent),
+            SendAnswer::Sent(Err(failed)) => {
                 debug_assert!(false, "a walk's send is never `Sent(Err)`: {failed}");
                 return Err(failed);
             }
-            SendOutcome::Sent(Ok(())) => {
+            SendAnswer::Sent(Ok(())) => {
                 debug_assert!(listing.is_some(), "a walk that sent returns its listing");
                 let tree = contained();
                 let walk = listing.and_then(|listing| tree.hold_walked(listing, Some(&WalkToken::new())));
                 (tree, walk)
             }
-            SendOutcome::RootExited(exited) => {
+            SendAnswer::RootExited(exited) => {
                 log::debug!(
                     "graceful_shutdown_tree({}): sent no SIGTERM: {report}",
                     self.id.pid(),

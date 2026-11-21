@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::{conclude, root_exited, unsupported, Scope, StopTarget, StopWaits, REMEDIES};
 use crate::containment::mechanism::Members;
-use crate::containment::SendOutcome;
+use crate::containment::SendAnswer;
 use crate::error::{io_context, io_context_over, win32_io_error, Error};
 use crate::identity::{Kernel, ProcessId};
 
@@ -257,15 +257,15 @@ fn warn_all(missed: &[Missed], went_out: bool) {
 
 /// What `folded` is as the send's answer, warning of each window or process that was not posted to or
 /// asked and is not the answer's cause; `None` for [`Fold::NothingAsked`], which the caller answers.
-pub(super) fn answer(folded: Fold) -> Option<SendOutcome> {
+pub(super) fn answer(folded: Fold) -> Option<SendAnswer> {
     match folded {
         Fold::Sent(missed) => {
             warn_all(&missed, true);
-            Some(SendOutcome::Sent(Ok(())))
+            Some(SendAnswer::Sent(Ok(())))
         }
         Fold::Failed { first, others } => {
             warn_all(&others, false);
-            Some(SendOutcome::NotSent(Error::Io(io_context_over(
+            Some(SendAnswer::NotSent(Error::Io(io_context_over(
                 "nothing was sent",
                 first,
             ))))
@@ -274,7 +274,7 @@ pub(super) fn answer(folded: Fold) -> Option<SendOutcome> {
             for refusal in &others {
                 warn_refused(refusal, false);
             }
-            Some(SendOutcome::NotSent(unsupported(
+            Some(SendAnswer::NotSent(unsupported(
                 format!(
                     "every window that was asked refused WM_CLOSE (the first: {}), as a window of higher integrity or \
                      one with a message filter does, so nothing was sent. {REMEDIES}",
@@ -457,8 +457,8 @@ fn after_failed_post(pid: u32, class: &str, error: io::Error) -> Window {
 // The send -----
 
 /// The send, made without waiting: `None` when no window was asked; [`send`] then looks at the root.
-fn attempt(target: &StopTarget<'_>) -> Option<SendOutcome> {
-    let not_sent = |error| Some(SendOutcome::NotSent(error));
+fn attempt(target: &StopTarget<'_>) -> Option<SendAnswer> {
+    let not_sent = |error| Some(SendAnswer::NotSent(error));
     let Some(id) = target.id() else {
         return not_sent(unsupported(format!("{NO_IDENTITY_REASON} {REMEDIES}"), None));
     };
@@ -498,19 +498,19 @@ fn attempt(target: &StopTarget<'_>) -> Option<SendOutcome> {
 }
 
 /// How the send went: [`attempt`], and when no window was asked, one look at the root.
-async fn outcome<D: StopWaits>(driver: &D, target: &StopTarget<'_>) -> SendOutcome {
+async fn outcome<D: StopWaits>(driver: &D, target: &StopTarget<'_>) -> SendAnswer {
     match attempt(target) {
         Some(sent) => sent,
         None => match driver.root_exited(Duration::ZERO).await {
-            Ok(true) => SendOutcome::RootExited(root_exited(
+            Ok(true) => SendAnswer::RootExited(root_exited(
                 &format!(
                     "the child (pid {}) had exited when cosca looked, and no window of it was asked",
                     target.pid()
                 ),
                 "no window of a member of its tree that outlived it was asked",
             )),
-            Ok(false) => SendOutcome::NotSent(no_visible_window(target.covers_tree())),
-            Err(look_failed) => SendOutcome::NotSent(look_failed),
+            Ok(false) => SendAnswer::NotSent(no_visible_window(target.covers_tree())),
+            Err(look_failed) => SendAnswer::NotSent(look_failed),
         },
     }
 }

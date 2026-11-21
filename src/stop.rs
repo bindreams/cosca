@@ -151,7 +151,7 @@ pub(crate) use target::{RootRecord, Scope, TreeCall, TreeRecord};
 pub(crate) use waits::StopWaits;
 
 #[cfg(windows)]
-use crate::containment::SendOutcome;
+use crate::containment::SendAnswer;
 #[cfg(windows)]
 use proxy::protocol::CtrlEvent;
 
@@ -365,7 +365,7 @@ pub fn send_ctrl_break_to_group(target: &StopTarget<'_>) -> Result<(), Error> {
     conclude(
         target,
         CtrlEvent::CtrlBreak.name(),
-        SendOutcome::direct(crate::containment::windows::terminate(child.pid())),
+        SendAnswer::direct(crate::containment::windows::terminate(child.pid())),
     )
 }
 
@@ -413,21 +413,21 @@ fn refuse(target: &StopTarget<'_>, detail: impl Into<String>) -> Error {
 }
 
 /// Windows: a prepared send's end: `sent`, what the send named `name` (`CTRL_BREAK`, `WM_CLOSE`) came to
-/// ([`SendOutcome`] says what each outcome means), left as what the last send did, and, on a tree
+/// ([`SendAnswer`] says what each outcome means), left as what the last send did, and, on a tree
 /// target, handed to the mechanism's route, whose answer is the call's.
 #[cfg(windows)]
-fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendOutcome) -> Result<(), Error> {
+fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendAnswer) -> Result<(), Error> {
     match target.scope() {
         Scope::Root => match sent {
-            SendOutcome::Sent(answer) => {
+            SendAnswer::Sent(answer) => {
                 target.note_root_went_out(name);
                 answer
             }
-            SendOutcome::RootExited(_) => {
+            SendAnswer::RootExited(_) => {
                 target.note_root_went_out(name);
                 Ok(())
             }
-            SendOutcome::NotSent(not_sent) => {
+            SendAnswer::NotSent(not_sent) => {
                 target.note_refused(&not_sent);
                 Err(not_sent)
             }

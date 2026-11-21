@@ -17,31 +17,31 @@ fn the_default_tree_stop_names_the_platforms_graceful_signal() {
 #[cfg(windows)]
 #[skuld::test]
 fn a_tree_stop_carries_the_name_and_the_answer_its_caller_sent() {
-    use super::SendOutcome;
+    use super::SendAnswer;
     use crate::stop::proxy::protocol::CtrlEvent;
 
-    let stop = TreeStop::named(CtrlEvent::CtrlBreak.name(), SendOutcome::Sent(Ok(())));
+    let stop = TreeStop::named(CtrlEvent::CtrlBreak.name(), SendAnswer::Sent(Ok(())));
     assert_eq!(stop.name(), "CTRL_BREAK");
     assert_eq!(stop.earlier(), "the CTRL_BREAK");
-    assert!(matches!(stop.into_sent(), SendOutcome::Sent(Ok(()))));
+    assert!(matches!(stop.into_sent(), SendAnswer::Sent(Ok(()))));
 
-    let ctrl_c = TreeStop::named(CtrlEvent::CtrlC.name(), SendOutcome::Sent(Ok(())));
+    let ctrl_c = TreeStop::named(CtrlEvent::CtrlC.name(), SendAnswer::Sent(Ok(())));
     assert_eq!(ctrl_c.name(), "CTRL_C");
     assert_eq!(ctrl_c.earlier(), "the CTRL_C");
 
-    let wm_close = TreeStop::named("WM_CLOSE", SendOutcome::Sent(Ok(())));
+    let wm_close = TreeStop::named("WM_CLOSE", SendAnswer::Sent(Ok(())));
     assert_eq!(wm_close.name(), "WM_CLOSE");
     assert_eq!(wm_close.earlier(), "the WM_CLOSE");
 
     let refused = TreeStop::named(
         CtrlEvent::CtrlBreak.name(),
-        SendOutcome::NotSent(crate::error::Error::NoConsole {
+        SendAnswer::NotSent(crate::error::Error::NoConsole {
             detail: "the caller had none".into(),
         }),
     );
     assert!(matches!(
         refused.into_sent(),
-        SendOutcome::NotSent(crate::error::Error::NoConsole { .. })
+        SendAnswer::NotSent(crate::error::Error::NoConsole { .. })
     ));
 }
 

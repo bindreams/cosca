@@ -643,7 +643,7 @@ pub(crate) mod fault {
         #[cfg(windows)]
         crate::containment::TreeStop::named(
             crate::stop::proxy::protocol::CtrlEvent::CtrlBreak.name(),
-            crate::containment::SendOutcome::Sent(Ok(())),
+            crate::containment::SendAnswer::Sent(Ok(())),
         )
     }
 

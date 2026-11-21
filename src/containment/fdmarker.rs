@@ -845,7 +845,7 @@ use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::sweep_passes::run_passes;
 use crate::containment::treewalk::{KillOutcome, Listing};
-use crate::containment::{Containment, Root, SendOutcome, Skip, TerminateOutcome, TreeKill, TreeStop, Why};
+use crate::containment::{Containment, Root, SendAnswer, Skip, TerminateOutcome, TreeKill, TreeStop, Why};
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
 use crate::signal::Sig;
@@ -1239,7 +1239,7 @@ impl Marker {
     /// `terminate_tree()` — a blocking API with no timeout — forever. One pass, matching
     /// `term_group`'s own cooperative, best-effort contract; `hard_kill` (`kill_tree`) is the
     /// guaranteed sweep.
-    fn terminate(&self, root: Option<&dyn Root>, how: TreeStop) -> SendOutcome {
+    fn terminate(&self, root: Option<&dyn Root>, how: TreeStop) -> SendAnswer {
         self.terminate_impl(Scope::Full(root), how)
     }
 
@@ -1266,23 +1266,21 @@ impl Marker {
             NumberLook::Trusted => TerminateOutcome::of(self.terminate(root, how), earlier),
             NumberLook::Untrusted(_) => TerminateOutcome::of(holders_only(except), earlier),
             look => match holders_only(None) {
-                SendOutcome::Sent(result) => TerminateOutcome::HoldersOnly(self.skip("signal", root_pid, look, result)),
+                SendAnswer::Sent(result) => TerminateOutcome::HoldersOnly(self.skip("signal", root_pid, look, result)),
                 // `terminate_impl` yields no `RootExited`.
-                SendOutcome::NotSent(not_sent) | SendOutcome::RootExited(not_sent) => {
-                    TerminateOutcome::NotSent(not_sent)
-                }
+                SendAnswer::NotSent(not_sent) | SendAnswer::RootExited(not_sent) => TerminateOutcome::NotSent(not_sent),
             },
         }
     }
 
-    /// One pass of `scope` with the stop `how`'s signal: [`NotSent`](SendOutcome::NotSent) is a signal
+    /// One pass of `scope` with the stop `how`'s signal: [`NotSent`](SendAnswer::NotSent) is a signal
     /// never sent (a read end that no longer names its pipe, or a group that cannot be signalled while
-    /// no other channel sent anything), [`Sent`](SendOutcome::Sent) what the pass found. A group that
+    /// no other channel sent anything), [`Sent`](SendAnswer::Sent) what the pass found. A group that
     /// cannot be signalled is one failed channel: when another channel sent, its failure is among what
-    /// the pass found. Never [`RootExited`](SendOutcome::RootExited): the marker looks at no walk.
-    fn terminate_impl(&self, scope: Scope<'_>, how: TreeStop) -> SendOutcome {
+    /// the pass found. Never [`RootExited`](SendAnswer::RootExited): the marker looks at no walk.
+    fn terminate_impl(&self, scope: Scope<'_>, how: TreeStop) -> SendAnswer {
         if let Err(stale) = self.check_read_end_still_valid() {
-            return SendOutcome::NotSent(stale);
+            return SendAnswer::NotSent(stale);
         }
         // A cooperative signal is not a kill: nothing it reaches is waited for.
         let mut reached = Vec::new();
@@ -1292,8 +1290,8 @@ impl Marker {
         match swept {
             // Nothing was sent: the group's failure and the members that refused or could not be assessed
             // are all `finish_sweep` found.
-            Err(unsent) if state.group_unsent && !state.delivered => SendOutcome::NotSent(unsent),
-            swept => SendOutcome::Sent(swept),
+            Err(unsent) if state.group_unsent && !state.delivered => SendAnswer::NotSent(unsent),
+            swept => SendAnswer::Sent(swept),
         }
     }
 
@@ -1641,9 +1639,9 @@ impl Marker {
                     (Some(pgid), Sig::Kill) => crate::containment::unix::kill_group(pgid, group_root, killed),
                     (Some(pgid), Sig::Graceful(signal)) => {
                         match crate::containment::unix::term_group_sent(pgid, group_root, signal) {
-                            SendOutcome::Sent(checked) => checked,
+                            SendAnswer::Sent(checked) => checked,
                             // `term_group_sent` yields no `RootExited`.
-                            SendOutcome::NotSent(unsent) | SendOutcome::RootExited(unsent) => {
+                            SendAnswer::NotSent(unsent) | SendAnswer::RootExited(unsent) => {
                                 *group_unsent = true;
                                 Err(unsent)
                             }

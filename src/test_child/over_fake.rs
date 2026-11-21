@@ -59,7 +59,7 @@ fn stated_break(target: &crate::StopTarget<'_>) -> Result<(), crate::error::Erro
             call,
             crate::containment::TreeStop::named(
                 crate::stop::proxy::protocol::CtrlEvent::CtrlBreak.name(),
-                crate::containment::SendOutcome::Sent(Ok(())),
+                crate::containment::SendAnswer::Sent(Ok(())),
             ),
         ),
     }

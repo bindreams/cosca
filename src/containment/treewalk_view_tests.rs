@@ -250,7 +250,7 @@ fn terminate_over_an_exited_root_with_an_unreadable_candidate_sends_nothing() {
     );
 
     assert!(
-        matches!(walked, (super::SendOutcome::RootExited(_), None)),
+        matches!(walked, (super::SendAnswer::RootExited(_), None)),
         "nothing is sent"
     );
     release(child);

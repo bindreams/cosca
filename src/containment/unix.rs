@@ -58,7 +58,7 @@ use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::treewalk::Listing;
 use crate::containment::{
-    check_number, Containment, Root, SendOutcome, Skip, TerminateOutcome, TreeKill, TreeStop, Why,
+    check_number, Containment, Root, SendAnswer, Skip, TerminateOutcome, TreeKill, TreeStop, Why,
 };
 use crate::error::{Error, Failures};
 use std::sync::Arc;
@@ -356,12 +356,12 @@ pub(crate) fn term_group(pgid: i32, root: Option<&dyn Root>) -> Result<(), Error
     term_group_sent(pgid, root, crate::signal::Signal::Term).into_tree_result()
 }
 
-/// [`term_group`], saying whether the signal went out: [`NotSent`](SendOutcome::NotSent) is a send that
-/// did not happen, [`Sent`](SendOutcome::Sent) what the check after the send found.
-pub(crate) fn term_group_sent(pgid: i32, root: Option<&dyn Root>, signal: crate::signal::Signal) -> SendOutcome {
+/// [`term_group`], saying whether the signal went out: [`NotSent`](SendAnswer::NotSent) is a send that
+/// did not happen, [`Sent`](SendAnswer::Sent) what the check after the send found.
+pub(crate) fn term_group_sent(pgid: i32, root: Option<&dyn Root>, signal: crate::signal::Signal) -> SendAnswer {
     #[cfg(test)]
     if fault::intercept_term_group(pgid) {
-        return SendOutcome::Sent(Ok(()));
+        return SendAnswer::Sent(Ok(()));
     }
     // A cooperative signal is only probed, never resent: no member is reached by a handle of its own.
     signal_group_sent(pgid, signal.as_nix(), root, &mut Vec::new())
@@ -475,9 +475,9 @@ fn signal_group(
     signal_group_sent(pgid, signal, root, killed).into_tree_result()
 }
 
-/// [`signal_group`], saying whether the signal went out: [`NotSent`](SendOutcome::NotSent) is a send that
+/// [`signal_group`], saying whether the signal went out: [`NotSent`](SendAnswer::NotSent) is a send that
 /// did not happen (an invalid `pgid`, a failed check of the root, a failed `killpg`),
-/// [`Sent`](SendOutcome::Sent) what `verify` found after it. Never [`RootExited`](SendOutcome::RootExited):
+/// [`Sent`](SendAnswer::Sent) what `verify` found after it. Never [`RootExited`](SendAnswer::RootExited):
 /// a group's send looks at no walk.
 ///
 /// **The `pgid` guard lives HERE, before any signal is sent — not only in `group::state`.**
@@ -489,13 +489,13 @@ fn signal_group_sent(
     signal: Signal,
     root: Option<&dyn Root>,
     killed: &mut Vec<crate::identity::ProcessId>,
-) -> SendOutcome {
+) -> SendAnswer {
     // NOT a debug_assert!: an invalid `pgid` reaching this function is a directly and deliberately
     // TESTED, ordinary input-validation outcome, not a "should never happen" internal contract —
     // `kill_group_and_term_group_reject_non_positive_pgid` (this file) calls this path with
     // `0`/`-1`/`i32::MIN` on purpose and asserts a plain `Err`, not a panic.
     if pgid <= 0 {
-        return SendOutcome::NotSent(Error::Unassessable {
+        return SendAnswer::NotSent(Error::Unassessable {
             detail: format!(
                 "process group {pgid} is not a valid group id to signal (0 addresses this \
                  process's own group; negative wraps to a broadcast or double-negation hazard)"
@@ -505,7 +505,7 @@ fn signal_group_sent(
     }
     let sent = match send_to_group(pgid, signal, root) {
         Ok(sent) => sent,
-        Err(unchecked) => return SendOutcome::NotSent(unchecked),
+        Err(unchecked) => return SendAnswer::NotSent(unchecked),
     };
     match sent {
         Ok(()) => {}
@@ -520,13 +520,13 @@ fn signal_group_sent(
             _ = signal_direct(pgid, signal, root);
         }
         Err(e) => {
-            return SendOutcome::NotSent(Error::Containment {
+            return SendAnswer::NotSent(Error::Containment {
                 detail: format!("{signal} could not be sent to process group {pgid}"),
                 source: Some(Error::io_cause(io::Error::from(e))),
             })
         }
     }
-    SendOutcome::Sent(verify(pgid, signal, root, killed))
+    SendAnswer::Sent(verify(pgid, signal, root, killed))
 }
 
 /// The send to the whole group, and the kernel's answer to it. On Linux it goes through the root's

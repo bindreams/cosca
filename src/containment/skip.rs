@@ -144,18 +144,18 @@ pub(crate) enum TerminateOutcome {
 impl TerminateOutcome {
     /// The outcome of a stop's send that went as `sent`, as the tree route takes it. `earlier` names
     /// what a later sweep's error says was sent before it.
-    pub(crate) fn of(sent: SendOutcome, earlier: Option<String>) -> TerminateOutcome {
+    pub(crate) fn of(sent: SendAnswer, earlier: Option<String>) -> TerminateOutcome {
         match sent {
-            SendOutcome::NotSent(not_sent) => TerminateOutcome::NotSent(not_sent),
-            SendOutcome::RootExited(exited) => TerminateOutcome::RootExited(exited),
-            SendOutcome::Sent(result) => TerminateOutcome::Sent { result, earlier },
+            SendAnswer::NotSent(not_sent) => TerminateOutcome::NotSent(not_sent),
+            SendAnswer::RootExited(exited) => TerminateOutcome::RootExited(exited),
+            SendAnswer::Sent(result) => TerminateOutcome::Sent { result, earlier },
         }
     }
 }
 
 /// How a stop's send went: the one statement of what a send hands the call that runs it.
 #[derive(Debug)]
-pub(crate) enum SendOutcome {
+pub(crate) enum SendAnswer {
     /// Nothing was sent, for this reason: a refusal, or a failure before the send was made. A root
     /// target records a refusal, and a tree call ends with the error.
     NotSent(Error),
@@ -176,14 +176,14 @@ pub(crate) enum SendOutcome {
     Sent(Result<(), Error>),
 }
 
-impl SendOutcome {
+impl SendAnswer {
     /// Windows: the outcome of a send whose every error says nothing was sent (the direct `CTRL_BREAK`
     /// to a group).
     #[cfg(windows)]
-    pub(crate) fn direct(sent: Result<(), Error>) -> SendOutcome {
+    pub(crate) fn direct(sent: Result<(), Error>) -> SendAnswer {
         match sent {
-            Ok(()) => SendOutcome::Sent(Ok(())),
-            Err(not_sent) => SendOutcome::NotSent(not_sent),
+            Ok(()) => SendAnswer::Sent(Ok(())),
+            Err(not_sent) => SendAnswer::NotSent(not_sent),
         }
     }
 
@@ -192,8 +192,8 @@ impl SendOutcome {
     /// send answered. Not for a root target: on Windows it answers an exited root `Ok`.
     pub(crate) fn into_tree_result(self) -> Result<(), Error> {
         match self {
-            SendOutcome::NotSent(error) | SendOutcome::RootExited(error) => Err(error),
-            SendOutcome::Sent(result) => result,
+            SendAnswer::NotSent(error) | SendAnswer::RootExited(error) => Err(error),
+            SendAnswer::Sent(result) => result,
         }
     }
 }
@@ -212,7 +212,7 @@ pub(crate) struct TreeStop {
     #[cfg(windows)]
     name: &'static str,
     #[cfg(windows)]
-    sent: SendOutcome,
+    sent: SendAnswer,
 }
 
 #[cfg(unix)]
@@ -231,13 +231,13 @@ impl TreeStop {
 
     /// The stop named `name`, whose send came to `sent`.
     #[cfg(windows)]
-    pub(crate) fn named(name: &'static str, sent: SendOutcome) -> TreeStop {
+    pub(crate) fn named(name: &'static str, sent: SendAnswer) -> TreeStop {
         TreeStop { name, sent }
     }
 
     /// What the send the stop function made came to.
     #[cfg(windows)]
-    pub(crate) fn into_sent(self) -> SendOutcome {
+    pub(crate) fn into_sent(self) -> SendAnswer {
         self.sent
     }
 

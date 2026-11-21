@@ -6,7 +6,7 @@ use std::io;
 use super::{after_failed_post, answer, asked, fold, Class, Fold, Listed, Missed, Unasked, Unposted, Why, Window};
 use crate::child::graceful::shutdown::{run_ready, BlockingDriver};
 use crate::containment::fake::FakeContains;
-use crate::containment::{Containment, SendOutcome};
+use crate::containment::{Containment, SendAnswer};
 use crate::error::{first_os_code, said, Error};
 use crate::os_process::fake::{Answer, FakeProcess};
 use crate::stop::{StopTarget, TreeCall};
@@ -289,7 +289,7 @@ fn a_send_that_went_out_is_sent_ok() {
             class: "Notepad".to_owned(),
             why: Why::Refused
         })])),
-        Some(SendOutcome::Sent(Ok(())))
+        Some(SendAnswer::Sent(Ok(())))
     ));
 }
 
@@ -348,7 +348,7 @@ fn the_cause_of_a_failed_post_says_only_what_happened_to_the_window() {
 /// the answer is `Sent`.
 #[skuld::test]
 fn a_failure_is_an_io_error_that_says_nothing_was_sent_once_above_its_cause() {
-    let Some(SendOutcome::NotSent(answered)) = answer(Fold::Failed {
+    let Some(SendAnswer::NotSent(answered)) = answer(Fold::Failed {
         first: Error::Io(failed_post()),
         others: Vec::new(),
     }) else {
@@ -363,7 +363,7 @@ fn a_failure_is_an_io_error_that_says_nothing_was_sent_once_above_its_cause() {
     );
     assert_eq!(crate::error::first_os_code(&answered), Some(1234));
 
-    let Some(SendOutcome::NotSent(not_asked)) = answer(Fold::Failed {
+    let Some(SendAnswer::NotSent(not_asked)) = answer(Fold::Failed {
         first: unopened(7),
         others: Vec::new(),
     }) else {
@@ -401,7 +401,7 @@ fn a_send_that_went_out_warns_of_what_it_missed_in_the_causes_words() {
         Err(Unasked { cause: unopened(9) }),
     ]));
 
-    assert!(matches!(sent, Some(SendOutcome::Sent(Ok(())))));
+    assert!(matches!(sent, Some(SendAnswer::Sent(Ok(())))));
     let warns = crate::log_capture::warns_since(mark, "");
     assert_eq!(
         warns,
@@ -428,7 +428,7 @@ fn a_send_that_went_out_warns_of_what_it_missed_in_the_causes_words() {
 fn an_answer_that_sent_nothing_warns_of_every_other_miss() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let Some(SendOutcome::NotSent(_)) = answer(fold(vec![refused(4), failed(7, 1234), unasked(5678)])) else {
+    let Some(SendAnswer::NotSent(_)) = answer(fold(vec![refused(4), failed(7, 1234), unasked(5678)])) else {
         panic!("a failure sends nothing")
     };
     let warns = crate::log_capture::warns_since(mark, "");
@@ -444,7 +444,7 @@ fn an_answer_that_sent_nothing_warns_of_every_other_miss() {
     );
 
     let mark = crate::log_capture::mark();
-    let Some(SendOutcome::NotSent(_)) = answer(fold(vec![refused(4), refused(5)])) else {
+    let Some(SendAnswer::NotSent(_)) = answer(fold(vec![refused(4), refused(5)])) else {
         panic!("every window refused")
     };
     assert_eq!(
@@ -460,7 +460,7 @@ fn a_refusal_is_unsupported_with_access_denied_as_its_source() {
     let Fold::Refused { first, others } = fold(vec![refused(4)]) else {
         panic!("a refusal")
     };
-    let Some(SendOutcome::NotSent(refusal)) = answer(Fold::Refused { first, others }) else {
+    let Some(SendAnswer::NotSent(refusal)) = answer(Fold::Refused { first, others }) else {
         panic!("a refusal sends nothing")
     };
     let Error::Unsupported { detail, source, .. } = &refusal else {
@@ -509,7 +509,7 @@ fn no_visible_window_says_what_it_covers_and_names_kill() {
 // No window is listed or posted to: each case is answered before the desktop is read.
 
 /// How the send of a child over a fake root answers, for a tree target (`tree`) or a root target.
-fn sent_over(child: &Child, tree: bool) -> SendOutcome {
+fn sent_over(child: &Child, tree: bool) -> SendAnswer {
     let target = if tree {
         StopTarget::tree(child, TreeCall::SignalOnly)
     } else {
@@ -545,7 +545,7 @@ fn a_child_with_no_identity_is_refused_naming_kill() {
     for tree in [false, true] {
         let mut child = child_over_a_fake_tree(false, fake_tree());
         child.id = None;
-        let SendOutcome::NotSent(error) = sent_over(&child, tree) else {
+        let SendAnswer::NotSent(error) = sent_over(&child, tree) else {
             panic!("a child with no identity sends nothing")
         };
         assert!(matches!(error, Error::Unsupported { .. }), "{error:?}");
@@ -560,7 +560,7 @@ fn a_child_with_no_identity_is_refused_naming_kill() {
 #[skuld::test]
 fn a_listing_that_could_not_be_made_is_the_answer() {
     let child = child_over_a_fake_tree(false, fake_tree().unable_to_list("the fake could not list"));
-    let SendOutcome::NotSent(error) = sent_over(&child, true) else {
+    let SendAnswer::NotSent(error) = sent_over(&child, true) else {
         panic!("a failed listing sends nothing")
     };
     assert_eq!(detail_of(&error), "the fake could not list");
@@ -575,7 +575,7 @@ fn a_listing_that_could_not_be_made_is_the_answer() {
 #[skuld::test]
 fn a_tree_that_names_no_member_is_answered_by_the_look_at_the_root() {
     let exited = child_over_a_fake_tree(true, fake_tree());
-    let SendOutcome::RootExited(error) = sent_over(&exited, true) else {
+    let SendAnswer::RootExited(error) = sent_over(&exited, true) else {
         panic!("a root that exited with no member asked")
     };
     let detail = detail_of(&error);
@@ -586,7 +586,7 @@ fn a_tree_that_names_no_member_is_answered_by_the_look_at_the_root() {
     );
 
     let running = child_over_a_fake_tree(false, fake_tree());
-    let SendOutcome::NotSent(error) = sent_over(&running, true) else {
+    let SendAnswer::NotSent(error) = sent_over(&running, true) else {
         panic!("a running root with no member shows no window")
     };
     assert!(
@@ -611,7 +611,7 @@ fn a_tree_whose_members_could_not_all_be_named_is_a_failure_that_names_the_first
             .unable_to_name("pid 32 could not be named");
         let child = child_over_a_fake_tree(root_exited, fake);
 
-        let SendOutcome::NotSent(error) = sent_over(&child, true) else {
+        let SendAnswer::NotSent(error) = sent_over(&child, true) else {
             panic!("no member could be named, and nothing was sent")
         };
 

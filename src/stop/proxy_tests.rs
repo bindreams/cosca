@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use super::protocol::{exit_text, Cause, CtrlEvent, ProxyAnswer, ProxyArgs, ProxyExit, Step, VERSION};
 use super::{exe_unreadable, failed_step, start_failed, wait_failed, CtrlProxy};
-use crate::containment::SendOutcome;
+use crate::containment::SendAnswer;
 use crate::error::Error;
 use crate::stop::{self, StopTarget};
 use crate::test_child::ctrl_break::{
@@ -1000,10 +1000,10 @@ fn a_start_that_may_have_started_the_proxy_may_have_sent() {
     };
     assert!(matches!(
         start_failed(exe, may_have_started),
-        SendOutcome::Sent(Err(Error::MayHaveStarted { .. }))
+        SendAnswer::Sent(Err(Error::MayHaveStarted { .. }))
     ));
 
-    let SendOutcome::NotSent(Error::Io(io)) = start_failed(
+    let SendAnswer::NotSent(Error::Io(io)) = start_failed(
         exe,
         Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
     ) else {
@@ -1022,7 +1022,7 @@ fn a_start_that_may_have_started_the_proxy_may_have_sent() {
 /// be made to reach. Mutants: the failed wait is a send that was not made; the source is dropped.
 #[skuld::test]
 fn a_failed_wait_for_the_proxy_is_unknown_and_says_the_proxy_was_ended() {
-    let SendOutcome::Sent(Err(Error::Unassessable { detail, source })) = wait_failed(
+    let SendAnswer::Sent(Err(Error::Unassessable { detail, source })) = wait_failed(
         77,
         CtrlEvent::CtrlC,
         Error::Io(std::io::Error::other("the wait was refused")),
@@ -1040,8 +1040,7 @@ fn a_failed_wait_for_the_proxy_is_unknown_and_says_the_proxy_was_ended() {
 /// seam. Mutants: the kind is lost; the failure is a send that may have gone out.
 #[skuld::test]
 fn an_unreadable_host_path_sends_nothing_and_keeps_the_os_error() {
-    let SendOutcome::NotSent(Error::Io(io)) =
-        exe_unreadable(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    let SendAnswer::NotSent(Error::Io(io)) = exe_unreadable(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
     else {
         panic!("nothing was sent")
     };
