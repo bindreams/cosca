@@ -421,15 +421,11 @@ fn a_holders_normal_return_leaves_the_next_holder_alone() {
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
-    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
-    let second = std::thread::spawn({
+    let (second, parked_rx) = crate::wait::block_probe::spawn_signalling_at_block({
         let child = Arc::clone(&child);
         move || {
             let _hook = crate::wait::block_probe::on_condvar_block(move || {
                 _ = blocked_tx.send(());
-            });
-            let _blocking = crate::wait::block_probe::on_blocking(move || {
-                _ = parked_tx.send(());
             });
             child.wait(None)
         }
