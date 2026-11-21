@@ -867,3 +867,211 @@ fn the_default_refuses_a_child_cosca_did_not_create() {
         crate::test_child::ctrl_break::assert_no_break_sent();
     }
 }
+
+// Windows: one handle, a waiter, and the tree calls =====
+//
+// One handle, a thread blocked in `wait()`, and the main thread calling the tree calls. A main-thread call
+// that blocks behind the waiter on the handle's `Condvar` fails by assertion (`not_behind_the_waiter`). No
+// assertion covers a tree wait that never sees the tree drained: it waits out `TREE_DRAINS_WITHIN`.
+
+/// How long a tree whose root was told to exit has to drain: a failure bound for a human, never a proof.
+#[cfg(windows)]
+const TREE_DRAINS_WITHIN: Duration = Duration::from_secs(3600);
+
+/// A hook that fails the test, naming `call`, if this thread's next call blocks on the handle's `Condvar`
+/// (behind another thread's wait). Disarmed when dropped.
+#[cfg(windows)]
+fn not_behind_the_waiter(call: &'static str) -> crate::wait::block_probe::Armed {
+    crate::wait::block_probe::on_condvar_block(move || panic!("{call} waited behind the waiter's wait"))
+}
+
+/// A Job-contained [`ctrl_break`](test_child::ctrl_break) member that stops by `action`, with a thread
+/// blocked in its `wait()`. The member runs while `control` is open, and exits with 0 once it is shut. Dropped
+/// before the test ends (a failed assertion), it ends the member and joins the waiter.
+#[cfg(windows)]
+struct Waited {
+    child: Arc<crate::Child>,
+    control: std::net::TcpStream,
+    waiter: Option<std::thread::JoinHandle<Result<std::process::ExitStatus, Error>>>,
+}
+
+#[cfg(windows)]
+impl Waited {
+    fn start(
+        handler: test_child::ctrl_break::Handler,
+        action: impl Fn(&StopTarget<'_>) -> Result<(), Error> + Send + Sync + 'static,
+    ) -> Waited {
+        let (child, control, _) =
+            test_child::ctrl_break::spawn_member(handler, None, crate::ContainMode::Strongest, |cmd| {
+                cmd.graceful_stop(action);
+            });
+        assert_eq!(child.containment(), crate::Containment::JobObject);
+        test_child::ctrl_break::assert_in_our_console(child.pid(), "the root");
+        let child = Arc::new(child);
+        let waiter = crate::wait::block_probe::spawn_until_blocked({
+            let child = Arc::clone(&child);
+            move || child.wait()
+        });
+        Waited {
+            child,
+            control,
+            waiter: Some(waiter),
+        }
+    }
+
+    /// Ends the member when this thread's next wait blocks (the tree wait's), so the waiter is provably
+    /// already waiting.
+    fn end_at_the_next_block(&self) -> crate::wait::block_probe::Armed {
+        let control = self.control.try_clone().expect("clone the control socket");
+        crate::wait::block_probe::on_blocking(move || control.shutdown(std::net::Shutdown::Both).expect("end the root"))
+    }
+
+    /// Joins the waiter and returns what its `wait()` returned.
+    fn status(mut self) -> std::process::ExitStatus {
+        self.waiter
+            .take()
+            .expect("joined once")
+            .join()
+            .expect("the waiter thread")
+            .expect("the waiter's wait returned the root's status")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Waited {
+    fn drop(&mut self) {
+        _ = self.control.shutdown(std::net::Shutdown::Both);
+        if let Some(waiter) = self.waiter.take() {
+            _ = waiter.join();
+        }
+    }
+}
+
+/// After `AllMembersExited` the root's process object is signalled: every wait on the handle gives exit code
+/// `code`.
+#[cfg(windows)]
+#[track_caller]
+fn assert_every_wait_gives(waited: Waited, code: i32) {
+    let child = Arc::clone(&waited.child);
+    let status = {
+        let _no_wait = not_behind_the_waiter("try_wait");
+        child
+            .try_wait()
+            .expect("a look at the root")
+            .expect("a drained tree's root has exited")
+    };
+    assert_eq!(status.code(), Some(code), "the status of the end: {status:?}");
+    assert_eq!(waited.status(), status, "the waiter's wait");
+    assert_eq!(child.wait().expect("a later wait on the same handle"), status);
+}
+
+/// The action sends the direct `CTRL_BREAK` (no proxy; only the root's group gets it) and the root handles
+/// it and runs on. The tree wait's own block ends the root, so the order is provable: the waiter holds the
+/// root's wait before the root can exit. Every wait then gives code 0, which only that end gives; a kill
+/// gives 1.
+///
+/// Mutants: `terminate_tree` kills the root or ends the waiter's wait (`try_wait` is `Some`, with code 1);
+/// `wait_tree_timeout` answers drained at once (`try_wait` is `None`); a later `wait()` answers another
+/// status; `terminate_tree`, `try_wait` or `wait_tree_timeout` waits behind the waiter (the hook).
+#[cfg(windows)]
+#[skuld::test]
+fn a_waiter_gets_the_roots_status_when_terminate_tree_sends_and_the_tree_drains() {
+    use test_child::ctrl_break::{self, Handler};
+
+    let mut waited = Waited::start(Handler::Ack, prepared_send);
+    let child = Arc::clone(&waited.child);
+
+    {
+        let _no_wait = not_behind_the_waiter("terminate_tree");
+        child.terminate_tree().expect("the send went out");
+    }
+    ctrl_break::assert_break_sent_to(child.pid());
+    ctrl_break::assert_acked(&mut waited.control, "the root");
+    {
+        let _no_wait = not_behind_the_waiter("try_wait");
+        assert_eq!(child.try_wait().expect("one look at the root"), None, "the root runs");
+    }
+
+    let drained = {
+        let _no_wait = not_behind_the_waiter("wait_tree_timeout");
+        let _end = waited.end_at_the_next_block();
+        child.wait_tree_timeout(TREE_DRAINS_WITHIN).expect("the tree wait")
+    };
+    assert_eq!(drained, crate::containment::TreeDrain::AllMembersExited);
+    assert_every_wait_gives(waited, 0);
+}
+
+/// [`a_waiter_gets_the_roots_status_when_terminate_tree_sends_and_the_tree_drains`] for a root with no
+/// handler, which the `CTRL_BREAK` ends itself: the waiter gets the break's exit code,
+/// `STATUS_CONTROL_C_EXIT`, which a kill (1) does not give. Whether the break ends the root before the tree
+/// wait blocks is not provable, so the answers are those of every order.
+///
+/// Caught for certain: a `terminate_tree` that kills with no send (`assert_break_sent_to`), a status other
+/// than the break's, and a call that waits behind the waiter (the hook). A `terminate_tree` that sends the break and then kills is caught
+/// only if the kill lands first; that mutant belongs to the Ack-handler test above, where only a kill can
+/// give 1.
+#[cfg(windows)]
+#[skuld::test]
+fn a_waiter_gets_the_breaks_status_when_the_send_ends_the_root() {
+    use test_child::ctrl_break::{self, Handler, STATUS_CONTROL_C_EXIT};
+
+    let waited = Waited::start(Handler::Default, prepared_send);
+    let child = Arc::clone(&waited.child);
+
+    {
+        let _no_wait = not_behind_the_waiter("terminate_tree");
+        child.terminate_tree().expect("the send went out");
+    }
+    ctrl_break::assert_break_sent_to(child.pid());
+    let drained = {
+        let _no_wait = not_behind_the_waiter("wait_tree_timeout");
+        child.wait_tree_timeout(TREE_DRAINS_WITHIN).expect("the tree wait")
+    };
+    assert_eq!(drained, crate::containment::TreeDrain::AllMembersExited);
+    assert_every_wait_gives(waited, STATUS_CONTROL_C_EXIT);
+}
+
+/// `terminate_tree` whose action refuses and sends nothing, with a waiter blocked on the same handle: the
+/// waiter stays blocked, and once the root is ended during the tree wait every wait gives its exit code 0 (a
+/// kill gives 1).
+///
+/// Mutants: `terminate_tree` kills the root, or ends the waiter's wait, when the action refuses
+/// (`try_wait` is `Some`); `wait_tree_timeout` answers drained while the member runs (the zero look);
+/// a call waits behind the waiter (the hook); a later `wait()` answers another status.
+#[cfg(windows)]
+#[skuld::test]
+fn a_waiter_stays_blocked_when_terminate_tree_is_refused_and_gets_the_status_of_the_end() {
+    use test_child::ctrl_break::{self, Handler};
+
+    let waited = Waited::start(Handler::Ack, |_| Err(refused()));
+    let child = Arc::clone(&waited.child);
+
+    let err = {
+        let _no_wait = not_behind_the_waiter("terminate_tree");
+        child.terminate_tree().expect_err("the action refused")
+    };
+    assert!(
+        matches!(&err, Error::Unsupported { detail, .. } if detail == "refused by the test action"),
+        "{err:?}"
+    );
+    ctrl_break::assert_no_break_sent();
+    {
+        let _no_wait = not_behind_the_waiter("try_wait");
+        assert_eq!(child.try_wait().expect("one look at the root"), None, "the root runs");
+    }
+    {
+        let _no_wait = not_behind_the_waiter("wait_tree_timeout(ZERO)");
+        assert_eq!(
+            child.wait_tree_timeout(Duration::ZERO).expect("one look at the tree"),
+            crate::containment::TreeDrain::MembersRemain
+        );
+    }
+
+    let drained = {
+        let _no_wait = not_behind_the_waiter("wait_tree_timeout");
+        let _end = waited.end_at_the_next_block();
+        child.wait_tree_timeout(TREE_DRAINS_WITHIN).expect("the tree wait")
+    };
+    assert_eq!(drained, crate::containment::TreeDrain::AllMembersExited);
+    assert_every_wait_gives(waited, 0);
+}

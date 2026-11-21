@@ -750,6 +750,35 @@ pub(crate) mod block_probe {
         Armed(Disarm::Block(id), PhantomData)
     }
 
+    /// Runs `body` on a new thread with [`on_blocking`] armed first. The receiver gets a message just before
+    /// the thread's first wait, with its locks released, and is disconnected if the thread ends without
+    /// blocking. `body` may arm more hooks.
+    pub(crate) fn spawn_signalling_at_block<T: Send + 'static>(
+        body: impl FnOnce() -> T + Send + 'static,
+    ) -> (std::thread::JoinHandle<T>, std::sync::mpsc::Receiver<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _blocking = on_blocking(move || _ = reached_tx.send(()));
+            body()
+        });
+        (thread, reached_rx)
+    }
+
+    /// [`spawn_signalling_at_block`], returning once the thread has reached its wait. A thread that ends
+    /// first resumes its panic here, or, if `body` returned, fails with a message saying so.
+    pub(crate) fn spawn_until_blocked<T: Send + 'static>(
+        body: impl FnOnce() -> T + Send + 'static,
+    ) -> std::thread::JoinHandle<T> {
+        let (thread, reached) = spawn_signalling_at_block(body);
+        if reached.recv().is_err() {
+            match thread.join() {
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(_) => panic!("the thread's body returned without blocking"),
+            }
+        }
+        thread
+    }
+
     /// Run `hook` once, at the next block of this thread that `keep` accepts.
     fn once_at(keep: fn(&Block<'_>) -> bool, hook: impl FnOnce(&Block<'_>) + 'static) -> Armed {
         let mut hook = Some(hook);

@@ -248,15 +248,8 @@ pub(super) fn park_holder<T: Send + 'static>(
         fake.holds_its_waits(),
         "park_holder: the fake must be built held_until_woken(), or its wait is over and the holder runs on"
     );
-    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let owned = Arc::clone(owned);
-    let thread = std::thread::spawn(move || {
-        let _blocking = crate::wait::block_probe::on_blocking(move || {
-            _ = reached_tx.send(());
-        });
-        body(&owned)
-    });
-    reached_rx.recv().expect("the holder must reach its wait");
+    let thread = crate::wait::block_probe::spawn_until_blocked(move || body(&owned));
     ParkedHolder {
         thread,
         fake: fake.clone(),
