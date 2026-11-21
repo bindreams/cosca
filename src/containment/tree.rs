@@ -45,6 +45,17 @@ enum Holder {
     Contained(Mechanism),
 }
 
+/// The error of an operation on a tree that holds no actionable mechanism, which the tree calls rule out
+/// before it: an internal invariant.
+fn non_actionable(op: &str) -> Error {
+    Error::Unsupported {
+        op: format!("{op} on a non-actionable mechanism"),
+        platform: std::env::consts::OS,
+        detail: format!("internal invariant: a non-actionable mechanism reached {op}"),
+        source: None,
+    }
+}
+
 impl Tree {
     /// An uncontained tree, never settled.
     pub(crate) fn none() -> Tree {
@@ -213,19 +224,30 @@ impl Tree {
         match &self.holder {
             Holder::None | Holder::Delegated => {
                 debug_assert!(false, "Tree::terminate on a tree that is not contained");
-                let not_sent = TerminateOutcome::NotSent(Error::Unsupported {
-                    op: "terminate on a non-actionable mechanism".into(),
-                    platform: std::env::consts::OS,
-                    detail: "internal invariant: a non-actionable mechanism reached terminate".into(),
-                    source: None,
-                });
-                (not_sent, None)
+                (TerminateOutcome::NotSent(non_actionable("terminate")), None)
             }
             Holder::Contained(mechanism) => {
                 debug_assert!(!self.released, "a send on a released tree");
                 let (outcome, listing) = mechanism.send_terminate(pid, root, how);
                 let walk = listing.and_then(|listing| self.hold_walked(listing, call));
                 (outcome, walk)
+            }
+        }
+    }
+
+    /// Windows: the members of the tree, as its mechanism names them ([`Contains::member_ids`]). Like
+    /// [`terminate`](Self::terminate), only a contained tree has any: the tree calls refuse the others
+    /// before an action runs.
+    #[cfg(windows)]
+    pub(crate) fn member_ids(&self) -> Result<crate::containment::mechanism::Members, Error> {
+        match &self.holder {
+            Holder::None | Holder::Delegated => {
+                debug_assert!(false, "Tree::member_ids on a tree that is not contained");
+                Err(non_actionable("list the members"))
+            }
+            Holder::Contained(mechanism) => {
+                debug_assert!(!self.released, "a listing of a released tree");
+                mechanism.member_ids()
             }
         }
     }

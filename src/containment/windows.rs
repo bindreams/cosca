@@ -33,6 +33,7 @@ use windows::Win32::System::Threading::{
     THREAD_SUSPEND_RESUME,
 };
 
+use crate::containment::mechanism::Members;
 use crate::containment::tree_kill::{Settled, Unnamed};
 use crate::error::{io_context, win32_io_error};
 use crate::identity::ProcessId;
@@ -212,15 +213,15 @@ impl JobHandle {
     /// and `unobserved` holds each unproved pid (with its refusal) and one nameless entry for the
     /// failed listing.
     pub(crate) fn list_members(&self, root: Option<u32>) -> (Vec<ProcessId>, Vec<Unnamed>) {
-        use crate::error::Error;
+        let (members, gaps) = self.look_up_members(root);
+        (members, gaps.into_iter().map(Gap::for_kill).collect())
+    }
 
+    /// What the listing could not name, as [`Gap`]s.
+    fn look_up_members(&self, root: Option<u32>) -> (Vec<ProcessId>, Vec<Gap>) {
         let pids = match query_job_pid_list(self.raw) {
             Ok(pids) => pids,
-            Err(e) => {
-                let detail =
-                    "the members of the job could not be listed before the kill, so their exit cannot be observed";
-                return (Vec::new(), vec![unlisted(detail, e)]);
-            }
+            Err(e) => return (Vec::new(), vec![Gap::Listing(e)]),
         };
         let mut found = Listed::default();
         for pid in pids.into_iter().filter(|pid| Some(*pid) != root) {
@@ -228,17 +229,16 @@ impl JobHandle {
         }
         let unproved = std::mem::take(&mut found.unproved);
         if unproved.is_empty() {
-            return (found.members, found.unobserved);
+            return (found.members, found.gaps);
         }
         match settle_unproved(self.raw, &unproved) {
             Err(e) => {
                 // The members proved are waited for; these are neither named nor cleared.
-                let detail = "the members of the job were listed, but the listing that settles the pids whose \
-                              membership could not be established failed, so whether those exited cannot be observed";
-                found.unobserved.push(unlisted(detail, e));
-                found
-                    .unobserved
-                    .extend(unproved.into_iter().map(|(pid, e)| Unnamed::member(pid, Error::Io(e))));
+                found.gaps.push(Gap::Settling(e));
+                found.gaps.extend(unproved.into_iter().map(|(pid, e)| Gap::Unproved {
+                    pid,
+                    cause: crate::error::Error::Io(e),
+                }));
             }
             Ok(ControlFlow::Break(())) => {}
             Ok(ControlFlow::Continue(named)) => {
@@ -247,31 +247,93 @@ impl JobHandle {
                 }
             }
         }
-        (found.members, found.unobserved)
+        (found.members, found.gaps)
     }
 }
 
-/// What [`JobHandle::list_members`] has made of the pids it looked at.
+/// What [`JobHandle::look_up_members`] has made of the pids it looked at.
 #[derive(Default)]
 struct Listed {
     members: Vec<ProcessId>,
-    unobserved: Vec<Unnamed>,
+    gaps: Vec<Gap>,
     /// Pids whose membership could not be established on the first look, each with the reason.
     unproved: Vec<(u32, io::Error)>,
 }
 
 impl Listed {
     /// Look at the listed pid `pid`. `settling`: the pid is one the settling listing named again
-    /// ([`settle_unproved`]), so one still unproved is unobserved, not left to settle.
+    /// ([`settle_unproved`]), so one still unproved is a gap, not left to settle.
     fn look(&mut self, job: HANDLE, pid: u32, settling: bool) {
         use crate::error::Error;
 
         match member_identity(job, pid, open_for_membership(pid)) {
             Ok(Some(id)) => self.members.push(id),
             Ok(None) => {}
-            Err(NotNamed::Membership(e)) if settling => self.unobserved.push(Unnamed::member(pid, Error::Io(e))),
+            Err(NotNamed::Membership(e)) if settling => self.gaps.push(Gap::Unproved {
+                pid,
+                cause: Error::Io(e),
+            }),
             Err(NotNamed::Membership(e)) => self.unproved.push((pid, e)),
-            Err(NotNamed::Identity(cause)) => self.unobserved.push(Unnamed::member(pid, cause)),
+            Err(NotNamed::Identity(cause)) => self.gaps.push(Gap::Unidentified { pid, cause }),
+        }
+    }
+}
+
+/// A member, or a listing, of a job that [`JobHandle::look_up_members`] could not name.
+enum Gap {
+    /// The pid `pid` is proved a member of the job, but its identity could not be read, for `cause`.
+    Unidentified { pid: u32, cause: crate::error::Error },
+    /// The pid `pid` was listed by the job, but whether it is a member could not be established, for
+    /// `cause`.
+    Unproved { pid: u32, cause: crate::error::Error },
+    /// The job's pid list could not be read.
+    Listing(io::Error),
+    /// The listing that settles the pids whose membership could not be established failed.
+    Settling(io::Error),
+}
+
+impl Gap {
+    /// For a kill's wait: the member a kill reaches, whose exit cannot be observed.
+    fn for_kill(self) -> Unnamed {
+        match self {
+            Gap::Unidentified { pid, cause } | Gap::Unproved { pid, cause } => Unnamed::member(pid, cause),
+            Gap::Listing(e) => unlisted(
+                "the members of the job could not be listed before the kill, so their exit cannot be observed",
+                e,
+            ),
+            Gap::Settling(e) => unlisted(
+                "the members of the job were listed, but the listing that settles the pids whose membership \
+                 could not be established failed, so whether those exited cannot be observed",
+                e,
+            ),
+        }
+    }
+
+    /// For a send that asks each member by itself: a pid that cannot be named is not asked.
+    fn for_send(self) -> crate::error::Error {
+        use crate::error::Error;
+
+        match self {
+            Gap::Unidentified { pid, cause } => Error::Unassessable {
+                detail: format!("pid {pid} is a member of the job but could not be named, so it is not asked"),
+                source: Some(std::sync::Arc::new(cause)),
+            },
+            Gap::Unproved { pid, cause } => Error::Unassessable {
+                detail: format!(
+                    "pid {pid} was listed by the job but its membership could not be established, so it is not asked"
+                ),
+                source: Some(std::sync::Arc::new(cause)),
+            },
+            Gap::Listing(e) => Error::Unassessable {
+                detail: "the members of the job could not be listed, so no member is asked".to_owned(),
+                source: Some(Error::io_cause(e)),
+            },
+            Gap::Settling(e) => Error::Unassessable {
+                detail: "the members of the job were listed, but the listing that settles the pids whose membership \
+                 could not be established failed, so those members are not asked"
+                    .to_owned(),
+                source: Some(Error::io_cause(e)),
+            },
         }
     }
 }
@@ -378,7 +440,21 @@ impl crate::containment::Contains for JobHandle {
         )
     }
 
-    /// The console event the caller's stop function sent: the job sends nothing and lists nothing.
+    /// The job's own listing, the root among its members; each member it could not name, worded for a
+    /// send. A pid list that cannot be read at all is the error.
+    fn member_ids(&self) -> Result<Members, crate::error::Error> {
+        let (named, gaps) = self.look_up_members(None);
+        let mut unnamed = Vec::new();
+        for gap in gaps {
+            if matches!(gap, Gap::Listing(_)) {
+                return Err(gap.for_send());
+            }
+            unnamed.push(gap.for_send());
+        }
+        Ok(Members { named, unnamed })
+    }
+
+    /// The send the caller's stop function made: the job sends nothing and lists nothing.
     fn send_terminate(
         &self,
         _pid: u32,

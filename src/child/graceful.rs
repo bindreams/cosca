@@ -641,8 +641,8 @@ pub(crate) mod fault {
         #[cfg(unix)]
         return crate::containment::TreeStop::default();
         #[cfg(windows)]
-        crate::containment::TreeStop::of_event(
-            crate::stop::proxy::protocol::CtrlEvent::CtrlBreak,
+        crate::containment::TreeStop::named(
+            crate::stop::proxy::protocol::CtrlEvent::CtrlBreak.name(),
             crate::containment::SendOutcome::Sent(Ok(())),
         )
     }

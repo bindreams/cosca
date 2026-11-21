@@ -9,7 +9,7 @@
 //! functions, not for an action that also calls the blocking ones of [`cosca::stop`](crate::stop) over
 //! the same target. A prepared function that sends and does not wait (`send_signal`,
 //! `send_ctrl_break_to_group`) is the sync function made `async`, so an action composes it as it
-//! composes the others.
+//! composes the others. So is `send_wm_close`, whose one await is the look at the root.
 //!
 //! [`tokio::Child::terminate`]: crate::tokio::Child::terminate
 
@@ -117,6 +117,14 @@ pub async fn send_ctrl_break_to_group(target: &StopTarget<'_>) -> Result<(), Err
 #[cfg(windows)]
 pub async fn send_console_event_via_proxy(target: &StopTarget<'_>, event: crate::CtrlEvent) -> Result<(), Error> {
     crate::stop::proxy::send(&AsyncDriver(target.child()), target, event).await
+}
+
+/// Windows: asks the child's windows to close, and does not wait. As
+/// [`stop::send_wm_close`](crate::stop::send_wm_close), with the look at the root awaited: the windows are
+/// listed and posted to on the calling thread, which is bounded work that waits for no process.
+#[cfg(windows)]
+pub async fn send_wm_close(target: &StopTarget<'_>) -> Result<(), Error> {
+    crate::stop::send_wm_close_with(&AsyncDriver(target.child()), target).await
 }
 
 /// Waits up to `grace` for the child's root to exit, and whether it did, through the child's handle. As

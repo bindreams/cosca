@@ -57,8 +57,8 @@ fn stated_break(target: &crate::StopTarget<'_>) -> Result<(), crate::error::Erro
         crate::stop::Scope::Root => Ok(()),
         crate::stop::Scope::Tree(call) => target.send_tree(
             call,
-            crate::containment::TreeStop::of_event(
-                crate::stop::proxy::protocol::CtrlEvent::CtrlBreak,
+            crate::containment::TreeStop::named(
+                crate::stop::proxy::protocol::CtrlEvent::CtrlBreak.name(),
                 crate::containment::SendOutcome::Sent(Ok(())),
             ),
         ),

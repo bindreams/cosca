@@ -251,3 +251,50 @@ fn wait_tree_timeout_zero_reports_members_remain() {
 
     job.kill_tree().expect("kill_tree");
 }
+
+/// A job names the members of its tree for a send that reaches each by itself, the root among them.
+///
+/// Mutant: the listing leaves the root out, as a kill's wait does (its owner waits for it).
+#[skuld::test]
+fn a_jobs_member_ids_name_the_root_among_its_members() {
+    use crate::containment::Contains as _;
+
+    let child = spawn_more_blocker();
+    let id = crate::identity::ProcessId::of(child.id())
+        .found()
+        .expect("the member's identity");
+    let raw = child.as_raw_handle();
+    // SAFETY: `child` outlives this borrow.
+    let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
+
+    let members = job.0.member_ids().expect("the job lists its members");
+
+    assert!(members.named.contains(&id), "the root is a member: {members:?}");
+}
+
+/// A job whose members cannot be listed answers the listing's error: it names no member, and an empty list
+/// would read as a tree with nothing to ask. Its text says what a listing did, not what a kill did.
+///
+/// Mutants: the failed listing is an empty list of members; the text is the kill's ("before the kill, so
+/// their exit cannot be observed").
+#[skuld::test]
+fn a_jobs_member_ids_are_an_error_when_the_job_cannot_be_listed() {
+    use windows::Win32::System::SystemServices::JOB_OBJECT_TERMINATE;
+
+    use crate::containment::Contains as _;
+
+    let child = spawn_more_blocker();
+    let raw = child.as_raw_handle();
+    // SAFETY: `child` outlives this borrow.
+    let job = Job::assign(unsafe { BorrowedHandle::borrow_raw(raw) }).expect("assign to job");
+    // A handle that may terminate the job and not query it: the OS refuses the listing.
+    let unlistable = job.0.duplicate_with_access_for_test(JOB_OBJECT_TERMINATE);
+
+    let error = unlistable.member_ids().expect_err("the listing is refused");
+
+    assert!(
+        matches!(&error, crate::error::Error::Unassessable { detail, .. }
+            if detail.as_str() == "the members of the job could not be listed, so no member is asked"),
+        "{error:?}"
+    );
+}

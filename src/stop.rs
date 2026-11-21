@@ -51,23 +51,27 @@
 //! process group, a session, a macOS fd marker's group and walk): see the section on a child reaped by
 //! something else in [`Command::contain`](crate::Command::contain).
 //!
-//! **Windows.** The prepared sends deliver a console event, and the containment mechanism sends nothing
-//! of its own, so a root target and a tree target reach the same processes:
+//! **Windows.** The containment mechanism sends nothing of its own. The two console-event sends reach the
+//! same processes for a root target and for a tree target, since the event addresses a group or a console;
+//! `send_wm_close` reaches only the windows it is given, so it takes the tree's members from the
+//! mechanism:
 //!
 //! | Send | The event reaches |
 //! |---|---|
 //! | direct (`send_ctrl_break_to_group`) | when the child is on this process's console, every process in its console process group: the child, and the descendants that stayed in the group, not a nested contained descendant, which leads a group of its own. A child with a console of its own, or with none, is sent nothing, and the send still answers `Ok` |
 //! | through the proxy (`send_console_event_via_proxy`) | every process on the child's console, in whatever process group: the child, its descendants that share the console, and any other process attached to it |
+//! | `WM_CLOSE` (`send_wm_close`) | a root target: the visible unowned windows of the child. A tree target: those of every member of the contained tree, the root included, as the mechanism lists them (a job's members, or the descendants a tree walk finds from the root's identity) |
 //!
-//! Neither reaches a descendant that has a console of its own or was started detached. A root that has
-//! already exited changes what the proxy reaches: it sends nothing, even to descendants on the root's
-//! console, which `graceful_shutdown_tree`'s sweep ends, where the direct send to the group would still
-//! reach them (see `send_console_event_via_proxy`).
+//! Neither console event reaches a descendant that has a console of its own or was started detached. A
+//! root that has already exited changes what the proxy reaches: it sends nothing, even to descendants on
+//! the root's console, which `graceful_shutdown_tree`'s sweep ends, where the direct send to the group
+//! would still reach them (see `send_console_event_via_proxy`). `send_wm_close` on a tree target asks the
+//! members the mechanism lists, so a window of a descendant that outlived its root is reached.
 //!
 //! # Choosing an action
 //!
 //! [`Command::graceful_stop`](crate::Command::graceful_stop) takes a function of a [`StopTarget`]; it
-//! gives the signature and says what the call does with the function's answer. Four ways to write one:
+//! gives the signature and says what the call does with the function's answer. Five ways to write one:
 //!
 //! - **Another signal (Unix).** `stop::send_signal(target, Signal::Int)` sends the signal `Signal` names
 //!   in place of `SIGTERM`, to the root or the tree as the target says. A `sudo` or `doas` front relays
@@ -78,6 +82,10 @@
 //!   `Command::new_process_group(false)`, and see `send_console_event_via_proxy` for when Ctrl+C then
 //!   reaches it. The proxy sends to a whole console and refuses one that is this process's own, so this
 //!   suits a child with a console of its own (`no_window()`) or a caller with no console.
+//! - **A GUI child (Windows).** `stop::send_wm_close(target)` posts `WM_CLOSE` to the child's visible
+//!   top-level windows that have no owner, which is what asks a program with no console to close: pick it
+//!   with `Command::graceful_stop(stop::send_wm_close)`. It never posts to a console's window, and a program
+//!   that shows no such window is refused.
 //! - **A composition.** [`StopTarget::wait_exit`] waits up to a grace for the root to exit, so an action
 //!   can ask, wait, and ask harder. [`covers_tree`](StopTarget::covers_tree) tells the action which kind
 //!   of target it has.
@@ -127,11 +135,15 @@
 //! - **A front that does not relay the signal.** An elevated child behind such a front is refused the
 //!   signal, with nothing sent: see `send_signal`.
 //! - **A direct send's success does not prove delivery:** see [`Child::terminate`](crate::Child::terminate).
+//! - **`send_wm_close` asks only visible windows without an owner, on the calling thread's desktop:** see
+//!   `send_wm_close`.
 
 mod action;
 pub(crate) mod proxy;
 mod target;
 mod waits;
+#[cfg(windows)]
+mod wm_close;
 
 pub(crate) use action::StopAction;
 pub use target::StopTarget;
@@ -183,7 +195,8 @@ use crate::error::Error;
 /// - Case 3, a child a system elevation service created on a UAC consent: the error names `kill()`. Nothing
 ///   is started.
 /// - Case 3, the child has no console to attach to (`detached()`, or a GUI-subsystem program given
-///   `no_window`), or has not set one up yet: the proxy finds none and the error names `Child::kill`.
+///   `no_window`), or has not set one up yet: the proxy finds none and the error names `Child::kill`, and
+///   `stop::send_wm_close` as the action that fits a GUI child.
 /// - Case 3, the child's console is also this process's own (one changed console after the spawn): an event
 ///   sent there would reach this process too. The error names `stop::send_ctrl_break_to_group`, and
 ///   `Command::new_process_group` for a child that leads no group.
@@ -351,7 +364,7 @@ pub fn send_ctrl_break_to_group(target: &StopTarget<'_>) -> Result<(), Error> {
     }
     conclude(
         target,
-        CtrlEvent::CtrlBreak,
+        CtrlEvent::CtrlBreak.name(),
         SendOutcome::direct(crate::containment::windows::terminate(child.pid())),
     )
 }
@@ -363,13 +376,29 @@ const ELEVATED_REFUSAL: &str = "cosca did not create this child — a system ele
      event addressed to its pid would reach its leader's whole group instead. \
      Use kill() for a hard teardown.";
 
-/// Windows: [`Error::Unsupported`] for a graceful stop, with `detail`. Nothing was sent.
+/// Windows: what a refusal that leaves the child running says to use instead, in this order.
 #[cfg(windows)]
-fn unsupported(detail: impl Into<String>) -> Error {
+const REMEDIES: &str = "Use Child::kill for a hard teardown, or Command::graceful_stop with a stop of your own.";
+
+/// Windows: [`Error::Unsupported`] for a graceful stop, with `detail` and the error behind it, if there
+/// is one. Nothing was sent.
+#[cfg(windows)]
+fn unsupported(detail: impl Into<String>, source: Option<std::sync::Arc<Error>>) -> Error {
     Error::Unsupported {
         op: "graceful terminate".into(),
         platform: std::env::consts::OS,
         detail: detail.into(),
+        source,
+    }
+}
+
+/// Windows: the answer of a send whose root had exited when cosca looked, with nothing sent: `cause` says
+/// where the look was and `outliving` what the send cannot do for a member of the tree that outlived the
+/// root.
+#[cfg(windows)]
+fn root_exited(cause: &str, outliving: &str) -> Error {
+    Error::Unassessable {
+        detail: format!("{cause}: nothing was sent, and {outliving}"),
         source: None,
     }
 }
@@ -378,24 +407,24 @@ fn unsupported(detail: impl Into<String>) -> Error {
 /// did, for either kind of target.
 #[cfg(windows)]
 fn refuse(target: &StopTarget<'_>, detail: impl Into<String>) -> Error {
-    let refusal = unsupported(detail);
+    let refusal = unsupported(detail, None);
     target.note_refused(&refusal);
     refusal
 }
 
-/// Windows: a prepared send's end: `sent`, what the send of `event` came to ([`SendOutcome`] says what
-/// each outcome means), left as what the last send did, and, on a tree target, handed to the mechanism's
-/// route, whose answer is the call's.
+/// Windows: a prepared send's end: `sent`, what the send named `name` (`CTRL_BREAK`, `WM_CLOSE`) came to
+/// ([`SendOutcome`] says what each outcome means), left as what the last send did, and, on a tree
+/// target, handed to the mechanism's route, whose answer is the call's.
 #[cfg(windows)]
-fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Result<(), Error> {
+fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendOutcome) -> Result<(), Error> {
     match target.scope() {
         Scope::Root => match sent {
             SendOutcome::Sent(answer) => {
-                target.note_root_went_out(event.name());
+                target.note_root_went_out(name);
                 answer
             }
             SendOutcome::RootExited(_) => {
-                target.note_root_went_out(event.name());
+                target.note_root_went_out(name);
                 Ok(())
             }
             SendOutcome::NotSent(not_sent) => {
@@ -403,7 +432,7 @@ fn conclude(target: &StopTarget<'_>, event: CtrlEvent, sent: SendOutcome) -> Res
                 Err(not_sent)
             }
         },
-        Scope::Tree(call) => target.send_tree(call, crate::containment::TreeStop::of_event(event, sent)),
+        Scope::Tree(call) => target.send_tree(call, crate::containment::TreeStop::named(name, sent)),
     }
 }
 
@@ -506,6 +535,83 @@ pub fn send_console_event_via_proxy(target: &StopTarget<'_>, event: CtrlEvent) -
         target,
         event,
     ))
+}
+
+/// Windows: asks the child's windows to close, and does not wait.
+///
+/// It posts `WM_CLOSE` to the top-level windows of the target's processes that are **visible and have no
+/// owner**: a tool window is one of them, a hidden window and an owned one (a dialog, an input-method
+/// helper) are not. A window of a console (class `ConsoleWindowClass` or `PseudoConsoleWindow`) is never
+/// posted to, whichever process it is listed under: the system turns a close of a `ConsoleWindowClass`
+/// window into `CTRL_CLOSE_EVENT` for every process on that console, and what a post to the other class does
+/// was not established. A window whose class cannot be read is not asked.
+/// A GUI program that handles `WM_CLOSE` by default closes its main window and exits; one that handles it
+/// itself may prompt, or refuse. The call does not wait for the program: wait with
+/// [`StopTarget::wait_exit`], or let `graceful_shutdown` do it.
+///
+/// On a root target the windows are the child's. On a tree target they are those of every member of the
+/// contained tree, as its mechanism lists them (the root among them), so a descendant's window may be
+/// asked to close though its parent would also have sent it a close.
+///
+/// This is not what [`default`] does for a child with no console: pick it with
+/// `Command::graceful_stop(|target| stop::send_wm_close(target))`.
+///
+/// # What the windows are
+///
+/// The send reads the windows of the calling thread's desktop once, and asks each window of a process in
+/// turn. A process is opened by its identity and held while its windows are asked, so its pid cannot be
+/// taken by another program meanwhile, and right before each post the window's owning process is read
+/// again and must still be that process. Windows has no call that posts only to a window that belongs to a
+/// given process, so the owner check and the post are back to back. A window that was destroyed in between,
+/// or whose handle value another program's window took, is told by the check; what is left is a window
+/// destroyed and replaced by another program's after that read. A handle value recurs only after 32765
+/// reallocations of its slot.
+///
+/// # Errors
+///
+/// A send went out when at least one window was posted to. A window that was refused or failed while another
+/// was posted to, and a member that could not be named or opened, is warned of, and the call is `Ok`.
+/// Otherwise nothing was sent, each other miss is warned of, and the answer is the
+/// first row that applies:
+///
+/// - the child has no identity ([`Child::id`](crate::Child::id) is `None`): [`Error::Unsupported`];
+/// - the windows of the desktop, or the members of the tree, could not be listed: [`Error::Io`] or the
+///   listing's own error;
+/// - a post failed with an error other than a refusal, or a member could not be named or opened:
+///   [`Error::Io`], with that error as its cause;
+/// - every post was refused (`ERROR_ACCESS_DENIED`: the window belongs to a program of higher integrity, or
+///   has a message filter, which is set per window): [`Error::Unsupported`], whose
+///   [`source`](std::error::Error::source) is that error;
+/// - no window was asked and the child had exited when cosca looked: as every other send answers an exited
+///   child, `Ok` on a root target, and on a tree target the tree call's own answer (see the module doc);
+/// - no window was asked: [`Error::Unsupported`], which says the process shows no visible top-level window
+///   without an owner on this desktop, and names [`Child::kill`](crate::Child::kill).
+///
+/// # Limits
+///
+/// Each is an [`Error::Unsupported`] with nothing sent, or a window that is not asked, and
+/// [`Child::kill`](crate::Child::kill) is the alternative.
+///
+/// - **A program with no visible window without an owner is not asked:** one that keeps its window hidden or
+///   lives in the notification area. Hidden windows are not a fallback.
+/// - **Before the child has shown its window,** it has none to ask. A child that was just created can be
+///   refused as one with no window; a caller that has observed output or a handshake from the child is past
+///   that window. A caller that wants the child gone before it has run at all uses `Child::kill`.
+/// - **The calling thread's desktop only.** A window on another desktop or in another session is not
+///   listed, so a child that moved itself to one is refused as one with no window.
+#[cfg(windows)]
+pub fn send_wm_close(target: &StopTarget<'_>) -> Result<(), Error> {
+    crate::child::graceful::shutdown::run_ready(send_wm_close_with(
+        &crate::child::graceful::shutdown::BlockingDriver(target.child()),
+        target,
+    ))
+}
+
+/// Windows: the one body of [`send_wm_close`], for the driver that blocks and the one that awaits, which
+/// make only the look at the root.
+#[cfg(windows)]
+pub(crate) async fn send_wm_close_with<D: StopWaits>(driver: &D, target: &StopTarget<'_>) -> Result<(), Error> {
+    wm_close::send(driver, target).await
 }
 
 #[cfg(test)]

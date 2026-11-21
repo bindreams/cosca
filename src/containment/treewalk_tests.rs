@@ -345,6 +345,66 @@ fn complete_members_keeps_every_candidate_below_an_unassessable_when_the_first_i
     assert_eq!(codes, [Some(2), Some(3)]);
 }
 
+/// A walk's `member_ids` ([`super::listed_members`]) names the root and the walk's members, and every
+/// candidate the walk could not assess as unnamed: whether or not there is a member, which the send decides.
+///
+/// Mutants: an unassessed candidate is dropped, or is the walk's raw read error, not worded for a send; or a
+/// walk that named nothing and assessed nothing is not an empty listing.
+#[cfg(windows)]
+#[skuld::test]
+fn a_walks_member_ids_name_the_members_and_each_candidate_it_could_not_assess() {
+    let unassessed_only = || {
+        descendants_with(
+            root(),
+            root_bound(),
+            &[(200, ROOT_PID)],
+            |pid, _, _| Err(unreadable(pid)),
+            &no_reads(),
+        )
+    };
+    let listed = super::listed_members(None, unassessed_only());
+    assert!(listed.named.is_empty(), "{listed:?}");
+    // Worded for a send, as the Job's gaps are, with the read's own error as the cause.
+    let [Error::Unassessable { detail, source }] = &listed.unnamed[..] else {
+        panic!("{listed:?}")
+    };
+    assert_eq!(
+        detail,
+        "pid 200 is a candidate member of the tree that could not be read, so it is not asked"
+    );
+    assert_eq!(
+        crate::error::said(source.as_deref().expect("the read's error is the cause")),
+        crate::error::said(&unreadable(200))
+    );
+
+    let with_root = super::listed_members(Some(root()), unassessed_only());
+    assert_eq!(with_root.named, [root()]);
+    assert_eq!(with_root.unnamed.len(), 1, "{with_root:?}");
+
+    let tokens = HashMap::from([(300u32, ROOT_TOKEN + 1)]);
+    let read = resolver(&tokens);
+    let with_a_member = descendants_with(
+        root(),
+        root_bound(),
+        &[(200, ROOT_PID), (300, ROOT_PID)],
+        |pid, parent, bound| {
+            if pid == 200 {
+                Err(unreadable(200))
+            } else {
+                read(pid, parent, bound)
+            }
+        },
+        &no_reads(),
+    );
+    let listed = super::listed_members(None, with_a_member);
+    assert_eq!(listed.named, [id(300, ROOT_TOKEN + 1)]);
+    assert_eq!(listed.unnamed.len(), 1, "{listed:?}");
+
+    let none = descendants_with(root(), root_bound(), &[], |_, _, _| Ok(None), &no_reads());
+    let listed = super::listed_members(None, none);
+    assert!(listed.named.is_empty() && listed.unnamed.is_empty(), "{listed:?}");
+}
+
 /// A snapshot that lists the unreadable pid twice reads it once and counts it once.
 #[skuld::test]
 fn a_duplicate_edge_to_an_unreadable_candidate_is_one_unassessed_entry() {

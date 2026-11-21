@@ -98,6 +98,7 @@ static_assertions = "1"
 #   is gone, rather than read a `schtasks` exit code.
 # - `Win32_System_Pipes`: only `pipe_tests.rs` needs it, for `PeekNamedPipe`, to show that the read it
 #   polls after completed synchronously.
+# - `Win32_Graphics_Gdi`: `RegisterClassW`/`WNDCLASSW`, for the window class of the test GUI process.
 #
 # Declaring them here, in dev-dependencies, keeps them out of the published crate's own
 # dependency footprint for downstream consumers who only pull in `[dependencies]`. The `windows_*`
@@ -112,6 +113,7 @@ windows = { version = "0.62", features = [
     "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Globalization",
+    "Win32_Graphics_Gdi",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
