@@ -19,6 +19,17 @@ fn contain_with_and_nesting_recorded() {
     assert_eq!(req.nesting, Nesting::Opaque);
 }
 
+/// Mutant: the async getter answers a fixed mode, or `None` after `contain_with`.
+#[skuld::test]
+fn get_contain_mode_mirrors_the_sync_command() {
+    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
+    assert_eq!(cmd.get_contain_mode(), None);
+    cmd.contain();
+    assert_eq!(cmd.get_contain_mode(), Some(ContainMode::Strongest));
+    cmd.contain_with(ContainMode::BestEffort);
+    assert_eq!(cmd.get_contain_mode(), Some(ContainMode::BestEffort));
+}
+
 /// The run-to-completion helpers' futures are `Send`, so a caller can `tokio::spawn` them: the
 /// teardown they await on a failure holds the child's resources across its waits.
 ///

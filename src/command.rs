@@ -768,6 +768,13 @@ impl Command {
         self
     }
 
+    /// The [`ContainMode`] a spawn asks for: `None` if the command is not contained,
+    /// [`Strongest`](ContainMode::Strongest) after `contain()`, else the mode given to `contain_with`. This
+    /// is the request, not what a spawn got: [`Child::containment`](crate::Child::containment) reports that.
+    pub fn get_contain_mode(&self) -> Option<ContainMode> {
+        self.contain.mode
+    }
+
     /// Set how this contained spawn marks its descendants (default [`Nesting::Mark`]).
     pub fn nesting(&mut self, nesting: Nesting) -> &mut Command {
         self.contain.nesting = nesting;
