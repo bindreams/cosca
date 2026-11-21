@@ -53,8 +53,8 @@
 //! A kill or [`terminate`] whose root's exit had begun when its walk ended, or whose flag could not be
 //! read, never answers `Ok`:
 //!
-//! - **No member found:** [`TreeKillOutcome::NoRoot`] and [`SendOutcome::RootExited`], nothing sent. With
-//!   the flag unreadable, [`TreeKillOutcome::Unwalked`] (a [`terminate`]'s [`SendOutcome::NotSent`]):
+//! - **No member found:** [`TreeKillOutcome::NoRoot`] and [`SendAnswer::RootExited`], nothing sent. With
+//!   the flag unreadable, [`TreeKillOutcome::Unwalked`] (a [`terminate`]'s [`SendAnswer::NotSent`]):
 //!   nothing is sent, and a retry can read it.
 //! - **Members found:** they are killed or signalled all the same. A [`hard_kill`] that left nothing is
 //!   [`TreeKillOutcome::RootExiting`], settled as a gone root is (a graceful call's own complete
@@ -126,7 +126,7 @@ use crate::containment::mechanism::Members;
 use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{Contains, KillLeftOutcome};
 #[cfg(not(windows))]
-use crate::containment::SendOutcome;
+use crate::containment::SendAnswer;
 #[cfg(target_os = "macos")]
 use crate::containment::Why;
 use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill, TreeStop};
@@ -278,6 +278,10 @@ impl Contains for Walker {
 pub(crate) enum KillOutcome {
     /// The signal reached the verified identity.
     Terminated,
+    /// The verified identity's exit has begun or finished and it is not reaped ([`Sent::Exited`]): nothing was
+    /// delivered. A kill treats it as [`Terminated`](KillOutcome::Terminated), its exit being what the kill
+    /// asks for and waits on; a cooperative walk's record does not count it as a send that reached a process.
+    Exited,
     /// The pid holds no process, or holds a different one - nothing to kill.
     AlreadyGone,
     /// A live-or-unassessable process we did not signal, with why. The only outcome that can leave a
@@ -297,6 +301,7 @@ impl KillOutcome {
     pub(crate) fn of(sent: Result<Sent, Error>) -> KillOutcome {
         match sent {
             Ok(Sent::Delivered) => KillOutcome::Terminated,
+            Ok(Sent::Exited) => KillOutcome::Exited,
             Ok(Sent::Gone) => KillOutcome::AlreadyGone,
             Ok(Sent::Unverified) => {
                 debug_assert!(false, "a walk's send cannot be unverified");
@@ -941,7 +946,7 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
         }
         for id in descendants {
             let outcome = kill_one(kernel, id);
-            if matches!(outcome, KillOutcome::Terminated) {
+            if matches!(outcome, KillOutcome::Terminated | KillOutcome::Exited) {
                 killed.push(id);
             }
             if let Some(error) = left_behind(id, outcome) {
@@ -1104,7 +1109,7 @@ pub(crate) fn with_earlier(
                 #[cfg(any(unix, windows))]
                 {
                     let outcome = kill_one(kernel, id);
-                    if matches!(outcome, KillOutcome::Terminated) {
+                    if matches!(outcome, KillOutcome::Terminated | KillOutcome::Exited) {
                         killed.push(id);
                     }
                     if let Some(error) = left_behind(id, outcome) {
@@ -1167,7 +1172,7 @@ fn not_killed(pid: RawPid, source: Error) -> Error {
 fn left_behind(id: ProcessId, outcome: KillOutcome) -> Option<Error> {
     match outcome {
         KillOutcome::NotAttempted(source) => Some(not_killed(id.pid(), source)),
-        KillOutcome::Terminated | KillOutcome::AlreadyGone => None,
+        KillOutcome::Terminated | KillOutcome::Exited | KillOutcome::AlreadyGone => None,
     }
 }
 
@@ -1352,7 +1357,7 @@ pub(crate) mod fault {
 /// Unix: the same snapshot + identity walk with the signal `how` carries (root then descendants) —
 /// cooperative shutdown that still re-verifies identity before each signal, so it
 /// reaches the whole genuine tree that the walk could assess. A walk that cannot be made sends nothing
-/// ([`SendOutcome::NotSent`], as [`hard_kill`]'s walk errors). Unlike `hard_kill` it does not report a
+/// ([`SendAnswer::NotSent`], as [`hard_kill`]'s walk errors). Unlike `hard_kill` it does not report a
 /// candidate the walk could not assess ([`Walk::unassessed`]), nor a member whose signal was not
 /// sent: they are warned of and not signalled, and the send is still `Sent(Ok(()))`.
 ///
@@ -1366,24 +1371,25 @@ pub(crate) mod fault {
 /// The members it found, the root apart, are its [`Listing`]: once the root exits
 /// they are reparented out of every later walk, so a later kill can reach them only by these
 /// identities. A root whose exit has begun, reaped or not, and whose walk finds no member sends
-/// nothing ([`SendOutcome::RootExited`], see the module doc); one whose walk finds members signals
+/// nothing ([`SendAnswer::RootExited`], see the module doc); one whose walk finds members signals
 /// them, and its [`Listing`] is not complete. So is the listing of a walk whose members were signalled
 /// though the flag could not be read; with no member found, that error is the walk's.
 ///
-/// How the send went is a [`SendOutcome`]. The [`Listing`] is beside it exactly when it is
-/// [`Sent`](SendOutcome::Sent), and that is always `Sent(Ok(()))`: a failed signal to the root or a
-/// member is only warned of. Asserted in debug before the pair is handed on.
+/// How the send went is a [`SendAnswer`]. The [`Listing`] is beside it exactly when it is
+/// [`Sent`](SendAnswer::Sent) or [`NoneReached`](SendAnswer::NoneReached) (a walk whose every signal found its
+/// process gone, or failed), and that is always `Ok(())`: a failed signal to the root or a member is only
+/// warned of. Asserted in debug before the pair is handed on.
 #[cfg(not(windows))]
 pub(crate) fn terminate(
     kernel: &dyn Kernel,
     root: ProcessId,
     held: &dyn Root,
     how: TreeStop,
-) -> (SendOutcome, Option<Listing>) {
+) -> (SendAnswer, Option<Listing>) {
     debug_assert_eq!(held.pid(), root.pid(), "the held root is not the walk's root");
     #[cfg(unix)]
     let paired = 'walk: {
-        let not_sent = |error| (SendOutcome::NotSent(error), None);
+        let not_sent = |error| (SendAnswer::NotSent(error), None);
         let signal = how.signal();
         let table = match crate::containment::enumerate::process_table(kernel) {
             Ok(table) => table,
@@ -1391,7 +1397,7 @@ pub(crate) fn terminate(
         };
         let walk = match walk_from(kernel, root, &table.parents, Recursive::Yes) {
             Ok(Some(walk)) => walk,
-            Ok(None) => break 'walk (SendOutcome::RootExited(exited_root_error(root.pid())), None),
+            Ok(None) => break 'walk (SendAnswer::RootExited(exited_root_error(root.pid())), None),
             Err(unwalkable) => break 'walk not_sent(unwalkable),
         };
         #[cfg(test)]
@@ -1401,7 +1407,7 @@ pub(crate) fn terminate(
         // reparented every child. Read before the root's own signal, which would begin its exit.
         let begun = match exit_begun(kernel, &table, root) {
             Ok(true) if walk.members.is_empty() => {
-                break 'walk (SendOutcome::RootExited(exited_root_error(root.pid())), None);
+                break 'walk (SendAnswer::RootExited(exited_root_error(root.pid())), None);
             }
             Ok(begun) => begun,
             Err(unreadable) if walk.members.is_empty() => break 'walk not_sent(unreadable),
@@ -1419,12 +1425,23 @@ pub(crate) fn terminate(
         // Best effort by contract: a candidate that could not be read is warned of and not signalled.
         warn_unassessed(&walk.unassessed);
         let sig = how.sig();
-        warn_if_not_attempted(root, sig, &KillOutcome::of(held.signal(sig)));
+        let mut reached = false;
+        let mut note = |id: ProcessId, outcome: KillOutcome| {
+            warn_if_not_attempted(id, sig, &outcome);
+            reached |= matches!(outcome, KillOutcome::Terminated);
+        };
+        note(root, KillOutcome::of(held.signal(sig)));
         for id in &walk.members {
-            warn_if_not_attempted(*id, sig, &kill_by_identity(kernel, *id, sig));
+            note(*id, kill_by_identity(kernel, *id, sig));
         }
         (
-            SendOutcome::Sent(Ok(())),
+            // A signal that reached no one (every send answered gone, or failed and was warned of) went out to
+            // no process.
+            if reached {
+                SendAnswer::Sent(Ok(()))
+            } else {
+                SendAnswer::NoneReached(Ok(()))
+            },
             Some(Listing {
                 // A root whose exit had begun, or whose flag could not be read, may have had children
                 // reparented out of the walk.
@@ -1437,7 +1454,7 @@ pub(crate) fn terminate(
     let paired = {
         let _ = (kernel, root, held, how);
         (
-            SendOutcome::Sent(Ok(())),
+            SendAnswer::Sent(Ok(())),
             Some(Listing {
                 members: Vec::new(),
                 complete: true,
@@ -1445,8 +1462,8 @@ pub(crate) fn terminate(
         )
     };
     debug_assert!(
-        paired.1.is_some() == matches!(paired.0, SendOutcome::Sent(Ok(()))),
-        "a walk's listing is beside `Sent(Ok(()))` and beside no other outcome: {:?}",
+        paired.1.is_some() == matches!(paired.0, SendAnswer::Sent(Ok(())) | SendAnswer::NoneReached(Ok(()))),
+        "a walk's listing is beside `Sent(Ok(()))` or `NoneReached(Ok(()))` and beside no other outcome: {:?}",
         paired.0
     );
     paired
@@ -1495,6 +1512,7 @@ fn skipped_walk(root: Option<&dyn crate::containment::Root>) -> Option<Skip> {
                 action: format!("walk the process table from the root's pid (root pid {})", root.pid()),
                 why: Why::untrusted(&state),
                 root_alone: false,
+                no_holder_reached: false,
                 holders: None,
             });
         }
@@ -1530,7 +1548,12 @@ pub(crate) fn terminate_tree(
             {
                 let _ = (kernel, root, owner);
                 let outcome = TerminateOutcome::of(how.into_sent(), Some(earlier));
-                let listing = matches!(outcome, TerminateOutcome::Sent { .. }).then(|| Listing {
+                // The event may have gone out for an `Unknown` too, so the listing is the call's.
+                let listing = matches!(
+                    outcome,
+                    TerminateOutcome::Sent { .. } | TerminateOutcome::Unknown { .. }
+                )
+                .then(|| Listing {
                     members: Vec::new(),
                     complete: true,
                 });

@@ -39,6 +39,7 @@ fn skip() -> Skip {
             None,
         ),
         root_alone: true,
+        no_holder_reached: false,
         holders: None,
     }
 }

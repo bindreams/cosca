@@ -176,7 +176,7 @@ fn graceful_shutdown_of_an_exited_root_launchd_holds_is_refused_without_a_warn()
 
     assert!(
         matches!(&err, Error::Unassessable { detail, source: None }
-            if detail.contains("graceful_shutdown sent its signals")
+            if detail.contains("graceful_shutdown: the root's exit status cannot be collected")
                 && detail.contains("exit status cannot be collected")
                 && detail.contains("launchd")),
         "{err:?}"

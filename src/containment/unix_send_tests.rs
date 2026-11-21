@@ -7,7 +7,7 @@ use super::kill_group;
 use crate::send_log::{GroupStep, OrderedStep, Route};
 use crate::test_child::StdChild;
 #[cfg(target_os = "linux")]
-use crate::test_groups::{pidfd_group_signal, Group};
+use crate::test_groups::{pidfd_group_signal, stray_signal, Group};
 use crate::test_support::stated_root::StatedRoot;
 
 /// A leader in a group of its own with two members, all blocked on reads of the test's pipe, the
@@ -160,7 +160,7 @@ fn a_terminate_whose_check_fails_says_nothing_was_sent() {
 
     assert_eq!(steps, [GroupStep::Check], "nothing was sent");
     match sent {
-        crate::containment::SendOutcome::NotSent(crate::error::Error::Unassessable { detail, source: None }) => {
+        crate::containment::SendAnswer::NotSent(crate::error::Error::Unassessable { detail, source: None }) => {
             assert!(detail.contains("was reaped elsewhere"), "{detail}");
         }
         other => panic!("expected NotSent(Unassessable), got {other:?}"),
@@ -293,6 +293,78 @@ fn term_group_ends_the_leader_by_its_number_when_the_group_send_is_refused() {
     );
     assert_each_send_by_number_follows_its_check(&steps);
     result.expect("term_group on an owned group");
+}
+
+/// A group send the kernel refused whole, whose fallback (the leader's signal) finds the leader gone,
+/// reached nobody: the members are up and the check after it finds nothing wrong, so the answer is `Ok`,
+/// and the send did not go out ([`SendAnswer::outcome`](crate::containment::SendAnswer::outcome)).
+///
+/// Mutant: a refused group send followed by a fallback that found nothing is `Sent`.
+#[skuld::test]
+fn a_refused_group_send_whose_leader_is_gone_reached_nobody() {
+    let (mut child, stdin, _) = group_of_three();
+    let pgid = child.id() as i32;
+    child.kill().expect("kill the leader");
+    child
+        .wait()
+        .expect("reap the leader; the members keep the group's number in use");
+    let refused = super::fault::refuse_group_sends();
+    let sent = super::term_group_sent(pgid, Some(&StatedRoot::unreaped()), crate::signal::Signal::Term);
+    drop(refused);
+    drop(stdin);
+
+    assert_eq!(sent.outcome(), crate::stop::SendOutcome::NotSent, "{sent:?}");
+    sent.into_tree_result()
+        .expect("the members are up: the check finds nothing wrong");
+}
+
+/// A group send the kernel refused whole, whose fallback reached the leader, went out to one process,
+/// though the check after it finds every member refused its probe: the error is the check's, and the
+/// outcome is `Sent`.
+///
+/// Mutant: an error from the check after a send that reached the leader reads the send as not made.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_refused_group_send_whose_leader_got_it_went_out_whatever_the_check_found() {
+    let (mut child, stdin, _) = group_of_three();
+    let refused = super::fault::refuse_group_sends();
+    let refusing = super::fault::refuse_probes();
+    let sent = super::term_group_sent(
+        child.id() as i32,
+        Some(&StatedRoot::unreaped()),
+        crate::signal::Signal::Term,
+    );
+    drop((refused, refusing));
+    drop(stdin);
+    child.wait().expect("reap the leader");
+
+    assert_eq!(sent.outcome(), crate::stop::SendOutcome::Sent, "{sent:?}");
+    sent.into_tree_result()
+        .expect_err("the refused probes leave the members refused");
+}
+
+/// A send to the group of a root whose pidfd shows the leader gone (the kernel answers `ESRCH`) went to
+/// nobody.
+///
+/// Mutant: an `ESRCH` from the group's send reads as `Sent`.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_group_send_the_kernel_answers_with_esrch_reached_nobody(
+    #[fixture(pidfd_group_signal)] _group: &Group,
+    #[fixture(stray_signal)] _stray: &Group,
+) {
+    use std::os::fd::AsFd as _;
+    use std::os::unix::process::CommandExt as _;
+    let mut child = StdChild::spawn(std::process::Command::new("true").process_group(0));
+    let pidfd = crate::containment::cgroup::test_support::pidfd_of(child.id());
+    let pgid = child.id() as i32;
+    child
+        .wait()
+        .expect("the leader exits and is reaped; the pidfd names it still");
+    let root = StatedRoot::unreaped().with_pidfd(pidfd.as_fd());
+    let sent = super::term_group_sent(pgid, Some(&root), crate::signal::Signal::Term);
+
+    assert_eq!(sent.outcome(), crate::stop::SendOutcome::NotSent, "{sent:?}");
 }
 
 /// A member's signal-0 probe is a send like any other: recorded, and refused by the probe seam.

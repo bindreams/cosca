@@ -1063,7 +1063,7 @@ impl SweepFailure {
     /// kill that could not be verified (`Sent::Unverified`) may have left the root running.
     pub(crate) fn killed_root(sent: &Result<crate::signal::Sent, Error>) -> bool {
         use crate::signal::Sent;
-        matches!(sent, Ok(Sent::Delivered | Sent::Gone))
+        matches!(sent, Ok(Sent::Delivered | Sent::Exited | Sent::Gone))
     }
 
     /// The handle backstop's answer from its root kill's `sent`, and whether it ended the root.

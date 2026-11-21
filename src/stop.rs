@@ -16,6 +16,11 @@
 //! is what the call that runs it answers, and a call that waits afterwards (the graceful shutdowns) goes
 //! on from the last prepared send.
 //!
+//! Every prepared send also leaves how it went on the target, whatever it answered, for the call to read
+//! after the action returns: `terminate` and `terminate_tree` fail with a [`StopError`], which holds the
+//! action's error and the [`SendOutcome`] of its last prepared send. An action that made no prepared send
+//! and failed is [`SendOutcome::Unknown`]; `SendOutcome` says what each value claims.
+//!
 //! In each tree call a prepared send answers what that call does with the route's outcome. Where
 //! nothing names the tree (a root reaped by something else, on a mechanism with no other channel) that
 //! is the answer the call computes: an error, with nothing sent and the call ended, so an action
@@ -139,6 +144,7 @@
 //!   `send_wm_close`.
 
 mod action;
+mod outcome;
 pub(crate) mod proxy;
 mod target;
 mod waits;
@@ -146,12 +152,13 @@ mod waits;
 mod wm_close;
 
 pub(crate) use action::StopAction;
+pub use outcome::{SendOutcome, StopError};
 pub use target::StopTarget;
 pub(crate) use target::{RootRecord, Scope, TreeCall, TreeRecord};
 pub(crate) use waits::StopWaits;
 
 #[cfg(windows)]
-use crate::containment::SendOutcome;
+use crate::containment::SendAnswer;
 #[cfg(windows)]
 use proxy::protocol::CtrlEvent;
 
@@ -299,25 +306,43 @@ pub fn send_signal(target: &StopTarget<'_>, signal: crate::Signal) -> Result<(),
     // send's own answer.
     let gated = child.proc.terminate_by(signal, || {
         Ok(match target.scope() {
-            Scope::Root => child
-                .refuse_unpinned("terminate", None)
-                .and_then(|()| child.proc.signal(crate::signal::Sig::Graceful(signal)).map(drop)),
+            Scope::Root => {
+                let sent = child
+                    .refuse_unpinned("terminate", None)
+                    .and_then(|()| child.proc.signal(crate::signal::Sig::Graceful(signal)))
+                    .and_then(|sent| match sent {
+                        // A contract breach, as for a walk's send (`KillOutcome::of`): a child's handle always
+                        // holds what it verifies its pid against (macOS: the unique id it sends with).
+                        crate::signal::Sent::Unverified => {
+                            debug_assert!(false, "a child's handle always verifies its root");
+                            Err(Error::Unassessable {
+                                detail: format!(
+                                    "the root (pid {}) could not be verified, so no {} was sent",
+                                    child.pid(),
+                                    signal.name()
+                                ),
+                                source: None,
+                            })
+                        }
+                        sent => Ok(sent),
+                    });
+                match &sent {
+                    Ok(crate::signal::Sent::Delivered) => target.note_root_sent(signal.name()),
+                    // Not delivered: the root was gone, or its exit had begun. Nothing was sent.
+                    Ok(_) => target.note_root_gone(),
+                    Err(refusal) => target.note_not_sent(refusal),
+                }
+                sent.map(drop)
+            }
             Scope::Tree(call) => target.send_tree(call, crate::containment::TreeStop::of(signal)),
         })
     });
-    match (gated, target.scope()) {
-        (Err(refusal), _) => {
-            target.note_refused(&refusal);
+    match gated {
+        Err(refusal) => {
+            target.note_not_sent(&refusal);
             Err(refusal)
         }
-        (Ok(sent), Scope::Root) => {
-            match &sent {
-                Ok(()) => target.note_root_went_out(signal.name()),
-                Err(refusal) => target.note_refused(refusal),
-            }
-            sent
-        }
-        (Ok(sent), Scope::Tree(_)) => sent,
+        Ok(sent) => sent,
     }
 }
 
@@ -365,7 +390,7 @@ pub fn send_ctrl_break_to_group(target: &StopTarget<'_>) -> Result<(), Error> {
     conclude(
         target,
         CtrlEvent::CtrlBreak.name(),
-        SendOutcome::direct(crate::containment::windows::terminate(child.pid())),
+        SendAnswer::direct(crate::containment::windows::terminate(child.pid())),
     )
 }
 
@@ -408,30 +433,44 @@ fn root_exited(cause: &str, outliving: &str) -> Error {
 #[cfg(windows)]
 fn refuse(target: &StopTarget<'_>, detail: impl Into<String>) -> Error {
     let refusal = unsupported(detail, None);
-    target.note_refused(&refusal);
+    target.note_not_sent(&refusal);
     refusal
 }
 
 /// Windows: a prepared send's end: `sent`, what the send named `name` (`CTRL_BREAK`, `WM_CLOSE`) came to
-/// ([`SendOutcome`] says what each outcome means), left as what the last send did, and, on a tree
+/// ([`SendAnswer`] says what each outcome means), left as what the last send did, and, on a tree
 /// target, handed to the mechanism's route, whose answer is the call's.
 #[cfg(windows)]
-fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendOutcome) -> Result<(), Error> {
+fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendAnswer) -> Result<(), Error> {
     match target.scope() {
-        Scope::Root => match sent {
-            SendOutcome::Sent(answer) => {
-                target.note_root_went_out(name);
-                answer
+        Scope::Root => {
+            // Only a Unix mechanism's send can reach no process: a root send that did reads as one that sent
+            // nothing.
+            debug_assert!(
+                !matches!(sent, SendAnswer::NoneReached(_)),
+                "a Windows send is never `NoneReached`: {sent:?}"
+            );
+            match sent {
+                SendAnswer::Sent(answer) => {
+                    target.note_root_sent(name);
+                    answer
+                }
+                // The event may have gone out, and the answer cannot say.
+                SendAnswer::Unknown(unknown) => {
+                    target.note_root_unknown(name);
+                    Err(unknown)
+                }
+                // Nothing was sent, no stop is named as sent, and no refusal is logged for a root that had exited.
+                SendAnswer::RootExited(_) | SendAnswer::NoneReached(Ok(())) => {
+                    target.note_root_gone();
+                    Ok(())
+                }
+                SendAnswer::NotSent(not_sent) | SendAnswer::NoneReached(Err(not_sent)) => {
+                    target.note_not_sent(&not_sent);
+                    Err(not_sent)
+                }
             }
-            SendOutcome::RootExited(_) => {
-                target.note_root_went_out(name);
-                Ok(())
-            }
-            SendOutcome::NotSent(not_sent) => {
-                target.note_refused(&not_sent);
-                Err(not_sent)
-            }
-        },
+        }
         Scope::Tree(call) => target.send_tree(call, crate::containment::TreeStop::named(name, sent)),
     }
 }
@@ -480,8 +519,15 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendOutcome) -> R
 ///
 /// # Errors
 ///
-/// [`Error::Unsupported`], with nothing sent and, for the first two, nothing started (for a child that
-/// has not exited; see below):
+/// Whether the event went out is the [`SendOutcome`] of the `terminate` or `terminate_tree` that runs this
+/// function ([`StopError::outcome`]), not the error's variant: it is
+/// [`Unknown`](SendOutcome::Unknown) for a proxy that ran and did not confirm its event, one that may have
+/// run ([`Error::MayHaveStarted`]) and one whose exit is no answer, and
+/// [`NotSent`](SendOutcome::NotSent) for every other error, whatever its variant (an
+/// [`Error::Unassessable`] for a child that had exited among them). The variants:
+///
+/// [`Error::Unsupported`], with, for the first two, nothing started (for a child that has not exited; see
+/// below):
 /// - the child is one a system service created on a UAC consent;
 /// - the child has no identity ([`Child::id`](crate::Child::id) is `None`), which the proxy names its
 ///   target by, so that a reused pid is never sent an event;
@@ -494,7 +540,7 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendOutcome) -> R
 ///   looked;
 /// - the program started does not speak this cosca's protocol version, or is no proxy.
 ///
-/// An [`Error::Io`] says nothing was sent: the proxy could not be started, or it failed before it
+/// An [`Error::Io`]: the proxy could not be started, or it failed before it
 /// generated the event. For a proxy that failed a step (`FreeConsole`, `AttachConsole`, the generate, the
 /// open of the child, and the like), the error's text names the step. When the failure was a Win32
 /// error of 16 bits (nearly all are) that is not 0, it is the `source()` of the error, as an `io::Error`
@@ -503,12 +549,11 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendOutcome) -> R
 /// code has the kind `Other` and no source. The proxy carries step
 /// and code in its exit code, so no output of the proxy is read.
 ///
-/// [`Error::Unassessable`] says whether the event was sent is unknown: the proxy
-/// ended without a known answer, or generated the event and did not see its own copy. So does an
-/// [`Error::MayHaveStarted`] from the start of the proxy, which says the proxy may have run.
+/// [`Error::Unassessable`]: the proxy ended without a known answer, or generated the event and did not see
+/// its own copy. [`Error::MayHaveStarted`], from the start of the proxy, says the proxy may have run.
 ///
-/// On a tree target, an error that says the event may have been sent still goes on to the grace and
-/// sweep, with that error as the cooperative error; every other error, `Unsupported` included, ends the
+/// On a tree target, an error whose outcome is [`Unknown`](SendOutcome::Unknown) still goes on to the grace
+/// and sweep, with that error as the cooperative error; every other error, `Unsupported` included, ends the
 /// call as a refused send.
 ///
 /// # A child that has exited

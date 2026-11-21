@@ -112,7 +112,10 @@ fn tree_ops_on_uncontained_child_are_unsupported() {
     cmd.executable(testbin()).args(["cosca_testbin", "exit", "0"]);
     let child = cmd.spawn().expect("spawn");
     assert_eq!(child.containment(), cosca::Containment::None);
-    for r in [child.kill_tree(), child.terminate_tree()] {
+    for r in [
+        child.kill_tree(),
+        child.terminate_tree().map_err(cosca::error::Error::from),
+    ] {
         assert!(
             matches!(r, Err(cosca::error::Error::Unsupported { .. })),
             "uncontained _tree op must be Unsupported, got {r:?}"

@@ -1075,11 +1075,12 @@ fn a_cooperative_signal_reaches_a_group_member_only_the_group_send_names() {
 /// A cooperative sweep pass over a marker holder that is exiting: the holder's identity send is refused
 /// with `EPERM` (the refused-kills seam) while the kernel states its exit begun (`P_WEXIT`, not yet a
 /// zombie), as the group signal just before it can leave a member that handled the signal by exiting.
-/// The holder is delivered, the pass is not `incomplete`, and `finish_sweep` answers `Ok`, not
-/// "teardown may be incomplete". The marker has no group, so the identity send is the pass's only send.
+/// The holder is no gap (the pass is not `incomplete`, and `finish_sweep` answers `Ok`, not "teardown may
+/// be incomplete"), and nothing was delivered to it. The marker has no group, so the identity send is the
+/// pass's only send.
 ///
 /// Mutant: the exit is read for a `SIGKILL`'s `EPERM` only (`signal_by_token`'s old `Sig::Kill` guard):
-/// the holder reads `NotAttempted`, and the sweep is `incomplete`.
+/// the holder reads `NotAttempted`, and the sweep is `incomplete`; or the exiting holder counts as delivered.
 #[skuld::test]
 fn a_cooperative_pass_over_a_holder_whose_exit_began_is_a_complete_sweep() {
     use crate::identity::{FakeKernel, HostKernel};
@@ -1104,7 +1105,7 @@ fn a_cooperative_pass_over_a_holder_whose_exit_began_is_a_complete_sweep() {
     drop(refused);
 
     assert!(found >= 1, "the pass found the holder");
-    assert!(state.delivered, "the holder's send is read as delivered");
+    assert!(!state.delivered, "a holder whose exit began was sent nothing");
     assert!(!state.incomplete, "a holder that is exiting is no gap in the sweep");
     let swept = super::Marker::finish_sweep(marker.handle, state.group_result, state.incomplete, false);
     assert!(swept.is_ok(), "{swept:?}");
@@ -1765,6 +1766,68 @@ fn a_group_send_that_fails_while_a_holder_is_signalled_is_sent() {
     }
 }
 
+/// A holders-only terminate (a root this process does not pin, or whose number may name another process)
+/// of a marker with no holder and no group signalled no process: where the root is merely untrusted the
+/// answer is `NoneReached`, and where its number may name another process it is the skip that ends the
+/// call, whose outcome says nothing went out.
+///
+/// Mutant: a pass that signalled no holder reads as `Sent`.
+#[skuld::test]
+fn a_holders_only_terminate_that_finds_no_holder_sent_nothing() {
+    use crate::containment::TerminateOutcome;
+    use crate::signal::RootState;
+    use crate::stop::SendOutcome;
+
+    let _serialize = test_spawn_lock();
+    let unpinned = crate::test_support::stated_root::StatedRoot::with_state(4242, || RootState::Unpinned);
+    let marker = marker_without_holders(
+        crate::identity::ProcessId::from_parts_for_test(4242, crate::identity::Key::for_test(1)),
+        None,
+        host_kernel(),
+    );
+    let untrusted = marker.terminate_tree(Some(&unpinned), crate::containment::TreeStop::default());
+    assert!(
+        matches!(untrusted, TerminateOutcome::NoneReached { .. }),
+        "no holder was signalled: {untrusted:?}"
+    );
+
+    let reaped = crate::test_support::stated_root::StatedRoot::with_state(4242, || RootState::Reaped);
+    let skipped = marker.terminate_tree(Some(&reaped), crate::containment::TreeStop::default());
+    assert!(
+        matches!(&skipped, TerminateOutcome::HoldersOnly(skip) if skip.outcome() == SendOutcome::NotSent),
+        "no holder was signalled: {skipped:?}"
+    );
+}
+
+/// A member or holder whose exit had begun took no signal: the sweep does not count it as one delivered,
+/// but a kill still waits for it.
+///
+/// Mutant: an exit under way counts as a delivered signal (the pass reads `Sent`), or a kill does not wait
+/// for it.
+#[skuld::test]
+fn a_member_whose_exit_had_begun_is_waited_for_but_is_no_signal_delivered() {
+    use super::KillOutcome;
+    use crate::signal::Sig;
+
+    let id = crate::identity::ProcessId::from_parts_for_test(4242, crate::identity::Key::for_test(1));
+    for (outcome, signal, delivered, waited) in [
+        (KillOutcome::Exited, Sig::Kill, false, true),
+        (
+            KillOutcome::Exited,
+            Sig::Graceful(crate::signal::Signal::Term),
+            false,
+            false,
+        ),
+        (KillOutcome::Terminated, Sig::Kill, true, true),
+    ] {
+        let mut reached = Vec::new();
+        let mut state = super::SweepState::new(&mut reached);
+        state.record(id, signal, &outcome, true);
+        assert_eq!(state.delivered, delivered, "{outcome:?} {signal}");
+        assert_eq!(!reached.is_empty(), waited, "{outcome:?} {signal}");
+    }
+}
+
 /// A kill skipped because the root was reaped elsewhere names what the marker would have done by the
 /// root's number: the walk always, and the group only when the mode made one.
 #[skuld::test]
@@ -1852,7 +1915,15 @@ fn a_chosen_signal_sent_to_a_tree_names_a_group_member_the_caller_may_not_signal
         .terminate_tree()
         .expect_err("the helper refuses the signal, and the tree send says so");
 
-    assert!(matches!(err, crate::error::Error::Containment { .. }), "{err:?}");
+    assert!(
+        matches!(err.error(), crate::error::Error::Containment { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.outcome(),
+        crate::stop::SendOutcome::Sent,
+        "the signal went out, and the check after it found the helper's refusal"
+    );
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
     let said = crate::error::said(&err);
     assert!(said.contains(&format!("pid {helper}: refused the signal")), "{said}");

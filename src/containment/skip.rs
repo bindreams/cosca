@@ -4,6 +4,7 @@
 
 use crate::containment::root::Refusal;
 use crate::error::Error;
+use crate::stop::SendOutcome;
 
 /// What a kill or a terminate skipped because the root's number may not name the root.
 #[derive(Debug)]
@@ -21,6 +22,22 @@ pub(crate) struct Skip {
     /// macOS: the sweep by identity a fd marker still makes of its holders, which no reuse of a pid
     /// redirects. `None`: the mechanism has none.
     pub(crate) holders: Option<Result<(), Error>>,
+    /// macOS: a graceful sweep of the holders reached none, so it sent nothing ([`outcome`](Skip::outcome)):
+    /// the marker had none, or those it had were gone, refused or unassessable ([`holders`](Skip::holders)
+    /// then holds the failure, if there is one).
+    pub(crate) no_holder_reached: bool,
+}
+
+impl Skip {
+    /// How the graceful sweep of the holders went as a send: [`NotSent`](SendOutcome::NotSent) when it
+    /// reached no holder, else [`Sent`](SendOutcome::Sent).
+    pub(crate) fn outcome(&self) -> SendOutcome {
+        if self.no_holder_reached {
+            SendOutcome::NotSent
+        } else {
+            SendOutcome::Sent
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -126,6 +143,21 @@ pub(crate) enum TerminateOutcome {
     /// Nothing was sent: the root has exited, so its children were reparented at its exit (Unix: the walk
     /// found no member), or no event can be named to a member that outlived it (Windows).
     RootExited(Error),
+    /// The send may have gone out, and its answer cannot say (Windows: the console-event proxy's): `error` is
+    /// the answer, and a call that goes on to wait and sweep does, as for [`Sent`](Self::Sent).
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only the Windows console-event proxy's answer is unknown")
+    )]
+    Unknown { error: Error, earlier: Option<String> },
+    /// The send went to no process (the group or the leaf had no member, or every send to a member failed or
+    /// had no member to reach): `result` is what the check after it found, and a call that goes on to wait
+    /// and sweep does, as for [`Sent`](Self::Sent), with no earlier send to name.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only a Unix mechanism's send can reach no process")
+    )]
+    NoneReached { result: Result<(), Error> },
     /// Nothing is sent by the root's number, and nothing else names the tree: the call ends now.
     End(Skip),
     /// Linux: the root's number may name another process, but its handle names it exactly: the caller
@@ -133,7 +165,9 @@ pub(crate) enum TerminateOutcome {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux has a pidfd"))]
     RootThroughPidfd(Skip),
     /// macOS: an fd marker's holders alone were signalled, by the pipe they hold (the result is in
-    /// [`Skip::holders`]): the caller waits the grace and kills any left, and the call ends.
+    /// [`Skip::holders`]): the caller waits the grace and kills any left, and the call ends. Whether the
+    /// signal reached a holder is [`Skip::outcome`]: [`NotSent`](SendOutcome::NotSent) when no holder was
+    /// reached (the marker has none, or every one was gone, exiting, refused or unassessable).
     #[cfg_attr(
         not(target_os = "macos"),
         allow(dead_code, reason = "only a macOS fd marker names its tree by identity")
@@ -144,18 +178,36 @@ pub(crate) enum TerminateOutcome {
 impl TerminateOutcome {
     /// The outcome of a stop's send that went as `sent`, as the tree route takes it. `earlier` names
     /// what a later sweep's error says was sent before it.
-    pub(crate) fn of(sent: SendOutcome, earlier: Option<String>) -> TerminateOutcome {
+    pub(crate) fn of(sent: SendAnswer, earlier: Option<String>) -> TerminateOutcome {
         match sent {
-            SendOutcome::NotSent(not_sent) => TerminateOutcome::NotSent(not_sent),
-            SendOutcome::RootExited(exited) => TerminateOutcome::RootExited(exited),
-            SendOutcome::Sent(result) => TerminateOutcome::Sent { result, earlier },
+            SendAnswer::NotSent(not_sent) => TerminateOutcome::NotSent(not_sent),
+            SendAnswer::RootExited(exited) => TerminateOutcome::RootExited(exited),
+            SendAnswer::Sent(result) => TerminateOutcome::Sent { result, earlier },
+            SendAnswer::Unknown(error) => TerminateOutcome::Unknown { error, earlier },
+            // Nothing was sent, so no later error says a stop was sent before it.
+            SendAnswer::NoneReached(result) => TerminateOutcome::NoneReached { result },
+        }
+    }
+
+    /// The outcome as the answer of a send. Not for a skip (`End`, `RootThroughPidfd`, `HoldersOnly`), which
+    /// no send answers: the caller handles those first.
+    pub(crate) fn into_answer(self) -> SendAnswer {
+        match self {
+            TerminateOutcome::Sent { result, .. } => SendAnswer::Sent(result),
+            TerminateOutcome::NotSent(not_sent) => SendAnswer::NotSent(not_sent),
+            TerminateOutcome::RootExited(exited) => SendAnswer::RootExited(exited),
+            TerminateOutcome::Unknown { error, .. } => SendAnswer::Unknown(error),
+            TerminateOutcome::NoneReached { result } => SendAnswer::NoneReached(result),
+            TerminateOutcome::End(_) | TerminateOutcome::RootThroughPidfd(_) | TerminateOutcome::HoldersOnly(..) => {
+                unreachable!("a skip is no send's answer")
+            }
         }
     }
 }
 
 /// How a stop's send went: the one statement of what a send hands the call that runs it.
 #[derive(Debug)]
-pub(crate) enum SendOutcome {
+pub(crate) enum SendAnswer {
     /// Nothing was sent, for this reason: a refusal, or a failure before the send was made. A root
     /// target records a refusal, and a tree call ends with the error.
     NotSent(Error),
@@ -169,31 +221,57 @@ pub(crate) enum SendOutcome {
     /// the mechanism listed having been asked first. A root target answers `Ok`, as the direct send
     /// answers an exited child.
     RootExited(Error),
-    /// The send went out, or may have. The `Err` is an answer that cannot say it arrived: a tree call
-    /// goes on to its grace and sweep with that error as its cooperative error, and on Windows a root
-    /// target records the send as made. Unix: the `Err` is what the check after the send found
-    /// (`verify`, the marker's sweep).
+    /// The send went out. The `Err` is what a check after it found: a tree call goes on to its grace and
+    /// sweep with that error as its cooperative error. Unix: what `verify` or the marker's sweep found.
     Sent(Result<(), Error>),
+    /// The send may have gone out, and the answer cannot say: the error is that answer. A tree call goes
+    /// on to its grace and sweep with it as its cooperative error, as after [`Sent`](Self::Sent), and a
+    /// root target records the send as made, with an outcome of its own
+    /// ([`SendOutcome::Unknown`]). Only the Windows console-event proxy gives it.
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only the Windows console-event proxy's answer is unknown")
+    )]
+    Unknown(Error),
+    /// The send was made and went to no process: the group or the leaf it names had no member, every send to
+    /// a member failed or found its member gone, or the kernel answered that nothing was there. The `Err` is
+    /// what the check after it found, and a tree call goes on to its grace and sweep as after
+    /// [`Sent`](Self::Sent). Unix: what `verify` or the leaf's sends found.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only a Unix mechanism's send can reach no process")
+    )]
+    NoneReached(Result<(), Error>),
 }
 
-impl SendOutcome {
+impl SendAnswer {
     /// Windows: the outcome of a send whose every error says nothing was sent (the direct `CTRL_BREAK`
     /// to a group).
     #[cfg(windows)]
-    pub(crate) fn direct(sent: Result<(), Error>) -> SendOutcome {
+    pub(crate) fn direct(sent: Result<(), Error>) -> SendAnswer {
         match sent {
-            Ok(()) => SendOutcome::Sent(Ok(())),
-            Err(not_sent) => SendOutcome::NotSent(not_sent),
+            Ok(()) => SendAnswer::Sent(Ok(())),
+            Err(not_sent) => SendAnswer::NotSent(not_sent),
+        }
+    }
+
+    /// How the send went, as a stop's own error says it ([`SendOutcome`]).
+    pub(crate) fn outcome(&self) -> SendOutcome {
+        match self {
+            SendAnswer::NotSent(_) | SendAnswer::RootExited(_) | SendAnswer::NoneReached(_) => SendOutcome::NotSent,
+            SendAnswer::Sent(_) => SendOutcome::Sent,
+            SendAnswer::Unknown(_) => SendOutcome::Unknown,
         }
     }
 
     /// The answer of a tree call that makes this send and nothing else (the Unix group send,
-    /// `terminate_tree`): `Err` when nothing was sent (not sent, or the root had exited), else what the
-    /// send answered. Not for a root target: on Windows it answers an exited root `Ok`.
+    /// `terminate_tree`): `Err` when nothing was sent (not sent, or the root had exited) or the answer is
+    /// an error, else what the send answered. Not for a root target: on Windows it answers an exited root
+    /// `Ok`. The one flattening: `terminate_tree` of a `Child` and of a foreign `Process` both end in it.
     pub(crate) fn into_tree_result(self) -> Result<(), Error> {
         match self {
-            SendOutcome::NotSent(error) | SendOutcome::RootExited(error) => Err(error),
-            SendOutcome::Sent(result) => result,
+            SendAnswer::NotSent(error) | SendAnswer::RootExited(error) | SendAnswer::Unknown(error) => Err(error),
+            SendAnswer::Sent(result) | SendAnswer::NoneReached(result) => result,
         }
     }
 }
@@ -212,7 +290,7 @@ pub(crate) struct TreeStop {
     #[cfg(windows)]
     name: &'static str,
     #[cfg(windows)]
-    sent: SendOutcome,
+    sent: SendAnswer,
 }
 
 #[cfg(unix)]
@@ -231,13 +309,13 @@ impl TreeStop {
 
     /// The stop named `name`, whose send came to `sent`.
     #[cfg(windows)]
-    pub(crate) fn named(name: &'static str, sent: SendOutcome) -> TreeStop {
+    pub(crate) fn named(name: &'static str, sent: SendAnswer) -> TreeStop {
         TreeStop { name, sent }
     }
 
     /// What the send the stop function made came to.
     #[cfg(windows)]
-    pub(crate) fn into_sent(self) -> SendOutcome {
+    pub(crate) fn into_sent(self) -> SendAnswer {
         self.sent
     }
 
@@ -350,7 +428,7 @@ mod call {
             root: Option<Result<Sent, Error>>,
         ) -> Settled<Result<(), Error>> {
             let swept = skip.holders.is_some();
-            let went = self.went(&skip.holders, &root);
+            let went = self.went(&skip.holders, skip.no_holder_reached, &root);
             let root = root.and_then(Result::err);
             let (Settled { answer, killed_again }, over_killed) = self.settle_skip(tree, skip.holders.take());
             if over_killed && skip.moot_after_kill() {
@@ -421,9 +499,27 @@ mod call {
             }
         }
 
+        /// What a graceful sweep that reached no holder says: no marker holder was signalled, and `failure`, the
+        /// sweep's own, if it failed (in full, or only that it did).
+        fn no_holder_signalled(failure: Option<&Error>, in_full: bool) -> String {
+            match failure {
+                None => "no marker holder was signalled".to_owned(),
+                Some(e) if in_full => format!(
+                    "no marker holder was signalled, and the sweep of the holders failed ({})",
+                    crate::error::Report(e)
+                ),
+                Some(_) => "no marker holder was signalled, and the sweep of the holders failed".to_owned(),
+            }
+        }
+
         /// What this call sent: the holders' sweep by identity, or the root through its pidfd, if
         /// anything.
-        fn went(&self, holders: &Option<Result<(), Error>>, root: &Option<Result<Sent, Error>>) -> Went {
+        fn went(
+            &self,
+            holders: &Option<Result<(), Error>>,
+            no_holder_reached: bool,
+            root: &Option<Result<Sent, Error>>,
+        ) -> Went {
             let (sent_root, failed_root) = match self.signal {
                 Sig::Kill => (
                     "killed the root through its pidfd, which names it exactly".to_owned(),
@@ -441,6 +537,20 @@ mod call {
             // members the settlement killed by identity.
             let same = |text: &str| Went::of(text.to_owned(), text.to_owned());
             match (holders, root) {
+                // The pass reached no holder: nothing was delivered, whatever its check found.
+                (Some(swept), _) if no_holder_reached => Went {
+                    nothing: true,
+                    ..Went::of(
+                        format!(
+                            "sent nothing: {}",
+                            Self::no_holder_signalled(swept.as_ref().err(), false)
+                        ),
+                        format!(
+                            "sent nothing: {}",
+                            Self::no_holder_signalled(swept.as_ref().err(), true)
+                        ),
+                    )
+                },
                 (Some(Ok(())), _) => same("signalled the marker holders"),
                 (Some(Err(e)), _) => Went::of(
                     "signalled the marker holders, which failed".to_owned(),
@@ -541,15 +651,25 @@ mod call {
             let name = self.signal;
             // The warn says each failure in full; the returned `Unassessable` says only that it
             // failed, for the failure is a peer of the answer.
+            let holders_failure = skip.holders.as_ref().and_then(|h| h.as_ref().err());
             let sent = |with_errors: bool| {
                 let said = |failure: Option<&Error>| match failure {
                     None => String::new(),
                     Some(e) if with_errors => format!(", which failed ({})", crate::error::Report(e)),
                     Some(_) => ", which failed".to_owned(),
                 };
-                let term = said(skip.holders.as_ref().and_then(|h| h.as_ref().err()));
-                let kill_failed = said(settled.as_ref().err());
-                format!("sent the {name} only to the marker holders{term}, then killed any left after the grace{kill_failed}")
+                let to = if skip.no_holder_reached {
+                    format!(
+                        "sent no {name}: {}",
+                        Self::no_holder_signalled(holders_failure, with_errors)
+                    )
+                } else {
+                    format!("sent the {name} only to the marker holders{}", said(holders_failure))
+                };
+                format!(
+                    "{to}, then killed any left after the grace{}",
+                    said(settled.as_ref().err())
+                )
             };
             let detail = self.skipped_detail(&skip, &sent(false));
             skip.why.warn(&self.skipped_detail(&skip, &sent(true)));

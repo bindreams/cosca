@@ -257,7 +257,10 @@ fn a_seccomp_refused_openat2_makes_kill_tree_and_terminate_tree_of_a_session_uns
         let results = with_openat2_refused(errno, || {
             [
                 ("kill_tree", child.kill_tree()),
-                ("terminate_tree", child.terminate_tree()),
+                (
+                    "terminate_tree",
+                    child.terminate_tree().map_err(cosca::error::Error::from),
+                ),
             ]
         });
         for (call, result) in results {

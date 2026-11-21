@@ -907,6 +907,14 @@ impl Child {
     /// what `stop::send_signal` does on a tree target with its signal. An
     /// action of the caller's own answers as it chooses: the call does nothing else.
     ///
+    /// **What a failure says of the send.** The error is a [`StopError`](crate::stop::StopError): the
+    /// [`Error`](crate::error::Error) the action answered, and its
+    /// [`outcome`](crate::stop::StopError::outcome), how the action's last prepared send went
+    /// ([`SendOutcome`](crate::stop::SendOutcome)):
+    /// - [`Sent`](crate::stop::SendOutcome::Sent): the signal went out to at least one process, whatever the error says of what a check after it found;
+    /// - [`NotSent`](crate::stop::SendOutcome::NotSent): nothing was sent; the error says why;
+    /// - [`Unknown`](crate::stop::SendOutcome::Unknown): whether it went out cannot be told, as for an action that made no prepared send and failed.
+    ///
     /// **Windows: what the default signals.** For a root that leads its group on this process's console
     /// (see [`stop::default`](crate::stop::default)), `CTRL_BREAK` is delivered to the root's **process
     /// group**, not to the tree. A nested contained descendant that leads its own group never receives it,
@@ -927,8 +935,9 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) says the opposite of the proxy's: a root
     /// the default sends through the proxy had exited when the call looked, and nothing was sent (the proxy
     /// cannot name a member that outlived the root), with no proxy started. The variant alone cannot tell
-    /// the two apart; a caller that only wants the tree gone calls [`kill_tree`](Child::kill_tree) after any
-    /// error.
+    /// the two apart; the [`outcome`](crate::stop::StopError::outcome) does ([`NotSent`](crate::stop::SendOutcome::NotSent)
+    /// here, [`Unknown`](crate::stop::SendOutcome::Unknown) for the proxy's). A caller that only wants the tree
+    /// gone calls [`kill_tree`](Child::kill_tree) after any error.
     ///
     /// **macOS `Containment::FdMarker` is stricter than the paragraph above:** `Err` there
     /// means at least one known or suspected tree member could not be assessed or signalled
@@ -979,7 +988,7 @@ impl Child {
     /// # Panics
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
-    pub fn terminate_tree(&self) -> Result<(), Error> {
+    pub fn terminate_tree(&self) -> Result<(), crate::stop::StopError> {
         graceful::shutdown::run_ready(graceful::shutdown::terminate_tree(&graceful::shutdown::BlockingDriver(
             self,
         )))

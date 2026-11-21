@@ -417,8 +417,8 @@ fn a_token_send_refused_for_a_pid_that_names_another_process_is_gone() {
 /// An `EPERM` from a zombie is a process that has exited and is not reaped, as `ESRCH` from one is:
 /// `p_stat` is `SZOMB`, which is not the `Exiting` window.
 ///
-/// Mutant: a zombie's `EPERM` reads as `Exiting`, which every caller reads as delivered, so a holder
-/// of no child waits for an exit that has happened.
+/// Mutant: a zombie's `EPERM` reads as `Exiting`, which every caller reads as [`Sent::Exited`], so a holder
+/// of no child, which reads a zombie as gone, waits for an exit that has happened.
 #[skuld::test]
 fn a_token_send_refused_by_a_zombie_is_exited_unreaped() {
     for sig in kill_and_two_graceful_signals() {
@@ -439,13 +439,14 @@ fn a_token_send_refused_by_a_zombie_is_exited_unreaped() {
     }
 }
 
-/// A held process whose exit has begun reads as signalled: its exit is what the
-/// stop is for, and a kill's wait goes on to wait for it. A zombie, which is gone to a holder of no
+/// A held process whose exit has begun reads as `Exited`: nothing was delivered, and its exit is what the
+/// stop is for, so a kill's wait goes on to wait for it. A zombie, which is gone to a holder of no
 /// child, stays `Gone` (`signal_to_a_zombie_is_gone_after_one_attempt`).
 ///
-/// Mutant: an exiting process is read as `Gone`, so the wait skips it.
+/// Mutants: an exiting process is read as `Gone`, so the wait skips it; as `Delivered`, so a cooperative
+/// stop's record says a signal went out that the kernel refused.
 #[skuld::test]
-fn signal_to_a_process_whose_exit_began_is_delivered() {
+fn signal_to_a_process_whose_exit_began_is_exited() {
     use crate::os_process::open_with;
 
     for sig in kill_and_two_graceful_signals() {
@@ -457,7 +458,7 @@ fn signal_to_a_process_whose_exit_began_is_delivered() {
         let refused = crate::signal::seams::refuse_kills();
         let sent = p.signal(sig);
         drop(refused);
-        assert_eq!(sent.unwrap_or_else(|e| panic!("{sig}: {e}")), Sent::Delivered, "{sig}");
+        assert_eq!(sent.unwrap_or_else(|e| panic!("{sig}: {e}")), Sent::Exited, "{sig}");
     }
 }
 

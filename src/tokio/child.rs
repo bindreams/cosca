@@ -386,7 +386,8 @@ impl Child {
     /// awaits the child's stop action
     /// ([`Command::graceful_stop`](crate::tokio::Command::graceful_stop), else
     /// [`stop::default`](crate::tokio::stop::default)) on a target that stands for the tree, and answers what
-    /// the action answers.
+    /// the action answers, with how its last prepared send went when it failed: the error is a
+    /// [`StopError`](crate::stop::StopError), as for the sync call.
     ///
     /// # Runtime
     ///
@@ -398,7 +399,7 @@ impl Child {
     /// # Panics
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
-    pub async fn terminate_tree(&self) -> Result<(), Error> {
+    pub async fn terminate_tree(&self) -> Result<(), crate::stop::StopError> {
         crate::child::graceful::shutdown::terminate_tree(self).await
     }
 

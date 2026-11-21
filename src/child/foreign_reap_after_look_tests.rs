@@ -77,7 +77,9 @@ fn kill_tree_checks_the_root_again_before_a_send_by_number(#[fixture(stray_signa
 #[skuld::test]
 fn terminate_tree_checks_the_root_again_before_a_send_by_number(#[fixture(stray_signal)] _stray: &Group) {
     let child = zombie_group_root();
-    let (steps, result) = reaped_after_the_look(child.pid(), || child.terminate_tree());
+    let (steps, result) = reaped_after_the_look(child.pid(), || {
+        child.terminate_tree().map_err(crate::error::Error::from)
+    });
     assert_nothing_by_number(&steps);
     assert_reaped_elsewhere(&result.expect_err("a root reaped elsewhere is not assessable"));
 }

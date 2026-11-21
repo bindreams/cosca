@@ -198,11 +198,12 @@ mod macos {
         assert_eq!(log.entries(), [(NEVER_A_PID, Sig::Kill, Via::Identity)]);
     }
 
-    /// A child that has exited and is not reaped is ours, not gone: `Delivered`, as on Linux.
+    /// A child that has exited and is not reaped is ours, not gone, and the kernel took nothing: `Exited`.
     ///
-    /// Mutant: an exited-but-unreaped child is mapped to `Gone`.
+    /// Mutants: an exited-but-unreaped child is mapped to `Gone`; it is mapped to `Delivered`, so a
+    /// cooperative stop's record says a signal went out that the kernel never took.
     #[skuld::test]
-    fn an_exited_unreaped_child_is_delivered() {
+    fn an_exited_unreaped_child_is_exited() {
         let mut child = blocker();
         let identity = read_identity(&HostKernel, child.id()).expect("readable");
         drop(child.stdin.take());
@@ -219,7 +220,7 @@ mod macos {
         assert_eq!(r, 0, "waitid(WNOWAIT): {}", io::Error::last_os_error());
         assert_eq!(
             via_audit_token(&HostKernel, child.id(), identity, Sig::Kill).expect("send"),
-            Sent::Delivered
+            Sent::Exited
         );
     }
 
@@ -239,11 +240,12 @@ mod macos {
     }
 
     /// A child whose exit has begun and that is not yet a zombie answers the token send `EPERM`; it is
-    /// ours and on its way out, so the send is `Delivered`, as for a zombie.
+    /// ours and on its way out, so the send answers `Exited` (nothing delivered, no error), as for a zombie.
     ///
-    /// Mutant: the `EPERM` is surfaced raw, so a stop of a child that is exiting is an error.
+    /// Mutant: the `EPERM` is surfaced raw, so a stop of a child that is exiting is an error; or the send
+    /// answers `Delivered`.
     #[skuld::test]
-    fn a_child_whose_exit_began_is_delivered() {
+    fn a_child_whose_exit_began_is_exited() {
         for sig in crate::test_support::kill_and_two_graceful_signals() {
             let child = blocker();
             let identity = read_identity(&HostKernel, child.id()).expect("readable");
@@ -256,7 +258,7 @@ mod macos {
             drop(refused);
             assert_eq!(
                 sent.unwrap_or_else(|e| panic!("{sig}: an exiting child is no refuser: {e}")),
-                Sent::Delivered,
+                Sent::Exited,
                 "{sig}"
             );
         }

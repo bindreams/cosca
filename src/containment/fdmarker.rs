@@ -845,7 +845,7 @@ use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::sweep_passes::run_passes;
 use crate::containment::treewalk::{KillOutcome, Listing};
-use crate::containment::{Containment, Root, SendOutcome, Skip, TerminateOutcome, TreeKill, TreeStop, Why};
+use crate::containment::{Containment, Root, SendAnswer, Skip, TerminateOutcome, TreeKill, TreeStop, Why};
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
 use crate::signal::Sig;
@@ -873,7 +873,7 @@ struct SweepState<'k> {
     /// Whether a cooperative group signal went unsent: its failure is in `group_result`, and the pass went
     /// on through the other channels.
     group_unsent: bool,
-    /// Whether any signal reached a member by identity or a marker holder.
+    /// Whether any signal reached a member by identity, a marker holder, or the group.
     delivered: bool,
     /// Whether any pass was blind, any holder could not be resolved, or any signal was refused: checked
     /// once, by `finish_sweep`, whichever pass it happened on.
@@ -902,8 +902,9 @@ impl<'k> SweepState<'k> {
     /// for), and only when `waited_for` (the root's owner waits for the root).
     fn record(&mut self, id: ProcessId, signal: Sig, outcome: &KillOutcome, waited_for: bool) {
         match outcome {
-            KillOutcome::Terminated => {
-                self.delivered = true;
+            KillOutcome::Terminated | KillOutcome::Exited => {
+                // A member whose exit had begun took no signal, but a kill waits for its exit.
+                self.delivered |= matches!(outcome, KillOutcome::Terminated);
                 if waited_for && signal == Sig::Kill {
                     self.killed.push(id);
                 }
@@ -1169,8 +1170,9 @@ impl Marker {
         }
     }
 
-    /// What this marker skipped, and why, for `look`: its holders' own signal, `holders`, was sent.
-    fn skip(&self, verb: &str, root_pid: u32, look: NumberLook, holders: Result<(), Error>) -> Skip {
+    /// What this marker skipped, and why, for `look`: its holders' own signal, `holders`, was sent, and
+    /// `none` says it reached no holder.
+    fn skip(&self, verb: &str, root_pid: u32, look: NumberLook, holders: Result<(), Error>, none: bool) -> Skip {
         let why = match look {
             NumberLook::Untrusted(state) => Why::untrusted(&state),
             NumberLook::MayNameAnother { refusal, probe, .. } => Why::MayNameAnother(refusal, probe),
@@ -1182,6 +1184,7 @@ impl Marker {
             action: self.number_named(verb, root_pid),
             why,
             root_alone: false,
+            no_holder_reached: none,
             holders: Some(holders),
         }
     }
@@ -1213,6 +1216,7 @@ impl Marker {
                         root_pid,
                         look,
                         self.hard_kill_impl(Scope::HoldersOnly { except }, &mut killed),
+                        false,
                     )),
                 }
             }
@@ -1239,7 +1243,7 @@ impl Marker {
     /// `terminate_tree()` — a blocking API with no timeout — forever. One pass, matching
     /// `term_group`'s own cooperative, best-effort contract; `hard_kill` (`kill_tree`) is the
     /// guaranteed sweep.
-    fn terminate(&self, root: Option<&dyn Root>, how: TreeStop) -> SendOutcome {
+    fn terminate(&self, root: Option<&dyn Root>, how: TreeStop) -> SendAnswer {
         self.terminate_impl(Scope::Full(root), how)
     }
 
@@ -1265,24 +1269,42 @@ impl Marker {
         match look {
             NumberLook::Trusted => TerminateOutcome::of(self.terminate(root, how), earlier),
             NumberLook::Untrusted(_) => TerminateOutcome::of(holders_only(except), earlier),
-            look => match holders_only(None) {
-                SendOutcome::Sent(result) => TerminateOutcome::HoldersOnly(self.skip("signal", root_pid, look, result)),
-                // `terminate_impl` yields no `RootExited`.
-                SendOutcome::NotSent(not_sent) | SendOutcome::RootExited(not_sent) => {
-                    TerminateOutcome::NotSent(not_sent)
+            look => {
+                let answer = holders_only(None);
+                // Only the Windows console-event proxy's answer is unknown.
+                debug_assert!(
+                    !matches!(answer, SendAnswer::Unknown(_)),
+                    "a marker's holders-only send is never unknown: {answer:?}"
+                );
+                match answer {
+                    SendAnswer::Sent(result) => {
+                        TerminateOutcome::HoldersOnly(self.skip("signal", root_pid, look, result, false))
+                    }
+                    // The pass reached no holder (it had none, or those it had were gone, refused or unassessable):
+                    // the call still ends as for a skip, with nothing sent.
+                    SendAnswer::NoneReached(result) => {
+                        TerminateOutcome::HoldersOnly(self.skip("signal", root_pid, look, result, true))
+                    }
+                    // `terminate_impl` yields no `RootExited`, and no unknown answer.
+                    SendAnswer::NotSent(error) | SendAnswer::RootExited(error) | SendAnswer::Unknown(error) => {
+                        TerminateOutcome::NotSent(error)
+                    }
                 }
-            },
+            }
         }
     }
 
-    /// One pass of `scope` with the stop `how`'s signal: [`NotSent`](SendOutcome::NotSent) is a signal
+    /// One pass of `scope` with the stop `how`'s signal: [`NotSent`](SendAnswer::NotSent) is a signal
     /// never sent (a read end that no longer names its pipe, or a group that cannot be signalled while
-    /// no other channel sent anything), [`Sent`](SendOutcome::Sent) what the pass found. A group that
-    /// cannot be signalled is one failed channel: when another channel sent, its failure is among what
-    /// the pass found. Never [`RootExited`](SendOutcome::RootExited): the marker looks at no walk.
-    fn terminate_impl(&self, scope: Scope<'_>, how: TreeStop) -> SendOutcome {
+    /// no other channel sent anything), [`Sent`](SendAnswer::Sent) what the pass found when a signal
+    /// reached a process (a holder, a walked member, or the group), and
+    /// [`NoneReached`](SendAnswer::NoneReached) what it found when none did (a holders-only scope in which no holder was
+    /// reached: none, or every one gone, exiting, refused or unassessable; no group). A group that cannot be signalled is one failed channel: when another channel
+    /// sent, its failure is among what the pass found. Never [`RootExited`](SendAnswer::RootExited): the
+    /// marker looks at no walk.
+    fn terminate_impl(&self, scope: Scope<'_>, how: TreeStop) -> SendAnswer {
         if let Err(stale) = self.check_read_end_still_valid() {
-            return SendOutcome::NotSent(stale);
+            return SendAnswer::NotSent(stale);
         }
         // A cooperative signal is not a kill: nothing it reaches is waited for.
         let mut reached = Vec::new();
@@ -1292,8 +1314,9 @@ impl Marker {
         match swept {
             // Nothing was sent: the group's failure and the members that refused or could not be assessed
             // are all `finish_sweep` found.
-            Err(unsent) if state.group_unsent && !state.delivered => SendOutcome::NotSent(unsent),
-            swept => SendOutcome::Sent(swept),
+            Err(unsent) if state.group_unsent && !state.delivered => SendAnswer::NotSent(unsent),
+            swept if state.delivered => SendAnswer::Sent(swept),
+            swept => SendAnswer::NoneReached(swept),
         }
     }
 
@@ -1462,9 +1485,9 @@ impl Marker {
             seen,
             group_result,
             group_unsent,
+            delivered,
             incomplete,
             killed,
-            ..
         } = state;
         let walk = matches!(scope, Scope::Full(_));
         let group_root = match scope {
@@ -1640,10 +1663,22 @@ impl Marker {
                 let this_pass_group_result: Result<(), Error> = match (self.pgid, signal) {
                     (Some(pgid), Sig::Kill) => crate::containment::unix::kill_group(pgid, group_root, killed),
                     (Some(pgid), Sig::Graceful(signal)) => {
-                        match crate::containment::unix::term_group_sent(pgid, group_root, signal) {
-                            SendOutcome::Sent(checked) => checked,
-                            // `term_group_sent` yields no `RootExited`.
-                            SendOutcome::NotSent(unsent) | SendOutcome::RootExited(unsent) => {
+                        let answer = crate::containment::unix::term_group_sent(pgid, group_root, signal);
+                        // Only the Windows console-event proxy's answer is unknown.
+                        debug_assert!(
+                            !matches!(answer, SendAnswer::Unknown(_)),
+                            "a marker's group send is never unknown: {answer:?}"
+                        );
+                        match answer {
+                            SendAnswer::Sent(checked) => {
+                                *delivered = true;
+                                checked
+                            }
+                            SendAnswer::NoneReached(checked) => checked,
+                            // `term_group_sent` yields no `RootExited`, and no unknown answer.
+                            SendAnswer::NotSent(unsent)
+                            | SendAnswer::RootExited(unsent)
+                            | SendAnswer::Unknown(unsent) => {
                                 *group_unsent = true;
                                 Err(unsent)
                             }
@@ -1794,7 +1829,7 @@ impl Marker {
                 // From the outcome, after the call: a kill that re-verified a different process, or
                 // sent nothing, leaves no record of a holder killed.
                 #[cfg(test)]
-                if matches!(outcome, KillOutcome::Terminated) {
+                if matches!(outcome, KillOutcome::Terminated | KillOutcome::Exited) {
                     fault::note_holder_kill(id.pid(), signal.as_nix());
                 }
                 Some(outcome)

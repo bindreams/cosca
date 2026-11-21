@@ -799,11 +799,17 @@ fn io_error<'a>(layer: &'a (dyn std::error::Error + 'static)) -> Option<&'a std:
 
 /// The [`Error`] a layer of a chain is: an `Error`, or the `Arc<Error>` a holder keeps its cause as
 /// and lends as its `source()`. The `Arc` forwards its `Display` and `source()` to the error it
-/// holds, so it is that error's layer.
+/// holds, so it is that error's layer; so does a [`StopError`](crate::stop::StopError), which is
+/// transparent.
 fn cosca_error<'a>(layer: &'a (dyn std::error::Error + 'static)) -> Option<&'a Error> {
     layer
         .downcast_ref::<Error>()
         .or_else(|| layer.downcast_ref::<Arc<Error>>().map(|held| &**held))
+        .or_else(|| {
+            layer
+                .downcast_ref::<crate::stop::StopError>()
+                .map(crate::stop::StopError::error)
+        })
 }
 
 /// An error as one line: every layer of its `source()` chain, each layer's `Display` joined with

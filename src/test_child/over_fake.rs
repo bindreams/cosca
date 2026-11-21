@@ -59,7 +59,7 @@ fn stated_break(target: &crate::StopTarget<'_>) -> Result<(), crate::error::Erro
             call,
             crate::containment::TreeStop::named(
                 crate::stop::proxy::protocol::CtrlEvent::CtrlBreak.name(),
-                crate::containment::SendOutcome::Sent(Ok(())),
+                crate::containment::SendAnswer::Sent(Ok(())),
             ),
         ),
     }
@@ -95,6 +95,7 @@ pub(crate) fn holders_only_skip(child: &Child) -> crate::containment::Skip {
         action: "signal its process group".to_owned(),
         why: Why::MayNameAnother(Refusal::Unpinned(child.pid()), None),
         root_alone: false,
+        no_holder_reached: false,
         holders: Some(Ok(())),
     }
 }

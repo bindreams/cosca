@@ -98,7 +98,7 @@ fn terminate_places_a_pinned_member_through_the_kernel_the_leaf_was_given() {
     let result = leaf.terminate_member(STATED, &subtree, crate::signal::Signal::Term);
 
     assert!(
-        matches!(result, Ok(())),
+        matches!(result, Ok(crate::signal::Sent::Gone)),
         "a pinned member outside the leaf is not signalled, and is no error"
     );
 }

@@ -57,7 +57,15 @@ async fn async_tree_ops_unsupported_when_uncontained() {
     let err = child.kill_tree().await.expect_err("uncontained kill_tree");
     assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
     let err = child.terminate_tree().await.expect_err("uncontained terminate_tree");
-    assert!(matches!(err, cosca::error::Error::Unsupported { .. }), "got {err:?}");
+    assert!(
+        matches!(err.error(), cosca::error::Error::Unsupported { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(
+        err.outcome(),
+        cosca::stop::SendOutcome::NotSent,
+        "the refusal is before any send"
+    );
     common::kill_release_reap_async(&mut child, sock).await;
 }
 
@@ -180,7 +188,7 @@ async fn async_terminate_unsupported_for_an_uncontained_child_on_windows() {
         .terminate()
         .await
         .expect_err("a child that leads no group cannot be addressed");
-    common::assert_refused_for_no_group(&err);
+    common::assert_refused_for_no_group(err.error());
     common::kill_release_reap_async(&mut child, sock).await;
 }
 
@@ -377,7 +385,7 @@ async fn async_child_terminate_reports_ok_for_an_already_exited_child() {
             .terminate()
             .await
             .expect_err("a child on our console that leads no group is refused, exited or not");
-        common::assert_refused_for_no_group(&err);
+        common::assert_refused_for_no_group(err.error());
     }
 }
 
@@ -507,8 +515,8 @@ async fn async_default_answers_match_the_sync_surface_on_our_console() {
 /// says the child "leads no console process group" is the direct send's refusal of a child that leads no
 /// group; the proxy's own refusal (`ConsoleIsCallers`) names `Command::new_process_group` too, and is told
 /// from it by that phrase.
-fn refusal_shape(result: &Result<(), cosca::error::Error>) -> &'static str {
-    match result {
+fn refusal_shape(result: &Result<(), cosca::stop::StopError>) -> &'static str {
+    match result.as_ref().map_err(cosca::stop::StopError::error) {
         Ok(()) => "ok",
         Err(cosca::error::Error::Unsupported { detail, .. })
             if detail.contains("leads no console process group") && detail.contains("Command::new_process_group") =>

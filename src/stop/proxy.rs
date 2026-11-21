@@ -26,7 +26,7 @@ use protocol::{exit_text, Cause, CtrlEvent, ProxyAnswer, ProxyArgs, ProxyExit, V
 #[cfg(windows)]
 use super::{conclude, refuse, root_exited, unsupported, StopTarget, StopWaits, ELEVATED_REFUSAL, REMEDIES};
 #[cfg(windows)]
-use crate::containment::SendOutcome;
+use crate::containment::SendAnswer;
 #[cfg(windows)]
 use crate::error::Error;
 #[cfg(windows)]
@@ -156,7 +156,7 @@ pub(crate) async fn send<D: StopWaits>(driver: &D, target: &StopTarget<'_>, even
             return conclude(
                 target,
                 event.name(),
-                SendOutcome::RootExited(root_exited(
+                SendAnswer::RootExited(root_exited(
                     &format!(
                         "the child (pid {}) had exited when cosca looked, before the console-event proxy was started",
                         target.pid()
@@ -165,7 +165,7 @@ pub(crate) async fn send<D: StopWaits>(driver: &D, target: &StopTarget<'_>, even
                 )),
             )
         }
-        Err(look_failed) => return conclude(target, event.name(), SendOutcome::NotSent(look_failed)),
+        Err(look_failed) => return conclude(target, event.name(), SendAnswer::NotSent(look_failed)),
     }
     let (id, exe): (ProcessId, std::borrow::Cow<'_, Path>) = match plan {
         Plan::RefuseElevated => return Err(refuse(target, ELEVATED_REFUSAL)),
@@ -192,10 +192,10 @@ async fn ask<D: StopWaits>(
     event: CtrlEvent,
     id: &ProcessId,
     exe: &Path,
-) -> SendOutcome {
+) -> SendAnswer {
     let record = match id.to_record() {
         Ok(record) => record,
-        Err(e) => return SendOutcome::NotSent(e),
+        Err(e) => return SendAnswer::NotSent(e),
     };
     debug_assert_eq!(record.pid, target.pid(), "the child's identity names the child");
     let args = ProxyArgs {
@@ -204,6 +204,9 @@ async fn ask<D: StopWaits>(
         event,
         caller: std::process::id(),
     };
+    // From the start the proxy may send, and a dropped call never reaches `conclude`: the record says so
+    // until `conclude` replaces it.
+    target.note_may_have_sent(event.name());
     // The target borrows the child, which holds its process handle: the pid stays this child's until
     // the call returns, whatever the child does.
     let (proxy_pid, mut proxy) = match driver.start_proxy(exe, &args).await {
@@ -223,18 +226,18 @@ async fn ask<D: StopWaits>(
         Err(e) => return wait_failed(proxy_pid, event, e),
     };
     let Some(code) = status.code() else {
-        return SendOutcome::Sent(Err(Error::Unassessable {
+        return SendAnswer::Unknown(Error::Unassessable {
             detail: format!(
                 "the console-event proxy (pid {proxy_pid}) ended without an exit code ({status}), so whether {} \
                  was sent is unknown",
                 event.name()
             ),
             source: None,
-        }));
+        });
     };
     if code == crate::role::UNKNOWN_HELPER_ROLE {
         // The helper refused the role cosca named: it never played one, so nothing was sent.
-        return SendOutcome::NotSent(unsupported(
+        return SendAnswer::NotSent(unsupported(
             format!(
                 "the program started as the console-event proxy ({}) refused the helper role this cosca named \
              (exit {code}): it knows no `{}` role, so nothing was sent. {SAME_COSCA_PROXY}",
@@ -245,7 +248,7 @@ async fn ask<D: StopWaits>(
         ));
     }
     let Some(exit) = ProxyExit::from_code(code) else {
-        return SendOutcome::Sent(Err(Error::Unassessable {
+        return SendAnswer::Unknown(Error::Unassessable {
             detail: format!(
                 "the console-event proxy {} (pid {proxy_pid}) exited with code {}, which is no answer of its \
                  protocol, so whether {} was sent is unknown",
@@ -254,7 +257,7 @@ async fn ask<D: StopWaits>(
                 event.name()
             ),
             source: None,
-        }));
+        });
     };
     #[cfg(test)]
     crate::containment::windows::observe::record_ctrl_send(crate::containment::windows::observe::CtrlSend::Proxy {
@@ -284,8 +287,8 @@ pub(crate) fn configure_start(command: &mut crate::Command, exe: &Path, args: &P
 
 /// This program's own path cannot be read, to start it as the proxy.
 #[cfg(windows)]
-fn exe_unreadable(e: std::io::Error) -> SendOutcome {
-    SendOutcome::NotSent(Error::Io(crate::error::io_context(
+fn exe_unreadable(e: std::io::Error) -> SendAnswer {
+    SendAnswer::NotSent(Error::Io(crate::error::io_context(
         "nothing was sent: this program's own path cannot be read, to start it as the proxy",
         e,
     )))
@@ -294,10 +297,10 @@ fn exe_unreadable(e: std::io::Error) -> SendOutcome {
 /// The proxy could not be started, as `e` says. A proxy that may have started may have sent, so its error
 /// keeps that meaning.
 #[cfg(windows)]
-fn start_failed(exe: &Path, e: Error) -> SendOutcome {
+fn start_failed(exe: &Path, e: Error) -> SendAnswer {
     match e {
-        may_have_started @ Error::MayHaveStarted { .. } => SendOutcome::Sent(Err(may_have_started)),
-        not_started => SendOutcome::NotSent(not_started.in_step(&format!(
+        may_have_started @ Error::MayHaveStarted { .. } => SendAnswer::Unknown(may_have_started),
+        not_started => SendAnswer::NotSent(not_started.in_step(&format!(
             "nothing was sent: the console-event proxy {} could not be started",
             exe.display()
         ))),
@@ -307,15 +310,15 @@ fn start_failed(exe: &Path, e: Error) -> SendOutcome {
 /// The wait for the proxy `proxy_pid` failed, as `e` says. The proxy's [`Child`](crate::Child) is dropped
 /// with the failure, which kills it.
 #[cfg(windows)]
-fn wait_failed(proxy_pid: u32, event: CtrlEvent, e: Error) -> SendOutcome {
-    SendOutcome::Sent(Err(Error::Unassessable {
+fn wait_failed(proxy_pid: u32, event: CtrlEvent, e: Error) -> SendAnswer {
+    SendAnswer::Unknown(Error::Unassessable {
         detail: format!(
             "the wait for the console-event proxy (pid {proxy_pid}) failed, so whether {} was sent is \
              unknown; cosca ended the proxy when the wait failed",
             event.name()
         ),
         source: Some(Arc::new(e)),
-    }))
+    })
 }
 
 /// The error of a proxy that sent nothing because a step failed. See [`send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy) for its text, kind
@@ -349,17 +352,17 @@ async fn result_of<D: StopWaits>(
     event: CtrlEvent,
     exe: &Path,
     exit: ProxyExit,
-) -> SendOutcome {
+) -> SendAnswer {
     let sent = event.name();
     let answer = match exit {
         ProxyExit::Answer(answer) => answer,
-        ProxyExit::Cause(cause) => return SendOutcome::NotSent(Error::Io(failed_step(cause, sent))),
+        ProxyExit::Cause(cause) => return SendAnswer::NotSent(Error::Io(failed_step(cause, sent))),
     };
     let code = answer.code();
     // The attach did not succeed, and the child had not exited when cosca looked: the child's own exit
     // is the one thing the proxy's answer cannot say.
     let attach_refused = |cause: &str, remedies: &str| {
-        SendOutcome::NotSent(unsupported(
+        SendAnswer::NotSent(unsupported(
             format!(
                 "the console-event proxy's attach to the child's console did not succeed (answer {answer:?}, exit \
              {code}), and the child had not exited when cosca looked, so nothing was sent. {cause} {remedies}"
@@ -367,13 +370,13 @@ async fn result_of<D: StopWaits>(
             None,
         ))
     };
-    let not_sent = |error: Error| SendOutcome::NotSent(error);
+    let not_sent = |error: Error| SendAnswer::NotSent(error);
     match answer {
-        ProxyAnswer::Sent => SendOutcome::Sent(Ok(())),
+        ProxyAnswer::Sent => SendAnswer::Sent(Ok(())),
         ProxyAnswer::TargetGone | ProxyAnswer::AttachDenied | ProxyAnswer::TargetHasNoConsole => {
             match driver.root_exited(Duration::ZERO).await {
                 Err(look_failed) => not_sent(look_failed),
-                Ok(true) => SendOutcome::RootExited(root_exited(
+                Ok(true) => SendAnswer::RootExited(root_exited(
                     &format!(
                         "the console-event proxy's attach to the console of the child (pid {}) did not succeed \
                          (answer {answer:?}, exit {code}), and the child had exited when cosca looked",
@@ -417,13 +420,13 @@ async fn result_of<D: StopWaits>(
             ),
             None,
         )),
-        ProxyAnswer::Unconfirmed => SendOutcome::Sent(Err(Error::Unassessable {
+        ProxyAnswer::Unconfirmed => SendAnswer::Unknown(Error::Unassessable {
             detail: format!(
                 "the console-event proxy generated the {sent} and did not see its own copy of it (answer \
                  {answer:?}, exit {code}), so whether the child received it is unknown"
             ),
             source: None,
-        })),
+        }),
     }
 }
 

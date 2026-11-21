@@ -17,7 +17,7 @@ use crate::containment::TreeDrain;
 use crate::error::Error;
 #[cfg(target_os = "macos")]
 use crate::os_process::child::Foreign;
-use crate::stop::{StopTarget, StopWaits, TreeCall};
+use crate::stop::{SendOutcome, StopError, StopTarget, StopWaits, TreeCall};
 
 /// What the four stop calls need of a driver: the stop action's run, and the waits [`shutdown_lone`] and
 /// [`shutdown_tree`] make, beside the root's exit look of [`StopWaits`]. A deadline is a `Duration` from the
@@ -120,7 +120,7 @@ pub(crate) fn run_ready<F: Future>(f: F) -> F::Output {
     }
 }
 
-/// What `op` answers for the root's reap, `outcome`, once its signals went out: the status, or the
+/// What `op` answers for the root's reap, `outcome`, once its stop is done: the status, or the
 /// reap's failure, or, for a root this process cannot collect, [`Error::Unassessable`] saying so. A
 /// zombie launchd holds is the macOS refusal ([`unpinned_status`](crate::signal::unpinned_status));
 /// a root reaped elsewhere (or whose pid names another process now) is the same, with the `ECHILD`
@@ -138,8 +138,7 @@ fn graceful_status_of_reap(pid: u32, op: &str, outcome: Result<ChildWaitOutcome,
             log::debug!("{op}({pid}): the root was reaped elsewhere");
             Err(Error::Unassessable {
                 detail: format!(
-                    "pid {pid}: {op} sent its signals, but its exit status cannot be collected: the root was \
-                     reaped elsewhere"
+                    "pid {pid}: {op}: the root's exit status cannot be collected: the root was reaped elsewhere"
                 ),
                 source: Some(std::sync::Arc::new(Error::Io(echild()))),
             })
@@ -148,21 +147,29 @@ fn graceful_status_of_reap(pid: u32, op: &str, outcome: Result<ChildWaitOutcome,
     }
 }
 
-/// [`Child::terminate`](crate::Child::terminate), for any [`Waits`].
-pub(crate) async fn terminate<W: Waits>(w: &W) -> Result<(), Error> {
-    w.stop(&StopTarget::root(w.child())).await
+/// [`Child::terminate`](crate::Child::terminate), for any [`Waits`]: the action's answer, with how its last
+/// prepared send went when it failed.
+pub(crate) async fn terminate<W: Waits>(w: &W) -> Result<(), StopError> {
+    let target = StopTarget::root(w.child());
+    let acted = w.stop(&target).await;
+    target.into_stop_result(acted)
 }
 
 /// [`Child::terminate_tree`](crate::Child::terminate_tree), for any [`Waits`].
-pub(crate) async fn terminate_tree<W: Waits>(w: &W) -> Result<(), Error> {
-    w.child().require_contained()?;
+pub(crate) async fn terminate_tree<W: Waits>(w: &W) -> Result<(), StopError> {
+    // Before the action runs, so nothing was sent.
+    w.child()
+        .require_contained()
+        .map_err(|refused| StopError::new(refused, SendOutcome::NotSent))?;
     // A separate `terminate_tree` is no call that sweeps: it holds its members for the next kill.
-    w.stop(&StopTarget::tree(w.child(), TreeCall::SignalOnly)).await
+    let target = StopTarget::tree(w.child(), TreeCall::SignalOnly);
+    let acted = w.stop(&target).await;
+    target.into_stop_result(acted)
 }
 
 /// [`terminate`] with what the action said it sent, for the kill after the grace; see
 /// [`Child::after_root_stop`].
-pub(crate) async fn stop_root<W: Waits>(w: &W) -> (Result<(), Error>, String) {
+pub(crate) async fn stop_root<W: Waits>(w: &W) -> (Result<(), Error>, Option<String>) {
     let target = StopTarget::root(w.child());
     let stopped = w.stop(&target).await;
     w.child().after_root_stop(target, stopped)
@@ -200,7 +207,7 @@ pub(crate) async fn shutdown_lone<W: Waits>(w: &mut W, grace: Duration) -> Resul
     let watch = crate::graceful::after_grace(call, watch, || {
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeEscalation);
-        w.child().kill_after(Some(&earlier))
+        w.child().kill_after(earlier.as_deref())
     })?;
     #[cfg(test)]
     fault::run_hook(fault::HookPoint::BeforeReap);

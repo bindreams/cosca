@@ -33,6 +33,7 @@ fn skipped_kill(action: &str, holders: Option<Result<(), crate::error::Error>>) 
         action: action.into(),
         why: crate::containment::skip::Why::MayNameAnother(crate::containment::root::Refusal::ReapedElsewhere(1), None),
         root_alone: false,
+        no_holder_reached: false,
         holders,
     })
 }
@@ -2726,6 +2727,27 @@ fn swept_in(
 
 fn io_error(code: i32) -> crate::error::Error {
     crate::error::Error::Io(std::io::Error::from_raw_os_error(code))
+}
+
+/// A kill through the root's handle ended the root when it was delivered, found the exit begun
+/// (`Exited`, macOS) or found the root gone; one that could not be verified, or failed, may have left it
+/// running.
+///
+/// Mutant: `Exited` is not among the kills that ended the root.
+#[skuld::test]
+fn a_root_kill_ended_the_root_when_it_delivered_found_the_exit_begun_or_found_it_gone() {
+    use crate::signal::Sent;
+
+    let ended = |sent| super::SweepFailure::killed_root(&sent);
+    assert!(ended(Ok(Sent::Delivered)));
+    assert!(ended(Ok(Sent::Exited)));
+    assert!(ended(Ok(Sent::Gone)));
+    assert!(!ended(Ok(Sent::Unverified)));
+    assert!(!ended(Err(io_error(CODES[0]))));
+    for sent in [Ok(Sent::Exited), Ok(Sent::Delivered)] {
+        let (answer, root_ended) = super::SweepFailure::backstop_of(sent);
+        assert!(answer.is_ok() && root_ended);
+    }
 }
 
 /// A root that the walk left and the backstop could not kill either is one member, whose cause holds

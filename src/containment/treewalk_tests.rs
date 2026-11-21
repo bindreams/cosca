@@ -84,7 +84,7 @@ fn an_unverified_send_is_not_attempted_in_release() {
 }
 
 /// The one reading of a send's answer, for a walk's members and the root alike. Mutants: a refusal
-/// is read as delivered or gone.
+/// is read as delivered or gone; an exit under way is read as delivered, or as gone (a kill would not wait for it).
 #[skuld::test]
 fn a_sends_answer_is_one_outcome_whoever_sent() {
     use super::KillOutcome;
@@ -92,6 +92,7 @@ fn a_sends_answer_is_one_outcome_whoever_sent() {
 
     assert!(matches!(KillOutcome::of(Ok(Sent::Delivered)), KillOutcome::Terminated));
     assert!(matches!(KillOutcome::of(Ok(Sent::Gone)), KillOutcome::AlreadyGone));
+    assert!(matches!(KillOutcome::of(Ok(Sent::Exited)), KillOutcome::Exited));
     match KillOutcome::of(Err(Error::Io(std::io::Error::from(
         std::io::ErrorKind::PermissionDenied,
     )))) {
@@ -1538,6 +1539,40 @@ fn terminate_warns_once_of_a_member_that_refuses_the_signal(#[fixture(setuid)] _
     assert!(warned[0].contains(&os.to_string()), "{warned:?}");
     drop(stdin);
     child.wait().expect("reap the root");
+}
+
+/// A `SIGTERM` walk whose every send found its process gone, or with its exit under way (the root's handle
+/// answers `Gone` or `Exited`, and the root has no member), went out to no process: the answer says so, and
+/// it still carries the walk's listing.
+///
+/// Mutants: the walk answers `Sent` whatever its sends reached; a root whose exit is under way, which
+/// took no signal, counts as one that did.
+#[cfg(unix)]
+#[skuld::test]
+fn a_terminate_whose_every_send_found_its_process_gone_sent_to_nobody() {
+    for answered in [crate::signal::Sent::Gone, crate::signal::Sent::Exited] {
+        let (child, stdin) = crate::test_child::held_uncontained_blocker(false);
+        let id = child.id().expect(crate::test_child::IDENTITY_READ);
+        let kernel = crate::identity::HostKernel;
+        let held =
+            crate::test_support::stated_root::StatedRoot::with_state(id.pid(), || crate::signal::RootState::Unreaped)
+                .answering(answered);
+
+        let (answer, listing) = super::terminate(&kernel, id, &held, crate::containment::TreeStop::default());
+
+        assert_eq!(
+            answer.outcome(),
+            crate::stop::SendOutcome::NotSent,
+            "{answered:?}: {answer:?}"
+        );
+        assert!(
+            matches!(answer, super::SendAnswer::NoneReached(Ok(()))) && listing.is_some(),
+            "the walk's listing is beside the answer: {answered:?}: {answer:?}"
+        );
+        drop(stdin);
+        let status = child.wait().expect("the blocker ends at its stdin's EOF");
+        assert!(status.success(), "nothing signalled the blocker: {status:?}");
+    }
 }
 
 /// `kill_by_identity` must terminate only the process whose START TOKEN matches. A stale

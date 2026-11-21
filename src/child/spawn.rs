@@ -286,7 +286,7 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                     report.fold_clause(torn),
                 )
             }
-            Ok(crate::signal::Sent::Delivered) => {
+            Ok(crate::signal::Sent::Delivered | crate::signal::Sent::Exited) => {
                 #[cfg(test)]
                 fault::run_between_kill_and_wait();
                 let settlement = Settlement::new(wait_killed_elevated(&child), true);
@@ -1176,8 +1176,8 @@ fn unwatched_child_fate(
         );
     }
     match via_audit_token(kernel, pid, Some(unique), Sig::Kill) {
-        // `Delivered` includes a send refused because the exit had begun.
-        Ok(Sent::Delivered) => (
+        // `Exited` is a send that found the exit begun.
+        Ok(Sent::Delivered | Sent::Exited) => (
             ChildFate::Killed,
             "it was sent SIGKILL, or its exit had begun when the send was made".to_owned(),
             None,

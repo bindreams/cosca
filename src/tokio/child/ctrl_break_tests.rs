@@ -179,8 +179,8 @@ impl Call {
     ) -> Result<Option<std::process::ExitStatus>, Error> {
         never_blocking(async {
             match self {
-                Call::Terminate => child.terminate().await.map(|()| None),
-                Call::TerminateTree => child.terminate_tree().await.map(|()| None),
+                Call::Terminate => child.terminate().await.map(|()| None).map_err(Error::from),
+                Call::TerminateTree => child.terminate_tree().await.map(|()| None).map_err(Error::from),
                 Call::GracefulShutdown => child.graceful_shutdown(grace).await.map(Some),
                 Call::GracefulShutdownTree => child.graceful_shutdown_tree(grace).await.map(Some),
             }
