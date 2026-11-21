@@ -994,7 +994,11 @@ impl Command {
     ///   with [`std::io::ErrorKind::InvalidInput`], since whether the launch expands it is
     ///   unmeasured. These hold whether or not the caller is already elevated.
     ///
-    /// An already-root caller runs no backend and spawns argv as it would unelevated.
+    /// An already-root caller runs no backend and spawns argv as it would unelevated, whatever the
+    /// state of the elevation program or terminal; its `Auth` is never used (an `Auth::Stdin`
+    /// password is never read). A request the platform refuses is refused for every caller, and so is
+    /// what [`Backend::Auto`](crate::elevation::Backend::Auto) cannot decide under `Auth::Stdin` or
+    /// `Auth::Askpass` (see there).
     pub fn elevate(&mut self) -> &mut Command {
         self.elevation.enabled = true;
         self

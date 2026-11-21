@@ -52,8 +52,9 @@ pub enum FrontState {
     /// the validated path is exactly the one argv[0] emits.
     Found(PathBuf),
     /// The search stopped on an entry it could not examine (`error`), so whether the front is there
-    /// is unknown. The planner reports it, as the cause of `BackendUnavailable`, only if it needs
-    /// the front.
+    /// is unknown. `error` is the cause of the `BackendUnavailable` the planner reports when the plan
+    /// picks this front for a caller that is not elevated, or leaves the request
+    /// [`StructuralOutcome::Undecided`].
     #[cfg_attr(
         not(unix),
         allow(dead_code, reason = "only the POSIX detection finds a front it cannot examine")
@@ -191,14 +192,20 @@ impl Host {
         if target != Privilege::Elevated {
             return Transition::RunAsIs;
         }
-        // Structural matrix — privilege-independent, BEFORE the already-elevated
-        // short-circuit, so an impossible combo never passes under root.
+        // Runs BEFORE the already-elevated short-circuit, so an impossible request never passes under
+        // root and an undecided one is not run as is.
         let structural = match self.os {
             Os::Windows => structural_windows(backend, &auth),
             os => structural_posix(os, backend, &auth, self),
         };
-        if let Some(error) = structural {
-            return Transition::Reject { error };
+        match structural {
+            StructuralOutcome::Valid => {}
+            StructuralOutcome::Invalid(error) => return Transition::Reject { error },
+            StructuralOutcome::Undecided { open, error } => {
+                return Transition::Reject {
+                    error: undecided_by_front(open, error),
+                }
+            }
         }
         if self.elevated {
             return Transition::RunAsIs;
@@ -298,6 +305,17 @@ fn unexamined(program: &str, error: &std::sync::Arc<Error>) -> Error {
     )
 }
 
+/// The `BackendUnavailable` for an undecided structural outcome; `error` is the cause.
+fn undecided_by_front(open: Backend, error: std::sync::Arc<Error>) -> Error {
+    let detail = match open {
+        Backend::Doas => {
+            "Auth::Stdin and Auth::Askpass need sudo, which is not on PATH; whether doas is there could not be told"
+        }
+        _ => "Auth::Stdin and Auth::Askpass need sudo; whether sudo is on PATH could not be told",
+    };
+    backend_unavailable(detail, Some(error))
+}
+
 fn backend_unavailable(detail: &str, source: Option<std::sync::Arc<Error>>) -> Error {
     Error::Elevation {
         kind: ElevationErrorKind::BackendUnavailable,
@@ -312,18 +330,25 @@ fn reject_backend_unavailable(detail: &str, source: Option<std::sync::Arc<Error>
     }
 }
 
-/// The full POSIX (backend, auth) matrix, privilege-independent: called BEFORE the
-/// already-elevated short-circuit so an impossible combo never passes under root.
-///
-/// The Askpass/Stdin-needs-sudo check is evaluated against the backend `Auto` WOULD
-/// resolve to (via `host`), not against ambient privilege — otherwise
-/// `Backend::Auto` + `Auth::Stdin` on a doas-only host would return `Unsupported`
-/// unprivileged but `RunAsIs` once already root, a verdict that flips on ambient
-/// privilege instead of staying a property of the request.
-fn structural_posix(os: Os, backend: Backend, auth: &Auth, host: &Host) -> Option<Error> {
+/// What the structural step says of a request, whatever the caller's privilege.
+enum StructuralOutcome {
+    /// The platform, backend and auth allow it.
+    Valid,
+    /// They do not, and no front changes that: the `Unsupported` error.
+    Invalid(Error),
+    /// The request cannot be told valid from invalid because the front `open` (`Sudo` or `Doas`) could
+    /// not be examined: `error` is its lookup's. See [`Backend::Auto`]'s table.
+    Undecided {
+        open: Backend,
+        error: std::sync::Arc<Error>,
+    },
+}
+
+/// The POSIX (backend, auth) matrix. The verdict is the same for every caller.
+fn structural_posix(os: Os, backend: Backend, auth: &Auth, host: &Host) -> StructuralOutcome {
     let platform = if os == Os::MacOs { "macos" } else { "unix" };
     let unsupported = |op: String, detail: &str| {
-        Some(Error::Unsupported {
+        StructuralOutcome::Invalid(Error::Unsupported {
             op,
             platform,
             detail: detail.into(),
@@ -375,14 +400,30 @@ fn structural_posix(os: Os, backend: Backend, auth: &Auth, host: &Host) -> Optio
         );
     }
     if matches!(auth, Auth::Askpass(_) | Auth::Stdin(_)) {
-        // `Auto` with neither sudo nor doas on PATH is left to resolution's `BackendUnavailable`,
-        // not reported as a config mismatch here. One whose search could not be completed is that
-        // same `BackendUnavailable` here, so the verdict does not depend on the caller's privilege.
-        let effective = host.available.resolve(backend);
-        if let (Backend::Auto, Some((_, program, FrontState::Unexamined(error)))) = (backend, effective) {
-            return Some(unexamined(program, error));
-        }
-        if let Some(eff) = effective.map(|(eff, ..)| eff).filter(|eff| *eff != Backend::Sudo) {
+        // The table in `Backend::Auto`'s doc, row by row.
+        let refused = match backend {
+            Backend::Sudo => None,
+            Backend::Auto => match (&host.available.sudo, &host.available.doas) {
+                (FrontState::Found(_), _)
+                | (FrontState::Absent, FrontState::Absent)
+                | (FrontState::Unexamined(_), FrontState::Absent) => None,
+                (FrontState::Absent, FrontState::Found(_)) => Some(Backend::Doas),
+                (FrontState::Unexamined(error), _) => {
+                    return StructuralOutcome::Undecided {
+                        open: Backend::Sudo,
+                        error: std::sync::Arc::clone(error),
+                    }
+                }
+                (FrontState::Absent, FrontState::Unexamined(error)) => {
+                    return StructuralOutcome::Undecided {
+                        open: Backend::Doas,
+                        error: std::sync::Arc::clone(error),
+                    }
+                }
+            },
+            named => Some(named),
+        };
+        if let Some(eff) = refused {
             let (kind, detail) = if matches!(auth, Auth::Askpass(_)) {
                 (
                     "Askpass",
@@ -402,14 +443,14 @@ fn structural_posix(os: Os, backend: Backend, auth: &Auth, host: &Host) -> Optio
             return unsupported(op, detail);
         }
     }
-    None
+    StructuralOutcome::Valid
 }
 
-/// The full Windows (backend, auth) matrix, privilege-independent for the same reason
-/// as [`structural_posix`].
-fn structural_windows(backend: Backend, auth: &Auth) -> Option<Error> {
+/// The Windows (backend, auth) matrix, privilege-independent for the same reason as
+/// [`structural_posix`].
+fn structural_windows(backend: Backend, auth: &Auth) -> StructuralOutcome {
     if backend != Backend::Auto {
-        return Some(Error::Unsupported {
+        return StructuralOutcome::Invalid(Error::Unsupported {
             op: format!("elevation backend {backend:?}"),
             platform: "windows",
             detail: "POSIX elevation backends do not exist on Windows; use Backend::Auto (ShellExecuteEx runas)".into(),
@@ -417,7 +458,7 @@ fn structural_windows(backend: Backend, auth: &Auth) -> Option<Error> {
         });
     }
     if matches!(auth, Auth::NonInteractive | Auth::Askpass(_) | Auth::Stdin(_)) {
-        return Some(Error::Unsupported {
+        return StructuralOutcome::Invalid(Error::Unsupported {
             op: "runas + non-interactive/askpass/stdin auth".into(),
             platform: "windows",
             detail: "ShellExecuteEx(runas) has no non-interactive, askpass, or stdin-credential mechanism; \
@@ -426,7 +467,7 @@ fn structural_windows(backend: Backend, auth: &Auth) -> Option<Error> {
             source: None,
         });
     }
-    None
+    StructuralOutcome::Valid
 }
 
 #[cfg(test)]

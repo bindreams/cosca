@@ -179,8 +179,25 @@ pub fn is_elevated() -> bool {
 /// be resolved or opened: if the plan needs that backend it fails with
 /// [`crate::error::ElevationErrorKind::BackendUnavailable`] (source: the error), otherwise nothing
 /// fails. `Auto` fails the same way when its `sudo` search could not be completed, even if a `doas`
-/// was found, and does so for a root and a non-root caller alike under `Auth::Stdin` and `Askpass`.
-/// On macOS `/usr/bin/osascript` follows the same rule.
+/// was found. A caller that is already root needs no backend. On macOS a non-root caller's plan that
+/// needs `/usr/bin/osascript`, and cannot examine it, fails with `BackendUnavailable` too (source:
+/// the error).
+///
+/// `Auth::Stdin` and `Auth::Askpass` need `sudo`, so under `Auto` the state of the `sudo` and `doas`
+/// searches decides the request. These answers are the same for a caller that is already elevated and
+/// one that is not; "runs" is a valid request, which a root caller runs as is and any other caller
+/// needs the front for, so it is `BackendUnavailable` where there is none or it could not be
+/// examined.
+///
+/// | `sudo` | `doas` | Answer |
+/// |---|---|---|
+/// | found | any | runs, through `sudo` |
+/// | absent | absent | runs |
+/// | absent | found | `Unsupported`: `Auto` names the `doas` |
+/// | absent | unexamined | `BackendUnavailable`, `source()`: the `doas` lookup's error |
+/// | unexamined | absent | runs |
+/// | unexamined | found | `BackendUnavailable`, `source()`: the `sudo` lookup's error |
+/// | unexamined | unexamined | `BackendUnavailable`, `source()`: the `sudo` lookup's error |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
     #[default]

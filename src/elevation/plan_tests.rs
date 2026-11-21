@@ -1,4 +1,5 @@
 use super::{BackendSet, FrontState, Host, Os, Transition};
+use crate::elevation::elevation_tests::unavailable;
 use crate::elevation::{Auth, Backend, Privilege};
 use crate::error::{ElevationErrorKind, Error};
 use std::path::PathBuf;
@@ -40,9 +41,14 @@ fn all_backends() -> BackendSet {
     }
 }
 
-/// A front whose search stopped on an entry that could not be examined, `ELOOP`.
+/// A front whose search stopped on an entry that could not be examined, `ELOOP` (40).
 fn unexamined() -> FrontState {
-    FrontState::Unexamined(std::sync::Arc::new(Error::Io(std::io::Error::from_raw_os_error(40))))
+    unexamined_by(40)
+}
+
+/// An unexamined front whose cause carries OS error `code`, to tell two such fronts' errors apart.
+fn unexamined_by(code: i32) -> FrontState {
+    FrontState::Unexamined(std::sync::Arc::new(Error::Io(std::io::Error::from_raw_os_error(code))))
 }
 
 fn unix_host(available: BackendSet, elevated: bool, has_tty: bool) -> Host {
@@ -303,61 +309,286 @@ fn pkexec_off_linux_is_refused_naming_linux() {
     }
 }
 
-/// `Backend::Auto` goes to `sudo` first, then `doas`, and takes the first whose search did not end
-/// in a miss. If that front could not be looked up, whether it is there is unknown: the plan reports
-/// it, with the cause, and takes no later one, found or not. Under `Auth::Stdin` and `Askpass`,
-/// which only `sudo` serves, that verdict is the same for a root caller as for one who is not, as
-/// the structural matrix is run first. (Under `Interactive` a root caller runs as is, before the
-/// front is looked at, as it does for a clean miss.) A `Backend::Doas` named is `Unsupported` under
-/// those two auths whatever its search found, and under `Interactive` fails as `Auto` does.
+/// A caller that is already elevated runs a request its OS, backend and auth allow as is, whether
+/// `sudo` is absent or not examinable, whatever the auth and the terminal. One that is not elevated is
+/// `BackendUnavailable`, caused by the lookup's error if the search could not be completed. A named
+/// `Sudo` ignores the `doas` state.
 ///
-/// Mutants: `Auto` falls through to the later front when the first's search failed, or skips an
-/// unexamined `doas` for "no sudo/doas"; the structural matrix lets an unexamined `sudo` or `doas`
-/// through, so root is `RunAsIs`, or checks only the `sudo`.
+/// Mutants: a root caller is refused for an unexamined `sudo`; `Auth` or the terminal is read before a
+/// root caller runs as is; the lookup's error is not the cause; the `Auto` table is applied to a named
+/// `Sudo`.
 #[skuld::test]
-fn auto_reports_a_front_that_could_not_be_looked_up_instead_of_taking_the_next() {
-    let found = || all_backends().doas;
-    for (sudo, doas, backend) in [
-        (unexamined(), found(), Backend::Auto),
-        (unexamined(), FrontState::Absent, Backend::Auto),
-        (FrontState::Absent, unexamined(), Backend::Auto),
-        (FrontState::Absent, unexamined(), Backend::Doas),
-    ] {
-        for elevated in [true, false] {
-            let h = unix_host(
-                BackendSet {
-                    sudo: sudo.clone(),
-                    doas: doas.clone(),
-                    ..all_backends()
-                },
-                elevated,
-                true,
-            );
-            let mut auths = vec![
+fn an_elevated_caller_runs_as_is_where_the_front_is_unusable_and_one_that_is_not_is_refused() {
+    for os in [Os::Linux, Os::Unix, Os::MacOs] {
+        for (sudo, doas, backend) in [
+            (FrontState::Absent, FrontState::Absent, Backend::Auto),
+            (FrontState::Absent, FrontState::Absent, Backend::Sudo),
+            (unexamined(), FrontState::Absent, Backend::Auto),
+            (unexamined(), FrontState::Absent, Backend::Sudo),
+            (FrontState::Absent, all_backends().doas, Backend::Sudo),
+            (FrontState::Absent, unexamined_by(41), Backend::Sudo),
+            (unexamined(), all_backends().doas, Backend::Sudo),
+            (unexamined(), unexamined_by(41), Backend::Sudo),
+        ] {
+            let cause = matches!(sudo, FrontState::Unexamined(_)).then_some(40);
+            for auth in [
                 Auth::Stdin(crate::elevation::Secret::new("p")),
                 Auth::Askpass("/usr/bin/ssh-askpass".into()),
-            ];
-            if !elevated {
-                auths.push(Auth::Interactive);
-            }
-            for auth in auths {
-                let case = format!("{backend:?}, elevated {elevated}, {auth:?}");
-                let doas_needs_sudo = backend == Backend::Doas && !matches!(auth, Auth::Interactive);
-                let error = reject_error(h.plan(Privilege::Elevated, backend, auth));
-                if doas_needs_sudo {
-                    assert!(matches!(error, Error::Unsupported { .. }), "{case}: {error:?}");
-                } else {
-                    assert_eq!(crate::error::first_os_code(&error), Some(40), "{case}: {error:?}");
+                Auth::Interactive,
+                Auth::NonInteractive,
+            ] {
+                for has_tty in [true, false] {
+                    let case = format!("{os:?}, {backend:?}, sudo {sudo:?}, doas {doas:?}, {auth:?}, tty {has_tty}");
+                    let available = BackendSet {
+                        sudo: sudo.clone(),
+                        doas: doas.clone(),
+                        ..all_backends()
+                    };
+                    let root = Host {
+                        os,
+                        ..unix_host(available.clone(), true, has_tty)
+                    };
                     assert!(
                         matches!(
-                            error,
-                            Error::Elevation {
-                                kind: ElevationErrorKind::BackendUnavailable,
-                                ..
-                            }
+                            root.plan(Privilege::Elevated, backend, auth.clone()),
+                            Transition::RunAsIs
                         ),
-                        "{case}: {error:?}"
+                        "root, {case}"
                     );
+                    let non_root = Host {
+                        os,
+                        ..unix_host(available, false, has_tty)
+                    };
+                    let (_, got, report) = unavailable(non_root.plan(Privilege::Elevated, backend, auth.clone()));
+                    assert_eq!(got, cause, "non-root, {case}: {report}");
+                }
+            }
+        }
+    }
+}
+
+/// The root rule beyond `sudo`: a request its platform allows runs as is for a root caller whose
+/// front (`pkexec`, `osascript` or a named `doas`) is absent or not examinable; a caller that is not
+/// elevated is `BackendUnavailable`, caused by the lookup's error if there was one.
+///
+/// Mutants: a root caller is refused for such a front; a non-root caller's unexamined front is
+/// reported as absent.
+#[skuld::test]
+fn an_elevated_caller_runs_as_is_where_a_non_sudo_front_or_a_graphical_one_is_unusable() {
+    /// Picks the front a row's request needs.
+    type Front = fn(&mut BackendSet) -> &mut FrontState;
+    let mut rows: Vec<(Os, Backend, Front, Auth)> = vec![
+        (Os::Linux, Backend::Pkexec, |set| &mut set.pkexec, Auth::Gui),
+        (Os::MacOs, Backend::Auto, |set| &mut set.osascript, Auth::Gui),
+    ];
+    for os in [Os::Linux, Os::Unix, Os::MacOs] {
+        rows.push((os, Backend::Doas, |set| &mut set.doas, Auth::Interactive));
+        rows.push((os, Backend::Doas, |set| &mut set.doas, Auth::NonInteractive));
+    }
+    for (os, backend, front, auth) in rows {
+        for state in [FrontState::Absent, unexamined()] {
+            let cause = matches!(state, FrontState::Unexamined(_)).then_some(40);
+            let mut available = all_backends();
+            *front(&mut available) = state.clone();
+            let case = format!("{os:?}, {backend:?}, front {state:?}, {auth:?}");
+            let root = Host {
+                os,
+                ..unix_host(available.clone(), true, true)
+            };
+            assert!(
+                matches!(
+                    root.plan(Privilege::Elevated, backend, auth.clone()),
+                    Transition::RunAsIs
+                ),
+                "root, {case}"
+            );
+            let non_root = Host {
+                os,
+                ..unix_host(available, false, true)
+            };
+            let (_, got, report) = unavailable(non_root.plan(Privilege::Elevated, backend, auth.clone()));
+            assert_eq!(got, cause, "non-root, {case}: {report}");
+        }
+    }
+}
+
+/// What a plan answers: run as is, elevate through `sudo`, `Unsupported`, or `BackendUnavailable` with
+/// the lookup error's OS code as its cause (`None` for no cause) and its detail.
+#[derive(Debug, Clone, Copy)]
+enum Verdict {
+    RunAsIs,
+    Sudo,
+    Unsupported,
+    Unavailable(Option<i32>, Option<&'static str>),
+}
+
+/// The detail of a `BackendUnavailable` for a `sudo` or `doas` that could not be examined.
+const SUDO_OPEN: &str = "Auth::Stdin and Auth::Askpass need sudo; whether sudo is on PATH could not be told";
+const DOAS_OPEN: &str =
+    "Auth::Stdin and Auth::Askpass need sudo, which is not on PATH; whether doas is there could not be told";
+
+/// The table in [`Backend::Auto`]'s doc, row by row. Each row is `sudo`, `doas`, then the answer for a
+/// root caller and for one that is not.
+///
+/// Mutants: an unexamined `sudo` is taken as `sudo` whatever the `doas` is; the cause is the `doas`'s
+/// where the `sudo`'s is expected.
+#[skuld::test]
+fn stdin_and_askpass_with_auto_are_decided_by_both_fronts() {
+    use Verdict::{RunAsIs, Sudo, Unavailable, Unsupported};
+    let found = FrontState::Found;
+    let doas_found = || found(PathBuf::from("/usr/bin/doas"));
+    let sudo_found = || found(PathBuf::from("/usr/bin/sudo"));
+    let rows = [
+        (sudo_found(), FrontState::Absent, RunAsIs, Sudo),
+        (sudo_found(), doas_found(), RunAsIs, Sudo),
+        (sudo_found(), unexamined_by(41), RunAsIs, Sudo),
+        (FrontState::Absent, FrontState::Absent, RunAsIs, Unavailable(None, None)),
+        (FrontState::Absent, doas_found(), Unsupported, Unsupported),
+        (
+            FrontState::Absent,
+            unexamined_by(41),
+            Unavailable(Some(41), Some(DOAS_OPEN)),
+            Unavailable(Some(41), Some(DOAS_OPEN)),
+        ),
+        (
+            unexamined_by(40),
+            FrontState::Absent,
+            RunAsIs,
+            Unavailable(Some(40), None),
+        ),
+        (
+            unexamined_by(40),
+            doas_found(),
+            Unavailable(Some(40), Some(SUDO_OPEN)),
+            Unavailable(Some(40), Some(SUDO_OPEN)),
+        ),
+        (
+            unexamined_by(40),
+            unexamined_by(41),
+            Unavailable(Some(40), Some(SUDO_OPEN)),
+            Unavailable(Some(40), Some(SUDO_OPEN)),
+        ),
+    ];
+    for os in [Os::Linux, Os::Unix, Os::MacOs] {
+        for (sudo, doas, root, non_root) in &rows {
+            for auth in [
+                Auth::Stdin(crate::elevation::Secret::new("p")),
+                Auth::Askpass("/usr/bin/ssh-askpass".into()),
+            ] {
+                for (elevated, want) in [(true, root), (false, non_root)] {
+                    let case = format!("{os:?}, sudo {sudo:?}, doas {doas:?}, {auth:?}, elevated {elevated}");
+                    let available = BackendSet {
+                        sudo: sudo.clone(),
+                        doas: doas.clone(),
+                        ..all_backends()
+                    };
+                    let host = Host {
+                        os,
+                        ..unix_host(available, elevated, true)
+                    };
+                    let plan = host.plan(Privilege::Elevated, Backend::Auto, auth.clone());
+                    match want {
+                        RunAsIs => assert!(matches!(plan, Transition::RunAsIs), "{case}: {plan:?}"),
+                        Sudo => assert!(
+                            matches!(
+                                plan,
+                                Transition::ElevatePosix {
+                                    backend: Backend::Sudo,
+                                    ..
+                                }
+                            ),
+                            "{case}: {plan:?}"
+                        ),
+                        Unsupported => assert!(is_unsupported(plan), "{case}"),
+                        Unavailable(code, detail) => {
+                            let (got_detail, got_code, report) = unavailable(plan);
+                            assert_eq!(got_code, *code, "{case}: {report}");
+                            if let Some(detail) = detail {
+                                assert_eq!(got_detail, *detail, "{case}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A named `Doas` under `Stdin` or `Askpass` is `Unsupported` for every caller, whatever its search
+/// found.
+///
+/// Mutant: a named `Doas` that could not be examined is `BackendUnavailable`.
+#[skuld::test]
+fn stdin_and_askpass_with_a_named_doas_are_unsupported_whatever_the_lookup_found() {
+    for os in [Os::Linux, Os::Unix, Os::MacOs] {
+        for state in [FrontState::Absent, unexamined(), all_backends().doas] {
+            for elevated in [true, false] {
+                for auth in [
+                    Auth::Stdin(crate::elevation::Secret::new("p")),
+                    Auth::Askpass("/usr/bin/ssh-askpass".into()),
+                ] {
+                    let h = Host {
+                        os,
+                        ..unix_host(
+                            BackendSet {
+                                doas: state.clone(),
+                                ..all_backends()
+                            },
+                            elevated,
+                            true,
+                        )
+                    };
+                    let error = reject_error(h.plan(Privilege::Elevated, Backend::Doas, auth.clone()));
+                    assert!(
+                        matches!(error, Error::Unsupported { .. }),
+                        "{os:?}, doas {state:?}, elevated {elevated}, {auth:?}: {error:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Where `Auto` could not examine the front it names, under the auths `doas` serves, a root caller
+/// runs as is and one that is not is `BackendUnavailable`, caused by that front's error: the `doas`'s
+/// when `sudo` is absent, else the `sudo`'s. Resolution finds the front before it reads the terminal,
+/// so without one the answer is the same `BackendUnavailable`, not `NoTty`.
+///
+/// Mutant: `Auto` skips an unexamined front, so the cause is lost or the next front's.
+#[skuld::test]
+fn auto_names_an_unexamined_front_for_the_auths_doas_serves() {
+    for os in [Os::Linux, Os::Unix, Os::MacOs] {
+        for (sudo, doas) in [
+            (FrontState::Absent, unexamined_by(40)),
+            (unexamined_by(40), all_backends().doas),
+            (unexamined_by(40), unexamined_by(41)),
+        ] {
+            for auth in [Auth::Interactive, Auth::NonInteractive] {
+                for has_tty in [true, false] {
+                    let available = BackendSet {
+                        sudo: sudo.clone(),
+                        doas: doas.clone(),
+                        ..all_backends()
+                    };
+                    let case = format!("{os:?}, sudo {sudo:?}, doas {doas:?}, {auth:?}, tty {has_tty}");
+                    let root = Host {
+                        os,
+                        ..unix_host(available.clone(), true, has_tty)
+                    };
+                    assert!(
+                        matches!(
+                            root.plan(Privilege::Elevated, Backend::Auto, auth.clone()),
+                            Transition::RunAsIs
+                        ),
+                        "root, {case}"
+                    );
+                    let non_root = Host {
+                        os,
+                        ..unix_host(available, false, has_tty)
+                    };
+                    let (_, cause, report) =
+                        unavailable(non_root.plan(Privilege::Elevated, Backend::Auto, auth.clone()));
+                    assert_eq!(cause, Some(40), "{case}: {report}");
                 }
             }
         }
@@ -528,27 +759,12 @@ fn macos_gui_with_a_non_auto_backend_is_still_unsupported() {
 fn macos_gui_without_osascript_is_a_backend_problem_not_a_platform_one() {
     let mut h = macos_host(false, true);
     h.available.osascript = FrontState::Absent;
-    match reject_error(h.plan(Privilege::Elevated, Backend::Auto, Auth::Gui)) {
-        Error::Elevation {
-            kind: ElevationErrorKind::BackendUnavailable,
-            detail,
-            source: None,
-        } => assert!(detail.contains("missing") && !detail.contains("executable"), "{detail}"),
-        other => panic!("expected BackendUnavailable, got {other:?}"),
-    }
+    let (detail, cause, report) = unavailable(h.plan(Privilege::Elevated, Backend::Auto, Auth::Gui));
+    assert!(detail.contains("missing") && !detail.contains("executable"), "{detail}");
+    assert_eq!(cause, None, "{report}");
     h.available.osascript = unexamined();
-    let error = reject_error(h.plan(Privilege::Elevated, Backend::Auto, Auth::Gui));
-    assert_eq!(crate::error::first_os_code(&error), Some(40), "{error:?}");
-    assert!(
-        matches!(
-            error,
-            Error::Elevation {
-                kind: ElevationErrorKind::BackendUnavailable,
-                ..
-            }
-        ),
-        "{error:?}"
-    );
+    let (_, cause, report) = unavailable(h.plan(Privilege::Elevated, Backend::Auto, Auth::Gui));
+    assert_eq!(cause, Some(40), "{report}");
 }
 
 #[skuld::test]

@@ -4,6 +4,7 @@
 use super::super::{detect_with, find_fixed_front, front_of};
 #[cfg(target_os = "linux")]
 use super::super::{rewrite_with_host, run_version_probe};
+use crate::elevation::elevation_tests::unavailable;
 use crate::elevation::plan::{FrontState, Host, Os, Transition};
 use crate::elevation::{Auth, Backend, Privilege};
 use crate::error::{ElevationErrorKind, Error};
@@ -54,26 +55,6 @@ fn is_found(state: &FrontState, path: &Path) -> bool {
 
 fn is_unexamined_by(state: &FrontState, code: i32) -> bool {
     matches!(state, FrontState::Unexamined(error) if crate::error::first_os_code(error) == Some(code))
-}
-
-/// The `BackendUnavailable` a plan is: its detail, the OS code of its cause, and the whole error as
-/// [`Report`](crate::error::Report) prints it.
-fn unavailable(plan: Transition) -> (String, Option<i32>, String) {
-    match plan {
-        Transition::Reject { error } => match &error {
-            Error::Elevation {
-                kind: ElevationErrorKind::BackendUnavailable,
-                detail,
-                source,
-            } => (
-                detail.clone(),
-                source.as_ref().and_then(|s| crate::error::first_os_code(&**s)),
-                crate::error::Report(&error).to_string(),
-            ),
-            other => panic!("expected BackendUnavailable, got {other:?}"),
-        },
-        other => panic!("expected BackendUnavailable, got {other:?}"),
-    }
 }
 
 /// The file the lookup finds is the front, whatever its mode: detection has no rule of its own.

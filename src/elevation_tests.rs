@@ -25,6 +25,27 @@ pub(crate) fn report(via: ElevatedVia) -> ElevationReport {
     }
 }
 
+/// The `BackendUnavailable` a plan is: its detail, the OS code of its cause, and the whole error as
+/// [`Report`](crate::error::Report) prints it. Panics on any other plan.
+pub(crate) fn unavailable(plan: super::plan::Transition) -> (String, Option<i32>, String) {
+    use crate::error::{ElevationErrorKind, Error};
+    match plan {
+        super::plan::Transition::Reject { error } => match &error {
+            Error::Elevation {
+                kind: ElevationErrorKind::BackendUnavailable,
+                detail,
+                source,
+            } => (
+                detail.clone(),
+                source.as_ref().and_then(|s| crate::error::first_os_code(&**s)),
+                crate::error::Report(&error).to_string(),
+            ),
+            other => panic!("expected BackendUnavailable, got {other:?}"),
+        },
+        other => panic!("expected BackendUnavailable, got {other:?}"),
+    }
+}
+
 /// The launches that leave no front: pkexec execs the program, and UAC and an already-elevated
 /// parent track it. A child reported as one fails or hands back as a plain child, never as a front.
 pub(crate) const VIAS_WITHOUT_A_FRONT: [ElevatedVia; 3] = [
