@@ -899,13 +899,38 @@ fn names_no_file_refusal(program: &Path) -> Error {
     )
 )]
 pub(crate) fn resolve(input: ResolveInput<'_>) -> Result<PathBuf, Error> {
-    search(input).map(|(found, _)| found)
+    search(input).map(|(found, _)| found.path)
+}
+
+/// A file a search names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Candidate {
+    pub(crate) path: PathBuf,
+    /// The `PATH` element, as written, the path was joined to. `None` for a located name and for any name on
+    /// the Windows grammar: only the POSIX grammar has an element to name (a Windows match can be in a
+    /// system directory, which is no `PATH` element).
+    pub(crate) entry: Option<PathBuf>,
+}
+
+/// What a search says when it stops at `candidate`, which it cannot examine: in `dir`, the entry the
+/// candidate was joined to, when it has one (a bare name; a located one has none). The one text of the
+/// stop, for the parent's search and for the child's walk of the later candidates, which both stop there.
+/// With no `candidate` (the child's report did not name it) it says only that a later one cannot be told.
+pub(crate) fn unexamined_context(candidate: Option<&Path>, dir: Option<&Path>) -> String {
+    match (candidate, dir) {
+        (Some(candidate), Some(dir)) => {
+            format!("could not tell whether {candidate:?} exists in {dir:?}, so the search stops")
+        }
+        (Some(candidate), None) => format!("could not tell whether {candidate:?} exists, so the search stops"),
+        (None, _) => "could not tell whether a later candidate exists, so the search stops".into(),
+    }
 }
 
 /// [`resolve`], and with the match the candidates after it: for a POSIX bare name, the `PATH`
 /// elements after the one the match is in, joined to the name, in order and fully qualified only
-/// (not probed); empty for any other name and for the Windows grammar.
-pub(crate) fn search(input: ResolveInput<'_>) -> Result<(PathBuf, Vec<PathBuf>), Error> {
+/// (not probed), each with its element; empty for any other name and for the Windows grammar. The
+/// match carries the element it was found in when the name is bare, on the POSIX grammar.
+pub(crate) fn search(input: ResolveInput<'_>) -> Result<(Candidate, Vec<Candidate>), Error> {
     let name = input.program.as_os_str();
     // The base contract, reported at the call boundary rather than where the base is first used.
     debug_assert!(
@@ -1075,13 +1100,22 @@ pub(crate) fn search(input: ResolveInput<'_>) -> Result<(PathBuf, Vec<PathBuf>),
                     let later = if !input.windows && shape == Shape::BareName {
                         dirs[at + 1..]
                             .iter()
-                            .flat_map(|dir| candidates.iter().map(move |c| join_candidate(dir, c, false, false)))
-                            .filter(|joined| accepted(joined, false))
+                            .flat_map(|dir| {
+                                candidates
+                                    .iter()
+                                    .map(move |c| (dir, join_candidate(dir, c, false, false)))
+                            })
+                            .filter(|(_, joined)| accepted(joined, false))
+                            .map(|(dir, path)| Candidate {
+                                path,
+                                entry: Some(dir.clone()),
+                            })
                             .collect()
                     } else {
                         Vec::new()
                     };
-                    return Ok((path, later));
+                    let entry = (!input.windows && shape == Shape::BareName).then(|| dir.clone());
+                    return Ok((Candidate { path, entry }, later));
                 }
                 Ok(None) => {}
                 // A `loadable_only` search fails closed: skipping a candidate it could not check
@@ -1094,12 +1128,8 @@ pub(crate) fn search(input: ResolveInput<'_>) -> Result<(PathBuf, Vec<PathBuf>),
                 // caller to branch on.
                 Err(e) if !input.windows && shape == Shape::Located => return Err(Error::Io(e)),
                 Err(e) if !input.windows || input.loadable_only => {
-                    // `dir` is the cwd, or empty, for a located name: only a bare name has an entry to name.
-                    let context = if shape == Shape::BareName {
-                        format!("could not tell whether {joined:?} exists in {dir:?}, so the search stops")
-                    } else {
-                        format!("could not tell whether {joined:?} exists, so the search stops")
-                    };
+                    let context =
+                        unexamined_context(Some(&joined), (shape == Shape::BareName).then_some(dir.as_path()));
                     return Err(Error::Io(crate::error::io_context(context, e)));
                 }
                 // An ordinary Windows spawn goes on, so one unreadable `PATH` directory does not

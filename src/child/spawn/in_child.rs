@@ -261,10 +261,14 @@ pub(super) fn spawn_sh_placed(
     use std::ffi::OsStr;
 
     let argv = [OsStr::new("sh"), OsStr::new("-c"), OsStr::new(script)];
-    let program = super::fork_exec::Program::new(&[OsStr::new("/bin/sh")], &argv, std::env::vars_os()).expect("no NUL");
+    let sh = crate::resolve::Candidate {
+        path: "/bin/sh".into(),
+        entry: None,
+    };
+    let launch = super::launch::Launch::new(vec![sh], &argv, std::env::vars_os()).expect("no NUL");
     let lock = super::spawn_lock();
     super::fork_spawn::start(
-        &program,
+        &launch,
         steps,
         crate::identity::spawn_kernel(crate::identity::HostKernel),
         super::fork_spawn::OnFailure {

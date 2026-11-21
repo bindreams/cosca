@@ -309,13 +309,16 @@ fn a_bare_names_match_comes_with_the_candidates_after_it() {
 
     let found = super::lookup(Path::new("tool"), Some(root.path()), Some(&path)).unwrap();
     assert_eq!(found.path, first.join("tool"));
-    assert_eq!(
-        found.later,
-        [missing.join("tool"), dir_of_the_name.join("tool"), last.join("tool")]
-    );
+    assert_eq!(found.entry.as_deref(), Some(first.as_path()));
+    let after = |dir: &PathBuf| Candidate {
+        path: dir.join("tool"),
+        entry: Some(dir.clone()),
+    };
+    assert_eq!(found.later, [after(&missing), after(&dir_of_the_name), after(&last)]);
 
     let located = super::lookup(Path::new("./tool"), Some(&first), Some(&path)).unwrap();
     assert!(located.later.is_empty(), "{:?}", located.later);
+    assert_eq!(located.entry, None, "a located name has no PATH element");
 }
 
 /// A located name is the one entry it names, whatever the entry is: a directory or a device is the

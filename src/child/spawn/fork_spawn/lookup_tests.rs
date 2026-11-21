@@ -1,6 +1,7 @@
 //! How the ordinary Linux spawn finds its program: the parent searches ([`crate::resolve::posix`]),
 //! and the child only `execve`s what was found. One test per lookup rule.
 
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -330,6 +331,140 @@ fn fixture_a_located_name_spawns_from_a_process_whose_directory_has_no_path() {
     let mut entered = command();
     entered.args(["./tool"]).current_dir("../other");
     assert_eq!(exit_code(entered), Some(9), "a relative current_dir");
+}
+
+// A stop in the child's walk =====
+
+/// The report of the error of a spawn whose search found `found` (on `PATH` `dirs`), which is removed
+/// before the spawn starts, so that the child's walk goes on to the later `PATH` entries.
+fn report_of_a_spawn_after_removing(found: &Path, dirs: &[&OsStr]) -> String {
+    use crate::child::spawn::{child_env, fork_spawn, in_child::InChild, policy::SpawnPolicy};
+
+    let mut cmd = command();
+    cmd.args(["tool"]).env("PATH", dirs.join(OsStr::new(":")));
+    let mut invocation = super::super::invocation(&cmd).expect("an invocation");
+    let env = child_env::child_env_of(&cmd);
+    let candidates = invocation.find(&env).expect("the search finds the file");
+    assert_eq!(
+        Path::new(&invocation.program),
+        found,
+        "precondition: the search found the file"
+    );
+    let launch = fork_spawn::launch(&invocation, candidates, env).expect("no NUL");
+    std::fs::remove_file(found).expect("remove the file the search found");
+    let lock = crate::child::spawn::spawn_lock();
+    let failure = fork_spawn::start(
+        &launch,
+        &mut InChild::default(),
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+        fork_spawn::OnFailure {
+            policy: SpawnPolicy::SYNC,
+            tracked: crate::elevation::front::TrackedKind::Own,
+            placement: None,
+            refusing_placement: false,
+        },
+        &lock,
+    )
+    .err()
+    .expect("the program is gone and a later candidate cannot be examined");
+    let (cause, _fate) = failure.expect_not_started_with_child();
+    assert_eq!(crate::error::first_os_code(&cause), Some(libc::ELOOP), "{cause:?}");
+    crate::error::said(&cause)
+}
+
+/// The program the search found is gone when the child starts it, and the child's walk meets a later
+/// candidate it cannot examine (a symlink loop: `ELOOP`): the spawn's error says what the parent's own
+/// search says when it stops at that candidate, in the same words, and holds the OS code down its
+/// `source()` chain. The entry is the `PATH` element as written, with or without a trailing `/`.
+///
+/// Mutants: the stop is the bare errno; the entry is the candidate's parent, not the element as written.
+#[skuld::test]
+fn a_stop_in_the_childs_walk_is_worded_as_the_searchs_stop() {
+    for written in ["", "/"] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let looping = root.path().join("loop");
+        std::os::unix::fs::symlink("loop", &looping).expect("symlink");
+        let open = root.path().join("open");
+        std::fs::create_dir(&open).expect("mkdir");
+        let found = script(
+            &open,
+            "tool",
+            "#!/bin/sh
+exit 7
+",
+            0o755,
+        );
+        let entry = OsString::from(format!("{}{written}", looping.display()));
+
+        // The parent's own stop at the loop's candidate: the loop comes first on `PATH`.
+        let mut parent = command();
+        parent
+            .args(["tool"])
+            .env("PATH", [entry.as_os_str(), open.as_os_str()].join(OsStr::new(":")));
+        let stop = spawn_error(parent, "the search stops at the loop");
+        let searched = crate::error::said(&stop);
+        assert_eq!(crate::error::first_os_code(&stop), Some(libc::ELOOP), "{stop:?}");
+
+        let walked = report_of_a_spawn_after_removing(&found, &[open.as_os_str(), entry.as_os_str()]);
+        assert_eq!(walked, searched, "{written:?}: the walk's stop and the search's differ");
+        for named in [format!("{entry:?}"), format!("{:?}", looping.join("tool"))] {
+            assert!(walked.contains(&named), "{named} is not named: {walked}");
+        }
+    }
+}
+
+/// A stop at a candidate that has no `PATH` element (the first path of a located name, or of an exactly
+/// named program) is the OS's own error, bare, as the parent's search gives for a located name; one at a
+/// candidate with an element is worded as the search's stop, and one at no candidate (the report did not
+/// name it) says only that a later one cannot be told. `failed` is given the report: no file-system
+/// state gives the first stop.
+///
+/// Mutants: a stop at a candidate with no element is wrapped; a stop at one with an element is bare, or
+/// words another candidate or entry; a stop with no index is bare or worded as a named one.
+#[skuld::test]
+fn a_stop_at_a_candidate_with_no_entry_is_the_bare_errno() {
+    use crate::child::spawn::fork_exec::Failure;
+    use crate::resolve::{unexamined_context, Candidate};
+
+    let at = |path: &str, entry: Option<&str>| Candidate {
+        path: PathBuf::from(path),
+        entry: entry.map(PathBuf::from),
+    };
+    let candidates = [at("./d/tool", None), at("/bin/d/tool", Some("/bin/d"))];
+    let stop = |candidate| {
+        let failure = Failure::Unexamined {
+            errno: libc::ELOOP,
+            candidate,
+        };
+        match super::failed(1, &candidates, failure) {
+            Error::Io(e) => e,
+            other => panic!("{candidate:?}: {other:?}"),
+        }
+    };
+
+    let bare = stop(Some(0));
+    assert_eq!(bare.raw_os_error(), Some(libc::ELOOP), "{bare:?}");
+
+    let wrapped = stop(Some(1));
+    assert_eq!(wrapped.raw_os_error(), None, "{wrapped:?}");
+    assert_eq!(
+        wrapped.to_string(),
+        unexamined_context(Some(Path::new("/bin/d/tool")), Some(Path::new("/bin/d"))),
+        "the stop at the candidate with an element"
+    );
+    assert_eq!(
+        crate::error::first_os_code(&Error::Io(wrapped)),
+        Some(libc::ELOOP),
+        "the code is down the chain"
+    );
+
+    let unnamed = stop(None);
+    assert_eq!(unnamed.raw_os_error(), None, "{unnamed:?}");
+    let report = crate::error::said(&Error::Io(unnamed));
+    assert!(
+        report.contains(&unexamined_context(None, None)),
+        "the stop with no index: {report}"
+    );
 }
 
 /// A `current_dir` that is missing, or not a directory, is the spawn's error for a located name: the

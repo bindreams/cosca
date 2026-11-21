@@ -149,7 +149,8 @@ const KIND_TERMINATED: u8 = 4;
 /// never gives its child is not the child's: an error.
 pub(in crate::elevation::shim) fn not_executed(failure: Failure) -> std::io::Result<NotExecuted> {
     Ok(match failure {
-        Failure::Exec(errno) => NotExecuted::ExecFailed(Errno(errno)),
+        // The wire says a number for a stop of the parent's search too (`start_and_supervise`).
+        Failure::Exec(errno) | Failure::Unexamined { errno, .. } => NotExecuted::ExecFailed(Errno(errno)),
         Failure::Step(StepFailure {
             kind: KIND_SETUP,
             value,

@@ -11,7 +11,12 @@
 //! The parent reads the channel without blocking ([`Status::progress`]) and never waits for its end:
 //! another thread's fork-without-exec may hold a copy of the write end for as long as it lives.
 //!
-//! - A failure record means the program did not start: a step failed, or the `execve` failed.
+//! - A failure record means the program did not start: a step failed, the `execve` failed, or the
+//!   walk of the later paths met one it could not examine ([`Failure::Unexamined`]). That failure
+//!   follows the path's index, which the caller names from the paths it built the program from: a run of
+//!   [`INDEX_RECORDS`] candidate records, the index's 16-bit parts, most significant first. A run that
+//!   was not written whole (a record that could not be written) is no index, and the failure arrives
+//!   with its errno and no candidate.
 //! - No ready record means the child ended before it got to the `execve`: not started. A child whose
 //!   ready record cannot be written ends too, with the step code, and does not exec; only a broken
 //!   pipe (nobody reads) lets it exec.
@@ -46,8 +51,8 @@
 //! goes on to the next path only when the file is not there (`ENOENT`, `ENOTDIR`, and an `fstatat` of
 //! the path says so too), which a file found and then removed gives; a path that is there (a script whose
 //! interpreter is missing gives `ENOENT`) and any other failure of an `execve` are the spawn's error. A
-//! later path is `fstatat`ed first and is passed over unless it is a regular file. `fstatat` is a raw
-//! system call too.
+//! later path is `fstatat`ed first and is passed over unless it is a regular file, and one that cannot be
+//! examined ends the walk ([`Failure::Unexamined`]). `fstatat` is a raw system call too.
 //!
 //! The vfork kind's child never waits on the parent: the parent is suspended until the child's `execve`
 //! or exit, so a wait on it never ends. The kernel releases the parent when the child's address space
@@ -158,6 +163,10 @@ pub(crate) enum Failure {
     Step(StepFailure),
     /// The `execve` failed with this errno.
     Exec(i32),
+    /// The child's walk of the later paths met one it could not examine (`fstatat` answered `errno`,
+    /// other than `ENOENT` and `ENOTDIR`), and went no further. `candidate` is its index in the paths
+    /// the program was built from, when the whole index reached the parent.
+    Unexamined { errno: i32, candidate: Option<u64> },
 }
 
 /// What the status channel has said so far.
@@ -180,21 +189,48 @@ pub(crate) enum Progress {
 enum Record {
     Ready,
     Reported(u16),
-    Failed(Failure),
+    /// One 16-bit part of the index of the candidate the walk is at: [`INDEX_RECORDS`] of them, most
+    /// significant first, before the record of its stop ([`Record::index_run`]).
+    Candidate(u16),
+    /// A step failed.
+    Step(StepFailure),
+    /// The `execve` failed with this errno.
+    Exec(u16),
+    /// The walk could not examine a candidate: this errno.
+    Unexamined(u16),
 }
+
+/// The candidate records that carry an index: it is a `u64`, in 16-bit parts.
+const INDEX_RECORDS: u32 = u64::BITS / u16::BITS;
 
 /// The kinds the core reserves; a caller's [`StepFailure::kind`] is a `u8`, so it cannot collide.
 const KIND_READY: u16 = 0xffff;
 const KIND_EXEC: u16 = 0xfffe;
 const KIND_REPORT: u16 = 0xfffd;
+const KIND_CANDIDATE: u16 = 0xfffc;
+const KIND_UNEXAMINED: u16 = 0xfffb;
 
 impl Record {
+    /// The records that carry `index`: its 16-bit parts, most significant first, always [`INDEX_RECORDS`]
+    /// of them, so that the child's code has no count to choose and no branch on the value. It runs in
+    /// the child: constant shifts and no checked operation, so there is no panic path to format.
+    fn index_run(index: u64) -> [Record; INDEX_RECORDS as usize] {
+        [
+            Record::Candidate((index >> 48) as u16),
+            Record::Candidate((index >> 32) as u16),
+            Record::Candidate((index >> 16) as u16),
+            Record::Candidate(index as u16),
+        ]
+    }
+
     fn encode(self) -> [u8; 4] {
         let (kind, value) = match self {
             Record::Ready => (KIND_READY, 0),
             Record::Reported(value) => (KIND_REPORT, value),
-            Record::Failed(Failure::Exec(errno)) => (KIND_EXEC, errno as u16),
-            Record::Failed(Failure::Step(step)) => (u16::from(step.kind), step.value),
+            Record::Candidate(index) => (KIND_CANDIDATE, index),
+            Record::Exec(errno) => (KIND_EXEC, errno),
+            Record::Unexamined(errno) => (KIND_UNEXAMINED, errno),
+            Record::Step(step) => (u16::from(step.kind), step.value),
         };
         (u32::from(kind) << 16 | u32::from(value)).to_ne_bytes()
     }
@@ -206,9 +242,11 @@ impl Record {
         match kind {
             KIND_READY => Ok(Record::Ready),
             KIND_REPORT => Ok(Record::Reported(value)),
-            KIND_EXEC => Ok(Record::Failed(Failure::Exec(i32::from(value)))),
+            KIND_CANDIDATE => Ok(Record::Candidate(value)),
+            KIND_EXEC => Ok(Record::Exec(value)),
+            KIND_UNEXAMINED => Ok(Record::Unexamined(value)),
             kind => match u8::try_from(kind) {
-                Ok(kind) => Ok(Record::Failed(Failure::Step(StepFailure { kind, value }))),
+                Ok(kind) => Ok(Record::Step(StepFailure { kind, value })),
                 Err(_) => Err(kind),
             },
         }
@@ -224,10 +262,33 @@ pub(crate) struct Status {
     ready: bool,
     /// The first report a step wrote ([`Reporter::report`]), once read.
     reported: Option<u16>,
+    /// The candidate records read so far, the index they carry, and how many came: the index a
+    /// [`Failure::Unexamined`] names, once all [`INDEX_RECORDS`] have.
+    candidate: IndexParts,
     /// A failure or the end, once read: the answer for good.
     settled: Option<Progress>,
     /// What made the channel unusable, once something did: for good.
     garbled: Option<Garbled>,
+}
+
+/// The parts of an index read so far.
+#[derive(Debug, Clone, Copy, Default)]
+struct IndexParts {
+    /// The parts read, joined: the first read is the most significant.
+    index: u64,
+    records: u32,
+}
+
+impl IndexParts {
+    fn push(&mut self, part: u16) {
+        self.index = self.index << u16::BITS | u64::from(part);
+        self.records = self.records.saturating_add(1);
+    }
+
+    /// The index, when the whole run of its records came.
+    fn index(self) -> Option<u64> {
+        (self.records == INDEX_RECORDS).then_some(self.index)
+    }
 }
 
 /// What the child never writes to the channel.
@@ -270,7 +331,16 @@ impl Status {
                 Ok(4) => match Record::decode(bytes) {
                     Ok(Record::Ready) => self.ready = true,
                     Ok(Record::Reported(value)) => _ = self.reported.get_or_insert(value),
-                    Ok(Record::Failed(failure)) => return Ok(*self.settled.insert(Progress::Failed(failure))),
+                    Ok(Record::Candidate(part)) => self.candidate.push(part),
+                    Ok(Record::Step(step)) => return Ok(self.fail(Failure::Step(step))),
+                    Ok(Record::Exec(errno)) => return Ok(self.fail(Failure::Exec(i32::from(errno)))),
+                    Ok(Record::Unexamined(errno)) => {
+                        let stop = Failure::Unexamined {
+                            errno: i32::from(errno),
+                            candidate: self.candidate.index(),
+                        };
+                        return Ok(self.fail(stop));
+                    }
                     Err(kind) => return Err(self.garble(Garbled::Kind(kind))),
                 },
                 Ok(0) => return Ok(*self.settled.insert(Progress::Ended { ready: self.ready })),
@@ -280,6 +350,11 @@ impl Status {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    /// Settles the channel's answer on `failure`, for good.
+    fn fail(&mut self, failure: Failure) -> Progress {
+        *self.settled.insert(Progress::Failed(failure))
     }
 
     /// The first report a step wrote, as far as [`progress`](Self::progress) has read; final once it returns
@@ -338,6 +413,7 @@ pub(super) fn channel(kind: CloneKind, keep_off: &[RawFd]) -> io::Result<(Status
             kind,
             ready: false,
             reported: None,
+            candidate: IndexParts::default(),
             settled: None,
             garbled: None,
         },
@@ -532,7 +608,7 @@ unsafe fn run_child(
         libc::close(read);
         if let Err(failure) = steps(Reporter { fd: write }) {
             // A record that cannot be written is lost; the child ends either way.
-            write_record(write, Record::Failed(Failure::Step(failure))).unwrap_or(());
+            write_record(write, Record::Step(failure)).unwrap_or(());
             libc::_exit(step_exit)
         }
         // A broken pipe means nobody reads the records: the program runs, and its parent learns of it
@@ -542,8 +618,19 @@ unsafe fn run_child(
             Ok(()) | Err(libc::EPIPE) => {}
             Err(_) => libc::_exit(step_exit),
         }
-        let errno = exec_candidates(program);
-        write_record(write, Record::Failed(Failure::Exec(errno))).unwrap_or(());
+        match exec_candidates(program) {
+            ExecCandidatesOutcome::Failed(errno) => {
+                write_record(write, Record::Exec(errno as u16)).unwrap_or(());
+            }
+            ExecCandidatesOutcome::Unexamined { errno, index } => {
+                // A record of the index that cannot be written leaves the run short and the stop without a
+                // candidate: its errno still arrives.
+                for record in Record::index_run(index as u64) {
+                    write_record(write, record).unwrap_or(());
+                }
+                write_record(write, Record::Unexamined(errno as u16)).unwrap_or(());
+            }
+        }
         libc::_exit(127)
     }
 }
@@ -579,15 +666,24 @@ unsafe fn entry(path: *const libc::c_char) -> Entry {
     }
 }
 
-/// `execve` of the program's paths in order; returns the errno of the failure, and only on one. The
-/// first existing file is the program, and no later file runs in its place:
+/// How [`exec_candidates`] ended. It returns only on a failure.
+enum ExecCandidatesOutcome {
+    /// The last `execve` failed with this errno, or ended the candidates with it.
+    Failed(i32),
+    /// The walk could not examine the path at `index` (`fstatat` answered `errno`), and went no further.
+    Unexamined { errno: i32, index: usize },
+}
+
+/// `execve` of the program's paths in order; returns how it ended, and only on a failure. The first
+/// existing file is the program, and no later file runs in its place:
 ///
 /// - a later path (the first is the caller's find) is looked at first: a directory of the name is not a
 ///   file and is passed over, a name that is not there is passed over, and an entry that cannot be examined
-///   ends the search with its errno;
+///   ends the search ([`ExecCandidatesOutcome::Unexamined`], with its errno and index);
 /// - an `execve` that fails with `ENOENT` or `ENOTDIR` goes on to the next path only if the path is no
 ///   longer there (the file was removed); a path that is there (a script whose interpreter is missing
-///   gives `ENOENT` too) ends the search with the `execve`'s errno;
+///   gives `ENOENT` too) ends the search with the `execve`'s errno; a path that cannot be examined then
+///   ends it as a later one does;
 /// - any other failure of an `execve` (`EACCES`, `ENOEXEC` included) ends it.
 ///
 /// Makes `execve` and `fstatat` calls over pointers built before the clone, and nothing else.
@@ -595,7 +691,7 @@ unsafe fn entry(path: *const libc::c_char) -> Entry {
 /// # Safety
 ///
 /// Called only in the child of the clone, bound by the module's contract.
-unsafe fn exec_candidates(program: &Program) -> i32 {
+unsafe fn exec_candidates(program: &Program) -> ExecCandidatesOutcome {
     let mut errno = libc::ENOENT;
     for (index, &path) in program.paths.iter().enumerate() {
         // SAFETY: the caller's contract; the pointers are into `program`'s strings, which outlive the child.
@@ -611,7 +707,7 @@ unsafe fn exec_candidates(program: &Program) -> i32 {
                         errno = gone;
                         continue;
                     }
-                    Entry::Unexaminable(failed) => return failed,
+                    Entry::Unexaminable(errno) => return ExecCandidatesOutcome::Unexamined { errno, index },
                 }
             }
             libc::execve(path, program.argv.as_ptr(), program.envp.as_ptr());
@@ -622,11 +718,11 @@ unsafe fn exec_candidates(program: &Program) -> i32 {
             match entry(path) {
                 Entry::Absent(_) => {}
                 Entry::RegularFile | Entry::NotAFile => break,
-                Entry::Unexaminable(failed) => return failed,
+                Entry::Unexaminable(errno) => return ExecCandidatesOutcome::Unexamined { errno, index },
             }
         }
     }
-    errno
+    ExecCandidatesOutcome::Failed(errno)
 }
 
 #[cfg(test)]
