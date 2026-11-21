@@ -84,7 +84,9 @@ fn a_poisoned_lock_neither_aborts_nor_hangs() {
 /// panic in the hook, instead of a deadlock on its own thread.
 #[skuld::test]
 fn debug_inside_a_blocked_waiter_does_not_block() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
+        .held_until_woken();
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let (printed_tx, printed_rx) = std::sync::mpsc::channel();
@@ -116,7 +118,9 @@ fn debug_inside_a_blocked_waiter_does_not_block() {
 /// scripted answers, and its hook never fires.
 #[skuld::test]
 fn a_second_wait_blocks_behind_the_holder() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
+        .held_until_woken();
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let (waiter, blocked) = spawn_waiter(&child, |c| c.wait(None));
@@ -181,7 +185,8 @@ fn a_look_that_fails_returns_the_error_and_stays_n() {
 fn signal_during_a_parked_wait_signals_and_the_holder_reaps() {
     let fake = FakeProcess::new([])
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
-        .signals([Ok(Sent::Delivered)]);
+        .signals([Ok(Sent::Delivered)])
+        .held_until_woken();
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let signaller = std::thread::spawn({
@@ -212,7 +217,8 @@ fn signal_during_a_parked_wait_signals_and_the_holder_reaps() {
 fn a_deadline_waiter_behind_a_parked_holder_returns_at_its_deadline() {
     let fake = FakeProcess::new([])
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
-        .peeks([Ok(PeekOutcome::Running)]);
+        .peeks([Ok(PeekOutcome::Running)])
+        .held_until_woken();
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let remaining = Duration::from_millis(50);
@@ -257,7 +263,9 @@ fn a_deadline_waiter_behind_a_parked_holder_returns_at_its_deadline() {
 /// Mutant: the remaining time computed once, before the loop: both rounds are armed alike.
 #[skuld::test]
 fn a_spurious_wake_re_arms_a_deadline_waiter_with_less_time() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
+        .held_until_woken();
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
@@ -318,7 +326,8 @@ fn a_spurious_wake_re_arms_a_deadline_waiter_with_less_time() {
 fn a_waiter_that_sees_an_exit_at_its_deadline_returns_its_status_without_reaping() {
     let fake = FakeProcess::new([])
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
-        .peeks([Ok(PeekOutcome::Exit(exit()))]);
+        .peeks([Ok(PeekOutcome::Exit(exit()))])
+        .held_until_woken();
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let waiter = std::thread::spawn({
@@ -341,7 +350,8 @@ fn a_waiter_that_sees_an_exit_at_its_deadline_returns_its_status_without_reaping
 fn a_waiter_at_its_deadline_behind_a_holder_on_a_running_child_gets_deadline_passed() {
     let fake = FakeProcess::new([])
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
-        .peeks([Ok(PeekOutcome::Running)]);
+        .peeks([Ok(PeekOutcome::Running)])
+        .held_until_woken();
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let waiter = std::thread::spawn({
@@ -368,7 +378,8 @@ fn a_waiter_at_its_deadline_behind_a_holder_on_a_running_child_gets_deadline_pas
 fn a_non_holder_peek_that_is_foreign_returns_it_and_writes_nothing() {
     let fake = FakeProcess::new([])
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
-        .peeks([Ok(PeekOutcome::Foreign(Foreign::Gone))]);
+        .peeks([Ok(PeekOutcome::Foreign(Foreign::Gone))])
+        .held_until_woken();
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(Some(far())));
     let got = try_wait(&child).expect("the scripted peek");
@@ -399,12 +410,14 @@ fn an_exit_is_seen_once_under_the_lock() {
 /// no RED claimed: `finish` consumes the guard, so the hazard it guards is unrepresentable.
 #[skuld::test]
 fn a_holders_normal_return_leaves_the_next_holder_alone() {
-    let fake = FakeProcess::new([]).reaps([
-        ReapAnswer::Running,
-        ReapAnswer::Foreign(Foreign::Gone),
-        ReapAnswer::Running,
-        ReapAnswer::Exited(exit()),
-    ]);
+    let fake = FakeProcess::new([])
+        .reaps([
+            ReapAnswer::Running,
+            ReapAnswer::Foreign(Foreign::Gone),
+            ReapAnswer::Running,
+            ReapAnswer::Exited(exit()),
+        ])
+        .held_until_woken();
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
@@ -443,7 +456,9 @@ fn a_holders_normal_return_leaves_the_next_holder_alone() {
 /// Mutant: a `?` return that leaves `W`: the waiter never wakes.
 #[skuld::test]
 fn a_reap_error_restores_n_and_wakes_the_waiters() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Err(KIND), ReapAnswer::Exited(exit())]);
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Running, ReapAnswer::Err(KIND), ReapAnswer::Exited(exit())])
+        .held_until_woken();
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let (waiter, blocked) = spawn_waiter(&child, |c| c.wait(None));
@@ -463,12 +478,14 @@ fn a_reap_error_restores_n_and_wakes_the_waiters() {
 /// Mutant: `N` written without `notify_all`: the waiter never wakes.
 #[skuld::test]
 fn an_expired_holder_hands_off_to_a_blocked_wait() {
-    let fake = FakeProcess::new([]).reaps([
-        ReapAnswer::Running,
-        ReapAnswer::Running,
-        ReapAnswer::Running,
-        ReapAnswer::Exited(exit()),
-    ]);
+    let fake = FakeProcess::new([])
+        .reaps([
+            ReapAnswer::Running,
+            ReapAnswer::Running,
+            ReapAnswer::Running,
+            ReapAnswer::Exited(exit()),
+        ])
+        .held_until_woken();
     fake.on_look(|look| {
         if look == 1 {
             crate::wait::test_clock::advance(Duration::from_secs(7200));
@@ -508,7 +525,9 @@ fn a_holder_that_sees_a_foreign_reap_returns_it_and_restores_n() {
 /// Mutant: no guard: the waiter never wakes.
 #[skuld::test]
 fn a_holder_that_panics_in_its_look_restores_n_and_wakes_the_waiters() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
+        .held_until_woken();
     fake.on_look(|look| {
         if look == 1 {
             panic!("forced panic in the holder's look");
@@ -534,7 +553,9 @@ fn a_holder_that_panics_in_its_look_restores_n_and_wakes_the_waiters() {
 /// `Condvar` result that is `unwrap()`ped (the waiter panics).
 #[skuld::test]
 fn a_holder_that_panics_after_its_relock_restores_n_without_deadlocking() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
+        .held_until_woken();
     // Armed in the first look, on the holder's thread: its second look's re-lock panics.
     fake.on_look(|look| {
         if look == 0 {
@@ -606,7 +627,8 @@ fn a_holders_recheck_pause_leaves_the_handle_unlocked() {
 fn a_holder_blocked_on_its_wait_holds_no_lock() {
     let fake = FakeProcess::new([])
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
-        .signals([Ok(Sent::Delivered)]);
+        .signals([Ok(Sent::Delivered)])
+        .held_until_woken();
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     // The check comes first, so a RED fails on `locked` rather than hanging in `signal`.
@@ -622,7 +644,9 @@ fn a_holder_blocked_on_its_wait_holds_no_lock() {
 /// Mutant: a holder that looks again without waiting (a spin).
 #[skuld::test]
 fn a_holder_blocked_on_its_wait_wakes_when_signalled() {
-    let fake = FakeProcess::new([]).reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
+    let fake = FakeProcess::new([])
+        .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
+        .held_until_woken();
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     assert_eq!(fake.looks(), 1, "the holder has not looked again");
@@ -914,7 +938,8 @@ fn the_state_is_unreaped_while_a_holder_waits() {
     use crate::signal::RootState;
     let fake = FakeProcess::new([])
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
-        .peeks([Ok(PeekOutcome::Running)]);
+        .peeks([Ok(PeekOutcome::Running)])
+        .held_until_woken();
     let child = owned_over(&fake);
     let holder = park_holder(&child, &fake, |c| c.wait(None));
     let seen = child.hold(UNREAD_PID).state();

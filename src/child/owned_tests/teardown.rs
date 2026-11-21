@@ -76,15 +76,6 @@ fn teardown_when_the_reap_answers(reap: ReapAnswer) -> (TeardownOutcome, Vec<log
     teardown(&fake().reaps([reap]).signals([Ok(Sent::Delivered)]))
 }
 
-/// Turns a wait that blocks into a recorded fact: the fake's wait is fired as the block begins, so
-/// a teardown that waits where it must not fails the count instead of hanging. The count starts
-/// empty: a block an earlier test left on this thread is dropped.
-pub(crate) fn fire_on_block(fake: &FakeProcess) -> crate::wait::block_probe::Armed {
-    crate::wait::block_probe::take();
-    let fake = fake.clone();
-    crate::wait::block_probe::on_blocking(move || fake.wake())
-}
-
 /// A live blocker as a spawn's teardown holds it: its root, answering as `script` says (see
 /// `script_over`), with the handle inert, as `into_unreaped` leaves it, so the teardown owns the
 /// root. The write end of its stdin comes with it.
@@ -181,7 +172,6 @@ fn a_reap_after_a_delivered_tree_kill_that_meets_a_foreign_reap_is_killed() {
 #[skuld::test]
 fn a_reap_after_a_tree_kill_waits_for_the_exit() {
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
-    let _fire = fire_on_block(&fake);
     let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     let torn = child.reap_after_tree_kill(&child.teardown_subject(), Disposition::Leave, None);
     assert_eq!(torn.fate(), ChildFate::Reaped);
@@ -212,7 +202,6 @@ fn teardown_after_a_delivered_kill_waits_through_try_reap() {
     let fake = fake()
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .signals([Ok(Sent::Delivered)]);
-    let _fire = fire_on_block(&fake);
     let (torn, _) = teardown(&fake);
     assert_eq!(torn.fate(), ChildFate::Reaped);
     assert_eq!(
@@ -235,7 +224,6 @@ fn teardown_after_a_kill_that_found_nothing_to_signal_waits_too() {
     let fake = fake()
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .signals([Ok(Sent::Gone)]);
-    let _fire = fire_on_block(&fake);
     let (torn, _) = teardown(&fake);
     assert_eq!(torn.fate(), ChildFate::Reaped);
     assert_eq!(fake.looks(), 2);
@@ -292,7 +280,6 @@ fn a_refused_kill_of_a_child_the_tree_kill_reached_is_waited_for_and_reaped() {
     let fake = fake()
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
-    let _fire = fire_on_block(&fake);
     let child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
 
     let torn = child.tear_down(
@@ -395,7 +382,6 @@ fn teardown_after_a_refused_kill_looks_once_and_never_waits() {
         let fake = fake()
             .reaps([ReapAnswer::Running])
             .signals([Err(std::io::Error::new(kind, "refused for the test"))]);
-        let _fire = fire_on_block(&fake);
         let (torn, _) = teardown(&fake);
         assert_eq!(torn.fate(), ChildFate::Running { id: Some(id()) }, "{kind:?}: {torn:?}");
         let left = warn_of(&torn).unwrap_or_default();
@@ -599,7 +585,6 @@ fn a_teardown_without_a_threshold_never_looks_for_the_exit() {
     let fake = fake()
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .signals([Ok(Sent::Delivered)]);
-    let _fire = fire_on_block(&fake);
     let (torn, _) = tear_down_logged(&fake, Some(id()), None);
     assert_eq!(torn.fate(), ChildFate::Reaped);
     assert_eq!(fake.looks(), 2);
@@ -614,7 +599,6 @@ fn a_teardown_past_its_threshold_warns_once_before_it_blocks() {
     let fake = fake()
         .reaps([ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Exited(exit())])
         .signals([Ok(Sent::Delivered)]);
-    let _fire = fire_on_block(&fake);
     let (torn, records) = tear_down_logged(&fake, Some(id()), Some(due_now()));
     assert_eq!(torn.fate(), ChildFate::Reaped);
     let warns = slow_warns(&records);
@@ -730,7 +714,6 @@ fn fake_slow_to_exit() -> FakeProcess {
 #[skuld::test]
 fn a_wait_left_by_a_delivered_kill_warns_past_the_threshold_it_was_begun_with() {
     let fake = fake_slow_to_exit().signals([Ok(Sent::Delivered)]);
-    let _fire = fire_on_block(&fake);
     let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     let kill = Kill {
         disposition: Disposition::Leave,
@@ -775,7 +758,6 @@ fn a_wait_settled_on_another_child_is_a_breach_even_for_children_without_a_pid()
 #[skuld::test]
 fn the_wait_after_a_refused_kill_a_tree_kill_reached_warns_past_the_threshold() {
     let fake = fake_slow_to_exit().signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))]);
-    let _fire = fire_on_block(&fake);
     let reach = FakeReach::answering(Ok(true));
     let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     let kill = Kill {
@@ -839,7 +821,6 @@ fn the_hook_is_told_a_refused_root_a_tree_kill_reached_was_refused_though_its_re
 #[skuld::test]
 fn the_reap_after_a_tree_kill_warns_past_the_threshold() {
     let fake = fake_slow_to_exit();
-    let _fire = fire_on_block(&fake);
     let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     let mut torn = None;
     let warns = slow_warns_during(|| {
@@ -857,7 +838,6 @@ fn the_reap_after_a_tree_kill_warns_past_the_threshold() {
 #[skuld::test]
 fn the_wait_for_a_front_a_kill_reached_warns_past_the_threshold_the_look_was_given() {
     let fake = fake_slow_to_exit();
-    let _fire = fire_on_block(&fake);
     let child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
     let reach = FakeReach::answering(Ok(true));
     let begun = child.begin_look_at_front(Some(id()), Ok(Some(&reach)), Some(due_now()));

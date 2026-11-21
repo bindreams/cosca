@@ -236,13 +236,18 @@ impl<T> ParkedHolder<T> {
 }
 
 /// Start a holder on its own thread: it runs `body` on `owned` (a `wait`, say) and blocks on the
-/// wait its first look returned, which `fake` hands out and the test fires. Returns once it is
+/// wait its first look returned, which `fake` hands out and the test fires. `fake` is built
+/// `held_until_woken()`: otherwise its wait is over and the holder runs on. Returns once it is
 /// blocked, with the lock released, so the state is `W`.
 pub(super) fn park_holder<T: Send + 'static>(
     owned: &Arc<OwnedChild>,
     fake: &FakeProcess,
     body: impl FnOnce(&OwnedChild) -> T + Send + 'static,
 ) -> ParkedHolder<T> {
+    assert!(
+        fake.holds_its_waits(),
+        "park_holder: the fake must be built held_until_woken(), or its wait is over and the holder runs on"
+    );
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let owned = Arc::clone(owned);
     let thread = std::thread::spawn(move || {

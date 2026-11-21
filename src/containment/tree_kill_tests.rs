@@ -96,8 +96,6 @@ fn a_kill_tree_waits_for_the_root_once_its_kill_landed() {
     let root = root_looking([Answer::Running, Answer::Exited]);
     let child = child_reaching(&root, &[]);
 
-    let woken = root.clone();
-    let _blocking = crate::wait::block_probe::on_blocking(move || woken.wake());
     child.kill_tree().expect("the root exited");
 
     assert_eq!(root.looks(), 2, "the wait looked at the root until it had exited");
@@ -354,16 +352,12 @@ fn the_edge_is_waited_for_after_the_root() {
     let edge = job_child.tree.drain_edge().expect("a Job has a drain edge");
     let root = root_looking([Answer::Running, Answer::Exited]);
     let _forced = force_job_pid_list(Vec::new());
-    let _blocking = crate::wait::block_probe::on_blocking({
-        let root = root.clone();
-        move || {
-            assert_eq!(
-                job_pid_list_queries(),
-                0,
-                "the edge was asked before the root was waited for"
-            );
-            root.wake();
-        }
+    let _blocking = crate::wait::block_probe::on_blocking(|| {
+        assert_eq!(
+            job_pid_list_queries(),
+            0,
+            "the edge was asked before the root was waited for"
+        );
     });
     let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), edge).split();
 

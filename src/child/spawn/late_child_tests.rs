@@ -2,7 +2,7 @@
 //! one warn of its slow wait.
 
 use super::{abandon_boxed_late_child, sweep_and_tear_down, LateSweeps};
-use crate::child::owned::owned_tests::teardown::{fire_on_block, slow_warns_during};
+use crate::child::owned::owned_tests::teardown::slow_warns_during;
 use crate::child::owned::OwnedChild;
 use crate::child::spawn::failure::SpawnFailure;
 use crate::child::spawn::policy::SpawnPolicy;
@@ -105,7 +105,6 @@ fn a_late_childs_slow_wait_warns_once_and_the_child_is_reaped() {
     let fake = delivered_kill(PID, [Answer::Running, Answer::Exited])
         .peeks([Ok(PeekOutcome::Exit(record))])
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(record)]);
-    let _fire = fire_on_block(&fake);
 
     let (failure, warns) = abandon_over(&fake, PID);
 
@@ -133,7 +132,6 @@ fn a_root_exited_but_not_reapable_after_its_kill_is_warned_of_at_the_reap() {
     let fake = delivered_kill(PID, [Answer::Exited])
         .peeks([Ok(PeekOutcome::Running)])
         .reaps([ReapAnswer::Running, ReapAnswer::Exited(record)]);
-    let _fire = fire_on_block(&fake);
 
     let (failure, warns) = abandon_over(&fake, PID);
 
@@ -467,7 +465,7 @@ fn root_killed(kill: RootKilled, pid: u32) -> FakeProcess {
             .reaps([ReapAnswer::Exited(record)]),
         RootKilled::Refused => root(Vec::new())
             .signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))])
-            .reaps_always(ReapAnswer::Running),
+            .reaps([ReapAnswer::Running]),
         RootKilled::AlreadyReaped => root(Vec::new()).reaps([ReapAnswer::Exited(record)]),
     }
 }

@@ -5,7 +5,7 @@
 //! dropped on the way. The Linux-only teardowns (a front's look, the cgroup-only reap, the held
 //! child's) have their rows beside the lanes that reach them.
 
-use super::teardown::{fire_on_block, slow_warns_during};
+use super::teardown::slow_warns_during;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::os_process::fake::{FakeProcess, ReapAnswer};
 use crate::test_child::held_uncontained_blocker;
@@ -24,8 +24,7 @@ fn slow_to_be_reaped(fake: FakeProcess) -> FakeProcess {
 fn a_dropped_childs_wait_warns_past_its_spawns_threshold() {
     let (mut child, _stdin) = held_uncontained_blocker(true);
     child.policy = SpawnPolicy::WARNS_AT_ONCE;
-    let fake = child.proc.script_over(slow_to_be_reaped);
-    let _fire = fire_on_block(&fake);
+    child.proc.script_over(slow_to_be_reaped);
 
     let warns = slow_warns_during(|| drop(child));
 
@@ -36,7 +35,7 @@ fn a_dropped_childs_wait_warns_past_its_spawns_threshold() {
 #[cfg(any(target_os = "linux", windows))]
 mod failed_spawn {
     use super::slow_to_be_reaped;
-    use crate::child::owned::owned_tests::teardown::{fire_on_block, held_owned_blocker, slow_warns_during};
+    use crate::child::owned::owned_tests::teardown::{held_owned_blocker, slow_warns_during};
     use crate::child::owned::teardown::{Disposition, Past, RootKill};
     use crate::child::spawn::held_teardown::tear_down_failed_spawn;
     use crate::child::spawn::policy::SpawnPolicy;
@@ -50,12 +49,7 @@ mod failed_spawn {
     /// Mutant: `tear_down_failed_spawn` hands the teardown no threshold.
     #[skuld::test]
     fn a_failed_spawns_wait_warns_past_its_policys_threshold() {
-        let mut fake = None;
-        let (owned, _stdin) = held_owned_blocker(|f| {
-            fake = Some(f.clone());
-            slow_to_be_reaped(f)
-        });
-        let _fire = fire_on_block(&fake.expect("the script ran"));
+        let (owned, _stdin) = held_owned_blocker(slow_to_be_reaped);
         let mut fate = None;
 
         let warns = slow_warns_during(|| {
@@ -83,13 +77,8 @@ mod failed_spawn {
     fn a_hook_that_waited_with_the_threshold_leaves_the_settle_none() {
         use crate::child::spawn::held_teardown::tear_down_failed_spawn_between;
 
-        let mut fake = None;
-        // One reap that is not ready: the wait blocks on it once, and the block's hook fires it.
-        let (owned, _stdin) = held_owned_blocker(|f| {
-            fake = Some(f.clone());
-            f.reaps([ReapAnswer::Running])
-        });
-        let _fire = fire_on_block(&fake.expect("the script ran"));
+        // One reap that is not ready: the wait blocks on it once, and it is over.
+        let (owned, _stdin) = held_owned_blocker(|f| f.reaps([ReapAnswer::Running]));
         let mut fate = None;
 
         let warns = slow_warns_during(|| {

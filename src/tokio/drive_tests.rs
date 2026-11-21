@@ -69,17 +69,16 @@ async fn exited_before_first_look_returns_true_without_waiting() {
 #[skuld::test]
 async fn wakes_and_looks_again() {
     let p = fake([Answer::Running, Answer::Exited]);
-    p.wake();
     assert!(exited_held(&p, Some(Duration::from_secs(60))).await.unwrap());
     assert_eq!(p.looks(), 2);
 }
 
-/// Mutant: answer `false` on the expiry itself, without a look after the deadline. The fake is never
-/// woken, so only the deadline ends the wait.
+/// Mutant: answer `false` on the expiry itself, without a look after the deadline. The fake is held
+/// and never woken, so only the deadline ends the wait.
 #[skuld::test]
 async fn expiry_ends_in_one_final_look() {
     let timeout = Duration::from_millis(50);
-    let p = fake([Answer::Running, Answer::Running]);
+    let p = fake([Answer::Running, Answer::Running]).held_until_woken();
     let start = crate::wait::now();
     assert!(!exited_held(&p, Some(timeout)).await.unwrap());
     assert_eq!(p.looks(), 2);
@@ -94,7 +93,7 @@ async fn expiry_ends_in_one_final_look() {
 /// was pending when the deadline passed.
 #[skuld::test]
 async fn the_final_look_can_find_an_exit() {
-    let p = fake([Answer::Running, Answer::Exited]);
+    let p = fake([Answer::Running, Answer::Exited]).held_until_woken();
     assert!(exited_held(&p, Some(Duration::from_millis(50))).await.unwrap());
     assert_eq!(p.looks(), 2);
 }
@@ -113,7 +112,6 @@ async fn duration_max_is_unbounded() {
     #[cfg(windows)]
     let _log = crate::wait::read_probe::install(log_tx);
     let p = fake([Answer::Running, Answer::Exited]);
-    p.wake();
     assert!(exited_held(&p, Some(Duration::MAX)).await.unwrap());
     #[cfg(unix)]
     assert_eq!(armed.try_iter().count(), 0, "an overflowing timeout arms no timer");
@@ -144,7 +142,6 @@ async fn a_bounded_wait_arms_the_timer_at_the_deadline() {
     let timeout = Duration::from_secs(60);
     let before = crate::tokio::wait::tokio_now();
     let p = fake([Answer::Running, Answer::Exited]);
-    p.wake();
     assert!(exited_held(&p, Some(timeout)).await.unwrap());
     let after = crate::tokio::wait::tokio_now();
     let [Armed::At(at)] = armed.try_iter().collect::<Vec<_>>()[..] else {
@@ -161,7 +158,7 @@ fn dropped_wait_releases_the_watch() {
         .enable_all()
         .build()
         .expect("build a runtime");
-    let p = fake([Answer::Running]);
+    let p = fake([Answer::Running]).held_until_woken();
     runtime.block_on(async {
         let mut wait = pin!(exited_held(&p, None));
         assert!(

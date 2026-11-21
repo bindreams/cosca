@@ -1,7 +1,7 @@
 //! `Unreaped` over a `FakeProcess`: a call past a fake's table panics, which is how a test notices
 //! a second wait on a child that was already consumed.
 
-use super::teardown::{exit, fake, fire_on_block, id, PID};
+use super::teardown::{exit, fake, id, PID};
 use crate::child::owned::unreaped::{DropKind, Unreaped};
 use crate::elevation::front::TrackedKind;
 use crate::error::Error;
@@ -21,7 +21,6 @@ fn dropped_when_the_reap_answers(
 ) -> (Vec<(log::Level, String)>, Vec<Option<std::time::Duration>>) {
     crate::log_capture::install();
     let fake = fake.reaps([ReapAnswer::Running, reap]);
-    let _fire = fire_on_block(&fake);
     let child = unreaped(&fake, Some(id()));
     let mark = crate::log_capture::mark();
     drop(child);
@@ -39,7 +38,6 @@ fn dropped_when_the_reap_answers(
 fn wait_blocks_until_the_child_exits_and_returns_its_status() {
     crate::log_capture::install();
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Exited(exit())]);
-    let _fire = fire_on_block(&fake);
     let child = unreaped(&fake, Some(id()));
     let mark = crate::log_capture::mark();
     let status = child.wait().expect("the child exits");
