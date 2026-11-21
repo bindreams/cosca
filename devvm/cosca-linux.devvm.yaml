@@ -37,13 +37,13 @@ steps:
   - shell: bash
     run: |
       set -euo pipefail
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.1
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.100.0
   # cargo-nextest's release tarball, checked before it is unpacked. The tag and digest share a line so Renovate
   # moves them together.
   - shell: bash
     run: |
       set -euo pipefail
-      NEXTEST_TAG_X86_64="cargo-nextest-0.9.151" NEXTEST_SHA256_X86_64="1d4ce302b820c41f4b89c5fb9bce45f0f0c94882c1cf08fc360caf08be6e7df4"
+      NEXTEST_TAG_X86_64="cargo-nextest-0.9.152" NEXTEST_SHA256_X86_64="d039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a"
       tarball="$(mktemp)"
       curl --proto '=https' --tlsv1.2 -sSf -L -o "$tarball" \
         "https://github.com/nextest-rs/nextest/releases/download/$NEXTEST_TAG_X86_64/$NEXTEST_TAG_X86_64-x86_64-unknown-linux-gnu.tar.gz"
