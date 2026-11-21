@@ -139,6 +139,12 @@ impl Command {
         self
     }
 
+    /// The [`ContainMode`](crate::ContainMode) a spawn asks for, as
+    /// [`Command::get_contain_mode`](crate::Command::get_contain_mode).
+    pub fn get_contain_mode(&self) -> Option<crate::ContainMode> {
+        self.inner.get_contain_mode()
+    }
+
     /// Set how this contained spawn marks its descendants (default
     /// [`Nesting::Mark`](crate::containment::Nesting::Mark)).
     pub fn nesting(&mut self, nesting: crate::containment::Nesting) -> &mut Command {

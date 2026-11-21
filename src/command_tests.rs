@@ -226,6 +226,30 @@ fn contain_with_and_nesting_recorded() {
     assert_eq!(req.nesting, Nesting::Opaque);
 }
 
+/// Mutants: the getter answers `None` after `contain_with`; it answers a fixed mode; the first call
+/// wins over the last.
+#[skuld::test]
+fn get_contain_mode_answers_the_request() {
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    assert_eq!(cmd.get_contain_mode(), None);
+
+    cmd.contain();
+    assert_eq!(cmd.get_contain_mode(), Some(ContainMode::Strongest));
+
+    for mode in [
+        ContainMode::Strongest,
+        ContainMode::BestEffort,
+        ContainMode::TreeWalk,
+        ContainMode::Session,
+    ] {
+        cmd.contain_with(mode);
+        assert_eq!(cmd.get_contain_mode(), Some(mode));
+    }
+
+    cmd.contain_with(ContainMode::TreeWalk).contain();
+    assert_eq!(cmd.get_contain_mode(), Some(ContainMode::Strongest));
+}
+
 #[skuld::test]
 fn elevate_enables_with_defaults() {
     let mut c = crate::test_child::command(Console::Hidden);
