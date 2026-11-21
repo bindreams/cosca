@@ -635,8 +635,9 @@ fn program_and_args(cmd: &Command) -> Result<Launch, Error> {
 
 /// Structural request-validation, evaluated against the REQUESTED backend so the verdict
 /// is privilege-independent. Run BEFORE the already-elevated short-circuit, so an
-/// already-elevated caller gets the same rejection. (Backend availability + NoTty are
-/// environmental and stay in the planner, after the short-circuit.)
+/// already-elevated caller gets the same rejection. (NoTty is environmental and stays in the
+/// planner, after the short-circuit; the planner's structural step reads backend availability only
+/// for `Auto` under `Stdin` or `Askpass`, see the table in [`Backend::Auto`].)
 ///
 /// Reads nothing: an already-root caller runs no backend, and needs no path to its cwd.
 fn reject_structural_posix_config(cmd: &Command, backend: Backend, auth: &Auth) -> Result<(), Error> {

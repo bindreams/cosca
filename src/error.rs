@@ -40,7 +40,9 @@ pub enum QuoteErrorKind {
 #[non_exhaustive]
 pub enum ElevationErrorKind {
     /// The requested (or auto-detected) backend is not on PATH, or the resolved
-    /// backend could not be executed.
+    /// backend could not be executed, or the search for it could not be completed (source: the
+    /// lookup's error). See also [`Backend::Auto`](crate::elevation::Backend::Auto), which can
+    /// leave a request open for every caller.
     #[error("no usable elevation backend is available")]
     BackendUnavailable,
     /// Wrong password, or `sudo -n` found no cached credential, or the launch failed.
