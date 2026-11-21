@@ -80,7 +80,7 @@ fn a_terminate_of_a_root_that_has_begun_to_exit_signals_its_members_and_lists_th
         &super::ByIdentity::new(&kernel, root),
         crate::containment::TreeStop::default(),
     );
-    let (super::SendOutcome::Sent(Ok(())), Some(listing)) = walked else {
+    let (super::SendAnswer::Sent(Ok(())), Some(listing)) = walked else {
         panic!("the members were walked");
     };
     assert_eq!(listing.members, [descendant]);
@@ -112,7 +112,7 @@ fn a_root_that_has_begun_to_exit_with_no_member_is_no_root_and_nothing_is_sent()
         crate::containment::TreeStop::default(),
     );
     assert!(
-        matches!(termed, (super::SendOutcome::RootExited(_), None)),
+        matches!(termed, (super::SendAnswer::RootExited(_), None)),
         "nothing is sent"
     );
     // Never signalled: the member ends by its own clean exit.
@@ -162,7 +162,7 @@ fn a_terminate_whose_exit_flag_cannot_be_read_signals_its_members_and_lists_them
             &super::ByIdentity::new(&kernel, root),
             crate::containment::TreeStop::of(signal),
         );
-        let (super::SendOutcome::Sent(Ok(())), Some(listing)) = walked else {
+        let (super::SendAnswer::Sent(Ok(())), Some(listing)) = walked else {
             panic!("the members were walked");
         };
         assert_eq!(listing.members, [descendant]);
@@ -202,7 +202,7 @@ fn a_walk_with_no_member_whose_exit_flag_cannot_be_read_sends_nothing() {
         matches!(
             termed,
             (
-                super::SendOutcome::NotSent(crate::error::Error::Unassessable { .. }),
+                super::SendAnswer::NotSent(crate::error::Error::Unassessable { .. }),
                 None
             )
         ),

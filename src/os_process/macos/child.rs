@@ -89,8 +89,8 @@ impl<K: Kernel + Send> MacosChild<K> {
 
 impl<K: Kernel + Send> OsProcess for MacosChild<K> {
     /// By audit token, which the kernel checks against the pid's `p_idversion`: a bare errno on a
-    /// refused send; `Gone` once the unique id says the pid names another process; `Delivered` for
-    /// this child's own unreaped zombie.
+    /// refused send; `Gone` once the unique id says the pid names another process; `Exited` for this
+    /// child's own unreaped zombie, and for one whose exit has begun.
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
         via_audit_token(&self.kernel, self.pid, Some(self.unique), sig).map_err(Error::Io)
     }

@@ -7,6 +7,8 @@ pub(crate) struct StatedRoot<'a> {
     pid: u32,
     /// Built fresh per call: a `RootState` holds an `io::Error`.
     state: Box<dyn Fn() -> RootState + 'a>,
+    /// What a signal through the handle answers.
+    answer: crate::signal::Sent,
     #[cfg(target_os = "linux")]
     pidfd: Option<std::os::fd::BorrowedFd<'a>>,
 }
@@ -21,9 +23,16 @@ impl<'a> StatedRoot<'a> {
         StatedRoot {
             pid,
             state: Box::new(state),
+            answer: crate::signal::Sent::Gone,
             #[cfg(target_os = "linux")]
             pidfd: None,
         }
+    }
+
+    /// A root whose handle answers a signal with `answer`, instead of that it is gone.
+    pub(crate) fn answering(mut self, answer: crate::signal::Sent) -> StatedRoot<'a> {
+        self.answer = answer;
+        self
     }
 
     #[cfg(target_os = "linux")]
@@ -38,9 +47,10 @@ impl Root for StatedRoot<'_> {
         self.pid
     }
 
-    /// A stated root holds no process: its handle says the root is gone.
+    /// A stated root holds no process: its handle answers as stated, that the root is gone unless told
+    /// otherwise.
     fn signal(&self, _sig: crate::signal::Sig) -> Result<crate::signal::Sent, crate::error::Error> {
-        Ok(crate::signal::Sent::Gone)
+        Ok(self.answer)
     }
 
     fn state(&self) -> RootState {

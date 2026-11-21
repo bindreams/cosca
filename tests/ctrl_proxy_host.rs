@@ -95,8 +95,8 @@ impl Call {
     fn run(self, child: &cosca::Child) -> Result<(), cosca::error::Error> {
         let grace = std::time::Duration::ZERO;
         match self {
-            Call::Terminate => child.terminate(),
-            Call::TerminateTree => child.terminate_tree(),
+            Call::Terminate => child.terminate().map_err(Into::into),
+            Call::TerminateTree => child.terminate_tree().map_err(Into::into),
             Call::GracefulShutdown => child.graceful_shutdown(grace).map(drop),
             Call::GracefulShutdownTree => child.graceful_shutdown_tree(grace).map(drop),
         }
@@ -106,8 +106,8 @@ impl Call {
     async fn run_async(self, child: &mut cosca::tokio::Child) -> Result<(), cosca::error::Error> {
         let grace = std::time::Duration::ZERO;
         match self {
-            Call::Terminate => child.terminate().await,
-            Call::TerminateTree => child.terminate_tree().await,
+            Call::Terminate => child.terminate().await.map_err(Into::into),
+            Call::TerminateTree => child.terminate_tree().await.map_err(Into::into),
             Call::GracefulShutdown => child.graceful_shutdown(grace).await.map(drop),
             Call::GracefulShutdownTree => child.graceful_shutdown_tree(grace).await.map(drop),
         }
@@ -170,7 +170,7 @@ fn the_default_stop_without_the_init_hook_panics_only_on_the_proxy_route() {
         let err = ungrouped
             .terminate()
             .expect_err("a child that leads no group cannot be addressed");
-        common::assert_refused_for_no_group(&err);
+        common::assert_refused_for_no_group(err.error());
         ungrouped.kill().expect("kill the child");
         drop(sock);
 

@@ -154,7 +154,7 @@ pub(crate) fn let_go_line(
     let dropped = dropped(&child_named(pid));
     let subject = match kill {
         None => dropped,
-        Some(Ok(Sent::Delivered)) => format!("{dropped} (killed it)"),
+        Some(Ok(Sent::Delivered | Sent::Exited)) => format!("{dropped} (killed it)"),
         Some(Ok(Sent::Gone)) => format!("{dropped} (its kill found nothing to signal)"),
         Some(Ok(Sent::Unverified)) => {
             format!("{dropped} (its kill was not sent: the child could not be verified)")
@@ -165,7 +165,7 @@ pub(crate) fn let_go_line(
         Some(status) => (log::Level::Warn, format!("{subject}: {}", reaped_it(status))),
         None => {
             let running = match kill {
-                Some(Ok(Sent::Delivered)) => format!("{subject}; it had not exited yet{LEFT}"),
+                Some(Ok(Sent::Delivered | Sent::Exited)) => format!("{subject}; it had not exited yet{LEFT}"),
                 Some(Ok(Sent::Gone)) => format!("{subject}; the look saw no exit yet{LEFT}"),
                 _ => format!("{subject}{LEAVING_RUNNING}"),
             };

@@ -1,4 +1,4 @@
-use super::{SendOutcome, Skip, Why};
+use super::{SendAnswer, Skip, Why};
 use crate::containment::dispatch::TreeKillOutcome;
 use crate::containment::{Refusal, Tree};
 
@@ -9,6 +9,7 @@ fn skip(why: Why) -> Skip {
         action: "kill its process group".to_owned(),
         why,
         root_alone: false,
+        no_holder_reached: false,
         holders: None,
     }
 }
@@ -96,6 +97,7 @@ fn a_sweep_that_skipped_has_the_handles_error_as_its_source_unless_the_holders_f
         source: None,
     };
     let answer = Skip {
+        no_holder_reached: false,
         holders: Some(Err(own)),
         ..skip(why())
     }
@@ -161,6 +163,7 @@ fn a_tree_call_that_skipped_an_untrusted_root_leaves_the_drop_what_a_drop_alone_
     use crate::signal::Sig;
 
     let untrusted = |swept: bool| Skip {
+        no_holder_reached: false,
         holders: swept.then_some(Ok(())),
         ..skip(Why::untrusted(&crate::signal::RootState::Unpinned))
     };
@@ -411,6 +414,7 @@ fn a_skipped_kill_whose_holders_failed_leaves_the_drop_a_warn_in_either_order() 
     use crate::error::Error;
     for (kind, why) in kinds() {
         let failing = || Skip {
+            no_holder_reached: false,
             holders: Some(Err(Error::Containment {
                 detail: "the holders' sweep failed".into(),
                 source: None,
@@ -624,6 +628,7 @@ fn a_skipped_call_whose_holders_and_root_both_failed_keeps_both_and_the_reason()
         .answer(
             &killed(false),
             Skip {
+                no_holder_reached: false,
                 holders: Some(Err(holders)),
                 ..skip(unsure(libc::EACCES))
             },
@@ -714,6 +719,7 @@ fn an_untrusted_roots_cause_joins_the_failed_holders_sweep() {
         .answer(
             &killed(false),
             Skip {
+                no_holder_reached: false,
                 holders: Some(Err(holders)),
                 ..skip(untrusted)
             },
@@ -754,6 +760,7 @@ fn a_reason_with_two_causes_joins_the_failed_holders_sweep_flat() {
         .answer(
             &killed(false),
             Skip {
+                no_holder_reached: false,
                 holders: Some(Err(holders())),
                 ..skip(reason())
             },
@@ -779,6 +786,7 @@ fn a_reason_with_two_causes_joins_the_failed_holders_sweep_flat() {
     assert_eq!(below, [Some(libc::EACCES), Some(libc::EMFILE)], "{skipped:?}");
 
     let swept = Skip {
+        no_holder_reached: false,
         holders: Some(Err(holders())),
         ..skip(reason())
     }
@@ -807,6 +815,7 @@ fn a_holders_only_kill_that_failed_takes_the_term_and_the_reason_as_peers() {
     let settled = graceful_call("skip_peers_probe_c1", crate::signal::Signal::Term).holders_settled(
         &killed(false),
         Skip {
+            no_holder_reached: false,
             holders: Some(Err(term_failed())),
             ..skip(unsure(libc::EACCES))
         },
@@ -823,6 +832,7 @@ fn a_holders_only_kill_that_failed_takes_the_term_and_the_reason_as_peers() {
         let settled = graceful_call("skip_peers_probe_c2", signal).holders_settled(
             &killed(false),
             Skip {
+                no_holder_reached: false,
                 holders: Some(Err(term_failed())),
                 ..skip(unsure(libc::EACCES))
             },
@@ -837,6 +847,57 @@ fn a_holders_only_kill_that_failed_takes_the_term_and_the_reason_as_peers() {
             "{detail}"
         );
         assert_eq!(codes_below(&settled.answer), [Some(libc::EACCES), Some(libc::EIO)]);
+    }
+}
+
+/// A holders-only graceful call whose sweep reached no holder (macOS) words what it sent from that: nothing,
+/// no marker holder having been signalled, whether the marker had none or the sweep of those it had failed.
+/// Whichever way it ends (the call's own answer, or the kill after the grace), it does not say it signalled
+/// the holders, and a failed sweep is named. A pass that did signal one says so.
+///
+/// Mutants: the words follow the sweep's check alone, so a pass that reached no holder says it signalled
+/// them (a failed sweep of holders none of which was reached above all); a pass that signalled one says it
+/// reached none.
+#[skuld::test]
+fn a_holders_only_call_that_reached_no_holder_says_it_sent_nothing() {
+    use crate::error::{Error, Report};
+
+    // Not an `Io`, a leaf with no slot for the peers a settlement joins to an error.
+    let refused = || Error::Unassessable {
+        detail: "a holder refused the signal".into(),
+        source: Some(Error::io_cause(std::io::Error::from_raw_os_error(libc::EPERM))),
+    };
+    for (kind, why) in kinds() {
+        for (signal, name) in SENT {
+            let to_holders = format!("sent the {name} only to the marker holders");
+            for (none, failed) in [(false, false), (true, false), (true, true)] {
+                let held = || Skip {
+                    no_holder_reached: none,
+                    holders: Some(if failed { Err(refused()) } else { Ok(()) }),
+                    ..skip(why())
+                };
+                let answered = graceful_call("skip_none_probe_f1", signal)
+                    .answer(&killed(false), held(), None)
+                    .answer
+                    .expect_err("a skipped call is no success");
+                let mut worded = vec![("answer", answered, "signalled the marker holders")];
+                // The kill after the grace is the end of a holders-only call over a root whose number may
+                // name another process; an untrusted root's call ends at its answer.
+                if kind == "may name another" {
+                    let settled = graceful_call("skip_none_probe_f2", signal)
+                        .holders_settled(&killed(false), held(), TreeKillOutcome::Ran(Ok(())))
+                        .answer;
+                    worded.push(("holders_settled", settled, to_holders.as_str()));
+                }
+                for (what, error, sent) in worded {
+                    let text = Report(&error).to_string();
+                    let ctx = format!("{kind}, {what}, none {none}, failed {failed}: {text}");
+                    assert_eq!(text.contains(sent), !none, "{ctx}");
+                    assert_eq!(text.contains("no marker holder was signalled"), none, "{ctx}");
+                    assert_eq!(text.contains("the sweep of the holders failed"), failed, "{ctx}");
+                }
+            }
+        }
     }
 }
 
@@ -899,18 +960,18 @@ fn a_tree_calls_answer_is_the_sends_unless_nothing_was_sent() {
     };
 
     assert_eq!(
-        detail(SendOutcome::NotSent(error("not sent")).into_tree_result()),
+        detail(SendAnswer::NotSent(error("not sent")).into_tree_result()),
         "not sent"
     );
     assert_eq!(
-        detail(SendOutcome::RootExited(error("exited")).into_tree_result()),
+        detail(SendAnswer::RootExited(error("exited")).into_tree_result()),
         "exited"
     );
     assert_eq!(
-        detail(SendOutcome::Sent(Err(error("unverified"))).into_tree_result()),
+        detail(SendAnswer::Sent(Err(error("unverified"))).into_tree_result()),
         "unverified"
     );
-    SendOutcome::Sent(Ok(()))
+    SendAnswer::Sent(Ok(()))
         .into_tree_result()
         .expect("a send that went out and checked");
 }

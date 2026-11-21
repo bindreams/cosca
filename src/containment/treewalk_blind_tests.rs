@@ -116,7 +116,7 @@ fn every_walk_from_a_root_that_lost_its_pid_signals_nothing_and_a_kill_is_unasse
         crate::containment::TreeStop::default(),
     );
     assert!(
-        matches!(result, (super::SendOutcome::RootExited(_), None)),
+        matches!(result, (super::SendAnswer::RootExited(_), None)),
         "terminate sends nothing: {result:?}"
     );
     release(child);

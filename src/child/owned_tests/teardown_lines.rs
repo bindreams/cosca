@@ -47,6 +47,9 @@ pub(crate) fn refusal() -> String {
 pub(crate) enum Kill {
     /// A signal reached the child.
     Delivered,
+    /// The child's exit had begun (macOS): nothing was delivered, and the kill is read as one that
+    /// was, the exit being what it asked for.
+    Exited,
     /// The child was already gone: nothing to signal, and none reached it.
     Nothing,
     /// The signal was refused, so the teardown looks once and never waits.
@@ -114,7 +117,7 @@ pub(crate) fn rows() -> Vec<Row> {
         leave: format!("{clause}{LEFT}"),
         hand_back: format!("{clause}{HANDED_BACK}"),
     };
-    vec![
+    let mut rows = vec![
         // The kill reached the child: the wait that follows is the reap.
         same(
             Kill::Delivered,
@@ -185,7 +188,22 @@ pub(crate) fn rows() -> Vec<Row> {
             leave: format!("{after_a_refusal}{LEAVING_RUNNING}"),
             hand_back: format!("{after_a_refusal}{HANDED_BACK}"),
         },
-    ]
+    ];
+    // A kill that found the exit begun is said as a delivered one.
+    let exited: Vec<Row> = rows
+        .iter()
+        .filter(|row| row.kill == Kill::Delivered)
+        .map(|row| Row {
+            kill: Kill::Exited,
+            found: row.found,
+            level: row.level,
+            uncollected: row.uncollected,
+            leave: row.leave.clone(),
+            hand_back: row.hand_back.clone(),
+        })
+        .collect();
+    rows.extend(exited);
+    rows
 }
 
 /// What `torn` said of the child, and at what level.
@@ -203,6 +221,7 @@ pub(crate) fn outcome(row: &Row, disposition: Disposition) -> TeardownOutcome {
     let refused = || io::Error::new(io::ErrorKind::PermissionDenied, REFUSED);
     let signal = match row.kill {
         Kill::Delivered => Ok(Sent::Delivered),
+        Kill::Exited => Ok(Sent::Exited),
         Kill::Nothing => Ok(Sent::Gone),
         Kill::Refused => Err(refused()),
     };
@@ -260,7 +279,8 @@ fn assert_one_wording(clause: &str) {
 ///
 /// Mutants: a clause is worded apart from `Disposition::suffix`; "after the kill" is said of a kill
 /// that reached nothing; the leave wording is the hand-back one; a failed wait or a look that finds
-/// the child running leaves it collected, or a reaped one uncollected.
+/// the child running leaves it collected, or a reaped one uncollected; a kill that found the exit begun
+/// (`Sent::Exited`) is not waited for as a delivered one is.
 #[skuld::test]
 fn the_teardown_says_every_row_as_the_table_states_it() {
     for row in rows() {

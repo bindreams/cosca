@@ -380,7 +380,7 @@ fn a_root_whose_proof_finds_another_process_walks_nothing() {
         crate::containment::TreeStop::default(),
     );
     assert!(
-        matches!(termed, (super::SendOutcome::RootExited(_), None)),
+        matches!(termed, (super::SendAnswer::RootExited(_), None)),
         "a gone root sends nothing"
     );
     for recursive in [Recursive::No, Recursive::Yes] {
@@ -414,7 +414,7 @@ fn a_root_whose_proof_cannot_be_made_is_unassessable_and_signals_nothing() {
             &super::ByIdentity::new(&root_proof_fails(), root()),
             crate::containment::TreeStop::default(),
         ) {
-            (super::SendOutcome::NotSent(not_sent), _) => Err(not_sent),
+            (super::SendAnswer::NotSent(not_sent), _) => Err(not_sent),
             _ => Ok(()),
         },
         root().children_with(&root_proof_fails(), Recursive::No).map(|_| ()),

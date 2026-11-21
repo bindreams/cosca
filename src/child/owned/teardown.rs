@@ -564,7 +564,7 @@ impl OwnedChild {
                 let wait = TeardownWait::new(
                     self,
                     warn_after,
-                    matches!(sent, Sent::Delivered),
+                    matches!(sent, Sent::Delivered | Sent::Exited),
                     id,
                     self.teardown_subject(),
                     disposition,

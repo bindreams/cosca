@@ -58,7 +58,7 @@ use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::treewalk::Listing;
 use crate::containment::{
-    check_number, Containment, Root, SendOutcome, Skip, TerminateOutcome, TreeKill, TreeStop, Why,
+    check_number, Containment, Root, SendAnswer, Skip, TerminateOutcome, TreeKill, TreeStop, Why,
 };
 use crate::error::{Error, Failures};
 use std::sync::Arc;
@@ -356,12 +356,12 @@ pub(crate) fn term_group(pgid: i32, root: Option<&dyn Root>) -> Result<(), Error
     term_group_sent(pgid, root, crate::signal::Signal::Term).into_tree_result()
 }
 
-/// [`term_group`], saying whether the signal went out: [`NotSent`](SendOutcome::NotSent) is a send that
-/// did not happen, [`Sent`](SendOutcome::Sent) what the check after the send found.
-pub(crate) fn term_group_sent(pgid: i32, root: Option<&dyn Root>, signal: crate::signal::Signal) -> SendOutcome {
+/// [`term_group`], saying whether the signal went out: [`NotSent`](SendAnswer::NotSent) is a send that
+/// did not happen, [`Sent`](SendAnswer::Sent) what the check after the send found.
+pub(crate) fn term_group_sent(pgid: i32, root: Option<&dyn Root>, signal: crate::signal::Signal) -> SendAnswer {
     #[cfg(test)]
     if fault::intercept_term_group(pgid) {
-        return SendOutcome::Sent(Ok(()));
+        return SendAnswer::Sent(Ok(()));
     }
     // A cooperative signal is only probed, never resent: no member is reached by a handle of its own.
     signal_group_sent(pgid, signal.as_nix(), root, &mut Vec::new())
@@ -396,6 +396,7 @@ fn skipped_group(pgid: i32, verb: &str, look: NumberLook) -> Skip {
         action: format!("{verb} its process group (pgid {pgid})"),
         why,
         root_alone,
+        no_holder_reached: false,
         holders: None,
     }
 }
@@ -447,10 +448,7 @@ pub(crate) fn term_group_tree(pgid: i32, root: Option<&dyn Root>, how: TreeStop)
         NumberLook::Trusted => sent(Some(root)),
         NumberLook::GroupGone => {
             log_empty_group(pgid);
-            TerminateOutcome::Sent {
-                result: Ok(()),
-                earlier: None,
-            }
+            TerminateOutcome::NoneReached { result: Ok(()) }
         }
         look => {
             let skip = skipped_group(pgid, "signal", look);
@@ -475,10 +473,12 @@ fn signal_group(
     signal_group_sent(pgid, signal, root, killed).into_tree_result()
 }
 
-/// [`signal_group`], saying whether the signal went out: [`NotSent`](SendOutcome::NotSent) is a send that
+/// [`signal_group`], saying whether the signal went out: [`NotSent`](SendAnswer::NotSent) is a send that
 /// did not happen (an invalid `pgid`, a failed check of the root, a failed `killpg`),
-/// [`Sent`](SendOutcome::Sent) what `verify` found after it. Never [`RootExited`](SendOutcome::RootExited):
-/// a group's send looks at no walk.
+/// [`Sent`](SendAnswer::Sent) what `verify` found after a signal that reached at least one process, and
+/// [`NoneReached`](SendAnswer::NoneReached) what it found after a send that reached none (the group had no
+/// member, or the kernel refused it whole and the leader's fallback found nobody). Never
+/// [`RootExited`](SendAnswer::RootExited): a group's send looks at no walk.
 ///
 /// **The `pgid` guard lives HERE, before any signal is sent — not only in `group::state`.**
 /// A `pgid` of `0` signals the CALLER's own process group (per POSIX); a negative one risks
@@ -489,13 +489,13 @@ fn signal_group_sent(
     signal: Signal,
     root: Option<&dyn Root>,
     killed: &mut Vec<crate::identity::ProcessId>,
-) -> SendOutcome {
+) -> SendAnswer {
     // NOT a debug_assert!: an invalid `pgid` reaching this function is a directly and deliberately
     // TESTED, ordinary input-validation outcome, not a "should never happen" internal contract —
     // `kill_group_and_term_group_reject_non_positive_pgid` (this file) calls this path with
     // `0`/`-1`/`i32::MIN` on purpose and asserts a plain `Err`, not a panic.
     if pgid <= 0 {
-        return SendOutcome::NotSent(Error::Unassessable {
+        return SendAnswer::NotSent(Error::Unassessable {
             detail: format!(
                 "process group {pgid} is not a valid group id to signal (0 addresses this \
                  process's own group; negative wraps to a broadcast or double-negation hazard)"
@@ -505,28 +505,36 @@ fn signal_group_sent(
     }
     let sent = match send_to_group(pgid, signal, root) {
         Ok(sent) => sent,
-        Err(unchecked) => return SendOutcome::NotSent(unchecked),
+        Err(unchecked) => return SendAnswer::NotSent(unchecked),
     };
+    // Whether the group's own send, or the leader's fallback, went out to at least one process. A `SIGKILL`
+    // member's resend is not counted: it is the kill's check, and a kill's answer is not read for it.
+    let mut reached = false;
     match sent {
-        Ok(()) => {}
+        Ok(()) => reached = true,
         // NOT trusted as "definitely empty": Linux's __kill_pgrp_info returns the LAST
         // per-member error once none succeed, so ESRCH can mean "empty" or "a departed member
         // processed after a live refuser" indistinguishably. `verify` below re-lists and
-        // settles it either way.
+        // settles it either way. Either way the group's send reached no process.
         Err(nix::errno::Errno::ESRCH) => {}
         // Preserved exactly as before this fix: the pgid == pid direct-to-leader fallback
         // for the sudo-wrapper case (sibling #54 territory — do not remove or reshape).
         Err(nix::errno::Errno::EPERM) => {
-            _ = signal_direct(pgid, signal, root);
+            reached = matches!(signal_direct(pgid, signal, root), Ok(crate::signal::Sent::Delivered));
         }
         Err(e) => {
-            return SendOutcome::NotSent(Error::Containment {
+            return SendAnswer::NotSent(Error::Containment {
                 detail: format!("{signal} could not be sent to process group {pgid}"),
                 source: Some(Error::io_cause(io::Error::from(e))),
             })
         }
     }
-    SendOutcome::Sent(verify(pgid, signal, root, killed))
+    let checked = verify(pgid, signal, root, killed);
+    if reached {
+        SendAnswer::Sent(checked)
+    } else {
+        SendAnswer::NoneReached(checked)
+    }
 }
 
 /// The send to the whole group, and the kernel's answer to it. On Linux it goes through the root's
@@ -803,7 +811,8 @@ fn answer_of(state: group::GroupState, pgid: i32, signal: Signal) -> Result<(), 
     }
 }
 
-/// Signal `pid` directly. Already-gone is success. Kept, unmodified, because sibling #54
+/// Signal `pid` directly. Already-gone is success ([`Sent::Gone`](crate::signal::Sent::Gone), where a delivered
+/// signal is [`Sent::Delivered`](crate::signal::Sent::Delivered)). Kept, unmodified, because sibling #54
 /// explicitly forbids touching this fallback — but the two signals it guards need opposite
 /// framing, worked out fully rather than left as one general "unclear":
 ///
@@ -827,7 +836,7 @@ fn answer_of(state: group::GroupState, pgid: i32, signal: Signal) -> Result<(), 
 ///
 /// On Linux it goes through the root's pidfd when it has one, which names the leader exactly;
 /// otherwise by `pid`, right after the root's own check, and not at all if that fails.
-fn signal_direct(pid: i32, signal: Signal, root: Option<&dyn Root>) -> io::Result<()> {
+fn signal_direct(pid: i32, signal: Signal, root: Option<&dyn Root>) -> io::Result<crate::signal::Sent> {
     #[cfg(target_os = "linux")]
     let sent = root
         .and_then(Root::pidfd)
@@ -848,7 +857,8 @@ fn signal_direct(pid: i32, signal: Signal, root: Option<&dyn Root>) -> io::Resul
         }
     };
     match sent {
-        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Ok(()) => Ok(crate::signal::Sent::Delivered),
+        Err(nix::errno::Errno::ESRCH) => Ok(crate::signal::Sent::Gone),
         Err(e) => {
             log::debug!(
                 "containment::unix::signal_direct: kill({pid}, {signal}) failed: {report}",

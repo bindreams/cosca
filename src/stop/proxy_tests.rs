@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use super::protocol::{exit_text, Cause, CtrlEvent, ProxyAnswer, ProxyArgs, ProxyExit, Step, VERSION};
 use super::{exe_unreadable, failed_step, start_failed, wait_failed, CtrlProxy};
-use crate::containment::SendOutcome;
+use crate::containment::SendAnswer;
 use crate::error::Error;
 use crate::stop::{self, StopTarget};
 use crate::test_child::ctrl_break::{
@@ -347,11 +347,12 @@ fn a_child_that_has_exited_is_answered_before_the_proxy_is_started() {
             let err = child
                 .terminate_tree()
                 .expect_err("nothing was sent to a tree whose root had exited");
-            let Error::Unassessable { detail, .. } = &err else {
+            let Error::Unassessable { detail, .. } = err.error() else {
                 panic!("{mode:?}: {err:?}")
             };
             assert!(detail.contains("nothing was sent"), "{mode:?}: {detail}");
             assert!(!detail.contains("CTRL_C"), "{mode:?}: no event went out: {detail}");
+            assert_eq!(err.outcome(), crate::stop::SendOutcome::NotSent, "{mode:?}");
         } else {
             child
                 .terminate()
@@ -382,6 +383,58 @@ fn a_child_that_has_exited_is_answered_before_the_proxy_is_started() {
                 "{mode:?}: the call says it sent no event: {logged:?}"
             );
         }
+    }
+}
+
+/// A root target whose child had exited records that nothing was sent, with no stop named and no refusal
+/// reported: an action that goes on after the send, and the lone shutdown's kill after it, name no earlier
+/// send (not the `CTRL_C` that never went out, and not "the stop action"), and the call logs no refused send,
+/// for a root that had simply exited refused nothing; and an action that fails after the send is `NotSent`.
+///
+/// Mutants: the exited root is recorded as a send of the event (the kill's words name the `CTRL_C`, and the
+/// failed action reads as `Sent`); it is recorded as a refusal (the kill's words name "the stop action", and
+/// a refused send is logged).
+#[skuld::test]
+fn an_exited_root_records_no_send_and_names_no_stop() {
+    use crate::stop::SendOutcome;
+
+    crate::log_capture::install();
+    for fails_after in [false, true] {
+        let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+        let (child, sock, _) = spawn_member(Handler::Ignore, None, ContainMode::Strongest, |cmd| {
+            cmd.no_window();
+            cmd.ctrl_proxy(fixture.setting());
+            cmd.graceful_stop(move |target| {
+                stop::send_console_event_via_proxy(target, CtrlEvent::CtrlC)?;
+                if fails_after {
+                    Err(Error::Io(std::io::Error::other("the action failed after its send")))
+                } else {
+                    Ok(())
+                }
+            });
+        });
+        child.kill().expect("kill the member");
+        child.wait().expect("see its exit, reaping nothing");
+        drop(sock);
+        let mark = crate::log_capture::mark();
+
+        if fails_after {
+            let err = child.terminate().expect_err("the action failed");
+            assert_eq!(err.outcome(), SendOutcome::NotSent);
+        } else {
+            let (acted, said) = crate::child::graceful::shutdown::run_ready(
+                crate::child::graceful::shutdown::stop_root(&crate::child::graceful::shutdown::BlockingDriver(&child)),
+            );
+            acted.expect("an exited child is Ok");
+            assert_eq!(said, None);
+            assert!(
+                crate::log_capture::records_since_on_current_thread(mark, "the action went on after a refused send")
+                    .is_empty(),
+                "a root that had exited refused nothing"
+            );
+        }
+        assert_no_break_sent();
+        assert!(fixture.ran().is_none(), "the proxy was started");
     }
 }
 
@@ -790,6 +843,94 @@ fn the_calls_answer_what_the_proxy_answered() {
     }
 }
 
+/// Each exit the proxy can end with, as the outcome of a failed `terminate` and `terminate_tree`, for a root
+/// target and for a tree target over a job object and over a tree walk: `Sent` is `Ok`; an answer or a
+/// failed step that says nothing was sent is `NotSent`; one that cannot say whether the event went out
+/// (`Unconfirmed`, an exit that is no answer) is `Unknown`. The child is running, so an attach the proxy
+/// could not make is a refusal.
+///
+/// Mutants: `Unconfirmed` or an exit that is no answer reads as `Sent`; an answer that sent nothing reads as
+/// `Unknown`; a tree target's route loses the difference (the job object's, or the tree walk's).
+#[skuld::test]
+fn a_failed_call_says_from_the_proxys_exit_whether_the_event_went_out() {
+    use crate::stop::SendOutcome::{self, NotSent, Unknown};
+
+    let answered = |answer: ProxyAnswer| (answer.code(), Some(ProxyExit::from(answer)));
+    // The exit, the answer the call records for it (`None`: no answer, so none is recorded), the outcome.
+    let rows: Vec<(i32, Option<ProxyExit>, Option<SendOutcome>)> = vec![
+        (answered(ProxyAnswer::Sent).0, answered(ProxyAnswer::Sent).1, None),
+        (nothing_sent().code(), Some(nothing_sent()), Some(NotSent)),
+        (
+            answered(ProxyAnswer::Unconfirmed).0,
+            answered(ProxyAnswer::Unconfirmed).1,
+            Some(Unknown),
+        ),
+        (
+            answered(ProxyAnswer::ConsoleIsCallers).0,
+            answered(ProxyAnswer::ConsoleIsCallers).1,
+            Some(NotSent),
+        ),
+        (
+            answered(ProxyAnswer::VersionMismatch).0,
+            answered(ProxyAnswer::VersionMismatch).1,
+            Some(NotSent),
+        ),
+        (
+            answered(ProxyAnswer::Usage).0,
+            answered(ProxyAnswer::Usage).1,
+            Some(NotSent),
+        ),
+        (
+            answered(ProxyAnswer::NoProxyHere).0,
+            answered(ProxyAnswer::NoProxyHere).1,
+            Some(NotSent),
+        ),
+        (
+            answered(ProxyAnswer::TargetHasNoConsole).0,
+            answered(ProxyAnswer::TargetHasNoConsole).1,
+            Some(NotSent),
+        ),
+        (
+            answered(ProxyAnswer::AttachDenied).0,
+            answered(ProxyAnswer::AttachDenied).1,
+            Some(NotSent),
+        ),
+        (
+            answered(ProxyAnswer::TargetGone).0,
+            answered(ProxyAnswer::TargetGone).1,
+            Some(NotSent),
+        ),
+        (crate::role::UNKNOWN_HELPER_ROLE, None, Some(NotSent)),
+        (0, None, Some(Unknown)),
+        (3, None, Some(Unknown)),
+    ];
+    for (code, exit, expected) in rows {
+        for (tree, mode) in [
+            (false, ContainMode::Strongest),
+            (true, ContainMode::Strongest),
+            (true, ContainMode::TreeWalk),
+        ] {
+            let fixture = Fixture::answering(code);
+            let (child, sock) = stopping_member(&fixture, mode);
+            let called = if tree {
+                child.terminate_tree()
+            } else {
+                child.terminate()
+            };
+            assert_eq!(
+                called.err().map(|stopped| stopped.outcome()),
+                expected,
+                "exit {code}, tree: {tree}, {mode:?}"
+            );
+            match exit {
+                Some(exit) => assert_proxy_answered(child.pid(), CtrlEvent::CtrlC, exit),
+                None => assert_no_break_sent(),
+            }
+            kill_release_reap(&child, sock, tree);
+        }
+    }
+}
+
 /// A proxy answer that may have sent the event (`Unconfirmed`) is a send that went out: a tree call
 /// goes on to its grace and sweep, which end the member, and keeps the answer as its cooperative error
 /// (a sweep that proves the tree clear discards it, saying so). One that sent nothing (a failed step)
@@ -840,12 +981,13 @@ fn a_tree_call_goes_on_after_a_send_that_may_have_gone_out_and_ends_after_one_th
 
 /// On a root target, an answer that may have sent the event is recorded as a send that was made: a
 /// shutdown that goes on after an action that ignored the call's error words its kill's `earlier` as the
-/// event; a refused send leaves "the stop action". Mutants: either answer is recorded as the other.
+/// event; a refused send leaves no earlier send to name. Mutants: either answer is recorded as the other; a
+/// refused send names "the stop action".
 #[skuld::test]
 fn a_root_records_a_send_that_may_have_gone_out_as_made() {
     for (answer, earlier) in [
-        (ProxyExit::from(ProxyAnswer::Unconfirmed), "the CTRL_C"),
-        (nothing_sent(), "the stop action"),
+        (ProxyExit::from(ProxyAnswer::Unconfirmed), Some("the CTRL_C")),
+        (nothing_sent(), None),
     ] {
         let fixture = Fixture::answering(answer.code());
         let (child, sock, _) = spawn_member(Handler::Ignore, None, ContainMode::Strongest, |cmd| {
@@ -861,7 +1003,7 @@ fn a_root_records_a_send_that_may_have_gone_out_as_made() {
             &crate::child::graceful::shutdown::BlockingDriver(&child),
         ));
         acted.expect("the action ignored the send's answer");
-        assert_eq!(said, earlier, "{answer:?}");
+        assert_eq!(said.as_deref(), earlier, "{answer:?}");
         assert_proxy_answered(child.pid(), CtrlEvent::CtrlC, answer);
         kill_release_reap(&child, sock, false);
     }
@@ -920,7 +1062,7 @@ fn a_tree_call_whose_root_exited_during_the_ask_sends_nothing_and_says_so() {
             let err = asking_while_the_child_exits(&child, &held, || child.terminate_tree())
                 .expect_err("nothing was sent to a tree whose root had exited");
             drop(sock);
-            let Error::Unassessable { detail, .. } = &err else {
+            let Error::Unassessable { detail, .. } = err.error() else {
                 panic!("{mode:?}, {answer:?}: {err:?}")
             };
             assert!(detail.contains("nothing was sent"), "{mode:?}, {answer:?}: {detail}");
@@ -1000,10 +1142,10 @@ fn a_start_that_may_have_started_the_proxy_may_have_sent() {
     };
     assert!(matches!(
         start_failed(exe, may_have_started),
-        SendOutcome::Sent(Err(Error::MayHaveStarted { .. }))
+        SendAnswer::Unknown(Error::MayHaveStarted { .. })
     ));
 
-    let SendOutcome::NotSent(Error::Io(io)) = start_failed(
+    let SendAnswer::NotSent(Error::Io(io)) = start_failed(
         exe,
         Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
     ) else {
@@ -1015,6 +1157,23 @@ fn a_start_that_may_have_started_the_proxy_may_have_sent() {
         text.contains("nothing was sent") && text.contains(&exe.display().to_string()),
         "{text}"
     );
+
+    // Any other variant that fails the start says the proxy never ran, whatever its variant: `Io` is not
+    // the only not-sent answer.
+    for failed in [
+        Error::Containment {
+            detail: "the proxy could not be placed".into(),
+            source: None,
+        },
+        Error::Quote(crate::error::QuoteError::new(
+            0,
+            crate::error::QuoteErrorKind::TrailingBackslash,
+        )),
+    ] {
+        let answer = start_failed(exe, failed);
+        assert_eq!(answer.outcome(), crate::stop::SendOutcome::NotSent, "{answer:?}");
+        assert!(matches!(answer, SendAnswer::NotSent(_)), "{answer:?}");
+    }
 }
 
 /// A failed wait for the proxy leaves unknown whether the event was sent, keeps the wait's error as the
@@ -1022,7 +1181,7 @@ fn a_start_that_may_have_started_the_proxy_may_have_sent() {
 /// be made to reach. Mutants: the failed wait is a send that was not made; the source is dropped.
 #[skuld::test]
 fn a_failed_wait_for_the_proxy_is_unknown_and_says_the_proxy_was_ended() {
-    let SendOutcome::Sent(Err(Error::Unassessable { detail, source })) = wait_failed(
+    let SendAnswer::Unknown(Error::Unassessable { detail, source }) = wait_failed(
         77,
         CtrlEvent::CtrlC,
         Error::Io(std::io::Error::other("the wait was refused")),
@@ -1040,8 +1199,7 @@ fn a_failed_wait_for_the_proxy_is_unknown_and_says_the_proxy_was_ended() {
 /// seam. Mutants: the kind is lost; the failure is a send that may have gone out.
 #[skuld::test]
 fn an_unreadable_host_path_sends_nothing_and_keeps_the_os_error() {
-    let SendOutcome::NotSent(Error::Io(io)) =
-        exe_unreadable(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    let SendAnswer::NotSent(Error::Io(io)) = exe_unreadable(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
     else {
         panic!("nothing was sent")
     };

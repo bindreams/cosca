@@ -275,8 +275,9 @@ fn the_async_terminate_needs_no_pidfd_open() {
     use std::os::unix::process::ExitStatusExt;
 
     for (code, name) in REFUSALS {
-        let (result, status) =
-            async_act_under_refusal(code, false, |runtime, child| runtime.block_on(child.terminate()));
+        let (result, status) = async_act_under_refusal(code, false, |runtime, child| {
+            runtime.block_on(child.terminate()).map_err(cosca::error::Error::from)
+        });
         result.unwrap_or_else(|e| panic!("{name}: terminate needs no pidfd_open: {e}"));
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {status:?}");
     }

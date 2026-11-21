@@ -73,7 +73,7 @@ fn assert_refused_sends_are_not_sent() {
     .expect("assign the group leader to a job");
     let broken = TreeStop::named(
         crate::stop::proxy::protocol::CtrlEvent::CtrlBreak.name(),
-        crate::containment::SendOutcome::direct(crate::containment::windows::terminate(leader.id())),
+        crate::containment::SendAnswer::direct(crate::containment::windows::terminate(leader.id())),
     );
     let (outcome, _) = job.send_terminate(leader.id(), None, broken);
     assert!(
@@ -89,7 +89,7 @@ fn assert_refused_sends_are_not_sent() {
         .expect("the live group leader resolves");
     let broken = TreeStop::named(
         crate::stop::proxy::protocol::CtrlEvent::CtrlBreak.name(),
-        crate::containment::SendOutcome::direct(crate::containment::windows::terminate(leader.id())),
+        crate::containment::SendAnswer::direct(crate::containment::windows::terminate(leader.id())),
     );
     let (outcome, _) = crate::containment::treewalk::terminate_tree(&crate::identity::HostKernel, id, None, broken);
     assert!(
@@ -111,10 +111,11 @@ fn assert_the_direct_send_has_no_console() {
     // The tree ops.
     let (child, sock) = spawn_gui_root(|cmd| _ = cmd.graceful_stop(direct));
     assert_eq!(child.containment(), Containment::JobObject);
-    assert!(
-        matches!(child.terminate_tree(), Err(Error::NoConsole { .. })),
-        "terminate_tree must report NoConsole"
-    );
+    let err = child
+        .terminate_tree()
+        .expect_err("terminate_tree must report NoConsole");
+    assert!(matches!(err.error(), Error::NoConsole { .. }), "{err:?}");
+    assert_eq!(err.outcome(), crate::stop::SendOutcome::NotSent, "no event was sent");
     assert_no_break_sent();
     assert_eq!(
         child.is_alive(),
@@ -138,10 +139,9 @@ fn assert_the_direct_send_has_no_console() {
 
     // The lone ops.
     let (child, sock) = spawn_gui_root(|cmd| _ = cmd.graceful_stop(direct));
-    assert!(
-        matches!(child.terminate(), Err(Error::NoConsole { .. })),
-        "terminate must report NoConsole"
-    );
+    let err = child.terminate().expect_err("terminate must report NoConsole");
+    assert!(matches!(err.error(), Error::NoConsole { .. }), "{err:?}");
+    assert_eq!(err.outcome(), crate::stop::SendOutcome::NotSent, "no event was sent");
     assert_no_break_sent();
     assert_eq!(
         child.is_alive(),

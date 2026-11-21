@@ -84,7 +84,7 @@ enum Intent {
 /// flag the OS got.
 struct Probed {
     report: String,
-    terminate: Result<(), cosca::error::Error>,
+    terminate: Result<(), cosca::stop::StopError>,
 }
 
 #[cfg(windows)]
@@ -245,7 +245,12 @@ fn assert_no_group(backend: Backend) {
     let err = probed
         .terminate
         .expect_err("a contained child told to lead no group must be refused the group break");
-    common::assert_refused_for_no_group(&err);
+    common::assert_refused_for_no_group(err.error());
+    assert_eq!(
+        err.outcome(),
+        cosca::stop::SendOutcome::NotSent,
+        "{backend:?}: the refusal sent nothing"
+    );
     assert_backend(backend, &probed.report);
 }
 

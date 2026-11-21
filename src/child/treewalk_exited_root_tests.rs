@@ -325,7 +325,8 @@ fn terminate_tree_over_an_exited_root_with_an_empty_walk_is_unassessable_and_sen
         .terminate_tree()
         .expect_err("a walk from an exited root finds no member");
 
-    assert!(matches!(err, Error::Unassessable { .. }), "{err:?}");
+    assert!(matches!(err.error(), Error::Unassessable { .. }), "{err:?}");
+    assert_eq!(err.outcome(), crate::stop::SendOutcome::NotSent);
     assert_eq!(sends.entries(), vec![], "nothing was sent");
     drop(stdin);
     child.wait().expect("reap the root");

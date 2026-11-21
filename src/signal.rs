@@ -58,10 +58,17 @@ impl std::fmt::Display for Sig {
 /// What a send did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sent {
-    /// The signal was handed to the OS for the child. It also covers a target whose exit had begun
-    /// when the send was refused (macOS: a signal answered `EPERM`, `P_WEXIT` set): nothing was
-    /// delivered, and the exit is on its way.
+    /// The signal was handed to the OS for the child.
     Delivered,
+    /// Nothing was delivered: the process's exit has begun or finished and it is not reaped, so its pid still
+    /// names it (macOS: a signal answered `ESRCH` by a zombie, or `EPERM` with `P_WEXIT` set). A kill reads it
+    /// as [`Delivered`](Sent::Delivered), the exit being what it asked for; a cooperative stop's record reads
+    /// it as not sent.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only macOS's token send finds an exit under way")
+    )]
+    Exited,
     /// Nothing was delivered because the child is gone: reaped, or its pid no longer names it. Not
     /// an error; logged at `debug`.
     Gone,
@@ -136,12 +143,12 @@ pub(crate) fn is_unpinned(state: impl FnOnce() -> RootState) -> bool {
     }
 }
 
-/// The root of `op` is [`RootState::Unpinned`] at the end of it: its signals went out, but the
-/// exit status of a zombie launchd holds cannot be collected.
+/// The root of `op` is [`RootState::Unpinned`] at the end of it: the exit status of a zombie launchd
+/// holds cannot be collected.
 #[cfg(target_os = "macos")]
 pub(crate) fn unpinned_status(pid: u32, op: &str) -> crate::error::Error {
     crate::error::Error::Unassessable {
-        detail: format!("pid {pid}: {op} sent its signals, but its exit status cannot be collected: {UNPINNED_WHY}"),
+        detail: format!("pid {pid}: {op}: the root's exit status cannot be collected: {UNPINNED_WHY}"),
         source: None,
     }
 }
@@ -275,8 +282,8 @@ pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
 /// `exec`. A refused send is the bare errno, so an `EPERM` stays raw; a refused id read keeps its
 /// errno's kind, so an `EPERM` stays `PermissionDenied`.
 ///
-/// A child that has exited and is not reaped is [`Sent::Delivered`], as on Linux: it is ours, and
-/// its zombie holds the pid.
+/// A child that has exited and is not reaped, or whose exit has begun, is [`Sent::Exited`]: it is ours, and
+/// its zombie holds the pid, so it is not [`Sent::Gone`].
 #[cfg(target_os = "macos")]
 pub(crate) fn via_audit_token(
     kernel: &dyn crate::identity::Kernel,
@@ -299,9 +306,8 @@ pub(crate) fn via_audit_token(
     #[cfg(test)]
     crate::send_log::record(pid, sig, crate::send_log::Via::Identity);
     Ok(match sent? {
-        SignalByTokenOutcome::Delivered | SignalByTokenOutcome::ExitedUnreaped | SignalByTokenOutcome::Exiting => {
-            Sent::Delivered
-        }
+        SignalByTokenOutcome::Delivered => Sent::Delivered,
+        SignalByTokenOutcome::ExitedUnreaped | SignalByTokenOutcome::Exiting => Sent::Exited,
         SignalByTokenOutcome::Gone => Sent::Gone,
     })
 }

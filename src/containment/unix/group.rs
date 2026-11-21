@@ -560,7 +560,7 @@ fn resend_sigkill(
             Err(reached) => reached,
             Ok(()) => {
                 match KillOutcome::of(os.signal(Sig::Kill)) {
-                    KillOutcome::Terminated => Reached::Killed,
+                    KillOutcome::Terminated | KillOutcome::Exited => Reached::Killed,
                     // Exited between the open and the send.
                     KillOutcome::AlreadyGone => Reached::Yes,
                     KillOutcome::NotAttempted(refused) if matches!(&refused, Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)) =>

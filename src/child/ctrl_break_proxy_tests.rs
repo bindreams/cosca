@@ -94,7 +94,7 @@ fn a_child_without_a_group_is_refused_by_the_real_proxy_when_asked(#[fixture(ctr
     });
     assert_in_our_console(child.pid(), "the member");
     let err = child.terminate().expect_err("the child is on our console");
-    let Error::Unsupported { detail, .. } = &err else {
+    let Error::Unsupported { detail, .. } = err.error() else {
         panic!("{err:?}")
     };
     assert!(detail.contains("Command::new_process_group"), "{detail}");

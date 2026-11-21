@@ -404,7 +404,8 @@ async fn a_cancelled_wait_async_lets_a_real_child_go_without_blocking() {
 /// Mutants: any cell worded another way: a kill not said (or said though none was sent), a refusal
 /// without its error, a foreign reap above `debug` (or a refused kill's line below `warn`), a
 /// running child said reaped, a child whose kill found nothing to signal also said to be running,
-/// the wrong per-OS clause, a doubled "unreaped".
+/// the wrong per-OS clause, a doubled "unreaped"; a kill that found the exit begun (`Sent::Exited`) said
+/// as one that was not sent.
 #[skuld::test]
 fn the_let_go_line_is_pinned_for_every_kill_and_look() {
     use crate::child::lifecycle::Settlement;
@@ -432,14 +433,23 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
     let denied = format!("could not be terminated ({})", crate::error::io_said("denied"));
     let boom = format!("the wait failed: {}", crate::error::io_said("boom"));
 
-    // Every kill the drop can have, over every look it can see: all 5 x 6 pairs the types allow,
+    // Every kill the drop can have, over every look it can see: all 6 x 5 pairs the types allow,
     // reachable or not on a given platform. A kill answers `Gone` once the child has exited, so a
     // look right after it may still find the zombie not yet collectable. The wording is pinned for
     // each.
-    let kills: [KillCase<'_>; 5] = [
+    let kills: [KillCase<'_>; 6] = [
         (|| None, "", &["kill"], vec![LEAVING_RUNNING], &["kill"]),
         (
             || Some(Ok(Sent::Delivered)),
+            "(killed it)",
+            &["refused", "terminated"],
+            vec!["it had not exited yet", LEFT],
+            &["refused", "terminated", LEAVING_RUNNING],
+        ),
+        // A kill of a child whose exit had begun (macOS) is settled as a delivered one: the exit is what it
+        // asked for, and the child may not be collectable yet.
+        (
+            || Some(Ok(Sent::Exited)),
             "(killed it)",
             &["refused", "terminated"],
             vec!["it had not exited yet", LEFT],

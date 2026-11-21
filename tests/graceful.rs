@@ -32,7 +32,7 @@ fn child_terminate_unsupported_for_an_uncontained_child_on_windows() {
     let err = child
         .terminate()
         .expect_err("a child that leads no group cannot be addressed");
-    common::assert_refused_for_no_group(&err);
+    common::assert_refused_for_no_group(err.error());
     common::kill_release_reap(&child, sock);
 }
 
@@ -181,7 +181,7 @@ fn child_terminate_reports_ok_for_an_already_exited_child() {
         let err = child
             .terminate()
             .expect_err("a child on our console that leads no group is refused, exited or not");
-        common::assert_refused_for_no_group(&err);
+        common::assert_refused_for_no_group(err.error());
     }
 }
 

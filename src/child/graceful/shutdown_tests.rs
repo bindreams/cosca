@@ -38,13 +38,11 @@ fn a_root_reaped_elsewhere_answers_unassessable_with_its_echild_as_the_source() 
             let Error::Unassessable { detail, .. } = &answer else {
                 panic!("{answer:?}");
             };
-            assert!(
-                detail.starts_with(&format!("pid 4242: {op} sent its signals")),
-                "{detail}"
-            );
-            assert!(
-                detail.ends_with("exit status cannot be collected: the root was reaped elsewhere"),
-                "{detail}"
+            // Only what is true on every path: the status cannot be collected, and why. Nothing about what was
+            // sent, which the record of the stop's send says and this answer does not know.
+            assert_eq!(
+                detail,
+                &format!("pid 4242: {op}: the root's exit status cannot be collected: the root was reaped elsewhere")
             );
             assert_eq!(crate::error::first_os_code(&answer), Some(libc::ECHILD), "{answer:?}");
         }
@@ -105,9 +103,10 @@ fn a_zombie_launchd_holds_answers_the_unpinned_refusal_quietly() {
             panic!("{answer:?}");
         };
         assert!(
-            detail.starts_with(&format!("pid 4242: {op} sent its signals")),
+            detail.starts_with(&format!("pid 4242: {op}: the root's exit status cannot be collected")),
             "{detail}"
         );
+        assert!(!detail.contains("sent"), "{detail}");
         assert!(detail.contains("launchd"), "{detail}");
     }
     assert_eq!(crate::log_capture::warns_since(mark, ""), Vec::<String>::new());

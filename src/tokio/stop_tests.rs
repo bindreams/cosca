@@ -109,6 +109,49 @@ async fn async_terminate_tree_runs_the_action_on_a_tree_target() {
     assert_nothing_was_sent(&mut child, stdin).await;
 }
 
+/// A failed async call answers how the action's last prepared send went, as the sync call does
+/// (`a_failed_call_answers_how_the_actions_last_prepared_send_went`), for a root target and a tree target:
+/// an error after a send that went out is `Sent`, and one from an action that made no prepared send is
+/// `Unknown`.
+///
+/// Mutants: the outcome is taken from the action's error and not from the record; the async send writes no
+/// record, or the tree call reads none.
+#[skuld::test]
+async fn async_a_failed_call_answers_how_the_actions_last_prepared_send_went() {
+    use crate::stop::SendOutcome::{Sent, Unknown};
+
+    assert_current_thread();
+    for tree in [false, true] {
+        for sends in [false, true] {
+            let (mut child, stdin) = if sends {
+                blocker_stopping_by(
+                    |target| {
+                        Box::pin(async move {
+                            prepared_send(target).await?;
+                            Err(refused())
+                        })
+                    },
+                    true,
+                )
+                .await
+            } else {
+                blocker_stopping_by(|_| Box::pin(async { Err(refused()) }), true).await
+            };
+            let err = if tree {
+                never_blocking(child.terminate_tree()).await
+            } else {
+                never_blocking(child.terminate()).await
+            }
+            .expect_err("the action failed");
+            let expected = if sends { Sent } else { Unknown };
+            assert_eq!(err.outcome(), expected, "tree: {tree}, a send: {sends}");
+            child.kill_tree().await.expect("kill_tree");
+            drop(stdin);
+            child.wait().await.expect("reap");
+        }
+    }
+}
+
 /// The action's error is the call's, and `graceful_shutdown` ends there: nothing waited for, nothing
 /// killed, the child left running.
 ///
@@ -119,7 +162,7 @@ async fn async_an_actions_error_is_terminates_error() {
     let (mut child, stdin) = blocker_stopping_by(|_| Box::pin(async { Err(refused()) }), false).await;
     let err = never_blocking(child.terminate()).await.expect_err("the action refused");
     assert!(
-        matches!(&err, Error::Unsupported { detail, .. } if detail == "refused by the test action"),
+        matches!(err.error(), Error::Unsupported { detail, .. } if detail == "refused by the test action"),
         "{err:?}"
     );
     let err = never_blocking(child.graceful_shutdown(Duration::ZERO))
@@ -623,6 +666,23 @@ async fn member_stopping_through(held: &Held) -> (crate::tokio::Child, std::net:
     (child, sock)
 }
 
+/// Polls `call` by hand to its wait for the proxy and returns the proxy's pid. The start of the proxy is on
+/// the blocking pool, and the future is woken when it is done: the next poll is the wait for the proxy.
+#[cfg(windows)]
+async fn polled_to_the_proxy_wait<F: std::future::Future>(call: &mut std::pin::Pin<Box<F>>, held: &mut Held) -> u32 {
+    use std::task::Context;
+
+    let (waker, wakes) = crate::tokio::test_runtime::counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(call.as_mut().poll(&mut cx).is_pending(), "the proxy is not started yet");
+    wakes.recv().expect("the start of the proxy woke the call");
+    assert!(
+        call.as_mut().poll(&mut cx).is_pending(),
+        "the proxy has not answered, so the call waits for it"
+    );
+    held.started().await
+}
+
 /// The wait for the proxy's exit is an await: while the proxy runs, a second task on the same runtime runs,
 /// and releases it. A wait that blocked the runtime thread would starve that task, so the release comes from
 /// the block itself, which also records that the thread blocked: the call returns and fails here by
@@ -669,29 +729,14 @@ async fn the_wait_for_the_proxy_blocks_no_runtime_thread() {
 #[cfg(windows)]
 #[skuld::test]
 async fn a_dropped_terminate_has_ended_its_proxy() {
-    use std::future::Future as _;
-    use std::task::Context;
-
     use crate::test_child::ctrl_break::{assert_no_break_sent, kill_release_reap_async};
 
     assert_current_thread();
     let mut held = Held::new();
     let (mut child, sock) = member_stopping_through(&held).await;
     {
-        let (waker, wakes) = crate::tokio::test_runtime::counting_waker();
-        let mut cx = Context::from_waker(&waker);
         let mut terminate = Box::pin(child.terminate());
-        assert!(
-            terminate.as_mut().poll(&mut cx).is_pending(),
-            "the proxy is not started yet"
-        );
-        // The start of the proxy finished: the next poll is the wait for it.
-        wakes.recv().expect("the start of the proxy woke the call");
-        assert!(
-            terminate.as_mut().poll(&mut cx).is_pending(),
-            "the proxy has not answered, so the call waits for it"
-        );
-        let proxy = held.started().await;
+        let proxy = polled_to_the_proxy_wait(&mut terminate, &mut held).await;
         let id = crate::identity::ProcessId::of(proxy)
             .found()
             .expect("the proxy runs, and has an identity");
@@ -708,6 +753,55 @@ async fn a_dropped_terminate_has_ended_its_proxy() {
     assert_no_break_sent();
     held.release();
     kill_release_reap_async(&mut child, sock, false).await;
+}
+
+/// A proxy send dropped while its proxy runs leaves the record of a send that may have gone out, whatever
+/// an earlier send of the same target recorded: the proxy was started, and may have sent before it was ended.
+/// The target holds a refused send, then the send's future is polled to its wait for the proxy and dropped;
+/// the record is `Unknown` and names the `CTRL_BREAK` as sent, for a root and for a tree target.
+///
+/// Mutants: the record is written only when the answer is in (`conclude`), so the dropped send leaves the
+/// earlier refusal, `NotSent`; the record of a tree target does not name the stop.
+#[cfg(windows)]
+#[skuld::test]
+async fn a_dropped_proxy_send_records_a_send_that_may_have_gone_out() {
+    use crate::containment::earlier_of;
+    use crate::stop::{RootRecord, SendOutcome, TreeCall, TreeRecord};
+    use crate::test_child::ctrl_break::kill_release_reap_async;
+
+    assert_current_thread();
+    for tree in [false, true] {
+        let mut held = Held::new();
+        let (mut child, sock) = member_stopping_through(&held).await;
+        let target = if tree {
+            StopTarget::tree(&child.inner, TreeCall::SignalOnly)
+        } else {
+            StopTarget::from(&child)
+        };
+        target.note_not_sent(&refused());
+        {
+            let mut send = Box::pin(stop::send_console_event_via_proxy(&target, crate::CtrlEvent::CtrlBreak));
+            polled_to_the_proxy_wait(&mut send, &mut held).await;
+        }
+        // The outcome, and the stop the record names as sent.
+        let (recorded, named) = if tree {
+            let Some(TreeRecord::Sent { earlier, outcome, .. }) = target.into_tree_record() else {
+                panic!("the tree target holds no record of a send that was made")
+            };
+            (outcome, earlier)
+        } else {
+            let record = target.into_root_record().expect("the root target holds a record");
+            let outcome = record.outcome();
+            let RootRecord::Unknown(name) = record else {
+                panic!("the root's record names no send that may have gone out")
+            };
+            (outcome, Some(earlier_of(name)))
+        };
+        assert_eq!(recorded, SendOutcome::Unknown, "tree: {tree}");
+        assert_eq!(named.as_deref(), Some("the CTRL_BREAK"), "tree: {tree}");
+        held.release();
+        kill_release_reap_async(&mut child, sock, false).await;
+    }
 }
 
 /// The warning for a proxy that has not answered by the threshold, as the sync driver gives it (see its
@@ -831,7 +925,7 @@ async fn async_a_child_that_has_exited_is_answered_before_the_proxy_is_started()
                 .await
                 .expect_err("nothing was sent to a tree whose root had exited");
             assert!(
-                matches!(&err, Error::Unassessable { detail, .. } if detail.contains("nothing was sent") && !detail.contains("CTRL_BREAK")),
+                matches!(err.error(), Error::Unassessable { detail, .. } if detail.contains("nothing was sent") && !detail.contains("CTRL_BREAK")),
                 "{err:?}"
             );
             never_blocking(child.graceful_shutdown_tree(Duration::ZERO))

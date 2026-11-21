@@ -210,7 +210,7 @@ fn graceful_lone_shutdown_of_a_root_reaped_elsewhere_answers_unassessable_with_t
     assert!(
         matches!(&err, crate::error::Error::Unassessable { detail, .. }
             if detail.contains("exit status cannot be collected: the root was reaped elsewhere")
-                && detail.contains("graceful_shutdown sent its signals")),
+                && detail.contains("graceful_shutdown: the root's exit status cannot be collected")),
         "{err:?}"
     );
     assert_eq!(crate::error::first_os_code(&err), Some(libc::ECHILD), "{err:?}");

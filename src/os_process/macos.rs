@@ -150,13 +150,13 @@ pub(crate) enum SignalByTokenOutcome {
     Delivered,
     /// The process has exited and is not reaped: `ESRCH`, and the pid still has the same unique id
     /// at the same `p_idversion`; or a signal was refused with `EPERM` and the process is a zombie.
-    /// Nothing was delivered. A caller that owns the child reads this as delivered, as a zombie it
-    /// owns is on Linux; a caller that holds no child reads it as gone.
+    /// Nothing was delivered. A caller that owns the child reads this as [`Sent::Exited`]; a caller that
+    /// holds no child reads it as gone.
     ExitedUnreaped,
     /// A signal was refused with `EPERM` and the process's exit has begun (`P_WEXIT`, with `p_stat`
     /// not yet `SZOMB`). The kernel answers `EPERM` to a send in that window, so it is no refusal.
     /// Measured for `SIGKILL`, `SIGTERM` and `SIGUSR1`; other signals are not measured. Nothing was
-    /// delivered. Every caller, a holder of no child too, reads it as delivered: the exit is what a
+    /// delivered. Every caller, a holder of no child too, reads it as [`Sent::Exited`]: the exit is what a
     /// stop asked for.
     Exiting,
     /// The process is gone, or its pid names another process.
@@ -259,7 +259,8 @@ impl<K: Kernel + Send> OsProcess for MacosProcess<K> {
         let outcome = signal_by_token(&self.kernel, pid, self.unique, &mut idversion, sig);
         self.idversion.store(idversion, Ordering::Relaxed);
         match outcome.map_err(Error::Io)? {
-            SignalByTokenOutcome::Delivered | SignalByTokenOutcome::Exiting => Ok(Sent::Delivered),
+            SignalByTokenOutcome::Delivered => Ok(Sent::Delivered),
+            SignalByTokenOutcome::Exiting => Ok(Sent::Exited),
             // This process holds no child: an exited process is gone to it.
             SignalByTokenOutcome::ExitedUnreaped | SignalByTokenOutcome::Gone => Ok(Sent::Gone),
         }

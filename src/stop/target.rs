@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use crate::child::Child;
 use crate::containment::treewalk::WalkToken;
-use crate::containment::{Root, TerminateOutcome, TreeStop};
+use crate::containment::{Root, SendAnswer, TerminateOutcome, TreeStop};
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::signal::Sig;
-use crate::stop::StopWaits as _;
+use crate::stop::{SendOutcome, StopError, StopWaits as _};
 
 /// What a stop action acts on: a child's process, or its whole tree, and what the spawn recorded about
 /// the child.
@@ -54,23 +54,37 @@ pub(crate) enum TreeCall<'a> {
     Shutdown(&'a WalkToken),
 }
 
-/// What the last prepared send of a call on the root did, for the call to go on from.
+/// What the last prepared send of a call on the root did, for the call to go on from, and what
+/// `terminate` answers when the action fails ([`outcome`](RootRecord::outcome)). Only a record of a send that
+/// went out, or may have, names a stop: a later error says that stop was sent before it.
 pub(crate) enum RootRecord {
-    /// The send went out; the stop it sent, by name (`TreeStop::name`). The lone shutdown words what a
-    /// refused kill after it says was sent from this.
+    /// The stop went out, by name (`TreeStop::name`), which the lone shutdown words what a refused kill after
+    /// it says was sent from.
     Sent(&'static str),
-    /// The send was refused: the error's report, for the call to log if the action goes on regardless.
-    Refused(String),
+    /// The stop may have gone out, and the answer cannot say ([`SendOutcome::Unknown`]).
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only the Windows proxy's answer is unknown")
+    )]
+    Unknown(&'static str),
+    /// Nothing was sent. `Some`: a refusal, with its error's report, for the call to log if the action goes on
+    /// regardless. `None`: there was nothing to send to (the root had exited, or the handle found it gone),
+    /// which is no refusal.
+    NotSent(Option<String>),
 }
 
 /// What the last prepared send of a call on the tree did, for the call to go on from.
 pub(crate) enum TreeRecord {
-    /// A send to the tree went out, or found nothing to send: the grace, the sweep and the reap follow.
-    /// `earlier` names what the sweep's error says was sent before it; `walk` is the token of this
-    /// call's complete walk, which the sweep may stand on.
+    /// A send to the tree was made, whoever it reached, or found nothing to send: the grace, the sweep and
+    /// the reap follow. `earlier` names what the sweep's error says was sent before it; `walk` is the token
+    /// of this call's complete walk, which the sweep may stand on. `outcome` is how the send went: `Sent`, or
+    /// `Unknown`, or `NotSent` when the call goes on though nothing went out (the send reached no process:
+    /// an empty group or leaf, every member gone or refusing it; the root had exited; or the tree was already
+    /// killed).
     Sent {
         earlier: Option<String>,
         walk: Option<WalkToken>,
+        outcome: SendOutcome,
     },
     /// The send was refused, or found nothing that names the tree, and answered an error (its report):
     /// the call ends with it unless the action went on regardless.
@@ -80,8 +94,8 @@ pub(crate) enum TreeRecord {
     /// it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux has a pidfd"))]
     RootThroughPidfd(crate::containment::Skip, Result<crate::signal::Sent, Error>, Sig),
-    /// macOS: an fd marker's holders alone were sent the signal; the call waits the grace and kills any
-    /// left.
+    /// macOS: an fd marker's holders alone were sent the signal ([`Skip::outcome`](crate::containment::Skip::outcome) says whether it reached one); the
+    /// call waits the grace and kills any left.
     #[cfg_attr(
         not(unix),
         allow(dead_code, reason = "only a Unix mechanism skips by the root's number")
@@ -89,10 +103,55 @@ pub(crate) enum TreeRecord {
     HoldersOnly(crate::containment::Skip, Sig),
 }
 
+impl RootRecord {
+    /// How the send this record is of went.
+    pub(crate) fn outcome(&self) -> SendOutcome {
+        match self {
+            RootRecord::Sent(_) => SendOutcome::Sent,
+            RootRecord::Unknown(_) => SendOutcome::Unknown,
+            RootRecord::NotSent(_) => SendOutcome::NotSent,
+        }
+    }
+}
+
+/// How a signal sent through a root's handle went: delivered, or not (the root was gone, or the handle
+/// could not vouch for it, or the OS refused).
+pub(super) fn signal_outcome(sent: &Result<crate::signal::Sent, Error>) -> SendOutcome {
+    match sent {
+        Ok(crate::signal::Sent::Delivered) => SendOutcome::Sent,
+        Ok(_) | Err(_) => SendOutcome::NotSent,
+    }
+}
+
 impl TreeRecord {
+    /// How the send this record is of went.
+    pub(crate) fn outcome(&self) -> SendOutcome {
+        match self {
+            TreeRecord::Sent { outcome, .. } => *outcome,
+            TreeRecord::NotSent(_) => SendOutcome::NotSent,
+            TreeRecord::RootThroughPidfd(_, sent, _) => signal_outcome(sent),
+            TreeRecord::HoldersOnly(skip, _) => skip.outcome(),
+        }
+    }
+
+    /// The record of a send after which the call goes on from nothing the send found (no earlier stop,
+    /// no listing), and which went as `outcome`.
+    fn bare(outcome: SendOutcome) -> TreeRecord {
+        TreeRecord::Sent {
+            earlier: None,
+            walk: None,
+            outcome,
+        }
+    }
+
     /// A send that answered `refusal`.
     fn not_sent(refusal: &Error) -> TreeRecord {
         TreeRecord::NotSent(crate::error::Report(refusal).to_string())
+    }
+
+    /// The record of the send that came to `answer`, for a call that reads only how it went.
+    fn of(answer: &SendAnswer) -> TreeRecord {
+        TreeRecord::bare(answer.outcome())
     }
 }
 
@@ -125,22 +184,56 @@ impl<'a> StopTarget<'a> {
         self.scope
     }
 
-    /// Leaves a send of the stop `name` to the root that went out, or may have, as what the last send
-    /// did, whatever it answered: an answer that is an error but cannot say the stop did not arrive
-    /// is not a refusal.
-    pub(crate) fn note_root_went_out(&self, name: &'static str) {
-        debug_assert!(!self.covers_tree(), "a tree target records its sends as tree records");
-        *lock(&self.root_record) = Some(RootRecord::Sent(name));
+    /// Leaves a send of the stop `name` to the root that went out as what the last send did, whatever it
+    /// answered: an answer that is an error but cannot say the stop did not arrive is not a refusal.
+    pub(crate) fn note_root_sent(&self, name: &'static str) {
+        self.note_root(RootRecord::Sent(name));
     }
 
-    /// Leaves a send that was refused (a rule's refusal, or an early refusal of a prepared function) as
-    /// what the last send did, for either kind of target.
-    pub(crate) fn note_refused(&self, refusal: &Error) {
+    /// Leaves a send of the stop `name` to the root that may have gone out, and whose answer cannot say, as
+    /// what the last send did.
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only the Windows proxy's answer is unknown")
+    )]
+    pub(crate) fn note_root_unknown(&self, name: &'static str) {
+        self.note_root(RootRecord::Unknown(name));
+    }
+
+    /// Windows: leaves the stop `name` as a send that may have gone out, for either kind of target, before a
+    /// send that may never answer (the proxy's: its future can be dropped while the proxy runs). The send's
+    /// end replaces it with what the send came to.
+    #[cfg(windows)]
+    pub(crate) fn note_may_have_sent(&self, name: &'static str) {
         match self.scope {
-            Scope::Root => {
-                *lock(&self.root_record) = Some(RootRecord::Refused(crate::error::Report(refusal).to_string()));
-            }
-            Scope::Tree(_) => self.note_tree(TreeRecord::not_sent(refusal)),
+            Scope::Root => self.note_root_unknown(name),
+            Scope::Tree(_) => self.note_tree(TreeRecord::Sent {
+                earlier: Some(crate::containment::earlier_of(name)),
+                walk: None,
+                outcome: SendOutcome::Unknown,
+            }),
+        }
+    }
+
+    /// Leaves a send that found no root to send to (`NotSent(None)`) as what the last send did: nothing was
+    /// sent, no stop is named, and no refusal is reported.
+    pub(crate) fn note_root_gone(&self) {
+        self.note_root(RootRecord::NotSent(None));
+    }
+
+    fn note_root(&self, record: RootRecord) {
+        debug_assert!(!self.covers_tree(), "a tree target records its sends as tree records");
+        *lock(&self.root_record) = Some(record);
+    }
+
+    /// Leaves a refusal (a rule's, or an early refusal of a prepared function) as what the last send did,
+    /// for either kind of target. A call that ends at its send ([`TreeCall::SignalOnly`]) keeps only that
+    /// nothing was sent: only a call that goes on from it reads the report.
+    pub(crate) fn note_not_sent(&self, refusal: &Error) {
+        match self.scope {
+            Scope::Root => self.note_root(RootRecord::NotSent(Some(crate::error::Report(refusal).to_string()))),
+            Scope::Tree(TreeCall::SignalOnly) => self.note_tree(TreeRecord::bare(SendOutcome::NotSent)),
+            Scope::Tree(TreeCall::Shutdown(_)) => self.note_tree(TreeRecord::not_sent(refusal)),
         }
     }
 
@@ -163,6 +256,19 @@ impl<'a> StopTarget<'a> {
         self.tree_record
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What `terminate` or `terminate_tree` answers once the action has returned `acted`: `Ok` as it is, an
+    /// error with how the action's last prepared send went. An action that made no prepared send and
+    /// failed is [`Unknown`](SendOutcome::Unknown).
+    pub(crate) fn into_stop_result(self, acted: Result<(), Error>) -> Result<(), StopError> {
+        acted.map_err(|error| {
+            let recorded = match self.scope {
+                Scope::Root => self.into_root_record().map(|record| record.outcome()),
+                Scope::Tree(_) => self.into_tree_record().map(|record| record.outcome()),
+            };
+            StopError::new(error, recorded.unwrap_or(SendOutcome::Unknown))
+        })
     }
 
     /// The child's pid, as [`Child::pid`].
@@ -263,26 +369,37 @@ impl<'a> StopTarget<'a> {
 
     /// `terminate_tree`'s answer to the route's `outcome`: what the signals reached is all it says, and
     /// nothing is waited for. A send to the root through its pidfd is gated as any send of the action's is,
-    /// in front of the route.
+    /// in front of the route. The record is only what the call reads back for how the send went.
     fn signal_only_answer(&self, outcome: TerminateOutcome, #[cfg(unix)] sig: Sig) -> Result<(), Error> {
         match outcome {
-            TerminateOutcome::Sent { result, .. } => result,
-            TerminateOutcome::NotSent(not_sent) | TerminateOutcome::RootExited(not_sent) => Err(not_sent),
             // A signal settles nothing, so nothing is killed again and nothing waited for.
             #[cfg(unix)]
-            TerminateOutcome::End(skip) | TerminateOutcome::HoldersOnly(skip) => {
+            TerminateOutcome::End(skip) => {
                 let call = self.child.skip_call("terminate_tree", sig, None);
+                self.note_tree(TreeRecord::bare(SendOutcome::NotSent));
+                call.answer(&self.child.tree, skip, None).answer
+            }
+            #[cfg(unix)]
+            TerminateOutcome::HoldersOnly(skip) => {
+                let call = self.child.skip_call("terminate_tree", sig, None);
+                self.note_tree(TreeRecord::bare(skip.outcome()));
                 call.answer(&self.child.tree, skip, None).answer
             }
             #[cfg(unix)]
             TerminateOutcome::RootThroughPidfd(skip) => {
                 let call = self.child.skip_call("terminate_tree", sig, None);
                 let sent = self.child.proc.signal(sig);
+                self.note_tree(TreeRecord::bare(signal_outcome(&sent)));
                 call.answer(&self.child.tree, skip, Some(sent)).answer
             }
             #[cfg(not(unix))]
-            TerminateOutcome::End(_) | TerminateOutcome::HoldersOnly(_) | TerminateOutcome::RootThroughPidfd(_) => {
+            TerminateOutcome::End(_) | TerminateOutcome::HoldersOnly(..) | TerminateOutcome::RootThroughPidfd(_) => {
                 unreachable!("only a Unix mechanism skips by the root's number")
+            }
+            sent => {
+                let answer = sent.into_answer();
+                self.note_tree(TreeRecord::of(&answer));
+                answer.into_tree_result()
             }
         }
     }
@@ -298,7 +415,31 @@ impl<'a> StopTarget<'a> {
     ) -> Result<(), Error> {
         match outcome {
             TerminateOutcome::Sent { result, earlier } => {
-                self.note_tree(TreeRecord::Sent { earlier, walk });
+                self.note_tree(TreeRecord::Sent {
+                    earlier,
+                    walk,
+                    outcome: SendOutcome::Sent,
+                });
+                result
+            }
+            // The send may have gone out: the call goes on to the grace and the sweep with the error as
+            // its cooperative error, as for one that did.
+            TerminateOutcome::Unknown { error, earlier } => {
+                self.note_tree(TreeRecord::Sent {
+                    earlier,
+                    walk,
+                    outcome: SendOutcome::Unknown,
+                });
+                Err(error)
+            }
+            // The send went to no process, whatever the check after it found: the call goes on as after a send,
+            // and no later error says a stop was sent before it.
+            TerminateOutcome::NoneReached { result } => {
+                self.note_tree(TreeRecord::Sent {
+                    earlier: None,
+                    walk,
+                    outcome: SendOutcome::NotSent,
+                });
                 result
             }
             TerminateOutcome::NotSent(not_sent) => {
@@ -311,22 +452,16 @@ impl<'a> StopTarget<'a> {
                     self.child.pid(),
                     report = crate::error::Report(&exited)
                 );
-                self.note_tree(TreeRecord::Sent {
-                    earlier: None,
-                    walk: None,
-                });
+                self.note_tree(TreeRecord::bare(SendOutcome::NotSent));
                 Ok(())
             }
-            // `Err`: nothing sent. `Ok`: the tree was already killed.
+            // `Err`: nothing sent. `Ok`: the tree was already killed, and nothing was sent either.
             #[cfg(unix)]
             TerminateOutcome::End(skip) => {
                 let call = self.child.skip_call("graceful_shutdown_tree", sig, None);
                 let answer = call.answer(&self.child.tree, skip, None).answer;
                 self.note_tree(match &answer {
-                    Ok(()) => TreeRecord::Sent {
-                        earlier: None,
-                        walk: None,
-                    },
+                    Ok(()) => TreeRecord::bare(SendOutcome::NotSent),
                     Err(refusal) => TreeRecord::not_sent(refusal),
                 });
                 answer
@@ -348,10 +483,7 @@ impl<'a> StopTarget<'a> {
                     "graceful_shutdown_tree({}): this handle already killed the tree, so the holders' grace is skipped",
                     self.child.pid()
                 );
-                self.note_tree(TreeRecord::Sent {
-                    earlier: None,
-                    walk: None,
-                });
+                self.note_tree(TreeRecord::bare(skip.outcome()));
                 // The holders' signal was sent: a failure of it is the call's.
                 skip.holders.take().unwrap_or(Ok(()))
             }
@@ -361,7 +493,7 @@ impl<'a> StopTarget<'a> {
                 Ok(())
             }
             #[cfg(not(unix))]
-            TerminateOutcome::End(_) | TerminateOutcome::RootThroughPidfd(_) | TerminateOutcome::HoldersOnly(_) => {
+            TerminateOutcome::End(_) | TerminateOutcome::RootThroughPidfd(_) | TerminateOutcome::HoldersOnly(..) => {
                 unreachable!("only a Unix mechanism skips by the root's number")
             }
         }

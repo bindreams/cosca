@@ -17,32 +17,82 @@ fn the_default_tree_stop_names_the_platforms_graceful_signal() {
 #[cfg(windows)]
 #[skuld::test]
 fn a_tree_stop_carries_the_name_and_the_answer_its_caller_sent() {
-    use super::SendOutcome;
+    use super::SendAnswer;
     use crate::stop::proxy::protocol::CtrlEvent;
 
-    let stop = TreeStop::named(CtrlEvent::CtrlBreak.name(), SendOutcome::Sent(Ok(())));
+    let stop = TreeStop::named(CtrlEvent::CtrlBreak.name(), SendAnswer::Sent(Ok(())));
     assert_eq!(stop.name(), "CTRL_BREAK");
     assert_eq!(stop.earlier(), "the CTRL_BREAK");
-    assert!(matches!(stop.into_sent(), SendOutcome::Sent(Ok(()))));
+    assert!(matches!(stop.into_sent(), SendAnswer::Sent(Ok(()))));
 
-    let ctrl_c = TreeStop::named(CtrlEvent::CtrlC.name(), SendOutcome::Sent(Ok(())));
+    let ctrl_c = TreeStop::named(CtrlEvent::CtrlC.name(), SendAnswer::Sent(Ok(())));
     assert_eq!(ctrl_c.name(), "CTRL_C");
     assert_eq!(ctrl_c.earlier(), "the CTRL_C");
 
-    let wm_close = TreeStop::named("WM_CLOSE", SendOutcome::Sent(Ok(())));
+    let wm_close = TreeStop::named("WM_CLOSE", SendAnswer::Sent(Ok(())));
     assert_eq!(wm_close.name(), "WM_CLOSE");
     assert_eq!(wm_close.earlier(), "the WM_CLOSE");
 
     let refused = TreeStop::named(
         CtrlEvent::CtrlBreak.name(),
-        SendOutcome::NotSent(crate::error::Error::NoConsole {
+        SendAnswer::NotSent(crate::error::Error::NoConsole {
             detail: "the caller had none".into(),
         }),
     );
     assert!(matches!(
         refused.into_sent(),
-        SendOutcome::NotSent(crate::error::Error::NoConsole { .. })
+        SendAnswer::NotSent(crate::error::Error::NoConsole { .. })
     ));
+}
+
+/// A send's answer says how it went as the public outcome, and flattens to the tree call's answer: `Err` for
+/// nothing sent, for an exited root and for an unknown answer, else what the send answered, a send that went
+/// to no process included. A terminate outcome made of an answer gives the same answer back.
+///
+/// Mutants: an unknown answer reads as `Sent`; an exited root reads as `Sent` or `Unknown`; the flattening
+/// of an unknown answer is `Ok`; the terminate outcome loses the unknown answer's difference; a send that
+/// went to no process reads as `Sent`.
+#[skuld::test]
+fn a_send_answer_says_how_it_went_and_flattens_to_one_tree_answer() {
+    use super::{SendAnswer, TerminateOutcome};
+    use crate::error::Error;
+    use crate::stop::SendOutcome;
+
+    let error = |detail: &str| Error::Unassessable {
+        detail: detail.to_owned(),
+        source: None,
+    };
+    type Make = fn(Error) -> SendAnswer;
+    let rows: [(&str, Make, SendOutcome); 5] = [
+        ("not sent", SendAnswer::NotSent, SendOutcome::NotSent),
+        ("exited", SendAnswer::RootExited, SendOutcome::NotSent),
+        ("checked", |e| SendAnswer::Sent(Err(e)), SendOutcome::Sent),
+        (
+            "checked, reached nobody",
+            |e| SendAnswer::NoneReached(Err(e)),
+            SendOutcome::NotSent,
+        ),
+        ("unknown", SendAnswer::Unknown, SendOutcome::Unknown),
+    ];
+    for (detail, make, outcome) in rows {
+        let answer = make(error(detail));
+        assert_eq!(answer.outcome(), outcome, "{detail}");
+        let round_trip = TerminateOutcome::of(make(error(detail)), None).into_answer();
+        assert_eq!(round_trip.outcome(), outcome, "{detail}: through a terminate outcome");
+        let flat = answer.into_tree_result();
+        assert!(
+            matches!(&flat, Err(Error::Unassessable { detail: d, .. }) if d == detail),
+            "{detail}: {flat:?}"
+        );
+    }
+    assert_eq!(SendAnswer::Sent(Ok(())).outcome(), SendOutcome::Sent);
+    SendAnswer::Sent(Ok(()))
+        .into_tree_result()
+        .expect("a send that went out and checked");
+    assert_eq!(SendAnswer::NoneReached(Ok(())).outcome(), SendOutcome::NotSent);
+    SendAnswer::NoneReached(Ok(()))
+        .into_tree_result()
+        .expect("a send that went to nobody has nothing wrong to report");
 }
 
 /// A stop made of a signal carries and names that signal, not the default's.

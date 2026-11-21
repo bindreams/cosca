@@ -8,7 +8,7 @@ use super::Child;
 #[cfg(unix)]
 use crate::containment::{Skip, SkipCall};
 use crate::error::Error;
-use crate::stop::{RootRecord, StopTarget, TreeRecord};
+use crate::stop::{RootRecord, StopError, StopTarget, TreeRecord};
 
 /// What an action's own sends are called when it recorded none: a caller's own action, or one that
 /// failed before it sent.
@@ -78,6 +78,14 @@ impl Child {
     /// its own: the prepared functions of [`stop`](crate::stop) apply the rules below inside
     /// themselves, whoever calls them.
     ///
+    /// **What a failure says of the send.** The error is a [`StopError`](crate::stop::StopError): the
+    /// [`Error`](crate::error::Error) the action answered, and its
+    /// [`outcome`](crate::stop::StopError::outcome), how the action's last prepared send went
+    /// ([`SendOutcome`](crate::stop::SendOutcome)):
+    /// - [`Sent`](crate::stop::SendOutcome::Sent): the signal went out to at least one process, whatever the error says of what a check after it found;
+    /// - [`NotSent`](crate::stop::SendOutcome::NotSent): nothing was sent; the error says why;
+    /// - [`Unknown`](crate::stop::SendOutcome::Unknown): whether it went out cannot be told, as for an action that made no prepared send and failed.
+    ///
     /// What the rest of this documentation says is what the default does. On Unix it is an
     /// identity-bound `SIGTERM` to this process alone, so it cannot race a concurrent reap onto a
     /// recycled pid. On Windows it is `CTRL_BREAK`, sent directly from this process to the child's
@@ -109,11 +117,13 @@ impl Child {
     /// has no such gap: it attaches to the child's own console and answers what it found. Each direct
     /// send also leaves a dead entry in the caller's console process list.
     ///
-    /// **Every error of the default means nothing was killed, and that nothing was sent, except on
-    /// Windows through the proxy:** an [`Error::Unassessable`](crate::error::Error::Unassessable) (the
-    /// proxy ended without a known answer, or sent the event and did not see its own copy) and an
-    /// [`Error::MayHaveStarted`](crate::error::Error::MayHaveStarted) from the proxy's start say whether
-    /// it was sent is unknown. The refusals on Windows, each an
+    /// **Every error of the default means nothing was killed, and, on Unix and on Windows for the direct
+    /// send, that nothing was sent or that a check after the send failed**
+    /// ([`outcome`](crate::stop::StopError::outcome) says which). Through the proxy on Windows an
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) (the proxy ended without a known answer, or
+    /// sent the event and did not see its own copy) and an
+    /// [`Error::MayHaveStarted`](crate::error::Error::MayHaveStarted) from the proxy's start leave
+    /// whether it was sent [`Unknown`](crate::stop::SendOutcome::Unknown). The refusals on Windows, each an
     /// [`Error::Unsupported`](crate::error::Error::Unsupported), are listed by
     /// [`stop::default`](crate::stop::default).
     ///
@@ -134,31 +144,32 @@ impl Child {
     /// # Panics
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
-    pub fn terminate(&self) -> Result<(), Error> {
+    pub fn terminate(&self) -> Result<(), StopError> {
         shutdown::run_ready(shutdown::terminate(&shutdown::BlockingDriver(self)))
     }
 
     /// What a call that kills after the stop says the action sent ([`kill_after`](Child::kill_after)), from
-    /// the record the action's last prepared send left on `target`: that send's stop, or [`STOP_ACTION`] when
-    /// the action's last send went nowhere or it made none. `stopped` is what the action answered, which is
-    /// the call's answer.
+    /// the record the action's last prepared send left on `target`: that send's stop when it went out or may
+    /// have, [`STOP_ACTION`] when the action made no prepared send, and nothing when the last send was not
+    /// sent. `stopped` is what the action answered, which is the call's answer.
     pub(crate) fn after_root_stop(
         &self,
         target: StopTarget<'_>,
         stopped: Result<(), Error>,
-    ) -> (Result<(), Error>, String) {
+    ) -> (Result<(), Error>, Option<String>) {
         let earlier = match target.into_root_record() {
-            Some(RootRecord::Sent(name)) => crate::containment::earlier_of(name),
-            Some(RootRecord::Refused(report)) => {
+            Some(RootRecord::Sent(name) | RootRecord::Unknown(name)) => Some(crate::containment::earlier_of(name)),
+            Some(RootRecord::NotSent(Some(report))) => {
                 if stopped.is_ok() {
                     log::debug!(
                         "graceful_shutdown({}): the action went on after a refused send: {report}",
                         self.pid()
                     );
                 }
-                STOP_ACTION.to_owned()
+                None
             }
-            None => STOP_ACTION.to_owned(),
+            Some(RootRecord::NotSent(None)) => None,
+            None => Some(STOP_ACTION.to_owned()),
         };
         (stopped, earlier)
     }
@@ -176,8 +187,8 @@ impl Child {
     /// [`stop::default`](crate::stop::default)) run on a root target, and every caveat on it applies. An
     /// error of the action propagates immediately: no grace is waited, nothing is killed, and the child
     /// is left running for the caller to `kill`. The escalation after the grace names what was sent
-    /// before it as what the action's last prepared send sent, or "the stop action" when it sent none, or
-    /// when its last send was refused and the action went on (the refusal is logged at `debug`).
+    /// before it as what the action's last prepared send sent, or "the stop action" when it made none, and
+    /// as nothing when the last send was not sent.
     ///
     /// The grace starts when the stop action returns: an action that does not return holds the call.
     ///
@@ -286,23 +297,23 @@ impl Child {
     /// still runs, so a member that only needed the follow-up `SIGKILL` does not strand the
     /// rest of the tree. A subsequent successful sweep is fresher, positive proof the group
     /// cleared, which supersedes the earlier refusal: it is logged and discarded, and this
-    /// call reports `Ok`. If the sweep fails too, the refusal is a peer of its error. A failed group
-    /// send on an fd marker that still signalled the root, a holder or a walked descendant is a
-    /// signal that went out: the grace is held and the sweep runs. A signal that was not sent at all
-    /// (`NoConsole`, an invalid process group, a root whose number may name another process, an fd
-    /// marker whose group send failed with nothing else signalled) returns at once: there is
-    /// nothing for a grace wait or sweep to act on yet.
+    /// call reports `Ok`. If the sweep fails too, the refusal is a peer of its error. A send that was made
+    /// goes on to the grace and the sweep, whoever it reached. One that was not sent at all (`NoConsole`, an
+    /// invalid process group, a root whose number may name another process, an fd marker whose group send
+    /// failed with nothing else signalled) returns at once: there is nothing for a grace wait or sweep to act
+    /// on yet.
     ///
     /// **The grace starts when the stop action returns.** An action that does not return holds the call.
     ///
-    /// **An action's error ends the call before its grace unless its last prepared send went out.** When
-    /// the last prepared send of the child's stop action was refused, or the action made none, the
-    /// action's own `Err` is the call's answer, with nothing waited and nothing killed; this holds even
-    /// when an earlier send of the same action went out and a later step failed. When its last prepared
-    /// send went out, the call goes on to the grace and the sweep and keeps the action's error as the
-    /// refusal above. An action of the caller's own that makes no prepared send and returns `Ok` goes on
-    /// to the grace and the sweep, with nothing assumed about what it sent. An action that returns `Ok`
-    /// after its last prepared send was refused goes on the same way, and the refusal is logged at `debug`.
+    /// **An action's error ends the call before its grace unless its last prepared send was made.** When
+    /// the last prepared send of the child's stop action was refused, or failed before it was made, or the
+    /// action made none, the action's own `Err` is the call's answer, with nothing waited and nothing
+    /// killed; this holds even when an earlier send of the same action went out and a later step failed.
+    /// When its last prepared send was made, the call goes on to the grace and the sweep and keeps the
+    /// action's error as the refusal above. An action of the caller's own that makes no prepared send and
+    /// returns `Ok` goes on to the grace and the sweep, with nothing assumed about what it sent. An action that
+    /// returns `Ok` after its last prepared send was refused goes on the same way, and the refusal is logged at
+    /// `debug`.
     ///
     /// **A root reaped by something else** (see [`kill_tree`](Child::kill_tree)):
     ///
@@ -378,22 +389,21 @@ impl Child {
     /// | Tree record (the last prepared send) | Action returned `Ok` | Action returned `Err` |
     /// |---|---|---|
     /// | none (the caller's own action) | grace, sweep, reap; nothing assumed sent | the call ends with that error |
-    /// | sent, or root exited | grace, sweep, reap | grace, sweep, reap; the error is the call's cooperative error |
-    /// | not sent, or nothing names the tree | grace, sweep, reap; nothing assumed sent | the call ends with that error |
+    /// | sent (to some process, to none, or unknown), or root exited, or tree already killed | grace, sweep, reap | grace, sweep, reap; the error is the call's cooperative error |
+    /// | refused or failed before the send, or nothing names the tree | grace, sweep, reap; nothing assumed sent | the call ends with that error |
     /// | pidfd-only, holders-only | that outcome's own path | that path; the error joins its |
     pub(crate) fn after_tree_stop(
         &self,
         target: StopTarget<'_>,
         acted: Result<(), Error>,
     ) -> SignalTreeCooperativelyOutcome {
-        let sent_by_the_action = || Some(STOP_ACTION.to_owned());
         match (target.into_tree_record(), acted) {
-            (Some(TreeRecord::Sent { earlier, walk }), result) => {
+            (Some(TreeRecord::Sent { earlier, walk, .. }), result) => {
                 SignalTreeCooperativelyOutcome::Sent { result, earlier, walk }
             }
             (None, Ok(())) => SignalTreeCooperativelyOutcome::Sent {
                 result: Ok(()),
-                earlier: sent_by_the_action(),
+                earlier: Some(STOP_ACTION.to_owned()),
                 walk: None,
             },
             (Some(TreeRecord::NotSent(report)), Ok(())) => {
@@ -403,7 +413,7 @@ impl Child {
                 );
                 SignalTreeCooperativelyOutcome::Sent {
                     result: Ok(()),
-                    earlier: sent_by_the_action(),
+                    earlier: None,
                     walk: None,
                 }
             }
@@ -643,7 +653,7 @@ pub(crate) mod fault {
         #[cfg(windows)]
         crate::containment::TreeStop::named(
             crate::stop::proxy::protocol::CtrlEvent::CtrlBreak.name(),
-            crate::containment::SendOutcome::Sent(Ok(())),
+            crate::containment::SendAnswer::Sent(Ok(())),
         )
     }
 

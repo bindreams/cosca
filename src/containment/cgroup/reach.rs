@@ -832,7 +832,7 @@ fn kill_and_reap(
     channel: std::os::unix::net::UnixStream,
 ) -> io::Result<ProbeEnd> {
     match child.signal(Sig::Kill) {
-        Ok(Sent::Delivered) => {}
+        Ok(Sent::Delivered | Sent::Exited) => {}
         Ok(Sent::Unverified) => debug_assert!(false, "a send through a pidfd always verifies its process"),
         Ok(Sent::Gone) => log::debug!(
             "containment::cgroup: the placement probe's child {pid} had already exited, or was reaped by another reaper in this process, when it was to be killed"

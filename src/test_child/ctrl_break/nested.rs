@@ -41,7 +41,10 @@ fn fixture_nested_terminate_reporter() {
     // A nested member owns no tree teardown. The refusal comes before any signal, so the one break
     // asserted below is `terminate`'s.
     assert!(
-        matches!(child.terminate_tree(), Err(crate::error::Error::Unsupported { .. })),
+        matches!(
+            child.terminate_tree().map_err(crate::error::Error::from),
+            Err(crate::error::Error::Unsupported { .. })
+        ),
         "a nested member still owns no tree teardown"
     );
     child.terminate().expect("terminate a nested console-group child");
@@ -84,7 +87,7 @@ fn fixture_nested_without_group_reporter() {
     let err = child
         .terminate()
         .expect_err("a nested member that leads no group is refused by the direct send");
-    assert_refused_by_the_direct_send_for_no_group(&err);
+    assert_refused_by_the_direct_send_for_no_group(err.error());
     assert!(fixture.ran().is_none(), "the proxy was started");
 
     kill_release_reap(&child, sock, false);

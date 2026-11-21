@@ -37,10 +37,14 @@ impl Child {
     /// **What it reaches, what it refuses, and what success proves on Windows** are those of the sync
     /// [`Child::terminate`](crate::Child::terminate).
     ///
-    /// **Every error means nothing was killed, and that nothing was sent, except on Windows through the
-    /// proxy:** an [`Error::Unassessable`](crate::error::Error::Unassessable) and an
+    /// **What a failure says of the send.** The error is a [`StopError`](crate::stop::StopError), as for the
+    /// sync [`Child::terminate`](crate::Child::terminate): the error the action answered, and how its last
+    /// prepared send went ([`outcome`](crate::stop::StopError::outcome), a [`SendOutcome`](crate::stop::SendOutcome)).
+    ///
+    /// **Every error means nothing was killed, and that nothing was sent or that a check after the send failed,
+    /// except on Windows through the proxy:** an [`Error::Unassessable`](crate::error::Error::Unassessable) and an
     /// [`Error::MayHaveStarted`](crate::error::Error::MayHaveStarted) from the proxy's start say whether
-    /// it was sent is unknown. On Linux that includes a refused `pidfd_open`, which is `Unsupported` (see
+    /// it was sent is unknown ([`Unknown`](crate::stop::SendOutcome::Unknown)). On Linux that includes a refused `pidfd_open`, which is `Unsupported` (see
     /// [`Error::Unsupported`](crate::error::Error::Unsupported)).
     ///
     /// **Windows, before the child has run.** As for the sync [`Child::terminate`](crate::Child::terminate) and
@@ -71,7 +75,7 @@ impl Child {
     /// # Panics
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
-    pub async fn terminate(&self) -> Result<(), Error> {
+    pub async fn terminate(&self) -> Result<(), crate::stop::StopError> {
         crate::child::graceful::shutdown::terminate(self).await
     }
 
@@ -88,7 +92,8 @@ impl Child {
     /// [`stop::default`](crate::tokio::stop::default)) awaited on a root target, and every caveat on it applies. An
     /// error of the action propagates immediately: no grace is waited, nothing is killed, and the child
     /// is left running for the caller to `kill`. The escalation after the grace names what was sent
-    /// before it as what the action's last prepared send sent, or "the stop action" when it sent none.
+    /// before it as what the action's last prepared send sent, or "the stop action" when it made none, and
+    /// as nothing when the last send was not sent.
     ///
     /// The grace starts when the stop action returns: an action that does not return holds the call.
     ///
@@ -182,22 +187,23 @@ impl Child {
     /// still runs, so a member that only needed the follow-up `SIGKILL` does not strand the
     /// rest of the tree. A subsequent successful sweep is fresher, positive proof the group
     /// cleared, which supersedes the earlier refusal: it is logged and discarded, and this
-    /// call reports `Ok`. If the sweep fails too, the refusal is a peer of its error. A failed group
-    /// send on an fd marker that still signalled the root, a holder or a walked descendant is a
-    /// signal that went out: the grace is held and the sweep runs. A signal that was not sent at all
-    /// (`NoConsole`, an invalid process group, a root whose number may name another process, an fd
-    /// marker whose group send failed with nothing else signalled) returns at once: there is
-    /// nothing for a grace wait or sweep to act on yet.
+    /// call reports `Ok`. If the sweep fails too, the refusal is a peer of its error. A send that was made
+    /// goes on to the grace and the sweep, whoever it reached. One that was not sent at all (`NoConsole`, an
+    /// invalid process group, a root whose number may name another process, an fd marker whose group send
+    /// failed with nothing else signalled) returns at once: there is nothing for a grace wait or sweep to act
+    /// on yet.
     ///
     /// **The grace starts when the stop action returns.** An action that does not return holds the call.
     ///
-    /// **An action's error ends the call before its grace unless its last prepared send went out.** When
-    /// the last prepared send of the child's stop action was refused, or the action made none, the
-    /// action's own `Err` is the call's answer, with nothing waited and nothing killed; this holds even
-    /// when an earlier send of the same action went out and a later step failed. When its last prepared
-    /// send went out, the call goes on to the grace and the sweep and keeps the action's error as the
-    /// refusal above. An action of the caller's own that makes no prepared send and returns `Ok` goes on
-    /// to the grace and the sweep, with nothing assumed about what it sent.
+    /// **An action's error ends the call before its grace unless its last prepared send was made.** When
+    /// the last prepared send of the child's stop action was refused, or failed before it was made, or the
+    /// action made none, the action's own `Err` is the call's answer, with nothing waited and nothing
+    /// killed; this holds even when an earlier send of the same action went out and a later step failed.
+    /// When its last prepared send was made, the call goes on to the grace and the sweep and keeps the
+    /// action's error as the refusal above. An action of the caller's own that makes no prepared send and
+    /// returns `Ok` goes on to the grace and the sweep, with nothing assumed about what it sent. An action that
+    /// returns `Ok` after its last prepared send was refused goes on the same way, and the refusal is logged at
+    /// `debug`.
     ///
     /// A refused Linux `pidfd_open` while watching the root is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)); it is a
     /// watch failure, so the sweep still runs.

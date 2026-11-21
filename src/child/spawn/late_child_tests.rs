@@ -426,6 +426,7 @@ fn swept_answer(swept: Swept) -> TreeKillOutcome {
             action: "kill its process group (pgid 7)".into(),
             why,
             root_alone: false,
+            no_holder_reached: false,
             holders,
         })
     };

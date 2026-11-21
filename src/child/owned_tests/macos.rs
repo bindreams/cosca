@@ -295,16 +295,17 @@ fn kill_signals_a_live_child_through_its_audit_token() {
     assert_eq!(super::fixtures::signal_of(status), Some(libc::SIGKILL));
 }
 
-/// `kill` on this child's own unreaped zombie is `Delivered`, as on Linux: the kernel answers `ESRCH`
-/// for a zombie, but the pid still has the child's unique id and `p_idversion`, so it is ours and
-/// not gone. A zombie that reads as `Gone` would send `kill` down the already-reaped path.
+/// `kill` on this child's own unreaped zombie is `Exited`, which a kill reads as delivered: the kernel
+/// answers `ESRCH` for a zombie, but the pid still has the child's unique id and `p_idversion`, so it is
+/// ours and not gone. A zombie that reads as `Gone` would send `kill` down the already-reaped path; one
+/// that reads as `Delivered` would say the kernel took a signal it never did.
 ///
-/// Mutant: an exited-but-unreaped child is mapped to `Gone`.
+/// Mutants: an exited-but-unreaped child is mapped to `Gone`, or to `Delivered`.
 #[skuld::test]
-fn kill_on_an_own_unreaped_zombie_is_delivered() {
+fn kill_on_an_own_unreaped_zombie_is_exited() {
     let mut b = Blocker::spawn();
     b.end_child_and_confirm_exit();
-    assert_eq!(b.owned.signal(Sig::Kill).expect("kill"), crate::signal::Sent::Delivered);
+    assert_eq!(b.owned.signal(Sig::Kill).expect("kill"), crate::signal::Sent::Exited);
     // The zombie was never consumed: a real wait reaps it, and it ended of its own accord.
     let status = wait_status(&b.owned);
     assert!(status.success(), "{status:?}");
