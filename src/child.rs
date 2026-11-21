@@ -910,8 +910,8 @@ impl Child {
     /// **What a failure says of the send.** The error is a [`StopError`](crate::stop::StopError): the
     /// [`Error`](crate::error::Error) the action answered, and its
     /// [`outcome`](crate::stop::StopError::outcome), how the action's last prepared send went:
-    /// - [`Sent`](crate::stop::SendOutcome::Sent): the send went out, whatever the error says of what a check after it found;
-    /// - [`NotSent`](crate::stop::SendOutcome::NotSent): nothing was sent, and nothing cosca knows of would change if it were asked again;
+    /// - [`Sent`](crate::stop::SendOutcome::Sent): the signal went out to at least one process, whatever the error says of what a check after it found;
+    /// - [`NotSent`](crate::stop::SendOutcome::NotSent): it went to none (nothing was sent, or what it names had no member, or the kernel refused it to every member), and nothing cosca knows of would change if it were asked again;
     /// - [`Unknown`](crate::stop::SendOutcome::Unknown): whether it went out cannot be told, as for an action that made no prepared send and failed.
     ///
     /// `Sent` says the send went out, not that the child took it: a child that ignores Ctrl+C is `Ok`.

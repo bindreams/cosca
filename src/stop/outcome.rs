@@ -5,19 +5,21 @@ use crate::error::Error;
 
 /// How the last prepared send of a stop went ([`StopError::outcome`]).
 ///
-/// `Sent` says the send went out, not that the child took it: a child that ignores Ctrl+C is `Ok`, and so
-/// is a Ctrl+C aimed at a group the child does not lead.
+/// `Sent` says the send went out, not that the child took it: a child that ignores Ctrl+C is still `Sent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SendOutcome {
-    /// The send went out. An error beside it is what a check after the send found: a member it could not
-    /// reach while it reached others, a member that refused it.
+    /// The send went out: on Unix to at least one process. An error beside it is what a check after the
+    /// send found: a member it could not reach while it reached others, a member that refused it.
     Sent,
     /// Nothing was sent, and nothing cosca knows of would change if it were asked again: a refusal, a
-    /// failure before the send was made, a child that had already exited.
+    /// failure before the send was made, a child that had already exited, a send that went to no process
+    /// (the group or the cgroup had no member, or the kernel refused every member), whatever a check after
+    /// it found.
     NotSent,
-    /// Whether the send went out cannot be told: the console-event proxy ran and did not confirm its
-    /// event, or may have run, or its exit is no answer.
+    /// Whether the send went out cannot be told: an action that made no prepared send and failed, or, on
+    /// Windows, the console-event proxy ran and did not confirm its event, or may have run, or its exit is
+    /// no answer.
     Unknown,
 }
 
@@ -29,6 +31,10 @@ pub enum SendOutcome {
 /// [`source`](std::error::Error::source) is that error's own source, so a report of a `StopError`
 /// ([`Report`](crate::error::Report)) reads as a report of the [`Error`]. `?` turns it into the [`Error`]
 /// ([`From`]).
+///
+/// The [`Error`] is reached by [`error`](StopError::error), or by `Error::from`. It is not a layer of the
+/// `source()` chain, so a walk of that chain that downcasts to [`Error`] must downcast to `StopError`
+/// first.
 ///
 /// The outcome is the last prepared send's, whatever the action did after it: an action that made no
 /// prepared send ([`stop`](crate::stop)) and failed is [`Unknown`](SendOutcome::Unknown).

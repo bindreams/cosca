@@ -81,8 +81,8 @@ impl Child {
     /// **What a failure says of the send.** The error is a [`StopError`](crate::stop::StopError): the
     /// [`Error`](crate::error::Error) the action answered, and its
     /// [`outcome`](crate::stop::StopError::outcome), how the action's last prepared send went:
-    /// - [`Sent`](crate::stop::SendOutcome::Sent): the send went out, whatever the error says of what a check after it found;
-    /// - [`NotSent`](crate::stop::SendOutcome::NotSent): nothing was sent, and nothing cosca knows of would change if it were asked again;
+    /// - [`Sent`](crate::stop::SendOutcome::Sent): the signal went out to at least one process, whatever the error says of what a check after it found;
+    /// - [`NotSent`](crate::stop::SendOutcome::NotSent): it went to none (nothing was sent, or what it names had no member, or the kernel refused it to every member), and nothing cosca knows of would change if it were asked again;
     /// - [`Unknown`](crate::stop::SendOutcome::Unknown): whether it went out cannot be told, as for an action that made no prepared send and failed.
     ///
     /// `Sent` says the send went out, not that the child took it: a child that ignores Ctrl+C is `Ok`.
@@ -150,26 +150,28 @@ impl Child {
     }
 
     /// What a call that kills after the stop says the action sent ([`kill_after`](Child::kill_after)), from
-    /// the record the action's last prepared send left on `target`: that send's stop, or [`STOP_ACTION`] when
-    /// the action's last send went nowhere or it made none. `stopped` is what the action answered, which is
-    /// the call's answer.
+    /// the record the action's last prepared send left on `target`: that send's stop when it went out or may
+    /// have, [`STOP_ACTION`] when the action's last send was refused or it made none, and nothing when the
+    /// last send found no root to send to (it had exited, or its handle found it gone). `stopped` is what the
+    /// action answered, which is the call's answer.
     pub(crate) fn after_root_stop(
         &self,
         target: StopTarget<'_>,
         stopped: Result<(), Error>,
-    ) -> (Result<(), Error>, String) {
+    ) -> (Result<(), Error>, Option<String>) {
         let earlier = match target.into_root_record() {
-            Some(RootRecord::Sent(name, _)) => crate::containment::earlier_of(name),
-            Some(RootRecord::NotSent(report)) => {
+            Some(RootRecord::Sent(name) | RootRecord::Unknown(name)) => Some(crate::containment::earlier_of(name)),
+            Some(RootRecord::NotSent(Some(report))) => {
                 if stopped.is_ok() {
                     log::debug!(
                         "graceful_shutdown({}): the action went on after a refused send: {report}",
                         self.pid()
                     );
                 }
-                STOP_ACTION.to_owned()
+                Some(STOP_ACTION.to_owned())
             }
-            None => STOP_ACTION.to_owned(),
+            Some(RootRecord::NotSent(None)) => None,
+            None => Some(STOP_ACTION.to_owned()),
         };
         (stopped, earlier)
     }
@@ -188,7 +190,8 @@ impl Child {
     /// error of the action propagates immediately: no grace is waited, nothing is killed, and the child
     /// is left running for the caller to `kill`. The escalation after the grace names what was sent
     /// before it as what the action's last prepared send sent, or "the stop action" when it sent none, or
-    /// when its last send was refused and the action went on (the refusal is logged at `debug`).
+    /// when its last send was refused and the action went on (the refusal is logged at `debug`), and
+    /// as nothing when the last send found no root to send to (it had exited, or its handle found it gone).
     ///
     /// The grace starts when the stop action returns: an action that does not return holds the call.
     ///
@@ -426,7 +429,7 @@ impl Child {
             #[cfg(not(target_os = "linux"))]
             (Some(TreeRecord::RootThroughPidfd(..)), _) => unreachable!("only a Linux pidfd names the root exactly"),
             #[cfg(unix)]
-            (Some(TreeRecord::HoldersOnly(skip, sig)), acted) => {
+            (Some(TreeRecord::HoldersOnly(skip, sig, _)), acted) => {
                 SignalTreeCooperativelyOutcome::HoldersOnly(skip, sig, acted.err())
             }
             #[cfg(not(unix))]

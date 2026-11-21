@@ -1765,6 +1765,39 @@ fn a_group_send_that_fails_while_a_holder_is_signalled_is_sent() {
     }
 }
 
+/// A holders-only terminate (a root this process does not pin, or whose number may name another process)
+/// of a marker with no holder and no group signalled no process: where the root is merely untrusted the
+/// answer is `NoneReached`, and where its number may name another process it is the skip that ends the
+/// call, whose outcome says nothing went out.
+///
+/// Mutant: a pass that signalled no holder reads as `Sent`.
+#[skuld::test]
+fn a_holders_only_terminate_that_finds_no_holder_sent_nothing() {
+    use crate::containment::TerminateOutcome;
+    use crate::signal::RootState;
+    use crate::stop::SendOutcome;
+
+    let _serialize = test_spawn_lock();
+    let unpinned = crate::test_support::stated_root::StatedRoot::with_state(4242, || RootState::Unpinned);
+    let marker = marker_without_holders(
+        crate::identity::ProcessId::from_parts_for_test(4242, crate::identity::Key::for_test(1)),
+        None,
+        host_kernel(),
+    );
+    let untrusted = marker.terminate_tree(Some(&unpinned), crate::containment::TreeStop::default());
+    assert!(
+        matches!(untrusted, TerminateOutcome::NoneReached { .. }),
+        "no holder was signalled: {untrusted:?}"
+    );
+
+    let reaped = crate::test_support::stated_root::StatedRoot::with_state(4242, || RootState::Reaped);
+    let skipped = marker.terminate_tree(Some(&reaped), crate::containment::TreeStop::default());
+    assert!(
+        matches!(skipped, TerminateOutcome::HoldersOnly(_, SendOutcome::NotSent)),
+        "no holder was signalled: {skipped:?}"
+    );
+}
+
 /// A kill skipped because the root was reaped elsewhere names what the marker would have done by the
 /// root's number: the walk always, and the group only when the mode made one.
 #[skuld::test]

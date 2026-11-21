@@ -808,25 +808,34 @@ impl CgroupLeaf {
     /// a `cgroup.procs` line that is no pid.
     ///
     /// [`NotSent`](SendAnswer::NotSent) is a `cgroup.procs` that could not be read: no member was
-    /// listed, so nothing was sent. Past it the signal went out, and [`Sent`](SendAnswer::Sent) is what
-    /// the sends found. Never [`RootExited`](SendAnswer::RootExited): the leaf looks at no walk.
+    /// listed, so nothing was sent. Past it, [`Sent`](SendAnswer::Sent) is what the sends found when the
+    /// signal reached at least one member, and [`NoneReached`](SendAnswer::NoneReached) when it reached none
+    /// (the leaf is gone or lists no member, or every listed member was gone, unproven or refused).
+    /// Never [`RootExited`](SendAnswer::RootExited): the leaf looks at no walk.
     pub(crate) fn terminate(&self, signal: crate::signal::Signal) -> SendAnswer {
         let path = self.leaf_path.join("cgroup.procs");
         let content = match self.dir.read("cgroup.procs") {
             Ok(c) => c,
             Err(e) if removed_after_drain(&e) => {
                 log::debug!("cgroup terminate: leaf {} is already gone", path.display());
-                return SendAnswer::Sent(Ok(()));
+                return SendAnswer::NoneReached(Ok(()));
             }
             Err(e) => return SendAnswer::NotSent(crate::error::Error::Io(e)),
         };
         #[cfg(test)]
         fault::run_after_procs_read();
-        SendAnswer::Sent(self.terminate_listed(&content, signal))
+        self.terminate_listed_sent(&content, signal)
     }
 
-    /// [`terminate`](Self::terminate) for the members `procs` lists, in `cgroup.procs`' format.
+    /// [`terminate_listed_sent`](Self::terminate_listed_sent), as the check after the sends found it.
+    #[cfg(test)]
     fn terminate_listed(&self, procs: &str, signal: crate::signal::Signal) -> Result<(), crate::error::Error> {
+        self.terminate_listed_sent(procs, signal).into_tree_result()
+    }
+
+    /// [`terminate`](Self::terminate) for the members `procs` lists, in `cgroup.procs`' format: whether the
+    /// signal reached any member, and what the sends found.
+    fn terminate_listed_sent(&self, procs: &str, signal: crate::signal::Signal) -> SendAnswer {
         use crate::error::Error;
         let mut pids = Vec::new();
         let mut unproven: Vec<Error> = Vec::new();
@@ -846,19 +855,29 @@ impl CgroupLeaf {
             }
         }
         if pids.is_empty() && unproven.is_empty() {
-            return Ok(());
+            return SendAnswer::NoneReached(Ok(()));
         }
         let subtree = self.listing_subtree();
         let mut failed: Vec<Error> = Vec::new();
+        let mut delivered = false;
         for pid in pids {
             match self.terminate_member(pid, &subtree, signal) {
-                Ok(()) => {}
+                Ok(crate::signal::Sent::Delivered) => delivered = true,
+                Ok(_) => {}
                 Err(Unsignalled::Failed(unsent)) => failed.push(unsent),
                 Err(Unsignalled::Unproven(unsent)) => unproven.push(unsent),
             }
         }
+        // The signal went out only if a member got it, whatever the others did.
+        let answer = |checked| {
+            if delivered {
+                SendAnswer::Sent(checked)
+            } else {
+                SendAnswer::NoneReached(checked)
+            }
+        };
         if failed.is_empty() && unproven.is_empty() {
-            return Ok(());
+            return answer(Ok(()));
         }
         let leaf = self.leaf_path.display();
         let mut parts = Vec::new();
@@ -887,7 +906,7 @@ impl CgroupLeaf {
             Error::Unassessable { detail, source }
         };
         log::warn!("cgroup terminate: {}", crate::error::Report(&error));
-        Err(error)
+        answer(Err(error))
     }
 
     /// The one subtree a pass over the listed members places each of them in. Where the leaf's id
@@ -1016,15 +1035,21 @@ impl CgroupLeaf {
     }
 
     /// [`terminate`](Self::terminate)'s `signal` to the listed `pid`, if it is still a running
-    /// member of the leaf. `Ok` once sent, or for a pid that is gone or not a running member, which
-    /// it logs at `debug`; `Err` says why a pid that may be a member got none.
-    fn terminate_member(&self, pid: u32, subtree: &Subtree, signal: crate::signal::Signal) -> Result<(), Unsignalled> {
+    /// member of the leaf. `Ok(Delivered)` once sent, `Ok(Gone)` for a pid that is gone or not a running
+    /// member, which it logs at `debug`; `Err` says why a pid that may be a member got none.
+    fn terminate_member(
+        &self,
+        pid: u32,
+        subtree: &Subtree,
+        signal: crate::signal::Signal,
+    ) -> Result<crate::signal::Sent, Unsignalled> {
+        use crate::signal::Sent;
         use std::os::fd::AsFd as _;
         let pidfd = match pin_member(&*self.kernel, pid) {
             Ok(pidfd) => pidfd,
             Err(rustix::io::Errno::SRCH) => {
                 log::debug!("cgroup terminate: pid {pid} is gone; not signalled");
-                return Ok(());
+                return Ok(Sent::Gone);
             }
             Err(e) => {
                 return Err(Unsignalled::Unproven(crate::error::Error::of_member(
@@ -1047,7 +1072,7 @@ impl CgroupLeaf {
                     "cgroup terminate: pid {pid} exited before it was placed ({report}); not signalled",
                     report = crate::error::Report(&placement)
                 );
-                return Ok(());
+                return Ok(Sent::Gone);
             }
             Err(e) => {
                 return Err(Unsignalled::Unproven(crate::error::Error::of_member(
@@ -1060,13 +1085,13 @@ impl CgroupLeaf {
         };
         if !inside {
             log::debug!("cgroup terminate: pid {pid} is not a member of the leaf; not signalled");
-            return Ok(());
+            return Ok(Sent::Gone);
         }
         match member_exited(pidfd.as_fd()) {
             Ok(false) => {}
             Ok(true) => {
                 log::debug!("cgroup terminate: pid {pid} has exited; not signalled");
-                return Ok(());
+                return Ok(Sent::Gone);
             }
             Err(e) => {
                 return Err(Unsignalled::Unproven(crate::error::Error::of_member(
@@ -1078,10 +1103,10 @@ impl CgroupLeaf {
             }
         }
         match send_to_member(pidfd.as_fd(), pid, signal) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(Sent::Delivered),
             Err(nix::errno::Errno::ESRCH) => {
                 log::debug!("cgroup terminate: pid {pid} exited before its {}", signal.name());
-                Ok(())
+                Ok(Sent::Gone)
             }
             Err(e) => Err(Unsignalled::Failed(crate::error::Error::of_member(
                 pid,

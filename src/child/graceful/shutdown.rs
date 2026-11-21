@@ -170,7 +170,7 @@ pub(crate) async fn terminate_tree<W: Waits>(w: &W) -> Result<(), StopError> {
 
 /// [`terminate`] with what the action said it sent, for the kill after the grace; see
 /// [`Child::after_root_stop`].
-pub(crate) async fn stop_root<W: Waits>(w: &W) -> (Result<(), Error>, String) {
+pub(crate) async fn stop_root<W: Waits>(w: &W) -> (Result<(), Error>, Option<String>) {
     let target = StopTarget::root(w.child());
     let stopped = w.stop(&target).await;
     w.child().after_root_stop(target, stopped)
@@ -208,7 +208,7 @@ pub(crate) async fn shutdown_lone<W: Waits>(w: &mut W, grace: Duration) -> Resul
     let watch = crate::graceful::after_grace(call, watch, || {
         #[cfg(test)]
         fault::run_hook(fault::HookPoint::BeforeEscalation);
-        w.child().kill_after(Some(&earlier))
+        w.child().kill_after(earlier.as_deref())
     })?;
     #[cfg(test)]
     fault::run_hook(fault::HookPoint::BeforeReap);

@@ -311,7 +311,9 @@ pub fn send_signal(target: &StopTarget<'_>, signal: crate::Signal) -> Result<(),
                     .refuse_unpinned("terminate", None)
                     .and_then(|()| child.proc.signal(crate::signal::Sig::Graceful(signal)));
                 match &sent {
-                    Ok(_) => target.note_root_sent(signal.name(), crate::stop::target::signal_outcome(&sent)),
+                    Ok(crate::signal::Sent::Delivered) => target.note_root_sent(signal.name()),
+                    // Not delivered: the root was gone, or its handle could not vouch for it. Nothing was sent.
+                    Ok(_) => target.note_root_gone(),
                     Err(refusal) => target.note_not_sent(refusal),
                 }
                 sent.map(drop)
@@ -427,19 +429,20 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendAnswer) -> Re
     match target.scope() {
         Scope::Root => match sent {
             SendAnswer::Sent(answer) => {
-                target.note_root_sent(name, SendOutcome::Sent);
+                target.note_root_sent(name);
                 answer
             }
             // The event may have gone out, and the answer cannot say.
             SendAnswer::Unknown(unknown) => {
-                target.note_root_sent(name, SendOutcome::Unknown);
+                target.note_root_unknown(name);
                 Err(unknown)
             }
-            // Nothing was sent, and no stop is named as sent.
-            SendAnswer::RootExited(exited) => {
-                target.note_not_sent(&exited);
+            // Nothing was sent, no stop is named as sent, and no refusal is logged for a root that had exited.
+            SendAnswer::RootExited(_) => {
+                target.note_root_gone();
                 Ok(())
             }
+            SendAnswer::NoneReached(_) => unreachable!("only a Unix mechanism's send can reach no process"),
             SendAnswer::NotSent(not_sent) => {
                 target.note_not_sent(&not_sent);
                 Err(not_sent)

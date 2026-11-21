@@ -134,6 +134,14 @@ pub(crate) enum TerminateOutcome {
         allow(dead_code, reason = "only the Windows console-event proxy's answer is unknown")
     )]
     Unknown { error: Error, earlier: Option<String> },
+    /// The send went to no process (the group or the leaf had no member, or every send to a member failed or
+    /// had no member to reach): `result` is what the check after it found, and a call that goes on to wait
+    /// and sweep does, as for [`Sent`](Self::Sent), with no earlier send to name.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only a Unix mechanism's send can reach no process")
+    )]
+    NoneReached { result: Result<(), Error> },
     /// Nothing is sent by the root's number, and nothing else names the tree: the call ends now.
     End(Skip),
     /// Linux: the root's number may name another process, but its handle names it exactly: the caller
@@ -141,12 +149,14 @@ pub(crate) enum TerminateOutcome {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux has a pidfd"))]
     RootThroughPidfd(Skip),
     /// macOS: an fd marker's holders alone were signalled, by the pipe they hold (the result is in
-    /// [`Skip::holders`]): the caller waits the grace and kills any left, and the call ends.
+    /// [`Skip::holders`]): the caller waits the grace and kills any left, and the call ends. The
+    /// [`SendOutcome`] says whether the signal reached a holder: [`NotSent`](SendOutcome::NotSent) when the
+    /// marker has none.
     #[cfg_attr(
         not(target_os = "macos"),
         allow(dead_code, reason = "only a macOS fd marker names its tree by identity")
     )]
-    HoldersOnly(Skip),
+    HoldersOnly(Skip, SendOutcome),
 }
 
 impl TerminateOutcome {
@@ -158,6 +168,8 @@ impl TerminateOutcome {
             SendAnswer::RootExited(exited) => TerminateOutcome::RootExited(exited),
             SendAnswer::Sent(result) => TerminateOutcome::Sent { result, earlier },
             SendAnswer::Unknown(error) => TerminateOutcome::Unknown { error, earlier },
+            // Nothing was sent, so no later error says a stop was sent before it.
+            SendAnswer::NoneReached(result) => TerminateOutcome::NoneReached { result },
         }
     }
 
@@ -169,7 +181,8 @@ impl TerminateOutcome {
             TerminateOutcome::NotSent(not_sent) => SendAnswer::NotSent(not_sent),
             TerminateOutcome::RootExited(exited) => SendAnswer::RootExited(exited),
             TerminateOutcome::Unknown { error, .. } => SendAnswer::Unknown(error),
-            TerminateOutcome::End(_) | TerminateOutcome::RootThroughPidfd(_) | TerminateOutcome::HoldersOnly(_) => {
+            TerminateOutcome::NoneReached { result } => SendAnswer::NoneReached(result),
+            TerminateOutcome::End(_) | TerminateOutcome::RootThroughPidfd(_) | TerminateOutcome::HoldersOnly(..) => {
                 unreachable!("a skip is no send's answer")
             }
         }
@@ -204,6 +217,15 @@ pub(crate) enum SendAnswer {
         allow(dead_code, reason = "only the Windows console-event proxy's answer is unknown")
     )]
     Unknown(Error),
+    /// The send was made and went to no process: the group or the leaf it names had no member, every send to
+    /// a member failed or found its member gone, or the kernel answered that nothing was there. The `Err` is
+    /// what the check after it found, and a tree call goes on to its grace and sweep as after
+    /// [`Sent`](Self::Sent). Unix: what `verify` or the leaf's sends found.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only a Unix mechanism's send can reach no process")
+    )]
+    NoneReached(Result<(), Error>),
 }
 
 impl SendAnswer {
@@ -220,7 +242,7 @@ impl SendAnswer {
     /// How the send went, as a stop's own error says it ([`SendOutcome`]).
     pub(crate) fn outcome(&self) -> SendOutcome {
         match self {
-            SendAnswer::NotSent(_) | SendAnswer::RootExited(_) => SendOutcome::NotSent,
+            SendAnswer::NotSent(_) | SendAnswer::RootExited(_) | SendAnswer::NoneReached(_) => SendOutcome::NotSent,
             SendAnswer::Sent(_) => SendOutcome::Sent,
             SendAnswer::Unknown(_) => SendOutcome::Unknown,
         }
@@ -233,7 +255,7 @@ impl SendAnswer {
     pub(crate) fn into_tree_result(self) -> Result<(), Error> {
         match self {
             SendAnswer::NotSent(error) | SendAnswer::RootExited(error) | SendAnswer::Unknown(error) => Err(error),
-            SendAnswer::Sent(result) => result,
+            SendAnswer::Sent(result) | SendAnswer::NoneReached(result) => result,
         }
     }
 }

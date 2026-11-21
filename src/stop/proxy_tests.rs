@@ -386,16 +386,19 @@ fn a_child_that_has_exited_is_answered_before_the_proxy_is_started() {
     }
 }
 
-/// A root target whose child had exited records that nothing was sent, with no stop named: an action that
-/// goes on after the send, and the lone shutdown's kill after it, word what was sent as "the stop action",
-/// not as the `CTRL_C` that never went out; and an action that fails after the send is `NotSent`.
+/// A root target whose child had exited records that nothing was sent, with no stop named and no refusal
+/// reported: an action that goes on after the send, and the lone shutdown's kill after it, name no earlier
+/// send (not the `CTRL_C` that never went out, and not "the stop action"), and the call logs no refused send,
+/// for a root that had simply exited refused nothing; and an action that fails after the send is `NotSent`.
 ///
-/// Mutant: the exited root is recorded as a send of the event (the kill's words name the `CTRL_C`, and the
-/// failed action reads as `Sent`).
+/// Mutants: the exited root is recorded as a send of the event (the kill's words name the `CTRL_C`, and the
+/// failed action reads as `Sent`); it is recorded as a refusal (the kill's words name "the stop action", and
+/// a refused send is logged).
 #[skuld::test]
 fn an_exited_root_records_no_send_and_names_no_stop() {
     use crate::stop::SendOutcome;
 
+    crate::log_capture::install();
     for fails_after in [false, true] {
         let fixture = Fixture::answering(ProxyAnswer::Sent.code());
         let (child, sock, _) = spawn_member(Handler::Ignore, None, ContainMode::Strongest, |cmd| {
@@ -413,6 +416,7 @@ fn an_exited_root_records_no_send_and_names_no_stop() {
         child.kill().expect("kill the member");
         child.wait().expect("see its exit, reaping nothing");
         drop(sock);
+        let mark = crate::log_capture::mark();
 
         if fails_after {
             let err = child.terminate().expect_err("the action failed");
@@ -422,7 +426,12 @@ fn an_exited_root_records_no_send_and_names_no_stop() {
                 crate::child::graceful::shutdown::stop_root(&crate::child::graceful::shutdown::BlockingDriver(&child)),
             );
             acted.expect("an exited child is Ok");
-            assert_eq!(said, "the stop action");
+            assert_eq!(said, None);
+            assert!(
+                crate::log_capture::records_since_on_current_thread(mark, "the action went on after a refused send")
+                    .is_empty(),
+                "a root that had exited refused nothing"
+            );
         }
         assert_no_break_sent();
         assert!(fixture.ran().is_none(), "the proxy was started");
@@ -993,7 +1002,7 @@ fn a_root_records_a_send_that_may_have_gone_out_as_made() {
             &crate::child::graceful::shutdown::BlockingDriver(&child),
         ));
         acted.expect("the action ignored the send's answer");
-        assert_eq!(said, earlier, "{answer:?}");
+        assert_eq!(said.as_deref(), Some(earlier), "{answer:?}");
         assert_proxy_answered(child.pid(), CtrlEvent::CtrlC, answer);
         kill_release_reap(&child, sock, false);
     }

@@ -359,19 +359,29 @@ fn terminate_tree_signals_the_group_of_a_root_reaped_elsewhere(#[fixture(pidfd_g
 }
 
 /// 6.9+: `terminate_tree` of a root reaped elsewhere whose group has no member left sends nothing
-/// and succeeds. Mutants: "a group with no member left is still unassessable", "it is signalled
-/// through the pidfd regardless".
+/// and succeeds, and the send's record says nothing went out. Mutants: "a group with no member left is
+/// still unassessable", "it is signalled through the pidfd regardless", "the empty group's send is
+/// recorded as `Sent`".
 #[skuld::test]
 fn terminate_tree_of_a_root_reaped_elsewhere_with_no_member_left_sends_nothing(
     #[fixture(pidfd_group_signal)] _group: &Group,
     #[fixture(stray_signal)] _stray: &Group,
 ) {
+    use crate::stop::{StopTarget, TreeCall};
+
     let (child, _pgid) = foreign_reaped_group_root();
     let capture = Capture::start();
     let result = child.terminate_tree();
+    let target = StopTarget::tree(&child, TreeCall::SignalOnly);
+    let sent = crate::stop::send_signal(&target, crate::Signal::Term);
     let steps = capture.group_steps();
     result.expect("an empty group has nothing to signal");
+    sent.expect("an empty group has nothing to signal");
     assert_eq!(steps, [], "nothing was sent");
+    assert_eq!(
+        target.into_tree_record().map(|record| record.outcome()),
+        Some(crate::stop::SendOutcome::NotSent)
+    );
 }
 
 /// 6.9+: `graceful_shutdown_tree` of a root reaped elsewhere shuts its group down through the root's

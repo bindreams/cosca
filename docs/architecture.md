@@ -92,7 +92,10 @@ What a child's cooperative stop sends is an action it stores, not a rule inside 
 - **The record is also what `terminate` and `terminate_tree` answer from.** Every prepared send, to a root
   or to a tree and whatever it answered, leaves on the target how it went (`SendOutcome`: `Sent`,
   `NotSent`, `Unknown`); the producer says which (an error found by a check after a send that went out is
-  `Sent`; an answer that cannot say whether the event went out is `Unknown`). After the action returns,
+  `Sent`; an answer that cannot say whether the event went out is `Unknown`; a send that reached no process,
+  an empty group or leaf or one whose every member refused it, is `NotSent` whatever its answer). A root's
+  record names a stop only for a send that went out or may have, so a later error never says a stop was sent
+  before it when none was. After the action returns,
   `terminate` and `terminate_tree` read the record, never what the action returned: an `Err` becomes a
   `StopError` with the last prepared send's outcome, or `Unknown` when the action made none. The action
   closures, the prepared sends and the graceful shutdowns keep `Result<(), Error>`.

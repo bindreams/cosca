@@ -1540,6 +1540,31 @@ fn terminate_warns_once_of_a_member_that_refuses_the_signal(#[fixture(setuid)] _
     child.wait().expect("reap the root");
 }
 
+/// A `SIGTERM` walk whose every send found its process gone (the root's handle answers `Gone`, and the
+/// root has no member) went out to no process: the answer says so, and it still carries the walk's listing.
+///
+/// Mutant: the walk answers `Sent` whatever its sends reached.
+#[cfg(unix)]
+#[skuld::test]
+fn a_terminate_whose_every_send_found_its_process_gone_sent_to_nobody() {
+    let (child, stdin) = crate::test_child::held_uncontained_blocker(false);
+    let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    let kernel = crate::identity::HostKernel;
+    let held =
+        crate::test_support::stated_root::StatedRoot::with_state(id.pid(), || crate::signal::RootState::Unreaped);
+
+    let (answer, listing) = super::terminate(&kernel, id, &held, crate::containment::TreeStop::default());
+
+    assert_eq!(answer.outcome(), crate::stop::SendOutcome::NotSent, "{answer:?}");
+    assert!(
+        matches!(answer, super::SendAnswer::NoneReached(Ok(()))) && listing.is_some(),
+        "the walk's listing is beside the answer: {answer:?}"
+    );
+    drop(stdin);
+    let status = child.wait().expect("the blocker ends at its stdin's EOF");
+    assert!(status.success(), "nothing signalled the blocker: {status:?}");
+}
+
 /// `kill_by_identity` must terminate only the process whose START TOKEN matches. A stale
 /// identity names a recycled pid, and killing it would kill a stranger.
 #[cfg(windows)]

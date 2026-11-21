@@ -10,11 +10,11 @@ use crate::test_groups::{cgroup, Group};
 #[cfg(target_os = "linux")]
 use crate::wait::block_probe::{on_drain_block, on_each_drain_block};
 
-/// What a `terminate` that went out found. A `cgroup.procs` that could not be read, or a walk's
-/// `RootExited`, fails the test.
+/// What a `terminate` that was made found, whether or not it reached a member. A `cgroup.procs` that could
+/// not be read, or a walk's `RootExited`, fails the test.
 fn sent(outcome: crate::containment::SendAnswer) -> Result<(), crate::error::Error> {
     match outcome {
-        crate::containment::SendAnswer::Sent(found) => found,
+        crate::containment::SendAnswer::Sent(found) | crate::containment::SendAnswer::NoneReached(found) => found,
         other => panic!("cgroup.procs is readable: {other:?}"),
     }
 }
@@ -1412,7 +1412,10 @@ fn hard_kill_reads_an_already_removed_leaf_as_a_completed_teardown() {
     );
 }
 
-/// `terminate` reads an already-removed leaf as a completed teardown, as `hard_kill` does.
+/// `terminate` reads an already-removed leaf as a completed teardown, as `hard_kill` does, and says it sent
+/// nothing: no member was there to receive it.
+///
+/// Mutant: the removed leaf's `terminate` is a `Sent`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
@@ -1420,13 +1423,15 @@ fn terminate_reads_an_already_removed_leaf_as_a_completed_teardown() {
     let leaf = crate::containment::cgroup::CgroupLeaf::for_test_at(std::path::PathBuf::from(
         "/nonexistent/cosca-terminate-already-gone",
     ));
-    sent(leaf.terminate(crate::signal::Signal::Term)).expect("an already-removed leaf has no member left to signal");
+    let answer = leaf.terminate(crate::signal::Signal::Term);
+    assert_eq!(answer.outcome(), crate::stop::SendOutcome::NotSent, "{answer:?}");
+    sent(answer).expect("an already-removed leaf has no member left to signal");
 
     let tree = crate::containment::Tree::contained(crate::containment::Mechanism::Cgroup(leaf));
     assert!(
         matches!(
             tree.terminate(0, None, None, crate::containment::TreeStop::default()),
-            (crate::containment::TerminateOutcome::Sent { result: Ok(()), .. }, _)
+            (crate::containment::TerminateOutcome::NoneReached { result: Ok(()) }, _)
         ),
         "terminate and hard_kill must agree about an already-gone leaf"
     );
@@ -3902,7 +3907,7 @@ fn cgroup_terminate_reports_a_leaf_listing_only_pid_zero(#[fixture(cgroup)] _gro
 /// member's pid or cause. Unprivileged: no member is real, as the pin is refused by a fault.
 ///
 /// Mutants: the causes are folded into the detail; only one cause is kept when there are several; the
-/// members with no cause of their own are dropped.
+/// members with no cause of their own are dropped; the send, which reached no member, is `NotSent`.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn terminate_of_several_members_it_could_not_signal_keeps_every_cause_below_the_error() {
@@ -3910,10 +3915,11 @@ fn terminate_of_several_members_it_could_not_signal_keeps_every_cause_below_the_
     use crate::error::Error;
     let _pin = fail_terminate(TerminateStep::Pin, libc::EMFILE);
 
-    let result = crate::containment::cgroup::CgroupLeaf::placeholder_for_test()
-        .terminate_listed("0\nnot-a-pid\n4000001\n4000002\n", crate::signal::Signal::Term);
+    let answer = crate::containment::cgroup::CgroupLeaf::placeholder_for_test()
+        .terminate_listed_sent("0\nnot-a-pid\n4000001\n4000002\n", crate::signal::Signal::Term);
 
-    let err = result.expect_err("no member got a SIGTERM");
+    assert_eq!(answer.outcome(), crate::stop::SendOutcome::NotSent, "{answer:?}");
+    let err = answer.into_tree_result().expect_err("no member got a SIGTERM");
     let Error::Unassessable {
         detail,
         source: Some(source),
@@ -4185,12 +4191,19 @@ fn cgroup_terminate_does_not_signal_a_member_that_exited_unreaped(#[fixture(cgro
     crate::test_child::wait_until_zombie(pid);
     take_member_terms();
     let mark = crate::log_capture::mark();
-    let result = leaf.terminate_listed(&format!("{pid}\n"), crate::signal::Signal::Term);
+    let answer = leaf.terminate_listed_sent(&format!("{pid}\n"), crate::signal::Signal::Term);
     let noted = take_member_terms();
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
     member.wait().expect("reap the member");
     drop(leaf);
-    result.expect("a member that exited is not a failure");
+    assert_eq!(
+        answer.outcome(),
+        crate::stop::SendOutcome::NotSent,
+        "a member that exited was sent nothing: {answer:?}"
+    );
+    answer
+        .into_tree_result()
+        .expect("a member that exited is not a failure");
     assert_eq!(noted, [], "a member that exited was signalled");
     assert_eq!(warns, Vec::<String>::new());
 }
@@ -4293,7 +4306,7 @@ fn cgroup_terminate_counts_a_member_reaped_after_its_pin_as_gone_through_proc(#[
 
 /// A member that cannot be pinned does not stop the members listed after it: each is still
 /// signalled, and the call reports only the one. Mutant: "the first member that got no `SIGTERM`
-/// ends the call".
+/// ends the call". The member after it got the signal, so the send went out.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn cgroup_terminate_tries_every_member_after_one_fails(#[fixture(cgroup)] _group: &Group) {
@@ -4304,8 +4317,14 @@ fn cgroup_terminate_tries_every_member_after_one_fails(#[fixture(cgroup)] _group
     let pids: Vec<u32> = members.iter().map(|m| m.id()).collect();
     take_member_terms();
     let guard = fail_terminate_once(TerminateStep::Pin, libc::EMFILE);
-    let result = leaf.terminate_listed(&format!("{}\n{}\n", pids[0], pids[1]), crate::signal::Signal::Term);
+    let answer = leaf.terminate_listed_sent(&format!("{}\n{}\n", pids[0], pids[1]), crate::signal::Signal::Term);
     drop(guard);
+    assert_eq!(
+        answer.outcome(),
+        crate::stop::SendOutcome::Sent,
+        "one member was signalled: {answer:?}"
+    );
+    let result = answer.into_tree_result();
     let noted = take_member_terms();
     let statuses: Vec<_> = members
         .drain(..)
@@ -4344,9 +4363,15 @@ fn cgroup_terminate_reports_every_member_that_got_no_sigterm_in_one_error_and_wa
     take_member_terms();
     let mark = crate::log_capture::mark();
     let guard = fail_terminate(TerminateStep::Send, libc::EIO);
-    // Pid 0 is unproven, and both real members' sends fail.
-    let result = leaf.terminate_listed(&format!("0\n{}\n{}\n", pids[0], pids[1]), crate::signal::Signal::Term);
+    // Pid 0 is unproven, and both real members' sends fail: the signal reached nobody.
+    let answer = leaf.terminate_listed_sent(&format!("0\n{}\n{}\n", pids[0], pids[1]), crate::signal::Signal::Term);
     drop(guard);
+    assert_eq!(
+        answer.outcome(),
+        crate::stop::SendOutcome::NotSent,
+        "no member was signalled: {answer:?}"
+    );
+    let result = answer.into_tree_result();
     let noted = take_member_terms();
     let warns = crate::log_capture::warns_since(mark, &leaf_name);
     for mut member in members.drain(..) {

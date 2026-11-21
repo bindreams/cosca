@@ -1371,8 +1371,9 @@ pub(crate) mod fault {
 /// though the flag could not be read; with no member found, that error is the walk's.
 ///
 /// How the send went is a [`SendAnswer`]. The [`Listing`] is beside it exactly when it is
-/// [`Sent`](SendAnswer::Sent), and that is always `Sent(Ok(()))`: a failed signal to the root or a
-/// member is only warned of. Asserted in debug before the pair is handed on.
+/// [`Sent`](SendAnswer::Sent) or [`NoneReached`](SendAnswer::NoneReached) (a walk whose every signal found its
+/// process gone, or failed), and that is always `Ok(())`: a failed signal to the root or a member is only
+/// warned of. Asserted in debug before the pair is handed on.
 #[cfg(not(windows))]
 pub(crate) fn terminate(
     kernel: &dyn Kernel,
@@ -1419,12 +1420,23 @@ pub(crate) fn terminate(
         // Best effort by contract: a candidate that could not be read is warned of and not signalled.
         warn_unassessed(&walk.unassessed);
         let sig = how.sig();
-        warn_if_not_attempted(root, sig, &KillOutcome::of(held.signal(sig)));
+        let mut reached = false;
+        let mut note = |id: ProcessId, outcome: KillOutcome| {
+            warn_if_not_attempted(id, sig, &outcome);
+            reached |= matches!(outcome, KillOutcome::Terminated);
+        };
+        note(root, KillOutcome::of(held.signal(sig)));
         for id in &walk.members {
-            warn_if_not_attempted(*id, sig, &kill_by_identity(kernel, *id, sig));
+            note(*id, kill_by_identity(kernel, *id, sig));
         }
         (
-            SendAnswer::Sent(Ok(())),
+            // A signal that reached no one (every send answered gone, or failed and was warned of) went out to
+            // no process.
+            if reached {
+                SendAnswer::Sent(Ok(()))
+            } else {
+                SendAnswer::NoneReached(Ok(()))
+            },
             Some(Listing {
                 // A root whose exit had begun, or whose flag could not be read, may have had children
                 // reparented out of the walk.
@@ -1445,8 +1457,8 @@ pub(crate) fn terminate(
         )
     };
     debug_assert!(
-        paired.1.is_some() == matches!(paired.0, SendAnswer::Sent(Ok(()))),
-        "a walk's listing is beside `Sent(Ok(()))` and beside no other outcome: {:?}",
+        paired.1.is_some() == matches!(paired.0, SendAnswer::Sent(Ok(())) | SendAnswer::NoneReached(Ok(()))),
+        "a walk's listing is beside `Sent(Ok(()))` or `NoneReached(Ok(()))` and beside no other outcome: {:?}",
         paired.0
     );
     paired

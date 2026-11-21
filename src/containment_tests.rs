@@ -46,11 +46,12 @@ fn a_tree_stop_carries_the_name_and_the_answer_its_caller_sent() {
 }
 
 /// A send's answer says how it went as the public outcome, and flattens to the tree call's answer: `Err` for
-/// nothing sent, for an exited root and for an unknown answer, else what the send answered. A terminate
-/// outcome made of an answer gives the same answer back.
+/// nothing sent, for an exited root and for an unknown answer, else what the send answered, a send that went
+/// to no process included. A terminate outcome made of an answer gives the same answer back.
 ///
 /// Mutants: an unknown answer reads as `Sent`; an exited root reads as `Sent` or `Unknown`; the flattening
-/// of an unknown answer is `Ok`; the terminate outcome loses the unknown answer's difference.
+/// of an unknown answer is `Ok`; the terminate outcome loses the unknown answer's difference; a send that
+/// went to no process reads as `Sent`.
 #[skuld::test]
 fn a_send_answer_says_how_it_went_and_flattens_to_one_tree_answer() {
     use super::{SendAnswer, TerminateOutcome};
@@ -62,10 +63,15 @@ fn a_send_answer_says_how_it_went_and_flattens_to_one_tree_answer() {
         source: None,
     };
     type Make = fn(Error) -> SendAnswer;
-    let rows: [(&str, Make, SendOutcome); 4] = [
+    let rows: [(&str, Make, SendOutcome); 5] = [
         ("not sent", SendAnswer::NotSent, SendOutcome::NotSent),
         ("exited", SendAnswer::RootExited, SendOutcome::NotSent),
         ("checked", |e| SendAnswer::Sent(Err(e)), SendOutcome::Sent),
+        (
+            "checked, reached nobody",
+            |e| SendAnswer::NoneReached(Err(e)),
+            SendOutcome::NotSent,
+        ),
         ("unknown", SendAnswer::Unknown, SendOutcome::Unknown),
     ];
     for (detail, make, outcome) in rows {
@@ -83,6 +89,10 @@ fn a_send_answer_says_how_it_went_and_flattens_to_one_tree_answer() {
     SendAnswer::Sent(Ok(()))
         .into_tree_result()
         .expect("a send that went out and checked");
+    assert_eq!(SendAnswer::NoneReached(Ok(())).outcome(), SendOutcome::NotSent);
+    SendAnswer::NoneReached(Ok(()))
+        .into_tree_result()
+        .expect("a send that went to nobody has nothing wrong to report");
 }
 
 /// A stop made of a signal carries and names that signal, not the default's.

@@ -710,7 +710,7 @@ fn a_call_words_what_the_action_sent_before_its_kill() {
             crate::child::graceful::shutdown::stop_root(&crate::child::graceful::shutdown::BlockingDriver(&child)),
         );
         answer.unwrap_or_else(|e| panic!("{what}: {e:?}"));
-        assert_eq!(earlier, says, "the lone shutdown's kill, after {what}");
+        assert_eq!(earlier.as_deref(), Some(says), "the lone shutdown's kill, after {what}");
         assert_eq!(
             refusal_logged(mark, &format!("graceful_shutdown({})", child.pid())),
             logs_a_refusal,
