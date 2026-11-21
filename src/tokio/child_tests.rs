@@ -46,7 +46,10 @@ async fn a_teardown_future_dropped_at_its_wait_settles_as_a_drop_does() {
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
     #[cfg(unix)]
     let pid = child.pid();
-    child.inner.proc.script_over(|f| f.reaps([ReapAnswer::Running]));
+    child
+        .inner
+        .proc
+        .script_over(|f| f.reaps([ReapAnswer::Running]).held_until_woken());
     let mut teardown = Box::pin(child.tear_down_awaiting());
 
     let first = std::future::poll_fn(|cx| Poll::Ready(teardown.as_mut().poll(cx))).await;
@@ -114,7 +117,10 @@ async fn a_teardown_future_dropped_while_panicking_gives_the_child_up_and_warns(
     crate::log_capture::install();
     let (mut child, _stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {}).await;
     let pid = child.pid();
-    child.inner.proc.script_over(|f| f.reaps([ReapAnswer::Running]));
+    child
+        .inner
+        .proc
+        .script_over(|f| f.reaps([ReapAnswer::Running]).held_until_woken());
     let mut teardown = Box::pin(child.tear_down_awaiting());
     let first = std::future::poll_fn(|cx| Poll::Ready(teardown.as_mut().poll(cx))).await;
     assert!(first.is_pending(), "the teardown waits for the root");

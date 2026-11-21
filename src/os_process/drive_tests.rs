@@ -50,7 +50,6 @@ fn exited_before_first_look_returns_true_without_blocking() {
 fn wakes_and_looks_again() {
     block_probe::take();
     let p = fake([Answer::Running, Answer::Exited]);
-    p.wake();
     assert!(exited_held(&p, Some(Duration::from_secs(60))).unwrap());
     assert_eq!(p.looks(), 2);
     assert_eq!(block_probe::take().len(), 1, "one wait, between the two looks");
@@ -83,7 +82,6 @@ fn expiry_ends_in_one_final_look() {
 fn duration_max_is_unbounded() {
     block_probe::take();
     let p = fake([Answer::Running, Answer::Exited]);
-    p.wake();
     assert!(exited_held(&p, Some(Duration::MAX)).unwrap());
     assert_eq!(
         block_probe::take(),
@@ -124,7 +122,6 @@ impl Scripted {
         let moves: std::collections::VecDeque<Move> = moves.into_iter().collect();
         let waits = moves.iter().filter(|m| matches!(m, Move::Wait)).count();
         let source = fake(vec![Answer::Running; waits]);
-        source.wake();
         Self {
             moves,
             source,
@@ -667,7 +664,6 @@ fn run_returns_done_without_blocking() {
 fn run_blocks_on_the_wait_the_look_returned_then_looks_again() {
     block_probe::take();
     let p = fake([Answer::Running, Answer::Exited]);
-    p.wake();
     assert!(matches!(
         run_fake(&p, absolute(Some(Duration::from_secs(60)))).unwrap(),
         RunOutcome::Done(())
@@ -698,7 +694,6 @@ fn run_takes_one_final_look_at_the_deadline_and_starts_no_round() {
     let (_clock, start) = test_clock::FrozenClockGuard::install();
     let timeout = Duration::from_secs(10);
     let p = fake([Answer::Running, Answer::Running, Answer::Running]);
-    p.wake();
     p.on_look(|n| {
         if n == 1 {
             test_clock::advance(Duration::from_secs(11));
@@ -723,7 +718,6 @@ fn run_arms_each_block_with_at_most_the_time_remaining() {
     block_probe::take();
     let (_clock, _start) = test_clock::FrozenClockGuard::install();
     let p = fake([Answer::Running, Answer::Running, Answer::Exited]);
-    p.wake();
     // 3 s of the 10 s pass at the start of each of the first two looks.
     p.on_look(|n| {
         if n < 2 {
@@ -746,7 +740,6 @@ fn run_arms_each_block_with_at_most_the_time_remaining() {
 fn run_arms_a_deadline_beyond_the_block_limit_in_pieces() {
     block_probe::take();
     let p = fake([Answer::Running, Answer::Exited]);
-    p.wake();
     let far = absolute(Some(Duration::from_secs(u64::from(u32::MAX)))).expect("the clock reaches 136 years");
     assert!(matches!(run_fake(&p, Some(far)).unwrap(), RunOutcome::Done(())));
     let armed = block_probe::take();

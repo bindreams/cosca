@@ -8,7 +8,7 @@ use super::held_teardown::{tear_down_held, warn_of_teardown_failures, HeldTeardo
 use super::policy::SpawnPolicy;
 use super::Diagnosis;
 use crate::child::owned::owned_tests::teardown::{
-    fire_on_block, held_owned_blocker as held_blocker, held_owned_blocker_reporting, slow_warns_during,
+    held_owned_blocker as held_blocker, held_owned_blocker_reporting, slow_warns_during,
 };
 use crate::child::owned::owned_tests::teardown_lines::{self, Found, Kill};
 use crate::child::owned::teardown::{Disposition, Expect, HandleTeardown, Past};
@@ -82,13 +82,8 @@ fn a_front_whose_look_failed_is_handed_back_and_the_error_says_so() {
 #[skuld::test]
 fn a_front_whose_place_cannot_be_read_is_handed_back_and_the_error_says_so() {
     let record = ExitRecord::Status(std::process::ExitStatus::default());
-    let mut fake = None;
-    let (owned, stdin) = held_front(|f| {
-        fake = Some(f.clone());
-        f.reaps([ReapAnswer::Running, ReapAnswer::Exited(record)])
-    });
+    let (owned, stdin) = held_front(|f| f.reaps([ReapAnswer::Running, ReapAnswer::Exited(record)]));
     let pid = owned.pid().expect("the held child has a pid");
-    let _fire = fire_on_block(&fake.expect("the script ran"));
     let subtree = killed_subtree();
 
     let (detail, fate, handed_back) = {
@@ -120,12 +115,7 @@ fn a_front_whose_place_cannot_be_read_is_handed_back_and_the_error_says_so() {
 /// the front reads as not a front, so the teardown kills and waits for it.
 #[skuld::test]
 fn a_front_whose_reap_failed_after_the_leaf_kill_is_handed_back_and_the_error_says_so() {
-    let mut fake = None;
-    let (owned, stdin) = held_front(|f| {
-        fake = Some(f.clone());
-        f.reaps([ReapAnswer::Running, ReapAnswer::Err(io::ErrorKind::Other)])
-    });
-    let _fire = fire_on_block(&fake.expect("the script ran"));
+    let (owned, stdin) = held_front(|f| f.reaps([ReapAnswer::Running, ReapAnswer::Err(io::ErrorKind::Other)]));
     let subtree = killed_subtree();
 
     let (detail, fate, handed_back) = {
@@ -199,13 +189,8 @@ fn a_front_reaped_elsewhere_is_noted_without_a_hand_back() {
 #[skuld::test]
 fn a_running_front_with_no_subtree_is_handed_back_and_the_error_says_so() {
     let record = ExitRecord::Status(std::process::ExitStatus::default());
-    let mut fake = None;
-    let (owned, stdin) = held_front(|f| {
-        fake = Some(f.clone());
-        f.reaps([ReapAnswer::Running, ReapAnswer::Exited(record)])
-    });
+    let (owned, stdin) = held_front(|f| f.reaps([ReapAnswer::Running, ReapAnswer::Exited(record)]));
     let pid = owned.pid().expect("the held child has a pid");
-    let _fire = fire_on_block(&fake.expect("the script ran"));
 
     let (detail, fate, handed_back) = tear_down_held_holding(owned, None, None, &mut Diagnosis::default(), stdin);
 
@@ -331,13 +316,8 @@ fn a_refused_kill_under_leave_is_left_running_and_warned_and_nothing_is_handed_b
 fn a_running_front_under_leave_is_noted_as_left_unreaped_and_nothing_is_handed_back() {
     crate::log_capture::install();
     let record = ExitRecord::Status(std::process::ExitStatus::default());
-    let mut fake = None;
-    let (owned, stdin) = held_front(|f| {
-        fake = Some(f.clone());
-        f.reaps([ReapAnswer::Running, ReapAnswer::Exited(record)])
-    });
+    let (owned, stdin) = held_front(|f| f.reaps([ReapAnswer::Running, ReapAnswer::Exited(record)]));
     let blocker = ReapsBlocker::new(&owned, stdin);
-    let _fire = fire_on_block(&fake.expect("the script ran"));
     let mark = crate::log_capture::mark();
 
     let (detail, fate, unreaped) = tear_down_leaving(owned, &mut Diagnosis::default());
@@ -364,20 +344,19 @@ fn a_running_front_under_leave_is_noted_as_left_unreaped_and_nothing_is_handed_b
 }
 
 /// A front whose pid is not known (tokio's spawn failed before it returned one) is named so, in the
-/// error and in the warn.
+/// error and in the warn. The front is a fake with no real child and no pid, whose one look finds it
+/// running.
 ///
-/// Mutant: the front is named `pid 0`.
+/// Mutants: the front is named `pid 0`; a running front with no reach is waited for.
 #[skuld::test]
 fn a_front_with_no_pid_is_named_as_such() {
     crate::log_capture::install();
-    let (owned, stdin) = held_blocker(|f| f);
-    let blocker = ReapsBlocker::new(&owned, stdin);
-    // The same child, named by its pidfd alone: the copy is the pid-less handle's own.
-    let pidfd = owned.pidfd().expect("a Linux child has its pidfd");
-    let pidless = OwnedChild::over_pidfd(
-        crate::identity::HostKernel,
-        None,
-        pidfd.try_clone_to_owned().expect("dup the pidfd"),
+    let pidless = OwnedChild::new(
+        Box::new(
+            FakeProcess::new([])
+                .reaps([ReapAnswer::Running])
+                .with_kill_refusal(KillRefusal::Permission),
+        ),
         crate::elevation::front::TrackedKind::Front(Front::Sudo),
     );
     let mark = crate::log_capture::mark();
@@ -393,8 +372,6 @@ fn a_front_with_no_pid_is_named_as_such() {
         warns[0].starts_with("teardown after a failed spawn: the elevation front (pid unknown)"),
         "{warns:?}"
     );
-    drop(owned);
-    blocker.finish().expect("the left front is still unreaped");
 }
 
 /// The teardown of the table's row `kill` and `found` over a pidfd, as a caller that leaves the child
@@ -586,7 +563,8 @@ fn tear_down_front_under(
 /// the teardown, once. The look, the wait's first bounded try, its second, and the block it ends
 /// in, are the four answers; the last is scripted, and the real blocker is reaped by the test.
 ///
-/// Mutant: `tear_down_held` hands the front's look no threshold.
+/// Mutants: `tear_down_held` hands the front's look no threshold; the front reads as not a front, so
+/// the teardown kills it.
 #[skuld::test]
 fn the_wait_for_a_front_its_leafs_kill_reached_warns_past_its_policys_threshold() {
     let record = ExitRecord::Status(std::process::ExitStatus::default());
@@ -601,7 +579,6 @@ fn the_wait_for_a_front_its_leafs_kill_reached_warns_past_its_policys_threshold(
         ])
     });
     let _blocker = ReapsBlocker::new(&owned, stdin);
-    let _fire = fire_on_block(&fake.expect("the script ran"));
     let subtree = killed_subtree();
     let mut handed_back = None;
 
@@ -615,6 +592,11 @@ fn the_wait_for_a_front_its_leafs_kill_reached_warns_past_its_policys_threshold(
         "a reaped front is not handed back"
     );
     assert_eq!(warns, 1);
+    assert_eq!(
+        fake.expect("the script ran").signal_calls(),
+        [],
+        "a front is looked at and waited for, and sent nothing"
+    );
 }
 
 /// The `Unreaped` a failed spawn hands back for a front does what the spawn's policy says when
@@ -627,13 +609,8 @@ fn the_wait_for_a_front_its_leafs_kill_reached_warns_past_its_policys_threshold(
 fn the_unreaped_a_failed_spawn_hands_back_for_a_front_does_what_its_policy_says_on_drop() {
     crate::log_capture::install();
     let record = ExitRecord::Status(std::process::ExitStatus::default());
-    let mut fake = None;
-    let (owned, stdin) = held_front(|f| {
-        fake = Some(f.clone());
-        f.reaps([ReapAnswer::Running, ReapAnswer::Exited(record)])
-    });
+    let (owned, stdin) = held_front(|f| f.reaps([ReapAnswer::Running, ReapAnswer::Exited(record)]));
     let _blocker = ReapsBlocker::new(&owned, stdin);
-    let _fire = fire_on_block(&fake.expect("the script ran"));
     let (_, _, handed_back) = tear_down_front_under(owned, None, SpawnPolicy::LET_GO);
     assert_eq!(
         crate::wait::block_probe::take(),

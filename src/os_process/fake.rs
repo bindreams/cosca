@@ -1,9 +1,16 @@
 //! A stated-facts [`OsChild`]: what each call answers, in order, and nothing the OS would do. A call
-//! past its table panics. It never blocks; a `Running` answer hands out a [`WaitFor`] that the test
-//! fires with [`FakeProcess::wake`], and the driver's own blocking call is what a test counts.
+//! past its table panics. It never blocks: a scripted `Running` hands out a [`WaitFor`] that is
+//! already over, so a driver that waits on it returns at once, and the driver's own blocking call is
+//! what a test counts (`block_probe`). A test that holds a wait on purpose builds the fake
+//! [`held_until_woken`](FakeProcess::held_until_woken) and ends the wait with [`FakeProcess::wake`].
+//!
+//! A `Running` that repeats for ever (`reaps_always`) has no wait that ends, so a fake that is not
+//! held panics when it is first taken: hold the fake, or script a finite table.
 //!
 //! [`FakeProcess::over`] puts a real [`OsChild`] behind the tables: a call the table has an answer
-//! for gets it, and every other call, `os_handle` included, is the real one.
+//! for gets it, and every other call, `os_handle` included, is the real one. A look past the table
+//! of such a fake is that child's own answer, and nothing here ends its wait: a script over a live
+//! child ends on an answer that is not `Running`.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -63,6 +70,7 @@ pub(crate) struct FakeProcess(Arc<Shared>);
 
 struct Shared {
     script: Mutex<Script>,
+    /// The fake's one wait source; fired unless the fake is held.
     source: Source,
     /// What answers a call the tables have nothing for. `None`: such a call panics.
     real: Option<Box<dyn OsChild>>,
@@ -109,6 +117,7 @@ struct Script {
     look_times: Vec<Instant>,
     signal_calls: Vec<Sig>,
     on_look: Option<Box<dyn FnMut(usize) + Send>>,
+    held: bool,
 }
 
 impl FakeProcess {
@@ -125,6 +134,9 @@ impl FakeProcess {
     }
 
     fn with(exits: impl IntoIterator<Item = Answer>, real: Option<Box<dyn OsChild>>) -> Self {
+        // Fired from the start: the wait of a `Running` answer is over until the fake is held.
+        let source = Source::new();
+        source.fire();
         Self(Arc::new(Shared {
             script: Mutex::new(Script {
                 pid: None,
@@ -150,8 +162,9 @@ impl FakeProcess {
                 look_times: Vec::new(),
                 signal_calls: Vec::new(),
                 on_look: None,
+                held: false,
             }),
-            source: Source::new(),
+            source,
             real,
             kernel: std::sync::OnceLock::new(),
         }))
@@ -209,7 +222,6 @@ impl FakeProcess {
 
     /// Answer `refusal` to [`OsChild::kill_refusal`]. Without it, a fake over a real child answers
     /// that child's, and any other panics.
-    #[cfg(any(windows, target_os = "macos"))]
     pub(crate) fn with_kill_refusal(self, refusal: KillRefusal) -> Self {
         self.script().kill_refusal = Some(refusal);
         self
@@ -304,10 +316,38 @@ impl FakeProcess {
         self
     }
 
-    /// Fire the [`WaitFor`] that `Running` answers hand out; it stays fired, except that each
-    /// `Running` answer of [`OsChild::try_observe`] hands out an unfired one.
+    /// Hold the waits: the [`WaitFor`] a `Running` answer hands out is unfired, and a driver that
+    /// waits on it blocks until [`wake`](Self::wake). A test that asserts on a process parked in its
+    /// wait builds the fake this way.
+    pub(crate) fn held_until_woken(self) -> Self {
+        self.script().held = true;
+        self.0.source.reset();
+        self
+    }
+
+    pub(crate) fn holds_its_waits(&self) -> bool {
+        self.script().held
+    }
+
+    /// Fire the [`WaitFor`] that `Running` answers of a [`held_until_woken`](Self::held_until_woken)
+    /// fake hand out. It stays fired until the next `Running` answer of [`OsChild::try_observe`],
+    /// which hands out an unfired one. Panics on a fake that does not hold its waits.
+    #[track_caller]
     pub(crate) fn wake(&self) {
+        assert!(
+            self.script().held,
+            "FakeProcess: wake() on a fake not built held_until_woken(): its waits are already over"
+        );
         self.0.source.fire();
+    }
+
+    /// The wait a `Running` answer hands out: the fake's one source. It is fired, and stays so, unless
+    /// the fake is held; `unfire` (a `try_observe` answer) un-fires a held one.
+    fn running_wait(&self, unfire: bool) -> WaitFor<'_> {
+        if unfire && self.script().held {
+            self.0.source.reset();
+        }
+        self.0.source.wait_for()
     }
 
     /// How many looks were made: calls of `exited` and of `try_observe`.
@@ -393,7 +433,7 @@ impl OsProcess for FakeProcess {
         let scripted = self.script().exits.pop_front();
         match (scripted, &self.0.real) {
             (Some(Answer::Exited), _) => Ok(Exit::Exited),
-            (Some(Answer::Running), _) => Ok(Exit::Running(self.0.source.wait_for())),
+            (Some(Answer::Running), _) => Ok(Exit::Running(self.running_wait(false))),
             (Some(Answer::Err(kind)), _) => Err(Error::Io(kind.into())),
             (None, Some(real)) => real.exited(),
             (None, None) => panic!("FakeProcess: a look was made past the scripted answers"),
@@ -467,20 +507,24 @@ impl OsChild for FakeProcess {
 
     fn try_observe(&self) -> Result<TryObserveOutcome<'_>, Error> {
         self.begin_look();
-        let scripted = {
+        let (scripted, endless) = {
             let mut script = self.script();
-            script.reaps.pop_front().or_else(|| {
+            let mut endless = false;
+            let scripted = script.reaps.pop_front().or_else(|| {
                 let repeated = script.reaps_always;
                 script.repeats += usize::from(repeated.is_some());
+                endless = !script.held && matches!(repeated, Some(ReapAnswer::Running));
                 repeated
-            })
+            });
+            (scripted, endless)
         };
+        assert!(
+            !endless,
+            "FakeProcess: reaps_always(Running) on a fake that is not held_until_woken(): a Running that repeats for ever has no wait that ends; hold the fake (and let the test say what ends the wait) or script a finite table"
+        );
         match (scripted, &self.0.real) {
             (Some(ReapAnswer::Exited(record)), _) => Ok(TryObserveOutcome::Exited(record)),
-            (Some(ReapAnswer::Running), _) => {
-                self.0.source.reset();
-                Ok(TryObserveOutcome::Running(self.0.source.wait_for()))
-            }
+            (Some(ReapAnswer::Running), _) => Ok(TryObserveOutcome::Running(self.running_wait(true))),
             (Some(ReapAnswer::Recheck), _) => Ok(TryObserveOutcome::Recheck),
             (Some(ReapAnswer::Foreign(foreign)), _) => Ok(TryObserveOutcome::Foreign(foreign)),
             (Some(ReapAnswer::Err(kind)), _) => Err(Error::Io(kind.into())),
@@ -516,7 +560,8 @@ impl OsChild for FakeProcess {
     }
 }
 
-/// What a `Running` answer hands out, and the way a test fires it.
+/// What a `Running` answer hands out: fired or not. The fake fires it once when built, and a held
+/// fake's test fires it again.
 #[cfg(unix)]
 struct Source {
     rx: std::io::PipeReader,

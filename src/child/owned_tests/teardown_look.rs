@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::io;
 use std::time::Duration;
 
-use super::teardown::{due_now, exit, fake, fire_on_block, id, slow_warns, PID};
+use super::teardown::{due_now, exit, fake, id, slow_warns, PID};
 use crate::child::owned::teardown::{FrontLook, LookOutcome, Reach};
 use crate::child::owned::OwnedChild;
 use crate::elevation::front::TrackedKind;
@@ -138,7 +138,6 @@ fn a_front_that_has_exited_is_reaped_without_asking_where_it_is() {
 #[skuld::test]
 fn a_running_front_with_no_reach_is_left_running_and_not_waited_for() {
     let fake = fake().reaps([ReapAnswer::Running]);
-    let _fire = fire_on_block(&fake);
     let torn = look(&fake, None);
     assert_outcome(&torn, ChildFate::Running { id: Some(id()) }, Went::LeftRunning);
     assert_eq!(fake.looks(), 1);
@@ -152,7 +151,6 @@ fn a_running_front_with_no_reach_is_left_running_and_not_waited_for() {
 #[skuld::test]
 fn a_running_front_the_kill_did_not_reach_is_left_running() {
     let fake = fake().reaps([ReapAnswer::Running]);
-    let _fire = fire_on_block(&fake);
     let reach = FakeReach::answering(Ok(false));
     let torn = look(&fake, Some(&reach));
     assert_outcome(&torn, ChildFate::Running { id: Some(id()) }, Went::LeftRunning);
@@ -166,7 +164,6 @@ fn a_running_front_the_kill_did_not_reach_is_left_running() {
 #[skuld::test]
 fn a_running_front_the_kill_reached_is_waited_for_and_reaped() {
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Running, ReapAnswer::Exited(exit())]);
-    let _fire = fire_on_block(&fake);
     let torn = look(&fake, Some(&FakeReach::answering(Ok(true))));
     assert_outcome(&torn, ChildFate::Reaped, Went::Ended);
     assert_eq!(fake.looks(), 3, "the look, the wait's look, the look the wait woke to");
@@ -180,7 +177,6 @@ fn a_running_front_the_kill_reached_is_waited_for_and_reaped() {
 #[skuld::test]
 fn a_failed_wait_for_a_reached_front_is_unaccounted_for() {
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Err(io::ErrorKind::Other)]);
-    let _fire = fire_on_block(&fake);
     let torn = look(&fake, Some(&FakeReach::answering(Ok(true))));
     assert_outcome(&torn, ChildFate::Killed, Went::Ended);
 }
@@ -192,7 +188,6 @@ fn a_failed_wait_for_a_reached_front_is_unaccounted_for() {
 #[skuld::test]
 fn a_front_reaped_elsewhere_between_the_look_and_the_wait_is_killed_and_silent() {
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Foreign(Foreign::Gone)]);
-    let _fire = fire_on_block(&fake);
     let (torn, records) = look_logged(&fake, Some(id()), Ok(Some(&FakeReach::answering(Ok(true)))), None);
     assert_outcome(&torn, ChildFate::Killed, Went::Ended);
     assert!(
@@ -209,7 +204,6 @@ fn a_front_reaped_elsewhere_between_the_look_and_the_wait_is_killed_and_silent()
 #[skuld::test]
 fn a_dying_front_launchd_holds_is_killed_and_not_logged_by_the_policy() {
     let fake = fake().reaps([ReapAnswer::Running, ReapAnswer::Foreign(Foreign::Orphaned)]);
-    let _fire = fire_on_block(&fake);
     let (torn, records) = look_logged(&fake, Some(id()), Ok(Some(&FakeReach::answering(Ok(true)))), None);
     assert_outcome(&torn, ChildFate::Killed, Went::Ended);
     assert!(
@@ -225,7 +219,6 @@ fn a_dying_front_launchd_holds_is_killed_and_not_logged_by_the_policy() {
 #[skuld::test]
 fn a_front_whose_place_cannot_be_read_is_left_running_and_not_waited_for() {
     let fake = fake().reaps([ReapAnswer::Running]);
-    let _fire = fire_on_block(&fake);
     let torn = look(&fake, Some(&FakeReach::answering(Err(io::ErrorKind::Other))));
     assert_outcome(&torn, ChildFate::Running { id: Some(id()) }, Went::PlaceUnreadable);
     assert_eq!(fake.looks(), 1);
@@ -318,7 +311,6 @@ mod worded {
     /// The clause is a warn that says `wanted`, for the caller's one warn.
     #[track_caller]
     fn assert_left(disposition: Disposition, reach: Reaches<'_>, fake: &FakeProcess, wanted: &str) {
-        let _fire = fire_on_block(fake);
         let (worded, records) = worded_by_the_drop(disposition, fake, reach);
         assert_eq!(warn_of(&worded), Some(wanted), "{disposition:?}: {worded:?}");
         assert_eq!(records, [], "the wording logs nothing: the caller does");
@@ -327,7 +319,6 @@ mod worded {
     /// The clause is a `debug` line that says `wanted`.
     #[track_caller]
     fn assert_debug(disposition: Disposition, reach: Reaches<'_>, fake: &FakeProcess, wanted: &str) {
-        let _fire = fire_on_block(fake);
         let (worded, records) = worded_by_the_drop(disposition, fake, reach);
         assert_eq!(
             said_of(&worded),
@@ -340,7 +331,6 @@ mod worded {
     /// What `word_front` builds is uncollected (`wanted`) or not, as the look left the front.
     #[track_caller]
     fn assert_uncollected(disposition: Disposition, reach: Reaches<'_>, fake: &FakeProcess, wanted: bool) {
-        let _fire = fire_on_block(fake);
         let (worded, _) = worded_by_the_drop(disposition, fake, reach);
         assert_eq!(
             matches!(worded.said(), Some(Wording::Uncollected(_))),
@@ -469,7 +459,6 @@ mod worded {
     fn a_front_whose_place_a_refusal_hides_is_worded_in_its_own_words_and_fails_as_unsupported() {
         for disposition in BOTH {
             let fake = fake().reaps([ReapAnswer::Running]);
-            let _fire = fire_on_block(&fake);
             let (worded, _) = worded_by_the_drop(disposition, &fake, Ok(Some(&FakeReach::refusing())));
             let said = crate::error::said(&refusal());
             let warn = warn_of(&worded).expect("a warn");
@@ -727,7 +716,6 @@ fn a_front_waited_for_past_its_threshold_warns_once() {
         (vec![ReapAnswer::Running, ReapAnswer::Exited(exit())], 0),
     ] {
         let fake = fake().reaps(reaps);
-        let _fire = fire_on_block(&fake);
         let (torn, records) = look_logged(
             &fake,
             Some(id()),

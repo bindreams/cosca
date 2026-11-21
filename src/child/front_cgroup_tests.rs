@@ -23,7 +23,7 @@ use crate::child::front_kill_tests::{
     assert_ends_unsignalled, assert_reaped_unsignalled, assert_refused_by, assert_unkillable_front, cat, spawn_as,
     spawn_as_over, sudo_report,
 };
-use crate::child::owned::owned_tests::teardown::{fire_on_block, slow_warns_during};
+use crate::child::owned::owned_tests::teardown::slow_warns_during;
 use crate::child::owned::seams::record_root_teardowns;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::command::Command;
@@ -692,10 +692,9 @@ fn cgroup_a_drops_reap_of_a_front_its_leaf_killed_warns_past_its_spawns_threshol
     child.policy = SpawnPolicy::WARNS_AT_ONCE;
     let pid = child.pid();
     let front = pidfd_of(pid);
-    let fake = child
+    child
         .proc
         .script_over(|fake| fake.reaps([ReapAnswer::Running, ReapAnswer::Running]));
-    let _fire = fire_on_block(&fake);
     // Released as the kill returns; see [`KillRelease`].
     let release = release_after_cgroup_kill(stdin);
     release.observe(pid);
