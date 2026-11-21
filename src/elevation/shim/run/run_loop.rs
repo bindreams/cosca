@@ -16,10 +16,11 @@ use super::child::{died_before_exec, not_executed, signal};
 use super::fds::wait_readable;
 use super::log::Log;
 use super::reap::{kill, reap};
-use crate::child::spawn::fork_exec::{Progress, Status};
+use crate::child::spawn::fork_exec::{Failure, Progress, Status};
 use crate::elevation::shim::protocol::NotExecuted;
 use crate::elevation::shim::step::{decide, Actions, Control, Events, ExecEvent, LoopState};
 use crate::os_process::linux::fork::NewChild;
+use crate::resolve::Candidate;
 
 /// What the loop ended with: the inputs of [`conclude`](crate::elevation::shim::step::conclude).
 pub(super) struct Finished {
@@ -35,6 +36,8 @@ pub(super) struct Loop<'a> {
     pub(super) conn: BorrowedFd<'a>,
     pub(super) owner: BorrowedFd<'a>,
     pub(super) child: &'a NewChild,
+    /// The candidates the child was to run: a stop in its walk of the later ones is worded from them.
+    pub(super) candidates: &'a [Candidate],
     /// The read end of the pipe the signal handlers write to.
     pub(super) wake: BorrowedFd<'a>,
     /// The spawn core's status channel.
@@ -59,15 +62,23 @@ enum Drained {
 /// Reads the status channel without blocking. A read that fails is logged, and the loop goes on: the
 /// child's exit ends the wait for a report. A ready record is nothing yet: the report is a failure,
 /// and the end is the `exec`, or the child's death before it.
-fn drain_status(status: &mut Status, log: &Log) -> Drained {
-    drained(status.progress(), log)
+fn drain_status(status: &mut Status, candidates: &[Candidate], log: &Log) -> Drained {
+    drained(status.progress(), candidates, log)
 }
 
-/// What the loop makes of what the status channel said.
-fn drained(progress: std::io::Result<Progress>, log: &Log) -> Drained {
+/// What the loop makes of what the status channel said. The wire to cosca says a number for a stop in
+/// the child's walk of the later candidates, as for an `exec` failure; the log line keeps the text the
+/// spawn's error has for it (`candidates` hold the candidate and its `PATH` element).
+fn drained(progress: std::io::Result<Progress>, candidates: &[Candidate], log: &Log) -> Drained {
     match progress {
         Ok(Progress::Failed(failure)) => match not_executed(failure) {
-            Ok(report) => Drained::Report(report),
+            Ok(report) => {
+                if let Failure::Unexamined { errno, candidate } = failure {
+                    let stop = crate::resolve::posix::walk_stop(candidates, candidate, errno);
+                    log.line(format_args!("status pipe: {}", crate::error::Report(&stop)));
+                }
+                Drained::Report(report)
+            }
             Err(e) => unreadable(&e, log),
         },
         Ok(Progress::Ended { ready: true }) => Drained::Eof,
@@ -149,7 +160,7 @@ impl Loop<'_> {
             events.owner_exited = owner_ready;
             events.forced_failure = failure_ready;
             if status_ready || (events.child_exited && st.exec_pending) {
-                match drain_status(self.status, self.log) {
+                match drain_status(self.status, self.candidates, self.log) {
                     Drained::Report(r) => {
                         events.exec = ExecEvent::Report;
                         self.log.line(format_args!("status pipe: report {r:?}"));
@@ -209,7 +220,7 @@ impl Loop<'_> {
         if report.is_none() {
             // A report already written is positive evidence, whatever the reap gave. So is a channel
             // that ended with no ready record: no `execve` ran, and the reap says how the child died.
-            match drain_status(self.status, self.log) {
+            match drain_status(self.status, self.candidates, self.log) {
                 Drained::Report(r) => report = Some(r),
                 Drained::Died => report = Some(died_before_exec(reaped)),
                 Drained::Eof | Drained::Nothing => {}

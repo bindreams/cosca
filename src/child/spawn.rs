@@ -632,16 +632,16 @@ fn spawn_reported(
     #[cfg(unix)]
     let mut steps = in_child::InChild::default();
     #[cfg(target_os = "linux")]
-    let (invocation, later, env) = {
+    let (invocation, candidates, env) = {
         let mut invocation = invocation(cmd).not_started()?;
         // Before anything is made (stdio, a cgroup leaf), so a program that is nowhere fails the spawn
         // with nothing to tear down.
         let env = child_env::child_env_of(cmd);
-        let later = invocation.find(&env).not_started()?;
+        let candidates = invocation.find(&env).not_started()?;
         if let Some(dir) = &invocation.cwd {
             enter_in_child(&mut steps, dir).not_started()?;
         }
-        (invocation, later, env)
+        (invocation, candidates, env)
     };
     #[cfg(target_os = "macos")]
     let (mut std_cmd, report) = build_std_command_with(cmd, &mut steps, unique_report::register).not_started()?;
@@ -724,7 +724,7 @@ fn spawn_reported(
         if let Some(leaf) = prepared.cgroup_leaf.as_ref().filter(|_| front.is_some()) {
             crate::containment::cgroup::front_placement(&kernel, || leaf.id()).not_started()?;
         }
-        let program = fork_spawn::program(&invocation, &later, env).not_started()?;
+        let launch = fork_spawn::launch(&invocation, candidates, env).not_started()?;
 
         let guard = spawn_lock();
         let refusing_placement = prepared.refuses_failed_placement();
@@ -734,7 +734,7 @@ fn spawn_reported(
             placement: prepared.placement_leaf(),
             refusing_placement,
         };
-        let started = fork_spawn::start(&program, &mut steps, kernel, on_failure, &guard);
+        let started = fork_spawn::start(&launch, &mut steps, kernel, on_failure, &guard);
         // The child's ends of its pipes and its fd map's sources close here, under the lock, as std's
         // spawn closed them, whether or not the spawn started: a fork that does not exec, made by
         // another thread, holds a copy of an end until it ends.
@@ -2911,6 +2911,11 @@ pub(crate) mod fd_channel;
 #[cfg(target_os = "linux")]
 #[path = "spawn/fork_exec.rs"]
 pub(crate) mod fork_exec;
+
+// Linux: a program and the candidates its paths came from, which word a stop in its walk.
+#[cfg(target_os = "linux")]
+#[path = "spawn/launch.rs"]
+pub(crate) mod launch;
 
 // Linux: the ordinary spawn, on the fork-exec core.
 #[cfg(target_os = "linux")]

@@ -7,6 +7,17 @@ use crate::elevation::shim::protocol::{Errno, NotExecuted, Signal};
 use crate::elevation::shim::run::child::{died_before_exec, not_spawned};
 use crate::elevation::shim::run::log::Log;
 use crate::elevation::shim::step::Control;
+use crate::resolve::Candidate;
+use std::path::PathBuf;
+
+/// The candidates the child was to run: a file found in `/bin/d`, and the same name in `/usr/d`.
+fn candidates() -> [Candidate; 2] {
+    let at = |path: &str, entry: &str| Candidate {
+        path: PathBuf::from(path),
+        entry: Some(PathBuf::from(entry)),
+    };
+    [at("/bin/d/tool", "/bin/d"), at("/usr/d/tool", "/usr/d")]
+}
 
 /// A pipe, the read end non-blocking.
 fn pipe() -> (OwnedFd, OwnedFd) {
@@ -43,8 +54,8 @@ fn logged(reader: &OwnedFd) -> String {
 #[skuld::test]
 fn nothing_and_a_ready_record_say_nothing_yet() {
     let (log, _, _keep) = captured_log();
-    assert!(matches!(drained(Ok(Progress::Pending), &log), Drained::Nothing));
-    assert!(matches!(drained(Ok(Progress::Ready), &log), Drained::Nothing));
+    assert!(matches!(drained(Ok(Progress::Pending), &[], &log), Drained::Nothing));
+    assert!(matches!(drained(Ok(Progress::Ready), &[], &log), Drained::Nothing));
 }
 
 /// Each failure of the child is the report of its kind, and the channel's end is the `exec`.
@@ -53,7 +64,7 @@ fn nothing_and_a_ready_record_say_nothing_yet() {
 #[skuld::test]
 fn a_failure_is_the_report_of_its_kind_and_the_end_is_eof() {
     let (log, _, _keep) = captured_log();
-    let report = |failure| match drained(Ok(Progress::Failed(failure)), &log) {
+    let report = |failure| match drained(Ok(Progress::Failed(failure)), &candidates(), &log) {
         Drained::Report(report) => report,
         _ => panic!("a report for {failure:?}"),
     };
@@ -61,6 +72,16 @@ fn a_failure_is_the_report_of_its_kind_and_the_end_is_eof() {
         report(Failure::Exec(libc::ENOENT)),
         NotExecuted::ExecFailed(Errno(libc::ENOENT))
     );
+    for candidate in [None, Some(1)] {
+        assert_eq!(
+            report(Failure::Unexamined {
+                errno: libc::ELOOP,
+                candidate
+            }),
+            NotExecuted::ExecFailed(Errno(libc::ELOOP)),
+            "a walk that stopped at {candidate:?} is an exec failure on the wire"
+        );
+    }
     assert_eq!(
         report(Failure::Step(StepFailure {
             kind: 3,
@@ -76,9 +97,46 @@ fn a_failure_is_the_report_of_its_kind_and_the_end_is_eof() {
         NotExecuted::TerminatedBeforeExec(Signal(libc::SIGTERM))
     );
     assert!(matches!(
-        drained(Ok(Progress::Ended { ready: true }), &log),
+        drained(Ok(Progress::Ended { ready: true }), &[], &log),
         Drained::Eof
     ));
+}
+
+/// A stop in the child's walk is `ExecFailed` on the wire, and the log line says what the spawn's error
+/// says of it. A stop with no index is logged in the unnamed wording, and an `Exec` failure logs no stop
+/// line.
+///
+/// Mutants: the log line is the number alone, names the wrong candidate, or is not written; a stop with
+/// no index names a candidate; an `Exec` failure is logged as a stop.
+#[skuld::test]
+fn a_stop_in_the_walk_is_logged_with_its_candidate_and_entry() {
+    use crate::resolve::posix::walk_stop;
+
+    let line = |candidate| {
+        let stop = walk_stop(&candidates(), candidate, libc::ELOOP);
+        format!("status pipe: {}", crate::error::Report(&stop))
+    };
+    for candidate in [Some(1), None] {
+        let (log, lines, _keep) = captured_log();
+        let stop = Failure::Unexamined {
+            errno: libc::ELOOP,
+            candidate,
+        };
+        assert!(matches!(
+            drained(Ok(Progress::Failed(stop)), &candidates(), &log),
+            Drained::Report(NotExecuted::ExecFailed(Errno(libc::ELOOP)))
+        ));
+        let text = logged(&lines);
+        assert!(text.contains(&line(candidate)), "{candidate:?}: {text:?}");
+    }
+    assert_ne!(line(Some(1)), line(None), "the two wordings are told apart");
+
+    let (log, lines, _keep) = captured_log();
+    assert!(matches!(
+        drained(Ok(Progress::Failed(Failure::Exec(libc::ELOOP))), &candidates(), &log),
+        Drained::Report(NotExecuted::ExecFailed(Errno(libc::ELOOP)))
+    ));
+    assert_eq!(logged(&lines), "", "an exec failure is no stop");
 }
 
 /// A channel that ended with no ready record means the child died inside its steps and no `execve`
@@ -89,7 +147,7 @@ fn a_failure_is_the_report_of_its_kind_and_the_end_is_eof() {
 fn an_end_with_no_ready_record_is_the_child_dying_before_exec() {
     let (log, _, _keep) = captured_log();
     assert!(matches!(
-        drained(Ok(Progress::Ended { ready: false }), &log),
+        drained(Ok(Progress::Ended { ready: false }), &[], &log),
         Drained::Died
     ));
 }
@@ -141,7 +199,7 @@ fn a_spawn_that_made_no_child_reports_its_own_cause() {
 fn a_status_read_error_is_logged_and_says_nothing() {
     let (log, lines, _keep) = captured_log();
     let failed = std::io::Error::from_raw_os_error(libc::EBADF);
-    assert!(matches!(drained(Err(failed), &log), Drained::Nothing));
+    assert!(matches!(drained(Err(failed), &[], &log), Drained::Nothing));
     let text = logged(&lines);
     assert!(text.contains("reading the status pipe"), "{text:?}");
 }
@@ -154,7 +212,10 @@ fn a_status_read_error_is_logged_and_says_nothing() {
 fn a_step_failure_of_no_kind_is_logged_and_says_nothing() {
     let (log, lines, _keep) = captured_log();
     let unknown = Failure::Step(StepFailure { kind: 9, value: 1 });
-    assert!(matches!(drained(Ok(Progress::Failed(unknown)), &log), Drained::Nothing));
+    assert!(matches!(
+        drained(Ok(Progress::Failed(unknown)), &[], &log),
+        Drained::Nothing
+    ));
     let text = logged(&lines);
     assert!(text.contains("no kind names"), "{text:?}");
 }

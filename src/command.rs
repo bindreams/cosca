@@ -301,10 +301,10 @@ impl Command {
     ///   the program. The top [`std::io::Error`] has no OS code of its own
     ///   ([`first_os_code`](crate::error::first_os_code) finds the cause's) and takes its
     ///   [`kind`](std::io::Error::kind) from the cause. Only a definite
-    ///   absence, `ENOENT` or `ENOTDIR`, goes on. A name given with a path has no `PATH` entry to name,
-    ///   so its error is the OS's own, with the code on the error. On Linux, if the found file is gone
-    ///   by the time the child starts and a later candidate cannot be examined, the child's own walk
-    ///   reports that candidate's bare OS error.
+    ///   absence, `ENOENT` or `ENOTDIR`, goes on. The error is the same whether the search meets the candidate or, on Linux,
+    ///   the child does when the file found is gone by the time it starts.
+    ///   A name given with a path has no `PATH` entry to name, so its error is the OS's own, with the
+    ///   code on the error.
     /// - A program that is not found is `ENOENT` ([`std::io::ErrorKind::NotFound`]); a name that names no
     ///   file (`""`, `.`, `..`, one ending in `/`) or holds a NUL is [`std::io::ErrorKind::InvalidInput`].
     ///   Either is the spawn's error before any child exists.

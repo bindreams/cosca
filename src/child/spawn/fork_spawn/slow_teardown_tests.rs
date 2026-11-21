@@ -11,8 +11,8 @@
 //! The spawn's clone is a stand-in that hands over the tracee: its status channel is closed with no
 //! record, so it died before exec.
 
-use super::fork_spawn_tests::{hand_over, HANDED_OVER};
-use super::{start_via, OnFailure, Program};
+use super::fork_spawn_tests::{hand_over, launch_of, HANDED_OVER};
+use super::{start_via, OnFailure};
 use crate::child::spawn::fault::release_between_kill_and_wait;
 use crate::child::spawn::in_child::InChild;
 use crate::child::spawn::policy::SpawnPolicy;
@@ -49,16 +49,11 @@ fn dead_child() -> (
             });
             pid_tx.send(pid).expect("report the pid");
             seized_rx.recv().expect("the tracer seized the child");
-            let program = Program::new(
-                &[std::ffi::OsStr::new("/bin/true")],
-                &[std::ffi::OsStr::new("true")],
-                std::iter::empty(),
-            )
-            .expect("no NUL");
+            let launch = launch_of("/bin/true", &["true"]);
             let lock = crate::child::spawn::spawn_lock();
             let failed = start_via(
                 hand_over,
-                &program,
+                &launch,
                 &mut InChild::default(),
                 crate::identity::spawn_kernel(crate::identity::HostKernel),
                 OnFailure {

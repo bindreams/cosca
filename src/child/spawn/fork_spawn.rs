@@ -6,7 +6,8 @@
 //! at once. The spawn's answer is decided by the records alone:
 //!
 //! - an errno record: a step or the `execve` failed, the program did not start, and the errno is the
-//!   spawn's error;
+//!   spawn's error; or the child's walk met a later candidate it could not examine, worded by
+//!   [`walk_stop`](crate::resolve::posix::walk_stop);
 //! - no ready record: the child ended before its `execve`; the program did not start, and the child is
 //!   torn down through its box ([`Past::Unexecuted`]). Exception: a refused placement, which goes to the
 //!   attach (see `OnFailure::refusing_placement`);
@@ -23,17 +24,17 @@
 //! The child's steps are [`InChild`]'s (stdio, directory, process group, then cosca's own). Neither side
 //! waits for the other: no step may wait on the parent.
 //!
-//! The program is found before the clone ([`program`]), by cosca's own search over the child's `PATH`
+//! The program is found before the clone ([`launch`]), by cosca's own search over the child's `PATH`
 //! (`crate::resolve::posix`): the child only `execve`s the path. A program that is not found is an error
 //! with no child made.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
 
-use super::fork_exec::{self, Failure, Program, Progress, SpawnError, Spawned, Status, StepFailure};
+use super::fork_exec::{self, Failure, Progress, SpawnError, Spawned, Status, StepFailure};
 use super::in_child::{InChild, Step, StepError};
+use super::launch::Launch;
 use super::policy::SpawnPolicy;
 use super::{held_teardown, Diagnosis, Invocation, SpawnFailure, SpawnLockGuard};
 use crate::child::drop_teardown::Torn;
@@ -44,6 +45,7 @@ use crate::elevation::front::TrackedKind;
 use crate::error::Error;
 use crate::identity::SpawnKernel;
 use crate::os_process::linux::fork::{fork_with_pidfd, CloneKind, ForkFn, NewChild};
+use crate::resolve::Candidate;
 
 /// The kind of step failure the child reports: an in-child step failed, with this errno.
 const KIND_STEP: u8 = 1;
@@ -75,22 +77,18 @@ pub(super) struct OnFailure<'a> {
     pub(super) refusing_placement: bool,
 }
 
-/// The program `invocation` runs, which [`Invocation::find`] has found, with `later`, the candidates it
-/// returned, and the environment `env` the search read its `PATH` from. Everything the child needs is
-/// made here, before the clone.
-pub(super) fn program(
+/// The launch of `invocation`, of the `candidates` [`Invocation::find`] returned, with the environment `env`
+/// the search read its `PATH` from. Everything the child needs is made here, before the clone.
+pub(super) fn launch(
     invocation: &Invocation,
-    later: &[PathBuf],
+    candidates: Vec<Candidate>,
     env: Vec<(OsString, OsString)>,
-) -> Result<Program, Error> {
+) -> Result<Launch, Error> {
     let argv0 = invocation.arg0.as_deref().unwrap_or(invocation.program.as_os_str());
     let argv: Vec<&OsStr> = std::iter::once(argv0)
         .chain(invocation.args.iter().map(OsString::as_os_str))
         .collect();
-    let paths: Vec<&OsStr> = std::iter::once(invocation.program.as_os_str())
-        .chain(later.iter().map(|p| p.as_os_str()))
-        .collect();
-    Program::new(&paths, &argv, env.into_iter()).map_err(|_| {
+    Launch::new(candidates, &argv, env.into_iter()).map_err(|_| {
         Error::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             "nul byte found in provided data",
@@ -98,21 +96,21 @@ pub(super) fn program(
     })
 }
 
-/// Spawns `program`, after `steps`, under `lock`, the caller's `spawn_lock`. The box owns `kernel`.
+/// Spawns `launch`'s program, after `steps`, under `lock`, the caller's `spawn_lock`. The box owns `kernel`.
 pub(super) fn start(
-    program: &Program,
+    launch: &Launch,
     steps: &mut InChild,
     kernel: SpawnKernel,
     on_failure: OnFailure<'_>,
     lock: &SpawnLockGuard,
 ) -> Result<Started, SpawnFailure> {
-    start_via(fork_with_pidfd, program, steps, kernel, on_failure, lock)
+    start_via(fork_with_pidfd, launch, steps, kernel, on_failure, lock)
 }
 
 /// [`start`] with the clone `fork`, which a test replaces.
 pub(super) fn start_via(
     fork: ForkFn,
-    program: &Program,
+    launch: &Launch,
     steps: &mut InChild,
     kernel: SpawnKernel,
     on_failure: OnFailure<'_>,
@@ -125,14 +123,14 @@ pub(super) fn start_via(
         fork_exec::spawn(
             CloneKind::Vfork,
             fork,
-            program,
+            launch.program(),
             &keep_off,
             &mut |reporter| steps.run(reporter).map_err(step_failure),
             STEP_EXIT,
         )
     };
     match spawned {
-        Ok(Spawned { child, status }) => conclude(child, status, kernel, on_failure),
+        Ok(Spawned { child, status }) => conclude(child, status, kernel, on_failure, launch),
         Err(error) => Err(SpawnFailure::NotStarted(not_spawned(error))),
     }
 }
@@ -184,10 +182,15 @@ fn kernel_release() -> String {
 }
 
 /// The error of the child `pid`, which ended before the program started, from its record: a failure of the
-/// placement step is [`Error::Containment`]; any other is the errno.
-fn failed(pid: u32, failure: Failure) -> Error {
+/// placement step is [`Error::Containment`]; a walk that stopped at a candidate it could not examine says
+/// what the parent's search says of one ([`walk_stop`](crate::resolve::posix::walk_stop)); any other is the
+/// errno.
+fn failed(pid: u32, candidates: &[Candidate], failure: Failure) -> Error {
     let errno = match failure {
         Failure::Exec(errno) => errno,
+        Failure::Unexamined { errno, candidate } => {
+            return Error::Io(crate::resolve::posix::walk_stop(candidates, candidate, errno));
+        }
         Failure::Step(StepFailure { kind: KIND_STEP, value }) => i32::from(value),
         Failure::Step(StepFailure {
             kind: KIND_PLACEMENT,
@@ -256,6 +259,7 @@ fn conclude(
     mut status: Status,
     kernel: SpawnKernel,
     mut on_failure: OnFailure<'_>,
+    launch: &Launch,
 ) -> Result<Started, SpawnFailure> {
     let pid = child.pid.unsigned_abs();
     // First of all: the clone's pidfd takes the lowest free number, which can be a stdio slot that another
@@ -278,7 +282,7 @@ fn conclude(
         None
     } else {
         match progress {
-            Ok(Progress::Failed(failure)) => Some(failed(pid, failure)),
+            Ok(Progress::Failed(failure)) => Some(failed(pid, launch.candidates(), failure)),
             progress => match progress.and_then(|_| status.could_have_started()) {
                 Ok(true) => None,
                 Ok(false) => Some(died_before_exec(pid)),

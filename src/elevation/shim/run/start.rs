@@ -13,7 +13,8 @@ use super::fds::replace_stdio;
 use super::run_loop::Loop;
 use super::signals;
 use super::{Exit, Shim};
-use crate::child::spawn::fork_exec::{Program, Spawned};
+use crate::child::spawn::fork_exec::Spawned;
+use crate::child::spawn::launch::Launch;
 use crate::elevation::shim::codes;
 use crate::elevation::shim::hooks::{Gate, Inject};
 use crate::elevation::shim::protocol::{Errno, Frame, NotExecuted, ShimArgs};
@@ -120,11 +121,8 @@ pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &Owne
     let argv: Vec<&OsStr> = std::iter::once(args.program.as_os_str())
         .chain(args.args.iter().map(|a| a.as_os_str()))
         .collect();
-    let paths: Vec<&OsStr> = std::iter::once(found.path.as_os_str())
-        .chain(found.later.iter().map(|p| p.as_os_str()))
-        .collect();
-    let program =
-        Program::new(&paths, &argv, std::env::vars_os()).expect("argv carries no NUL: ShimArgs::parse checked");
+    let launch = Launch::new(found.into_candidates(), &argv, std::env::vars_os())
+        .expect("argv carries no NUL: ShimArgs::parse checked");
     let gate_path = shim.hooks.and_then(|h| h.child_gate());
     let prepared = Prepared::new(
         inherited,
@@ -160,7 +158,7 @@ pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &Owne
     };
     let spawned = {
         let _lock = crate::child::spawn::spawn_lock();
-        child::spawn(&prepared, &program, fork)
+        child::spawn(&prepared, launch.program(), fork)
     };
     let Spawned { child, mut status } = match spawned {
         Ok(spawned) => spawned,
@@ -206,6 +204,7 @@ pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &Owne
         conn: shim.conn().as_fd(),
         owner: owner.as_fd(),
         child: &child,
+        candidates: launch.candidates(),
         wake: shim.wake().rx.as_fd(),
         status: &mut status,
         failure,

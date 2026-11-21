@@ -5,7 +5,8 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::process::{pidfd_send_signal, waitid, Signal, WaitId, WaitIdOptions};
 
 use super::{
-    channel, spawn, Failure, Program, Progress, Record, RefusalKind, Reporter, SpawnError, Spawned, Status, StepFailure,
+    channel, spawn, Failure, Program, Progress, Record, RefusalKind, Reporter, SpawnError, Spawned, Status,
+    StepFailure, INDEX_RECORDS,
 };
 use crate::child::spawn::spawn_lock;
 use crate::os_process::linux::fork::{
@@ -103,7 +104,7 @@ fn the_status_reads_records_in_order_and_a_failure_sticks() {
     write_record(&writer, Record::Ready);
     assert_eq!(status.progress().unwrap(), Progress::Ready);
     assert_eq!(status.progress().unwrap(), Progress::Ready);
-    write_record(&writer, Record::Failed(Failure::Exec(libc::ENOENT)));
+    write_record(&writer, Record::Exec(libc::ENOENT as u16));
     let failed = Progress::Failed(Failure::Exec(libc::ENOENT));
     assert_eq!(status.progress().unwrap(), failed);
     assert_eq!(status.progress().unwrap(), failed, "a failure is the answer for good");
@@ -112,10 +113,10 @@ fn the_status_reads_records_in_order_and_a_failure_sticks() {
     write_record(&writer, Record::Ready);
     write_record(
         &writer,
-        Record::Failed(Failure::Step(StepFailure {
+        Record::Step(StepFailure {
             kind: 3,
             value: libc::EACCES as u16,
-        })),
+        }),
     );
     assert_eq!(
         status.progress().unwrap(),
@@ -299,10 +300,11 @@ fn an_exec_enoent_of_a_file_that_exists_ends_the_candidates() {
 
 /// A later candidate is checked before its `execve`: a directory of the name is not a program and is
 /// passed over as the parent's search passes it over, so the file after it runs. An entry that cannot be
-/// examined (a symlink loop: `ELOOP`) stops the search with its errno, and the file after it does not run.
+/// examined (a symlink loop: `ELOOP`) stops the search with its errno and its index, and the file after
+/// it does not run.
 ///
 /// Mutants: a later directory is `execve`d (`EACCES` ends the candidates); an entry that cannot be
-/// examined is passed over.
+/// examined is passed over; the stop is reported as an exec failure, or without the index.
 #[skuld::test]
 fn a_later_candidate_that_is_not_a_file_is_skipped_and_one_that_cannot_be_examined_stops() {
     let dir = tempfile::tempdir().unwrap();
@@ -331,7 +333,10 @@ fn a_later_candidate_that_is_not_a_file_is_skipped_and_one_that_cannot_be_examin
         let mut stopped = started(kind, &candidates(&[&gone, looped, &ran], &["tool"], &[]), &|| Ok(()));
         assert_eq!(
             settled(&mut stopped.status),
-            Progress::Failed(Failure::Exec(libc::ELOOP)),
+            Progress::Failed(Failure::Unexamined {
+                errno: libc::ELOOP,
+                candidate: Some(1)
+            }),
             "{kind:?}"
         );
         assert_eq!(exit_status(&stopped.child), 127, "{kind:?}");
@@ -339,6 +344,168 @@ fn a_later_candidate_that_is_not_a_file_is_skipped_and_one_that_cannot_be_examin
             !marker.exists(),
             "{kind:?}: the candidate after an unexaminable one ran"
         );
+    }
+}
+
+/// A stop at an index above what 16 bits hold arrives with its index whole: the one that fits 16 bits
+/// (65535), the first that does not (65536) and the one after it (65537).
+///
+/// Mutants: the two low parts of the index are dropped; the two low parts are swapped. The two upper
+/// parts are pinned by the table test and by `an_index_is_four_records_of_its_parts_most_significant_first`.
+#[skuld::test]
+fn a_stop_at_an_index_beyond_16_bits_arrives_with_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let looped = dir.path().join("loop");
+    std::os::unix::fs::symlink(&looped, &looped).unwrap();
+    let gone = format!("{}/gone", dir.path().display());
+    for index in [
+        usize::from(u16::MAX),
+        usize::from(u16::MAX) + 1,
+        usize::from(u16::MAX) + 2,
+    ] {
+        // Candidate 0 is the file the caller found, then gone; the loop is at `index`.
+        let mut paths = vec![gone.as_str(); index];
+        paths.push(looped.to_str().unwrap());
+        let mut stopped = started(CloneKind::Vfork, &candidates(&paths, &["tool"], &[]), &|| Ok(()));
+        assert_eq!(
+            stopped.status.progress().unwrap(),
+            Progress::Failed(Failure::Unexamined {
+                errno: libc::ELOOP,
+                candidate: Some(index as u64)
+            }),
+            "the loop at index {index}"
+        );
+        assert_eq!(exit_status(&stopped.child), 127, "the loop at index {index}");
+    }
+}
+
+/// The records of a walk that stopped: the index's run of candidate records, then the stop. A part of
+/// the index is no failure, so a read of the run alone is not the answer. The stop carries the index
+/// only when the whole run came before it, and an exec failure after a run carries none.
+///
+/// No file-system state gives a stop at index 0 (an `execve` that answers `ENOENT` or `ENOTDIR` of a
+/// path that `fstatat` then cannot examine is a race), so the table stands for it.
+///
+/// Mutants: a part is read as a failure, or as a report; the stop is read as an exec failure; the stop
+/// forgets the index before it, or takes a short run for one.
+#[skuld::test]
+fn the_records_of_a_stopped_walk_are_read_as_the_index_then_the_stop() {
+    for (index, errno) in [
+        (0u64, libc::ELOOP),
+        (1, libc::EACCES),
+        (u64::from(u16::MAX), libc::EIO),
+        (0x0001_0002_0003_0004, libc::ELOOP),
+        (u64::MAX, libc::EIO),
+    ] {
+        let (mut status, writer) = channel(CloneKind::Plain, &[]).expect("a channel");
+        write_index(&writer, index);
+        assert_eq!(status.progress().unwrap(), Progress::Pending, "an index is no answer");
+        write_record(&writer, stop(errno));
+        assert_eq!(
+            status.progress().unwrap(),
+            Progress::Failed(Failure::Unexamined {
+                errno,
+                candidate: Some(index)
+            })
+        );
+    }
+
+    let (mut status, writer) = channel(CloneKind::Plain, &[]).expect("a channel");
+    write_record(&writer, stop(libc::EIO));
+    assert_eq!(
+        status.progress().unwrap(),
+        Progress::Failed(Failure::Unexamined {
+            errno: libc::EIO,
+            candidate: None
+        }),
+        "a stop with no index before it"
+    );
+
+    // A run that is short (a record that could not be written is missing) is no index, wherever it is short.
+    for lost in 0..INDEX_RECORDS as usize {
+        let (mut status, writer) = channel(CloneKind::Plain, &[]).expect("a channel");
+        for (at, part) in Record::index_run(0x0001_0002_0003_0004).into_iter().enumerate() {
+            if at != lost {
+                write_record(&writer, part);
+            }
+        }
+        write_record(&writer, stop(libc::ELOOP));
+        assert_eq!(
+            status.progress().unwrap(),
+            Progress::Failed(Failure::Unexamined {
+                errno: libc::ELOOP,
+                candidate: None
+            }),
+            "a run without its part {lost}"
+        );
+    }
+
+    let (mut status, writer) = channel(CloneKind::Plain, &[]).expect("a channel");
+    write_index(&writer, 3);
+    write_record(&writer, Record::Exec(libc::ENOENT as u16));
+    assert_eq!(
+        status.progress().unwrap(),
+        Progress::Failed(Failure::Exec(libc::ENOENT)),
+        "an exec failure after an index is an exec failure"
+    );
+
+    let (mut status, writer) = channel(CloneKind::Plain, &[]).expect("a channel");
+    write_index(&writer, 3);
+    drop(writer);
+    assert_eq!(
+        status.progress().unwrap(),
+        Progress::Ended { ready: false },
+        "an index and then the end of the channel"
+    );
+}
+
+/// The records of `index`, as the child writes them.
+fn write_index(writer: &OwnedFd, index: u64) {
+    for part in Record::index_run(index) {
+        write_record(writer, part);
+    }
+}
+
+/// The record of a stop: its errno, and no candidate, which is the run of records before it.
+fn stop(errno: i32) -> Record {
+    Record::Unexamined(errno as u16)
+}
+
+/// The records of an index are its 16-bit parts, most significant first, always the same number.
+///
+/// Mutants: the parts are in the other order; the run is shorter for a small index; a part is cut.
+#[skuld::test]
+fn an_index_is_four_records_of_its_parts_most_significant_first() {
+    let part = |value| Record::Candidate(value);
+    assert_eq!(
+        Record::index_run(0x0001_0002_0003_0004),
+        [part(1), part(2), part(3), part(4)]
+    );
+    assert_eq!(Record::index_run(0x1_0000), [part(0), part(0), part(1), part(0)]);
+    assert_eq!(Record::index_run(0), [part(0); INDEX_RECORDS as usize]);
+}
+
+/// Every record decodes to what was encoded, kind by kind: the wire carries nothing a record holds beyond
+/// its kind and its 16 bits.
+///
+/// Mutants: a kind is decoded as another (the stop as an exec failure, the index as a report); a record
+/// is encoded under another's kind.
+#[skuld::test]
+fn every_record_decodes_to_what_was_encoded() {
+    let step = StepFailure {
+        kind: 3,
+        value: libc::EACCES as u16,
+    };
+    for record in [
+        Record::Ready,
+        Record::Reported(9),
+        Record::Candidate(5),
+        Record::Candidate(u16::MAX),
+        Record::Step(step),
+        Record::Exec(libc::ENOENT as u16),
+        stop(libc::ELOOP),
+    ] {
+        assert_eq!(Record::decode(record.encode()), Ok(record), "{record:?}");
     }
 }
 
@@ -839,7 +1006,7 @@ fn the_status_keeps_the_first_report_beside_the_other_records() {
     write_record(&writer, Record::Ready);
     assert_eq!(status.progress().unwrap(), Progress::Ready);
     assert_eq!(status.reported(), Some(0), "the first report stays");
-    write_record(&writer, Record::Failed(Failure::Exec(libc::ENOENT)));
+    write_record(&writer, Record::Exec(libc::ENOENT as u16));
     assert_eq!(
         status.progress().unwrap(),
         Progress::Failed(Failure::Exec(libc::ENOENT))

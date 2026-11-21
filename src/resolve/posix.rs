@@ -28,7 +28,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use super::{names_no_file, names_no_file_refusal, needs_base, search, ResolveInput};
+use super::{names_no_file, names_no_file_refusal, needs_base, search, Candidate, ResolveInput};
 use crate::error::Error;
 
 /// What [`lookup`] found.
@@ -37,10 +37,26 @@ pub(crate) struct Found {
     /// The file: for a bare name the absolute path of the file found, for a located name the name as
     /// written (see the module doc), which the child must read after entering `cwd`.
     pub(crate) path: PathBuf,
-    /// For a bare name, the paths a `PATH` element after the match's would give, in order: for a
-    /// launch that finds `path` gone between the search and its `execve` and goes on to these, not
-    /// probed. Empty for a located name.
-    pub(crate) later: Vec<PathBuf>,
+    /// The `PATH` element, as written, the file was found in ([`Candidate::entry`]).
+    pub(crate) entry: Option<PathBuf>,
+    /// For a bare name, the paths a `PATH` element after the match's would give, in order, each with its
+    /// element: for a launch that finds `path` gone between the search and its `execve` and goes on to
+    /// these, not probed. Empty for a located name.
+    pub(crate) later: Vec<Candidate>,
+}
+
+impl Found {
+    /// The candidates in the order the child walks them: the match, then `later`, each with its element
+    /// as the search wrote it. Moves them out; clones nothing.
+    pub(crate) fn into_candidates(self) -> Vec<Candidate> {
+        let mut candidates = Vec::with_capacity(1 + self.later.len());
+        candidates.push(Candidate {
+            path: self.path,
+            entry: self.entry,
+        });
+        candidates.extend(self.later);
+        candidates
+    }
 }
 
 /// The file `program` names, for a child that runs in `cwd` (the directory this process inherited
@@ -48,9 +64,8 @@ pub(crate) struct Found {
 ///
 /// `InvalidInput` for a name that carries a NUL or names no file; `ENOENT` for a miss; the
 /// candidate's error, naming the entry and the candidate, with the OS code down its `source()`
-/// chain, for one that cannot be examined (see the module doc); for a located name, which has no
-/// entry to name, the OS's own error, bare, whether its `cwd` cannot be entered or its file cannot be
-/// examined.
+/// chain, for one that cannot be examined (see the module doc); for a located name, the OS's own
+/// error, bare, whether its `cwd` cannot be entered or its file cannot be examined.
 pub(crate) fn lookup(program: &Path, cwd: Option<&Path>, path_var: Option<&OsStr>) -> Result<Found, Error> {
     if program.as_os_str().as_encoded_bytes().contains(&0) {
         return Err(Error::Io(std::io::Error::new(
@@ -80,13 +95,10 @@ pub(crate) fn lookup(program: &Path, cwd: Option<&Path>, path_var: Option<&OsStr
         same_drive: &|_, _| false,
     })
     .map_err(miss_as_enoent)?;
-    Ok(if located {
-        Found {
-            path: program.to_path_buf(),
-            later,
-        }
-    } else {
-        Found { path: found, later }
+    Ok(Found {
+        path: if located { program.to_path_buf() } else { found.path },
+        entry: found.entry,
+        later,
     })
 }
 
@@ -103,6 +115,27 @@ fn miss_as_enoent(error: Error) -> Error {
         Error::Io(std::io::Error::from_raw_os_error(libc::ENOENT))
     } else {
         error
+    }
+}
+
+/// The error for a walk of `candidates` that stopped at index `at` (`None`: not reported) on `errno`:
+/// worded as [`search`] words a stop, with the OS code down `source()`. A candidate with no element (a
+/// located name) gets the bare OS error, as [`lookup`] gives.
+#[cfg(target_os = "linux")]
+pub(crate) fn walk_stop(candidates: &[Candidate], at: Option<u64>, errno: i32) -> std::io::Error {
+    let cause = std::io::Error::from_raw_os_error(errno);
+    let named = at.and_then(|index| {
+        let candidate = usize::try_from(index).ok().and_then(|index| candidates.get(index));
+        debug_assert!(candidate.is_some(), "the child named the candidate {index} of no path");
+        candidate
+    });
+    match named {
+        Some(Candidate { entry: None, .. }) => cause,
+        Some(Candidate {
+            path,
+            entry: Some(entry),
+        }) => crate::error::io_context(super::unexamined_context(Some(path), Some(entry)), cause),
+        None => crate::error::io_context(super::unexamined_context(None, None), cause),
     }
 }
 

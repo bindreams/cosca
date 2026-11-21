@@ -701,7 +701,7 @@ fn bare_name_in_a_system_dir_and_on_path_resolves_from_the_system_dir() {
     let system_dirs = [sysdir.path().to_path_buf()];
     let system_dirs_fn = || -> Result<Vec<PathBuf>, Error> { Ok(system_dirs.to_vec()) };
     let path = path_var_for(&[pathdir.path()], true);
-    let got = resolve(ResolveInput {
+    let (got, later) = search(ResolveInput {
         program: Path::new("tool"),
         cwd: Some(cwd.path()),
         system_dirs: &system_dirs_fn,
@@ -713,7 +713,10 @@ fn bare_name_in_a_system_dir_and_on_path_resolves_from_the_system_dir() {
         same_drive: &ascii_same_drive,
     })
     .unwrap();
-    assert_eq!(got.canonicalize().unwrap(), want.canonicalize().unwrap());
+    assert_eq!(got.path.canonicalize().unwrap(), want.canonicalize().unwrap());
+    // Only the POSIX grammar has a `PATH` element to name: the match is in a system directory.
+    assert_eq!(got.entry, None);
+    assert!(later.is_empty(), "{later:?}");
 }
 
 #[skuld::test]
@@ -1348,4 +1351,20 @@ fn a_prefix_ending_in_exe_is_not_an_image_name() {
             "{n:?} names no file and must be refused"
         );
     }
+}
+
+/// The words of the stop are pinned literally: every other test derives its expected text from
+/// [`unexamined_context`], so none would notice the candidate and the entry swapped, or the wording changed.
+///
+/// Mutants: the candidate and the entry are swapped; the wording changes; the no-candidate text names a candidate.
+#[skuld::test]
+fn the_stop_names_the_candidate_then_the_entry() {
+    assert_eq!(
+        unexamined_context(Some(Path::new("/bin/d/tool")), Some(Path::new("/bin/d"))),
+        r#"could not tell whether "/bin/d/tool" exists in "/bin/d", so the search stops"#
+    );
+    assert_eq!(
+        unexamined_context(None, None),
+        "could not tell whether a later candidate exists, so the search stops"
+    );
 }

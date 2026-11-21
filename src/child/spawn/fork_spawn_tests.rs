@@ -8,17 +8,30 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
-use super::{conclude, start, start_via, OnFailure, Program, Started};
+use super::{conclude, start, start_via, OnFailure, Started};
 use crate::child::spawn::child_env::child_env_over;
 use crate::child::spawn::in_child::InChild;
+use crate::child::spawn::launch::Launch;
 use crate::child::spawn::policy::SpawnPolicy;
 use crate::child::spawn::SpawnFailure;
 use crate::containment::cgroup::{CgroupLeaf, NotEntered, NotPlaced};
 use crate::error::Error;
 use crate::os_process::linux::fork::{fails_with, CloneKind, Fork, ForkFn, NewChild, Path};
+use crate::resolve::Candidate;
 use crate::test_own_process::{child_completion, own_process, run, test_filter, test_path};
 use crate::test_stdio::RestoreStdio;
 use crate::Stdio;
+
+/// The launch of the one file `path`, with `argv` and an empty environment, for a spawn through a stand-in
+/// clone or a program that is run.
+pub(super) fn launch_of(path: &str, argv: &[&str]) -> Launch {
+    let candidate = Candidate {
+        path: path.into(),
+        entry: None,
+    };
+    let argv: Vec<&OsStr> = argv.iter().map(OsStr::new).collect();
+    Launch::new(vec![candidate], &argv, std::iter::empty()).expect("no NUL")
+}
 
 /// A program that does not exist: the spawn's `execve` fails with `ENOENT`.
 const MISSING: &str = "/nonexistent/cosca-fork-spawn-tests";
@@ -229,11 +242,11 @@ fn start_over(fork: ForkFn, placement: Option<(&mut CgroupLeaf, bool)>) -> Resul
         Some((channel, refusing)) => (Some(channel), refusing),
         None => (None, false),
     };
-    let program = Program::new(&[OsStr::new("/bin/true")], &[OsStr::new("true")], std::iter::empty()).expect("no NUL");
+    let launch = launch_of("/bin/true", &["true"]);
     let lock = crate::child::spawn::spawn_lock();
     start_via(
         fork,
-        &program,
+        &launch,
         &mut InChild::default(),
         crate::identity::spawn_kernel(crate::identity::HostKernel),
         OnFailure {
@@ -348,14 +361,14 @@ fn start_placed_expecting(
     expects_refusal: bool,
     more: impl FnOnce(&mut InChild),
 ) -> Result<Started, SpawnFailure> {
-    let program = Program::new(&[OsStr::new("/bin/true")], &[OsStr::new("true")], std::iter::empty()).expect("no NUL");
+    let launch = launch_of("/bin/true", &["true"]);
     let mut steps = InChild::default();
     // SAFETY: `procs_fd` stays open until the spawn has returned.
     unsafe { steps.place(procs_fd, refusing) };
     more(&mut steps);
     let lock = crate::child::spawn::spawn_lock();
     start(
-        &program,
+        &launch,
         &mut steps,
         crate::identity::spawn_kernel(crate::identity::HostKernel),
         OnFailure {
@@ -527,11 +540,11 @@ fn a_child_with_a_leaf_that_reached_its_exec_without_a_report_asserts() {
 
 /// A spawn of `/bin/true` through the real clone with no placement step, for `leaf`.
 fn start_via_the_real_clone(leaf: &mut CgroupLeaf) -> Result<Started, SpawnFailure> {
-    let program = Program::new(&[OsStr::new("/bin/true")], &[OsStr::new("true")], std::iter::empty()).expect("no NUL");
+    let launch = launch_of("/bin/true", &["true"]);
     let lock = crate::child::spawn::spawn_lock();
     start_via(
         crate::os_process::linux::fork::fork_with_pidfd,
-        &program,
+        &launch,
         &mut InChild::default(),
         crate::identity::spawn_kernel(crate::identity::HostKernel),
         OnFailure {
@@ -580,6 +593,7 @@ fn an_unreadable_status_channel_is_a_started_spawn_with_a_warning() {
             placement: Some(&mut leaf),
             refusing_placement: false,
         },
+        &launch_of("/bin/true", &["true"]),
     )
     .unwrap_or_else(|failure| panic!("an unreadable status channel failed the spawn: {failure:?}"));
     assert_eq!(started.pid, pid);
@@ -665,13 +679,8 @@ fn a_pidfd_that_cannot_be_moved_above_stdio_fails_the_spawn_and_ends_the_child()
     ) else {
         return;
     };
-    let program = Program::new(
-        &[OsStr::new("/bin/sleep")],
-        &[OsStr::new("sleep"), OsStr::new("1000")],
-        std::iter::empty(),
-    )
-    .expect("no NUL");
-    assert_unmovable_pidfd_ends_the_child(start_with_an_unmovable_pidfd(&done, &program, None));
+    let launch = launch_of("/bin/sleep", &["sleep", "1000"]);
+    assert_unmovable_pidfd_ends_the_child(start_with_an_unmovable_pidfd(&done, &launch, None));
 }
 
 /// A child whose pidfd cannot be moved still tells its leaf where it placed itself: the spawn fails, the
@@ -690,15 +699,10 @@ fn a_child_whose_pidfd_cannot_be_moved_still_tells_its_leaf_where_it_placed_itse
     let dir = tempfile::tempdir().expect("tempdir");
     let mut leaf = test_leaf(dir.path());
     let sink = File::options().write(true).open("/dev/null").expect("open /dev/null");
-    let program = Program::new(
-        &[OsStr::new("/bin/sleep")],
-        &[OsStr::new("sleep"), OsStr::new("1000")],
-        std::iter::empty(),
-    )
-    .expect("no NUL");
+    let launch = launch_of("/bin/sleep", &["sleep", "1000"]);
     assert_unmovable_pidfd_ends_the_child(start_with_an_unmovable_pidfd(
         &done,
-        &program,
+        &launch,
         Some((&mut leaf, sink.as_raw_fd())),
     ));
     assert_eq!(verdict_of(&mut leaf), Ok(()), "the child reported its placement");
@@ -708,7 +712,7 @@ fn a_child_whose_pidfd_cannot_be_moved_still_tells_its_leaf_where_it_placed_itse
 /// takes it and cannot be moved. `placement`: a leaf, and the descriptor its child's placement step writes.
 fn start_with_an_unmovable_pidfd(
     done: &crate::test_own_process::Completion,
-    program: &Program,
+    launch: &Launch,
     placement: Option<(&mut CgroupLeaf, RawFd)>,
 ) -> Result<Started, SpawnFailure> {
     let mut steps = InChild::default();
@@ -728,7 +732,7 @@ fn start_with_an_unmovable_pidfd(
     let lock = crate::child::spawn::spawn_lock();
     let failure = start_via(
         clone_then_refuse_new_descriptors,
-        program,
+        launch,
         &mut steps,
         crate::identity::spawn_kernel(crate::identity::HostKernel),
         OnFailure {
@@ -759,8 +763,8 @@ fn the_pidfd_is_moved_above_stdio_before_the_status_channel_is_read() {
     ) else {
         return;
     };
-    let program = Program::new(&[OsStr::new(MISSING)], &[OsStr::new("missing")], std::iter::empty()).expect("no NUL");
-    assert_unmovable_pidfd_ends_the_child(start_with_an_unmovable_pidfd(&done, &program, None));
+    let launch = launch_of(MISSING, &["missing"]);
+    assert_unmovable_pidfd_ends_the_child(start_with_an_unmovable_pidfd(&done, &launch, None));
 }
 
 /// The spawn failed as a child that may be running, for the failed move of its pidfd, and the child it made

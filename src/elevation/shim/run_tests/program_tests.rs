@@ -232,6 +232,15 @@ fn two_tool_dirs() -> Tools {
 /// Runs `tool` over `tools.path`, holding the shim just before the clone while `change` alters the
 /// directories, and returns the outcome. Both candidates were executable when the shim searched.
 fn changed_before_the_clone(tools: &Tools, args: &[&str], change: impl FnOnce()) -> LinkOutcome {
+    changed_before_the_clone_finished(tools, args, change).0
+}
+
+/// [`changed_before_the_clone`], and what the shim wrote.
+fn changed_before_the_clone_finished(
+    tools: &Tools,
+    args: &[&str],
+    change: impl FnOnce(),
+) -> (LinkOutcome, super::rig::Finished) {
     let rig = ShimRig::new();
     let mut run = rig.spawn(
         Spec::new("tool", args)
@@ -242,8 +251,7 @@ fn changed_before_the_clone(tools: &Tools, args: &[&str], change: impl FnOnce())
     change();
     run.release(crate::elevation::shim::hooks::Gate::BeforeClone);
     let outcome = rig.link.link.wait().unwrap();
-    run.finish();
-    outcome
+    (outcome, run.finish())
 }
 
 /// The file found is gone at the exec: the child goes on to the next candidate on the `PATH`, as it
@@ -290,4 +298,41 @@ fn a_match_that_fails_otherwise_at_the_exec_is_the_answer() {
     });
     assert_eq!(outcome, not_executed(NotExecuted::ExecFailed(Errno(libc::ELOOP))));
     assert!(!marker.exists(), "the search went on past a failure");
+}
+
+/// The file found is gone at the exec, and the child's walk meets a later candidate it cannot examine: the
+/// wire says `ExecFailed` with the errno, and the shim's log holds the text the spawn's error has for a
+/// stop at that candidate and its `PATH` entry.
+///
+/// A third directory holds a runnable `tool`, so a walk that passes over the stop writes the marker.
+///
+/// Mutants: the stop is not logged, or logged for another candidate or entry, or without either; the
+/// child skips a candidate it cannot examine.
+#[skuld::test]
+fn a_stop_in_the_childs_walk_is_logged_with_its_candidate_and_entry() {
+    let tools = two_tool_dirs();
+    let third = tools._tmp.path().join("third");
+    std::fs::create_dir(&third).unwrap();
+    let tools = Tools {
+        path: std::env::join_paths([&tools.first, &tools.second, &third]).unwrap(),
+        ..tools
+    };
+    let marker = tools.first.join("ran");
+    script(&tools.first, "tool", &marker, 0o755);
+    script(&tools.second, "tool", &marker, 0o755);
+    script(&third, "tool", &marker, 0o755);
+    let (outcome, finished) = changed_before_the_clone_finished(&tools, &[], || {
+        std::fs::remove_file(tools.first.join("tool")).unwrap();
+        let second = tools.second.join("tool");
+        std::fs::remove_file(&second).unwrap();
+        std::os::unix::fs::symlink("tool", &second).unwrap();
+    });
+    assert_eq!(outcome, not_executed(NotExecuted::ExecFailed(Errno(libc::ELOOP))));
+    assert!(!marker.exists(), "the walk went on past the stop");
+    let expected = crate::resolve::unexamined_context(Some(&tools.second.join("tool")), Some(&tools.second));
+    assert!(
+        finished.logged(&expected),
+        "the log does not say {expected:?}: {:?}",
+        finished.lines
+    );
 }
