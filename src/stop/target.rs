@@ -1,6 +1,7 @@
 //! [`StopTarget`]: what a stop action acts on, and the record a prepared send leaves for the call
 //! that ran the action.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,9 @@ pub struct StopTarget<'a> {
     /// When the waits cosca makes inside the call end (`None`: no bound). Only the target reads it: it knows
     /// the deadline's clock.
     deadline: Option<Deadline>,
+    /// Whether the call's deadline cut a wait of the action ([`timed_out`](Self::timed_out) sets it). Written while
+    /// the action runs, read once it has returned.
+    deadline_cut: AtomicBool,
 }
 
 /// A call's deadline: the instant its waits end by, and the clock it is read on.
@@ -59,6 +63,11 @@ pub(crate) enum ClockKind {
 }
 
 impl ClockKind {
+    /// The clock an async wait on a process is measured on: tokio's timer on Unix, and on Windows the OS's own
+    /// registered wait, which runs on the real clock.
+    #[cfg(feature = "tokio")]
+    pub(crate) const ASYNC_PROCESS_WAIT: ClockKind = if cfg!(unix) { ClockKind::Tokio } else { ClockKind::Real };
+
     /// Now, on this clock.
     fn now(self) -> Instant {
         match self {
@@ -87,12 +96,6 @@ impl Deadline {
         })
     }
 
-    /// Windows: what is left before this deadline, read now on its own clock; `ZERO` once it is past.
-    #[cfg(windows)]
-    fn left(&self) -> Duration {
-        crate::wait::remaining_at(Some(self.at), self.clock.now()).expect("a deadline that is set has a time left")
-    }
-
     /// This deadline's instant on `clock`, for a wait measured on it: the instant itself on its own clock,
     /// else what is left now, re-expressed on `clock`. `None` (no bound) for one too large for it.
     #[cfg_attr(
@@ -111,9 +114,30 @@ impl Deadline {
     fn after(&self, grace: Duration) -> Option<Deadline> {
         crate::wait::deadline_at(self.clock.now(), grace).map(|at| Deadline { at, clock: self.clock })
     }
+
+    /// A wait of up to `grace`, cut to `deadline` (`None`: no bound): the instant it ends by, on the deadline's
+    /// own clock, and which bound that is (a tie is the deadline's). `None` with no deadline: the wait is the
+    /// grace alone.
+    pub(crate) fn cut(deadline: Option<Deadline>, grace: Duration) -> Option<(Deadline, Bound)> {
+        let deadline = deadline?;
+        Some(match deadline.after(grace) {
+            Some(by) if by.at < deadline.at => (by, Bound::Grace),
+            _ => (deadline, Bound::Deadline),
+        })
+    }
+
+    /// The instant a wait of up to `grace` ends by, cut to `deadline` ([`cut`](Self::cut)), on `clock`, for a wait
+    /// that arms from an instant on that clock. `None` (no bound) for a grace too large for the clock, with no
+    /// deadline.
+    pub(crate) fn grace_end(deadline: Option<Deadline>, grace: Duration, clock: ClockKind) -> Option<Instant> {
+        match Deadline::cut(deadline, grace) {
+            Some((by, _)) => by.at_on(clock),
+            None => crate::wait::deadline_at(clock.now(), grace),
+        }
+    }
 }
 
-/// What ends a wait that [`StopTarget::cut`] cut.
+/// What ends a wait that [`Deadline::cut`] cut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Bound {
     /// The caller's grace: the wait ending with the root running says the grace is over.
@@ -249,6 +273,7 @@ impl<'a> StopTarget<'a> {
             root_record: Mutex::new(None),
             tree_record: Mutex::new(None),
             deadline: None,
+            deadline_cut: AtomicBool::new(false),
         }
     }
 
@@ -260,6 +285,7 @@ impl<'a> StopTarget<'a> {
             root_record: Mutex::new(None),
             tree_record: Mutex::new(None),
             deadline: None,
+            deadline_cut: AtomicBool::new(false),
         }
     }
 
@@ -277,21 +303,32 @@ impl<'a> StopTarget<'a> {
         self.deadline?.at_on(ClockKind::Real)
     }
 
-    /// Windows: whether the call's deadline has passed, now on its own clock.
+    /// Windows: whether the call's deadline has passed, now on its own clock, for the refusal before a proxy
+    /// start.
     #[cfg(windows)]
     pub(crate) fn deadline_passed(&self) -> bool {
-        self.deadline.is_some_and(|deadline| deadline.left().is_zero())
+        self.deadline
+            .is_some_and(|deadline| deadline.clock.now() >= deadline.at)
     }
 
-    /// A wait of up to `grace`, cut to the call's deadline: the instant it ends by, on the deadline's own
-    /// clock, and which bound that is (a tie is the deadline's). `None` with no deadline: the wait is the grace
-    /// alone.
-    fn cut(&self, grace: Duration) -> Option<(Deadline, Bound)> {
-        let deadline = self.deadline?;
-        Some(match deadline.after(grace) {
-            Some(by) if by.at < deadline.at => (by, Bound::Grace),
-            _ => (deadline, Bound::Deadline),
-        })
+    /// The [`Error::TimedOut`] of a wait of the action that the call's deadline cut, with no source; the target
+    /// keeps that the deadline cut it, for a graceful shutdown to go on to the kill
+    /// ([`ran_into_deadline`](Self::ran_into_deadline)).
+    pub(crate) fn timed_out(&self, detail: String, members: Vec<ProcessId>) -> Error {
+        self.deadline_cut.store(true, Ordering::Relaxed);
+        Error::TimedOut {
+            detail,
+            members,
+            source: None,
+        }
+    }
+
+    /// Whether `error`, which the action answered, is the action running into the call's deadline: an
+    /// [`Error::TimedOut`] once the deadline has cut one of the action's waits ([`timed_out`](Self::timed_out)),
+    /// whichever call of the action made it. The rule is
+    /// [`graceful_shutdown_timeout`](Child::graceful_shutdown_timeout)'s.
+    pub(crate) fn ran_into_deadline(&self, error: &Error) -> bool {
+        matches!(error, Error::TimedOut { .. }) && self.deadline_cut.load(Ordering::Relaxed)
     }
 
     /// `wait_exit`'s answer for a wait that `bound` ended; [`wait_exit_with`] is its only caller.
@@ -301,11 +338,10 @@ impl<'a> StopTarget<'a> {
             (false, Bound::Grace) => Ok(false),
             (false, Bound::Deadline) => {
                 let pid = self.pid();
-                Err(Error::TimedOut {
-                    detail: format!("the call was waiting for the child (pid {pid}) to exit"),
-                    members: self.id().into_iter().collect(),
-                    source: None,
-                })
+                Err(self.timed_out(
+                    format!("the call was waiting for the child (pid {pid}) to exit"),
+                    self.id().into_iter().collect(),
+                ))
             }
         }
     }
@@ -431,9 +467,8 @@ impl<'a> StopTarget<'a> {
     ///
     /// `grace` is the caller's own bound: the wait ends when the root has exited, or when `grace` is
     /// over, whichever comes first, and answers `false` for a root still running then. `Duration::ZERO`
-    /// is one look. In a call given a timeout
-    /// ([`terminate_timeout`](Child::terminate_timeout), [`terminate_tree_timeout`](Child::terminate_tree_timeout))
-    /// the wait also ends by the call's deadline, and for a root still running then it answers
+    /// is one look. In a call given a timeout the wait also ends by the call's deadline, and for a root still
+    /// running then it answers
     /// [`Error::TimedOut`] (naming the root) instead of `false`: `false` says the grace is over, and it is
     /// not. The grace is the bound only when it is strictly shorter than what is left before the deadline: a
     /// tie is the deadline's. An action that goes on with `?` therefore ends at the deadline, with that
@@ -684,12 +719,23 @@ pub(crate) async fn wait_exit_with<D: StopWaits>(
     target: &StopTarget<'_>,
     grace: Duration,
 ) -> Result<bool, Error> {
-    let cut = target.cut(grace);
+    let (exited, bound) = root_exited_within(driver, target.deadline, grace).await?;
+    target.exit_answer(exited, bound)
+}
+
+/// Whether the root has exited within `grace`, a wait cut to `deadline` ([`Deadline::cut`]), and which bound
+/// ended the wait: the one wait of the root's exit that `wait_exit` and the graceful shutdowns' grace share.
+pub(crate) async fn root_exited_within<D: StopWaits>(
+    driver: &D,
+    deadline: Option<Deadline>,
+    grace: Duration,
+) -> Result<(bool, Bound), Error> {
+    let cut = Deadline::cut(deadline, grace);
     let exited = match cut {
         Some((by, _)) => driver.root_exited_by(by).await?,
         None => driver.root_exited(grace).await?,
     };
-    target.exit_answer(exited, cut.map_or(Bound::Grace, |(_, bound)| bound))
+    Ok((exited, cut.map_or(Bound::Grace, |(_, bound)| bound)))
 }
 
 #[cfg(test)]

@@ -75,7 +75,7 @@ async fn wait_async_waits_out_a_tracer_held_zombie(#[fixture(tracer_group)] _gro
 
     crate::wait::block_probe::take();
     let owned = Arc::get_mut(&mut b.owned).expect("the blocker's child is not shared");
-    let mut wait = std::pin::pin!(owned.wait_async());
+    let mut wait = std::pin::pin!(owned.wait_async(None));
     assert!(
         crate::tokio::drive::drive_tests::poll_once(wait.as_mut()).is_pending(),
         "the tracer still holds the zombie"

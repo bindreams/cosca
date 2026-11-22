@@ -103,7 +103,8 @@ impl Child {
     /// started detached.
     ///
     /// **The proxy waits.** The default blocks the calling thread until the proxy answers, with no cap
-    /// unless the call was given a timeout ([`terminate_timeout`](Child::terminate_timeout)); see
+    /// unless the call was given a timeout ([`terminate_timeout`](Child::terminate_timeout),
+    /// [`graceful_shutdown_timeout`](Child::graceful_shutdown_timeout) or their tree forms); see
     /// `stop::send_console_event_via_proxy`.
     ///
     /// **A child that has exited is `Ok`**, as on every platform, except a child created on this
@@ -189,27 +190,34 @@ impl Child {
     /// What a call that kills after the stop says the action sent ([`kill_after`](Child::kill_after)), from
     /// the record the action's last prepared send left on `target`: that send's stop when it went out or may
     /// have, [`STOP_ACTION`] when the action made no prepared send, and nothing when the last send was not
-    /// sent. `stopped` is what the action answered, which is the call's answer.
+    /// sent. `stopped` is what the action answered.
+    ///
+    /// `Err`: the action's error, which ends the call. `Ok`: the action's `TimedOut` when it ran into the call's
+    /// deadline ([`StopTarget::ran_into_deadline`]), which the call goes on to the kill after, and what the kill says
+    /// was sent before it.
     pub(crate) fn after_root_stop(
         &self,
         target: StopTarget<'_>,
         stopped: Result<(), Error>,
-    ) -> (Result<(), Error>, Option<String>) {
+    ) -> Result<(Option<Error>, Option<String>), Error> {
+        let deadline_timeout = match stopped {
+            Ok(()) => None,
+            Err(error) if target.ran_into_deadline(&error) => Some(error),
+            Err(error) => return Err(error),
+        };
         let earlier = match target.into_root_record() {
             Some(RootRecord::Sent(name) | RootRecord::Unknown(name)) => Some(crate::containment::earlier_of(name)),
             Some(RootRecord::NotSent(Some(report), _)) => {
-                if stopped.is_ok() {
-                    log::debug!(
-                        "graceful_shutdown({}): the action went on after a refused send: {report}",
-                        self.pid()
-                    );
-                }
+                log::debug!(
+                    "graceful_shutdown({}): the action went on after a refused send: {report}",
+                    self.pid()
+                );
                 None
             }
             Some(RootRecord::NotSent(None, _)) => None,
             None => Some(STOP_ACTION.to_owned()),
         };
-        (stopped, earlier)
+        Ok((deadline_timeout, earlier))
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
@@ -271,11 +279,60 @@ impl Child {
     /// status cannot be collected. If it was orphaned after the grace ran out, the escalation returns
     /// `Unassessable` saying the kill sent nothing though the `SIGTERM` was sent.
     ///
+    /// **The wait for the killed root has no bound.** A caller that cannot wait for it without one uses
+    /// [`graceful_shutdown_timeout`](Child::graceful_shutdown_timeout), which bounds every wait of the call by
+    /// one timeout.
+    ///
     /// # Panics
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub fn graceful_shutdown(&self, grace: Duration) -> Result<ExitStatus, Error> {
-        shutdown::run_ready(shutdown::shutdown_lone(&mut shutdown::BlockingDriver(self), grace))
+        shutdown::run_ready(shutdown::shutdown_lone(
+            &mut shutdown::BlockingDriver(self),
+            grace,
+            None,
+        ))
+    }
+
+    /// [`graceful_shutdown`](Child::graceful_shutdown) in which every wait the call makes ends by `timeout`
+    /// from the call's start: the stop action's, the grace, and the wait for the root once it is killed. The
+    /// timeout is the caller's own: cosca picks none, and one too large for the clock is no bound, as for
+    /// [`wait_timeout`](Child::wait_timeout).
+    ///
+    /// **The kill is always sent.** A timeout that runs out during the stop action or the grace cuts the grace
+    /// short, to nothing if it has passed (the root is looked at once), and the root is killed unless it has
+    /// exited.
+    ///
+    /// **An action's [`Error::TimedOut`] ends the call, as any error of the action does for `graceful_shutdown`,
+    /// unless this timeout has cut one of the action's waits** (its `wait_exit` or its console-event proxy send; see
+    /// [`terminate_timeout`](Child::terminate_timeout)). After such a cut the call is out of time: any `TimedOut`
+    /// the action then answers, one from a call it gave a timeout of its own included, goes on to the kill, as when
+    /// the grace is over.
+    ///
+    /// Pass `timeout` equal to `grace` to send the kill and return: the kill follows the grace, then the reap looks
+    /// once.
+    ///
+    /// **`Ok` promises what `graceful_shutdown`'s `Ok` does:** the root's exit status, collected.
+    ///
+    /// **When the timeout runs out the answer is [`Error::TimedOut`](crate::error::Error::TimedOut)**, with the
+    /// root in its `members` when the call was waiting for it to exit and it had not: it was killed, or is on its
+    /// way, but this call did not see it exit. The call's other failures are below it. What was not seen to exit
+    /// stays with this handle: a later [`wait`](Child::wait) or [`kill`](Child::kill) goes on from there, and the
+    /// handle's drop waits for the root (see [`Command::kill_on_drop`](crate::Command::kill_on_drop)), which blocks
+    /// the dropping thread until it has exited.
+    ///
+    /// Everything else is as for [`graceful_shutdown`](Child::graceful_shutdown): the stop action, the radii on
+    /// Windows, the errors of the kill and of a root reaped elsewhere.
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
+    pub fn graceful_shutdown_timeout(&self, grace: Duration, timeout: Duration) -> Result<ExitStatus, Error> {
+        shutdown::run_ready(shutdown::shutdown_lone(
+            &mut shutdown::BlockingDriver(self),
+            grace,
+            crate::stop::Deadline::real(timeout),
+        ))
     }
 
     /// Cooperative-then-forced shutdown of the contained tree: run the child's stop action
@@ -321,11 +378,12 @@ impl Child {
     /// preserve a graceful exit's status (the lone backstop no-ops on an already-dead root).
     ///
     /// A watch failure never skips the sweep and reap. A sweep error is the call's error over it
-    /// — and over a graceful root exit (survivors may remain; the root is still reaped first when
-    /// its exit was observed, otherwise the child stays owned for `Drop`) — and so is a reap
-    /// error once the sweep succeeded. A refused graceful signal and then the watch failure join the
-    /// error as peers, in that order (`Error::with_peers_or_warn`); for a [`Error::MembersLeft`]
-    /// they are its `others`. The refusal is dropped only when the tree is proved clear and the root
+    /// — and over a graceful root exit (survivors may remain). A reap error once the sweep succeeded
+    /// is the call's error too. After a failed sweep the call looks at the root once, without waiting: an
+    /// exit it sees is kept by the handle, and a root it cannot collect (reaped elsewhere, held by
+    /// launchd) is a failure below the sweep's error. A refused graceful signal and then the watch failure also
+    /// join the error as peers, after it, in that order (`Error::with_peers_or_warn`); for a
+    /// [`Error::MembersLeft`] they are its `others`. The refusal is dropped only when the tree is proved clear and the root
     /// reaped.
     ///
     /// **A refused or unconfirmed graceful signal never skips the grace wait and hard sweep
@@ -404,11 +462,80 @@ impl Child {
     /// [`Error::Unassessable`](crate::error::Error::Unassessable) instead of waiting on a zombie that
     /// is not this process's to reap.
     ///
+    /// **The wait for the members the sweep killed, and for the root, has no bound.** A caller that cannot wait
+    /// for them without one (a Windows service that is stopping, say) uses
+    /// [`graceful_shutdown_tree_timeout`](Child::graceful_shutdown_tree_timeout), which bounds every wait of the
+    /// call by one timeout. A composition of [`terminate_tree`](Child::terminate_tree),
+    /// [`wait_tree_timeout`](Child::wait_tree_timeout) and [`send_kill_tree`](Child::send_kill_tree) is not a
+    /// replacement: on a `TreeWalk` a root that exits at the stop answers
+    /// [`Error::Unassessable`](crate::error::Error::Unassessable) where the paragraph above has this call answer
+    /// its status, `wait_tree_timeout` is `Unsupported` on process-group, session and tree-walk containment, and
+    /// neither bounds the wait for the root's reap.
+    ///
     /// # Panics
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub fn graceful_shutdown_tree(&self, grace: Duration) -> Result<ExitStatus, Error> {
-        shutdown::run_ready(shutdown::shutdown_tree(&mut shutdown::BlockingDriver(self), grace))
+        shutdown::run_ready(shutdown::shutdown_tree(
+            &mut shutdown::BlockingDriver(self),
+            grace,
+            None,
+        ))
+    }
+
+    /// [`graceful_shutdown_tree`](Child::graceful_shutdown_tree) in which every wait the call makes ends by
+    /// `timeout` from the call's start: the stop action's, the grace, the wait for the members the sweep killed
+    /// (each, the root and the tree's own drain), and the root's reap. The timeout is the caller's own: cosca
+    /// picks none, and one too large for the clock is no bound, as for
+    /// [`wait_tree_timeout`](Child::wait_tree_timeout).
+    ///
+    /// **The kill is always sent.** A timeout that runs out during the stop action or the grace cuts the grace
+    /// short, to nothing if it has passed (the tree is looked at once), and the sweep is sent whatever is left.
+    /// It then looks once at each member, the root and the drain and waits no further.
+    ///
+    /// **An action's [`Error::TimedOut`]** is answered as for
+    /// [`graceful_shutdown_timeout`](Child::graceful_shutdown_timeout): once this timeout has cut one of the action's
+    /// waits it goes on to the grace and the sweep, whatever the action's last prepared send was. Any other error of
+    /// the action ends the call as it does for `graceful_shutdown_tree`.
+    ///
+    /// Pass `timeout` equal to `grace` to send the kill and return: the kill is sent when the grace is over, and the
+    /// call then looks once for what it killed and answers `Ok` if it is all gone, or the [`Error::TimedOut`] below.
+    ///
+    /// **`Ok` promises what `graceful_shutdown_tree`'s `Ok` does:** the root's exit status, collected, with every
+    /// member the call killed seen to exit (and the tree-walk row below). A root that exits within the grace on
+    /// a `TreeWalk` still answers its real status once the members the `SIGTERM` walk listed are gone: the call
+    /// keeps the walk's token as the untimed call does.
+    ///
+    /// **When the timeout runs out the answer is [`Error::TimedOut`](crate::error::Error::TimedOut)**:
+    /// `members` are what the call's waits found running when the timeout ran out: the members its sweep
+    /// killed, and the root when it has an identity, as the sweep's wait for it found it, or, when that wait did
+    /// not wait for the root (its kill was refused, or reached it only through a cgroup), as one look after the
+    /// sweep found it. One that exits after its look is still named (see [`Error::TimedOut`]). A mechanism that
+    /// names no member (a cgroup's or a Job Object's drain edge) leaves it empty when only the tree's drain was
+    /// not seen, and `detail` says so. The call's other failures (the sweep's, that look's, the refused
+    /// cooperative signal's, the grace wait's) are below it, as for the untimed call.
+    ///
+    /// **What was not seen to exit stays with this handle.** The named members were sent the kill and had not
+    /// finished exiting; a root whose kill was refused was not, and may run on. A later [`wait`](Child::wait) or
+    /// [`kill_tree`](Child::kill_tree) goes on from there, and the handle's drop waits for them (see
+    /// [`Command::kill_on_drop`](crate::Command::kill_on_drop)), which blocks the dropping thread until they have
+    /// exited (principle 3). [`kill_tree`](Child::kill_tree) finishes the job on every containment;
+    /// [`wait_tree`](Child::wait_tree) does where the containment has a drain edge, and is `Unsupported` on
+    /// process-group, session and tree-walk containment.
+    ///
+    /// Everything else is as for [`graceful_shutdown_tree`](Child::graceful_shutdown_tree): the stop action,
+    /// what each mechanism's grace watches, a root reaped by something else, a root launchd holds, and why a
+    /// composition of other calls is no replacement.
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
+    pub fn graceful_shutdown_tree_timeout(&self, grace: Duration, timeout: Duration) -> Result<ExitStatus, Error> {
+        shutdown::run_ready(shutdown::shutdown_tree(
+            &mut shutdown::BlockingDriver(self),
+            grace,
+            crate::stop::Deadline::real(timeout),
+        ))
     }
 
     /// The armed forced failure ([`fault`]) in place of `graceful_shutdown_tree`'s cooperative stop, which is
@@ -430,32 +557,40 @@ impl Child {
     /// | sent (to some process, to none, or unknown), or root exited, or tree already killed | grace, sweep, reap | grace, sweep, reap; the error is the call's cooperative error |
     /// | refused or failed before the send, or nothing names the tree | grace, sweep, reap; nothing assumed sent | the call ends with that error |
     /// | pidfd-only, holders-only | that outcome's own path | that path; the error joins its |
+    ///
+    /// An action's error from a row that ends the call goes on instead when it is a `TimedOut` and the call's
+    /// deadline has cut one of the action's waits ([`StopTarget::ran_into_deadline`], with the rule of
+    /// [`graceful_shutdown_timeout`](Child::graceful_shutdown_timeout)). The call then goes to the grace and the
+    /// sweep with that error as the cooperative error, assuming sent what the other rows of that kind assume.
     pub(crate) fn after_tree_stop(
         &self,
         target: StopTarget<'_>,
         acted: Result<(), Error>,
     ) -> SignalTreeCooperativelyOutcome {
+        let ran_into_deadline = acted
+            .as_ref()
+            .err()
+            .is_some_and(|error| target.ran_into_deadline(error));
         match (target.into_tree_record(), acted) {
             (Some(TreeRecord::Sent { earlier, walk, .. }), result) => {
                 SignalTreeCooperativelyOutcome::Sent { result, earlier, walk }
             }
-            (None, Ok(())) => SignalTreeCooperativelyOutcome::Sent {
-                result: Ok(()),
-                earlier: Some(STOP_ACTION.to_owned()),
-                walk: None,
-            },
-            (Some(TreeRecord::NotSent(report, _)), Ok(())) => {
-                log::debug!(
-                    "graceful_shutdown_tree({}): the action went on after a refused send: {report}",
-                    self.pid()
-                );
+            (None | Some(TreeRecord::NotSent(..)), Err(e)) if !ran_into_deadline => {
+                SignalTreeCooperativelyOutcome::End(e)
+            }
+            (record @ (None | Some(TreeRecord::NotSent(..))), result) => {
+                if let Some(TreeRecord::NotSent(report, _)) = &record {
+                    log::debug!(
+                        "graceful_shutdown_tree({}): the action went on after a refused send: {report}",
+                        self.pid()
+                    );
+                }
                 SignalTreeCooperativelyOutcome::Sent {
-                    result: Ok(()),
-                    earlier: None,
+                    result,
+                    earlier: record.is_none().then(|| STOP_ACTION.to_owned()),
                     walk: None,
                 }
             }
-            (None | Some(TreeRecord::NotSent(..)), Err(e)) => SignalTreeCooperativelyOutcome::End(e),
             #[cfg(target_os = "linux")]
             (Some(TreeRecord::RootThroughPidfd(skip, term, sig)), acted) => {
                 SignalTreeCooperativelyOutcome::RootThroughPidfd(skip, PidfdShutdown::new(term), sig, acted.err())
@@ -501,28 +636,26 @@ pub(crate) struct HoldersShutdown<'a> {
 
 #[cfg(unix)]
 impl HoldersShutdown<'_> {
-    /// The call's error, after the wait. The call's answer is that the tree was not shut down whatever
-    /// the wait finds, so a wait that failed is only logged, as a failed `kill_tree`'s is; the wait
-    /// still ends the holders the kill reached.
+    /// The call's error, after the wait, which ends by `deadline` (`None`: no bound). The call's answer is
+    /// that the tree was not shut down whatever the wait finds, so the wait only decides it as
+    /// [`failure_after_wait`](crate::containment::tree_kill::failure_after_wait) says; the wait still ends
+    /// the holders the kill reached.
     #[must_use]
-    pub(crate) fn finish(self) -> Error {
+    pub(crate) fn finish(self, deadline: Option<crate::stop::Deadline>) -> Error {
         let HoldersShutdown { error, wait } = self;
-        Self::answered(error, wait.wait())
+        crate::containment::tree_kill::failure_after_wait("holders-only shutdown", error, wait.wait(deadline))
     }
 
     /// [`finish`](Self::finish), awaited: no runtime thread is blocked.
     #[cfg(feature = "tokio")]
     #[must_use]
-    pub(crate) async fn finish_async(self) -> Error {
+    pub(crate) async fn finish_async(self, deadline: Option<crate::stop::Deadline>) -> Error {
         let HoldersShutdown { error, wait } = self;
-        Self::answered(error, wait.wait_async().await)
-    }
-
-    fn answered(error: Error, waited: Result<(), Error>) -> Error {
-        if let Err(waited) = waited {
-            crate::containment::tree_kill::log_failed_wait("a holders-only shutdown", &waited);
-        }
-        error
+        crate::containment::tree_kill::failure_after_wait(
+            "holders-only shutdown",
+            error,
+            wait.wait_async(deadline).await,
+        )
     }
 }
 

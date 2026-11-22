@@ -171,6 +171,59 @@ fn graceful_shutdown_tree_kills_a_member_reparented_while_the_root_outlives_the_
     drop(stdin);
 }
 
+/// The timed call keeps the walk's token as the untimed one does: the root ends on the `SIGTERM`, the sweep kills
+/// the members the call's own walk found by identity and waits for them within the timeout, and the call answers the
+/// root's real status once they are gone. The drop afterwards has nothing to warn of.
+///
+/// Mutants: the timed call runs its stop as a bare signal that keeps no walk (the call answers `Unassessable`); the
+/// held members are not waited for with the deadline's time left (the call answers `TimedOut`).
+#[skuld::test]
+fn a_timed_graceful_shutdown_tree_answers_the_roots_status_once_the_members_its_sigterm_walk_found_are_gone() {
+    let (child, stdin, survivors) = survivor_tree();
+
+    let status = child
+        .graceful_shutdown_tree_timeout(Duration::from_secs(30), Duration::from_secs(3600))
+        .expect("every member its walk found is killed");
+
+    assert_sigtermed(status);
+    for survivor in &survivors {
+        assert_eq!(
+            survivor.is_alive(),
+            Liveness::Dead,
+            "{survivor:?} ignored the SIGTERM and must be killed by identity"
+        );
+    }
+    assert_eq!(drop_warns(child), Vec::<String>::new());
+    drop(stdin);
+}
+
+/// The awaited twin of
+/// [`a_timed_graceful_shutdown_tree_answers_the_roots_status_once_the_members_its_sigterm_walk_found_are_gone`].
+///
+/// Mutants: as the sync row's.
+#[cfg(feature = "tokio")]
+#[skuld::test]
+async fn an_awaited_timed_graceful_shutdown_tree_answers_the_roots_status_once_the_walks_members_are_gone() {
+    let (child, stdin, survivors) = survivor_tree();
+    let mut child = crate::tokio::Child { inner: child };
+
+    let status = child
+        .graceful_shutdown_tree_timeout(Duration::from_secs(30), Duration::from_secs(3600))
+        .await
+        .expect("every member its walk found is killed");
+
+    assert_sigtermed(status);
+    for survivor in &survivors {
+        assert_eq!(
+            survivor.is_alive(),
+            Liveness::Dead,
+            "{survivor:?} must be killed by identity"
+        );
+    }
+    assert_eq!(drop_warns(child.inner), Vec::<String>::new());
+    drop(stdin);
+}
+
 /// A tree every member of which ends on the `SIGTERM` is the common case: the call answers the root's
 /// status, and the drop does not warn.
 ///

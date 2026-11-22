@@ -99,8 +99,8 @@ impl Process {
         call: Option<&Settling>,
     ) -> Result<(), Error> {
         let (answer, wait) = self.sweep(kernel, call);
-        let waited = wait.wait();
-        crate::containment::tree_kill::answer_after_wait(op, answer, waited, |error| error)
+        let waited = wait.wait(None);
+        crate::containment::tree_kill::answer_after_wait(op, answer, waited)
     }
 
     /// [`kill_tree_with`](Self::kill_tree_with), awaited, with no runtime thread blocked.
@@ -127,8 +127,8 @@ impl Process {
         call: Option<&Settling>,
     ) -> Result<(), Error> {
         let (answer, wait) = self.sweep(kernel, call);
-        let waited = wait.wait_async().await;
-        crate::containment::tree_kill::answer_after_wait(op, answer, waited, |error| error)
+        let waited = wait.wait_async(None).await;
+        crate::containment::tree_kill::answer_after_wait(op, answer, waited)
     }
 
     /// [`send_kill_tree`](Self::send_kill_tree), reading through `kernel`.
@@ -159,7 +159,7 @@ impl Process {
             }
             None => outcome.into_result().or_else(|left| left.unsettled(false)),
         };
-        (answer, wait.with_root(&*self.os, self.id.pid(), landed))
+        (answer, wait.with_root(&*self.os, self.id.pid(), Some(self.id), landed))
     }
 
     /// Best-effort graceful (`SIGTERM`) sweep of the foreign process's tree (identity-walk, root

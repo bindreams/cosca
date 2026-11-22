@@ -1755,7 +1755,7 @@ fn a_skipped_kills_wait_reads_through_the_kernel_the_call_was_given() {
     assert!(matches!(outcome, TreeKillOutcome::Skipped(_)), "{outcome:?}");
     wait.reaching([member]);
     let err = wait
-        .wait()
+        .wait(None)
         .expect_err("the member's open was refused by the stated row");
 
     assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");

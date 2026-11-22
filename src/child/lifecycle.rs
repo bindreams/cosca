@@ -222,7 +222,7 @@ pub(super) fn wait_to_exit(proc: &OwnedChild, due: Option<Due>) -> Result<ChildW
 /// `deadline` (`None`: never): a [`DeadlinePassed`](ChildWaitOutcome::DeadlinePassed) is the answer only for
 /// one. A threshold the deadline comes before is no threshold: the wait ends at the deadline, with nothing to
 /// warn of.
-fn wait_to_exit_saying(
+pub(super) fn wait_to_exit_saying(
     proc: &OwnedChild,
     due: Option<Due>,
     warn: impl FnOnce(Duration),
@@ -331,18 +331,18 @@ impl Child {
     /// runtime and blocks no thread.
     #[cfg(feature = "tokio")]
     pub(crate) async fn wait_async(&mut self) -> Result<ExitStatus, Error> {
-        let outcome = self.reap_outcome_async().await?;
+        let outcome = self.reap_outcome_async(None).await?;
         self.status_of_reap(outcome)
     }
 
     /// [`reap_outcome`](Child::reap_outcome), awaited: the one async reap of the root.
     #[cfg(feature = "tokio")]
-    pub(crate) async fn reap_outcome_async(&mut self) -> Result<ChildWaitOutcome, Error> {
+    pub(crate) async fn reap_outcome_async(&mut self, deadline: Option<Instant>) -> Result<ChildWaitOutcome, Error> {
         #[cfg(test)]
         if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
             return Err(error);
         }
-        self.proc.wait_async().await
+        self.proc.wait_async(deadline).await
     }
 
     /// The status [`wait`](Child::wait) answers for the root's `outcome` ([`reap_outcome`](Child::reap_outcome)): a

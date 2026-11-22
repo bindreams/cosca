@@ -211,12 +211,10 @@ async fn ask<D: StopWaits>(
     // One that passes during the start is not this: the proxy may have sent, and the wait after it is one look.
     if target.deadline_passed() {
         return SendAnswer::NotSent(
-            Error::TimedOut {
-                detail: "the call's timeout had run out before the console-event proxy was started; nothing was sent"
-                    .into(),
-                members: Vec::new(),
-                source: None,
-            },
+            target.timed_out(
+                "the call's timeout had run out before the console-event proxy was started; nothing was sent".into(),
+                Vec::new(),
+            ),
             UnsentKind::NotSent,
         );
     }
@@ -249,7 +247,7 @@ async fn ask<D: StopWaits>(
     drop(proxy);
     let status = match status {
         Ok(Some(status)) => status,
-        Ok(None) => return SendAnswer::Unknown(timed_out(proxy_pid, event)),
+        Ok(None) => return SendAnswer::Unknown(timed_out(target, proxy_pid, event)),
         Err(e) => return wait_failed(proxy_pid, event, e),
     };
     let Some(code) = status.code() else {
@@ -359,16 +357,15 @@ fn wait_failed(proxy_pid: u32, event: CtrlEvent, e: Error) -> SendAnswer {
 
 /// The proxy `proxy_pid` had not answered when the call's deadline passed.
 #[cfg(windows)]
-fn timed_out(proxy_pid: u32, event: CtrlEvent) -> Error {
-    Error::TimedOut {
-        detail: format!(
+fn timed_out(target: &StopTarget<'_>, proxy_pid: u32, event: CtrlEvent) -> Error {
+    target.timed_out(
+        format!(
             "the console-event proxy (pid {proxy_pid}) did not answer within the call's timeout; cosca ended it, \
              so whether {} was sent is unknown",
             event.name()
         ),
-        members: Vec::new(),
-        source: None,
-    }
+        Vec::new(),
+    )
 }
 
 /// The error of a proxy that sent nothing because a step failed. See [`send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy) for its text, kind

@@ -317,9 +317,12 @@ impl Child {
     }
 
     /// The root's reap, as [`crate::Child::reap_outcome`] answers it, awaited: closes an untaken stdin first.
-    pub(crate) async fn reap_outcome(&mut self) -> Result<crate::child::owned::ChildWaitOutcome, Error> {
+    pub(crate) async fn reap_outcome(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<crate::child::owned::ChildWaitOutcome, Error> {
         drop(self.inner.pipes.remove(&Fd::STDIN));
-        self.inner.reap_outcome_async().await
+        self.inner.reap_outcome_async(deadline).await
     }
 
     /// Exit status if the child has already exited (non-blocking).
@@ -365,7 +368,7 @@ impl Child {
     /// the watch of a member or of a Job holds no thread.
     pub async fn kill_tree(&self) -> Result<(), Error> {
         self.kill_tree_after("kill_tree", None)
-            .wait_async()
+            .wait_async(None)
             .await
             .map_err(|failure| failure.error)
     }

@@ -46,12 +46,7 @@ impl StopWaits for AsyncDriver<'_> {
     }
 
     async fn root_exited_by(&self, by: Deadline) -> Result<bool, Error> {
-        // The clock the registered wait measures: tokio's timer on Unix, the OS's on Windows.
-        #[cfg(unix)]
-        let clock = ClockKind::Tokio;
-        #[cfg(windows)]
-        let clock = ClockKind::Real;
-        crate::tokio::drive::exited_until(self.0.proc.os_process(), by.at_on(clock)).await
+        crate::tokio::drive::exited_until(self.0.proc.os_process(), by.at_on(ClockKind::ASYNC_PROCESS_WAIT)).await
     }
 
     #[cfg(windows)]
@@ -111,7 +106,8 @@ pub async fn send_ctrl_break_to_group(target: &StopTarget<'_>) -> Result<(), Err
 /// Windows: sends `event` to the console of the child, from a process of its own. As
 /// [`stop::send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy), with the wait for the
 /// proxy awaited: no runtime thread blocks, and the wait has no cap unless the call that runs it was given a
-/// timeout ([`Child::terminate_timeout`](crate::tokio::Child::terminate_timeout)).
+/// timeout ([`Child::terminate_timeout`](crate::tokio::Child::terminate_timeout),
+/// [`Child::graceful_shutdown_timeout`](crate::tokio::Child::graceful_shutdown_timeout) or their tree forms).
 ///
 /// The proxy is started with [`tokio::Command`](crate::tokio::Command), on the blocking pool as every async
 /// spawn is, and the wait for its exit is registered with the OS.

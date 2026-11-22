@@ -137,7 +137,9 @@
 //!   `send_console_event_via_proxy`. A child of a layout that was not measured is not told apart from one
 //!   that finished without a console.
 //! - **The wait for the proxy has no cap unless the call was given a timeout
-//!   ([`Child::terminate_timeout`](crate::Child::terminate_timeout)), which does not bound the proxy's start,
+//!   ([`Child::terminate_timeout`](crate::Child::terminate_timeout),
+//!   [`Child::graceful_shutdown_timeout`](crate::Child::graceful_shutdown_timeout) or their tree forms), which does
+//!   not bound the proxy's start,
 //!   and the grace starts when the action returns:** see `send_console_event_via_proxy` and
 //!   [`Child::graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree).
 //! - **A front that does not relay the signal.** An elevated child behind such a front is refused the
@@ -156,6 +158,7 @@ mod wm_close;
 
 pub(crate) use action::StopAction;
 pub use outcome::{SendOutcome, StopError};
+pub(crate) use target::root_exited_within;
 #[cfg(feature = "tokio")]
 pub(crate) use target::wait_exit_with;
 pub use target::StopTarget;
@@ -560,7 +563,10 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendAnswer) -> Re
 ///
 /// The call waits for the proxy's answer, with no cap unless the call that runs it was given a timeout
 /// ([`Child::terminate_timeout`](crate::Child::terminate_timeout),
-/// [`Child::terminate_tree_timeout`](crate::Child::terminate_tree_timeout)), warning once after one second.
+/// [`Child::terminate_tree_timeout`](crate::Child::terminate_tree_timeout),
+/// [`Child::graceful_shutdown_timeout`](crate::Child::graceful_shutdown_timeout),
+/// [`Child::graceful_shutdown_tree_timeout`](crate::Child::graceful_shutdown_tree_timeout)), warning once after
+/// one second.
 /// No state of
 /// another process on the child's console was found to hold the proxy: a handler that never returns,
 /// every thread suspended, a debugger holding the process, and an exit as the event is generated were

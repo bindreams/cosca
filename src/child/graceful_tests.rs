@@ -656,50 +656,12 @@ fn a_refused_terminate_is_logged_when_the_reap_fails_after_a_clean_sweep() {
     );
 }
 
-/// The best-effort reap after a failed sweep of an exited root is secondary to the sweep's error,
-/// which stays the answer; its own failure is logged once, at warn, naming the call.
-///
-/// Mutants: the reap's failure is logged at debug, not logged, or put in the answer.
+/// The look at the root after a failed sweep does not wait: a zombie that is not ours yet stays with the handle, and
+/// the sweep's error is the answer, with nothing logged at warn. Mutant: the look is `Waits::reap`, which loops on
+/// the `Recheck` into a reap the fake has no answer for.
 #[cfg(unix)]
 #[skuld::test]
-fn a_best_effort_reap_that_fails_after_a_failed_sweep_is_logged_once_at_warn() {
-    use crate::containment::fake::FakeContains;
-    use crate::containment::Containment;
-    use crate::error::Error;
-    use crate::os_process::fake::{Answer, ReapAnswer};
-    use crate::test_child::over_fake::{child_with, root_looking};
-
-    crate::log_capture::install();
-    let mark = crate::log_capture::mark();
-    let root = root_looking([Answer::Exited; 4]).reaps([ReapAnswer::Err(std::io::ErrorKind::PermissionDenied)]);
-    let (fake, _) = FakeContains::new(Containment::Session, false);
-    let child = child_with(&root, fake);
-    let _armed = term_fault::ArmedKillTreeError::arm();
-
-    let err = child
-        .graceful_shutdown_tree(Duration::ZERO)
-        .expect_err("the sweep failed");
-
-    assert!(
-        matches!(&err, Error::Io(e) if e.to_string().contains("forced kill_tree failure")),
-        "{err:?}"
-    );
-    let logged = crate::log_capture::records_since_on_current_thread(mark, "best-effort reap");
-    assert!(
-        matches!(&logged[..], [(log::Level::Warn, line)] if line.contains("graceful_shutdown_tree(")),
-        "{logged:?}"
-    );
-}
-
-/// The best-effort reap after a failed sweep of an exited root is one attempt that does not wait: a
-/// zombie that is not ours yet (a tracer holds it, or the OS is finishing the exit) stays with the
-/// handle, and the sweep's error is the answer, with nothing logged.
-///
-/// Mutant: the best-effort reap is the blocking reap, which loops on the `Recheck` into a reap the
-/// fake has no answer for.
-#[cfg(unix)]
-#[skuld::test]
-fn a_best_effort_reap_that_is_not_ready_after_a_failed_sweep_leaves_the_zombie_with_the_handle() {
+fn a_look_at_the_root_that_is_not_ready_after_a_failed_sweep_does_not_wait() {
     use crate::containment::fake::FakeContains;
     use crate::containment::Containment;
     use crate::error::Error;
@@ -722,7 +684,7 @@ fn a_best_effort_reap_that_is_not_ready_after_a_failed_sweep_leaves_the_zombie_w
         "{err:?}"
     );
     assert_eq!(
-        crate::log_capture::records_since_on_current_thread(mark, "best-effort reap"),
+        crate::log_capture::records_since_on_current_thread(mark, "graceful_shutdown_tree("),
         Vec::<(log::Level, String)>::new()
     );
 }
@@ -896,10 +858,8 @@ fn graceful_tree_drained_still_sweeps_without_an_authoritative_mechanism() {
     );
 }
 
-// Regression test: on the `MembersRemain` branch (a drain-observable mechanism whose tree does
-// NOT fully drain within `grace`), `root_exited` must come from its own zero-duration probe of the
-// root, not be hardcoded `false`. Otherwise an already-exited-but-unreaped root is stranded as a
-// zombie when the hard sweep also fails, because the best-effort reap is gated on `root_exited`.
+// Regression test: an already-exited, unreaped root's exit is seen even when the hard sweep fails: the call's
+// one look after a failed sweep sees it. Mutant: the look is skipped.
 //
 // Fixture: the root shell ignores TERM (`trap ''` survives `exec`) and backgrounds a `cat` blocked
 // on a stdin this test holds open, so the tree cannot drain. It then writes a readiness byte (the
@@ -1272,7 +1232,7 @@ fn graceful_tree_over_a_leaf_whose_procs_cannot_be_read_fails_fast() {
 
 /// A holders-only escalation whose wait for the holders it killed fails answers with the
 /// holders-only error, as `kill_tree` answers a failed kill over a failed wait; the wait's failure is
-/// logged once, at warn (`log_failed_wait`). The fake has no drain edge, so the grace wait fails too;
+/// logged once, at warn (`failure_after_wait`). The fake has no drain edge, so the grace wait fails too;
 /// that failure is below the answer.
 ///
 /// Mutants: `finish` puts the wait's failure in the error; `finish` returns the error without
@@ -1297,6 +1257,7 @@ fn a_holders_only_escalation_whose_wait_fails_answers_the_holders_only_error() {
         skip,
         crate::signal::Sig::Graceful(crate::signal::Signal::Term),
         std::time::Duration::ZERO,
+        None,
     ));
 
     assert!(
@@ -1308,10 +1269,210 @@ fn a_holders_only_escalation_whose_wait_fails_answers_the_holders_only_error() {
         matches!(error.failures_below()[..], [crate::error::Error::Unsupported { .. }]),
         "the holders' grace wait's failure is its cause: {error:?}"
     );
-    let waited = crate::log_capture::records_since_on_current_thread(mark, "the wait after a holders-only shutdown");
+    let waited =
+        crate::log_capture::records_since_on_current_thread(mark, "the wait after a failed holders-only shutdown");
     assert!(
         matches!(&waited[..], [(log::Level::Warn, line)]
             if line.contains("pid 4242 was killed, but its exit cannot be observed")),
         "the member was waited for, and its failure is logged once, at warn: {waited:?}"
     );
+}
+
+/// A holders-only escalation whose wait for the holders it killed ran into the call's deadline is a timeout
+/// naming the holder that runs, with the holders-only error and the grace wait's failure below it. The wait looks
+/// once and blocks on nothing: a hook at a block would end the holder, and a wait that ignored the deadline would
+/// answer the holders-only error alone.
+///
+/// Mutants: the holders' wait has no bound; its timeout is only logged, and the answer is the holders-only
+/// error.
+#[cfg(unix)]
+#[skuld::test]
+fn a_holders_only_escalation_whose_wait_ran_out_is_a_timeout_with_the_holders_only_error_below_it() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::containment::fake::FakeContains;
+    use crate::containment::Containment;
+    use crate::os_process::fake::Answer;
+    use crate::stop::Deadline;
+    use crate::test_child::over_fake::{child_with, holders_only_skip, live_member, root_looking};
+
+    let (member, writer, id) = live_member();
+    let root = root_looking([Answer::Exited]);
+    let (fake, _) = FakeContains::new(Containment::Session, false);
+    let child = child_with(&root, fake.reaching([id]));
+    let skip = holders_only_skip(&child);
+    let writer = Cell::new(Some(writer));
+    let blocked = Rc::new(Cell::new(false));
+    let _blocking = crate::wait::block_probe::on_blocking({
+        let blocked = blocked.clone();
+        move || {
+            blocked.set(true);
+            drop(writer.take());
+        }
+    });
+
+    let error = super::shutdown::run_ready(super::shutdown::holders_only(
+        &super::shutdown::BlockingDriver(&child),
+        skip,
+        crate::signal::Sig::Graceful(crate::signal::Signal::Term),
+        std::time::Duration::ZERO,
+        Deadline::real(std::time::Duration::ZERO),
+    ));
+
+    assert!(!blocked.get(), "the wait blocked past the deadline");
+    let crate::error::Error::TimedOut { members, .. } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(members, &[id]);
+    let below = error.failures_below();
+    assert!(
+        below.iter().any(|cause| matches!(cause,
+            crate::error::Error::Unassessable { detail, .. }
+                if detail.contains("sent the SIGTERM only to the marker holders"))),
+        "the holders-only error is below the timeout: {error:?}"
+    );
+    _ = member.wait();
+}
+
+// A graceful shutdown given a timeout =====
+
+/// The timeout of the rows that arm the grace wait of a tree shutdown.
+const GRACE_ROW_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A tree shutdown of `child`, which `held` keeps running, given a timeout of [`GRACE_ROW_TIMEOUT`] and a grace of an
+/// hour, on a frozen clock: every wait it blocks on is armed within the timeout, and the root ends at the first block.
+/// Returns what each block was armed for.
+fn blocks_of_a_timed_tree_shutdown(child: crate::Child, held: Held) -> Vec<Option<Duration>> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::wait::block_probe;
+    use crate::wait::test_clock::FrozenClockGuard;
+
+    let timeout = GRACE_ROW_TIMEOUT;
+    let held = Rc::new(RefCell::new(Some(held)));
+    let _release = block_probe::on_blocking({
+        let held = held.clone();
+        move || drop(held.borrow_mut().take())
+    });
+    let (_clock, _) = FrozenClockGuard::install();
+    block_probe::take();
+
+    child
+        .graceful_shutdown_tree_timeout(Duration::from_secs(3600), timeout)
+        .expect("the root ended when its input did");
+
+    let armed = block_probe::take();
+    assert!(
+        armed.iter().all(|armed| armed.is_some_and(|armed| armed <= timeout)),
+        "every wait is armed within the timeout: {armed:?}"
+    );
+    assert!(held.borrow().is_none(), "the hook ended the root at the grace's block");
+    armed
+}
+
+/// The grace wait of a tree shutdown given a timeout, whichever mechanism it watches (a Job Object's drain edge on
+/// Windows, the root elsewhere), is armed within the timeout and not for the grace.
+///
+/// Mutants: the grace is not cut to the timeout (the first block is armed for the hour); a block is armed with no
+/// bound.
+#[skuld::test]
+fn a_timed_tree_shutdown_arms_its_grace_wait_at_the_timeout_not_the_grace() {
+    let (child, held) = kill_only_blocker();
+    let armed = blocks_of_a_timed_tree_shutdown(child, held);
+    assert_eq!(
+        armed.first(),
+        Some(&Some(GRACE_ROW_TIMEOUT)),
+        "the first block is the grace: {armed:?}"
+    );
+}
+
+/// The same over a cgroup, whose drain edge the grace watches, which no other Linux row of the call reaches. The
+/// drain's wait counts what is left on the real clock, so its blocks are armed a little under the timeout.
+///
+/// Mutant: the drain edge's wait is armed from the grace alone (every block is armed for the hour).
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_timed_tree_shutdown_arms_its_cgroup_drain_wait_at_the_timeout_not_the_grace(#[fixture(cgroup)] _group: &Group) {
+    let (child, held) = crate::test_child::term_ignoring_blocker();
+    assert_eq!(child.containment(), crate::Containment::CgroupV2);
+    let armed = blocks_of_a_timed_tree_shutdown(child, held);
+    assert!(!armed.is_empty(), "the grace watched the tree's drain");
+}
+
+/// A root only the kill ends, a timeout far off: the call kills the tree and answers the root's status, as it
+/// does without a timeout. The input is released after the sweep (before the reap), as the untimed rows do.
+///
+/// Mutant: a set deadline is treated as already passed (the sweep's wait for the root does not wait, and the call
+/// answers `TimedOut`).
+#[skuld::test]
+fn a_timed_tree_shutdown_with_time_left_kills_the_tree_and_answers_the_roots_status() {
+    let _warns = crate::log_capture::warn_watch();
+    let (child, held) = kill_only_blocker();
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, held);
+
+    let status = child
+        .graceful_shutdown_tree_timeout(Duration::ZERO, Duration::from_secs(3600))
+        .expect("the tree was killed");
+
+    crate::test_child::assert_killed("the root", status);
+}
+
+/// The lone twin of [`a_timed_tree_shutdown_with_time_left_kills_the_tree_and_answers_the_roots_status`].
+///
+/// Mutant: a set deadline is treated as already passed.
+#[cfg(unix)]
+#[skuld::test]
+fn a_timed_lone_shutdown_with_time_left_kills_the_child_and_answers_its_status() {
+    let (child, stdin) = crate::test_child::term_ignoring_blocker();
+    let _release = term_fault::release_at(term_fault::HookPoint::BeforeReap, stdin);
+
+    let status = child
+        .graceful_shutdown_timeout(Duration::ZERO, Duration::from_secs(3600))
+        .expect("the child was killed");
+
+    crate::test_child::assert_killed("the SIGTERM-ignoring child", status);
+}
+
+/// A tree whose root ends on the group's `SIGTERM` within the grace: the timed call answers the root's status,
+/// as `child_graceful_shutdown_tree_graceful_root_sigterm` has the untimed one do.
+///
+/// Mutant: the sweep after the grace is waited for with a deadline that has passed, and the call answers `TimedOut`.
+#[cfg(unix)]
+#[skuld::test]
+fn a_timed_tree_shutdown_of_a_root_that_ends_on_the_sigterm_answers_its_status() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _warns = crate::log_capture::warn_watch();
+    let (child, stdin) = crate::test_child::held_contained_blocker_without_cgroup(crate::Stdio::pipe());
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+
+    let status = child
+        .graceful_shutdown_tree_timeout(Duration::from_secs(30), Duration::from_secs(3600))
+        .expect("the tree ended on the SIGTERM");
+
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+}
+
+/// The lone twin of [`a_timed_tree_shutdown_of_a_root_that_ends_on_the_sigterm_answers_its_status`].
+///
+/// Mutant: the reap's deadline is treated as already passed.
+#[cfg(unix)]
+#[skuld::test]
+fn a_timed_lone_shutdown_of_a_child_that_ends_on_the_sigterm_answers_its_status() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    let _release = term_fault::release_at(term_fault::HookPoint::AfterTerminate, stdin);
+
+    let status = child
+        .graceful_shutdown_timeout(Duration::from_secs(30), Duration::from_secs(3600))
+        .expect("the child ended on the SIGTERM");
+
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
 }

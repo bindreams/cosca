@@ -94,7 +94,7 @@ fn a_job_kill_the_os_refuses_waits_for_no_member() {
             job.hard_kill().expect("end the member");
         }
     });
-    wait.wait().expect("a kill that failed waits for nothing");
+    wait.wait(None).expect("a kill that failed waits for nothing");
 
     assert!(!blocked.get(), "the wait blocked on a member the kill did not reach");
     job.hard_kill().expect("end the member");
@@ -860,7 +860,7 @@ fn a_kill_wait_reports_a_member_whose_identity_cannot_be_read_once() {
     )
     .split();
 
-    let verdict = wait.wait();
+    let verdict = wait.wait(None);
 
     drop(forced);
     let error = verdict.expect_err("a member whose exit cannot be observed is not a drain");
@@ -950,7 +950,7 @@ fn a_kill_wait_reports_a_member_it_waited_for_once_when_the_snapshot_cannot_read
     let forced = super::fault::force_job_pid_list(Vec::new());
     let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), DrainEdge::Job(&job)).split();
 
-    let verdict = wait.wait();
+    let verdict = wait.wait(None);
 
     drop(forced);
     let error = verdict.expect_err("a member whose exit cannot be observed is not a drain");
@@ -1535,7 +1535,7 @@ fn a_kill_wait_names_a_member_it_may_not_wait_on_once() {
     let forced = super::fault::force_job_pid_list(Vec::new());
     let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), DrainEdge::Job(&job)).split();
 
-    let verdict = wait.wait();
+    let verdict = wait.wait(None);
 
     drop(forced);
     let error = verdict.expect_err("a member whose exit cannot be observed is not a drain");
@@ -1621,7 +1621,7 @@ fn assert_the_failed_root_is_the_one_error(done: &crate::test_own_process::Compl
     )
     .split();
 
-    let verdict = wait.with_root(&root, member.pid(), true).wait();
+    let verdict = wait.with_root(&root, member.pid(), None, true).wait(None);
 
     drop(forced);
     let error = verdict.expect_err("a root whose exit cannot be observed is not a drain");

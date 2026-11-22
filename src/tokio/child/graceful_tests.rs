@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use crate::test_child::over_fake::killed_root;
 use crate::test_child::Console;
 #[cfg(target_os = "linux")]
 use crate::test_groups::{cgroup, Group};
@@ -115,8 +116,7 @@ async fn awaits_the_grace_and_the_sweep(contain: impl FnOnce(&mut crate::tokio::
     );
 }
 
-/// The grace watch is the root's alone on Linux (a session: no drain edge) and the job's drain, then the
-/// root's probe, on Windows.
+/// The grace watch is the root's alone on Linux (a session: no drain edge) and the job's drain on Windows.
 ///
 /// Mutants: `Waits::root_exited` (Linux), or `tree_drained` or `sweep` (Windows), of the async `Child`
 /// calls its blocking twin.
@@ -161,7 +161,7 @@ async fn async_the_reap_of_a_running_root_awaits_its_exit() {
         }
     });
 
-    let (reaped, ()) = ::tokio::join!(child.reap(), async {
+    let (reaped, ()) = ::tokio::join!(child.reap(None), async {
         ::tokio::task::yield_now().await;
         drop(stdin.take());
     });
@@ -204,7 +204,7 @@ async fn async_the_root_through_its_pidfd_awaits_the_grace() {
         tree.answering_terminates([TerminateOutcome::RootThroughPidfd(skip)]),
     ));
     let SignalTreeCooperativelyOutcome::RootThroughPidfd(skip, started, _, acted) =
-        crate::child::graceful::shutdown::signal_tree_cooperatively(&child).await
+        crate::child::graceful::shutdown::signal_tree_cooperatively(&child, None).await
     else {
         panic!("the default stop did not end on the root's pidfd");
     };
@@ -215,6 +215,7 @@ async fn async_the_root_through_its_pidfd_awaits_the_grace() {
         started,
         crate::signal::Sig::Graceful(crate::signal::Signal::Term),
         Duration::from_secs(30),
+        None,
     ))
     .await;
 
@@ -489,6 +490,36 @@ async fn async_graceful_tree_drained_skips_sweep_in_a_cgroup(#[fixture(cgroup)] 
     drained_tree_skips_the_sweep(|cmd| _ = cmd.contain(), crate::Containment::CgroupV2).await;
 }
 
+/// Linux: the awaited tree shutdown given a timeout watches the grace through the cgroup's drain edge, on tokio's
+/// clock, and arms that wait at the timeout, not for the grace: on a paused runtime a grace of an hour under a
+/// timeout of 30 s first arms the drain's wait for the instant 30 s after the call's start. The child ignores the
+/// signal, so the call goes on to the sweep once that wait is over; only what the wait was armed for is asserted.
+///
+/// Mutant: `Waits::tree_drained` of the async `Child` arms from the grace alone (the wait is armed for the hour).
+#[cfg(target_os = "linux")]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
+async fn a_timed_async_tree_shutdown_arms_its_cgroup_drain_wait_at_the_timeout_not_the_grace(
+    #[fixture(cgroup)] _group: &Group,
+) {
+    use crate::tokio::wait::armed_deadline_seam::{install, Armed};
+    use crate::tokio::wait::tokio_now;
+
+    let timeout = Duration::from_secs(30);
+    let mut child = contained_child_ignoring_the_signal(|cmd| _ = cmd.contain()).await;
+    assert_eq!(child.containment(), crate::Containment::CgroupV2);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _installed = install(tx);
+    let start = tokio_now();
+
+    // The answer is the sweep's and the reap's, which this row does not pin.
+    _ = child
+        .graceful_shutdown_tree_timeout(Duration::from_secs(3600), timeout)
+        .await;
+
+    let armed: Vec<_> = rx.try_iter().collect();
+    assert_eq!(armed.first(), Some(&Armed::At(start + timeout)), "{armed:?}");
+}
+
 // Async twin of `members_remain_still_reaps_an_already_exited_root`; see there for the fixture's
 // rationale (`drive::exited_held`, like the sync wait, does not reap) and for `mode` and `swept`.
 #[cfg(unix)]
@@ -560,10 +591,9 @@ async fn members_remain_still_reaps_an_already_exited_root(
     }
 }
 
-/// The root probe after a drain verdict that does not clear the tree, awaited: the root has exited, so
-/// the best-effort reap follows a failed sweep. The leaf is swept by its own handle. A pump that never
-/// broadcasts hangs this test; `a_changed_batch_notifies_a_listener_that_was_there_before_it` fails it by
-/// assertion.
+/// A tree whose members remain after a drain verdict, awaited: the root has exited, so the call's one look
+/// after a failed sweep sees it. The leaf is swept by its own handle. A pump that never broadcasts hangs this
+/// test; `a_changed_batch_notifies_a_listener_that_was_there_before_it` fails it by assertion.
 #[cfg(target_os = "linux")]
 #[skuld::test]
 async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_cgroup(
@@ -578,8 +608,7 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_i
 
 /// The root whose exit the shutdown saw is still a zombie that pins its group's number, so the group
 /// is signalled by it, and the TERM-ignoring member dies. On macOS the tree is the fd marker: the drain
-/// verdict is `AllMarkersClosed` or members remain, never proof to skip the sweep, and the root probe
-/// follows.
+/// verdict is `AllMarkersClosed` or members remain, never proof to skip the sweep.
 #[cfg(unix)]
 #[skuld::test]
 async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_in_a_process_group() {
@@ -604,7 +633,7 @@ async fn async_graceful_tree_members_remain_still_reaps_an_already_exited_root_i
 // like `tests/common::spawn_tree_async`'s own synchronous accept — a short, bounded wait for a
 // real connection, not a poll loop, and the same shape already accepted for an async test.
 //
-// Mutants: `Waits::tree_drained`, `root_exited` or `reap` of the async `Child` calls its blocking twin.
+// Mutants: `Waits::tree_drained` or `reap` of the async `Child` calls its blocking twin.
 #[cfg(windows)]
 #[skuld::test]
 async fn windows_async_graceful_tree_members_remain_surfaces_the_forced_sweep_failure() {
@@ -775,6 +804,7 @@ async fn a_holders_only_escalation_awaits_each_member_its_kill_reached() {
                 skip,
                 crate::signal::Sig::Graceful(crate::signal::Signal::Term),
                 Duration::ZERO,
+                None,
             )
             .await;
             done.set(true);
@@ -801,4 +831,270 @@ async fn a_holders_only_escalation_awaits_each_member_its_kill_reached() {
         "the member has exited when the escalation resolves"
     );
     _ = member.wait();
+}
+
+/// The awaited holders-only escalation whose deadline has passed names the holder its kill reached and that runs,
+/// with the holders-only error below the timeout. A sibling ends the holder after one yield, so a wait that ignored
+/// the deadline is still pending and then resolves without the timeout, which fails the assertion (no hang).
+///
+/// Mutants: `finish_async` takes no deadline; a wait that ran out is only logged.
+#[cfg(unix)]
+#[skuld::test]
+async fn a_timed_holders_only_escalation_names_the_holder_still_running() {
+    use crate::os_process::fake::Answer;
+    use crate::stop::Deadline;
+    use crate::test_child::over_fake::{holders_only_skip, live_member, root_looking, tokio_child_reaching};
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let (member, writer, id) = live_member();
+    let root = root_looking([Answer::Exited]);
+    let child = tokio_child_reaching(&root, &[id]);
+    let skip = holders_only_skip(&child.inner);
+
+    let (error, ()) = ::tokio::join!(
+        async {
+            never_blocking(crate::child::graceful::shutdown::holders_only(
+                &child,
+                skip,
+                crate::signal::Sig::Graceful(crate::signal::Signal::Term),
+                Duration::ZERO,
+                Deadline::tokio(Duration::ZERO),
+            ))
+            .await
+        },
+        async {
+            ::tokio::task::yield_now().await;
+            drop(writer);
+        }
+    );
+
+    let crate::error::Error::TimedOut { members, .. } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(members, &[id]);
+    assert!(
+        error.failures_below().iter().any(|cause| matches!(cause,
+            crate::error::Error::Unassessable { detail, .. }
+                if detail.contains("sent the SIGTERM only to the marker holders"))),
+        "the holders-only error is below the timeout: {error:?}"
+    );
+    _ = member.wait();
+}
+
+// A graceful shutdown given a timeout =====
+
+/// The awaited lone shutdown whose timeout has passed when its grace would start kills the root and answers
+/// `TimedOut` naming it, with no runtime thread blocked: the reap is awaited to the deadline, which is one look.
+///
+/// Mutants: the awaited reap has no deadline (it takes its second look and answers `Ok`); no kill once the deadline
+/// has passed.
+#[skuld::test]
+async fn a_timed_async_lone_shutdown_past_its_timeout_kills_and_names_the_root() {
+    use crate::os_process::fake::Answer;
+    use crate::signal::Sig;
+    use crate::test_child::over_fake::tokio_child_reaching;
+
+    let root = killed_root([Answer::Running]);
+    let mut child = tokio_child_reaching(&root, &[]);
+
+    let error = never_blocking(child.graceful_shutdown_timeout(Duration::from_secs(3600), Duration::ZERO))
+        .await
+        .expect_err("the root was not seen to exit");
+
+    let crate::error::Error::TimedOut { members, .. } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(members, &child.id().into_iter().collect::<Vec<_>>());
+    assert_eq!(
+        root.signal_calls().last(),
+        Some(&Sig::Kill),
+        "the root was killed whatever the deadline"
+    );
+}
+
+/// With time left the same call waits for the root's exit and answers its status.
+///
+/// Mutant: a set deadline is treated as already passed.
+#[skuld::test]
+async fn a_timed_async_lone_shutdown_with_time_left_answers_the_roots_status() {
+    use crate::os_process::fake::Answer;
+    use crate::test_child::over_fake::tokio_child_reaching;
+
+    let root = killed_root([Answer::Running]);
+    let mut child = tokio_child_reaching(&root, &[]);
+
+    let status = never_blocking(child.graceful_shutdown_timeout(Duration::ZERO, Duration::from_secs(3600)))
+        .await
+        .expect("the root exited");
+
+    assert_eq!(status, std::process::ExitStatus::default());
+}
+
+/// The awaited tree shutdown whose timeout has passed when its grace would start still sweeps, awaits nothing past
+/// the deadline and names the member the kill reached and the root, which a runtime thread never blocks on.
+///
+/// Mutants: the awaited sweep's wait ignores the deadline (it waits until the sibling ends the member, and the call
+/// answers `Ok`); the root is not named.
+#[skuld::test]
+async fn a_timed_async_tree_shutdown_past_its_timeout_names_what_it_did_not_see_exit() {
+    use crate::os_process::fake::{Answer, ReapAnswer};
+    use crate::test_child::over_fake::{live_member, root_looking, tokio_child_reaching};
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let (member, writer, id) = live_member();
+    let root = root_looking([Answer::Running, Answer::Running]).reaps([ReapAnswer::Running]);
+    let mut child = tokio_child_reaching(&root, &[id]);
+
+    // A sibling ends the member after one yield: a sweep wait with no bound is then still pending and resolves `Ok`,
+    // which the assertion on the error fails, with no hang.
+    let ((error, alive), ()) = ::tokio::join!(
+        async {
+            let error = never_blocking(child.graceful_shutdown_tree_timeout(Duration::from_secs(3600), Duration::ZERO))
+                .await
+                .expect_err("a member and the root were not seen to exit");
+            (error, id.is_alive())
+        },
+        async {
+            ::tokio::task::yield_now().await;
+            drop(writer);
+        }
+    );
+
+    let crate::error::Error::TimedOut { members, .. } = &error else {
+        panic!("{error:?}");
+    };
+    let mut named = vec![id];
+    named.extend(child.id());
+    assert_eq!(members, &named);
+    assert_eq!(alive, crate::identity::Liveness::Alive, "the fake killed nothing");
+    _ = member.wait();
+}
+
+/// An awaited call's deadline is on tokio's clock, and the action's `wait_exit` is timed on the real one, so a
+/// paused runtime does not move the deadline while the wait runs out: the wait the deadline cut is still the call's
+/// deadline running out, and the call goes on to the kill. The real clock is frozen, and the hook moves it on by
+/// what the wait's block is armed for; tokio's clock is never advanced by the test. The action blocks, by design,
+/// so the call is not wrapped in a helper that forbids a block.
+///
+/// Mutant: the deadline's passing is read off the deadline's own clock after the action (tokio's, which says it has
+/// not passed), so no kill is sent.
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
+async fn a_timed_async_shutdown_goes_on_to_the_kill_when_the_deadline_cut_a_wait_on_the_real_clock() {
+    use crate::os_process::fake::Answer;
+    use crate::signal::Sig;
+    use crate::stop::StopAction;
+    use crate::test_child::over_fake::tokio_child_reaching;
+    use crate::wait::block_probe::on_each_block;
+    use crate::wait::test_clock::{advance, FrozenClockGuard};
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let (_clock, _) = FrozenClockGuard::install();
+    let _blocks = on_each_block(|block| {
+        if let Some(armed) = block.armed {
+            advance(armed);
+        }
+    });
+    let root = killed_root([Answer::Running, Answer::Running, Answer::Running, Answer::Running]);
+    let mut child = tokio_child_reaching(&root, &[]);
+    child.inner.stop = StopAction::asynchronous(|target| {
+        Box::pin(async move { target.wait_exit(Duration::from_secs(3600)).map(|_| ()) })
+    });
+
+    let status = child
+        .graceful_shutdown_timeout(Duration::ZERO, Duration::from_secs(10))
+        .await
+        .expect("the deadline cut the action's wait, and the kill followed");
+
+    assert_eq!(status, std::process::ExitStatus::default());
+    assert_eq!(root.signal_calls().last(), Some(&Sig::Kill), "the root was killed");
+}
+
+/// With time left the awaited tree shutdown waits for the member, which a sibling task ends, and answers the root's
+/// status.
+///
+/// Mutant: a set deadline is treated as already passed.
+#[skuld::test]
+async fn a_timed_async_tree_shutdown_with_time_left_waits_for_the_members() {
+    use std::cell::Cell;
+
+    use crate::os_process::child::ExitRecord;
+    use crate::os_process::fake::{Answer, ReapAnswer};
+    use crate::test_child::over_fake::{live_member, root_looking, tokio_child_reaching};
+
+    crate::tokio::test_runtime::assert_current_thread();
+    let (member, writer, id) = live_member();
+    let root = root_looking([Answer::Running, Answer::Exited]).reaps([ReapAnswer::Exited(ExitRecord::Status(
+        std::process::ExitStatus::default(),
+    ))]);
+    let mut child = tokio_child_reaching(&root, &[id]);
+    let done = Cell::new(false);
+
+    let (shut_down, ()) = ::tokio::join!(
+        async {
+            let shut_down =
+                never_blocking(child.graceful_shutdown_tree_timeout(Duration::ZERO, Duration::from_secs(3600))).await;
+            done.set(true);
+            shut_down
+        },
+        async {
+            ::tokio::task::yield_now().await;
+            assert!(
+                !done.get(),
+                "the shutdown resolved while a member its sweep killed was running"
+            );
+            drop(writer);
+        }
+    );
+
+    assert_eq!(
+        shut_down.expect("the tree was shut down"),
+        std::process::ExitStatus::default()
+    );
+    assert_eq!(id.is_alive(), crate::identity::Liveness::Dead);
+    _ = member.wait();
+}
+
+/// Unix: the awaited shutdown reads its timeout on tokio's clock, and cuts the grace by it: on a paused runtime a
+/// grace of an hour under a timeout of 10 s arms its wait for the instant 10 s after the call's start, and a grace
+/// of 5 s under a timeout of an hour for 5 s after it.
+///
+/// Mutants: the grace is not cut (the wait is armed for the hour); the timeout replaces the grace.
+#[cfg(unix)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
+async fn a_timed_async_shutdown_arms_its_grace_wait_on_tokios_clock_at_the_nearer_bound() {
+    use crate::os_process::fake::Answer;
+    use crate::tokio::wait::armed_deadline_seam::{install, Armed};
+    use crate::tokio::wait::tokio_now;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _installed = install(tx);
+    for (grace, timeout, nearer) in [
+        (
+            Duration::from_secs(3600),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        ),
+        (
+            Duration::from_secs(5),
+            Duration::from_secs(3600),
+            Duration::from_secs(5),
+        ),
+    ] {
+        let root = killed_root([Answer::Running, Answer::Exited]);
+        let mut child = crate::test_child::over_fake::tokio_child_reaching(&root, &[]);
+        let start = tokio_now();
+        _ = rx.try_iter().count();
+
+        child
+            .graceful_shutdown_timeout(grace, timeout)
+            .await
+            .expect("the root exited within the grace");
+
+        let armed: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            armed.first(),
+            Some(&Armed::At(start + nearer)),
+            "grace {grace:?}, timeout {timeout:?}: {armed:?}"
+        );
+    }
 }

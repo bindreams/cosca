@@ -776,7 +776,7 @@ impl Pending {
             child.handle_id(),
             "a wait is settled on the child it began on"
         );
-        Settlement::new(child.wait_async().await, self.reached)
+        Settlement::new(child.wait_async(None).await, self.reached)
     }
 }
 

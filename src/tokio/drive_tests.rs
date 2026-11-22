@@ -826,7 +826,7 @@ mod windows {
         let (_, wait) =
             TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), DrainEdge::Job(&job)).split();
 
-        let verdict = rt.block_on(wait.wait_async());
+        let verdict = rt.block_on(wait.wait_async(None));
 
         drop(forced);
         let error = verdict.expect_err("a member whose exit cannot be observed is not a drain");

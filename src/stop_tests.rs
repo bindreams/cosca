@@ -864,10 +864,11 @@ fn a_call_words_what_the_action_sent_before_its_kill() {
     for (what, action, says, logs_a_refusal) in rows {
         let (child, stdin) = blocker_stopping_by(action, true);
         let mark = crate::log_capture::mark();
-        let (answer, earlier) = crate::child::graceful::shutdown::run_ready(
-            crate::child::graceful::shutdown::stop_root(&crate::child::graceful::shutdown::BlockingDriver(&child)),
-        );
-        answer.unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        let (_, earlier) = crate::child::graceful::shutdown::run_ready(crate::child::graceful::shutdown::stop_root(
+            &crate::child::graceful::shutdown::BlockingDriver(&child),
+            None,
+        ))
+        .unwrap_or_else(|e| panic!("{what}: {e:?}"));
         assert_eq!(earlier.as_deref(), says, "the lone shutdown's kill, after {what}");
         assert_eq!(
             refusal_logged(mark, &format!("graceful_shutdown({})", child.pid())),
@@ -913,6 +914,7 @@ fn a_tree_call_words_what_the_action_sent_before_its_sweep() {
         let mark = crate::log_capture::mark();
         match crate::child::graceful::shutdown::run_ready(crate::child::graceful::shutdown::signal_tree_cooperatively(
             &crate::child::graceful::shutdown::BlockingDriver(&child),
+            None,
         )) {
             SignalTreeCooperativelyOutcome::Sent {
                 result: Ok(()),

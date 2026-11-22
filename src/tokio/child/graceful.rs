@@ -11,7 +11,7 @@ use crate::child::graceful::HoldersShutdown;
 use crate::containment::dispatch::{SweepFailure, Swept};
 use crate::containment::TreeDrain;
 use crate::error::Error;
-use crate::stop::{Deadline, StopTarget, StopWaits};
+use crate::stop::{ClockKind, Deadline, StopTarget, StopWaits};
 use crate::tokio::stop::AsyncDriver;
 
 impl Child {
@@ -158,13 +158,29 @@ impl Child {
     /// `#[tokio::test]` defaults) — on a hand-built runtime missing either, tokio panics
     /// rather than returning a typed error.
     ///
-    /// Behaves as the sync [`graceful_shutdown`](crate::Child::graceful_shutdown), awaiting each wait.
+    /// Behaves as the sync [`graceful_shutdown`](crate::Child::graceful_shutdown), awaiting each wait. The wait for
+    /// the killed root has no bound: a caller that cannot wait without one uses
+    /// [`graceful_shutdown_timeout`](Child::graceful_shutdown_timeout).
     ///
     /// # Panics
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub async fn graceful_shutdown(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
-        crate::child::graceful::shutdown::shutdown_lone(self, grace).await
+        crate::child::graceful::shutdown::shutdown_lone(self, grace, None).await
+    }
+
+    /// As [`Child::graceful_shutdown_timeout`](crate::Child::graceful_shutdown_timeout), awaited; `timeout` is
+    /// counted on tokio's clock. Everything it says of the bound, the answer and the handle holds.
+    ///
+    /// # Runtime
+    ///
+    /// As [`graceful_shutdown`](Child::graceful_shutdown).
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
+    pub async fn graceful_shutdown_timeout(&mut self, grace: Duration, timeout: Duration) -> Result<ExitStatus, Error> {
+        crate::child::graceful::shutdown::shutdown_lone(self, grace, Deadline::tokio(timeout)).await
     }
 
     /// Cooperative-then-forced shutdown of the contained tree: run the child's stop action
@@ -198,9 +214,9 @@ impl Child {
     /// child stays owned, and `Drop`'s teardown still applies.
     ///
     /// A watch failure never skips the sweep and reap. A sweep error is the call's error over it
-    /// — and over a graceful root exit (survivors may remain; the root is still reaped first when
-    /// its exit was observed, otherwise the child stays owned for `Drop`) — and so is a reap
-    /// error once the sweep succeeded. A refused graceful signal and then the watch failure join the
+    /// — and over a graceful root exit (survivors may remain) — and so is a reap
+    /// error once the sweep succeeded. After a failed sweep the call looks at the root once, without
+    /// waiting, as the sync call does. A refused graceful signal and then the watch failure join the
     /// error as peers, as for the sync
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree).
     ///
@@ -230,7 +246,7 @@ impl Child {
     /// `debug`.
     ///
     /// A refused Linux `pidfd_open` while watching the root is `Unsupported` (see [`Error::Unsupported`](crate::error::Error::Unsupported)); it is a
-    /// watch failure, so the sweep still runs.
+    /// watch failure where the grace watches the root (a mechanism with no drain edge), so the sweep still runs.
     ///
     /// An untaken stdin pipe stays open through the grace, as for
     /// [`graceful_shutdown`](Child::graceful_shutdown): the signal, not an EOF on stdin, is what
@@ -247,11 +263,34 @@ impl Child {
     /// holds** are answered as for the sync
     /// [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree), with the grace awaited.
     ///
+    /// The wait for the members the sweep killed, and for the root, has no bound: a caller that cannot wait for
+    /// them without one uses [`graceful_shutdown_tree_timeout`](Child::graceful_shutdown_tree_timeout), and the
+    /// sync [`graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree) says why a composition of
+    /// `terminate_tree`, `wait_tree_timeout` and `send_kill_tree` is not a replacement.
+    ///
     /// # Panics
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub async fn graceful_shutdown_tree(&mut self, grace: Duration) -> Result<ExitStatus, Error> {
-        crate::child::graceful::shutdown::shutdown_tree(self, grace).await
+        crate::child::graceful::shutdown::shutdown_tree(self, grace, None).await
+    }
+
+    /// As [`Child::graceful_shutdown_tree_timeout`](crate::Child::graceful_shutdown_tree_timeout), awaited;
+    /// `timeout` is counted on tokio's clock. Everything it says of the bound, the answer and the handle holds.
+    ///
+    /// # Runtime
+    ///
+    /// As [`graceful_shutdown_tree`](Child::graceful_shutdown_tree).
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
+    pub async fn graceful_shutdown_tree_timeout(
+        &mut self,
+        grace: Duration,
+        timeout: Duration,
+    ) -> Result<ExitStatus, Error> {
+        crate::child::graceful::shutdown::shutdown_tree(self, grace, Deadline::tokio(timeout)).await
     }
 }
 
@@ -299,21 +338,25 @@ impl Waits for Child {
         self.inner.stop.run_async(target).await
     }
 
-    async fn tree_drained(&self, grace: Duration) -> Result<TreeDrain, Error> {
-        self.wait_tree_timeout(grace).await
+    async fn tree_drained(&self, grace: Duration, deadline: Option<Deadline>) -> Result<TreeDrain, Error> {
+        self.inner
+            .tree
+            .wait_drained_async(Deadline::grace_end(deadline, grace, ClockKind::Tokio))
+            .await
     }
 
-    async fn sweep(&self, swept: Swept<'_>) -> Result<(), SweepFailure> {
-        swept.wait_async().await
+    async fn sweep(&self, swept: Swept<'_>, deadline: Option<Deadline>) -> Result<(), SweepFailure> {
+        swept.wait_async(deadline).await
     }
 
-    async fn reap(&mut self) -> Result<crate::child::owned::ChildWaitOutcome, Error> {
-        self.reap_outcome().await
+    async fn reap(&mut self, deadline: Option<Deadline>) -> Result<crate::child::owned::ChildWaitOutcome, Error> {
+        self.reap_outcome(deadline.and_then(|deadline| deadline.at_on(ClockKind::ASYNC_PROCESS_WAIT)))
+            .await
     }
 
     #[cfg(unix)]
-    async fn holders_finish(&self, shutdown: HoldersShutdown<'_>) -> Error {
-        shutdown.finish_async().await
+    async fn holders_finish(&self, shutdown: HoldersShutdown<'_>, deadline: Option<Deadline>) -> Error {
+        shutdown.finish_async(deadline).await
     }
 }
 

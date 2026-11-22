@@ -907,7 +907,7 @@ fn a_cgroup_kill_the_kernel_refused_waits_for_no_member(#[fixture(cgroup)] _grou
             .expect("end the member");
         }
     });
-    wait.wait().expect("a kill that failed waits for nothing");
+    wait.wait(None).expect("a kill that failed waits for nothing");
 
     assert!(!blocked.get(), "the wait blocked on a member the kill did not reach");
     drop(member);
@@ -955,7 +955,7 @@ fn a_member_that_left_the_leaf_before_the_kill_is_neither_killed_nor_waited_for(
 
     let (sent, wait) = leaf.kill(None).split();
     sent.into_result().expect("the leaf's kill");
-    wait.wait().expect("the leaf drained");
+    wait.wait(None).expect("the leaf drained");
 
     assert!(!blocked.get(), "the wait blocked on a member that left the leaf");
     let mut member = member.borrow_mut();
@@ -1126,7 +1126,7 @@ fn the_wait_over_a_leafs_listed_members_blocks_on_a_running_member(#[fixture(cgr
         DrainEdge::Cgroup(&leaf),
     )
     .split();
-    wait.wait().expect("the member exited and the leaf drained");
+    wait.wait(None).expect("the member exited and the leaf drained");
 
     assert!(blocked.get(), "the wait did not block on a member that was running");
     _ = member.wait();

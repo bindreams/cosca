@@ -655,7 +655,9 @@ impl Command {
     /// ends `terminate` and `terminate_tree` with it, and ends the shutdown calls before their grace is
     /// waited, with the child left running for the caller to [`kill`](crate::Child::kill), unless the
     /// action's last prepared send went out, in which case a `graceful_shutdown_tree` goes on to its
-    /// grace and sweep and keeps the error as its cooperative error.
+    /// grace and sweep and keeps the error as its cooperative error. A timed shutdown goes on to its kill after
+    /// the deadline's `TimedOut` too; see
+    /// [`graceful_shutdown_timeout`](crate::Child::graceful_shutdown_timeout).
     ///
     /// ```no_run
     /// # #[cfg(unix)] fn demo() -> Result<(), cosca::error::Error> {

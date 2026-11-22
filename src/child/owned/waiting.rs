@@ -88,22 +88,24 @@ impl OwnedChild {
         Ok(outcome)
     }
 
-    /// [`wait`](OwnedChild::wait) with no deadline, awaited: observes through
-    /// [`crate::tokio::drive::run`]. `&mut self` means no other holder or waiter exists, so the
-    /// state is written through `Mutex::get_mut`, with no lock and no wake. A dropped future leaves
-    /// the state `N`: a record is written only by the look that sees it, and the future ends in the
-    /// same poll.
+    /// [`wait`](OwnedChild::wait), awaited: observes through [`crate::tokio::drive::run`]. `deadline`
+    /// (`None`: for ever) is on the clock an async wait on a process runs on
+    /// ([`ClockKind::ASYNC_PROCESS_WAIT`](crate::stop::ClockKind)); a deadline that passes with the child
+    /// running is [`DeadlinePassed`](ChildWaitOutcome::DeadlinePassed), after one final look. `&mut self` means
+    /// no other holder or waiter exists, so the state is written through `Mutex::get_mut`, with no lock and no
+    /// wake. A dropped future leaves the state `N`: a record is written only by the look that sees it, and the
+    /// future ends in the same poll.
     #[cfg(feature = "tokio")]
-    pub(crate) async fn wait_async(&mut self) -> Result<ChildWaitOutcome, Error> {
+    pub(crate) async fn wait_async(&mut self, deadline: Option<Instant>) -> Result<ChildWaitOutcome, Error> {
         if let State::Exited(record) = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner).state {
             return Ok(ChildWaitOutcome::Exited(record));
         }
-        let outcome = match crate::tokio::drive::run(&mut AsyncObserve(self), None).await? {
+        let outcome = match crate::tokio::drive::run(&mut AsyncObserve(self), deadline).await? {
             RunOutcome::Done(outcome) => outcome,
             RunOutcome::DeadlinePassed => ChildWaitOutcome::DeadlinePassed,
         };
         debug_assert!(
-            !matches!(outcome, ChildWaitOutcome::DeadlinePassed),
+            deadline.is_some() || !matches!(outcome, ChildWaitOutcome::DeadlinePassed),
             "an unbounded wait ended with no exit"
         );
         Ok(outcome)

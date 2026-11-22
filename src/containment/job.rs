@@ -78,7 +78,7 @@ impl Job {
     pub fn kill_tree(&self) -> Result<(), Error> {
         let (sent, wait) = self.kill().split();
         Self::answer(sent)?;
-        wait.wait()
+        wait.wait(None)
     }
 
     /// [`kill_tree`](Job::kill_tree) that sends and does not wait.
