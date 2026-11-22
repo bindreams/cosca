@@ -102,6 +102,9 @@ What a child's cooperative stop sends is an action it stores, not a rule inside 
   `terminate` and `terminate_tree` read the record, never what the action returned: an `Err` becomes a
   `StopError` with the last prepared send's outcome, or `Unknown` when the action made none. The action
   closures, the prepared sends and the graceful shutdowns keep `Result<(), Error>`.
+- **A call may be given a timeout.** `terminate_timeout` / `terminate_tree_timeout` put a `Deadline` (instant
+  plus real or tokio clock) on the `StopTarget`; only the target reads or converts it. The waits for an answer
+  (`wait_proxy`, `wait_exit`) end by it; per-wait behavior is in their docs.
 - **The proxy is a role, with one contract.** The console-event proxy is the host program, or the
   `cosca-ctrl-proxy` executable, started with the environment variable `__COSCA_HELPER=ctrl-proxy`. The
   variable, never the program's arguments, says a process is a helper: `cosca::init_helpers()`, first in

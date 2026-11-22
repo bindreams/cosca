@@ -622,6 +622,49 @@ async fn async_wait_exit_answers_false_when_the_grace_runs_out_with_the_root_run
     child.wait().await.expect("the root ended once its input did");
 }
 
+/// Unix: the async wait runs on tokio's clock, so on a paused runtime the test moves it: a running root's
+/// `wait_exit` under a tokio-clock deadline answers `TimedOut` once the clock is past the deadline, and
+/// `Ok(false)` once it is past a grace that is the shorter of the two. The sibling advances the clock after the
+/// wait's first poll, and a wait that did not end by the bound it was given is still pending when the sibling is
+/// done: it then ends the root's input and takes a second answer, which is `Ok(true)` and fails the assertion, with
+/// no hang. (The Windows wait is the OS's, on the real clock, which a paused runtime does not move.)
+///
+/// Mutants: the async wait ignores the deadline (the first row) or arms it in place of the grace (the second).
+#[cfg(unix)]
+#[skuld::test(runtime = crate::tokio::test_runtime::paused)]
+async fn async_wait_exit_ends_by_the_nearer_of_a_tokio_deadline_and_the_grace_on_a_paused_clock() {
+    use std::cell::RefCell;
+
+    use crate::stop::Deadline;
+
+    let thirty = Duration::from_secs(30);
+    let hour = Duration::from_secs(3600);
+    for (deadline, grace, timed_out) in [(thirty, Duration::MAX, true), (hour, thirty, false)] {
+        let case = format!("deadline {deadline:?}, grace {grace:?}");
+        let (member, writer, _) = test_child::over_fake::live_member();
+        let mut child = crate::tokio::Child { inner: member };
+        let writer = RefCell::new(Some(writer));
+        let target = StopTarget::from(&child).with_deadline(Deadline::tokio(deadline));
+        let waited = ::tokio::select! {
+            biased;
+            waited = stop::wait_exit(&target, grace) => waited,
+            () = ::tokio::time::advance(thirty + Duration::from_secs(1)) => {
+                drop(writer.borrow_mut().take());
+                stop::wait_exit(&target, grace).await
+            }
+        };
+        match (timed_out, waited) {
+            (true, Err(Error::TimedOut { members, .. })) => {
+                assert_eq!(members, [child.id().expect(test_child::IDENTITY_READ)], "{case}");
+            }
+            (false, Ok(false)) => {}
+            (_, other) => panic!("{case}: the wait did not end by the nearer bound: {other:?}"),
+        }
+        drop(writer.borrow_mut().take());
+        child.wait().await.expect("the root ended once its input did");
+    }
+}
+
 /// On Windows the wait for the root is a registered OS wait: it needs neither the IO nor the time driver, so
 /// it runs on a runtime built with neither, for a grace that runs out and for one that ends at the exit.
 ///
@@ -645,6 +688,119 @@ fn async_wait_exit_on_windows_needs_neither_the_io_nor_the_time_driver() {
         assert!(exited.expect("the wait for the root"), "the root exited");
         child.wait().await.expect("the exited root is reaped");
     });
+}
+
+/// The async twins of the sync timeout calls carry their timeout to the action's target as well: a timeout
+/// already past makes the action's `wait_exit` one look, which answers `TimedOut` naming the root for a root
+/// that runs, and the action's `?` makes it the call's answer (`Unknown`: the action sent nothing); a plain
+/// call makes the same wait for the whole grace and is `Ok`. The sibling ends the root's input, and runs only
+/// when the call is pending: a timeout call that has made its look is done before the sibling runs.
+///
+/// Mutants: a timeout call passes no deadline to its target (root or tree); the plain call passes one; the
+/// deadline's end answers `Ok(false)` instead of `TimedOut`.
+#[skuld::test]
+async fn async_a_timeout_call_bounds_the_wait_its_action_makes_and_a_plain_call_does_not() {
+    use crate::stop::SendOutcome;
+
+    assert_current_thread();
+    for (tree, timed) in [(false, true), (true, true), (false, false), (true, false)] {
+        let waited = Arc::new(Mutex::new(Vec::new()));
+        let (mut child, stdin) = blocker_stopping_by(
+            {
+                let waited = Arc::clone(&waited);
+                move |target| {
+                    let waited = Arc::clone(&waited);
+                    Box::pin(async move {
+                        let exited = stop::wait_exit(target, Duration::MAX).await?;
+                        waited.lock().unwrap().push(exited);
+                        Ok(())
+                    })
+                }
+            },
+            tree,
+        )
+        .await;
+        let release = async { drop(stdin) };
+        let (answer, ()) = match (tree, timed) {
+            (false, true) => ::tokio::join!(never_blocking(child.terminate_timeout(Duration::ZERO)), release),
+            (true, true) => ::tokio::join!(never_blocking(child.terminate_tree_timeout(Duration::ZERO)), release),
+            (false, false) => ::tokio::join!(never_blocking(child.terminate()), release),
+            (true, false) => ::tokio::join!(never_blocking(child.terminate_tree()), release),
+        };
+        let case = format!("tree: {tree}, timed: {timed}");
+        if timed {
+            let err = answer.expect_err("a past deadline is one look at a root that runs, and `?` ended the action");
+            assert_eq!(err.outcome(), SendOutcome::Unknown, "{case}: the action sent nothing");
+            let Error::TimedOut {
+                detail,
+                members,
+                source,
+            } = err.error()
+            else {
+                panic!("{case}: {err:?}")
+            };
+            assert_eq!(members, &[child.id().expect(test_child::IDENTITY_READ)], "{case}");
+            assert!(detail.contains(&format!("pid {}", child.pid())), "{case}: {detail}");
+            assert!(source.is_none(), "{case}: {source:?}");
+            assert!(
+                waited.lock().unwrap().is_empty(),
+                "{case}: the action ended at its wait"
+            );
+        } else {
+            answer.expect("the action ended with its wait");
+            assert_eq!(
+                *waited.lock().unwrap(),
+                [true],
+                "{case}: no deadline waits for the exit"
+            );
+        }
+        let status = child.wait().await.expect("the root is reaped once its input ended");
+        assert!(
+            status.success(),
+            "{case}: the blocker ended at its input's end: {status:?}"
+        );
+    }
+}
+
+/// A timeout too large for the clock is no bound on the async calls either: the call makes the wait the plain
+/// call makes and answers `Ok`, with no panic. The sibling ends the root's input once the call is pending, so a
+/// call that read the timeout as passed has answered `TimedOut` at its first look and fails the assertion.
+///
+/// Mutant: a timeout that overflows tokio's clock is read as already passed.
+#[skuld::test]
+async fn async_a_timeout_too_large_for_the_clock_is_no_bound() {
+    assert_current_thread();
+    for tree in [false, true] {
+        let waited = Arc::new(Mutex::new(Vec::new()));
+        let (mut child, stdin) = blocker_stopping_by(
+            {
+                let waited = Arc::clone(&waited);
+                move |target| {
+                    let waited = Arc::clone(&waited);
+                    Box::pin(async move {
+                        let exited = stop::wait_exit(target, Duration::MAX).await?;
+                        waited.lock().unwrap().push(exited);
+                        Ok(())
+                    })
+                }
+            },
+            tree,
+        )
+        .await;
+        let release = async { drop(stdin) };
+        let (answered, ()) = if tree {
+            ::tokio::join!(never_blocking(child.terminate_tree_timeout(Duration::MAX)), release)
+        } else {
+            ::tokio::join!(never_blocking(child.terminate_timeout(Duration::MAX)), release)
+        };
+        answered.unwrap_or_else(|e| panic!("tree: {tree}: no bound, so the wait is for the exit: {e:?}"));
+        assert_eq!(*waited.lock().unwrap(), [true], "tree: {tree}");
+        let status = child.wait().await.expect("the exited root is reaped");
+        assert!(
+            status.success(),
+            "tree: {tree}: the blocker ended at its input's end: {status:?}"
+        );
+    }
 }
 
 // Windows: the wait for the proxy =====
@@ -718,6 +874,201 @@ async fn the_wait_for_the_proxy_blocks_no_runtime_thread() {
     stopped.expect("the proxy answered Sent");
     assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::Sent);
     kill_release_reap_async(&mut child, sock, false).await;
+}
+
+/// The async driver's wait for the proxy ends by the deadline it is given, with the proxy still running: a
+/// deadline already past (on the real clock, which the target hands every driver) is one look, and the wait
+/// answers `None`, which `ask` takes as a proxy that did not answer in time. The proxy is up and held before
+/// the wait starts, and it is still running when the wait answers; dropping its handle, as `ask` does, ends
+/// it, which a look at the process by identity sees (the drop kills and reaps before it returns). The wait is
+/// raced, in order, against a future that tells the proxy to answer: a wait that made its look is ready first
+/// and the proxy is never told, and one that ignored the deadline is pending, so the second arm runs and fails
+/// the assertion, with no hang. The warn threshold is not due before the deadline, so `late` is never called.
+///
+/// Mutants: the deadline is not read by the async wait; the threshold's wait ignores the deadline; the proxy
+/// is not ended by its handle's drop.
+#[cfg(windows)]
+#[skuld::test]
+async fn async_wait_proxy_ends_by_its_deadline_with_the_proxy_running() {
+    use crate::identity::ProcessId;
+    use crate::stop::proxy::CtrlProxy;
+    use crate::stop::StopWaits as _;
+    use crate::test_child::ctrl_break::kill_release_reap_async;
+    use crate::test_child::exited_through_open;
+
+    assert_current_thread();
+    let mut held = Held::new();
+    let (mut child, sock) = member_stopping_through(&held).await;
+    let CtrlProxy::Executable(exe) = held.fixture.setting() else {
+        unreachable!("a fixture is an executable proxy")
+    };
+    let mut command = crate::tokio::Command::new();
+    let sync = command.as_sync_mut();
+    sync.raw_executable(&exe).detached();
+    sync.stdin(crate::Stdio::null()).expect("null stdin");
+    sync.stdout(crate::Stdio::null()).expect("null stdout");
+    sync.stderr(crate::Stdio::null()).expect("null stderr");
+    let mut proxy = command.spawn().await.expect("start the held proxy");
+    let id = ProcessId::of(held.started().await)
+        .found()
+        .expect("the held proxy runs");
+
+    let driver = stop::AsyncDriver(&child.inner);
+    let waited = ::tokio::select! {
+        biased;
+        waited = driver.wait_proxy(
+            &mut proxy,
+            crate::wait::teardown_warn::LATE,
+            |_| panic!("the threshold is past the deadline: nothing is waited for to warn of"),
+            crate::wait::deadline_from(Duration::ZERO),
+        ) => waited,
+        () = async { held.release() } => panic!("the wait was pending: it ignored the deadline"),
+    };
+    assert!(
+        matches!(waited, Ok(None)),
+        "the deadline ended the wait with the proxy running: {waited:?}"
+    );
+    assert!(
+        !exited_through_open(id, Some(Duration::ZERO)).expect("a look at the proxy"),
+        "the proxy is still running when the wait answers"
+    );
+    drop(proxy);
+    assert!(
+        exited_through_open(id, Some(Duration::ZERO)).expect("a look at the proxy"),
+        "the proxy is gone once its handle is dropped"
+    );
+    kill_release_reap_async(&mut child, sock, false).await;
+}
+
+/// A call whose timeout is already past is refused before the proxy is started, as the sync call is: the
+/// answer is `NotSent` with `TimedOut` and no members, and the fixture never ran. The call never reaches a wait,
+/// so it answers at its first poll.
+///
+/// Mutants: the proxy is started and ended; the answer is `Unknown`.
+#[cfg(windows)]
+#[skuld::test]
+async fn async_a_timeout_already_past_refuses_the_call_before_the_proxy_is_started() {
+    use crate::stop::proxy::protocol::ProxyAnswer;
+    use crate::stop::proxy::proxy_tests::Fixture;
+    use crate::stop::SendOutcome;
+    use crate::test_child::ctrl_break::{assert_no_break_sent, kill_release_reap_async, spawn_member_async, Handler};
+
+    assert_current_thread();
+    for tree in [false, true] {
+        let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+        let (mut child, sock, _) =
+            spawn_member_async(Handler::Ignore, None, Some(crate::ContainMode::Strongest), |cmd| {
+                cmd.no_window();
+                cmd.ctrl_proxy(fixture.setting());
+                cmd.graceful_stop(|target| {
+                    Box::pin(stop::send_console_event_via_proxy(target, crate::CtrlEvent::CtrlBreak))
+                });
+            })
+            .await;
+        let answer = if tree {
+            child.terminate_tree_timeout(Duration::ZERO).await
+        } else {
+            child.terminate_timeout(Duration::ZERO).await
+        };
+        let err = answer.expect_err("the timeout was past before the proxy would start");
+        assert_eq!(err.outcome(), SendOutcome::NotSent, "tree: {tree}");
+        let Error::TimedOut {
+            detail,
+            members,
+            source,
+        } = err.error()
+        else {
+            panic!("tree: {tree}: {err:?}")
+        };
+        assert_eq!(
+            detail, "the call's timeout had run out before the console-event proxy was started; nothing was sent",
+            "tree: {tree}"
+        );
+        assert!(members.is_empty() && source.is_none(), "tree: {tree}: {err:?}");
+        assert!(fixture.ran().is_none(), "tree: {tree}: no proxy was started");
+        assert_no_break_sent();
+        kill_release_reap_async(&mut child, sock, false).await;
+    }
+}
+
+/// A call with a generous timeout whose proxy answers is answered as the call without one: the deadline the
+/// target hands the async driver for its wait is not read as past. The proxy is told to answer once it runs.
+///
+/// Mutant: the deadline the target converts for the wait is already past (the call answers that the proxy did
+/// not answer in time).
+#[cfg(windows)]
+#[skuld::test]
+async fn async_a_proxy_that_answers_within_the_timeout_is_answered_as_without_one() {
+    use crate::stop::proxy::protocol::{CtrlEvent, ProxyAnswer};
+    use crate::test_child::ctrl_break::{assert_proxy_answered, kill_release_reap_async};
+
+    assert_current_thread();
+    for tree in [false, true] {
+        let mut held = Held::new();
+        let (mut child, sock) = member_stopping_through(&held).await;
+        let timeout = Duration::from_secs(3600);
+        let (stopped, ()) = if tree {
+            ::tokio::join!(never_blocking(child.terminate_tree_timeout(timeout)), async {
+                held.started().await;
+                held.release();
+            })
+        } else {
+            ::tokio::join!(never_blocking(child.terminate_timeout(timeout)), async {
+                held.started().await;
+                held.release();
+            })
+        };
+        stopped.unwrap_or_else(|e| panic!("tree: {tree}: the proxy answered Sent, once told: {e:?}"));
+        assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::Sent);
+        kill_release_reap_async(&mut child, sock, false).await;
+    }
+}
+
+/// The async call's deadline reaches the wait for the proxy: once the proxy is up, the wait's clock reads
+/// include one against a bound longer than the warn threshold (the threshold's own wait is the one before)
+/// and no longer than the call's generous timeout. The reads before the proxy is up are the call's own and
+/// are dropped from the log; the proxy answers once told, at its start, so a wait that ignored the deadline
+/// still ends, and fails the assertion on the log.
+///
+/// Mutant: the target hands the async driver no deadline for a call on tokio's clock (the log then holds
+/// only the threshold's reads, or unbounded ones).
+#[cfg(windows)]
+#[skuld::test]
+async fn async_a_calls_deadline_bounds_the_wait_for_the_proxy() {
+    use crate::stop::proxy::protocol::{CtrlEvent, ProxyAnswer};
+    use crate::test_child::ctrl_break::{assert_proxy_answered, kill_release_reap_async};
+    use crate::wait::read_probe::{self, Event};
+    use crate::wait::teardown_warn::LATE;
+
+    assert_current_thread();
+    let timeout = Duration::from_secs(3600);
+    for tree in [false, true] {
+        let case = format!("tree: {tree}");
+        let mut held = Held::new();
+        let (mut child, sock) = member_stopping_through(&held).await;
+        let (log_tx, log) = std::sync::mpsc::channel();
+        let _log = read_probe::install(log_tx);
+        let sibling = async {
+            held.started().await;
+            while log.try_recv().is_ok() {}
+            held.release();
+        };
+        let (stopped, ()) = if tree {
+            ::tokio::join!(never_blocking(child.terminate_tree_timeout(timeout)), sibling)
+        } else {
+            ::tokio::join!(never_blocking(child.terminate_timeout(timeout)), sibling)
+        };
+        stopped.unwrap_or_else(|e| panic!("{case}: the proxy answered Sent, once told: {e:?}"));
+        assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::Sent);
+        let reads: Vec<Event> = log.try_iter().collect();
+        assert!(
+            reads.iter().any(
+                |event| matches!(event, Event::Read { remaining: Some(left), .. } if *left > LATE && *left <= timeout)
+            ),
+            "{case}: the wait for the proxy was armed against the call's deadline: {reads:?}"
+        );
+        kill_release_reap_async(&mut child, sock, false).await;
+    }
 }
 
 /// A `terminate` dropped while its proxy runs has ended the proxy by the time the drop returns: the proxy's
@@ -867,11 +1218,16 @@ async fn async_wait_saying_calls_late_once_for_a_running_root_only() {
     let writer = Cell::new(Some(writer));
     let late = Cell::new(0u32);
     let late_at_release = Cell::new(None);
-    let (waited, ()) = ::tokio::join!(child.wait_saying(Duration::ZERO, |_| late.set(late.get() + 1)), async {
-        late_at_release.set(Some(late.get()));
-        drop(writer.take());
-    });
-    waited.expect("the root ended once its input did");
+    let (waited, ()) = ::tokio::join!(
+        child.wait_saying(Duration::ZERO, |_| late.set(late.get() + 1), None),
+        async {
+            late_at_release.set(Some(late.get()));
+            drop(writer.take());
+        }
+    );
+    waited
+        .expect("the root ended once its input did")
+        .expect("with no deadline, the wait is for the exit");
     assert_eq!(
         late_at_release.get(),
         Some(1),
@@ -890,9 +1246,96 @@ async fn async_wait_saying_calls_late_once_for_a_running_root_only() {
         "the root exited"
     );
     child
-        .wait_saying(Duration::ZERO, |_| panic!("late was called for a root that had exited"))
+        .wait_saying(
+            Duration::ZERO,
+            |_| panic!("late was called for a root that had exited"),
+            None,
+        )
         .await
-        .expect("the exited root is reaped");
+        .expect("the exited root is reaped")
+        .expect("with no deadline, the wait is for the exit");
+}
+
+/// The async `wait_saying` calls `late` for a threshold its deadline is after, and not for one at or before
+/// the deadline, as the sync wait does (`a_warn_threshold_is_warned_of_only_when_the_deadline_is_after_it`). The
+/// clock is frozen, so a tie is exact. A running root with the threshold due and the deadline an hour away is
+/// warned of, and then waited for: the sibling, which runs after the wait's first poll, ends it. The other
+/// rows end at their deadline, one look, and call `late` for nothing.
+///
+/// Mutants: the threshold is not filtered by the deadline (the rows with the deadline at or before it call
+/// `late`); every threshold is filtered (the first row does not); the filter's `<` is `<=` (the tie calls it).
+#[cfg(windows)]
+#[skuld::test]
+async fn async_wait_saying_calls_late_only_for_a_threshold_before_the_deadline() {
+    use std::cell::Cell;
+
+    use crate::wait::test_clock::FrozenClockGuard;
+
+    assert_current_thread();
+    let (_clock, now) = FrozenClockGuard::install();
+    let (member, writer, _) = crate::test_child::over_fake::live_member();
+    let mut child = crate::tokio::Child { inner: member };
+    let hour = Duration::from_secs(3600);
+    let late = Cell::new(0u32);
+    let writer = Cell::new(Some(writer));
+    let (waited, ()) = ::tokio::join!(
+        child.wait_saying(Duration::ZERO, |_| late.set(late.get() + 1), Some(now + hour)),
+        async {
+            assert_eq!(late.get(), 1, "late was called before the wait went on");
+            drop(writer.take());
+        }
+    );
+    assert!(
+        waited.expect("the root ended once its input did").is_some(),
+        "the wait to a deadline an hour away saw the exit"
+    );
+    late.set(0);
+
+    // The deadline is the threshold's instant, or before it: one look at a root that has exited by then.
+    let (member, writer, _) = crate::test_child::over_fake::live_member();
+    let mut child = crate::tokio::Child { inner: member };
+    for (after, case) in [(Duration::ZERO, "a tie"), (Duration::from_secs(1), "a deadline before")] {
+        let waited = child
+            .wait_saying(after, |_| late.set(late.get() + 1), Some(now))
+            .await
+            .expect("a look at the root");
+        assert!(waited.is_none(), "{case}: the root runs, and the deadline is past");
+        assert_eq!(late.get(), 0, "{case}: nothing is waited for to warn of");
+    }
+    drop(writer);
+    child.wait().await.expect("the root ended once its input did");
+}
+
+/// With no deadline the async `wait_saying` is `wait` after its warn stage: an untaken stdin is closed at once
+/// (a child that exits only at the end of its input needs that), and the wait for the exit has no cap. The
+/// future is polled once, with a threshold that is never due, and dropped: the stdin is closed by then, whatever
+/// the child has done, which a wait that first waited for the exit (and would hang here) has not done.
+///
+/// Mutant: with no deadline, the wait for the exit comes before `wait` closes the stdin.
+#[cfg(windows)]
+#[skuld::test]
+async fn async_wait_saying_with_no_deadline_closes_an_untaken_stdin_before_it_waits() {
+    use crate::stdio::Fd;
+    use crate::tokio::drive::drive_tests::poll_once;
+
+    assert_current_thread();
+    let mut cmd = test_child::tokio_command(Console::Hidden);
+    cmd.args(test_child::BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::null()).expect("set stdout null");
+    let mut child = cmd.spawn().await.expect("spawn");
+    assert!(child.inner.pipes.contains_key(&Fd::STDIN), "the stdin is not taken");
+    drop(poll_once(child.wait_saying(
+        Duration::MAX,
+        |_| panic!("the threshold is never due"),
+        None,
+    )));
+    assert!(
+        !child.inner.pipes.contains_key(&Fd::STDIN),
+        "the untaken stdin was closed before the wait for the exit"
+    );
+    let status = child.wait().await.expect("the blocker ended at its input's end");
+    assert!(status.success(), "{status:?}");
 }
 
 /// Async twin of the sync `a_child_that_has_exited_is_answered_before_the_proxy_is_started`: a child that has

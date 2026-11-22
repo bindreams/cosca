@@ -11,7 +11,7 @@ use crate::child::graceful::HoldersShutdown;
 use crate::containment::dispatch::{SweepFailure, Swept};
 use crate::containment::TreeDrain;
 use crate::error::Error;
-use crate::stop::{StopTarget, StopWaits};
+use crate::stop::{Deadline, StopTarget, StopWaits};
 use crate::tokio::stop::AsyncDriver;
 
 impl Child {
@@ -64,6 +64,8 @@ impl Child {
     /// **macOS, a root launchd holds** is refused with nothing sent, and an `Unknown` root is signalled
     /// through the handle, as for the sync [`Child::kill`](crate::Child::kill).
     ///
+    /// See [`terminate_timeout`](Child::terminate_timeout) to bound the waits.
+    ///
     /// # Runtime
     ///
     /// The default action on Unix waits for nothing and needs no driver; on Windows it may start the
@@ -76,7 +78,29 @@ impl Child {
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub async fn terminate(&self) -> Result<(), crate::stop::StopError> {
-        crate::child::graceful::shutdown::terminate(self).await
+        crate::child::graceful::shutdown::terminate(self, None).await
+    }
+
+    /// [`terminate`](Child::terminate), with a bound on the waits cosca makes for the stop action: they end by
+    /// `timeout` from the call's start. This is the sync [`Child::terminate_timeout`](crate::Child::terminate_timeout),
+    /// awaited, with what it says of the bound (which waits it covers, and what is not covered), of `wait_exit`
+    /// and of the answers when the console-event proxy has not answered by then, or the timeout was past before
+    /// it would be started. The timeout is the caller's own, and one too large for the clock is no bound.
+    ///
+    /// The proxy's start, which on Windows waits for a blocking-pool thread, is not bounded either: the sync
+    /// call's rule for a timeout that passes before the start holds.
+    ///
+    /// # Runtime
+    ///
+    /// As [`terminate`](Child::terminate): an action that awaits
+    /// [`tokio::stop::wait_exit`](crate::tokio::stop::wait_exit) needs, on Unix, a runtime with the IO **and**
+    /// time drivers enabled, and the deadline is read on tokio's clock.
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
+    pub async fn terminate_timeout(&self, timeout: Duration) -> Result<(), crate::stop::StopError> {
+        crate::child::graceful::shutdown::terminate(self, crate::stop::Deadline::tokio(timeout)).await
     }
 
     /// Cooperative-then-forced lone shutdown: [`terminate`](Child::terminate), wait up to
@@ -236,6 +260,10 @@ impl StopWaits for Child {
         AsyncDriver(&self.inner).root_exited(within).await
     }
 
+    async fn root_exited_by(&self, by: Deadline) -> Result<bool, Error> {
+        AsyncDriver(&self.inner).root_exited_by(by).await
+    }
+
     #[cfg(windows)]
     type Proxy = Child;
 
@@ -254,8 +282,9 @@ impl StopWaits for Child {
         proxy: &mut Child,
         after: Duration,
         late: impl FnOnce(Duration) + Send,
-    ) -> Result<std::process::ExitStatus, Error> {
-        AsyncDriver(&self.inner).wait_proxy(proxy, after, late).await
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<std::process::ExitStatus>, Error> {
+        AsyncDriver(&self.inner).wait_proxy(proxy, after, late, deadline).await
     }
 }
 

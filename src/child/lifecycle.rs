@@ -210,15 +210,25 @@ impl Wording {
 /// unbounded wait run.
 pub(super) fn wait_to_exit(proc: &OwnedChild, due: Option<Due>) -> Result<ChildWaitOutcome, Error> {
     let pid = proc.pid();
-    wait_to_exit_saying(proc, due, |after| crate::child::spawn::warn_still_waiting(pid, after))
+    wait_to_exit_saying(
+        proc,
+        due,
+        |after| crate::child::spawn::warn_still_waiting(pid, after),
+        None,
+    )
 }
 
-/// [`wait_to_exit`] that says `warn` where it warns, for a wait that is not a teardown's.
+/// [`wait_to_exit`] that says `warn` where it warns, for a wait that is not a teardown's, and that ends by
+/// `deadline` (`None`: never): a [`DeadlinePassed`](ChildWaitOutcome::DeadlinePassed) is the answer only for
+/// one. A threshold the deadline comes before is no threshold: the wait ends at the deadline, with nothing to
+/// warn of.
 fn wait_to_exit_saying(
     proc: &OwnedChild,
     due: Option<Due>,
     warn: impl FnOnce(Duration),
+    deadline: Option<Instant>,
 ) -> Result<ChildWaitOutcome, Error> {
+    let due = due.filter(|due| deadline.is_none_or(|deadline| due.until < deadline));
     // The state carries the bounded wait's answer to `wait` when it is the result.
     let answer = wait_warning(
         (proc, None),
@@ -232,10 +242,10 @@ fn wait_to_exit_saying(
             ended
         },
         warn,
-        |(proc, answer)| answer.unwrap_or_else(|| proc.wait(None)),
+        |(proc, answer)| answer.unwrap_or_else(|| proc.wait(deadline)),
     );
     debug_assert!(
-        !matches!(answer, Ok(ChildWaitOutcome::DeadlinePassed)),
+        deadline.is_some() || !matches!(answer, Ok(ChildWaitOutcome::DeadlinePassed)),
         "an unbounded wait ended with no exit"
     );
     answer
@@ -342,11 +352,18 @@ impl Child {
     }
 
     /// [`wait`](Child::wait), which calls `warn` once, with the threshold, if the wait is still going
-    /// `after` into it, and goes on waiting (no cap).
+    /// `after` into it, and goes on waiting (no cap unless `deadline`). `Ok(None)` is `deadline` passed with the
+    /// child still running (as [`wait_deadline`](Child::wait_deadline)); no warn is made for a deadline that
+    /// comes before the threshold.
     #[cfg(windows)]
-    pub(crate) fn wait_saying(&self, after: Duration, warn: impl FnOnce(Duration)) -> Result<ExitStatus, Error> {
-        let outcome = wait_to_exit_saying(&self.proc, Due::in_(Some(after)), warn)?;
-        self.status_of_reap(outcome)
+    pub(crate) fn wait_saying(
+        &self,
+        after: Duration,
+        warn: impl FnOnce(Duration),
+        deadline: Option<Instant>,
+    ) -> Result<Option<ExitStatus>, Error> {
+        let outcome = wait_to_exit_saying(&self.proc, Due::in_(Some(after)), warn, deadline)?;
+        status_of_outcome(self.proc.pid(), outcome, Orphaned::Warn)
     }
 
     /// One wait on the root through its handle, until `deadline` (`None`: for ever). `Ok(None)` is

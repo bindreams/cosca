@@ -207,6 +207,19 @@ async fn ask<D: StopWaits>(
         Err(e) => return SendAnswer::NotSent(e, UnsentKind::NotSent),
     };
     debug_assert_eq!(record.pid, target.pid(), "the child's identity names the child");
+    // A deadline that has passed before the start refuses the call: nothing is started, so nothing was sent.
+    // One that passes during the start is not this: the proxy may have sent, and the wait after it is one look.
+    if target.deadline_passed() {
+        return SendAnswer::NotSent(
+            Error::TimedOut {
+                detail: "the call's timeout had run out before the console-event proxy was started; nothing was sent"
+                    .into(),
+                members: Vec::new(),
+                source: None,
+            },
+            UnsentKind::NotSent,
+        );
+    }
     let args = ProxyArgs {
         target: record.pid,
         target_key: record.token,
@@ -224,14 +237,19 @@ async fn ask<D: StopWaits>(
     };
     // The wait is the driver's; the warning is this body's policy.
     let status = driver
-        .wait_proxy(&mut proxy, crate::wait::teardown_warn::LATE, |after| {
-            warn_still_waiting(Some(proxy_pid), record.pid, event, after)
-        })
+        .wait_proxy(
+            &mut proxy,
+            crate::wait::teardown_warn::LATE,
+            |after| warn_still_waiting(Some(proxy_pid), record.pid, event, after),
+            target.deadline(),
+        )
         .await;
-    // Dropped before the match so a failed wait has ended the proxy before the error returns.
+    // Dropped before the match so a failed wait, and a deadline that ran out, have ended the proxy before
+    // the answer returns.
     drop(proxy);
     let status = match status {
-        Ok(status) => status,
+        Ok(Some(status)) => status,
+        Ok(None) => return SendAnswer::Unknown(timed_out(proxy_pid, event)),
         Err(e) => return wait_failed(proxy_pid, event, e),
     };
     let Some(code) = status.code() else {
@@ -337,6 +355,20 @@ fn wait_failed(proxy_pid: u32, event: CtrlEvent, e: Error) -> SendAnswer {
         ),
         source: Some(Arc::new(e)),
     })
+}
+
+/// The proxy `proxy_pid` had not answered when the call's deadline passed.
+#[cfg(windows)]
+fn timed_out(proxy_pid: u32, event: CtrlEvent) -> Error {
+    Error::TimedOut {
+        detail: format!(
+            "the console-event proxy (pid {proxy_pid}) did not answer within the call's timeout; cosca ended it, \
+             so whether {} was sent is unknown",
+            event.name()
+        ),
+        members: Vec::new(),
+        source: None,
+    }
 }
 
 /// The error of a proxy that sent nothing because a step failed. See [`send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy) for its text, kind

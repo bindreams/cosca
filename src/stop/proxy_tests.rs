@@ -1524,3 +1524,284 @@ fn a_proxy_that_has_not_answered_is_warned_of_once_and_waited_for() {
     );
     kill_release_reap(&child, sock, false);
 }
+
+// A call given a timeout =====
+
+/// The answer of a call whose proxy `proxy` had not answered by its timeout, for the event the default sends.
+fn proxy_timed_out(proxy: u32) -> String {
+    format!(
+        "the console-event proxy (pid {proxy}) did not answer within the call's timeout; cosca ended it, so \
+         whether CTRL_BREAK was sent is unknown"
+    )
+}
+
+/// The proxy's pid and detail from a `TimedOut` answer, after asserting the rest (no member, no source, outcome
+/// `Unknown`).
+fn timed_out_answer(answered: Result<(), crate::stop::StopError>, case: &str) -> (u32, String) {
+    use crate::stop::SendOutcome;
+
+    let err = answered.expect_err("the proxy did not answer by the timeout");
+    assert_eq!(err.outcome(), SendOutcome::Unknown, "{case}");
+    let Error::TimedOut {
+        detail,
+        members,
+        source,
+    } = err.error()
+    else {
+        panic!("{case}: {err:?}")
+    };
+    assert!(members.is_empty(), "{case}: the proxy was ended, so no member is named");
+    assert!(source.is_none(), "{case}: {source:?}");
+    let pid = detail
+        .strip_prefix("the console-event proxy (pid ")
+        .and_then(|rest| rest.split_once(')'))
+        .and_then(|(pid, _)| pid.parse().ok())
+        .unwrap_or_else(|| panic!("{case}: the answer names the proxy: {detail}"));
+    (pid, detail.clone())
+}
+
+/// The call's deadline reaches the wait for the proxy: the held proxy is waited for first to the warn
+/// threshold, which comes before the deadline, and then to the deadline itself, so the second block is armed
+/// for what is left of a generous timeout and no longer. The test tells the proxy to answer at that block
+/// (the first block past the threshold, or an unbounded one), and the call answers as `terminate` does.
+///
+/// Mutant: `None` is passed to the wait for the proxy (the block is unbounded, and the assertion on what it
+/// was armed for fails; the test still releases the proxy there, so no hang).
+#[skuld::test]
+fn a_calls_deadline_bounds_the_wait_for_the_proxy() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use crate::wait::block_probe::{on_each_block, WaitObject};
+
+    let timeout = Duration::from_secs(3600);
+    for tree in [false, true] {
+        let case = format!("tree: {tree}");
+        let held = held_proxy::Held::new();
+        let (child, sock) = hidden_member(&held.fixture);
+        let releaser = held.releaser();
+        let released_at = Rc::new(RefCell::new(Vec::new()));
+        let at_a_block = on_each_block({
+            let released_at = Rc::clone(&released_at);
+            move |block| {
+                if matches!(block.on, WaitObject::Handles)
+                    && block.armed.is_none_or(|armed| armed > crate::wait::teardown_warn::LATE)
+                {
+                    released_at.borrow_mut().push(block.armed);
+                    _ = releaser.send(());
+                }
+            }
+        });
+        let answered = if tree {
+            child.terminate_tree_timeout(timeout)
+        } else {
+            child.terminate_timeout(timeout)
+        };
+        drop(at_a_block);
+        answered.unwrap_or_else(|e| panic!("{case}: the proxy answered Sent, once told: {e:?}"));
+        assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::Sent);
+        assert!(
+            matches!(released_at.borrow()[..], [Some(armed)] if armed <= timeout),
+            "{case}: the wait for the proxy was armed for no longer than the timeout: {released_at:?}"
+        );
+        kill_release_reap(&child, sock, false);
+    }
+}
+
+/// `ask` answers `TimedOut` with `Unknown` for a proxy still running when the call's deadline passes, and
+/// has ended the proxy by the time the call returns. The deadline is passed by hand, with no time in it: the
+/// clock is frozen, the timeout is generous, and at the block that waits for the proxy's warn threshold (a
+/// real wait for a proxy that is held, which cannot end it) the hook advances the frozen clock past the
+/// deadline, so the wait after the threshold finds it passed with the proxy running. The hook
+/// also tells the proxy to answer at an unbounded block, so a call that ignored its deadline answers `Ok`
+/// and fails the assertion on the error, with no hang.
+///
+/// Mutants: the wait's `None` (the deadline passed with the proxy running) is taken as a proxy that
+/// answered, or as a refused send (`NotSent`); the proxy is not dropped before the answer returns; the
+/// deadline is not passed to the wait.
+#[skuld::test]
+fn a_proxy_still_running_when_the_deadline_passes_is_ended_and_the_answer_is_timed_out() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use crate::identity::ProcessId;
+    use crate::wait::block_probe::{on_each_block, WaitObject};
+    use crate::wait::test_clock::{advance, FrozenClockGuard};
+
+    let timeout = Duration::from_secs(3600);
+    for tree in [false, true] {
+        let case = format!("tree: {tree}");
+        let held = held_proxy::Held::new();
+        let (child, sock) = hidden_member(&held.fixture);
+        let releaser = held.releaser();
+        let up = Rc::new(RefCell::new(None::<(u32, ProcessId)>));
+        let (clock, _) = FrozenClockGuard::install();
+        let passed = Cell::new(false);
+        let at_a_block = on_each_block({
+            let (up, held) = (Rc::clone(&up), RefCell::new(Some(held)));
+            move |block| {
+                if !matches!(block.on, WaitObject::Handles) {
+                    return;
+                }
+                if block.armed.is_none() {
+                    _ = releaser.send(());
+                }
+                // The first wait with a length is the threshold's: the proxy is up, and reports its pid.
+                if !passed.get() && block.armed.is_some_and(|armed| !armed.is_zero()) {
+                    passed.set(true);
+                    if let Some(mut held) = held.borrow_mut().take() {
+                        let pid = held.started_blocking();
+                        *up.borrow_mut() = Some((pid, ProcessId::of(pid).found().expect("the held proxy runs")));
+                    }
+                    advance(timeout * 2);
+                }
+            }
+        });
+        let answered = if tree {
+            child.terminate_tree_timeout(timeout)
+        } else {
+            child.terminate_timeout(timeout)
+        };
+        drop(at_a_block);
+        drop(clock);
+        let (proxy, detail) = timed_out_answer(answered, &case);
+        assert_eq!(detail, proxy_timed_out(proxy), "{case}");
+        let (pid, id) = up
+            .borrow_mut()
+            .take()
+            .expect("the threshold's wait ran with the proxy up");
+        assert_eq!(proxy, pid, "{case}: the answer names the proxy that ran");
+        assert!(
+            crate::test_child::exited_through_open(id, Some(Duration::ZERO)).expect("a look at the proxy"),
+            "{case}: the proxy was ended"
+        );
+        kill_release_reap(&child, sock, false);
+    }
+}
+
+/// A wait for the proxy whose deadline has run out ends the wait with the proxy running, and dropping the
+/// proxy's handle ends it: at the driver, with a proxy the test starts and holds and a deadline already past.
+/// The proxy is gone once the handle is dropped, which a look at the process by identity sees (the drop kills
+/// and reaps before it returns). The hook tells the proxy to answer at a block armed for ever, so a wait that
+/// ignored the deadline answers the proxy's exit and fails the assertion, with no hang.
+///
+/// Mutants: the deadline is not read by the wait; the threshold's wait ignores the deadline.
+#[skuld::test]
+fn a_wait_for_the_proxy_past_its_deadline_answers_with_the_proxy_running() {
+    use std::time::Duration;
+
+    use crate::child::graceful::shutdown::{run_ready, BlockingDriver};
+    use crate::identity::ProcessId;
+    use crate::stop::StopWaits as _;
+    use crate::test_child::exited_through_open;
+    use crate::wait::block_probe::on_each_block;
+
+    let mut held = held_proxy::Held::new();
+    let (child, sock) = hidden_member(&held.fixture);
+    let CtrlProxy::Executable(exe) = held.fixture.setting() else {
+        unreachable!("a fixture is an executable proxy")
+    };
+    let mut command = crate::Command::new();
+    command.raw_executable(&exe).detached();
+    command.stdin(crate::Stdio::null()).expect("null stdin");
+    command.stdout(crate::Stdio::null()).expect("null stdout");
+    command.stderr(crate::Stdio::null()).expect("null stderr");
+    let mut proxy = command.spawn().expect("start the held proxy");
+    let id = ProcessId::of(held.started_blocking())
+        .found()
+        .expect("the held proxy runs");
+
+    let releaser = held.releaser();
+    let at_an_unbounded_block = on_each_block(move |block| {
+        if block.armed.is_none() {
+            _ = releaser.send(());
+        }
+    });
+    let waited = run_ready(BlockingDriver(&child).wait_proxy(
+        &mut proxy,
+        crate::wait::teardown_warn::LATE,
+        |_| panic!("the threshold is past the deadline: nothing is waited for to warn of"),
+        crate::wait::deadline_from(Duration::ZERO),
+    ));
+    drop(at_an_unbounded_block);
+    assert!(
+        matches!(waited, Ok(None)),
+        "the deadline ended the wait with the proxy running: {waited:?}"
+    );
+    assert!(
+        !exited_through_open(id, Some(Duration::ZERO)).expect("a look at the proxy"),
+        "the proxy is still running when the wait answers"
+    );
+    drop(proxy);
+    assert!(
+        exited_through_open(id, Some(Duration::ZERO)).expect("a look at the proxy"),
+        "the proxy is gone once its handle is dropped"
+    );
+    kill_release_reap(&child, sock, false);
+}
+
+/// A call whose timeout is already past is refused before the proxy is started: nothing is sent, so the
+/// answer is `NotSent` (the call's outcome), `TimedOut` with no member, and the fixture, which answers `Sent`,
+/// never ran. For a root and a tree call.
+///
+/// Mutants: the proxy is started and then ended (the fixture ran); the answer is `Unknown`.
+#[skuld::test]
+fn a_timeout_already_past_refuses_the_call_before_the_proxy_is_started() {
+    use std::time::Duration;
+
+    use crate::stop::SendOutcome;
+
+    for tree in [false, true] {
+        let case = format!("tree: {tree}");
+        let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+        let (child, sock) = hidden_member(&fixture);
+        let answered = if tree {
+            child.terminate_tree_timeout(Duration::ZERO)
+        } else {
+            child.terminate_timeout(Duration::ZERO)
+        };
+        let err = answered.expect_err("the timeout was past before the proxy would start");
+        assert_eq!(err.outcome(), SendOutcome::NotSent, "{case}");
+        let Error::TimedOut {
+            detail,
+            members,
+            source,
+        } = err.error()
+        else {
+            panic!("{case}: {err:?}")
+        };
+        assert_eq!(
+            detail, "the call's timeout had run out before the console-event proxy was started; nothing was sent",
+            "{case}"
+        );
+        assert!(members.is_empty() && source.is_none(), "{case}: {err:?}");
+        assert!(fixture.ran().is_none(), "{case}: no proxy was started");
+        assert_no_break_sent();
+        kill_release_reap(&child, sock, false);
+    }
+}
+
+/// A proxy that answers within a generous timeout is answered as the call without a timeout answers it:
+/// `Sent` is `Ok`, and the proxy was asked for this child and event.
+///
+/// Mutant: a generous deadline is read as already past (the call fails with the proxy's answer in hand).
+#[skuld::test]
+fn a_proxy_that_answers_within_the_timeout_is_answered_as_without_one() {
+    use std::time::Duration;
+
+    for tree in [false, true] {
+        let fixture = Fixture::answering(ProxyAnswer::Sent.code());
+        let (child, sock) = hidden_member(&fixture);
+        let timeout = Duration::from_secs(3600);
+        if tree {
+            child.terminate_tree_timeout(timeout)
+        } else {
+            child.terminate_timeout(timeout)
+        }
+        .unwrap_or_else(|e| panic!("tree: {tree}: Sent is Ok: {e:?}"));
+        assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::Sent);
+        kill_release_reap(&child, sock, false);
+    }
+}

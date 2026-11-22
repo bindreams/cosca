@@ -1582,3 +1582,92 @@ fn with_note_on_a_member_not_killed_is_a_contract_breach() {
     }
     .with_note("n");
 }
+
+/// A `TimedOut` says its detail in its own words, holds the processes it names and the cause below it, takes
+/// a note after the detail, and takes the call's other failures below it with the cause it has.
+///
+/// Mutants: the Display says the cause's words; the source is dropped; a note replaces the detail or drops
+/// the members; a peer replaces the cause or the variant; the peers of a timeout with no cause of its own are
+/// dropped, or only the first is kept.
+#[skuld::test]
+fn a_timed_out_says_its_detail_and_keeps_its_members_and_cause() {
+    let id = crate::identity::ProcessId::current();
+    let e = Error::TimedOut {
+        detail: "the child (pid 7) was still running".into(),
+        members: vec![id],
+        source: Some(coded(CODES[0])),
+    };
+    assert_eq!(
+        e.to_string(),
+        "the timeout the call was given ran out: the child (pid 7) was still running"
+    );
+    assert_eq!(first_os_code(&e), Some(CODES[0]), "the cause is the source");
+    let bare = Error::TimedOut {
+        detail: "d".into(),
+        members: Vec::new(),
+        source: None,
+    };
+    assert!(std::error::Error::source(&bare).is_none());
+
+    let noted = e.with_note("left running");
+    let Error::TimedOut {
+        detail,
+        members,
+        source: Some(source),
+    } = &noted
+    else {
+        panic!("a note keeps the variant and its cause: {noted:?}");
+    };
+    assert_eq!(detail, "the child (pid 7) was still running; left running");
+    assert_eq!(members, &[id]);
+    assert!(matches!(&**source, Error::Io(_)));
+
+    let peered = noted.with_peers([coded(CODES[1])]);
+    let Error::TimedOut {
+        members,
+        source: Some(source),
+        ..
+    } = &peered
+    else {
+        panic!("a peer keeps the variant: {peered:?}");
+    };
+    assert_eq!(members, &[id]);
+    let Error::Several(list) = &**source else {
+        panic!("the cause and the peer are a list: {source:?}");
+    };
+    assert_eq!(codes_of(list), [Some(CODES[0]), Some(CODES[1])]);
+
+    // The shape the calls build: no cause of its own. One peer is the cause as it is, two are a list.
+    let bare = || Error::TimedOut {
+        detail: "d".into(),
+        members: Vec::new(),
+        source: None,
+    };
+    let one = bare().with_peers([coded(CODES[0])]);
+    let Error::TimedOut {
+        detail,
+        members,
+        source: Some(source),
+    } = &one
+    else {
+        panic!("a peer is the cause of a timeout that had none: {one:?}");
+    };
+    assert_eq!(detail, "d");
+    assert!(members.is_empty());
+    assert!(
+        matches!(&**source, Error::Io(_)),
+        "one peer is not wrapped in a list: {source:?}"
+    );
+    assert_eq!(first_os_code(&one), Some(CODES[0]));
+    let two = bare().with_peers([coded(CODES[0]), coded(CODES[1])]);
+    let Error::TimedOut {
+        source: Some(source), ..
+    } = &two
+    else {
+        panic!("the peers are the cause of a timeout that had none: {two:?}");
+    };
+    let Error::Several(list) = &**source else {
+        panic!("two peers are a list: {source:?}");
+    };
+    assert_eq!(codes_of(list), [Some(CODES[0]), Some(CODES[1])]);
+}
