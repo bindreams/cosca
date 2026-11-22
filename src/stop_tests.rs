@@ -546,13 +546,14 @@ fn a_timeout_call_bounds_the_wait_its_action_makes_and_a_plain_call_does_not() {
 /// A timeout too large for the clock is no bound, as for every timeout in the crate: the call makes the wait the
 /// plain call makes, which is unbounded (the hook ends the root at that block) and answers `Ok`, with no panic.
 ///
-/// Mutant: a timeout that overflows the clock is read as already passed (the action's wait answers `TimedOut`).
+/// Mutants: the overflowing timeout is read as already passed (the wait answers `TimedOut`), or as a far deadline
+/// (the wait blocks with a bound).
 #[skuld::test]
 fn a_timeout_too_large_for_the_clock_is_no_bound() {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crate::wait::block_probe::{on_each_block, take};
+    use crate::wait::block_probe::on_each_block;
 
     for tree in [false, true] {
         let waited = Arc::new(Mutex::new(Vec::new()));
@@ -567,11 +568,16 @@ fn a_timeout_too_large_for_the_clock_is_no_bound() {
             tree,
         );
         let stdin = Rc::new(RefCell::new(Some(stdin)));
+        // A recheck pause runs no block hook, so only blocks land here.
+        let blocks = Rc::new(RefCell::new(Vec::new()));
         let _release = on_each_block({
             let stdin = Rc::clone(&stdin);
-            move |_| drop(stdin.borrow_mut().take())
+            let blocks = Rc::clone(&blocks);
+            move |block| {
+                blocks.borrow_mut().push(block.armed);
+                drop(stdin.borrow_mut().take());
+            }
         });
-        take();
         let answered = if tree {
             child.terminate_tree_timeout(Duration::MAX)
         } else {
@@ -579,9 +585,11 @@ fn a_timeout_too_large_for_the_clock_is_no_bound() {
         };
         answered.unwrap_or_else(|e| panic!("tree: {tree}: no bound, so the wait is for the exit: {e:?}"));
         assert_eq!(*waited.lock().unwrap(), [true], "tree: {tree}");
+        // The hook stays armed through the reap.
+        let blocks = blocks.take();
         assert!(
-            take().iter().all(Option::is_none),
-            "tree: {tree}: every block was unbounded"
+            !blocks.is_empty() && blocks.iter().all(Option::is_none),
+            "tree: {tree}: every block was unbounded: {blocks:?}"
         );
         let status = child.wait().expect("the exited root is reaped");
         assert!(
