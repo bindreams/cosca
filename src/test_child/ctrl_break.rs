@@ -32,6 +32,8 @@ const TAG_ENV: &str = "COSCA_FIXTURE_CTRL_BREAK_TAG";
 const HANDLER_ENV: &str = "COSCA_FIXTURE_CTRL_BREAK_HANDLER";
 /// Set on a root: the [`Handler`] of the grandchild it starts.
 const GRANDCHILD_ENV: &str = "COSCA_FIXTURE_CTRL_BREAK_GRANDCHILD";
+/// Set on a member: after its tag it calls `FreeConsole` and writes `F`, so the caller knows it has none.
+pub(crate) const FREE_CONSOLE_ENV: &str = "COSCA_FIXTURE_CTRL_BREAK_FREE_CONSOLE";
 
 /// How a member answers a console control event.
 #[derive(Clone, Copy)]
@@ -128,6 +130,11 @@ fn fixture_ctrl_break_member() {
             .expect("report the grandchild's pid");
         grandchild
     });
+    if std::env::var_os(FREE_CONSOLE_ENV).is_some() {
+        // SAFETY: no preconditions.
+        unsafe { windows::Win32::System::Console::FreeConsole() }.expect("free the console");
+        sock.write_all(b"F").expect("report the freed console");
+    }
     sock.flush().expect("flush");
     let mut sink = [0u8; 1];
     _ = sock.read(&mut sink);

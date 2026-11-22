@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use super::protocol::{exit_text, Cause, CtrlEvent, ProxyAnswer, ProxyArgs, ProxyExit, Step, VERSION};
 use super::{exe_unreadable, failed_step, start_failed, wait_failed, CtrlProxy};
-use crate::containment::SendAnswer;
+use crate::containment::{SendAnswer, UnsentKind};
 use crate::error::Error;
 use crate::stop::{self, StopTarget};
 use crate::test_child::ctrl_break::{
@@ -464,25 +464,36 @@ fn a_refused_attach_to_a_running_child_is_unsupported() {
     }
 }
 
-/// A child the proxy found no console for, that had not exited: the error says what was observed and
-/// lists as possible causes that the child has none or has not set it up yet, and names `Child::kill`
+/// A child the proxy found no console for, that had not exited and that cosca's read found finished starting
+/// without one (a `detached()` child after its first line): the error says what was observed, that the child
+/// had finished starting without a console (and that a program can create one later), and names `Child::kill`
 /// first, `stop::send_wm_close` (the action that fits a GUI child) second and `Command::graceful_stop` last.
-/// Mutants: the text of `AttachDenied` is used (the missing console is not listed as a cause); the remedies
-/// swapped or dropped, or `send_wm_close` not named; a cause stated as the conclusion.
+/// The outcome is `NotSent`, not `NotYet`.
+/// Mutants: the text of `AttachDenied` is used (the missing console is not stated); the remedies swapped or
+/// dropped, or `send_wm_close` not named; the child is said to have no console for good; a child that
+/// finished without a console is `NotYet`.
 #[skuld::test]
-fn a_target_with_no_console_is_unsupported_and_names_the_remedies() {
+fn a_target_that_finished_starting_without_a_console_is_unsupported_and_names_the_remedies() {
     let fixture = Fixture::answering(ProxyAnswer::TargetHasNoConsole.code());
-    let (child, sock) = hidden_member(&fixture);
-    let err = send_err(&child, CtrlEvent::CtrlC);
-    let detail = unsupported_detail(&err);
+    let (child, sock) = member(&fixture, |cmd| _ = cmd.detached());
+    let stopped = child.terminate().expect_err("the child has no console to send to");
+    assert_eq!(stopped.outcome(), crate::stop::SendOutcome::NotSent);
+    let detail = unsupported_detail(stopped.error());
     assert!(detail.contains("did not succeed"), "{detail}");
     assert!(detail.contains("answer TargetHasNoConsole"), "{detail}");
     assert!(detail.contains("had not exited when cosca looked"), "{detail}");
-    assert!(detail.contains("may have no console"), "{detail}");
-    assert!(detail.contains("may not have started running yet"), "{detail}");
+    assert!(
+        detail.contains("had finished starting without a console"),
+        "the child's state is stated: {detail}"
+    );
+    assert!(
+        detail.contains("a program can create or attach one later"),
+        "no claim that it never will: {detail}"
+    );
+    assert!(!detail.contains("not finished starting"), "{detail}");
     names_in_order(detail, "Child::kill", "stop::send_wm_close");
     names_in_order(detail, "stop::send_wm_close", "Command::graceful_stop");
-    assert_proxy_answered(child.pid(), CtrlEvent::CtrlC, ProxyAnswer::TargetHasNoConsole);
+    assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::TargetHasNoConsole);
     kill_release_reap(&child, sock, false);
 }
 
@@ -693,6 +704,265 @@ fn a_detached_child_is_asked_and_gets_the_proxys_no_console_answer() {
     kill_release_reap(&child, sock, false);
 }
 
+// What the read of the child decides =====
+
+/// What `result_of` answers when the attach found no console (or failed with Win32 error 31) and the read
+/// returns each state in the table: `NotSent` only for finished with handle `0`, `NotYet` for any other
+/// state; for a failed read or a child of another layout, `NotSent` with the read as `source()` (no-console
+/// arm) or the failed step's `Io` with code 31 (setup arm). The child does not exit, so the second look
+/// after a failed read finds it running.
+///
+/// Mutants: the arm answers `NotBegun` or `Initializing` as finished; any handle other than `0` reads as
+/// finished; a failed read reads as `NotYet` or as finished; the failed read's cause is dropped; the
+/// error's words say the child will never have a console; no second look at the exit follows a failed read
+/// (the row's count of looks is 1, not 2).
+#[skuld::test]
+fn the_state_the_read_returns_decides_not_yet_from_finished_without_a_console() {
+    use crate::identity::StartupRead;
+    use crate::os_process::fake::Answer;
+
+    /// What the rule says of a read.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Want {
+        Finished,
+        NotYet,
+        Unread,
+    }
+    type Read = fn() -> std::io::Result<StartupRead>;
+    fn finished(console_handle: isize) -> std::io::Result<StartupRead> {
+        Ok(StartupRead::Finished { console_handle })
+    }
+    let rows: [(&str, Read, Want); 9] = [
+        ("finished with no console", || finished(0), Want::Finished),
+        ("not run: Ldr null", || Ok(StartupRead::NotBegun), Want::NotYet),
+        (
+            "loader running: the bit set",
+            || Ok(StartupRead::Initializing),
+            Want::NotYet,
+        ),
+        ("finished, handle -1", || finished(-1), Want::NotYet),
+        ("finished, handle -3", || finished(-3), Want::NotYet),
+        ("finished, handle 4", || finished(4), Want::NotYet),
+        ("finished, a console's handle", || finished(92), Want::NotYet),
+        (
+            "the read failed",
+            || Err(std::io::Error::from_raw_os_error(299)),
+            Want::Unread,
+        ),
+        (
+            "a child of another layout",
+            || Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "a 32-bit child")),
+            Want::Unread,
+        ),
+    ];
+    let no_console = ProxyExit::from(ProxyAnswer::TargetHasNoConsole);
+    let in_setup = ProxyExit::from(Cause::new(Step::AttachConsole, Some(31)));
+    for (arm, exit) in [("no console", no_console), ("attach failed in setup", in_setup)] {
+        let saw = if exit == no_console {
+            format!(
+                "the console-event proxy's attach to the child's console did not succeed (answer \
+                 TargetHasNoConsole, exit {})",
+                ProxyAnswer::TargetHasNoConsole.code()
+            )
+        } else {
+            format!(
+                "the console-event proxy's AttachConsole to the child's console failed with Win32 error 31 (exit {})",
+                exit_text(exit.code())
+            )
+        };
+        for (what, read, want) in rows {
+            // One look before the read, and one more after a read that failed.
+            let looks = if want == Want::Unread { 2 } else { 1 };
+            let (answer, pid, made) = answer_over_a_stated_read(exit, read(), [Answer::Running].repeat(looks));
+            let label = format!("{arm}, {what}");
+            assert_eq!(made, looks, "{label}: the looks made");
+            match (want, answer) {
+                (Want::NotYet, SendAnswer::NotSent(Error::Unsupported { detail, source, .. }, UnsentKind::NotYet)) => {
+                    assert!(source.is_none(), "{label}");
+                    assert_eq!(
+                        detail,
+                        format!(
+                            "{saw}, and the child (pid {pid}) had not set its console up when the console-event \
+                             proxy asked, so nothing was sent. Asking again can succeed."
+                        ),
+                        "{label}"
+                    );
+                }
+                (Want::Unread, SendAnswer::NotSent(Error::Unsupported { detail, source, .. }, UnsentKind::NotSent))
+                    if exit == no_console =>
+                {
+                    assert_eq!(
+                        detail,
+                        format!(
+                            "{saw}, and cosca could not tell whether the child had finished starting (reading \
+                             its start-up state failed), so nothing was sent. Use Child::kill for a hard \
+                             teardown, stop::send_wm_close for a GUI child that shows a window, or \
+                             Command::graceful_stop with a stop of your own."
+                        ),
+                        "{label}"
+                    );
+                    let Some(source) = source else {
+                        panic!("{label}: the read is the cause")
+                    };
+                    let Error::Io(cause) = &*source else {
+                        panic!("{label}: {source:?}")
+                    };
+                    let stated = read().expect_err("the row's read fails");
+                    assert_eq!(
+                        (cause.kind(), cause.raw_os_error(), cause.to_string()),
+                        (stated.kind(), stated.raw_os_error(), stated.to_string()),
+                        "{label}"
+                    );
+                }
+                (Want::Finished, SendAnswer::NotSent(Error::Unsupported { detail, .. }, UnsentKind::NotSent))
+                    if exit == no_console =>
+                {
+                    assert!(detail.starts_with(&saw), "{label}: {detail}");
+                    assert!(
+                        detail.contains(
+                            ", and the child had not exited when cosca looked, so nothing was sent. The child had \
+                             finished starting without a console (it was created without one, or gave it up), so \
+                             it has none to attach to now; a program can create or attach one later. Use \
+                             Child::kill"
+                        ),
+                        "{label}: {detail}"
+                    );
+                }
+                (Want::Finished | Want::Unread, SendAnswer::NotSent(Error::Io(failed), UnsentKind::NotSent))
+                    if exit == in_setup =>
+                {
+                    let failed = Error::Io(failed);
+                    let report = crate::error::Report(&failed).to_string();
+                    assert!(report.contains("nothing was sent"), "{label}: {report}");
+                    assert!(report.contains("AttachConsole"), "{label}: {report}");
+                    assert_eq!(crate::error::first_os_code(&failed), Some(31), "{label}");
+                }
+                (_, other) => panic!("{label}: {other:?}"),
+            }
+        }
+    }
+}
+
+/// An attach that failed with a refusal that is none of "no console" or "setup", or a proxy that answered
+/// anything but no console, makes no read: the fake kernel has no row to answer one with, and a read would
+/// fail the call. A child that exited is answered `RootExited` before any read, whether the attach found no
+/// console or failed in setup (Win32 error 31).
+///
+/// Mutants: the read is made for every refused attach; for every failed step; for a child that exited.
+#[skuld::test]
+fn only_the_attach_that_found_no_console_reads_the_child() {
+    use crate::child::graceful::shutdown::{run_ready, BlockingDriver};
+    use crate::identity::{spawn_kernel, FakeKernel};
+    use crate::os_process::fake::{Answer, FakeProcess};
+
+    let answering = |exited: Answer, exit: ProxyExit| {
+        let fake = FakeProcess::new([exited]).with_kernel(spawn_kernel(FakeKernel::new()));
+        let child = crate::test_child::over_fake::child_over(&fake);
+        run_ready(super::result_of(
+            &BlockingDriver(&child),
+            &StopTarget::from(&child),
+            CtrlEvent::CtrlC,
+            std::path::Path::new("proxy.exe"),
+            exit,
+        ))
+    };
+    for exit in [
+        ProxyExit::from(ProxyAnswer::AttachDenied),
+        ProxyExit::from(ProxyAnswer::TargetGone),
+        ProxyExit::from(ProxyAnswer::Sent),
+        ProxyExit::from(Cause::new(Step::AttachConsole, Some(5))),
+        ProxyExit::from(Cause::new(Step::AttachConsole, None)),
+        ProxyExit::from(Cause::new(Step::Generate, Some(31))),
+    ] {
+        let answer = answering(Answer::Running, exit);
+        assert_ne!(answer.outcome(), crate::stop::SendOutcome::NotYet, "{exit:?}");
+    }
+
+    for exit in [
+        ProxyExit::from(ProxyAnswer::TargetHasNoConsole),
+        ProxyExit::from(Cause::new(Step::AttachConsole, Some(31))),
+    ] {
+        let answer = answering(Answer::Exited, exit);
+        assert!(matches!(answer, SendAnswer::RootExited(_)), "{exit:?}: {answer:?}");
+    }
+}
+
+/// A child that exited after the first look and before the read is answered `RootExited`, as the first look
+/// answers an exited child: the read of a dead process fails, and that failure is not "could not tell". The
+/// first look finds it running, the read fails, the second look finds it exited. A read that succeeds makes
+/// no second look (`the_state_the_read_returns_decides_not_yet_from_finished_without_a_console` states one
+/// look for those rows).
+///
+/// Mutants: no second look after a failed read (the answer is `NotSent`, "could not tell"); the second look
+/// is made for the arm of the failed attach only, or the no-console arm only.
+#[skuld::test]
+fn a_child_that_exited_before_the_failed_read_is_answered_as_exited() {
+    use crate::os_process::fake::Answer;
+
+    for exit in [
+        ProxyExit::from(ProxyAnswer::TargetHasNoConsole),
+        ProxyExit::from(Cause::new(Step::AttachConsole, Some(31))),
+    ] {
+        let read = Err(std::io::Error::from_raw_os_error(299));
+        let (answer, _, _) = answer_over_a_stated_read(exit, read, vec![Answer::Running, Answer::Exited]);
+        let SendAnswer::RootExited(Error::Unassessable { detail, .. }) = &answer else {
+            panic!("{exit:?}: {answer:?}")
+        };
+        assert!(
+            detail.contains("the child had exited when cosca looked"),
+            "{exit:?}: {detail}"
+        );
+        assert!(detail.contains("nothing was sent"), "{exit:?}: {detail}");
+    }
+}
+
+/// An attach that failed with Win32 error 31 (the step `AttachConsole`) for a child the read finds finished
+/// starting without a console is the failed-step error: `NotSent`, nothing sent, the step named and the
+/// OS code 31 its source.
+///
+/// Mutants: the failed step answers `NotYet` whatever the read found; the OS code is dropped.
+#[skuld::test]
+fn an_attach_that_failed_in_setup_for_a_child_with_no_console_is_the_failed_step() {
+    let exit = ProxyExit::from(Cause::new(Step::AttachConsole, Some(31)));
+    let fixture = Fixture::answering(exit.code());
+    let (child, sock) = member(&fixture, |cmd| _ = cmd.detached());
+
+    let stopped = child.terminate().expect_err("the proxy failed a step");
+
+    assert_eq!(stopped.outcome(), crate::stop::SendOutcome::NotSent);
+    assert!(
+        matches!(stopped.error(), Error::Io(e) if e.to_string().contains("nothing was sent")),
+        "{stopped:?}"
+    );
+    assert_eq!(crate::error::first_os_code(stopped.error()), Some(31));
+    assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, exit);
+    kill_release_reap(&child, sock, false);
+}
+
+/// `result_of`'s answer for the proxy's `exit`, for a child whose successive looks at its exit answer
+/// `looks`, and whose start-up state the fake kernel answers `read`; the child's pid and how many looks at
+/// its exit were made.
+fn answer_over_a_stated_read(
+    exit: ProxyExit,
+    read: std::io::Result<crate::identity::StartupRead>,
+    looks: Vec<crate::os_process::fake::Answer>,
+) -> (SendAnswer, u32, usize) {
+    use crate::child::graceful::shutdown::{run_ready, BlockingDriver};
+    use crate::identity::{spawn_kernel, FakeKernel};
+    use crate::os_process::fake::FakeProcess;
+
+    let fake = FakeProcess::new(looks).with_kernel(spawn_kernel(FakeKernel::new().on_start_state(read)));
+    let child = crate::test_child::over_fake::child_over(&fake);
+    let answer = run_ready(super::result_of(
+        &BlockingDriver(&child),
+        &StopTarget::from(&child),
+        CtrlEvent::CtrlC,
+        std::path::Path::new("proxy.exe"),
+        exit,
+    ));
+    (answer, child.pid(), fake.looks())
+}
+
 // Refusals before anything starts =====
 
 /// A child with no identity cannot be named exactly, so the proxy, which names its target by
@@ -847,13 +1117,15 @@ fn the_calls_answer_what_the_proxy_answered() {
 /// target and for a tree target over a job object and over a tree walk: `Sent` is `Ok`; an answer or a
 /// failed step that says nothing was sent is `NotSent`; one that cannot say whether the event went out
 /// (`Unconfirmed`, an exit that is no answer) is `Unknown`. The child is running, so an attach the proxy
-/// could not make is a refusal.
+/// could not make is a refusal. The child has a console, which no attach failure measured for a real child
+/// leaves it with, so the read finds it not finished: `TargetHasNoConsole` is `NotYet`.
 ///
 /// Mutants: `Unconfirmed` or an exit that is no answer reads as `Sent`; an answer that sent nothing reads as
-/// `Unknown`; a tree target's route loses the difference (the job object's, or the tree walk's).
+/// `Unknown`; a tree target's route loses the difference (the job object's, or the tree walk's); a no-console
+/// answer reads as `NotSent` whatever the read found.
 #[skuld::test]
 fn a_failed_call_says_from_the_proxys_exit_whether_the_event_went_out() {
-    use crate::stop::SendOutcome::{self, NotSent, Unknown};
+    use crate::stop::SendOutcome::{self, NotSent, NotYet, Unknown};
 
     let answered = |answer: ProxyAnswer| (answer.code(), Some(ProxyExit::from(answer)));
     // The exit, the answer the call records for it (`None`: no answer, so none is recorded), the outcome.
@@ -888,7 +1160,7 @@ fn a_failed_call_says_from_the_proxys_exit_whether_the_event_went_out() {
         (
             answered(ProxyAnswer::TargetHasNoConsole).0,
             answered(ProxyAnswer::TargetHasNoConsole).1,
-            Some(NotSent),
+            Some(NotYet),
         ),
         (
             answered(ProxyAnswer::AttachDenied).0,
@@ -1145,7 +1417,7 @@ fn a_start_that_may_have_started_the_proxy_may_have_sent() {
         SendAnswer::Unknown(Error::MayHaveStarted { .. })
     ));
 
-    let SendAnswer::NotSent(Error::Io(io)) = start_failed(
+    let SendAnswer::NotSent(Error::Io(io), UnsentKind::NotSent) = start_failed(
         exe,
         Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
     ) else {
@@ -1172,7 +1444,10 @@ fn a_start_that_may_have_started_the_proxy_may_have_sent() {
     ] {
         let answer = start_failed(exe, failed);
         assert_eq!(answer.outcome(), crate::stop::SendOutcome::NotSent, "{answer:?}");
-        assert!(matches!(answer, SendAnswer::NotSent(_)), "{answer:?}");
+        assert!(
+            matches!(answer, SendAnswer::NotSent(_, UnsentKind::NotSent)),
+            "{answer:?}"
+        );
     }
 }
 
@@ -1199,7 +1474,8 @@ fn a_failed_wait_for_the_proxy_is_unknown_and_says_the_proxy_was_ended() {
 /// seam. Mutants: the kind is lost; the failure is a send that may have gone out.
 #[skuld::test]
 fn an_unreadable_host_path_sends_nothing_and_keeps_the_os_error() {
-    let SendAnswer::NotSent(Error::Io(io)) = exe_unreadable(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    let SendAnswer::NotSent(Error::Io(io), UnsentKind::NotSent) =
+        exe_unreadable(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
     else {
         panic!("nothing was sent")
     };

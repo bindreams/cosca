@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::{conclude, root_exited, unsupported, Scope, StopTarget, StopWaits, REMEDIES};
 use crate::containment::mechanism::Members;
-use crate::containment::SendAnswer;
+use crate::containment::{SendAnswer, UnsentKind};
 use crate::error::{io_context, io_context_over, win32_io_error, Error};
 use crate::identity::{Kernel, ProcessId};
 
@@ -265,25 +265,28 @@ pub(super) fn answer(folded: Fold) -> Option<SendAnswer> {
         }
         Fold::Failed { first, others } => {
             warn_all(&others, false);
-            Some(SendAnswer::NotSent(Error::Io(io_context_over(
-                "nothing was sent",
-                first,
-            ))))
+            Some(SendAnswer::NotSent(
+                Error::Io(io_context_over("nothing was sent", first)),
+                UnsentKind::NotSent,
+            ))
         }
         Fold::Refused { first, others } => {
             for refusal in &others {
                 warn_refused(refusal, false);
             }
-            Some(SendAnswer::NotSent(unsupported(
-                format!(
+            Some(SendAnswer::NotSent(
+                unsupported(
+                    format!(
                     "every window that was asked refused WM_CLOSE (the first: {}), as a window of higher integrity or \
                      one with a message filter does, so nothing was sent. {REMEDIES}",
                     first.subject()
                 ),
-                Some(Error::io_cause(io::Error::from_raw_os_error(
-                    ERROR_ACCESS_DENIED.0 as i32,
-                ))),
-            )))
+                    Some(Error::io_cause(io::Error::from_raw_os_error(
+                        ERROR_ACCESS_DENIED.0 as i32,
+                    ))),
+                ),
+                UnsentKind::NotSent,
+            ))
         }
         Fold::NothingAsked => None,
     }
@@ -458,7 +461,7 @@ fn after_failed_post(pid: u32, class: &str, error: io::Error) -> Window {
 
 /// The send, made without waiting: `None` when no window was asked; [`send`] then looks at the root.
 fn attempt(target: &StopTarget<'_>) -> Option<SendAnswer> {
-    let not_sent = |error| Some(SendAnswer::NotSent(error));
+    let not_sent = |error| Some(SendAnswer::NotSent(error, UnsentKind::NotSent));
     let Some(id) = target.id() else {
         return not_sent(unsupported(format!("{NO_IDENTITY_REASON} {REMEDIES}"), None));
     };
@@ -509,8 +512,8 @@ async fn outcome<D: StopWaits>(driver: &D, target: &StopTarget<'_>) -> SendAnswe
                 ),
                 "no window of a member of its tree that outlived it was asked",
             )),
-            Ok(false) => SendAnswer::NotSent(no_visible_window(target.covers_tree())),
-            Err(look_failed) => SendAnswer::NotSent(look_failed),
+            Ok(false) => SendAnswer::NotSent(no_visible_window(target.covers_tree()), UnsentKind::NotSent),
+            Err(look_failed) => SendAnswer::NotSent(look_failed, UnsentKind::NotSent),
         },
     }
 }

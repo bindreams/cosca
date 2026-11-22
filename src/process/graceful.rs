@@ -198,15 +198,18 @@ impl Process {
         {
             let _ = (kernel, self.id);
             (
-                SendAnswer::NotSent(Error::Unsupported {
-                    op: "foreign tree graceful terminate".into(),
-                    platform: "windows",
-                    detail: "Windows has no per-process graceful signal, and a foreign process \
+                SendAnswer::NotSent(
+                    Error::Unsupported {
+                        op: "foreign tree graceful terminate".into(),
+                        platform: "windows",
+                        detail: "Windows has no per-process graceful signal, and a foreign process \
                              shares no addressable process group with us; use kill_tree for a hard \
                              identity-walk sweep"
-                        .into(),
-                    source: None,
-                }),
+                            .into(),
+                        source: None,
+                    },
+                    crate::containment::UnsentKind::NotSent,
+                ),
                 None,
             )
         }
@@ -234,7 +237,7 @@ impl Process {
         let (sent, listing) = self.terminate_walk(&**kernel);
         let contained = || Tree::contained(Mechanism::Walk(Walker::new(self.id, Arc::clone(kernel))));
         let (tree, walk) = match sent {
-            SendAnswer::NotSent(not_sent) => return Err(not_sent),
+            SendAnswer::NotSent(not_sent, _) => return Err(not_sent),
             SendAnswer::Sent(Err(failed)) | SendAnswer::NoneReached(Err(failed)) | SendAnswer::Unknown(failed) => {
                 debug_assert!(false, "a walk's send is never `Sent(Err)` or unknown: {failed}");
                 return Err(failed);

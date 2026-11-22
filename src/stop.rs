@@ -132,8 +132,10 @@
 //! - **The proxy needs a host that called [`init_helpers`](crate::init_helpers)**, or a
 //!   `Command::ctrl_proxy` naming the `cosca-ctrl-proxy` executable. A stop that would start the host as
 //!   the proxy panics in a host that did neither: see [`default`]'s `# Panics`.
-//! - **A stop sent before the child has set its console up.** A proxy-routed child can look like one with
-//!   no console: see [`default`].
+//! - **A stop sent before the child has set its console up** (it has not run, or is early in its start-up) finds no console to
+//!   attach to and is answered [`NotYet`](SendOutcome::NotYet), which the caller asks again: see [`default`] and
+//!   `send_console_event_via_proxy`. A child of a layout that was not measured is not told apart from one
+//!   that finished without a console.
 //! - **The wait for the proxy has no cap, and the grace starts when the action returns:** see
 //!   `send_console_event_via_proxy` and
 //!   [`Child::graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree).
@@ -159,6 +161,7 @@ pub(crate) use waits::StopWaits;
 
 #[cfg(windows)]
 use crate::containment::SendAnswer;
+use crate::containment::UnsentKind;
 #[cfg(windows)]
 use proxy::protocol::CtrlEvent;
 
@@ -202,16 +205,20 @@ use crate::error::Error;
 /// - Case 3, a child a system elevation service created on a UAC consent: the error names `kill()`. Nothing
 ///   is started.
 /// - Case 3, the child has no console to attach to (`detached()`, or a GUI-subsystem program given
-///   `no_window`), or has not set one up yet: the proxy finds none and the error names `Child::kill`, and
-///   `stop::send_wm_close` as the action that fits a GUI child.
+///   `no_window`), and its start-up is over: the proxy finds none and the error names `Child::kill`, and
+///   `stop::send_wm_close` as the action that fits a GUI child. The outcome is `NotSent`.
+/// - Case 3, the child had not set its console up when the proxy asked (it had not run, or was early in its start-up): not a
+///   refusal to act on, though the error is also an [`Error::Unsupported`]. Nothing was sent, the outcome is
+///   [`NotYet`](SendOutcome::NotYet), and asking again can succeed.
+/// - Case 3, cosca could not tell which of the two (a child of a layout that was not measured, a failed
+///   read): the outcome is `NotSent`, and the error names `Child::kill` too.
 /// - Case 3, the child's console is also this process's own (one changed console after the spawn): an event
 ///   sent there would reach this process too. The error names `stop::send_ctrl_break_to_group`, and
 ///   `Command::new_process_group` for a child that leads no group.
 ///
-/// **Before the child has run.** A child that has not set its console up yet looks like one without a
-/// console, so a stop sent to a just-spawned child of case 3 can be refused as in the case 3 item for a
-/// child with no console to attach to, and the graceful calls end there with the child running. A caller
-/// that has observed output or a handshake from the child is past that window. A caller that wants the
+/// **Before the child has finished starting.** cosca neither waits nor asks again
+/// itself; the caller asks again, within a bound of its own. `send_console_event_via_proxy` gives the
+/// measured length of that window and the limit for a child of another layout. A caller that wants the
 /// child gone before it has run at all uses `Child::kill`.
 ///
 /// The route is chosen from what was true at the spawn, so a caller that changes its own console
@@ -330,7 +337,7 @@ pub fn send_signal(target: &StopTarget<'_>, signal: crate::Signal) -> Result<(),
                     Ok(crate::signal::Sent::Delivered) => target.note_root_sent(signal.name()),
                     // Not delivered: the root was gone, or its exit had begun. Nothing was sent.
                     Ok(_) => target.note_root_gone(),
-                    Err(refusal) => target.note_not_sent(refusal),
+                    Err(refusal) => target.note_not_sent(refusal, UnsentKind::NotSent),
                 }
                 sent.map(drop)
             }
@@ -339,7 +346,7 @@ pub fn send_signal(target: &StopTarget<'_>, signal: crate::Signal) -> Result<(),
     });
     match gated {
         Err(refusal) => {
-            target.note_not_sent(&refusal);
+            target.note_not_sent(&refusal, UnsentKind::NotSent);
             Err(refusal)
         }
         Ok(sent) => sent,
@@ -433,7 +440,7 @@ fn root_exited(cause: &str, outliving: &str) -> Error {
 #[cfg(windows)]
 fn refuse(target: &StopTarget<'_>, detail: impl Into<String>) -> Error {
     let refusal = unsupported(detail, None);
-    target.note_not_sent(&refusal);
+    target.note_not_sent(&refusal, UnsentKind::NotSent);
     refusal
 }
 
@@ -465,8 +472,12 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendAnswer) -> Re
                     target.note_root_gone();
                     Ok(())
                 }
-                SendAnswer::NotSent(not_sent) | SendAnswer::NoneReached(Err(not_sent)) => {
-                    target.note_not_sent(&not_sent);
+                SendAnswer::NotSent(not_sent, kind) => {
+                    target.note_not_sent(&not_sent, kind);
+                    Err(not_sent)
+                }
+                SendAnswer::NoneReached(Err(not_sent)) => {
+                    target.note_not_sent(&not_sent, UnsentKind::NotSent);
                     Err(not_sent)
                 }
             }
@@ -501,9 +512,46 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendAnswer) -> Re
 /// without the flag by a process whose own is not ignored, or one that re-enables it itself. The proxy
 /// re-enables Ctrl+C for itself and nothing else.
 ///
-/// The child must have a console to attach to. A stop sent before the child has set one up (a child
-/// that was just created and has shown the caller no output or handshake) can find none: that is
-/// answered [`Error::Unsupported`], as for a child that never has one.
+/// The child must have a console to attach to. A stop sent before the child has connected its console (it
+/// has not run, or its start-up has not got that far) finds none, and so does a child that never has one.
+/// The start-up connects the console before the child's own image runs any code (measured), so from then on
+/// the attach succeeds and the event is sent, though the start-up is not over. When the attach finds none,
+/// or fails as a child on this process's console fails it before its setup (Win32 error 31), and the child
+/// has not exited, the call reads the child once, through the handle it holds, to tell the two apart:
+///
+/// - a child that finished starting without a console (`detached`, a GUI-subsystem program given
+///   `no_window`, a program that freed its console): [`NotSent`](SendOutcome::NotSent). For an attach that
+///   found no console the answer is an [`Error::Unsupported`] whose text says the child finished starting
+///   without one, and not that it will never have one: a program can create or attach a console later. For
+///   an attach that failed with Win32 error 31 it is the failed step's [`Error::Io`] (see `# Errors`);
+/// - a child that had not set its console up when the proxy asked (it had not connected it yet, or did so
+///   just after the attach): an [`Error::Unsupported`] with outcome
+///   [`NotYet`](SendOutcome::NotYet). Nothing was sent, and asking again can succeed. The caller owns how
+///   often and for how long it asks: cosca makes one read and one answer, starts nothing more and waits for
+///   nothing;
+/// - a read that cannot tell: the limit below. A read that fails is followed by one more look at whether the
+///   child has exited, and a child that has is answered as one that had exited at the first look (see
+///   `# A child that has exited`); a second look that itself fails is answered with that look's error, as a
+///   failed first look is.
+///
+/// # How long "not yet" lasted
+///
+/// Measured, not promised: from the first read of a child as not yet started to the first attach that
+/// succeeded, the median was 1.6 to 179 ms by setup on an idle host (longest 322 ms), 12.9 to 278 ms under
+/// load (longest 387 ms). A child held before its console is connected (created suspended, or stopped that early by a debugger) is
+/// not yet for as long as it is held.
+///
+/// # A limit: a child whose layout was not measured
+///
+/// The read is of a child native to the host, by a build of cosca for the host's architecture (x64 or
+/// ARM64): the only layouts measured. For any other child (a 32-bit program, or an x64 program emulated on
+/// ARM64), and when the read fails (on an ARM64 build it needs Windows 11, so on Windows 10 it always
+/// fails; no version is checked and nothing falls back), cosca cannot tell whether the child had
+/// finished starting, and guesses neither way. When the child has not exited, the answer for an attach that
+/// found no console is [`Error::Unsupported`], outcome [`NotSent`](SendOutcome::NotSent), whose text says so
+/// and whose `source()` is the failed read. The caller asks again, or ends the child with
+/// [`Child::kill`](crate::Child::kill). When the look at the child's exit that follows a failed
+/// read itself fails, the answer is that look's error, not this one, as it is for a failed first look.
 ///
 /// # Waits
 ///
@@ -523,17 +571,26 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendAnswer) -> Re
 /// function ([`StopError::outcome`]), not the error's variant: it is
 /// [`Unknown`](SendOutcome::Unknown) for a proxy that ran and did not confirm its event, one that may have
 /// run ([`Error::MayHaveStarted`]) and one whose exit is no answer, and
-/// [`NotSent`](SendOutcome::NotSent) for every other error, whatever its variant (an
-/// [`Error::Unassessable`] for a child that had exited among them). The variants:
+/// [`NotYet`](SendOutcome::NotYet) for a child that had not set its console up when the proxy asked (below), and
+/// [`NotSent`](SendOutcome::NotSent) for every other error, whatever its variant (the
+/// [`Error::Unassessable`] that `terminate_tree` answers for a child that had exited among them). The
+/// variants:
 ///
 /// [`Error::Unsupported`], with, for the first two, nothing started (for a child that has not exited; see
 /// below):
 /// - the child is one a system service created on a UAC consent;
 /// - the child has no identity ([`Child::id`](crate::Child::id) is `None`), which the proxy names its
 ///   target by, so that a reused pid is never sent an event;
-/// - the proxy found no console to attach to for the child (the child has none, as a child created
-///   with [`detached`](crate::Command::detached) has none, or has not set it up yet), and the child had
-///   not exited when cosca looked;
+/// - the proxy found no console to attach to for the child, the child had not exited when cosca looked,
+///   and the read found that it had finished starting without one, as a child created with
+///   [`detached`](crate::Command::detached) has none ([`NotSent`](SendOutcome::NotSent));
+/// - the same, and the read found that the child had not set its console up when the proxy asked
+///   ([`NotYet`](SendOutcome::NotYet)); the same for an attach that failed with Win32 error 31, which a
+///   child on this process's console gives before its setup;
+/// - the same for the attach that found no console, and cosca could not tell whether the child had finished
+///   starting (the read failed, or the child's layout was not measured: see the limit above), with the
+///   failed read as the `source()` ([`NotSent`](SendOutcome::NotSent)); for the attach that failed with
+///   Win32 error 31 it is the failed step's `Io` below;
 /// - the child's console is this process's own, which an event would reach as well (send
 ///   [`Ctrl+Break` to the child's group](send_ctrl_break_to_group) instead);
 /// - the proxy's attach to the child's console was refused, and the child had not exited when cosca
@@ -547,7 +604,15 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendAnswer) -> Re
 /// with that OS code, and the error has that code's [`io::ErrorKind`](std::io::ErrorKind);
 /// [`first_os_code`](crate::error::first_os_code) reads the code from the chain. A failure with no such
 /// code has the kind `Other` and no source. The proxy carries step
-/// and code in its exit code, so no output of the proxy is read.
+/// and code in its exit code, so no output of the proxy is read. The failed-step answers that are not an
+/// `Io` are those of `AttachConsole` with Win32 error 31 (the child's own console, before its setup): the
+/// [`Unsupported`](Error::Unsupported) above with outcome [`NotYet`](SendOutcome::NotYet) for a child that
+/// had not set its console up, and, for a child that had exited (at either look: see
+/// `# A child that has exited`), the answer given there, as for every refused attach; the look's own error,
+/// if the look fails, is the answer in its place. When the child had not exited and the read of it cannot
+/// tell (it failed, or the layout was not measured), or finds it finished starting without a console, the
+/// answer is the failed step's `Io`, with the OS code 31 as its `source()` (the read's failure is not in the chain).
+/// Every other failed step is an `Io`.
 ///
 /// [`Error::Unassessable`]: the proxy ended without a known answer, or generated the event and did not see
 /// its own copy. [`Error::MayHaveStarted`], from the start of the proxy, says the proxy may have run.
@@ -566,8 +631,10 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendAnswer) -> Re
 /// with no event sent: members that outlived the root are ended by the sweep without a console event,
 /// where the direct send to the group would have reached them.
 ///
-/// A child that exits after that look is answered the same way when the proxy cannot attach and cosca's
-/// look at the proxy's answer finds the child exited.
+/// A child that exits after that look is answered the same way when the proxy's attach does not succeed
+/// (no console, refused, or Win32 error 31) and a look made after the proxy's answer finds the child
+/// exited: one look before the read of the child, and, when that read fails (as the read of an exited
+/// process does), one more after it. A read that succeeds needs no second look.
 ///
 /// # Panics
 ///

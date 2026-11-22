@@ -5,6 +5,7 @@
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::TerminateProcess;
 
+use super::peb::StartupRead;
 use crate::identity::Key;
 
 pub(crate) trait Kernel: Sync {
@@ -16,6 +17,12 @@ pub(crate) trait Kernel: Sync {
     /// `TerminateProcess(handle, exit_code)` on a live process handle the caller holds. Never
     /// blocks. The caller decides what a refusal means (`terminate_held`).
     fn terminate(&self, handle: HANDLE, exit_code: u32) -> windows::core::Result<()>;
+
+    /// How far the process `handle` names has got in starting ([`StartupRead`]), read once through the handle
+    /// (needs `PROCESS_QUERY_LIMITED_INFORMATION` and `PROCESS_VM_READ`). A child not native to the host is
+    /// `ErrorKind::Unsupported`; on an ARM64 build the read needs Windows 11. The caller decides what the
+    /// state means.
+    fn start_state(&self, handle: HANDLE) -> std::io::Result<StartupRead>;
 }
 
 pub(crate) struct HostKernel;
@@ -29,11 +36,16 @@ impl Kernel for HostKernel {
         // SAFETY: the caller's live process handle.
         unsafe { TerminateProcess(handle, exit_code) }
     }
+
+    fn start_state(&self, handle: HANDLE) -> std::io::Result<StartupRead> {
+        super::peb::start_state(handle)
+    }
 }
 
 forward_kernel! {
     fn creation_token(&self, handle: HANDLE) -> windows::core::Result<Key>;
     fn terminate(&self, handle: HANDLE, exit_code: u32) -> windows::core::Result<()>;
+    fn start_state(&self, handle: HANDLE) -> std::io::Result<StartupRead>;
 }
 
 #[cfg(test)]

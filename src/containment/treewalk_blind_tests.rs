@@ -41,7 +41,7 @@ fn a_walkers_terminate_over_a_failed_listing_says_nothing_was_sent() {
     let kernel = FakeKernel::over(&HostKernel).on_pids(Err(libc::EIO));
     let (outcome, _) = super::terminate_tree(&kernel, id, None, crate::containment::TreeStop::default());
     match outcome {
-        crate::containment::TerminateOutcome::NotSent(Error::Unassessable { detail, .. })
+        crate::containment::TerminateOutcome::NotSent(Error::Unassessable { detail, .. }, _)
             if detail.contains("proc_listallpids") => {}
         other => panic!("expected NotSent(Unassessable), got {other:?}"),
     }

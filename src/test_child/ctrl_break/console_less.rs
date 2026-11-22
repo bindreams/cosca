@@ -77,7 +77,7 @@ fn assert_refused_sends_are_not_sent() {
     );
     let (outcome, _) = job.send_terminate(leader.id(), None, broken);
     assert!(
-        matches!(outcome, TerminateOutcome::NotSent(_)),
+        matches!(outcome, TerminateOutcome::NotSent(_, _)),
         "a job's refused break must be NotSent, got {outcome:?}"
     );
     assert_no_break_sent();
@@ -93,7 +93,7 @@ fn assert_refused_sends_are_not_sent() {
     );
     let (outcome, _) = crate::containment::treewalk::terminate_tree(&crate::identity::HostKernel, id, None, broken);
     assert!(
-        matches!(outcome, TerminateOutcome::NotSent(_)),
+        matches!(outcome, TerminateOutcome::NotSent(_, _)),
         "a walker's refused break must be NotSent, got {outcome:?}"
     );
     assert_no_break_sent();

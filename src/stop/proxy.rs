@@ -14,6 +14,8 @@ pub(crate) mod protocol;
 pub(crate) mod run;
 
 #[cfg(windows)]
+use std::num::NonZeroU16;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::sync::Arc;
@@ -21,16 +23,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(windows)]
-use protocol::{exit_text, Cause, CtrlEvent, ProxyAnswer, ProxyArgs, ProxyExit, VERSION};
+use protocol::{exit_text, Cause, CtrlEvent, ProxyAnswer, ProxyArgs, ProxyExit, Step, VERSION};
+#[cfg(windows)]
+use windows::Win32::Foundation::{ERROR_GEN_FAILURE, HANDLE};
 
 #[cfg(windows)]
 use super::{conclude, refuse, root_exited, unsupported, StopTarget, StopWaits, ELEVATED_REFUSAL, REMEDIES};
 #[cfg(windows)]
-use crate::containment::SendAnswer;
+use crate::containment::{SendAnswer, UnsentKind};
 #[cfg(windows)]
 use crate::error::Error;
 #[cfg(windows)]
-use crate::identity::ProcessId;
+use crate::identity::{ProcessId, StartupRead};
 
 /// Which program a stop starts as the console-event proxy
 /// ([`stop::send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy)), as
@@ -88,12 +92,11 @@ const SAME_COSCA_PROXY: &str = "Start a proxy built from the same cosca: CtrlPro
 const NO_CONSOLE_REMEDIES: &str = "Use Child::kill for a hard teardown, stop::send_wm_close for a GUI child that \
      shows a window, or Command::graceful_stop with a stop of your own.";
 
-/// The possible causes of the answer `TargetHasNoConsole`, which cosca cannot tell apart.
+/// What cosca's read found for the answer `TargetHasNoConsole` when the child had finished starting without a
+/// console. A program can still create or attach one later, so this does not say it never will.
 #[cfg(windows)]
-const NO_CONSOLE_CAUSES: &str =
-    "The child may have no console (it was created without one, or gave it up), or may not \
-     have started running yet: a child that was just created looks like one without a console until it has \
-     set its own up.";
+const NO_CONSOLE_FINISHED: &str = "The child had finished starting without a console (it was created without \
+     one, or gave it up), so it has none to attach to now; a program can create or attach one later.";
 
 /// The possible cause of the answers `AttachDenied` and `TargetGone` for a child that has not exited.
 #[cfg(windows)]
@@ -165,7 +168,13 @@ pub(crate) async fn send<D: StopWaits>(driver: &D, target: &StopTarget<'_>, even
                 )),
             )
         }
-        Err(look_failed) => return conclude(target, event.name(), SendAnswer::NotSent(look_failed)),
+        Err(look_failed) => {
+            return conclude(
+                target,
+                event.name(),
+                SendAnswer::NotSent(look_failed, UnsentKind::NotSent),
+            )
+        }
     }
     let (id, exe): (ProcessId, std::borrow::Cow<'_, Path>) = match plan {
         Plan::RefuseElevated => return Err(refuse(target, ELEVATED_REFUSAL)),
@@ -195,7 +204,7 @@ async fn ask<D: StopWaits>(
 ) -> SendAnswer {
     let record = match id.to_record() {
         Ok(record) => record,
-        Err(e) => return SendAnswer::NotSent(e),
+        Err(e) => return SendAnswer::NotSent(e, UnsentKind::NotSent),
     };
     debug_assert_eq!(record.pid, target.pid(), "the child's identity names the child");
     let args = ProxyArgs {
@@ -237,15 +246,18 @@ async fn ask<D: StopWaits>(
     };
     if code == crate::role::UNKNOWN_HELPER_ROLE {
         // The helper refused the role cosca named: it never played one, so nothing was sent.
-        return SendAnswer::NotSent(unsupported(
-            format!(
-                "the program started as the console-event proxy ({}) refused the helper role this cosca named \
+        return SendAnswer::NotSent(
+            unsupported(
+                format!(
+                    "the program started as the console-event proxy ({}) refused the helper role this cosca named \
              (exit {code}): it knows no `{}` role, so nothing was sent. {SAME_COSCA_PROXY}",
-                exe.display(),
-                crate::role::CTRL_PROXY
+                    exe.display(),
+                    crate::role::CTRL_PROXY
+                ),
+                None,
             ),
-            None,
-        ));
+            UnsentKind::NotSent,
+        );
     }
     let Some(exit) = ProxyExit::from_code(code) else {
         return SendAnswer::Unknown(Error::Unassessable {
@@ -288,10 +300,13 @@ pub(crate) fn configure_start(command: &mut crate::Command, exe: &Path, args: &P
 /// This program's own path cannot be read, to start it as the proxy.
 #[cfg(windows)]
 fn exe_unreadable(e: std::io::Error) -> SendAnswer {
-    SendAnswer::NotSent(Error::Io(crate::error::io_context(
-        "nothing was sent: this program's own path cannot be read, to start it as the proxy",
-        e,
-    )))
+    SendAnswer::NotSent(
+        Error::Io(crate::error::io_context(
+            "nothing was sent: this program's own path cannot be read, to start it as the proxy",
+            e,
+        )),
+        UnsentKind::NotSent,
+    )
 }
 
 /// The proxy could not be started, as `e` says. A proxy that may have started may have sent, so its error
@@ -300,10 +315,13 @@ fn exe_unreadable(e: std::io::Error) -> SendAnswer {
 fn start_failed(exe: &Path, e: Error) -> SendAnswer {
     match e {
         may_have_started @ Error::MayHaveStarted { .. } => SendAnswer::Unknown(may_have_started),
-        not_started => SendAnswer::NotSent(not_started.in_step(&format!(
-            "nothing was sent: the console-event proxy {} could not be started",
-            exe.display()
-        ))),
+        not_started => SendAnswer::NotSent(
+            not_started.in_step(&format!(
+                "nothing was sent: the console-event proxy {} could not be started",
+                exe.display()
+            )),
+            UnsentKind::NotSent,
+        ),
     }
 }
 
@@ -344,6 +362,65 @@ fn failed_step(cause: Cause, sent: &str) -> std::io::Error {
     )
 }
 
+/// The proxy's attach was refused as a child on the caller's console refuses it before its console setup is
+/// done: the step `AttachConsole`, with Win32 error 31 (`ERROR_GEN_FAILURE`).
+#[cfg(windows)]
+fn attach_failed_in_setup(cause: Cause) -> bool {
+    cause.step == Step::AttachConsole && cause.os_code.map(NonZeroU16::get) == Some(ERROR_GEN_FAILURE.0 as u16)
+}
+
+/// One read of the child's start-up state through the process handle this call holds.
+#[cfg(windows)]
+fn read_start(target: &StopTarget<'_>) -> std::io::Result<StartupRead> {
+    let child = target.child();
+    child.proc.kernel().start_state(HANDLE(child.process_handle()))
+}
+
+/// The answer for a child that had not set its console up when the proxy asked: nothing was sent, and the
+/// caller may ask again. `saw` is what the proxy saw.
+#[cfg(windows)]
+fn not_yet(target: &StopTarget<'_>, saw: &str) -> SendAnswer {
+    SendAnswer::NotSent(
+        unsupported(
+            format!(
+                "{saw}, and the child (pid {}) had not set its console up when the console-event proxy asked, so \
+                 nothing was sent. Asking again can succeed.",
+                target.pid()
+            ),
+            None,
+        ),
+        UnsentKind::NotYet,
+    )
+}
+
+/// The answer when the read of the child failed: cosca cannot tell whether the child had finished starting,
+/// so nothing was sent and the failed read is the cause. `saw` is what the proxy saw.
+#[cfg(windows)]
+fn start_unread(saw: &str, read: std::io::Error) -> SendAnswer {
+    SendAnswer::NotSent(
+        unsupported(
+            format!(
+                "{saw}, and cosca could not tell whether the child had finished starting (reading its start-up \
+             state failed), so nothing was sent. {NO_CONSOLE_REMEDIES}"
+            ),
+            Some(Error::io_cause(read)),
+        ),
+        UnsentKind::NotSent,
+    )
+}
+
+/// One look at whether the child has exited, which reaps nothing: the answer when it had or the look
+/// failed, `None` when it had not. `cause` says what the proxy's failure was, up to and including that the
+/// child had exited when cosca looked.
+#[cfg(windows)]
+async fn answer_if_exited<D: StopWaits>(driver: &D, cause: &str) -> Option<SendAnswer> {
+    match driver.root_exited(Duration::ZERO).await {
+        Err(look_failed) => Some(SendAnswer::NotSent(look_failed, UnsentKind::NotSent)),
+        Ok(true) => Some(SendAnswer::RootExited(root_exited(cause, PROXY_CANNOT_REACH_OUTLIVERS))),
+        Ok(false) => None,
+    }
+}
+
 /// What the proxy's `exit` came to as the stop's send.
 #[cfg(windows)]
 async fn result_of<D: StopWaits>(
@@ -356,38 +433,76 @@ async fn result_of<D: StopWaits>(
     let sent = event.name();
     let answer = match exit {
         ProxyExit::Answer(answer) => answer,
-        ProxyExit::Cause(cause) => return SendAnswer::NotSent(Error::Io(failed_step(cause, sent))),
+        ProxyExit::Cause(cause) if attach_failed_in_setup(cause) => {
+            let saw = format!(
+                "the console-event proxy's AttachConsole to the child's console failed with Win32 error {} (exit {})",
+                ERROR_GEN_FAILURE.0,
+                exit_text(exit.code())
+            );
+            // A child that exited is answered as for the other refused attach, before any read.
+            let exited = format!("{saw}, and the child had exited when cosca looked");
+            if let Some(answer) = answer_if_exited(driver, &exited).await {
+                return answer;
+            }
+            let failed = || SendAnswer::NotSent(Error::Io(failed_step(cause, sent)), UnsentKind::NotSent);
+            return match read_start(target) {
+                Ok(read) if read.finished_without_console() => failed(),
+                Ok(_) => not_yet(target, &saw),
+                Err(read) => {
+                    log::debug!(
+                        "console-event proxy for pid {}: reading the child's start-up state failed: {read}",
+                        target.pid()
+                    );
+                    answer_if_exited(driver, &exited).await.unwrap_or_else(failed)
+                }
+            };
+        }
+        ProxyExit::Cause(cause) => {
+            return SendAnswer::NotSent(Error::Io(failed_step(cause, sent)), UnsentKind::NotSent)
+        }
     };
     let code = answer.code();
-    // The attach did not succeed, and the child had not exited when cosca looked: the child's own exit
-    // is the one thing the proxy's answer cannot say.
-    let attach_refused = |cause: &str, remedies: &str| {
-        SendAnswer::NotSent(unsupported(
-            format!(
-                "the console-event proxy's attach to the child's console did not succeed (answer {answer:?}, exit \
-             {code}), and the child had not exited when cosca looked, so nothing was sent. {cause} {remedies}"
-            ),
-            None,
-        ))
-    };
-    let not_sent = |error: Error| SendAnswer::NotSent(error);
+    let not_sent = |error: Error| SendAnswer::NotSent(error, UnsentKind::NotSent);
     match answer {
         ProxyAnswer::Sent => SendAnswer::Sent(Ok(())),
         ProxyAnswer::TargetGone | ProxyAnswer::AttachDenied | ProxyAnswer::TargetHasNoConsole => {
-            match driver.root_exited(Duration::ZERO).await {
-                Err(look_failed) => not_sent(look_failed),
-                Ok(true) => SendAnswer::RootExited(root_exited(
-                    &format!(
-                        "the console-event proxy's attach to the console of the child (pid {}) did not succeed \
-                         (answer {answer:?}, exit {code}), and the child had exited when cosca looked",
-                        target.pid()
+            let saw = format!(
+                "the console-event proxy's attach to the child's console did not succeed (answer {answer:?}, exit \
+                 {code})"
+            );
+            let exited = format!(
+                "the console-event proxy's attach to the console of the child (pid {}) did not succeed \
+                 (answer {answer:?}, exit {code}), and the child had exited when cosca looked",
+                target.pid()
+            );
+            if let Some(answer) = answer_if_exited(driver, &exited).await {
+                return answer;
+            }
+            // The attach did not succeed, and the child had not exited when cosca looked: the child's own
+            // exit is the one thing the proxy's answer cannot say.
+            let attach_refused = |cause: &str, remedies: &str| {
+                SendAnswer::NotSent(
+                    unsupported(
+                        format!(
+                            "{saw}, and the child had not exited when cosca looked, so nothing was sent. {cause} \
+                         {remedies}"
+                        ),
+                        None,
                     ),
-                    PROXY_CANNOT_REACH_OUTLIVERS,
-                )),
-                Ok(false) => match answer {
-                    ProxyAnswer::TargetHasNoConsole => attach_refused(NO_CONSOLE_CAUSES, NO_CONSOLE_REMEDIES),
-                    _ => attach_refused(ATTACH_DENIED_CAUSE, REMEDIES),
+                    UnsentKind::NotSent,
+                )
+            };
+            match answer {
+                ProxyAnswer::TargetHasNoConsole => match read_start(target) {
+                    Ok(read) if read.finished_without_console() => {
+                        attach_refused(NO_CONSOLE_FINISHED, NO_CONSOLE_REMEDIES)
+                    }
+                    Ok(_) => not_yet(target, &saw),
+                    Err(read) => answer_if_exited(driver, &exited)
+                        .await
+                        .unwrap_or_else(|| start_unread(&saw, read)),
                 },
+                _ => attach_refused(ATTACH_DENIED_CAUSE, REMEDIES),
             }
         }
         ProxyAnswer::ConsoleIsCallers => not_sent(unsupported(

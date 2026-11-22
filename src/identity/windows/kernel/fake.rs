@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use windows::core::HRESULT;
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE};
 
-use super::Kernel;
+use super::{Kernel, StartupRead};
 use crate::identity::Key;
 
 pub(crate) struct FakeKernel {
@@ -20,6 +20,8 @@ pub(crate) struct FakeKernel {
     creation_tokens: Mutex<VecDeque<Result<Key, HRESULT>>>,
     /// The answers of the `terminate` calls, in call order; `Err` is the failure's `HRESULT`.
     terminates: Mutex<VecDeque<Result<(), HRESULT>>>,
+    /// The answers of the `start_state` calls, in call order.
+    start_states: Mutex<VecDeque<std::io::Result<StartupRead>>>,
 }
 
 /// The refusal `TerminateProcess` gives a process that is exiting, or a handle without
@@ -38,6 +40,7 @@ impl FakeKernel {
         FakeKernel {
             creation_tokens: Mutex::new(VecDeque::new()),
             terminates: Mutex::new(VecDeque::new()),
+            start_states: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -59,6 +62,15 @@ impl FakeKernel {
         self
     }
 
+    /// The next `start_state` call after the earlier rows answers `answer`, and reads nothing.
+    pub(crate) fn on_start_state(mut self, answer: std::io::Result<StartupRead>) -> Self {
+        self.start_states
+            .get_mut()
+            .expect("no thread holds the rows")
+            .push_back(answer);
+        self
+    }
+
     /// Whether every stated row has answered a call. A row left over is a call the test expected and
     /// the code never made, or made in another order.
     pub(crate) fn all_rows_taken(&self) -> bool {
@@ -68,6 +80,11 @@ impl FakeKernel {
             .is_empty()
             && self
                 .creation_tokens
+                .lock()
+                .expect("no thread panics holding the rows")
+                .is_empty()
+            && self
+                .start_states
                 .lock()
                 .expect("no thread panics holding the rows")
                 .is_empty()
@@ -97,5 +114,13 @@ impl Kernel for FakeKernel {
             Ok(()) => Ok(()),
             Err(code) => Err(windows::core::Error::from_hresult(code)),
         }
+    }
+
+    fn start_state(&self, _handle: HANDLE) -> std::io::Result<StartupRead> {
+        self.start_states
+            .lock()
+            .expect("no thread panics holding the rows")
+            .pop_front()
+            .expect("the fake kernel has no row left for start_state")
     }
 }

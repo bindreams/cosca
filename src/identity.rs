@@ -704,7 +704,7 @@ impl ProcessId {
 }
 
 #[cfg(windows)]
-pub(crate) use backend::query as windows_query_process;
+pub(crate) use backend::peb::{read_peb as windows_read_peb, PebField, StartupRead};
 #[cfg(windows)]
 pub(crate) use backend::{
     exit_look as windows_exit_look, granted_access as windows_granted_access,

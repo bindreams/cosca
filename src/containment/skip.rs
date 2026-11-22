@@ -139,7 +139,7 @@ pub(crate) enum TerminateOutcome {
         earlier: Option<String>,
     },
     /// Nothing was sent: the call ends with this error.
-    NotSent(Error),
+    NotSent(Error, UnsentKind),
     /// Nothing was sent: the root has exited, so its children were reparented at its exit (Unix: the walk
     /// found no member), or no event can be named to a member that outlived it (Windows).
     RootExited(Error),
@@ -180,7 +180,7 @@ impl TerminateOutcome {
     /// what a later sweep's error says was sent before it.
     pub(crate) fn of(sent: SendAnswer, earlier: Option<String>) -> TerminateOutcome {
         match sent {
-            SendAnswer::NotSent(not_sent) => TerminateOutcome::NotSent(not_sent),
+            SendAnswer::NotSent(not_sent, kind) => TerminateOutcome::NotSent(not_sent, kind),
             SendAnswer::RootExited(exited) => TerminateOutcome::RootExited(exited),
             SendAnswer::Sent(result) => TerminateOutcome::Sent { result, earlier },
             SendAnswer::Unknown(error) => TerminateOutcome::Unknown { error, earlier },
@@ -194,7 +194,7 @@ impl TerminateOutcome {
     pub(crate) fn into_answer(self) -> SendAnswer {
         match self {
             TerminateOutcome::Sent { result, .. } => SendAnswer::Sent(result),
-            TerminateOutcome::NotSent(not_sent) => SendAnswer::NotSent(not_sent),
+            TerminateOutcome::NotSent(not_sent, kind) => SendAnswer::NotSent(not_sent, kind),
             TerminateOutcome::RootExited(exited) => SendAnswer::RootExited(exited),
             TerminateOutcome::Unknown { error, .. } => SendAnswer::Unknown(error),
             TerminateOutcome::NoneReached { result } => SendAnswer::NoneReached(result),
@@ -205,12 +205,36 @@ impl TerminateOutcome {
     }
 }
 
+/// Which [`SendOutcome`] a send that sent nothing reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnsentKind {
+    /// [`SendOutcome::NotSent`].
+    NotSent,
+    /// [`SendOutcome::NotYet`]: the child's console was not set up when the proxy asked; asking again can
+    /// succeed. The call ends with the error, as for [`NotSent`](Self::NotSent).
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only the Windows console-event proxy's answer is not yet")
+    )]
+    NotYet,
+}
+
+impl UnsentKind {
+    pub(crate) fn outcome(self) -> SendOutcome {
+        match self {
+            UnsentKind::NotSent => SendOutcome::NotSent,
+            UnsentKind::NotYet => SendOutcome::NotYet,
+        }
+    }
+}
+
 /// How a stop's send went: the one statement of what a send hands the call that runs it.
 #[derive(Debug)]
 pub(crate) enum SendAnswer {
     /// Nothing was sent, for this reason: a refusal, or a failure before the send was made. A root
-    /// target records a refusal, and a tree call ends with the error.
-    NotSent(Error),
+    /// target records a refusal, and a tree call ends with the error. `UnsentKind` says which
+    /// [`SendOutcome`] the stop's error reports.
+    NotSent(Error, UnsentKind),
     /// Nothing was sent because the root had exited when cosca looked. A tree call ends as for any
     /// exited root: `terminate_tree` answers the error, and `graceful_shutdown_tree` goes on to its
     /// grace, sweep and reap with nothing sent.
@@ -251,14 +275,15 @@ impl SendAnswer {
     pub(crate) fn direct(sent: Result<(), Error>) -> SendAnswer {
         match sent {
             Ok(()) => SendAnswer::Sent(Ok(())),
-            Err(not_sent) => SendAnswer::NotSent(not_sent),
+            Err(not_sent) => SendAnswer::NotSent(not_sent, UnsentKind::NotSent),
         }
     }
 
     /// How the send went, as a stop's own error says it ([`SendOutcome`]).
     pub(crate) fn outcome(&self) -> SendOutcome {
         match self {
-            SendAnswer::NotSent(_) | SendAnswer::RootExited(_) | SendAnswer::NoneReached(_) => SendOutcome::NotSent,
+            SendAnswer::NotSent(_, kind) => kind.outcome(),
+            SendAnswer::RootExited(_) | SendAnswer::NoneReached(_) => SendOutcome::NotSent,
             SendAnswer::Sent(_) => SendOutcome::Sent,
             SendAnswer::Unknown(_) => SendOutcome::Unknown,
         }
@@ -270,7 +295,7 @@ impl SendAnswer {
     /// `Ok`. The one flattening: `terminate_tree` of a `Child` and of a foreign `Process` both end in it.
     pub(crate) fn into_tree_result(self) -> Result<(), Error> {
         match self {
-            SendAnswer::NotSent(error) | SendAnswer::RootExited(error) | SendAnswer::Unknown(error) => Err(error),
+            SendAnswer::NotSent(error, _) | SendAnswer::RootExited(error) | SendAnswer::Unknown(error) => Err(error),
             SendAnswer::Sent(result) | SendAnswer::NoneReached(result) => result,
         }
     }

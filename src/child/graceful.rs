@@ -84,6 +84,7 @@ impl Child {
     /// ([`SendOutcome`](crate::stop::SendOutcome)):
     /// - [`Sent`](crate::stop::SendOutcome::Sent): the signal went out to at least one process, whatever the error says of what a check after it found;
     /// - [`NotSent`](crate::stop::SendOutcome::NotSent): nothing was sent; the error says why;
+    /// - [`NotYet`](crate::stop::SendOutcome::NotYet): nothing was sent because the child's console was not set up yet; asking again can succeed (Windows proxy only);
     /// - [`Unknown`](crate::stop::SendOutcome::Unknown): whether it went out cannot be told, as for an action that made no prepared send and failed.
     ///
     /// What the rest of this documentation says is what the default does. On Unix it is an
@@ -159,7 +160,7 @@ impl Child {
     ) -> (Result<(), Error>, Option<String>) {
         let earlier = match target.into_root_record() {
             Some(RootRecord::Sent(name) | RootRecord::Unknown(name)) => Some(crate::containment::earlier_of(name)),
-            Some(RootRecord::NotSent(Some(report))) => {
+            Some(RootRecord::NotSent(Some(report), _)) => {
                 if stopped.is_ok() {
                     log::debug!(
                         "graceful_shutdown({}): the action went on after a refused send: {report}",
@@ -168,7 +169,7 @@ impl Child {
                 }
                 None
             }
-            Some(RootRecord::NotSent(None)) => None,
+            Some(RootRecord::NotSent(None, _)) => None,
             None => Some(STOP_ACTION.to_owned()),
         };
         (stopped, earlier)
@@ -406,7 +407,7 @@ impl Child {
                 earlier: Some(STOP_ACTION.to_owned()),
                 walk: None,
             },
-            (Some(TreeRecord::NotSent(report)), Ok(())) => {
+            (Some(TreeRecord::NotSent(report, _)), Ok(())) => {
                 log::debug!(
                     "graceful_shutdown_tree({}): the action went on after a refused send: {report}",
                     self.pid()
@@ -417,7 +418,7 @@ impl Child {
                     walk: None,
                 }
             }
-            (None | Some(TreeRecord::NotSent(_)), Err(e)) => SignalTreeCooperativelyOutcome::End(e),
+            (None | Some(TreeRecord::NotSent(..)), Err(e)) => SignalTreeCooperativelyOutcome::End(e),
             #[cfg(target_os = "linux")]
             (Some(TreeRecord::RootThroughPidfd(skip, term, sig)), acted) => {
                 SignalTreeCooperativelyOutcome::RootThroughPidfd(skip, PidfdShutdown::new(term), sig, acted.err())

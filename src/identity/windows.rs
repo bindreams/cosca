@@ -34,6 +34,8 @@ use super::{Key, Liveness, OrderKey, OrderedRead, ParentRead, RawPid, Resolved, 
 
 #[path = "windows/kernel.rs"]
 pub(crate) mod kernel;
+#[path = "windows/peb.rs"]
+pub(crate) mod peb;
 
 use self::kernel::Kernel;
 

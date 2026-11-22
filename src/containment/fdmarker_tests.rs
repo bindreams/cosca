@@ -1694,7 +1694,7 @@ fn a_terminate_whose_group_cannot_be_signalled_says_nothing_was_sent() {
     let marker = marker_without_holders(inert_root(), Some(0), host_kernel());
     let root = crate::test_support::stated_root::StatedRoot::unreaped();
     match marker.terminate_tree(Some(&root), crate::containment::TreeStop::default()) {
-        crate::containment::TerminateOutcome::NotSent(crate::error::Error::Unassessable { source: None, .. }) => {}
+        crate::containment::TerminateOutcome::NotSent(crate::error::Error::Unassessable { source: None, .. }, _) => {}
         other => panic!("expected NotSent(Unassessable), got {other:?}"),
     }
 }
@@ -1715,10 +1715,13 @@ fn a_terminate_that_sent_nothing_keeps_the_members_it_could_not_reach() {
     );
     let root = crate::test_support::stated_root::StatedRoot::unreaped();
     match marker.terminate_tree(Some(&root), crate::containment::TreeStop::default()) {
-        crate::containment::TerminateOutcome::NotSent(crate::error::Error::Unassessable {
-            detail,
-            source: Some(source),
-        }) => {
+        crate::containment::TerminateOutcome::NotSent(
+            crate::error::Error::Unassessable {
+                detail,
+                source: Some(source),
+            },
+            _,
+        ) => {
             assert!(
                 detail.contains("not a valid group id"),
                 "the group's failure first: {detail}"

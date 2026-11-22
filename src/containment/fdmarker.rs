@@ -845,7 +845,7 @@ use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::sweep_passes::run_passes;
 use crate::containment::treewalk::{KillOutcome, Listing};
-use crate::containment::{Containment, Root, SendAnswer, Skip, TerminateOutcome, TreeKill, TreeStop, Why};
+use crate::containment::{Containment, Root, SendAnswer, Skip, TerminateOutcome, TreeKill, TreeStop, UnsentKind, Why};
 use crate::error::Error;
 use crate::identity::{ProcessId, Resolved};
 use crate::signal::Sig;
@@ -1286,8 +1286,9 @@ impl Marker {
                         TerminateOutcome::HoldersOnly(self.skip("signal", root_pid, look, result, true))
                     }
                     // `terminate_impl` yields no `RootExited`, and no unknown answer.
-                    SendAnswer::NotSent(error) | SendAnswer::RootExited(error) | SendAnswer::Unknown(error) => {
-                        TerminateOutcome::NotSent(error)
+                    SendAnswer::NotSent(error, kind) => TerminateOutcome::NotSent(error, kind),
+                    SendAnswer::RootExited(error) | SendAnswer::Unknown(error) => {
+                        TerminateOutcome::NotSent(error, UnsentKind::NotSent)
                     }
                 }
             }
@@ -1304,7 +1305,7 @@ impl Marker {
     /// marker looks at no walk.
     fn terminate_impl(&self, scope: Scope<'_>, how: TreeStop) -> SendAnswer {
         if let Err(stale) = self.check_read_end_still_valid() {
-            return SendAnswer::NotSent(stale);
+            return SendAnswer::NotSent(stale, UnsentKind::NotSent);
         }
         // A cooperative signal is not a kill: nothing it reaches is waited for.
         let mut reached = Vec::new();
@@ -1314,7 +1315,7 @@ impl Marker {
         match swept {
             // Nothing was sent: the group's failure and the members that refused or could not be assessed
             // are all `finish_sweep` found.
-            Err(unsent) if state.group_unsent && !state.delivered => SendAnswer::NotSent(unsent),
+            Err(unsent) if state.group_unsent && !state.delivered => SendAnswer::NotSent(unsent, UnsentKind::NotSent),
             swept if state.delivered => SendAnswer::Sent(swept),
             swept => SendAnswer::NoneReached(swept),
         }
@@ -1676,7 +1677,7 @@ impl Marker {
                             }
                             SendAnswer::NoneReached(checked) => checked,
                             // `term_group_sent` yields no `RootExited`, and no unknown answer.
-                            SendAnswer::NotSent(unsent)
+                            SendAnswer::NotSent(unsent, _)
                             | SendAnswer::RootExited(unsent)
                             | SendAnswer::Unknown(unsent) => {
                                 *group_unsent = true;

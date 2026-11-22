@@ -778,7 +778,7 @@ async fn a_dropped_proxy_send_records_a_send_that_may_have_gone_out() {
         } else {
             StopTarget::from(&child)
         };
-        target.note_not_sent(&refused());
+        target.note_not_sent(&refused(), crate::containment::UnsentKind::NotSent);
         {
             let mut send = Box::pin(stop::send_console_event_via_proxy(&target, crate::CtrlEvent::CtrlBreak));
             polled_to_the_proxy_wait(&mut send, &mut held).await;

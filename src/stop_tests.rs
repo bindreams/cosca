@@ -489,7 +489,7 @@ fn a_failed_call_answers_how_the_actions_last_prepared_send_went() {
                 "a send that went out, a refused send, then an error",
                 Box::new(|target| {
                     prepared_send(target)?;
-                    target.note_not_sent(&refused());
+                    target.note_not_sent(&refused(), crate::containment::UnsentKind::NotSent);
                     Err(refused())
                 }),
                 Some(NotSent),
@@ -497,7 +497,7 @@ fn a_failed_call_answers_how_the_actions_last_prepared_send_went() {
             (
                 "a refused send, a send that went out, then an error",
                 Box::new(|target| {
-                    target.note_not_sent(&refused());
+                    target.note_not_sent(&refused(), crate::containment::UnsentKind::NotSent);
                     prepared_send(target)?;
                     Err(refused())
                 }),
@@ -506,7 +506,7 @@ fn a_failed_call_answers_how_the_actions_last_prepared_send_went() {
             (
                 "a refused send, then Ok",
                 Box::new(|target| {
-                    target.note_not_sent(&refused());
+                    target.note_not_sent(&refused(), crate::containment::UnsentKind::NotSent);
                     Ok(())
                 }),
                 None,
@@ -687,7 +687,7 @@ fn a_call_words_what_the_action_sent_before_its_kill() {
             "a prepared send, then one that was refused",
             Box::new(|target| {
                 prepared_send(target)?;
-                target.note_not_sent(&refused());
+                target.note_not_sent(&refused(), crate::containment::UnsentKind::NotSent);
                 Ok(())
             }),
             None,
@@ -743,7 +743,7 @@ fn a_tree_call_words_what_the_action_sent_before_its_sweep() {
             "a prepared send, then one that was refused",
             Box::new(|target| {
                 prepared_send(target)?;
-                target.note_not_sent(&refused());
+                target.note_not_sent(&refused(), crate::containment::UnsentKind::NotSent);
                 Ok(())
             }),
             None,

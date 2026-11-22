@@ -172,7 +172,7 @@ impl FakeProcess {
 
     /// Answer `kernel` to [`OsChild::kernel`]. Without it, a fake over a real child answers that
     /// child's, and any other panics.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn with_kernel(self, kernel: crate::identity::SpawnKernel) -> Self {
         assert!(
             self.0.kernel.set(kernel).is_ok(),

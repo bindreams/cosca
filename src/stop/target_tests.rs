@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use super::{StopTarget, TreeCall};
+use crate::containment::UnsentKind;
 use crate::os_process::fake::FakeProcess;
 use crate::test_child::over_fake::child_over;
 
@@ -42,16 +43,16 @@ fn a_refused_send_replaces_the_record_of_an_earlier_one() {
         &*root.root_record.lock().unwrap(),
         Some(RootRecord::Sent("SIGTEST"))
     ));
-    root.note_not_sent(&refusal());
+    root.note_not_sent(&refusal(), UnsentKind::NotSent);
     assert!(
-        matches!(root.into_root_record(), Some(RootRecord::NotSent(Some(report))) if report.contains("refused by the test"))
+        matches!(root.into_root_record(), Some(RootRecord::NotSent(Some(report), _)) if report.contains("refused by the test"))
     );
 
     // A call that ends at its send reads only how it went and keeps no report; a call that goes on from
     // the send keeps the one it logs.
     let tree = StopTarget::tree(&child, TreeCall::SignalOnly);
     tree.note_tree(TreeRecord::bare(crate::stop::SendOutcome::Sent));
-    tree.note_not_sent(&refusal());
+    tree.note_not_sent(&refusal(), UnsentKind::NotSent);
     assert!(matches!(
         tree.into_tree_record(),
         Some(TreeRecord::Sent {
@@ -61,21 +62,22 @@ fn a_refused_send_replaces_the_record_of_an_earlier_one() {
     ));
     let token = crate::containment::treewalk::WalkToken::new();
     let shutdown = StopTarget::tree(&child, TreeCall::Shutdown(&token));
-    shutdown.note_not_sent(&refusal());
+    shutdown.note_not_sent(&refusal(), UnsentKind::NotSent);
     assert!(
-        matches!(shutdown.into_tree_record(), Some(TreeRecord::NotSent(report)) if report.contains("refused by the test"))
+        matches!(shutdown.into_tree_record(), Some(TreeRecord::NotSent(report, _)) if report.contains("refused by the test"))
     );
 }
 
 /// A root record names a stop only for a send that may have gone out: `Sent` and `Unknown` name it; a send
-/// that found the root gone and one that was refused name none, and no record says "sent" for a send that
-/// went out to nobody.
+/// that found the root gone, one that was refused and one that found the child not yet started name none,
+/// and no record says "sent" for a send that went out to nobody.
 ///
-/// Mutants: a root that was gone is recorded as a send of the stop; an unknown send reads as `Sent`.
+/// Mutants: a root that was gone is recorded as a send of the stop; an unknown send reads as `Sent`; a send
+/// that found the child not yet started reads as `NotSent`.
 #[skuld::test]
 fn a_root_record_names_a_stop_only_for_a_send_that_may_have_gone_out() {
     use super::RootRecord;
-    use crate::stop::SendOutcome::{NotSent, Sent, Unknown};
+    use crate::stop::SendOutcome::{NotSent, NotYet, Sent, Unknown};
 
     let child = child_over(&FakeProcess::new([]));
     let refusal = crate::error::Error::Unsupported {
@@ -85,7 +87,7 @@ fn a_root_record_names_a_stop_only_for_a_send_that_may_have_gone_out() {
         source: None,
     };
     type Note = fn(&StopTarget<'_>, &crate::error::Error);
-    let rows: [(&str, Note, crate::stop::SendOutcome, Option<&str>); 4] = [
+    let rows: [(&str, Note, crate::stop::SendOutcome, Option<&str>); 5] = [
         ("sent", |t, _| t.note_root_sent("SIGTEST"), Sent, Some("SIGTEST")),
         (
             "unknown",
@@ -93,7 +95,8 @@ fn a_root_record_names_a_stop_only_for_a_send_that_may_have_gone_out() {
             Unknown,
             Some("SIGTEST"),
         ),
-        ("refused", |t, e| t.note_not_sent(e), NotSent, None),
+        ("refused", |t, e| t.note_not_sent(e, UnsentKind::NotSent), NotSent, None),
+        ("not yet", |t, e| t.note_not_sent(e, UnsentKind::NotYet), NotYet, None),
         ("gone", |t, _| t.note_root_gone(), NotSent, None),
     ];
     for (what, note, outcome, names) in rows {
@@ -103,7 +106,7 @@ fn a_root_record_names_a_stop_only_for_a_send_that_may_have_gone_out() {
         assert_eq!(record.outcome(), outcome, "{what}");
         let named = match &record {
             RootRecord::Sent(name) | RootRecord::Unknown(name) => Some(*name),
-            RootRecord::NotSent(_) => None,
+            RootRecord::NotSent(..) => None,
         };
         assert_eq!(named, names, "{what}");
     }
@@ -112,22 +115,22 @@ fn a_root_record_names_a_stop_only_for_a_send_that_may_have_gone_out() {
 /// What the route of a tree send answered, as the outcome the target records for the call to read back: a send
 /// that went out is `Sent` whatever a check after it found (`Err` included), one that sent nothing is
 /// `NotSent` (an exited root too, though `graceful_shutdown_tree` goes on past it), and one that may have gone
-/// out is `Unknown`; for `terminate_tree`'s answer and for `graceful_shutdown_tree`'s alike. A send that went
-/// to no process is `NotSent` whatever its check found, and the shutdown that goes on after it names no
-/// earlier send. The table states the answers every platform's routes give; the Unix answers that carry a
+/// out is `Unknown`, and one that found the child not yet started `NotYet`; for `terminate_tree`'s answer and
+/// for `graceful_shutdown_tree`'s alike. A send that went to no process is `NotSent` whatever its check
+/// found, and the shutdown that goes on after it names no earlier send. The table states the answers every platform's routes give; the Unix answers that carry a
 /// `Skip` (`End`, `HoldersOnly`, `RootThroughPidfd`) are asserted through the public calls
 /// (`foreign_reap_tree_tests`, `fdmarker_tests`, `unpinned_public_tests`).
 ///
 /// Mutants: a check's error reads the send as not made; an unknown answer reads as `Sent`; an exited root
 /// reads as `Sent` in the shutdown's record (it goes on, which is not a send); a send that went to no process
 /// reads as `Sent` or names an earlier send; a send that went out drops the earlier send it names; either call
-/// records nothing.
+/// records nothing; a send that found the child not yet started is recorded as `NotSent`.
 #[skuld::test]
 fn a_tree_routes_answer_is_recorded_as_how_the_send_went() {
     use super::TreeRecord;
     use crate::containment::TerminateOutcome;
     use crate::error::Error;
-    use crate::stop::SendOutcome::{self, NotSent, Sent, Unknown};
+    use crate::stop::SendOutcome::{self, NotSent, NotYet, Sent, Unknown};
 
     let error = |detail: &str| Error::Unassessable {
         detail: detail.to_owned(),
@@ -192,8 +195,23 @@ fn a_tree_routes_answer_is_recorded_as_how_the_send_went() {
             false,
             true,
         ),
-        row("not sent", TerminateOutcome::NotSent, NotSent, false, false, true),
+        row(
+            "not sent",
+            |e| TerminateOutcome::NotSent(e, UnsentKind::NotSent),
+            NotSent,
+            false,
+            false,
+            true,
+        ),
         row("root exited", TerminateOutcome::RootExited, NotSent, false, true, true),
+        row(
+            "not yet",
+            |e| TerminateOutcome::NotSent(e, UnsentKind::NotYet),
+            NotYet,
+            false,
+            false,
+            true,
+        ),
         row(
             "unknown",
             |e| TerminateOutcome::Unknown {

@@ -42,6 +42,7 @@ mod on_windows {
     use crate::containment::windows::fault::{force_next, Step};
     use crate::error::{ChildFate, Error};
     use crate::test_frozen::{limit_flags, InitialThread, Remote, ResumeOnDrop};
+    use crate::test_groups::{ctrl_proxy, Group};
     use crate::Containment;
 
     const ERROR_ACCESS_DENIED: u32 = 5;
@@ -154,6 +155,156 @@ mod on_windows {
             assert_eq!(thread.suspend_count(), 0, "raw={raw}: running after resume");
             end(child);
         }
+    }
+
+    /// A frozen child has not run: the read of its start-up state finds `Ldr` null (`NotBegun`), and its
+    /// console handle is not read. A stop through the proxy whose attach found no console (or failed as a
+    /// child on the caller's console fails before its setup) reads that and answers `NotYet`: `terminate`
+    /// and `terminate_tree` report it as the outcome, the graceful shutdowns end with the error and the
+    /// child runs on, and the proxy was asked. The graceful shutdowns' records are read from the default
+    /// action run on the root and, as `graceful_shutdown_tree` runs it, on the tree. The child is then
+    /// resumed and ended.
+    ///
+    /// Mutants: the read is not made (the answer is `NotSent`); the stop reads `NotBegun` as finished (the
+    /// stop is answered `NotSent`, not `NotYet`); a graceful shutdown's record is plain `NotSent` (the action
+    /// rows read `NotSent`); a graceful shutdown goes on to kill (the child is not alive, or the error is
+    /// not the proxy's).
+    #[skuld::test]
+    fn a_stop_through_the_proxy_before_the_child_has_run_is_not_yet() {
+        use crate::identity::{HostKernel, Kernel};
+        use crate::stop::proxy::protocol::{Cause, CtrlEvent, ProxyAnswer, ProxyExit, Step};
+        use crate::stop::proxy::proxy_tests::Fixture;
+        use crate::stop::{SendOutcome, StopTarget, TreeCall};
+        use crate::test_child::ctrl_break::assert_proxy_answered;
+
+        let exits: [(ProxyExit, String); 2] = [
+            (
+                ProxyAnswer::TargetHasNoConsole.into(),
+                format!(
+                    "the console-event proxy's attach to the child's console did not succeed (answer \
+                     TargetHasNoConsole, exit {})",
+                    ProxyAnswer::TargetHasNoConsole.code()
+                ),
+            ),
+            (
+                Cause::new(Step::AttachConsole, Some(31)).into(),
+                "the console-event proxy's AttachConsole to the child's console failed with Win32 error 31 (exit"
+                    .to_owned(),
+            ),
+        ];
+        for (exit, saw) in exits {
+            for call in [
+                "terminate",
+                "terminate_tree",
+                "graceful_shutdown",
+                "graceful_shutdown_tree",
+                "the action on the root",
+                "the action on the tree, as the shutdown runs it",
+            ] {
+                let fixture = Fixture::answering(exit.code());
+                let mut cmd = blocker(false);
+                cmd.contain().ctrl_proxy(fixture.setting());
+                let frozen = cmd.spawn_suspended().expect("spawn suspended");
+                let read = HostKernel
+                    .start_state(windows::Win32::Foundation::HANDLE(frozen.child.process_handle()))
+                    .expect("read a frozen child");
+                assert_eq!(
+                    read,
+                    crate::identity::StartupRead::NotBegun,
+                    "{call}: a child that has not run"
+                );
+
+                let (outcome, error) = match call {
+                    "terminate" => {
+                        let stopped = frozen.child.terminate().expect_err("the child has not started");
+                        (Some(stopped.outcome()), Error::from(stopped))
+                    }
+                    "terminate_tree" => {
+                        let stopped = frozen.child.terminate_tree().expect_err("the child has not started");
+                        (Some(stopped.outcome()), Error::from(stopped))
+                    }
+                    "graceful_shutdown" => (
+                        None,
+                        frozen
+                            .child
+                            .graceful_shutdown(std::time::Duration::ZERO)
+                            .expect_err("the call ends at the send"),
+                    ),
+                    "graceful_shutdown_tree" => (
+                        None,
+                        frozen
+                            .child
+                            .graceful_shutdown_tree(std::time::Duration::ZERO)
+                            .expect_err("the call ends at the send"),
+                    ),
+                    "the action on the root" => {
+                        let target = StopTarget::from(&frozen.child);
+                        let error = crate::stop::default(&target).expect_err("the child has not started");
+                        let record = target.into_root_record().expect("the send left a record");
+                        (Some(record.outcome()), error)
+                    }
+                    _ => {
+                        let token = crate::containment::treewalk::WalkToken::new();
+                        let target = StopTarget::tree(&frozen.child, TreeCall::Shutdown(&token));
+                        let error = crate::stop::default(&target).expect_err("the child has not started");
+                        let record = target.into_tree_record().expect("the send left a record");
+                        (Some(record.outcome()), error)
+                    }
+                };
+
+                if let Some(outcome) = outcome {
+                    assert_eq!(outcome, SendOutcome::NotYet, "{call}");
+                }
+                let Error::Unsupported { detail, .. } = &error else {
+                    panic!("{call}: {error:?}")
+                };
+                assert!(detail.starts_with(&saw), "{call}: {detail}");
+                assert!(
+                    detail.ends_with(&format!(
+                        "and the child (pid {}) had not set its console up when the console-event proxy asked, so \
+                         nothing was sent. Asking again can succeed.",
+                        frozen.pid()
+                    )),
+                    "{call}: {detail}"
+                );
+                assert_proxy_answered(frozen.pid(), CtrlEvent::CtrlBreak, exit);
+                assert!(fixture.ran().is_some(), "{call}: the proxy was asked");
+                assert_eq!(
+                    frozen.child.is_alive(),
+                    crate::identity::Liveness::Alive,
+                    "{call}: the child runs on"
+                );
+                end(frozen.resume().expect("resume"));
+            }
+        }
+    }
+
+    /// [`a_stop_through_the_proxy_before_the_child_has_run_is_not_yet`] against the real proxy (this test
+    /// binary re-executed by `init_helpers`), so the answer that test hands the stop is the one the real
+    /// attach gives. A child that has not run has set no console up: measured, the attach to it finds no
+    /// console (Win32 error 6) or, for a child created on the caller's console, fails with error 31, and
+    /// both lead to the read, which finds the child not begun. The stop is `NotYet`, nothing was sent, and
+    /// the child is resumed and ended. A `CTRL_PROXY` test: CI, or a host after consenting.
+    ///
+    /// Mutant: the stop does not read the child (the outcome is `NotSent`).
+    #[skuld::test]
+    fn a_stop_through_the_real_proxy_before_the_child_has_run_is_not_yet(#[fixture(ctrl_proxy)] _group: &Group) {
+        use crate::stop::proxy::protocol::CtrlEvent;
+        use crate::stop::SendOutcome;
+
+        let mut cmd = blocker(false);
+        cmd.contain();
+        cmd.graceful_stop(|target| crate::stop::send_console_event_via_proxy(target, CtrlEvent::CtrlBreak));
+        let frozen = cmd.spawn_suspended().expect("spawn suspended");
+
+        let stopped = frozen.child.terminate().expect_err("the child has not started");
+        assert_eq!(stopped.outcome(), SendOutcome::NotYet, "{stopped:?}");
+        assert_eq!(
+            frozen.child.is_alive(),
+            crate::identity::Liveness::Alive,
+            "the child runs on"
+        );
+        end(frozen.resume().expect("resume"));
     }
 
     /// Something else started a running thread in the frozen child (an EDR agent, a debugger): the
@@ -653,5 +804,83 @@ mod on_windows {
             .join()
             .expect("the resuming thread");
         end(child);
+    }
+
+    /// One child, read at each phase of its start-up: a program that stays in its start-up until its stdin
+    /// closes (`cosca_testbin_held_start`). Before the resume the loader has not begun (`NotBegun`: `Ldr`
+    /// null). After it, the child's byte says it is inside its start-up, which holds until the test closes
+    /// stdin: `Initializing` (`Ldr` set, the bit set), the handle of its parameters block not read, because
+    /// the loader moves that block. What cosca answers if the proxy found no console for a child in that
+    /// state is pinned against the proxy fixture, which is told to say so: `NotYet`. The real attach does
+    /// not find none for such a child (a console child has its console connected before its image's
+    /// start-up callbacks run), and no outcome of a real proxy is asserted here. Once the child's first line
+    /// shows its start-up over, the read is `Finished` with a real console's handle.
+    ///
+    /// Mutants: the bit is read from another place (bit 3 of the flags: clear inside the loader, so the held
+    /// read is not `Initializing`); `start_state` reads the parameters pointer and the handle without
+    /// stopping at the bit (the held child's read is `Finished` or fails); `Ldr` is read from another
+    /// offset (the held child reads `NotBegun`). The race the order closes, a read that samples the bit and
+    /// `Ldr` out of order, cannot be shown with a child that holds still.
+    #[skuld::test]
+    fn a_child_held_inside_its_start_up_reads_initializing_and_a_stop_whose_attach_found_no_console_is_not_yet() {
+        use std::io::{BufRead as _, Read as _};
+
+        use crate::identity::{HostKernel, Kernel, StartupRead};
+        use crate::stop::proxy::protocol::{CtrlEvent, ProxyAnswer};
+        use crate::stop::proxy::proxy_tests::Fixture;
+        use crate::stop::SendOutcome;
+        use crate::test_child::ctrl_break::assert_proxy_answered;
+
+        let fixture = Fixture::answering(ProxyAnswer::TargetHasNoConsole.code());
+        let mut cmd = crate::test_child::command(Console::Hidden);
+        // `args` is the whole argv, program name included.
+        cmd.executable(crate::test_child::testbin("cosca_testbin_held_start"))
+            .args(["cosca_testbin_held_start"]);
+        cmd.contain().ctrl_proxy(fixture.setting());
+        cmd.stdin(crate::Stdio::pipe()).expect("stdin pipe");
+        cmd.stdout(crate::Stdio::pipe()).expect("stdout pipe");
+        cmd.stderr(crate::Stdio::null()).expect("stderr null");
+        let frozen = cmd.spawn_suspended().expect("spawn suspended");
+        let at = |process: HANDLE| HostKernel.start_state(process).expect("read the child's start-up");
+
+        assert_eq!(
+            at(HANDLE(frozen.child.process_handle())),
+            StartupRead::NotBegun,
+            "before the resume"
+        );
+
+        // `stdin` is declared after `child`, so a failure below releases the callback before the child's drop.
+        let mut child = frozen.resume().expect("resume");
+        let stdin = child.stdin().expect("the held child's piped stdin");
+        let mut stdout = child.stdout().expect("the held child's piped stdout");
+        let mut byte = [0u8; 1];
+        stdout
+            .read_exact(&mut byte)
+            .expect("the byte the child writes inside its start-up");
+
+        assert_eq!(
+            at(HANDLE(child.process_handle())),
+            StartupRead::Initializing,
+            "inside the start-up"
+        );
+        let stopped = child.terminate().expect_err("the child is inside its start-up");
+        assert_eq!(stopped.outcome(), SendOutcome::NotYet, "{stopped:?}");
+        assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, ProxyAnswer::TargetHasNoConsole);
+        assert!(fixture.ran().is_some(), "the proxy was asked");
+
+        drop(stdin);
+        let mut line = String::new();
+        std::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .expect("the first line of the child's main");
+        assert_eq!(line.trim_end(), "started");
+        let read = at(HANDLE(child.process_handle()));
+        assert!(
+            matches!(read, StartupRead::Finished { console_handle } if console_handle > 4),
+            "after the first line, a real console's handle: {read:?}"
+        );
+
+        child.kill().expect("kill the child");
+        crate::test_child::assert_killed("the held child", child.wait().expect("reap the held child"));
     }
 }

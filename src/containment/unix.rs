@@ -58,7 +58,7 @@ use crate::containment::mechanism::{Contains, Release};
 use crate::containment::root::NumberLook;
 use crate::containment::treewalk::Listing;
 use crate::containment::{
-    check_number, Containment, Root, SendAnswer, Skip, TerminateOutcome, TreeKill, TreeStop, Why,
+    check_number, Containment, Root, SendAnswer, Skip, TerminateOutcome, TreeKill, TreeStop, UnsentKind, Why,
 };
 use crate::error::{Error, Failures};
 use std::sync::Arc;
@@ -495,17 +495,20 @@ fn signal_group_sent(
     // `kill_group_and_term_group_reject_non_positive_pgid` (this file) calls this path with
     // `0`/`-1`/`i32::MIN` on purpose and asserts a plain `Err`, not a panic.
     if pgid <= 0 {
-        return SendAnswer::NotSent(Error::Unassessable {
-            detail: format!(
-                "process group {pgid} is not a valid group id to signal (0 addresses this \
+        return SendAnswer::NotSent(
+            Error::Unassessable {
+                detail: format!(
+                    "process group {pgid} is not a valid group id to signal (0 addresses this \
                  process's own group; negative wraps to a broadcast or double-negation hazard)"
-            ),
-            source: None,
-        });
+                ),
+                source: None,
+            },
+            UnsentKind::NotSent,
+        );
     }
     let sent = match send_to_group(pgid, signal, root) {
         Ok(sent) => sent,
-        Err(unchecked) => return SendAnswer::NotSent(unchecked),
+        Err(unchecked) => return SendAnswer::NotSent(unchecked, UnsentKind::NotSent),
     };
     // Whether the group's own send, or the leader's fallback, went out to at least one process. A `SIGKILL`
     // member's resend is not counted: it is the kill's check, and a kill's answer is not read for it.
@@ -523,10 +526,13 @@ fn signal_group_sent(
             reached = matches!(signal_direct(pgid, signal, root), Ok(crate::signal::Sent::Delivered));
         }
         Err(e) => {
-            return SendAnswer::NotSent(Error::Containment {
-                detail: format!("{signal} could not be sent to process group {pgid}"),
-                source: Some(Error::io_cause(io::Error::from(e))),
-            })
+            return SendAnswer::NotSent(
+                Error::Containment {
+                    detail: format!("{signal} could not be sent to process group {pgid}"),
+                    source: Some(Error::io_cause(io::Error::from(e))),
+                },
+                UnsentKind::NotSent,
+            )
         }
     }
     let checked = verify(pgid, signal, root, killed);
