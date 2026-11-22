@@ -201,8 +201,8 @@ fn pid_comes_from_the_child_and_id_from_the_spawn() {
 /// `warn` naming the pid and the panic, no block, and the child still runs. The stdin that ends the
 /// child stays with the test; a drop that waited anyway would close it from the blocking hook and
 /// reap the child, so a regression fails by assertion, not by a hang. The given-up child is not
-/// reaped (it has no owner left): the test closes its stdin so it exits, and the process exit
-/// collects its zombie.
+/// reaped (it has no owner left): the test closes its stdin so it exits, and waits for the exit; the
+/// process exit collects its zombie.
 ///
 /// Mutants: the drop waits though the thread is panicking (blocks, reaps, warns of the reap); it
 /// logs nothing, or twice; it kills the child.
@@ -217,8 +217,11 @@ fn dropping_an_unreaped_while_panicking_gives_the_child_up_without_waiting() {
     use crate::identity::Liveness;
 
     crate::log_capture::install();
-    let (child, stdin) = crate::test_child::blocker().into_parts();
-    let blocker_id = identity_of(&child);
+    let blocker = crate::test_child::blocker();
+    let blocker_id = identity_of(&blocker);
+    // Declared first so it drops last: the stdin closes before the guard waits.
+    let _exit = crate::test_child::ExitGuard::new(None, blocker_id);
+    let (child, stdin) = blocker.into_parts();
     let owned = OwnedChild::adopt(child, blocker_id, TrackedKind::Own).unwrap_or_else(|(e, _)| panic!("adopt: {e}"));
     let unreaped = Unreaped::new(owned, Some(blocker_id), DropKind::Wait);
     let stdin = Rc::new(RefCell::new(Some(stdin)));

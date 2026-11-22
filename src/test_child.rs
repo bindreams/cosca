@@ -111,6 +111,8 @@ pub(crate) fn testbin(name: &str) -> std::path::PathBuf {
 
 // Blocker fixtures =====
 
+mod exit_guard;
+pub(crate) use exit_guard::ExitGuard;
 mod std_child;
 #[cfg(windows)]
 pub(crate) use std_child::blocker_with_flags;
@@ -131,6 +133,7 @@ pub(crate) use std_child::{blocker, blocker_with};
 ///   guard is dropped. A test that must hold it apart takes it with `stdin.take()` (or
 ///   [`StdChild::into_parts`]); dropping that, or `Child::wait()`, which closes a piped stdin
 ///   before it waits, is a deliberate EOF release.
+/// - [`ExitGuard`]: for a child the product lets go; dropping it releases the child and waits for its exit.
 ///
 /// A `cat` backgrounded inside an `sh -c` script gets `/dev/null` as stdin (POSIX, for a
 /// non-interactive shell) unless it is redirected explicitly, and would exit at once. Write it
@@ -637,6 +640,27 @@ pub(crate) async fn held_blocker_async(
     let mut child = cmd.spawn().await.expect("spawn");
     let stdin = child.stdin().expect("piped stdin");
     (child, stdin)
+}
+
+/// Async twin of [`held_uncontained_blocker`].
+#[cfg(feature = "tokio")]
+pub(crate) async fn held_uncontained_blocker_async(kill_on_drop: bool) -> (crate::tokio::Child, crate::PipeWriter) {
+    held_uncontained_blocker_reporting_async(kill_on_drop, None).await
+}
+
+/// Async twin of [`held_uncontained_blocker_reporting`].
+#[cfg(feature = "tokio")]
+pub(crate) async fn held_uncontained_blocker_reporting_async(
+    kill_on_drop: bool,
+    report: Option<crate::elevation::ElevationReport>,
+) -> (crate::tokio::Child, crate::PipeWriter) {
+    let (stdin, writer) = held_writer_stdin();
+    let mut cmd = tokio_command(Console::Hidden);
+    cmd.args(BLOCKER_ARGV.iter().copied());
+    cmd.stdin(stdin).expect("set stdin");
+    cmd.kill_on_drop(kill_on_drop);
+    cmd.set_elevation_report(report);
+    (cmd.spawn().await.expect("spawn"), writer)
 }
 
 /// A process-group member that announces its own pid on a piped stdout and then blocks on a

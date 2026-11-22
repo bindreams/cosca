@@ -7,7 +7,9 @@ use std::future::Future as _;
 use std::task::{Context, Poll, Waker};
 
 use crate::containment::Nesting;
-use crate::test_child::Console;
+#[cfg(unix)]
+use crate::test_child::held_uncontained_blocker_reporting_async;
+use crate::test_child::{held_uncontained_blocker_async, Console, ExitGuard};
 use crate::ContainMode;
 
 #[skuld::test]
@@ -147,27 +149,6 @@ fn tokio_raw_executable_records_an_exact_spec() {
 
 // A failure after the spawn reports what became of the child =====
 
-/// A live blocker whose stdin this test holds, and that writer.
-#[cfg(unix)]
-async fn held_blocker(kill_on_drop: bool) -> (super::Child, crate::PipeWriter) {
-    held_blocker_reporting(kill_on_drop, None).await
-}
-
-/// [`held_blocker`] whose spawn reports `elevation`: a child launched behind that backend.
-#[cfg(unix)]
-async fn held_blocker_reporting(
-    kill_on_drop: bool,
-    elevation: Option<crate::elevation::ElevationReport>,
-) -> (super::Child, crate::PipeWriter) {
-    let (stdin, writer) = crate::test_child::held_writer_stdin();
-    let mut cmd = crate::test_child::tokio_command(Console::Hidden);
-    cmd.args(crate::test_child::BLOCKER_ARGV.iter().copied());
-    cmd.stdin(stdin).expect("set stdin");
-    cmd.kill_on_drop(kill_on_drop);
-    cmd.set_elevation_report(elevation);
-    (cmd.spawn().await.expect("spawn"), writer)
-}
-
 /// What `after_the_spawn` answers for a failed pump on `child`, a held blocker whose stdin `writer`
 /// is dropped between the teardown's kill and its reap, so a teardown that sent nothing leaves the
 /// blocker to exit `0`: the reap's status must be `SIGKILL`, and the kill is in the send log.
@@ -194,7 +175,7 @@ async fn after_a_pump_failure(child: super::Child, writer: crate::PipeWriter) ->
 #[cfg(unix)]
 #[skuld::test]
 async fn a_failure_after_the_spawn_signals_the_child_and_says_so() {
-    let (child, writer) = held_blocker(true).await;
+    let (child, writer) = held_uncontained_blocker_async(true).await;
     let error = after_a_pump_failure(child, writer).await;
     assert_eq!(error.fate(), Some(crate::error::ChildFate::Reaped), "{error}");
 }
@@ -205,8 +186,9 @@ async fn a_failure_after_the_spawn_signals_the_child_and_says_so() {
 #[cfg(unix)]
 #[skuld::test]
 async fn a_failure_after_the_spawn_leaves_a_child_that_opted_out() {
-    let (child, writer) = held_blocker(false).await;
+    let (child, writer) = held_uncontained_blocker_async(false).await;
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    let exit = ExitGuard::new(Some(writer), id);
     let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), child).await;
     assert_eq!(
         error.fate(),
@@ -214,24 +196,19 @@ async fn a_failure_after_the_spawn_leaves_a_child_that_opted_out() {
         "{error}"
     );
     // The child exits once its stdin closes.
-    drop(writer);
+    drop(exit);
 }
 
 /// A child whose teardown after a failed run had its kills refused, handed back as the caller gets it,
-/// with the child's id, its stdin writer, and the log mark from before the teardown. The refusals are
-/// stated to the child's process (`FakeProcess`) over the real one: the teardown's kill, then the
-/// one a let-go drop makes.
-async fn handed_back_after_refused_kills() -> (
-    crate::Unreaped,
-    crate::identity::ProcessId,
-    crate::tokio::ChildStdin,
-    usize,
-) {
+/// with the child's id, the [`ExitGuard`] that releases it and waits for its exit, and the log mark from
+/// before the teardown. The refusals are stated to the child's process (`FakeProcess`) over the real
+/// one: the teardown's kill, then the one a let-go drop makes.
+async fn handed_back_after_refused_kills() -> (crate::Unreaped, crate::identity::ProcessId, ExitGuard, usize) {
     crate::tokio::test_runtime::assert_current_thread();
     crate::log_capture::install();
-    let (mut child, writer) =
-        crate::test_child::held_blocker_async(crate::Stdio::null(), Console::Hidden, |_| {}).await;
+    let (mut child, writer) = held_uncontained_blocker_async(true).await;
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    let exit = ExitGuard::new(Some(writer), id);
     let refused = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
     child.inner.proc.script_over(|f| f.signals([refused(), refused()]));
     let mark = crate::log_capture::mark();
@@ -255,7 +232,7 @@ async fn handed_back_after_refused_kills() -> (
         matches!(&**cleanup.first(), crate::error::Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
         "{cleanup:?}"
     );
-    (*unreaped, id, writer, mark)
+    (*unreaped, id, exit, mark)
 }
 
 /// A teardown whose kill is refused hands the child back as an [`Unreaped`](crate::Unreaped), as the
@@ -265,7 +242,7 @@ async fn handed_back_after_refused_kills() -> (
 /// `Child::drop`.
 #[skuld::test]
 async fn a_failure_after_the_spawn_whose_kill_is_refused_hands_the_child_back_and_warns() {
-    let (unreaped, id, writer, mark) = handed_back_after_refused_kills().await;
+    let (unreaped, id, exit, mark) = handed_back_after_refused_kills().await;
 
     assert_eq!(unreaped.pid(), Some(id.pid()));
     let warns = crate::log_capture::records_since(mark, "handed back to the caller");
@@ -277,7 +254,7 @@ async fn a_failure_after_the_spawn_whose_kill_is_refused_hands_the_child_back_an
         "{warns:?}"
     );
     // The child exits once its stdin closes, and the caller settles what it was handed.
-    drop(writer);
+    drop(exit);
     unreaped.wait_async().await.expect("the child exits on EOF");
 }
 
@@ -288,8 +265,8 @@ async fn a_failure_after_the_spawn_whose_kill_is_refused_hands_the_child_back_an
 /// Mutant: the hand-back builds its `Unreaped` with the sync drop kind.
 #[skuld::test]
 async fn the_child_a_failed_async_run_hands_back_is_let_go_when_dropped() {
-    let (unreaped, _id, writer, mark) = handed_back_after_refused_kills().await;
-    drop(writer);
+    let (unreaped, _id, exit, mark) = handed_back_after_refused_kills().await;
+    drop(exit);
 
     drop(unreaped);
 
@@ -307,18 +284,20 @@ async fn the_child_a_failed_async_run_hands_back_is_let_go_when_dropped() {
 #[skuld::test]
 async fn a_failure_after_the_spawn_notes_the_elevated_program_only_behind_a_front() {
     let note = "an elevated program behind it may still run";
-    let (plain, w1) = held_blocker(true).await;
+    let (plain, w1) = held_uncontained_blocker_async(true).await;
     let plain = after_a_pump_failure(plain, w1).await;
     assert!(!plain.to_string().contains(note), "{plain}");
 
-    let (ended, writer) = held_blocker_reporting(true, crate::child::front_kill_tests::sudo_report()).await;
+    let (ended, writer) =
+        held_uncontained_blocker_reporting_async(true, crate::child::front_kill_tests::sudo_report()).await;
     drop(writer);
     crate::test_child::wait_until_zombie(ended.pid());
     let ended = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), ended).await;
     assert!(ended.to_string().contains(note), "{ended}");
     assert_eq!(ended.fate(), Some(crate::error::ChildFate::Reaped), "{ended}");
 
-    let (front, writer) = held_blocker_reporting(true, crate::child::front_kill_tests::sudo_report()).await;
+    let (front, writer) =
+        held_uncontained_blocker_reporting_async(true, crate::child::front_kill_tests::sudo_report()).await;
     let id = front.id().expect(crate::test_child::IDENTITY_READ);
     let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), front).await;
     assert!(!error.to_string().contains(note), "{error}");

@@ -43,6 +43,7 @@ mod failed_spawn {
     use crate::error::ChildFate;
     use crate::os_process::fake::ReapAnswer;
     use crate::signal::{Sent, Sig};
+    use crate::test_child::ExitGuard;
 
     /// A failed spawn's teardown of the child it holds warns past its policy's threshold, once.
     ///
@@ -209,6 +210,10 @@ mod failed_spawn {
                 .reaps([ReapAnswer::Err(std::io::ErrorKind::Other)])
         });
         let fake = fake.expect("the script ran");
+        let id = crate::identity::ProcessId::of(owned.pid().expect("the held root has a pid"))
+            .found()
+            .expect("the live child has an identity");
+        let exit = ExitGuard::new(Some(stdin), id);
 
         let torn = tear_down_failed_spawn(
             owned,
@@ -221,7 +226,7 @@ mod failed_spawn {
         let handed_back = torn.unreaped.expect("a child whose wait failed is handed back");
         assert_eq!(fake.signal_calls(), [Sig::Kill], "the teardown's own kill");
         // So that a drop that waits ends with the child, not never.
-        drop(stdin);
+        drop(exit);
 
         drop(handed_back);
 
