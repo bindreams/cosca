@@ -437,6 +437,7 @@ fn a_failure_after_the_spawn_tears_the_child_down_and_says_so() {
 fn a_failure_after_the_spawn_leaves_a_child_that_opted_out() {
     let (child, writer) = held_blocker(false);
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    let exit = crate::test_child::ExitGuard::new(Some(writer), id);
     let error = super::after_the_spawn(crate::error::Error::Io(std::io::Error::other("pump")), child);
     assert_eq!(
         error.fate(),
@@ -448,7 +449,7 @@ fn a_failure_after_the_spawn_leaves_a_child_that_opted_out() {
         "the caller chose to keep this child: {error}"
     );
     assert_eq!(id.is_alive(), crate::identity::Liveness::Alive, "{error}");
-    drop(writer);
+    drop(exit);
 }
 
 /// A child that opted out of the teardown and had its exit collected is reaped, not running.

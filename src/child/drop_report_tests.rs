@@ -403,6 +403,7 @@ fn a_walk_that_left_only_the_root_is_settled_by_a_root_someone_else_reaped() {
     use crate::containment::treewalk::fault::LeftBehind;
     crate::log_capture::install();
     let (mut child, writer) = crate::test_child::held_treewalk_blocker_leaving(LeftBehind::Root);
+    let exit = crate::test_child::ExitGuard::new(Some(writer), child.id().expect(crate::test_child::IDENTITY_READ));
     let mark = crate::log_capture::mark();
     // The walk's send of the root's kill goes through this handle too: it is answered first, and the
     // teardown's own kill is the refused one.
@@ -424,7 +425,7 @@ fn a_walk_that_left_only_the_root_is_settled_by_a_root_someone_else_reaped() {
     assert!(warns[0].contains("could not be vouched for"), "{warns:?}");
     assert!(!warns[0].contains("members"), "{warns:?}");
     assert!(!child.tree.is_killed(), "the walk saw the root running");
-    drop(writer);
+    drop(exit);
 }
 
 /// A failed spawn's cleanup whose root kill is refused, and whose root still runs, hands the root

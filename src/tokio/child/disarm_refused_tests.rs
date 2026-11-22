@@ -10,17 +10,15 @@ use crate::containment::windows::JobHandle;
 use crate::containment::{Mechanism, Tree};
 use crate::error::Error;
 use crate::identity::{Liveness, ProcessId};
-use crate::test_child::{held_blocker_async, Console};
+use crate::test_child::{held_uncontained_blocker_async, ExitGuard};
 
 /// A live blocker whose containment is a job that refuses `disarm`; `kill_on_drop` is the command's.
-async fn refusing_child(kill_on_drop: bool) -> (Child, crate::tokio::ChildStdin, ProcessId) {
-    let (mut child, stdin) = held_blocker_async(crate::Stdio::null(), Console::Hidden, |cmd| {
-        _ = cmd.kill_on_drop(kill_on_drop);
-    })
-    .await;
-    child.inner.tree = Tree::contained(Mechanism::Job(JobHandle::create_without_set_access_for_test()));
+async fn refusing_child(kill_on_drop: bool) -> (Child, ExitGuard, ProcessId) {
+    let (mut child, stdin) = held_uncontained_blocker_async(kill_on_drop).await;
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
-    (child, stdin, id)
+    let exit = ExitGuard::new(Some(stdin), id);
+    child.inner.tree = Tree::contained(Mechanism::Job(JobHandle::create_without_set_access_for_test()));
+    (child, exit, id)
 }
 
 #[track_caller]
@@ -39,7 +37,7 @@ fn assert_access_denied(error: &Error) {
 #[skuld::test]
 async fn a_refused_detach_is_returned_and_leaves_the_child_armed() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, _stdin, id) = refusing_child(true).await;
+    let (mut child, _exit, id) = refusing_child(true).await;
 
     let error = child.detach().expect_err("the disarm was refused");
 
@@ -56,11 +54,11 @@ async fn a_refused_detach_is_returned_and_leaves_the_child_armed() {
 #[skuld::test]
 async fn detaching_a_child_that_is_already_disarmed_is_ok_without_asking_the_job() {
     crate::tokio::test_runtime::assert_current_thread();
-    let (mut child, stdin, id) = refusing_child(false).await;
+    let (mut child, exit, id) = refusing_child(false).await;
 
     child.detach().expect("the child was already disarmed");
 
     assert_eq!(id.is_alive(), Liveness::Alive);
-    drop(stdin);
+    drop(exit);
     drop(child);
 }

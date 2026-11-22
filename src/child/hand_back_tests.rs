@@ -10,7 +10,7 @@ use crate::log_capture::warns_since;
 use crate::os_process::fake::FakeProcess;
 #[cfg(target_os = "linux")]
 use crate::test_child::Console;
-use crate::test_child::{held_uncontained_blocker, held_uncontained_blocker_reporting, tear_down_holding};
+use crate::test_child::{held_uncontained_blocker, held_uncontained_blocker_reporting, tear_down_holding, ExitGuard};
 
 /// Make the next kill of `child` fail with `PermissionDenied`, as an elevated child's does.
 fn refuse_the_kill(child: &mut Child) -> FakeProcess {
@@ -59,10 +59,11 @@ fn the_unreaped_a_child_hands_back_does_what_its_spawns_policy_says_on_drop() {
     use crate::signal::Sig;
 
     let (mut child, stdin) = held_uncontained_blocker(true);
+    let exit = ExitGuard::new(Some(stdin), child.id().expect(crate::test_child::IDENTITY_READ));
     child.policy = SpawnPolicy::LET_GO;
     let refused = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
     let fake = child.proc.script_over(|f| f.signals([refused(), refused()]));
-    let (_, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
+    let (_, handed_back) = tear_down_holding(child, exit, Disposition::HandBack);
     handed_back.unreaped();
     assert_eq!(fake.signal_calls(), [Sig::Kill], "the teardown's own kill");
 
@@ -84,10 +85,11 @@ fn the_unreaped_a_child_without_a_front_hands_back_is_sent_the_drops_kill() {
 
     for via in VIAS_WITHOUT_A_FRONT {
         let (mut child, stdin) = held_uncontained_blocker_reporting(true, Some(report(via.clone())));
+        let exit = ExitGuard::new(Some(stdin), child.id().expect(crate::test_child::IDENTITY_READ));
         child.policy = SpawnPolicy::LET_GO;
         let refused = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         let fake = child.proc.script_over(|f| f.signals([refused(), refused()]));
-        let (_, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
+        let (_, handed_back) = tear_down_holding(child, exit, Disposition::HandBack);
         handed_back.unreaped();
         assert_eq!(fake.signal_calls(), [Sig::Kill], "{via:?}: the teardown's own kill");
 
@@ -131,8 +133,9 @@ fn a_refused_kill_is_left_when_the_caller_leaves_it() {
 fn a_child_that_opted_out_is_not_handed_back() {
     let (child, stdin) = held_uncontained_blocker(false);
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    let exit = ExitGuard::new(Some(stdin), id);
 
-    let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
+    let (fate, handed_back) = tear_down_holding(child, exit, Disposition::HandBack);
 
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
     assert!(handed_back.is_none(), "the teardown handed the child back");
@@ -190,6 +193,7 @@ fn a_disarmed_teardown_names_the_fate_the_peek_at_the_root_shows() {
         for (name, answer, expected, logged) in &rows {
             let (mut child, stdin) = held_uncontained_blocker(false);
             let id = child.id().expect(crate::test_child::IDENTITY_READ);
+            let exit = ExitGuard::new(Some(stdin), id);
             child.proc.script_over(|fake| {
                 let fake = fake.peeks([answer()]);
                 #[cfg(unix)]
@@ -198,7 +202,7 @@ fn a_disarmed_teardown_names_the_fate_the_peek_at_the_root_shows() {
             });
             let mark = crate::log_capture::mark();
 
-            let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::Leave);
+            let (fate, handed_back) = tear_down_holding(child, exit, Disposition::Leave);
 
             let want = expected.map_or(ChildFate::Running { id: Some(id) }, |fate_of| fate_of(exact));
             assert_eq!(fate, want, "{name} (exact consume: {exact})");
@@ -321,11 +325,12 @@ fn a_child_reaped_elsewhere_is_not_handed_back() {
     let refused = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
     for (kill, fate) in [(refused(), ChildFate::Gone), (Ok(Sent::Delivered), ChildFate::Killed)] {
         let (mut child, stdin) = held_uncontained_blocker(true);
+        let exit = ExitGuard::new(Some(stdin), child.id().expect(crate::test_child::IDENTITY_READ));
         child
             .proc
             .script_over(|f| f.signals([kill]).reaps([ReapAnswer::Foreign(Foreign::Gone)]));
 
-        let (torn, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
+        let (torn, handed_back) = tear_down_holding(child, exit, Disposition::HandBack);
 
         assert_eq!(torn, fate);
         assert!(
@@ -376,13 +381,14 @@ fn a_job_contained_child_whose_kill_is_refused_and_look_shows_the_exit_is_not_ha
     use crate::os_process::child::ExitRecord;
     use crate::os_process::fake::ReapAnswer;
 
-    let (mut child, stdin, _id) = crate::test_child::live_blocker();
+    let (mut child, stdin, id) = crate::test_child::live_blocker();
+    let exit = ExitGuard::new(Some(stdin), id);
     child.proc.script_over(|f| {
         f.signals([Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))])
             .reaps([ReapAnswer::Exited(ExitRecord::Status(Default::default()))])
     });
 
-    let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::HandBack);
+    let (fate, handed_back) = tear_down_holding(child, exit, Disposition::HandBack);
 
     assert_eq!(fate, ChildFate::Reaped);
     assert!(handed_back.is_none());
