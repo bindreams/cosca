@@ -202,7 +202,7 @@ fn a_walk_with_no_member_whose_exit_flag_cannot_be_read_sends_nothing() {
         matches!(
             termed,
             (
-                super::SendAnswer::NotSent(crate::error::Error::Unassessable { .. }),
+                super::SendAnswer::NotSent(crate::error::Error::Unassessable { .. }, _),
                 None
             )
         ),

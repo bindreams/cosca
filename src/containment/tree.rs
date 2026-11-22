@@ -8,7 +8,7 @@ use crate::containment::drain_edge::DrainEdge;
 use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{Contains, Mechanism};
 use crate::containment::treewalk::{Listing, WalkToken};
-use crate::containment::{Containment, Root, TerminateOutcome, TreeKill, TreeStop};
+use crate::containment::{Containment, Root, TerminateOutcome, TreeKill, TreeStop, UnsentKind};
 use crate::error::Error;
 
 /// Owns the OS containment resource for a spawned child. `killed` is where the tree stands after the
@@ -224,7 +224,10 @@ impl Tree {
         match &self.holder {
             Holder::None | Holder::Delegated => {
                 debug_assert!(false, "Tree::terminate on a tree that is not contained");
-                (TerminateOutcome::NotSent(non_actionable("terminate")), None)
+                (
+                    TerminateOutcome::NotSent(non_actionable("terminate"), UnsentKind::NotSent),
+                    None,
+                )
             }
             Holder::Contained(mechanism) => {
                 debug_assert!(!self.released, "a send on a released tree");

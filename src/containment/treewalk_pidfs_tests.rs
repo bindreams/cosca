@@ -414,7 +414,7 @@ fn a_root_whose_proof_cannot_be_made_is_unassessable_and_signals_nothing() {
             &super::ByIdentity::new(&root_proof_fails(), root()),
             crate::containment::TreeStop::default(),
         ) {
-            (super::SendAnswer::NotSent(not_sent), _) => Err(not_sent),
+            (super::SendAnswer::NotSent(not_sent, _), _) => Err(not_sent),
             _ => Ok(()),
         },
         root().children_with(&root_proof_fails(), Recursive::No).map(|_| ()),

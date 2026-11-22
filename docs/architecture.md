@@ -39,8 +39,9 @@ A question about a _pid_ and a question about a _process you hold_ go to differe
 The identity module asks the kernel through one interface, `Kernel` (`HostKernel` makes the calls;
 tests pass a `FakeKernel` of stated answers). The trait exists on every platform, so shared code
 takes `&dyn Kernel` with no `#[cfg]`; Linux's and macOS's have the methods, and Windows's has
-`terminate` (`TerminateProcess`) and `creation_token` (`GetProcessTimes` of a handle the caller
-holds). A method enters with its first caller. A read that a test answers takes `&dyn Kernel`; code
+`terminate` (`TerminateProcess`), `creation_token` (`GetProcessTimes` of a handle the caller holds) and
+`start_state` (how far a process has got in starting, read through a handle the caller holds; see
+`identity/windows/peb.rs`). A method enters with its first caller. A read that a test answers takes `&dyn Kernel`; code
 that runs between fork and exec never does, and stays raw.
 
 The OS layer owns the kernel it asks, on every platform. `os_process::open_with(kernel, id)` checks
@@ -91,8 +92,9 @@ What a child's cooperative stop sends is an action it stores, not a rule inside 
   tree's members (`Contains::member_ids`: a job's listing, a tree walk's walk, a fake's stated table).
 - **The record is also what `terminate` and `terminate_tree` answer from.** Every prepared send, to a root
   or to a tree and whatever it answered, leaves on the target how it went (`SendOutcome`: `Sent`,
-  `NotSent`, `Unknown`); the producer says which (an error found by a check after a send that went out is
-  `Sent`; an answer that cannot say whether the event went out is `Unknown`; a send that reached no process,
+  `NotSent`, `NotYet`, `Unknown`); the producer says which (an error found by a check after a send that went
+  out is `Sent`; an answer that cannot say whether the event went out is `Unknown`; a proxy that found no
+  console for a child that has not connected its console yet is `NotYet`; a send that reached no process,
   an empty group or leaf, one whose every member refused it, or (macOS) a process whose exit had begun,
   which the kernel took no signal for (`Sent::Exited`), is `NotSent` whatever its answer). A root's
   record names a stop only for a send that went out or may have, so a later error never says a stop was sent

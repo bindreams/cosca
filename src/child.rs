@@ -913,6 +913,7 @@ impl Child {
     /// ([`SendOutcome`](crate::stop::SendOutcome)):
     /// - [`Sent`](crate::stop::SendOutcome::Sent): the signal went out to at least one process, whatever the error says of what a check after it found;
     /// - [`NotSent`](crate::stop::SendOutcome::NotSent): nothing was sent; the error says why;
+    /// - [`NotYet`](crate::stop::SendOutcome::NotYet): nothing was sent because the child's console was not set up yet; asking again can succeed (Windows proxy only);
     /// - [`Unknown`](crate::stop::SendOutcome::Unknown): whether it went out cannot be told, as for an action that made no prepared send and failed.
     ///
     /// **Windows: what the default signals.** For a root that leads its group on this process's console

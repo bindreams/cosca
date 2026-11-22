@@ -12,13 +12,10 @@
 use std::io;
 use std::sync::Arc;
 
-use windows::Wdk::System::Threading::ProcessBasicInformation;
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-use windows::Win32::System::Threading::{PEB, PROCESS_BASIC_INFORMATION};
 
 use super::{open_for_resume, owner_of, process_pid_of, resume_thread, suspend_thread, thread_entries, ThreadHandle};
-use crate::error::{io_context, nt_io_error, win32_io_error, Error};
+use crate::error::{io_context, win32_io_error, Error};
 
 /// A root proved not to have started: its initial thread, kept suspended by the suspend the proof
 /// took. Dropping it closes the handle and resumes nothing: the root is ended next, and a resume in
@@ -169,43 +166,7 @@ fn loader_started(process: HANDLE) -> io::Result<bool> {
     #[cfg(test)]
     super::forced(super::fault::Step::LoaderRead, None).map_err(win32_io_error)?;
 
-    let mut info = PROCESS_BASIC_INFORMATION::default();
-    // SAFETY: class 0 writes a `PROCESS_BASIC_INFORMATION`.
-    unsafe { crate::identity::windows_query_process(process, ProcessBasicInformation, &mut info) }.map_err(
-        |status| {
-            io_context(
-                "NtQueryInformationProcess(ProcessBasicInformation) failed",
-                nt_io_error(status),
-            )
-        },
-    )?;
-    if info.PebBaseAddress.is_null() {
-        return Err(io::Error::other("the process has no PEB"));
-    }
-    let ldr_at = info
-        .PebBaseAddress
-        .cast::<u8>()
-        .wrapping_add(std::mem::offset_of!(PEB, Ldr));
-    let mut ldr: *mut core::ffi::c_void = std::ptr::null_mut();
-    let mut read = 0usize;
-    // SAFETY: `ldr` is a pointer-sized buffer, whose size is passed; the address is read in the
-    // other process and never dereferenced here.
-    unsafe {
-        ReadProcessMemory(
-            process,
-            ldr_at.cast(),
-            std::ptr::addr_of_mut!(ldr).cast(),
-            size_of::<*mut core::ffi::c_void>(),
-            Some(&mut read),
-        )
-    }
-    .map_err(|e| io_context("ReadProcessMemory(PEB.Ldr) failed", win32_io_error(e)))?;
-    if read != size_of::<*mut core::ffi::c_void>() {
-        return Err(io::Error::other(format!(
-            "ReadProcessMemory(PEB.Ldr) read {read} bytes"
-        )));
-    }
-    Ok(!ldr.is_null())
+    crate::identity::windows_read_peb(process, crate::identity::PebField::Ldr).map(|ldr| ldr != 0)
 }
 
 #[cfg(test)]

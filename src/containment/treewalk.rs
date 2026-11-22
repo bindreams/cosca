@@ -125,11 +125,11 @@ use crate::containment::mechanism::Members;
 #[cfg(unix)]
 use crate::containment::mechanism::Release;
 use crate::containment::mechanism::{Contains, KillLeftOutcome};
-#[cfg(not(windows))]
-use crate::containment::SendAnswer;
 #[cfg(target_os = "macos")]
 use crate::containment::Why;
 use crate::containment::{Containment, Root, Skip, TerminateOutcome, TreeKill, TreeStop};
+#[cfg(not(windows))]
+use crate::containment::{SendAnswer, UnsentKind};
 use crate::error::Error;
 use crate::identity::Resolved;
 use crate::identity::{resolution_of, Kernel, OrderKey, ProcessId, RawPid, Resolution, SpawnKernel};
@@ -1389,7 +1389,7 @@ pub(crate) fn terminate(
     debug_assert_eq!(held.pid(), root.pid(), "the held root is not the walk's root");
     #[cfg(unix)]
     let paired = 'walk: {
-        let not_sent = |error| (SendAnswer::NotSent(error), None);
+        let not_sent = |error| (SendAnswer::NotSent(error, UnsentKind::NotSent), None);
         let signal = how.signal();
         let table = match crate::containment::enumerate::process_table(kernel) {
             Ok(table) => table,

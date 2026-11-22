@@ -113,7 +113,7 @@ fn a_walkers_terminate_over_an_untrusted_view_says_nothing_was_sent() {
             .send_terminate(id.pid(), None, crate::containment::TreeStop::default())
             .0
         {
-            crate::containment::TerminateOutcome::NotSent(Error::Unassessable { detail, .. })
+            crate::containment::TerminateOutcome::NotSent(Error::Unassessable { detail, .. }, _)
                 if detail.contains(view.cause()) => {}
             other => panic!("expected NotSent(Unassessable) naming {}, got {other:?}", view.cause()),
         }

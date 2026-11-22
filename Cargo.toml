@@ -415,6 +415,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "cosca_testbin_held_start"
+path = "testbin/held_start.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "cosca_testbin_image"
 path = "testbin/image_report.rs"
 test = false

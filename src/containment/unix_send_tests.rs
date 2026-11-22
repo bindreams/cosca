@@ -160,7 +160,7 @@ fn a_terminate_whose_check_fails_says_nothing_was_sent() {
 
     assert_eq!(steps, [GroupStep::Check], "nothing was sent");
     match sent {
-        crate::containment::SendAnswer::NotSent(crate::error::Error::Unassessable { detail, source: None }) => {
+        crate::containment::SendAnswer::NotSent(crate::error::Error::Unassessable { detail, source: None }, _) => {
             assert!(detail.contains("was reaped elsewhere"), "{detail}");
         }
         other => panic!("expected NotSent(Unassessable), got {other:?}"),

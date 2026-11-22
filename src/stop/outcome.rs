@@ -16,6 +16,11 @@ pub enum SendOutcome {
     /// send that went to no process (the group or the cgroup had no member, or the kernel refused every
     /// member), whatever a check after it found. The error says why.
     NotSent,
+    /// Nothing was sent because the child had not set its console up when the console-event proxy asked
+    /// (Windows: it had not connected its console yet, or did so just after the attach), so asking again can succeed. The
+    /// call is the caller's to repeat, with its own bound; `stop::send_console_event_via_proxy` says how long
+    /// the window lasted.
+    NotYet,
     /// Whether the send went out cannot be told: an action that made no prepared send and failed, or, on
     /// Windows, the console-event proxy ran and did not confirm its event, or may have run, or its exit is
     /// no answer.

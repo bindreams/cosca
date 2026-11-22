@@ -35,13 +35,16 @@ fn a_tree_stop_carries_the_name_and_the_answer_its_caller_sent() {
 
     let refused = TreeStop::named(
         CtrlEvent::CtrlBreak.name(),
-        SendAnswer::NotSent(crate::error::Error::NoConsole {
-            detail: "the caller had none".into(),
-        }),
+        SendAnswer::NotSent(
+            crate::error::Error::NoConsole {
+                detail: "the caller had none".into(),
+            },
+            crate::containment::UnsentKind::NotSent,
+        ),
     );
     assert!(matches!(
         refused.into_sent(),
-        SendAnswer::NotSent(crate::error::Error::NoConsole { .. })
+        SendAnswer::NotSent(crate::error::Error::NoConsole { .. }, _)
     ));
 }
 
@@ -54,7 +57,7 @@ fn a_tree_stop_carries_the_name_and_the_answer_its_caller_sent() {
 /// went to no process reads as `Sent`.
 #[skuld::test]
 fn a_send_answer_says_how_it_went_and_flattens_to_one_tree_answer() {
-    use super::{SendAnswer, TerminateOutcome};
+    use super::{SendAnswer, TerminateOutcome, UnsentKind};
     use crate::error::Error;
     use crate::stop::SendOutcome;
 
@@ -63,8 +66,17 @@ fn a_send_answer_says_how_it_went_and_flattens_to_one_tree_answer() {
         source: None,
     };
     type Make = fn(Error) -> SendAnswer;
-    let rows: [(&str, Make, SendOutcome); 5] = [
-        ("not sent", SendAnswer::NotSent, SendOutcome::NotSent),
+    let rows: [(&str, Make, SendOutcome); 6] = [
+        (
+            "not sent",
+            |e| SendAnswer::NotSent(e, UnsentKind::NotSent),
+            SendOutcome::NotSent,
+        ),
+        (
+            "not yet",
+            |e| SendAnswer::NotSent(e, UnsentKind::NotYet),
+            SendOutcome::NotYet,
+        ),
         ("exited", SendAnswer::RootExited, SendOutcome::NotSent),
         ("checked", |e| SendAnswer::Sent(Err(e)), SendOutcome::Sent),
         (

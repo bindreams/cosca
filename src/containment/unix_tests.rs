@@ -78,9 +78,10 @@ fn term_group_tree_of_a_non_positive_pgid_says_nothing_was_sent(#[fixture(stray_
             Some(&StatedRoot::unreaped()),
             crate::containment::TreeStop::default(),
         ) {
-            crate::containment::TerminateOutcome::NotSent(crate::error::Error::Unassessable {
-                source: None, ..
-            }) => {}
+            crate::containment::TerminateOutcome::NotSent(
+                crate::error::Error::Unassessable { source: None, .. },
+                _,
+            ) => {}
             other => panic!("pgid {pgid}: expected NotSent(Unassessable), got {other:?}"),
         }
     }

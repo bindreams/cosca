@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::containment::tree_kill::Unnamed;
-use crate::containment::SendAnswer;
+use crate::containment::{SendAnswer, UnsentKind};
 use crate::identity::ProcessId;
 
 #[cfg(target_os = "linux")]
@@ -820,7 +820,7 @@ impl CgroupLeaf {
                 log::debug!("cgroup terminate: leaf {} is already gone", path.display());
                 return SendAnswer::NoneReached(Ok(()));
             }
-            Err(e) => return SendAnswer::NotSent(crate::error::Error::Io(e)),
+            Err(e) => return SendAnswer::NotSent(crate::error::Error::Io(e), UnsentKind::NotSent),
         };
         #[cfg(test)]
         fault::run_after_procs_read();

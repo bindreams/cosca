@@ -960,7 +960,7 @@ fn a_tree_calls_answer_is_the_sends_unless_nothing_was_sent() {
     };
 
     assert_eq!(
-        detail(SendAnswer::NotSent(error("not sent")).into_tree_result()),
+        detail(SendAnswer::NotSent(error("not sent"), crate::containment::UnsentKind::NotSent).into_tree_result()),
         "not sent"
     );
     assert_eq!(
