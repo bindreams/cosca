@@ -353,13 +353,23 @@ pub enum Error {
         source: Option<Arc<Error>>,
     },
     /// A timeout the caller gave a call ran out before what the call waited for happened, as
-    /// [`Child::terminate_timeout`](crate::Child::terminate_timeout) and its tree and `tokio` twins give one.
-    /// The call stopped waiting at the timeout: what it waited for may still happen, or may have.
+    /// [`Child::terminate_timeout`](crate::Child::terminate_timeout),
+    /// [`Child::graceful_shutdown_timeout`](crate::Child::graceful_shutdown_timeout) and their tree and `tokio`
+    /// twins give one. The call stopped waiting at the timeout: what it waited for may still happen, or may have.
     ///
-    /// `members`: the child's root, not seen to exit, when the call waited for it and it has an identity
-    /// ([`Child::id`](crate::Child::id)); empty otherwise (no identity, or the wait was for a proxy cosca
-    /// ended). `detail` says what was waited for, with the pid where there is one. `source` is what went wrong
-    /// below the timeout, if anything.
+    /// `members`: what the call was waiting for and did not see exit, empty where nothing is named. From
+    /// [`terminate_timeout`](crate::Child::terminate_timeout)'s `wait_exit`: the root, when it has an identity. From
+    /// the console-event proxy: empty. From a graceful shutdown: see
+    /// [`Child::graceful_shutdown_timeout`](crate::Child::graceful_shutdown_timeout) and
+    /// [`Child::graceful_shutdown_tree_timeout`](crate::Child::graceful_shutdown_tree_timeout). `detail` says what
+    /// was waited for, with the pid where there is one. `source` is what went wrong below the timeout, if anything:
+    /// from a graceful shutdown, the call's other failures (the sweep's, the refused cooperative signal's, the grace
+    /// wait's, a member whose exit could not be observed, a last look at the root that failed).
+    ///
+    /// A call that runs a stop action answers the action's errors as they are, so a graceful shutdown may answer a
+    /// `TimedOut` from a call the action made with a timeout of its own. A timed one goes on to the kill instead once
+    /// its own timeout has cut a wait of the action: see
+    /// [`graceful_shutdown_timeout`](crate::Child::graceful_shutdown_timeout).
     ///
     /// The ids are identities, not pins, as [`ChildFate::Running`]'s: check one ([`ProcessId::is_alive`])
     /// before acting on it.

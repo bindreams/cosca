@@ -110,7 +110,7 @@ impl Unreaped {
         // Before the future exists, so a future dropped unpolled never blocks either.
         self.drop_kind = DropKind::LetGo;
         async move {
-            let outcome = self.child.wait_async().await;
+            let outcome = self.child.wait_async(None).await;
             // Settled once, whatever the outcome, as `wait` does.
             let child = self.child.take().expect("a live Unreaped holds its child");
             unbounded_status(child.pid(), outcome?, Orphaned::Warn)

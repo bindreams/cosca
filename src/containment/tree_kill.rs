@@ -15,6 +15,7 @@ use crate::containment::TreeDrain;
 use crate::error::Error;
 use crate::identity::{HostKernel, Kernel, ProcessId};
 use crate::os_process::OsProcess;
+use crate::stop::{ClockKind, Deadline};
 
 /// What a tree kill did ([`Contains::kill`](crate::containment::Contains::kill)) and what
 /// it left to wait on. Its [`outcome`](Self::outcome) is what the kill left running; a caller that
@@ -36,7 +37,7 @@ pub(crate) struct KillWait<'a> {
     /// Members a send reached but could not name by identity, so their exit cannot be observed.
     unobserved: Vec<Unnamed>,
     /// The tree's own edge for "no member runs", chosen by the mechanism: only a kernel tree whose
-    /// kill landed has one. It is waited for with no deadline.
+    /// kill landed has one.
     edge: Option<DrainEdge<'a>>,
     root: RootEnd<'a>,
     kernel: &'a dyn Kernel,
@@ -121,8 +122,12 @@ enum RootEnd<'a> {
     /// backstop ([`Process::kill_tree`](crate::Process::kill_tree)).
     Killed,
     /// Its kill landed, and it is waited for through its owner's handle. `pid` is the root's, as its
-    /// owner knows it.
-    Waited { os: &'a dyn OsProcess, pid: u32 },
+    /// owner knows it, and `id` its identity, if its owner has one: a wait that ran out names it.
+    Waited {
+        os: &'a dyn OsProcess,
+        pid: u32,
+        id: Option<ProcessId>,
+    },
 }
 
 impl<'a> TreeKill<'a> {
@@ -231,25 +236,35 @@ impl<'a> KillWait<'a> {
         matches!(self.root, RootEnd::Waited { .. })
     }
 
-    /// Wait for the root, whose pid its owner knows as `pid`, through its owner's handle if `landed`,
-    /// whether its kill landed. A kill that did not land leaves what the mechanism recorded
+    /// Wait for the root, whose pid its owner knows as `pid` and whose identity is `id`, through its owner's
+    /// handle if `landed`, whether its kill landed. A kill that did not land leaves what the mechanism recorded
     /// ([`TreeKill::root_killed`]) as it is.
-    pub(crate) fn with_root(mut self, root: &'a dyn OsProcess, pid: u32, landed: bool) -> KillWait<'a> {
+    pub(crate) fn with_root(
+        mut self,
+        root: &'a dyn OsProcess,
+        pid: u32,
+        id: Option<ProcessId>,
+        landed: bool,
+    ) -> KillWait<'a> {
         if landed {
-            self.root = RootEnd::Waited { os: root, pid };
+            self.root = RootEnd::Waited { os: root, pid, id };
         }
         self
     }
 
-    /// Wait until every member reached has exited, then the root, then the tree's own edge. There is
-    /// no deadline.
+    /// Wait until every member reached has exited, then the root, then the tree's own edge. There is no deadline
+    /// unless the call was given a timeout: `deadline` is that timeout's instant, `None` for ever.
     ///
     /// # Errors
     ///
     /// The first member whose exit could not be observed (a failed open or look is not an exit), as
     /// [`Error::Unassessable`] naming it, with the others whole below it ([`Error::with_peers`]), once
     /// every other member has been waited for.
-    pub(crate) fn wait(self) -> Result<(), Error> {
+    ///
+    /// [`Error::TimedOut`] when the deadline ran out with a member, the root or the tree's drain not seen
+    /// to exit: `members` are the members and the root that were running at their final look, none for a
+    /// drain edge, which names none, and the errors above are below it.
+    pub(crate) fn wait(self, deadline: Option<Deadline>) -> Result<(), Error> {
         let KillWait {
             members,
             unobserved: unnamed,
@@ -257,37 +272,32 @@ impl<'a> KillWait<'a> {
             root,
             kernel,
         } = self;
+        let by = deadline.and_then(|deadline| deadline.at_on(ClockKind::Real));
         let mut members: Vec<ProcessId> = once_each(members).collect();
         let mut reported = reported_pids(&unnamed);
-        let mut unobserved: Vec<Error> = unnamed.into_iter().map(|unnamed| unnamed.why).collect();
+        let mut unseen = Unseen::new(unnamed, deadline.is_some());
         for &id in &members {
-            if let Err(why) = wait_for_member(kernel, id, None).and_then(exit_seen) {
+            if unseen.after_member(id, wait_for_member(kernel, id, by)) {
                 reported.push(id.pid());
-                unobserved.push(exit_unobserved(id.pid(), why));
             }
         }
-        if let RootEnd::Waited { os: root, pid } = root {
-            let waited = wait_for_exit(root);
-            settle_root(root, pid, waited.is_err(), &mut members, &mut reported);
-            if let Err(why) = waited {
-                unobserved.push(root_unobserved(why));
-            }
+        if let RootEnd::Waited { os: root, pid, id } = root {
+            let unsettled = unseen.after_root(id, crate::os_process::drive::exited_until(root, by));
+            settle_root(root, pid, unsettled, &mut members, &mut reported);
         }
         if let Some(edge) = edge {
             // Every member reached is settled: it exited or was reported above, once.
             let settled = Settled::new(members, reported);
-            if let Err(why) = edge.wait_past(None, &settled).and_then(drained) {
-                unobserved.push(why);
-            }
+            unseen.after_edge(edge.wait_past(by, &settled));
         }
-        answer_of(unobserved)
+        unseen.answer()
     }
 
     /// [`wait`](Self::wait), awaited: the same members in the same order, with no runtime thread
     /// blocked, and the same answer. Dropping the future stops the wait only; the kill was sent
     /// before it.
     #[cfg(feature = "tokio")]
-    pub(crate) async fn wait_async(self) -> Result<(), Error> {
+    pub(crate) async fn wait_async(self, deadline: Option<Deadline>) -> Result<(), Error> {
         let KillWait {
             members,
             unobserved: unnamed,
@@ -295,29 +305,133 @@ impl<'a> KillWait<'a> {
             root,
             kernel,
         } = self;
+        // A process is waited for on the clock its wait runs on, the tree's edge on tokio's.
+        let by = deadline.and_then(|deadline| deadline.at_on(ClockKind::ASYNC_PROCESS_WAIT));
+        let edge_by = deadline.and_then(|deadline| deadline.at_on(ClockKind::Tokio));
         let mut members: Vec<ProcessId> = once_each(members).collect();
         let mut reported = reported_pids(&unnamed);
-        let mut unobserved: Vec<Error> = unnamed.into_iter().map(|unnamed| unnamed.why).collect();
+        let mut unseen = Unseen::new(unnamed, deadline.is_some());
         for &id in &members {
-            if let Err(why) = wait_for_member_async(kernel, id, None).await.and_then(exit_seen) {
+            if unseen.after_member(id, wait_for_member_async(kernel, id, by).await) {
                 reported.push(id.pid());
-                unobserved.push(exit_unobserved(id.pid(), why));
             }
         }
-        if let RootEnd::Waited { os: root, pid } = root {
-            let waited = wait_for_exit_async(root).await;
-            settle_root(root, pid, waited.is_err(), &mut members, &mut reported);
-            if let Err(why) = waited {
-                unobserved.push(root_unobserved(why));
-            }
+        if let RootEnd::Waited { os: root, pid, id } = root {
+            let unsettled = unseen.after_root(id, crate::tokio::drive::exited_until(root, by).await);
+            settle_root(root, pid, unsettled, &mut members, &mut reported);
         }
         if let Some(edge) = edge {
             let settled = Settled::new(members, reported);
-            if let Err(why) = edge.wait_async_past(None, &settled).await.and_then(drained) {
-                unobserved.push(why);
+            unseen.after_edge(edge.wait_async_past(edge_by, &settled).await);
+        }
+        unseen.answer()
+    }
+}
+
+/// What a [`KillWait`] did not see happen: the failures of the exits it could not observe and, for a wait
+/// that ran into its deadline, what was still running at the final look.
+struct Unseen {
+    /// The failures, in the order they were met.
+    unobserved: Vec<Error>,
+    /// Whether the wait had a deadline to run into: one with none ends only on what it waits for.
+    bounded: bool,
+    /// The members and the root that were running when the deadline ran out, in the order waited for.
+    running: Vec<ProcessId>,
+    /// The root was running when the deadline ran out, and its owner knows no identity for it.
+    root_unnamed: bool,
+    /// The tree's drain edge had not fired when the deadline ran out.
+    drain_unseen: bool,
+}
+
+impl Unseen {
+    fn new(unnamed: Vec<Unnamed>, bounded: bool) -> Unseen {
+        Unseen {
+            unobserved: unnamed.into_iter().map(|unnamed| unnamed.why).collect(),
+            bounded,
+            running: Vec::new(),
+            root_unnamed: false,
+            drain_unseen: false,
+        }
+    }
+
+    /// The wait for the member `id` ended as `waited`. Whether the member is `reported`, which the tree's edge
+    /// then neither waits for nor names again ([`Settled`]): its exit was not seen, or not observed.
+    fn after_member(&mut self, id: ProcessId, waited: Result<bool, Error>) -> bool {
+        match waited {
+            Ok(exited) => {
+                self.exited_or_running(exited);
+                if !exited {
+                    self.running.push(id);
+                }
+                !exited
+            }
+            Err(why) => {
+                self.unobserved.push(exit_unobserved(id.pid(), why));
+                true
             }
         }
-        answer_of(unobserved)
+    }
+
+    /// The wait for the root, whose identity its owner knows as `id`, ended as `waited`. Whether the root is
+    /// unsettled: its exit was not seen, or not observed.
+    fn after_root(&mut self, id: Option<ProcessId>, waited: Result<bool, Error>) -> bool {
+        match waited {
+            Ok(exited) => {
+                self.exited_or_running(exited);
+                if !exited {
+                    match id {
+                        Some(id) => self.running.push(id),
+                        None => self.root_unnamed = true,
+                    }
+                }
+                !exited
+            }
+            Err(why) => {
+                self.unobserved.push(root_unobserved(why));
+                true
+            }
+        }
+    }
+
+    /// The tree's edge answered `waited`: `MembersRemain` is a drain not seen when the wait had a deadline,
+    /// and no verdict when it had none ([`drained`]).
+    fn after_edge(&mut self, waited: Result<TreeDrain, Error>) {
+        match waited {
+            Ok(TreeDrain::MembersRemain) if self.bounded => self.drain_unseen = true,
+            waited => {
+                if let Err(why) = waited.and_then(drained) {
+                    self.unobserved.push(why);
+                }
+            }
+        }
+    }
+
+    /// A wait that answered `exited`: one that did not exit is an answer only a wait with a deadline gives.
+    fn exited_or_running(&self, exited: bool) {
+        debug_assert!(exited || self.bounded, "a wait with no deadline ends only on an exit");
+    }
+
+    /// The answer: `Ok` when every exit was seen, [`Error::TimedOut`] when one was not, else the failures of
+    /// the exits that could not be observed.
+    fn answer(self) -> Result<(), Error> {
+        let named = !self.running.is_empty() || self.root_unnamed;
+        if !named && !self.drain_unseen {
+            return answer_of(self.unobserved);
+        }
+        let detail = match (named, self.drain_unseen) {
+            (true, true) => {
+                "the call was waiting for the processes its kill reached to exit and for the tree to \
+                             drain: it did not see the exit of the ones named, nor the tree's drain"
+            }
+            (true, false) => "the call was waiting for the processes its kill reached to exit",
+            (false, _) => "the call was waiting for the killed tree to drain: the tree's drain was not seen",
+        };
+        Err(Error::TimedOut {
+            detail: detail.to_owned(),
+            members: self.running,
+            source: None,
+        }
+        .with_peers(self.unobserved.into_iter().map(std::sync::Arc::new)))
     }
 }
 
@@ -328,7 +442,7 @@ fn reported_pids(unnamed: &[Unnamed]) -> Vec<u32> {
 
 /// Settle the root, whose pid its owner gave as `pid`, once its wait ended: its identity, if its handle
 /// can read one, is a settled member (it is matched by identity alone, never by its pid), and `pid` is
-/// `reported` when the wait `failed`, so a snapshot entry for the root whose identity cannot be read is
+/// `reported` when the wait `failed` or ran out, so a snapshot entry for the root whose identity cannot be read is
 /// not named again. A root whose identity cannot be read is logged at `warn`: what it would have
 /// settled is lost, so a snapshot entry for it that reads an identity can be named a second time. Only a
 /// Job's edge reads the settlement.
@@ -401,12 +515,6 @@ fn drained(verdict: TreeDrain) -> Result<(), Error> {
     }
 }
 
-/// What a wait with no deadline comes to: it ends only on an exit, so `exited` is `true`.
-fn exit_seen(exited: bool) -> Result<(), Error> {
-    debug_assert!(exited, "a wait with no deadline ends only on an exit");
-    Ok(())
-}
-
 /// Wait for the member `id` to exit until `deadline` (`None`: for ever): re-open it by its identity,
 /// wait on it, close it. `Ok(true)` is an exit, and so is a member that cannot be opened because it is
 /// gone; `Ok(false)` is a member still running at the deadline's final look. One that cannot be opened
@@ -431,15 +539,6 @@ pub(crate) async fn wait_for_member_async(
     }
 }
 
-fn wait_for_exit(os: &dyn OsProcess) -> Result<(), Error> {
-    crate::os_process::drive::exited_until(os, None).and_then(exit_seen)
-}
-
-#[cfg(feature = "tokio")]
-async fn wait_for_exit_async(os: &dyn OsProcess) -> Result<(), Error> {
-    crate::tokio::drive::exited_held(os, None).await.and_then(exit_seen)
-}
-
 pub(crate) fn exit_unobserved(pid: u32, cause: Error) -> Error {
     Error::Unassessable {
         detail: format!("pid {pid} was killed, but its exit cannot be observed"),
@@ -459,21 +558,25 @@ pub(crate) fn refused_unobserved(pid: u32) -> Error {
     )
 }
 
-/// The call's answer once its wait has run: a kill that failed is the answer, over a wait that failed
-/// too (the wait's error is logged, once, naming the call `op`); otherwise a wait that failed is the
-/// failure, as `as_failure` makes it.
-pub(crate) fn answer_after_wait<F>(
-    op: &str,
-    answer: Result<(), F>,
-    waited: Result<(), Error>,
-    as_failure: impl FnOnce(Error) -> F,
-) -> Result<(), F> {
-    match (answer, waited) {
-        (Ok(()), waited) => waited.map_err(as_failure),
-        (Err(failure), Ok(())) => Err(failure),
-        (Err(failure), Err(waited)) => {
+/// The call's answer once its wait has run: a call that failed answers as [`failure_after_wait`] says;
+/// otherwise the wait's failure, if any, is the answer.
+pub(crate) fn answer_after_wait(op: &str, answer: Result<(), Error>, waited: Result<(), Error>) -> Result<(), Error> {
+    match answer {
+        Ok(()) => waited,
+        Err(failure) => Err(failure_after_wait(op, failure, waited)),
+    }
+}
+
+/// A failed call's answer once its wait has run: a wait that ran out ([`Error::TimedOut`]) is the answer,
+/// with `failure` below it; otherwise `failure` is the answer, over a wait that failed, whose error is
+/// logged once, naming the call `op`.
+pub(crate) fn failure_after_wait(op: &str, failure: Error, waited: Result<(), Error>) -> Error {
+    match waited {
+        Ok(()) => failure,
+        Err(timed_out @ Error::TimedOut { .. }) => timed_out.with_peers([std::sync::Arc::new(failure)]),
+        Err(waited) => {
             log_failed_wait(&format!("a failed {op}"), &waited);
-            Err(failure)
+            failure
         }
     }
 }
@@ -481,7 +584,7 @@ pub(crate) fn answer_after_wait<F>(
 /// Log the failed wait behind a failed answer, which stays the answer: the one place that policy's
 /// log is written. `after` names the call that failed first. A wait that failed means a member's exit
 /// was not seen, which the answer does not say, so it is a `warn`.
-pub(crate) fn log_failed_wait(after: &str, waited: &Error) {
+fn log_failed_wait(after: &str, waited: &Error) {
     log::warn!(
         "the wait after {after} also failed: {report}",
         report = crate::error::Report(waited)

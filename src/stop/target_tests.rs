@@ -324,8 +324,7 @@ fn a_signal_the_root_was_gone_for_is_recorded_as_not_sent_and_names_no_stop() {
         );
 
         let child = child_answering(answer);
-        let (acted, earlier) = run_ready(stop_root(&BlockingDriver(&child)));
-        acted.expect("the handle answered");
+        let (_, earlier) = run_ready(stop_root(&BlockingDriver(&child), None)).expect("the handle answered");
         assert_eq!(earlier.as_deref(), said, "{answer:?}");
     }
 }
@@ -496,14 +495,10 @@ fn cut_is_the_nearer_of_the_graces_instant_and_the_deadline_and_says_which() {
     use super::Bound;
     use crate::wait::test_clock::FrozenClockGuard;
 
-    let child = child_over(&FakeProcess::new([]));
     let (_clock, now) = FrozenClockGuard::install();
     let grace = Duration::from_secs(5);
     let cut = |deadline: Option<Duration>, grace| {
-        StopTarget::from(&child)
-            .with_deadline(deadline.and_then(Deadline::real))
-            .cut(grace)
-            .map(|(by, bound)| (by.at, bound))
+        Deadline::cut(deadline.and_then(Deadline::real), grace).map(|(by, bound)| (by.at, bound))
     };
     assert_eq!(cut(None, grace), None);
     let far = Duration::from_secs(3600);
@@ -628,7 +623,7 @@ async fn a_tokio_deadline_is_read_on_tokios_clock_and_re_expressed_for_the_real_
     let target = StopTarget::from(&child).with_deadline(Deadline::tokio(Duration::from_secs(3600)));
     let deadline = target.deadline.expect("the target has a deadline");
     let grace = Duration::from_secs(1000);
-    let cut = |target: &StopTarget<'_>| target.cut(grace).map(|(by, bound)| (by.at, bound));
+    let cut = |target: &StopTarget<'_>| Deadline::cut(target.deadline, grace).map(|(by, bound)| (by.at, bound));
     assert_eq!(cut(&target).map(|(_, bound)| bound), Some(Bound::Grace));
     ::tokio::time::advance(Duration::from_secs(3000)).await;
     assert_eq!(

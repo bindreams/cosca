@@ -104,7 +104,14 @@ What a child's cooperative stop sends is an action it stores, not a rule inside 
   closures, the prepared sends and the graceful shutdowns keep `Result<(), Error>`.
 - **A call may be given a timeout.** `terminate_timeout` / `terminate_tree_timeout` put a `Deadline` (instant
   plus real or tokio clock) on the `StopTarget`; only the target reads or converts it. The waits for an answer
-  (`wait_proxy`, `wait_exit`) end by it; per-wait behavior is in their docs.
+  (`wait_proxy`, `wait_exit`) end by it; per-wait behavior is in their docs. `graceful_shutdown_timeout` /
+  `graceful_shutdown_tree_timeout` are the graceful shutdowns with one `Deadline` for the whole call: the same
+  `shutdown_lone` / `shutdown_tree` take it (`None`: no bound) and every wait ends by it. The kill is always sent;
+  a wait that runs out answers `Error::TimedOut`, and what was not seen to exit stays with the handle. An
+  action's `Error::TimedOut` ends the call unless the deadline has cut one of the action's waits
+  (`StopTarget::timed_out`, the one maker of a deadline's `TimedOut` in an action, records the cut); after a
+  cut, any `TimedOut` the action answers goes on to the kill. Any other action error ends a lone shutdown; for a
+  tree shutdown the table of `Child::after_tree_stop` (`src/child/graceful.rs`) says whether it does.
 - **The proxy is a role, with one contract.** The console-event proxy is the host program, or the
   `cosca-ctrl-proxy` executable, started with the environment variable `__COSCA_HELPER=ctrl-proxy`. The
   variable, never the program's arguments, says a process is a helper: `cosca::init_helpers()`, first in

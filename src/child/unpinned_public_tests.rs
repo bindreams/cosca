@@ -178,9 +178,6 @@ pub(crate) enum Cause {
     None,
     /// The failed peek `Untrusted::Unknown` scripts.
     Unreadable,
-    /// The failure the test forces on the cooperative signal (`Forced::Containment`), carried below
-    /// the sweep's refusal.
-    ForcedTerm,
 }
 
 impl Cause {
@@ -195,10 +192,6 @@ impl Cause {
                 let said = crate::error::said(&**cause);
                 assert!(said.contains("unreadable"), "{said}");
             }
-            (Cause::ForcedTerm, Some(cause)) => assert!(
-                matches!(&**cause, Error::Containment { detail, .. } if detail.contains("forced term_group refusal")),
-                "{cause:?}"
-            ),
         }
     }
 }

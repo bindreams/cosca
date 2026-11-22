@@ -2,6 +2,7 @@
 
 use crate::pipe::{ParentEnd, PipeReader, PipeWriter};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use crate::child::owned::teardown::{Disposition, Reach};
 use crate::child::spawn::policy::SpawnPolicy;
@@ -366,17 +367,19 @@ impl Child {
     /// `RLIMIT_NPROC` and pids-cgroup charge) per exited handle that has not dropped; a handle that is
     /// leaked (`mem::forget`) leaks its zombie.
     pub fn wait(&self) -> Result<std::process::ExitStatus, Error> {
-        self.status_of_reap(self.reap_outcome()?)
+        self.status_of_reap(self.reap_outcome(None)?)
     }
 
-    /// The root's unbounded reap, as the wait ended: the exit record, or the foreign verdict
-    /// (reaped elsewhere, or a zombie launchd holds), not folded into an error and not warned of.
-    pub(crate) fn reap_outcome(&self) -> Result<owned::ChildWaitOutcome, Error> {
+    /// The root's reap, as the wait ended, until `deadline` (`None`: for ever): the exit record, or the
+    /// foreign verdict (reaped elsewhere, or a zombie launchd holds), or a deadline that passed with the root
+    /// running ([`DeadlinePassed`](owned::ChildWaitOutcome::DeadlinePassed)), not folded into an error and
+    /// not warned of.
+    pub(crate) fn reap_outcome(&self, deadline: Option<Instant>) -> Result<owned::ChildWaitOutcome, Error> {
         #[cfg(test)]
         if let Some(error) = crate::child::spawn::failure::seams::take_wait_failure() {
             return Err(error);
         }
-        lifecycle::wait_to_exit(&self.proc, None)
+        lifecycle::wait_to_exit_saying(&self.proc, None, |_| {}, deadline)
     }
 
     /// Return the exit status if the child has already exited.
@@ -650,7 +653,7 @@ impl Child {
     /// that only sends.
     pub fn kill_tree(&self) -> Result<(), Error> {
         self.kill_tree_after("kill_tree", None, None)
-            .wait()
+            .wait(None)
             .map_err(|failure| failure.error)
     }
 
@@ -788,7 +791,7 @@ impl Child {
         Swept::new(
             op,
             answered.answer.map_err(|error| SweepFailure { error, root_ended }),
-            wait.with_root(self.proc.os_process(), self.pid(), root_ended),
+            wait.with_root(self.proc.os_process(), self.pid(), self.id, root_ended),
         )
     }
 
@@ -810,7 +813,7 @@ impl Child {
         Swept::new(
             op,
             settled.answer,
-            wait.with_root(self.proc.os_process(), self.pid(), root_ended && !unpinned),
+            wait.with_root(self.proc.os_process(), self.pid(), self.id, root_ended && !unpinned),
         )
     }
 

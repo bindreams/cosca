@@ -83,7 +83,7 @@ fn the_wait_over_a_jobs_listed_members_blocks_on_a_running_member() {
         DrainEdge::Job(&job.0),
     )
     .split();
-    wait.wait().expect("the member exited and the job drained");
+    wait.wait(None).expect("the member exited and the job drained");
 
     assert!(blocked.get(), "the wait did not block on a member that was running");
 }

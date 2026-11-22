@@ -985,8 +985,9 @@ impl<A> Settled<A> {
     }
 }
 
-/// A `kill_tree` sweep that failed, and whether the root is dead all the same: its handle backstop
-/// ended it. A caller that waits for the root before it returns the error reads that.
+/// A `kill_tree` sweep that failed, and `root_ended`: the root is not running, because its kill landed (so the
+/// sweep's wait waited for it, and its answer covers it), or because launchd holds its zombie. A graceful
+/// shutdown's look after a failed sweep names a running root only when this is false.
 pub(crate) struct SweepFailure {
     pub(crate) error: Error,
     pub(crate) root_ended: bool,
@@ -1030,20 +1031,21 @@ impl<'a> Swept<'a> {
         self.answer
     }
 
-    /// The sweep's answer once every member it killed has exited. A kill that failed is the answer
-    /// over a wait that failed: the wait's error is logged. A wait that failed is a failure that
-    /// keeps the record of the root's kill, as a kill that failed does.
-    pub(crate) fn wait(self) -> Result<(), SweepFailure> {
+    /// The sweep's answer once every member it killed has exited, or `deadline` has passed (`None`: for
+    /// ever). Which of the kill's and the wait's failures is the answer is
+    /// [`answer_after_wait`](crate::containment::tree_kill::answer_after_wait)'s rule. A failure keeps the
+    /// record of the root's kill.
+    pub(crate) fn wait(self, deadline: Option<crate::stop::Deadline>) -> Result<(), SweepFailure> {
         let root_ended = self.wait.waits_for_root();
-        let waited = self.wait.wait();
+        let waited = self.wait.wait(deadline);
         Self::after_wait(self.op, self.answer, waited, root_ended)
     }
 
     /// [`wait`](Self::wait), awaited, with no runtime thread blocked.
     #[cfg(feature = "tokio")]
-    pub(crate) async fn wait_async(self) -> Result<(), SweepFailure> {
+    pub(crate) async fn wait_async(self, deadline: Option<crate::stop::Deadline>) -> Result<(), SweepFailure> {
         let root_ended = self.wait.waits_for_root();
-        let waited = self.wait.wait_async().await;
+        let waited = self.wait.wait_async(deadline).await;
         Self::after_wait(self.op, self.answer, waited, root_ended)
     }
 
@@ -1053,7 +1055,12 @@ impl<'a> Swept<'a> {
         waited: Result<(), Error>,
         root_ended: bool,
     ) -> Result<(), SweepFailure> {
-        crate::containment::tree_kill::answer_after_wait(op, answer, waited, |error| SweepFailure { error, root_ended })
+        let (answer, root_ended) = match answer {
+            Ok(()) => (Ok(()), root_ended),
+            Err(failure) => (Err(failure.error), failure.root_ended || root_ended),
+        };
+        crate::containment::tree_kill::answer_after_wait(op, answer, waited)
+            .map_err(|error| SweepFailure { error, root_ended })
     }
 }
 

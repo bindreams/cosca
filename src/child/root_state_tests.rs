@@ -298,7 +298,7 @@ mod linux {
 
         let failure = child
             .kill_tree_after("kill_tree", None, None)
-            .wait()
+            .wait(None)
             .expect_err("the number may name another process");
 
         fake.assert_peeks_exhausted();

@@ -73,6 +73,18 @@ pub(crate) fn root_looking(exits: impl IntoIterator<Item = Answer>) -> FakeProce
     root
 }
 
+/// A fake root for a shutdown that grace-waits, kills and reaps it: the reap's first look finds it running, so a
+/// reap whose deadline has passed ends there, and any other goes on to the exit. Its grace looks answer
+/// `grace_looks`, and the kill is delivered.
+pub(crate) fn killed_root(grace_looks: impl IntoIterator<Item = Answer>) -> FakeProcess {
+    root_looking(grace_looks)
+        .signals([Ok(Sent::Delivered), Ok(Sent::Delivered)])
+        .reaps([
+            ReapAnswer::Running,
+            ReapAnswer::Exited(ExitRecord::Status(std::process::ExitStatus::default())),
+        ])
+}
+
 /// A child over `root` whose mechanism states that its kill reached `members`.
 pub(crate) fn child_reaching(root: &FakeProcess, members: &[ProcessId]) -> Child {
     let (fake, _) = FakeContains::new(Containment::Session, false);

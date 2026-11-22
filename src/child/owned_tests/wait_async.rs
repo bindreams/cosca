@@ -43,7 +43,7 @@ pub(super) fn exits_three_on_eof() -> (OwnedChild, ChildStdin) {
 async fn wait_async_reaps_and_caches_the_record() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Recheck, ReapAnswer::Exited(exit())]);
     let mut child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
-    assert_eq!(child.wait_async().await.unwrap(), ChildWaitOutcome::Exited(exit()));
+    assert_eq!(child.wait_async(None).await.unwrap(), ChildWaitOutcome::Exited(exit()));
     assert_eq!(child.wait(None).unwrap(), ChildWaitOutcome::Exited(exit()));
     assert_eq!(fake.looks(), 2);
 }
@@ -54,7 +54,7 @@ async fn wait_async_after_a_sync_wait_answers_from_the_cache() {
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Exited(exit())]);
     let mut child = OwnedChild::new(Box::new(fake.clone()), TrackedKind::Own);
     child.wait(None).unwrap();
-    assert_eq!(child.wait_async().await.unwrap(), ChildWaitOutcome::Exited(exit()));
+    assert_eq!(child.wait_async(None).await.unwrap(), ChildWaitOutcome::Exited(exit()));
     assert_eq!(fake.looks(), 1);
 }
 
@@ -65,7 +65,7 @@ async fn wait_async_pauses_on_tokio_s_timer_for_a_recheck() {
     crate::wait::block_probe::take();
     let fake = FakeProcess::new([]).reaps([ReapAnswer::Recheck, ReapAnswer::Recheck, ReapAnswer::Exited(exit())]);
     let mut child = OwnedChild::new(Box::new(fake), TrackedKind::Own);
-    child.wait_async().await.unwrap();
+    child.wait_async(None).await.unwrap();
     let pauses: Vec<_> = crate::wait::block_probe::take()
         .into_iter()
         .map(|pause| pause.expect("a pause is bounded"))
@@ -80,7 +80,7 @@ async fn wait_async_pauses_on_tokio_s_timer_for_a_recheck() {
 async fn wait_async_waits_for_a_real_exit() {
     let (mut child, stdin) = exits_three_on_eof();
     let outcome = {
-        let mut wait = pin!(child.wait_async());
+        let mut wait = pin!(child.wait_async(None));
         assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
         drop(stdin);
         wait.await
@@ -97,7 +97,7 @@ async fn wait_async_waits_for_a_real_exit() {
 async fn a_dropped_wait_async_leaves_nobody_waiting() {
     let (mut child, stdin) = exits_three_on_eof();
     {
-        let mut wait = pin!(child.wait_async());
+        let mut wait = pin!(child.wait_async(None));
         assert!(poll_once(wait.as_mut()).is_pending(), "a running child is waited for");
     }
     assert!(!child.exit_seen());
@@ -111,5 +111,5 @@ fn wait_async_is_send() {
     fn assert_send<T: Send>(_: &T) {}
 
     let mut child = OwnedChild::new(Box::new(FakeProcess::new([])), TrackedKind::Own);
-    assert_send(&child.wait_async());
+    assert_send(&child.wait_async(None));
 }

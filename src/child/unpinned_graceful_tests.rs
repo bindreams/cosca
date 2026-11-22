@@ -9,8 +9,7 @@ use std::time::Duration;
 use super::graceful::fault as graceful_fault;
 use super::unpinned_public_tests::{
     assert_descendant_dies, assert_holders_only, assert_nothing_sent, assert_refused, assert_sent_by_identity,
-    assert_tree_refused, assert_tree_refused_caused_by, group_blocker, orphan, session_tree, walked_blocker, Cause,
-    Untrusted, BOTH,
+    assert_tree_refused, group_blocker, orphan, session_tree, walked_blocker, Untrusted, BOTH,
 };
 use crate::error::Error;
 use crate::log_capture::warns_since;
@@ -391,14 +390,15 @@ fn graceful_shutdown_tree_sweep_refuses_a_root_orphaned_during_the_grace() {
     drop(writer);
 }
 
-/// The best-effort reap after a failed sweep finds a root launchd holds out by asking the reap: it
-/// is an exited zombie, so the root reads as exited, the reap answers `Orphaned`, and nothing warns
-/// or waits. The root is a real zombie; the sweep's look reads it `Orphaned`, and the reap's answer
-/// is stated.
+/// The call's one look after a failed sweep finds a root launchd holds out by asking the reap: it is an exited
+/// zombie, so the root reads as exited, the reap answers `Orphaned`, and nothing warns or waits. The root is a real
+/// zombie; the sweep's look reads it `Orphaned`, and the reap's answer is stated. The sweep's refusal stays the answer,
+/// with the look's `Unassessable` (the root's status cannot be collected) and the cooperative signal's forced failure
+/// below it.
 ///
-/// Mutant: the best-effort reap waits on, or warns of, an `Unpinned` root.
+/// Mutants: the look waits on, or warns of, an `Unpinned` root; the look's answer is dropped.
 #[skuld::test]
-fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_failed_sweep() {
+fn graceful_shutdown_tree_reports_an_exited_orphaned_root_below_a_failed_sweep() {
     crate::log_capture::install();
     let (mut child, writer) = walked_blocker();
     let pid = child.pid();
@@ -418,8 +418,35 @@ fn graceful_shutdown_tree_does_not_reap_an_exited_orphaned_root_after_a_failed_s
         .expect_err("a root this process does not pin is not swept");
 
     fake.assert_peeks_exhausted();
-    // The cooperative signal's forced failure is the sweep refusal's source.
-    assert_tree_refused_caused_by(&err, "graceful_shutdown_tree", Untrusted::Unpinned, Cause::ForcedTerm);
+    // The answer is the sweep's refusal, as `assert_tree_refused` words it; its causes are a list, so they are read
+    // below and not as one `source`.
+    let Error::Unassessable { detail, .. } = &err else {
+        panic!("expected Unassessable, got {err:?}");
+    };
+    assert!(
+        detail.contains(Untrusted::Unpinned.why())
+            && detail.contains("graceful_shutdown_tree sent nothing")
+            && detail.contains("named by the root's number"),
+        "{detail}"
+    );
+    let below = err.failures_below();
+    assert!(
+        below.iter().any(|failure| matches!(
+            failure,
+            Error::Unassessable { detail, source: None }
+                if detail.starts_with(&format!(
+                    "pid {pid}: graceful_shutdown_tree: the root's exit status cannot be collected"
+                ))
+        )),
+        "the look's answer is below the refusal: {below:?}"
+    );
+    assert!(
+        below.iter().any(|failure| matches!(
+            failure,
+            Error::Containment { detail, .. } if detail.contains("forced term_group refusal")
+        )),
+        "the cooperative signal's failure is below the refusal: {below:?}"
+    );
     assert!(
         crate::test_child::is_unreaped_child(pid),
         "the zombie launchd holds was waited on"

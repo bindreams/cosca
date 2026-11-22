@@ -16,6 +16,8 @@ use crate::os_process::fake::{Answer, FakeProcess};
 #[cfg(feature = "tokio")]
 use crate::test_child::over_fake::tokio_child_reaching;
 use crate::test_child::over_fake::{child_over, child_reaching, live_member, root_looking};
+#[cfg(target_os = "linux")]
+use crate::test_groups::{cgroup, Group};
 
 /// The pid a row gives the fake root, which has no process to read one from.
 const ROOT_PID: u32 = 4242;
@@ -139,7 +141,7 @@ fn a_member_whose_exit_cannot_be_observed_is_named_once_the_rest_are_waited_for(
             ended.set(true);
         }
     });
-    let err = wait.wait().expect_err("a member's exit cannot be observed");
+    let err = wait.wait(None).expect_err("a member's exit cannot be observed");
 
     assert!(ended.get(), "the wait returned before it waited for the live member");
     assert!(
@@ -161,7 +163,7 @@ fn a_member_that_is_gone_has_exited() {
     drop(member);
 
     let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
-    wait.wait().expect("a member that is gone has exited");
+    wait.wait(None).expect("a member that is gone has exited");
 }
 
 /// A member whose open fails is not an exit: the wait goes on to the rest and names every member it could
@@ -184,7 +186,7 @@ fn a_failed_open_is_not_an_exit() {
         .through(&kernel)
         .reaching([first_id, second_id, first_id])
         .split();
-    let err = wait.wait().expect_err("neither member can be opened");
+    let err = wait.wait(None).expect_err("neither member can be opened");
 
     let said = crate::error::said(&err);
     assert!(said.contains(&format!("pid {} was killed", first_id.pid())), "{said}");
@@ -229,8 +231,8 @@ fn a_wait_error_keeps_the_record_that_the_root_was_killed() {
     let why = refused_unobserved(4242);
     let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).unobserved(why).split();
 
-    let failure = Swept::new("kill_tree", Ok(()), wait.with_root(&root, ROOT_PID, true))
-        .wait()
+    let failure = Swept::new("kill_tree", Ok(()), wait.with_root(&root, ROOT_PID, None, true))
+        .wait(None)
         .expect_err("a member's exit cannot be observed");
 
     assert!(failure.root_ended, "the root was killed, and its exit was waited for");
@@ -258,15 +260,15 @@ fn the_roots_state_is_set_by_root_killed_and_kept_by_with_root() {
         "the last answer is the state"
     );
     assert!(
-        killed(true).with_root(&root, ROOT_PID, false).root_killed(),
+        killed(true).with_root(&root, ROOT_PID, None, false).root_killed(),
         "a kill that did not land through the handle keeps what the walk recorded"
     );
     assert!(
-        killed(true).with_root(&root, ROOT_PID, true).waits_for_root(),
+        killed(true).with_root(&root, ROOT_PID, None, true).waits_for_root(),
         "a kill that landed is waited for through the handle"
     );
     assert!(
-        !killed(false).with_root(&root, ROOT_PID, false).waits_for_root(),
+        !killed(false).with_root(&root, ROOT_PID, None, false).waits_for_root(),
         "a root whose kill did not land is not waited for"
     );
 }
@@ -296,8 +298,8 @@ fn a_root_whose_look_fails_is_named_as_the_root() {
     let root = FakeProcess::new([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
 
     let err = KillWait::none()
-        .with_root(&root, ROOT_PID, true)
-        .wait()
+        .with_root(&root, ROOT_PID, None, true)
+        .wait(None)
         .expect_err("the root's exit cannot be observed");
 
     let said = crate::error::said(&err);
@@ -330,7 +332,9 @@ fn a_wait_goes_to_the_members_then_the_root() {
     });
     let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
 
-    wait.with_root(&root, ROOT_PID, true).wait().expect("every wait ended");
+    wait.with_root(&root, ROOT_PID, None, true)
+        .wait(None)
+        .expect("every wait ended");
 
     assert_eq!(id.is_alive(), Liveness::Dead, "the member has exited");
     assert_eq!(root.looks(), 1, "the root was looked at once the member had exited");
@@ -361,7 +365,9 @@ fn the_edge_is_waited_for_after_the_root() {
     });
     let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), edge).split();
 
-    wait.with_root(&root, ROOT_PID, true).wait().expect("every wait ended");
+    wait.with_root(&root, ROOT_PID, None, true)
+        .wait(None)
+        .expect("every wait ended");
 
     assert_eq!(job_pid_list_queries(), 1, "the edge was asked once, after the root");
 }
@@ -421,7 +427,7 @@ fn an_edge_that_fails_is_the_waits_error() {
     let failing = FailingEdge::new();
     let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), failing.edge()).split();
 
-    let err = wait.wait().expect_err("the edge could not be waited on");
+    let err = wait.wait(None).expect_err("the edge could not be waited on");
 
     assert_is_the_edges_error(&err);
 }
@@ -473,8 +479,8 @@ fn the_roots_error_comes_before_the_edges() {
     let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), failing.edge()).split();
 
     let err = wait
-        .with_root(&root, ROOT_PID, true)
-        .wait()
+        .with_root(&root, ROOT_PID, None, true)
+        .wait(None)
         .expect_err("neither the root's exit nor the edge could be observed");
 
     assert_the_root_comes_before_the_edge(&err);
@@ -542,7 +548,7 @@ fn a_failed_kill_is_the_answer_and_its_members_are_still_waited_for(wait_fails: 
     };
 
     let failure = Swept::new("kill_tree", Err(refused), wait)
-        .wait()
+        .wait(None)
         .expect_err("the kill was refused");
 
     assert!(
@@ -586,7 +592,7 @@ fn a_failed_waits_failure_behind_a_failed_kill_is_logged_once_at_warn() {
     };
 
     let failure = Swept::new("graceful_shutdown_tree", Err(refused), wait)
-        .wait()
+        .wait(None)
         .expect_err("the kill was refused");
 
     assert!(
@@ -659,6 +665,150 @@ fn a_send_only_kill_tree_of_a_job_reads_no_list_of_its_members() {
     _ = child.wait();
 }
 
+// A wait with a deadline =====
+
+/// A wait whose deadline has passed waits for nothing: each member is looked at once, and the ones still running
+/// are the answer, named by identity in the order they were reached; a member that has exited is not. The wait never
+/// blocks, and a hook at a block would end the running member, so a wait that ignored the deadline answers `Ok`.
+///
+/// Mutants: the deadline is not read; every member is named at the deadline; an exited member is named.
+#[skuld::test]
+fn a_wait_whose_deadline_has_passed_names_each_member_still_running_and_blocks_on_none() {
+    use crate::stop::Deadline;
+
+    let (running, writer, running_id) = live_member();
+    let (gone, gone_writer, gone_id) = live_member();
+    drop(gone_writer);
+    _ = gone.wait();
+    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())))
+        .reaching([gone_id, running_id])
+        .split();
+    let writer = Cell::new(Some(writer));
+    let blocked = Rc::new(Cell::new(false));
+    let _blocking = crate::wait::block_probe::on_blocking({
+        let blocked = blocked.clone();
+        move || {
+            blocked.set(true);
+            drop(writer.take());
+        }
+    });
+
+    let error = wait
+        .wait(Deadline::real(std::time::Duration::ZERO))
+        .expect_err("a member was still running");
+
+    assert!(!blocked.get(), "a wait blocked past its deadline");
+    let Error::TimedOut {
+        members, source: None, ..
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(members, &[running_id]);
+    _ = running.wait();
+}
+
+/// The root a wait ran out on is named by the identity its owner gave, after the members; one whose owner has none
+/// makes the wait `TimedOut` all the same, with no member to name. The exits that could not be observed are below
+/// it, not instead of it.
+///
+/// Mutants: the root is not named; a root with no identity is not a timeout; the failures are dropped, or are the
+/// answer in the timeout's place.
+#[skuld::test]
+fn a_root_still_running_at_the_deadline_is_named_by_its_identity_and_the_failures_are_below_it() {
+    use crate::identity::{Key, ProcessId};
+    use crate::stop::Deadline;
+
+    let root_id = ProcessId::from_parts_for_test(ROOT_PID, Key::for_test(2));
+    for (named, members) in [(Some(root_id), vec![root_id]), (None, vec![])] {
+        let root = root_looking([Answer::Running]);
+        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())))
+            .unobserved(refused_unobserved(77))
+            .split();
+
+        let error = wait
+            .with_root(&root, ROOT_PID, named, true)
+            .wait(Deadline::real(std::time::Duration::ZERO))
+            .expect_err("the root was still running");
+
+        let Error::TimedOut { members: left, .. } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(left, &members);
+        let below = error.failures_below();
+        assert!(
+            matches!(&below[..], [Error::Unassessable { detail, .. }] if detail.contains("pid 77 was killed")),
+            "{below:?}"
+        );
+        assert_eq!(root.looks(), 1, "the root was looked at once");
+    }
+}
+
+/// A deadline far off is waited for, not treated as passed: the member the kill reached is waited for (the hook
+/// ends it at the block) and the wait answers `Ok`, its block armed for no longer than the time left.
+///
+/// Mutants: a set deadline is treated as already passed; the block is armed past the deadline.
+#[skuld::test]
+fn a_wait_with_time_left_waits_for_its_members() {
+    use crate::stop::Deadline;
+
+    let timeout = std::time::Duration::from_secs(3600);
+    let (member, writer, id) = live_member();
+    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
+    let writer = Cell::new(Some(writer));
+    let _blocking = crate::wait::block_probe::on_blocking(move || drop(writer.take()));
+    crate::wait::block_probe::take();
+
+    wait.wait(Deadline::real(timeout)).expect("the member exited");
+
+    let armed = crate::wait::block_probe::take();
+    assert!(
+        !armed.is_empty() && armed.iter().all(|armed| armed.is_some_and(|armed| armed <= timeout)),
+        "the wait blocked, armed within the timeout: {armed:?}"
+    );
+    assert_eq!(id.is_alive(), Liveness::Dead);
+    _ = member.wait();
+}
+
+/// A tree's drain edge that has not fired when the deadline passes is a timeout with no member to name (the edge
+/// names none), and says so: the tree's drain was not seen. Windows (a Job) and Linux (a cgroup leaf) set an edge on
+/// a kill's wait.
+///
+/// Mutants: the edge's `MembersRemain` is dropped (`Ok`); it is the failure of a wait with no deadline.
+#[cfg(windows)]
+#[skuld::test]
+fn a_job_that_has_not_drained_at_the_deadline_is_a_timeout_naming_no_member() {
+    a_drain_edge_that_has_not_fired_is_a_timeout_naming_no_member();
+}
+
+/// [`a_job_that_has_not_drained_at_the_deadline_is_a_timeout_naming_no_member`] for a cgroup leaf.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_leaf_that_has_not_drained_at_the_deadline_is_a_timeout_naming_no_member(#[fixture(cgroup)] _group: &Group) {
+    a_drain_edge_that_has_not_fired_is_a_timeout_naming_no_member();
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn a_drain_edge_that_has_not_fired_is_a_timeout_naming_no_member() {
+    use crate::stop::Deadline;
+
+    let (child, writer) = crate::test_child::held_contained_blocker(crate::Stdio::null());
+    let edge = child.tree.drain_edge().expect("the tree has a drain edge");
+    let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), edge).split();
+
+    let error = wait
+        .wait(Deadline::real(std::time::Duration::ZERO))
+        .expect_err("a member of the tree runs");
+
+    let Error::TimedOut { detail, members, .. } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(members, &[]);
+    assert!(detail.contains("the tree's drain was not seen"), "{detail}");
+    drop(writer);
+    _ = child.wait();
+}
+
 // The awaited wait: the rows above, driven by `KillWait::wait_async` over real held members that the
 // test ends from a sibling task. The runtime is the test's current-thread one, so a wait that blocks
 // its thread never lets the sibling run, and the test does not finish.
@@ -680,7 +830,7 @@ mod awaited {
         let (member, writer, id) = live_member();
         let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
 
-        let mut waiting = pin!(wait.wait_async());
+        let mut waiting = pin!(wait.wait_async(None));
         assert!(
             waiting
                 .as_mut()
@@ -723,7 +873,7 @@ mod awaited {
 
         let (waited, ()) = ::tokio::join!(
             async {
-                let waited = wait.wait_async().await;
+                let waited = wait.wait_async(None).await;
                 done.set(true);
                 waited
             },
@@ -750,7 +900,7 @@ mod awaited {
         let root = root_looking([Answer::Exited]);
         let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
 
-        let (waited, ()) = ::tokio::join!(wait.with_root(&root, ROOT_PID, true).wait_async(), async {
+        let (waited, ()) = ::tokio::join!(wait.with_root(&root, ROOT_PID, None, true).wait_async(None), async {
             ::tokio::task::yield_now().await;
             assert_eq!(
                 root.looks(),
@@ -775,7 +925,10 @@ mod awaited {
         let failing = FailingEdge::new();
         let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), failing.edge()).split();
 
-        let err = wait.wait_async().await.expect_err("the edge could not be waited on");
+        let err = wait
+            .wait_async(None)
+            .await
+            .expect_err("the edge could not be waited on");
 
         assert_is_the_edges_error(&err);
     }
@@ -792,8 +945,8 @@ mod awaited {
         let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), failing.edge()).split();
 
         let err = wait
-            .with_root(&root, ROOT_PID, true)
-            .wait_async()
+            .with_root(&root, ROOT_PID, None, true)
+            .wait_async(None)
             .await
             .expect_err("neither the root's exit nor the edge could be observed");
 
@@ -813,7 +966,7 @@ mod awaited {
             .reaching([id])
             .split();
 
-        let (waited, ()) = ::tokio::join!(wait.wait_async(), async {
+        let (waited, ()) = ::tokio::join!(wait.wait_async(None), async {
             ::tokio::task::yield_now().await;
             drop(writer);
         });
@@ -847,7 +1000,7 @@ mod awaited {
             root_ended: false,
         };
 
-        let (swept, ()) = ::tokio::join!(Swept::new("kill_tree", Err(refused), wait).wait_async(), async {
+        let (swept, ()) = ::tokio::join!(Swept::new("kill_tree", Err(refused), wait).wait_async(None), async {
             ::tokio::task::yield_now().await;
             drop(writer);
         });
@@ -995,12 +1148,121 @@ mod awaited {
         let why = refused_unobserved(4242);
         let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).unobserved(why).split();
 
-        let failure = Swept::new("kill_tree", Ok(()), wait.with_root(&root, ROOT_PID, true))
-            .wait_async()
+        let failure = Swept::new("kill_tree", Ok(()), wait.with_root(&root, ROOT_PID, None, true))
+            .wait_async(None)
             .await
             .expect_err("a member's exit cannot be observed");
 
         assert!(failure.root_ended, "the root was killed, and its exit was waited for");
         assert_eq!(root.looks(), 1);
+    }
+
+    /// The awaited wait whose deadline has passed names the member still running and the root, as the sync wait does.
+    /// A sibling task ends the member after one yield, so a wait that ignored the deadline is still pending and then
+    /// answers `Ok`, which fails the assertion on the error (no hang).
+    ///
+    /// Mutants: the awaited wait ignores the deadline; it names the member and not the root.
+    #[skuld::test]
+    async fn an_awaited_wait_whose_deadline_has_passed_names_what_is_still_running() {
+        use crate::identity::{Key, ProcessId};
+        use crate::stop::Deadline;
+
+        crate::tokio::test_runtime::assert_current_thread();
+        let (member, writer, id) = live_member();
+        let root_id = ProcessId::from_parts_for_test(ROOT_PID, Key::for_test(2));
+        let root = root_looking([Answer::Running]);
+        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
+
+        let (error, ()) = ::tokio::join!(
+            async {
+                wait.with_root(&root, ROOT_PID, Some(root_id), true)
+                    .wait_async(Deadline::tokio(std::time::Duration::ZERO))
+                    .await
+                    .expect_err("a member and the root were still running")
+            },
+            async {
+                ::tokio::task::yield_now().await;
+                drop(writer);
+            }
+        );
+
+        let Error::TimedOut { members, .. } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(members, &[id, root_id]);
+        _ = member.wait();
+    }
+
+    /// With a deadline far off the awaited wait waits for the member, which a sibling task ends, and answers `Ok`.
+    ///
+    /// Mutant: a set deadline is treated as already passed.
+    #[skuld::test]
+    async fn an_awaited_wait_with_time_left_waits_for_its_members() {
+        use crate::stop::Deadline;
+
+        crate::tokio::test_runtime::assert_current_thread();
+        let (member, writer, id) = live_member();
+        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
+        let done = Cell::new(false);
+
+        let (waited, ()) = ::tokio::join!(
+            async {
+                let waited = wait
+                    .wait_async(Deadline::tokio(std::time::Duration::from_secs(3600)))
+                    .await;
+                done.set(true);
+                waited
+            },
+            async {
+                ::tokio::task::yield_now().await;
+                assert!(!done.get(), "the wait resolved while a member was running");
+                drop(writer);
+            }
+        );
+
+        waited.expect("the member exited");
+        assert_eq!(id.is_alive(), Liveness::Dead);
+        _ = member.wait();
+    }
+
+    /// The awaited twin of the sync drain-edge row: a Job's edge that has not fired when the deadline passes is a
+    /// timeout naming no member, which says the tree's drain was not seen.
+    ///
+    /// Mutant: the edge's `MembersRemain` is dropped (`Ok`).
+    #[cfg(windows)]
+    #[skuld::test]
+    async fn an_awaited_job_that_has_not_drained_at_the_deadline_is_a_timeout_naming_no_member() {
+        awaited_drain_edge_that_has_not_fired().await;
+    }
+
+    /// [`an_awaited_job_that_has_not_drained_at_the_deadline_is_a_timeout_naming_no_member`] for a cgroup leaf.
+    #[cfg(target_os = "linux")]
+    #[skuld::test]
+    async fn an_awaited_leaf_that_has_not_drained_at_the_deadline_is_a_timeout_naming_no_member(
+        #[fixture(cgroup)] _group: &Group,
+    ) {
+        awaited_drain_edge_that_has_not_fired().await;
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    async fn awaited_drain_edge_that_has_not_fired() {
+        use crate::stop::Deadline;
+
+        let (child, writer) = crate::test_child::held_contained_blocker(crate::Stdio::null());
+        let edge = child.tree.drain_edge().expect("the tree has a drain edge");
+        let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), edge).split();
+
+        let error = wait
+            .wait_async(Deadline::tokio(std::time::Duration::ZERO))
+            .await
+            .expect_err("a member of the tree runs");
+
+        let Error::TimedOut { detail, members, .. } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(members, &[]);
+        assert!(detail.contains("the tree's drain was not seen"), "{detail}");
+        drop(writer);
+        _ = child.wait();
     }
 }

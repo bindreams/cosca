@@ -103,6 +103,7 @@ fn run(
     ));
     let outcome = super::shutdown::run_ready(super::shutdown::signal_tree_cooperatively(
         &super::shutdown::BlockingDriver(&child),
+        None,
     ));
     if !root.signal_calls().is_empty() {
         sent.borrow_mut().push("term");
@@ -280,4 +281,61 @@ fn a_kill_that_finds_the_root_gone_says_so() {
         "{warns:?}"
     );
     assert!(!warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
+}
+
+/// The grace of the root-through-its-pidfd path is cut to the call's deadline, pinned through the wait it arms on a
+/// frozen clock: a grace of an hour under a timeout of 30 s blocks for 30 s, and ends when the root does (the hook
+/// ends it at that block, so a wait armed for the hour answers the same and fails the assertion on the value).
+///
+/// Mutant: the path waits its whole grace (`root_exited`), whatever the call's deadline.
+#[skuld::test]
+fn a_timed_root_through_its_pidfd_arms_its_grace_wait_at_the_timeout_not_the_grace() {
+    use std::io::Read as _;
+    use std::time::Duration;
+
+    use crate::child::graceful::shutdown::{root_through_pidfd, run_ready, signal_tree_cooperatively, BlockingDriver};
+    use crate::containment::{Mechanism, Tree};
+    use crate::wait::block_probe;
+    use crate::wait::test_clock::FrozenClockGuard;
+
+    let mut cmd = crate::test_child::command(crate::test_child::Console::Hidden);
+    cmd.args(crate::test_child::TERM_IGNORING_BLOCKER_ARGV.iter().copied());
+    cmd.stdin(crate::Stdio::pipe()).expect("set stdin pipe");
+    cmd.stdout(crate::Stdio::pipe()).expect("set stdout pipe");
+    let mut child = cmd.spawn().expect("spawn");
+    let stdin = child.stdin().expect("piped stdin");
+    child
+        .stdout()
+        .expect("piped stdout")
+        .read_exact(&mut [0u8; 1])
+        .expect("readiness byte");
+    let (tree, _) = FakeContains::new(Containment::Session, false);
+    child.tree = Tree::contained(Mechanism::Fake(
+        tree.answering_terminates([TerminateOutcome::RootThroughPidfd(skip())]),
+    ));
+    let driver = BlockingDriver(&child);
+    let SignalTreeCooperativelyOutcome::RootThroughPidfd(skip, started, sig, acted) =
+        run_ready(signal_tree_cooperatively(&driver, None))
+    else {
+        panic!("the default stop did not end on the root's pidfd");
+    };
+    assert!(acted.is_none(), "the default action answered Ok: {acted:?}");
+    let stdin = RefCell::new(Some(stdin));
+    let _release = block_probe::on_blocking(move || drop(stdin.borrow_mut().take()));
+    let (_clock, _) = FrozenClockGuard::install();
+    block_probe::take();
+
+    let timeout = Duration::from_secs(30);
+    let error = run_ready(root_through_pidfd(
+        &driver,
+        &skip,
+        started,
+        sig,
+        Duration::from_secs(3600),
+        crate::stop::Deadline::real(timeout),
+    ));
+
+    assert!(matches!(error, Error::Unassessable { .. }), "{error:?}");
+    assert_eq!(block_probe::take().first(), Some(&Some(timeout)));
+    child.wait().expect("the root ended when its input did");
 }
