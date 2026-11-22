@@ -261,6 +261,66 @@ fn wait_deadline_in_the_past_reports_an_exited_child() {
     assert_eq!(status, Some(waited));
 }
 
+/// A warn threshold is warned of once when the call's deadline is after it, and not when the deadline is at or
+/// before it: the wait ends at the deadline, with nothing to warn of. The clock is frozen, so a tie is exact. The
+/// root runs until the hook, at the block armed for the hour the deadline leaves, ends it, so the row that waits
+/// for the exit ends there; the other rows end at their deadline.
+///
+/// Mutants: the threshold is not filtered by the deadline (the rows with the deadline at or before it warn); every
+/// threshold is filtered (the row with the deadline after it does not warn); the filter's `<` is `<=` (the tie
+/// warns).
+#[skuld::test]
+fn a_warn_threshold_is_warned_of_only_when_the_deadline_is_after_it() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use crate::child::owned::ChildWaitOutcome;
+    use crate::wait::block_probe::on_each_block;
+    use crate::wait::teardown_warn::Due;
+    use crate::wait::test_clock::FrozenClockGuard;
+
+    let (child, stdin) = spawn_never_exiting();
+    let stdin = Rc::new(RefCell::new(Some(stdin)));
+    let hour = Duration::from_secs(3600);
+    let _release = on_each_block({
+        let stdin = Rc::clone(&stdin);
+        move |block| {
+            if block.armed.is_none_or(|armed| armed > Duration::from_secs(60)) {
+                drop(stdin.borrow_mut().take());
+            }
+        }
+    });
+    let (_clock, now) = FrozenClockGuard::install();
+    // (threshold, deadline, warns)
+    for (after, deadline, warns) in [
+        (Duration::from_secs(1), now, false),
+        (Duration::ZERO, now, false),
+        (Duration::ZERO, now + hour, true),
+    ] {
+        let warned = Cell::new(0u32);
+        let waited = super::wait_to_exit_saying(
+            &child.proc,
+            Due::in_(Some(after)),
+            |_| warned.set(warned.get() + 1),
+            Some(deadline),
+        )
+        .expect("the wait");
+        assert_eq!(
+            warned.get(),
+            u32::from(warns),
+            "threshold {after:?}, deadline {:?} from now",
+            deadline - now
+        );
+        assert_eq!(
+            matches!(waited, ChildWaitOutcome::Exited(_)),
+            warns,
+            "only the row that waits to its deadline an hour away sees the exit: {waited:?}"
+        );
+    }
+    drop(stdin.borrow_mut().take());
+    child.wait().expect("the child ended at its input's end");
+}
+
 /// The frozen clock advances by the real elapsed time of each wait exactly once, so a second wait
 /// never returns before its own deadline.
 fn assert_consecutive_frozen_waits_never_early(child: &crate::Child) {

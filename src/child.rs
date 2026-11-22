@@ -986,13 +986,32 @@ impl Child {
     /// members the walk reached, and a later [`kill_tree`](Child::kill_tree) or the drop kills them by
     /// identity.
     ///
+    /// See [`terminate_tree_timeout`](Child::terminate_tree_timeout) to bound the waits.
+    ///
     /// # Panics
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub fn terminate_tree(&self) -> Result<(), crate::stop::StopError> {
-        graceful::shutdown::run_ready(graceful::shutdown::terminate_tree(&graceful::shutdown::BlockingDriver(
-            self,
-        )))
+        graceful::shutdown::run_ready(graceful::shutdown::terminate_tree(
+            &graceful::shutdown::BlockingDriver(self),
+            None,
+        ))
+    }
+
+    /// [`terminate_tree`](Child::terminate_tree), with a bound on the waits cosca makes for the stop action: they
+    /// end by `timeout` from the call's start. What [`terminate_timeout`](Child::terminate_timeout) says of the
+    /// bound (which waits it covers, and what is not covered), of `wait_exit` and of the answers when the
+    /// console-event proxy has not answered by then, or the timeout was past before it would be started, holds
+    /// here.
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
+    pub fn terminate_tree_timeout(&self, timeout: std::time::Duration) -> Result<(), crate::stop::StopError> {
+        graceful::shutdown::run_ready(graceful::shutdown::terminate_tree(
+            &graceful::shutdown::BlockingDriver(self),
+            crate::stop::Deadline::real(timeout),
+        ))
     }
 
     /// A tree call on this child's tree that skipped what the root's number names ([`SkipCall`]).

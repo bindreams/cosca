@@ -352,6 +352,24 @@ pub enum Error {
         detail: String,
         source: Option<Arc<Error>>,
     },
+    /// A timeout the caller gave a call ran out before what the call waited for happened, as
+    /// [`Child::terminate_timeout`](crate::Child::terminate_timeout) and its tree and `tokio` twins give one.
+    /// The call stopped waiting at the timeout: what it waited for may still happen, or may have.
+    ///
+    /// `members`: the child's root, not seen to exit, when the call waited for it and it has an identity
+    /// ([`Child::id`](crate::Child::id)); empty otherwise (no identity, or the wait was for a proxy cosca
+    /// ended). `detail` says what was waited for, with the pid where there is one. `source` is what went wrong
+    /// below the timeout, if anything.
+    ///
+    /// The ids are identities, not pins, as [`ChildFate::Running`]'s: check one ([`ProcessId::is_alive`])
+    /// before acting on it.
+    ///
+    /// [`ProcessId::is_alive`]: crate::identity::ProcessId::is_alive
+    TimedOut {
+        detail: String,
+        members: Vec<crate::identity::ProcessId>,
+        source: Option<Arc<Error>>,
+    },
     /// A tree-walk kill killed what it could and left members running, one or more. Each of `members`
     /// is an [`Error::MemberNotKilled`], in the order the walk found them. `others` holds the call's
     /// failures besides the members left, none of which names a process: a walk that could not be made,
@@ -505,6 +523,7 @@ impl std::fmt::Display for Error {
             Error::Unassessable { detail, .. } => {
                 write!(f, "could not determine the target process's state: {detail}")
             }
+            Error::TimedOut { detail, .. } => write!(f, "the timeout the call was given ran out: {detail}"),
             Error::MembersLeft { members, .. } => match members.iter().len() {
                 1 => f.write_str("1 member of the tree was left running"),
                 n => write!(f, "{n} members of the tree were left running"),
@@ -553,6 +572,7 @@ impl std::error::Error for Error {
             | Error::Containment { source, .. }
             | Error::Elevation { source, .. }
             | Error::Unassessable { source, .. }
+            | Error::TimedOut { source, .. }
             | Error::IdentityRecord { source, .. } => source.as_deref().map(|source| source as _),
             Error::NoConsole { .. } => None,
             Error::MemberNotKilled { source, .. }
@@ -1139,6 +1159,15 @@ impl Error {
                 detail,
                 source: Some(joined(source, peers)),
             },
+            Error::TimedOut {
+                detail,
+                members,
+                source,
+            } => Error::TimedOut {
+                detail,
+                members,
+                source: Some(joined(source, peers)),
+            },
             Error::IdentityRecord { kind, detail, source } => Error::IdentityRecord {
                 kind,
                 detail,
@@ -1301,6 +1330,15 @@ impl Error {
             },
             Error::Unassessable { detail, source } => Error::Unassessable {
                 detail: append(detail),
+                source,
+            },
+            Error::TimedOut {
+                detail,
+                members,
+                source,
+            } => Error::TimedOut {
+                detail: append(detail),
+                members,
                 source,
             },
             compound @ (Error::MemberNotKilled { .. } | Error::MembersLeft { .. } | Error::Several(_)) => {

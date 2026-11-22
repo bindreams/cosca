@@ -2,7 +2,7 @@
 //! that ran the action.
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::child::Child;
 use crate::containment::treewalk::WalkToken;
@@ -10,7 +10,7 @@ use crate::containment::{Root, SendAnswer, TerminateOutcome, TreeStop, UnsentKin
 use crate::error::Error;
 use crate::identity::ProcessId;
 use crate::signal::Sig;
-use crate::stop::{SendOutcome, StopError, StopWaits as _};
+use crate::stop::{SendOutcome, StopError, StopWaits};
 
 /// What a stop action acts on: a child's process, or its whole tree, and what the spawn recorded about
 /// the child.
@@ -35,6 +35,91 @@ pub struct StopTarget<'a> {
     /// asynchronously.
     root_record: Mutex<Option<RootRecord>>,
     tree_record: Mutex<Option<TreeRecord>>,
+    /// When the waits cosca makes inside the call end (`None`: no bound). Only the target reads it: it knows
+    /// the deadline's clock.
+    deadline: Option<Deadline>,
+}
+
+/// A call's deadline: the instant its waits end by, and the clock it is read on.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Deadline {
+    at: Instant,
+    clock: ClockKind,
+}
+
+/// Which clock a [`Deadline`]'s instant is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClockKind {
+    /// The real clock ([`crate::wait::now`]), which a sync call's waits are measured on.
+    Real,
+    /// Tokio's clock ([`crate::tokio::wait::tokio_now`]), for an async call; OS-timed waits are on the real
+    /// clock (see `StopTarget::deadline`).
+    #[cfg(feature = "tokio")]
+    Tokio,
+}
+
+impl ClockKind {
+    /// Now, on this clock.
+    fn now(self) -> Instant {
+        match self {
+            ClockKind::Real => crate::wait::now(),
+            #[cfg(feature = "tokio")]
+            ClockKind::Tokio => crate::tokio::wait::tokio_now(),
+        }
+    }
+}
+
+impl Deadline {
+    /// `timeout` from now on the real clock, for a sync call; `None` (no bound) for one too large for the clock.
+    pub(crate) fn real(timeout: Duration) -> Option<Deadline> {
+        crate::wait::deadline_from(timeout).map(|at| Deadline {
+            at,
+            clock: ClockKind::Real,
+        })
+    }
+
+    /// `timeout` from now on tokio's clock, for an async call; `None` (no bound) for one too large for the clock.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn tokio(timeout: Duration) -> Option<Deadline> {
+        crate::tokio::wait::deadline_from(timeout).map(|at| Deadline {
+            at,
+            clock: ClockKind::Tokio,
+        })
+    }
+
+    /// Windows: what is left before this deadline, read now on its own clock; `ZERO` once it is past.
+    #[cfg(windows)]
+    fn left(&self) -> Duration {
+        crate::wait::remaining_at(Some(self.at), self.clock.now()).expect("a deadline that is set has a time left")
+    }
+
+    /// This deadline's instant on `clock`, for a wait measured on it: the instant itself on its own clock,
+    /// else what is left now, re-expressed on `clock`. `None` (no bound) for one too large for it.
+    #[cfg_attr(
+        not(feature = "tokio"),
+        allow(unused_variables, reason = "without tokio there is one clock")
+    )]
+    pub(crate) fn at_on(&self, clock: ClockKind) -> Option<Instant> {
+        #[cfg(feature = "tokio")]
+        if clock != self.clock {
+            return crate::tokio::wait::to_real_clock_at(Some(self.at), self.clock.now(), clock.now());
+        }
+        Some(self.at)
+    }
+
+    /// `grace` from now on this deadline's clock, as a deadline on it; `None` for one too large for the clock.
+    fn after(&self, grace: Duration) -> Option<Deadline> {
+        crate::wait::deadline_at(self.clock.now(), grace).map(|at| Deadline { at, clock: self.clock })
+    }
+}
+
+/// What ends a wait that [`StopTarget::cut`] cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Bound {
+    /// The caller's grace: the wait ending with the root running says the grace is over.
+    Grace,
+    /// The call's deadline: the wait ending with the root running says the call's timeout ran out.
+    Deadline,
 }
 
 /// What a [`StopTarget`] stands for.
@@ -163,6 +248,7 @@ impl<'a> StopTarget<'a> {
             scope: Scope::Root,
             root_record: Mutex::new(None),
             tree_record: Mutex::new(None),
+            deadline: None,
         }
     }
 
@@ -173,6 +259,54 @@ impl<'a> StopTarget<'a> {
             scope: Scope::Tree(call),
             root_record: Mutex::new(None),
             tree_record: Mutex::new(None),
+            deadline: None,
+        }
+    }
+
+    /// This target, with the waits cosca makes inside its call ending by `deadline` (`None`: no bound).
+    pub(crate) fn with_deadline(mut self, deadline: Option<Deadline>) -> StopTarget<'a> {
+        self.deadline = deadline;
+        self
+    }
+
+    /// Windows: the call's deadline on the real clock, for the proxy's wait, which the OS measures on it.
+    /// `None`: no bound, or one too large for the clock (a tokio-clock deadline that cannot be re-expressed
+    /// on the real clock).
+    #[cfg(windows)]
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.deadline?.at_on(ClockKind::Real)
+    }
+
+    /// Windows: whether the call's deadline has passed, now on its own clock.
+    #[cfg(windows)]
+    pub(crate) fn deadline_passed(&self) -> bool {
+        self.deadline.is_some_and(|deadline| deadline.left().is_zero())
+    }
+
+    /// A wait of up to `grace`, cut to the call's deadline: the instant it ends by, on the deadline's own
+    /// clock, and which bound that is (a tie is the deadline's). `None` with no deadline: the wait is the grace
+    /// alone.
+    fn cut(&self, grace: Duration) -> Option<(Deadline, Bound)> {
+        let deadline = self.deadline?;
+        Some(match deadline.after(grace) {
+            Some(by) if by.at < deadline.at => (by, Bound::Grace),
+            _ => (deadline, Bound::Deadline),
+        })
+    }
+
+    /// `wait_exit`'s answer for a wait that `bound` ended; [`wait_exit_with`] is its only caller.
+    fn exit_answer(&self, exited: bool, bound: Bound) -> Result<bool, Error> {
+        match (exited, bound) {
+            (true, _) => Ok(true),
+            (false, Bound::Grace) => Ok(false),
+            (false, Bound::Deadline) => {
+                let pid = self.pid();
+                Err(Error::TimedOut {
+                    detail: format!("the call was waiting for the child (pid {pid}) to exit"),
+                    members: self.id().into_iter().collect(),
+                    source: None,
+                })
+            }
         }
     }
 
@@ -296,14 +430,26 @@ impl<'a> StopTarget<'a> {
     /// exit status. The same for both kinds of target: a tree target waits for the root too.
     ///
     /// `grace` is the caller's own bound: the wait ends when the root has exited, or when `grace` is
-    /// over, whichever comes first. `Duration::ZERO` is one look.
+    /// over, whichever comes first, and answers `false` for a root still running then. `Duration::ZERO`
+    /// is one look. In a call given a timeout
+    /// ([`terminate_timeout`](Child::terminate_timeout), [`terminate_tree_timeout`](Child::terminate_tree_timeout))
+    /// the wait also ends by the call's deadline, and for a root still running then it answers
+    /// [`Error::TimedOut`] (naming the root) instead of `false`: `false` says the grace is over, and it is
+    /// not. The grace is the bound only when it is strictly shorter than what is left before the deadline: a
+    /// tie is the deadline's. An action that goes on with `?` therefore ends at the deadline, with that
+    /// error.
+    ///
+    /// The error's `members` lists the root when it has an identity ([`id`](Self::id)); a root with none is
+    /// not listed, and `detail` names what was waited for, with its pid.
     ///
     /// This blocks the calling thread for up to `grace`. An async action awaits
     /// `cosca::tokio::stop::wait_exit` (feature `tokio`) instead.
     pub fn wait_exit(&self, grace: Duration) -> Result<bool, Error> {
-        crate::child::graceful::shutdown::run_ready(
-            crate::child::graceful::shutdown::BlockingDriver(self.child).root_exited(grace),
-        )
+        crate::child::graceful::shutdown::run_ready(wait_exit_with(
+            &crate::child::graceful::shutdown::BlockingDriver(self.child),
+            self,
+            grace,
+        ))
     }
 
     /// Windows: which program a send through the proxy starts, as the child's command set it.
@@ -530,6 +676,20 @@ impl std::fmt::Debug for StopTarget<'_> {
             .field("covers_tree", &self.covers_tree())
             .finish_non_exhaustive()
     }
+}
+
+/// The one body of [`StopTarget::wait_exit`], shared by the blocking and the awaiting driver.
+pub(crate) async fn wait_exit_with<D: StopWaits>(
+    driver: &D,
+    target: &StopTarget<'_>,
+    grace: Duration,
+) -> Result<bool, Error> {
+    let cut = target.cut(grace);
+    let exited = match cut {
+        Some((by, _)) => driver.root_exited_by(by).await?,
+        None => driver.root_exited(grace).await?,
+    };
+    target.exit_answer(exited, cut.map_or(Bound::Grace, |(_, bound)| bound))
 }
 
 #[cfg(test)]

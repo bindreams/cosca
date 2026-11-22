@@ -18,7 +18,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::error::Error;
-use crate::stop::{StopTarget, StopWaits};
+use crate::stop::{ClockKind, Deadline, StopTarget, StopWaits};
 
 /// What an async stop action returns: a boxed future of the action's answer that borrows its
 /// [`StopTarget`] and is `Send`, so the call that runs it can be spawned. Box an `async` block that
@@ -45,6 +45,15 @@ impl StopWaits for AsyncDriver<'_> {
         crate::tokio::drive::exited_held(self.0.proc.os_process(), Some(within)).await
     }
 
+    async fn root_exited_by(&self, by: Deadline) -> Result<bool, Error> {
+        // The clock the registered wait measures: tokio's timer on Unix, the OS's on Windows.
+        #[cfg(unix)]
+        let clock = ClockKind::Tokio;
+        #[cfg(windows)]
+        let clock = ClockKind::Real;
+        crate::tokio::drive::exited_until(self.0.proc.os_process(), by.at_on(clock)).await
+    }
+
     #[cfg(windows)]
     type Proxy = crate::tokio::Child;
 
@@ -66,8 +75,9 @@ impl StopWaits for AsyncDriver<'_> {
         proxy: &mut crate::tokio::Child,
         after: Duration,
         late: impl FnOnce(Duration) + Send,
-    ) -> Result<std::process::ExitStatus, Error> {
-        proxy.wait_saying(after, late).await
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<std::process::ExitStatus>, Error> {
+        proxy.wait_saying(after, late, deadline).await
     }
 }
 
@@ -100,7 +110,8 @@ pub async fn send_ctrl_break_to_group(target: &StopTarget<'_>) -> Result<(), Err
 
 /// Windows: sends `event` to the console of the child, from a process of its own. As
 /// [`stop::send_console_event_via_proxy`](crate::stop::send_console_event_via_proxy), with the wait for the
-/// proxy awaited: no runtime thread blocks, and the wait has no cap.
+/// proxy awaited: no runtime thread blocks, and the wait has no cap unless the call that runs it was given a
+/// timeout ([`Child::terminate_timeout`](crate::tokio::Child::terminate_timeout)).
 ///
 /// The proxy is started with [`tokio::Command`](crate::tokio::Command), on the blocking pool as every async
 /// spawn is, and the wait for its exit is registered with the OS.
@@ -137,7 +148,7 @@ pub async fn send_wm_close(target: &StopTarget<'_>) -> Result<(), Error> {
 /// hand-built runtime missing either, tokio panics rather than returning a typed error. On Windows the
 /// wait holds no thread and needs neither driver.
 pub async fn wait_exit(target: &StopTarget<'_>, grace: Duration) -> Result<bool, Error> {
-    AsyncDriver(target.child()).root_exited(grace).await
+    crate::stop::wait_exit_with(&AsyncDriver(target.child()), target, grace).await
 }
 
 #[cfg(test)]

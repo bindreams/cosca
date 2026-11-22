@@ -136,8 +136,9 @@
 //!   attach to and is answered [`NotYet`](SendOutcome::NotYet), which the caller asks again: see [`default`] and
 //!   `send_console_event_via_proxy`. A child of a layout that was not measured is not told apart from one
 //!   that finished without a console.
-//! - **The wait for the proxy has no cap, and the grace starts when the action returns:** see
-//!   `send_console_event_via_proxy` and
+//! - **The wait for the proxy has no cap unless the call was given a timeout
+//!   ([`Child::terminate_timeout`](crate::Child::terminate_timeout)), which does not bound the proxy's start,
+//!   and the grace starts when the action returns:** see `send_console_event_via_proxy` and
 //!   [`Child::graceful_shutdown_tree`](crate::Child::graceful_shutdown_tree).
 //! - **A front that does not relay the signal.** An elevated child behind such a front is refused the
 //!   signal, with nothing sent: see `send_signal`.
@@ -155,8 +156,10 @@ mod wm_close;
 
 pub(crate) use action::StopAction;
 pub use outcome::{SendOutcome, StopError};
+#[cfg(feature = "tokio")]
+pub(crate) use target::wait_exit_with;
 pub use target::StopTarget;
-pub(crate) use target::{RootRecord, Scope, TreeCall, TreeRecord};
+pub(crate) use target::{ClockKind, Deadline, RootRecord, Scope, TreeCall, TreeRecord};
 pub(crate) use waits::StopWaits;
 
 #[cfg(windows)]
@@ -555,11 +558,14 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendAnswer) -> Re
 ///
 /// # Waits
 ///
-/// The call waits, with no cap, for the proxy's answer, warning once after one second. No state of
+/// The call waits for the proxy's answer, with no cap unless the call that runs it was given a timeout
+/// ([`Child::terminate_timeout`](crate::Child::terminate_timeout),
+/// [`Child::terminate_tree_timeout`](crate::Child::terminate_tree_timeout)), warning once after one second.
+/// No state of
 /// another process on the child's console was found to hold the proxy: a handler that never returns,
 /// every thread suspended, a debugger holding the process, and an exit as the event is generated were
 /// measured, and other states were not. A [`CtrlProxy::Executable`](crate::CtrlProxy::Executable) that
-/// is not a proxy and does not exit holds the call, and [`Child::kill`](crate::Child::kill) does not
+/// is not a proxy and does not exit holds a call given no timeout, and [`Child::kill`](crate::Child::kill) does not
 /// release it: the wait is for the proxy, not for the child.
 ///
 /// The wait blocks the calling thread. An async action awaits
@@ -570,11 +576,12 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendAnswer) -> Re
 /// Whether the event went out is the [`SendOutcome`] of the `terminate` or `terminate_tree` that runs this
 /// function ([`StopError::outcome`]), not the error's variant: it is
 /// [`Unknown`](SendOutcome::Unknown) for a proxy that ran and did not confirm its event, one that may have
-/// run ([`Error::MayHaveStarted`]) and one whose exit is no answer, and
+/// run ([`Error::MayHaveStarted`]), one whose exit is no answer, and one that had not answered by the call's
+/// timeout ([`Error::TimedOut`]), and
 /// [`NotYet`](SendOutcome::NotYet) for a child that had not set its console up when the proxy asked (below), and
-/// [`NotSent`](SendOutcome::NotSent) for every other error, whatever its variant (the
-/// [`Error::Unassessable`] that `terminate_tree` answers for a child that had exited among them). The
-/// variants:
+/// [`NotSent`](SendOutcome::NotSent) for every other error, whatever its variant (an
+/// [`Error::Unassessable`] for a child that had exited among them, and an [`Error::TimedOut`] for a timeout
+/// that was past before the proxy was started). The variants:
 ///
 /// [`Error::Unsupported`], with, for the first two, nothing started (for a child that has not exited; see
 /// below):
@@ -616,6 +623,10 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendAnswer) -> Re
 ///
 /// [`Error::Unassessable`]: the proxy ended without a known answer, or generated the event and did not see
 /// its own copy. [`Error::MayHaveStarted`], from the start of the proxy, says the proxy may have run.
+///
+/// [`Error::TimedOut`], from a call given a timeout: the proxy had not answered by it and cosca ended it
+/// (the proxy may have sent: no member is named), or the timeout was past before the proxy was started
+/// (nothing was started or sent).
 ///
 /// On a tree target, an error whose outcome is [`Unknown`](SendOutcome::Unknown) still goes on to the grace
 /// and sweep, with that error as the cooperative error; every other error, `Unsupported` included, ends the

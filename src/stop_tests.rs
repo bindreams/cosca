@@ -442,6 +442,155 @@ fn an_action_may_compose_sends_with_a_wait() {
     }
 }
 
+// A call given a timeout =====
+
+/// `terminate_timeout` and `terminate_tree_timeout` carry their timeout to the action's target: the wait an
+/// action makes through `wait_exit` ends by it, for a root that does not exit, with the call's
+/// [`Error::TimedOut`] naming the root, which the action's `?` makes the call's answer (`Unknown`: the action
+/// made no prepared send). `terminate` and `terminate_tree`, which carry none, make the same wait for the whole
+/// grace: it is unbounded, which is where the hook ends the root, and the call is `Ok`. A block armed for more
+/// than the timeout is also where the hook ends the root, so a timeout that never reached the target answers
+/// `Ok` and fails the assertion on the error, with no hang.
+///
+/// Mutants: a timeout call passes no deadline to its target (root or tree); the plain call passes one; the
+/// deadline's end answers `Ok(false)` instead of `TimedOut`.
+#[skuld::test]
+fn a_timeout_call_bounds_the_wait_its_action_makes_and_a_plain_call_does_not() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::stop::SendOutcome;
+    use crate::wait::block_probe::{on_each_block, take};
+
+    let timeout = Duration::from_millis(20);
+    for tree in [false, true] {
+        let waited = Arc::new(Mutex::new(Vec::new()));
+        let (child, stdin) = blocker_stopping_by(
+            {
+                let waited = Arc::clone(&waited);
+                move |target| {
+                    waited.lock().unwrap().push(target.wait_exit(Duration::MAX)?);
+                    Ok(())
+                }
+            },
+            tree,
+        );
+        let stdin = Rc::new(RefCell::new(Some(stdin)));
+        let _release = on_each_block({
+            let stdin = Rc::clone(&stdin);
+            move |block| {
+                if block.armed.is_none_or(|armed| armed > timeout) {
+                    drop(stdin.borrow_mut().take());
+                }
+            }
+        });
+        take();
+        let answered = if tree {
+            child.terminate_tree_timeout(timeout)
+        } else {
+            child.terminate_timeout(timeout)
+        };
+        let err = answered.expect_err("the wait ended at the deadline, and the action's `?` ended the action");
+        assert_eq!(
+            err.outcome(),
+            SendOutcome::Unknown,
+            "tree: {tree}: the action sent nothing"
+        );
+        let Error::TimedOut {
+            detail,
+            members,
+            source,
+        } = err.error()
+        else {
+            panic!("tree: {tree}: {err:?}")
+        };
+        assert_eq!(members, &[child.id().expect(test_child::IDENTITY_READ)], "tree: {tree}");
+        assert!(
+            detail.contains(&format!("pid {}", child.pid())),
+            "tree: {tree}: {detail}"
+        );
+        assert!(source.is_none(), "tree: {tree}: {source:?}");
+        assert!(
+            waited.lock().unwrap().is_empty(),
+            "tree: {tree}: the action ended at its wait"
+        );
+        assert!(stdin.borrow().is_some(), "tree: {tree}: no block was past the timeout");
+        assert!(
+            take().iter().all(|armed| armed.is_some_and(|armed| armed <= timeout)),
+            "tree: {tree}: the wait was armed for the timeout"
+        );
+
+        if tree {
+            child.terminate_tree()
+        } else {
+            child.terminate()
+        }
+        .expect("the action ended with its wait");
+        assert_eq!(
+            *waited.lock().unwrap(),
+            [true],
+            "tree: {tree}: the plain call waited whole"
+        );
+        assert!(
+            stdin.borrow().is_none(),
+            "tree: {tree}: the hook ended the root at the unbounded block"
+        );
+        let status = child.wait().expect("the exited root is reaped");
+        assert!(
+            status.success(),
+            "tree: {tree}: the blocker ended at its input's end: {status:?}"
+        );
+    }
+}
+
+/// A timeout too large for the clock is no bound, as for every timeout in the crate: the call makes the wait the
+/// plain call makes, which is unbounded (the hook ends the root at that block) and answers `Ok`, with no panic.
+///
+/// Mutant: a timeout that overflows the clock is read as already passed (the action's wait answers `TimedOut`).
+#[skuld::test]
+fn a_timeout_too_large_for_the_clock_is_no_bound() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::wait::block_probe::{on_each_block, take};
+
+    for tree in [false, true] {
+        let waited = Arc::new(Mutex::new(Vec::new()));
+        let (child, stdin) = blocker_stopping_by(
+            {
+                let waited = Arc::clone(&waited);
+                move |target| {
+                    waited.lock().unwrap().push(target.wait_exit(Duration::MAX)?);
+                    Ok(())
+                }
+            },
+            tree,
+        );
+        let stdin = Rc::new(RefCell::new(Some(stdin)));
+        let _release = on_each_block({
+            let stdin = Rc::clone(&stdin);
+            move |_| drop(stdin.borrow_mut().take())
+        });
+        take();
+        let answered = if tree {
+            child.terminate_tree_timeout(Duration::MAX)
+        } else {
+            child.terminate_timeout(Duration::MAX)
+        };
+        answered.unwrap_or_else(|e| panic!("tree: {tree}: no bound, so the wait is for the exit: {e:?}"));
+        assert_eq!(*waited.lock().unwrap(), [true], "tree: {tree}");
+        assert!(
+            take().iter().all(Option::is_none),
+            "tree: {tree}: every block was unbounded"
+        );
+        let status = child.wait().expect("the exited root is reaped");
+        assert!(
+            status.success(),
+            "tree: {tree}: the blocker ended at its input's end: {status:?}"
+        );
+    }
+}
+
 // What a failed `terminate` and `terminate_tree` say of the send =====
 
 /// Ends a blocker that an action's send may already have ended.

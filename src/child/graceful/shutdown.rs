@@ -17,10 +17,10 @@ use crate::containment::TreeDrain;
 use crate::error::Error;
 #[cfg(target_os = "macos")]
 use crate::os_process::child::Foreign;
-use crate::stop::{SendOutcome, StopError, StopTarget, StopWaits, TreeCall};
+use crate::stop::{ClockKind, Deadline, SendOutcome, StopError, StopTarget, StopWaits, TreeCall};
 
 /// What the four stop calls need of a driver: the stop action's run, and the waits [`shutdown_lone`] and
-/// [`shutdown_tree`] make, beside the root's exit look of [`StopWaits`]. A deadline is a `Duration` from the
+/// [`shutdown_tree`] make, beside the root's exit look of [`StopWaits`]. A grace is a `Duration` from the
 /// wait's start, which each driver turns into an instant on its own clock.
 pub(crate) trait Waits: StopWaits {
     /// The child the call acts on: its gates, signals, tree and pid.
@@ -54,6 +54,10 @@ impl StopWaits for BlockingDriver<'_> {
         self.0.proc.exited_by(crate::wait::deadline_from(within))
     }
 
+    async fn root_exited_by(&self, by: Deadline) -> Result<bool, Error> {
+        self.0.proc.exited_by(by.at_on(ClockKind::Real))
+    }
+
     #[cfg(windows)]
     type Proxy = Child;
 
@@ -75,8 +79,9 @@ impl StopWaits for BlockingDriver<'_> {
         proxy: &mut Child,
         after: Duration,
         late: impl FnOnce(Duration) + Send,
-    ) -> Result<std::process::ExitStatus, Error> {
-        proxy.wait_saying(after, late)
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<std::process::ExitStatus>, Error> {
+        proxy.wait_saying(after, late, deadline)
     }
 }
 
@@ -148,21 +153,23 @@ fn graceful_status_of_reap(pid: u32, op: &str, outcome: Result<ChildWaitOutcome,
 }
 
 /// [`Child::terminate`](crate::Child::terminate), for any [`Waits`]: the action's answer, with how its last
-/// prepared send went when it failed.
-pub(crate) async fn terminate<W: Waits>(w: &W) -> Result<(), StopError> {
-    let target = StopTarget::root(w.child());
+/// prepared send went when it failed. The waits the call makes end by `deadline` (`None`: no bound):
+/// `terminate_timeout` is this call with one.
+pub(crate) async fn terminate<W: Waits>(w: &W, deadline: Option<Deadline>) -> Result<(), StopError> {
+    let target = StopTarget::root(w.child()).with_deadline(deadline);
     let acted = w.stop(&target).await;
     target.into_stop_result(acted)
 }
 
-/// [`Child::terminate_tree`](crate::Child::terminate_tree), for any [`Waits`].
-pub(crate) async fn terminate_tree<W: Waits>(w: &W) -> Result<(), StopError> {
+/// [`Child::terminate_tree`](crate::Child::terminate_tree), for any [`Waits`], with [`terminate`]'s
+/// `deadline`.
+pub(crate) async fn terminate_tree<W: Waits>(w: &W, deadline: Option<Deadline>) -> Result<(), StopError> {
     // Before the action runs, so nothing was sent.
     w.child()
         .require_contained()
         .map_err(|refused| StopError::new(refused, SendOutcome::NotSent))?;
     // A separate `terminate_tree` is no call that sweeps: it holds its members for the next kill.
-    let target = StopTarget::tree(w.child(), TreeCall::SignalOnly);
+    let target = StopTarget::tree(w.child(), TreeCall::SignalOnly).with_deadline(deadline);
     let acted = w.stop(&target).await;
     target.into_stop_result(acted)
 }

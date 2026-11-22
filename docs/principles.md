@@ -35,8 +35,9 @@ whose drain cannot be watched (the reactor refuses the registration, or the hand
 error) is left to the leaf's `Drop`, which waits for it in place instead of giving up a leaf that
 is ours. Both warn past 1 s, as principle 3 says.
 So is the console-event proxy's `tokio::Child` inside `terminate` and `graceful_shutdown*` (Windows):
-when the wait for it fails, or the call's future is dropped while it holds the proxy, its armed drop
-kills it and blocks until it is reaped.
+when the wait for it fails, the call's timeout (`terminate_timeout`) runs out, or the call's future is
+dropped while it holds the proxy, its armed drop kills it and blocks until it is reaped, which the timeout
+does not bound.
 
 The async `spawn` and `spawn_suspended` are `async fn`s that run the whole sync spawn on tokio's
 blocking pool: the elevation setup, the wait for `exec`, and a failed spawn's teardown all wait
@@ -330,7 +331,7 @@ only as a failure bound, whose expiry fails the test or reports an error, like a
 `terminate-after` ([`.config/nextest.toml`](../.config/nextest.toml)); library code sets none on
 work cosca controls. A timeout a caller passes to cosca is the caller's policy: cosca honours it,
 re-reads state at expiry and reports what it finds (`wait_timeout` returns `Ok(None)` (`Ok(false)`
-on `Process`), `wait_tree_timeout` returns `MembersRemain`, and `graceful_shutdown`'s grace
+on `Process`), `wait_tree_timeout` returns `MembersRemain`, `graceful_shutdown`'s grace
 escalates to a kill). A test fails its stated mutant by an assertion; the suite's `slow-timeout` is a
 fire alarm, never the failure bound. A backoff that re-checks a deterministic condition, with no cap, is fine. No
 arbitrary retry or loop caps. A test child kept alive is a held child, never a `sleep` or `ping`: use
@@ -476,10 +477,11 @@ step consistent with these principles.
 ## 13. A deadline is never early, and never late by its own choice
 
 Every caller-supplied deadline cosca accepts (for example `wait_timeout`, `wait_tree_timeout`,
-`graceful_shutdown`'s grace) gets exactly two promises, both checked against a monotonic clock:
+`terminate_timeout`, `graceful_shutdown`'s grace) gets exactly two promises, both checked against a monotonic clock:
 
 - **Never early.** cosca never reports a timeout outcome (`wait_timeout`'s `Ok(None)`/`Ok(false)`,
-  `wait_tree_timeout`'s `MembersRemain`, a grace escalating to a kill) before `now >= deadline`, or
+  `wait_tree_timeout`'s `MembersRemain`, a grace escalating to a kill, a proxy ended as unanswered, a
+  `wait_exit` cut by the call's deadline answering `TimedOut`) before `now >= deadline`, or
   `elapsed >= timeout` for an API expressed as a relative timeout instead of an absolute deadline.
   Tests assert this exactly, with no slack: scheduling can only push a call later, never earlier,
   so a passing test never needed a tolerance band.

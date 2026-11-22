@@ -102,8 +102,9 @@ impl Child {
     /// nested contained descendant. Neither reaches a descendant that has a console of its own or was
     /// started detached.
     ///
-    /// **The proxy waits.** The default blocks the calling thread until the proxy answers, with no cap;
-    /// see `stop::send_console_event_via_proxy`.
+    /// **The proxy waits.** The default blocks the calling thread until the proxy answers, with no cap
+    /// unless the call was given a timeout ([`terminate_timeout`](Child::terminate_timeout)); see
+    /// `stop::send_console_event_via_proxy`.
     ///
     /// **A child that has exited is `Ok`**, as on every platform, except a child created on this
     /// process's console that leads no group: the direct send refuses it with
@@ -146,7 +147,43 @@ impl Child {
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub fn terminate(&self) -> Result<(), StopError> {
-        shutdown::run_ready(shutdown::terminate(&shutdown::BlockingDriver(self)))
+        shutdown::run_ready(shutdown::terminate(&shutdown::BlockingDriver(self), None))
+    }
+
+    /// [`terminate`](Child::terminate), with a bound on the waits cosca makes for the stop action: they end by
+    /// `timeout` from the call's start. The timeout is the caller's own: cosca picks none, and one too large for
+    /// the clock is no bound, as for [`wait_timeout`](Child::wait_timeout).
+    ///
+    /// **What the bound covers.** The waits cosca makes for an answer: the console-event proxy's answer (the
+    /// default's route for a child outside this process's console on Windows, and
+    /// `stop::send_console_event_via_proxy`) and [`StopTarget::wait_exit`](crate::StopTarget::wait_exit). It
+    /// does not cover the proxy's start, nor what an action of the caller's own does on its own (a read of a
+    /// control pipe, a call to a service): the call returns by the timeout only when the action waits through
+    /// the two above alone. A timeout that passes between the check that refuses one already past and the
+    /// proxy's start still starts the proxy: the wait after it is one look, so a proxy that has not answered by
+    /// then answers `TimedOut` with outcome `Unknown`.
+    ///
+    /// **`wait_exit`** waits for the shorter of its grace and what is left of the timeout. For a root still
+    /// running at the timeout it answers [`Error::TimedOut`](crate::error::Error::TimedOut) naming the root,
+    /// where it answers `false` when its grace ran out first.
+    ///
+    /// **When the proxy has not answered by the timeout,** it is dropped (killed, and waited for until it exits,
+    /// which the timeout does not bound) and the call answers
+    /// [`Error::TimedOut`](crate::error::Error::TimedOut) with outcome
+    /// [`Unknown`](crate::stop::SendOutcome::Unknown).
+    ///
+    /// **A timeout already past before the proxy would be started** refuses the call: the proxy is not
+    /// started, nothing is sent, and the call answers the same error, with the outcome
+    /// [`NotSent`](crate::stop::SendOutcome::NotSent).
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
+    pub fn terminate_timeout(&self, timeout: Duration) -> Result<(), StopError> {
+        shutdown::run_ready(shutdown::terminate(
+            &shutdown::BlockingDriver(self),
+            crate::stop::Deadline::real(timeout),
+        ))
     }
 
     /// What a call that kills after the stop says the action sent ([`kill_after`](Child::kill_after)), from

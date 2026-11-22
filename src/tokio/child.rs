@@ -289,17 +289,31 @@ impl Child {
     }
 
     /// [`wait`](Child::wait), which calls `warn` once, with `after`, if the child has not exited `after` into
-    /// the wait, and goes on waiting (no cap). An error from the look ends the wait and is returned.
+    /// the wait, and goes on waiting. An error from the look ends the wait and is returned.
+    ///
+    /// `Ok(None)` is `deadline` (real clock) passed with the child running. Unlike `wait`, a call with a
+    /// deadline closes an untaken stdin only once the child has exited, so a child that exits only at its
+    /// stdin's end runs to the deadline. No warn is made for a deadline before the threshold.
     #[cfg(windows)]
     pub(crate) async fn wait_saying(
         &mut self,
         after: std::time::Duration,
         warn: impl FnOnce(std::time::Duration),
-    ) -> Result<ExitStatus, Error> {
-        if !crate::tokio::drive::exited_held(self.inner.proc.os_process(), Some(after)).await? {
-            warn(after);
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<ExitStatus>, Error> {
+        let proc = self.inner.proc.os_process();
+        // An overflowing threshold is never due.
+        if let Some(due) =
+            crate::wait::deadline_from(after).filter(|due| deadline.is_none_or(|deadline| *due < deadline))
+        {
+            if !crate::tokio::drive::exited_until(proc, Some(due)).await? {
+                warn(after);
+            }
         }
-        self.wait().await
+        if deadline.is_some() && !crate::tokio::drive::exited_until(proc, deadline).await? {
+            return Ok(None);
+        }
+        self.wait().await.map(Some)
     }
 
     /// The root's reap, as [`crate::Child::reap_outcome`] answers it, awaited: closes an untaken stdin first.
@@ -389,6 +403,8 @@ impl Child {
     /// the action answers, with how its last prepared send went when it failed: the error is a
     /// [`StopError`](crate::stop::StopError), as for the sync call.
     ///
+    /// See [`terminate_tree_timeout`](Child::terminate_tree_timeout) to bound the waits.
+    ///
     /// # Runtime
     ///
     /// As [`terminate`](Child::terminate): the default action on Unix waits for nothing and needs no driver,
@@ -400,7 +416,23 @@ impl Child {
     ///
     /// On Windows: see [`stop::default`](crate::stop::default#panics).
     pub async fn terminate_tree(&self) -> Result<(), crate::stop::StopError> {
-        crate::child::graceful::shutdown::terminate_tree(self).await
+        crate::child::graceful::shutdown::terminate_tree(self, None).await
+    }
+
+    /// [`terminate_tree`](Child::terminate_tree), with a bound on the waits cosca makes for the stop action: they
+    /// end by `timeout` from the call's start. What [`terminate_timeout`](Child::terminate_timeout) says of the
+    /// bound (which waits it covers, and that the proxy's start is not covered), of `wait_exit` and of the
+    /// answers holds here.
+    ///
+    /// # Runtime
+    ///
+    /// As [`terminate_timeout`](Child::terminate_timeout).
+    ///
+    /// # Panics
+    ///
+    /// On Windows: see [`stop::default`](crate::stop::default#panics).
+    pub async fn terminate_tree_timeout(&self, timeout: std::time::Duration) -> Result<(), crate::stop::StopError> {
+        crate::child::graceful::shutdown::terminate_tree(self, crate::stop::Deadline::tokio(timeout)).await
     }
 
     /// Block until the contained tree's drain is observed: a cgroup leaf with no process left, a

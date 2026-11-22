@@ -29,15 +29,15 @@ pub(crate) fn deadline_from(duration: Duration) -> Option<std::time::Instant> {
     crate::wait::deadline_at(tokio_now(), duration)
 }
 
-/// Re-express a [`tokio_now`]-clock `deadline` on the real clock, for the Windows registered waits,
-/// which the OS times in real time. Identical when tokio's clock is unpaused.
-#[cfg(any(windows, test))]
+/// Re-express a `deadline` read on the clock whose now is `from_now` on the clock whose now is `to_now`:
+/// from tokio's to the real clock for the Windows registered waits, which the OS times in real time, or the
+/// reverse. Identical when tokio's clock is unpaused.
 pub(crate) fn to_real_clock_at(
     deadline: Option<std::time::Instant>,
-    tokio_now: std::time::Instant,
-    real_now: std::time::Instant,
+    from_now: std::time::Instant,
+    to_now: std::time::Instant,
 ) -> Option<std::time::Instant> {
-    deadline.and_then(|at| crate::wait::deadline_at(real_now, at.saturating_duration_since(tokio_now)))
+    deadline.and_then(|at| crate::wait::deadline_at(to_now, at.saturating_duration_since(from_now)))
 }
 
 /// [`to_real_clock_at`] from now, on both clocks.
