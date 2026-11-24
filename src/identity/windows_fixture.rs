@@ -111,13 +111,15 @@ pub(crate) fn deny_every_open_by_pid(pid: u32) {
     set.expect("SetKernelObjectSecurity(DACL)");
 }
 
-/// The image path of process `pid`, read on a handle of its own; `None` once it is gone.
-pub(crate) fn image_file_name(pid: u32) -> Option<String> {
+/// The image path of process `pid`, read on a handle of its own: `Ok(None)` once the process is gone,
+/// `Err` when it cannot be opened or its image cannot be read while it is live. A process that exits
+/// with 259 reads as live (the fixtures' never do, see `is_running`).
+pub(crate) fn image_of(pid: u32) -> windows::core::Result<Option<String>> {
     use super::backend::{close, open_classified, Opened};
     let handle = match open_classified(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
         Opened::Found(handle) => handle,
-        Opened::Gone => return None,
-        Opened::Denied(e) => panic!("fixture: the job member {pid} cannot be opened: {e}"),
+        Opened::Gone => return Ok(None),
+        Opened::Denied(e) => return Err(e),
     };
     // 32 767 UTF-16 units and a terminator: the longest path Windows has.
     let mut buffer = vec![0u16; 32_768];
@@ -126,27 +128,33 @@ pub(crate) fn image_file_name(pid: u32) -> Option<String> {
     let read = unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut len) };
     let mut exit_code = 0u32;
     // SAFETY: `handle` is live and owned here.
-    unsafe { GetExitCodeProcess(handle, &mut exit_code) }.expect("GetExitCodeProcess on an owned handle");
+    let exit = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
     close(handle);
-    match read {
-        Ok(()) => Some(String::from_utf16_lossy(&buffer[..len as usize])),
-        // The query fails on a process that has exited since it was listed. The fixture's
-        // processes never exit with 259 (`is_running`).
-        Err(e) if exit_code == STILL_ACTIVE.0 as u32 => {
-            panic!("fixture: the image of the live job member {pid} cannot be read: {e}")
-        }
-        Err(_) => None,
+    match (read, exit) {
+        (Ok(()), _) => Ok(Some(String::from_utf16_lossy(&buffer[..len as usize]))),
+        (Err(_), Err(e)) => Err(e),
+        (Err(e), Ok(())) if exit_code == STILL_ACTIVE.0 as u32 => Err(e),
+        (Err(_), Ok(())) => Ok(None),
     }
 }
 
-/// Whether process `pid` runs `more.com`, the child the fixtures hold (see
-/// [`crate::test_child::windows_more`]); `false` once it is gone.
-pub(crate) fn is_more_com(pid: u32) -> bool {
-    image_file_name(pid).is_some_and(|image| {
-        std::path::Path::new(&image)
-            .file_name()
-            .is_some_and(|name| name.eq_ignore_ascii_case("more.com"))
-    })
+/// [`image_of`] for the fixtures' children; panics where it errs.
+fn image_file_name(pid: u32) -> Option<String> {
+    image_of(pid).unwrap_or_else(|e| panic!("fixture: the image of the process {pid} cannot be read: {e}"))
+}
+
+/// Whether the image path `image` has the file name `file_name`, compared without case.
+pub(crate) fn image_named(image: &str, file_name: &str) -> bool {
+    std::path::Path::new(image)
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(file_name))
+}
+
+/// Whether process `pid` runs the image whose file name is `file_name` (`"more.com"`, the child the
+/// fixtures hold, see [`crate::test_child::windows_more`]; `"cmd.exe"`); `false` once it is gone.
+/// Needs a process this user can open and whose image reads, and panics otherwise (see [`image_of`]).
+pub(crate) fn has_image(pid: u32, file_name: &str) -> bool {
+    image_file_name(pid).is_some_and(|image| image_named(&image, file_name))
 }
 
 /// Sentinel for [`spawn_with_ace`]: build the DACL with no ACE at all.
@@ -222,7 +230,7 @@ impl RestrictedChild {
             if let Some(pid) = members
                 .into_iter()
                 .filter(|&pid| pid != self.pid())
-                .find(|&pid| is_more_com(pid))
+                .find(|&pid| has_image(pid, "more.com"))
             {
                 return pid;
             }

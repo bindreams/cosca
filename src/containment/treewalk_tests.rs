@@ -1179,7 +1179,7 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
     let children = root.children(Recursive::No).expect("the root's children");
     let held = children
         .into_iter()
-        .find(|id| crate::identity::windows_fixture::is_more_com(id.pid()))
+        .find(|id| crate::identity::windows_fixture::has_image(id.pid(), "more.com"))
         .expect("the root has a `more` child")
         .pid();
     let Opened::Found(held_handle) =
