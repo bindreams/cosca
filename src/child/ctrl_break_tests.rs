@@ -161,7 +161,7 @@ fn child_graceful_shutdown_signals_the_group_but_only_kills_the_child() {
     );
     // Released after the kill: code 1 is the kill's.
     child.kill_tree().expect("kill_tree");
-    let Grandchild { sock, exit } = grand;
+    let Grandchild { sock, exit, .. } = grand;
     drop(sock);
     assert_eq!(exit.wait_for_exit_code(), 1, "kill_tree must kill the grandchild");
 }
@@ -303,7 +303,7 @@ fn graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
         crate::identity::Liveness::Dead,
         "the sweep really ended the root"
     );
-    let Grandchild { sock, exit } = grand;
+    let Grandchild { sock, exit, .. } = grand;
     drop(sock);
     assert_eq!(exit.wait_for_exit_code(), 1, "the sweep must kill the grandchild");
 }
@@ -618,7 +618,7 @@ fn child_graceful_ops_report_success_for_a_child_that_shares_no_console() {
 fn drop_kills_a_job_object_tree() {
     let (child, root_sock, grand) = spawn_tree(Handler::Default, Handler::Default, crate::ContainMode::Strongest);
     assert_eq!(child.containment(), Containment::JobObject);
-    let Grandchild { sock, exit } = grand;
+    let Grandchild { sock, exit, .. } = grand;
     let teardown = crate::child::spawn::fault::release_at_drop_kill((root_sock, sock));
 
     drop(child);

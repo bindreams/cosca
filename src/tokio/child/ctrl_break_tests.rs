@@ -143,7 +143,7 @@ async fn async_graceful_shutdown_tree_sweep_is_load_bearing_on_windows() {
         crate::identity::Liveness::Dead,
         "the sweep really ended the root"
     );
-    let Grandchild { sock, exit } = grand;
+    let Grandchild { sock, exit, .. } = grand;
     drop(sock);
     assert_eq!(exit.wait_for_exit_code(), 1, "the sweep must kill the grandchild");
 }

@@ -920,3 +920,7 @@ pub(crate) mod ctrl_break_tests;
 #[cfg(all(test, windows))]
 #[path = "ctrl_break_proxy_tests.rs"]
 mod ctrl_break_proxy_tests;
+
+#[cfg(all(test, windows))]
+#[path = "graceful_exited_root_tests.rs"]
+mod graceful_exited_root_tests;

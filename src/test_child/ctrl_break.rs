@@ -329,10 +329,11 @@ fn gui_root_command(cmd: &mut crate::Command, addr: &str) {
 }
 
 /// The grandchild a root member started: its control socket, which keeps it running while held,
-/// and a handle on its process.
+/// its identity and a handle on its process.
 pub(crate) struct Grandchild {
     pub(crate) sock: TcpStream,
     pub(crate) exit: ExitWatch,
+    pub(crate) id: crate::identity::ProcessId,
 }
 
 /// Reads the grandchild's pid from the root's socket (after [`accept_root`]), opens its process,
@@ -351,7 +352,7 @@ pub(crate) fn accept_grandchild(listener: &TcpListener, root_sock: &mut TcpStrea
     let mut tag = [0u8; 1];
     sock.read_exact(&mut tag).expect("the grandchild's tag");
     assert_eq!(&tag, b"G", "wrong grandchild tag");
-    Grandchild { sock, exit }
+    Grandchild { sock, exit, id }
 }
 
 /// A contained [`Handler::Ignore`] root after its handshake, and its control socket, which keeps it
