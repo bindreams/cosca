@@ -61,9 +61,7 @@ pub(crate) enum Sent {
     /// The signal was handed to the OS for the child.
     Delivered,
     /// Nothing was delivered: the process's exit has begun or finished and it is not reaped, so its pid still
-    /// names it (macOS: a signal answered `ESRCH` by a zombie, or `EPERM` with `P_WEXIT` set). A kill reads it
-    /// as [`Delivered`](Sent::Delivered), the exit being what it asked for; a cooperative stop's record reads
-    /// it as not sent.
+    /// names it (macOS: a signal answered `ESRCH` by a zombie, or `EPERM` with `P_WEXIT` set).
     #[cfg_attr(
         not(target_os = "macos"),
         allow(dead_code, reason = "only macOS's token send finds an exit under way")
@@ -274,8 +272,7 @@ pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
 /// the id read right before each send follows an `exec`. A refused send is the bare errno, so an
 /// `EPERM` stays raw; a refused id read keeps its errno's kind, so an `EPERM` stays `PermissionDenied`.
 ///
-/// A child that has exited and is not reaped, or whose exit has begun, is [`Sent::Exited`]: it is ours, and
-/// its zombie holds the pid, so it is not [`Sent::Gone`].
+/// Exited-but-unreaped, or exit begun: [`Sent::Exited`]; pid reused or reaped: [`Sent::Gone`].
 #[cfg(target_os = "macos")]
 pub(crate) fn via_audit_token(
     kernel: &dyn crate::identity::Kernel,

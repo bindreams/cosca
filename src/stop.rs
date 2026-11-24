@@ -326,7 +326,7 @@ pub fn send_signal(target: &StopTarget<'_>, signal: crate::Signal) -> Result<(),
                 match &sent {
                     Ok(crate::signal::Sent::Delivered) => target.note_root_sent(signal.name()),
                     // Not delivered: the root was gone, or its exit had begun. Nothing was sent.
-                    Ok(_) => target.note_root_gone(),
+                    Ok(crate::signal::Sent::Gone | crate::signal::Sent::Exited) => target.note_root_gone(),
                     Err(refusal) => target.note_not_sent(refusal, UnsentKind::NotSent),
                 }
                 sent.map(drop)

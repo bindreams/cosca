@@ -863,7 +863,7 @@ impl CgroupLeaf {
         for pid in pids {
             match self.terminate_member(pid, &subtree, signal) {
                 Ok(crate::signal::Sent::Delivered) => delivered = true,
-                Ok(_) => {}
+                Ok(crate::signal::Sent::Exited | crate::signal::Sent::Gone) => {}
                 Err(Unsignalled::Failed(unsent)) => failed.push(unsent),
                 Err(Unsignalled::Unproven(unsent)) => unproven.push(unsent),
             }

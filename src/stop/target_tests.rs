@@ -271,8 +271,7 @@ fn a_tree_routes_answer_is_recorded_as_how_the_send_went() {
     }
 }
 
-/// A signal through a root's handle is `Sent` only when it was delivered: a root that was gone, a root whose
-/// exit had begun (macOS), and a refusal, are not.
+/// A signal through a root's handle is `Sent` only when it was delivered.
 ///
 /// Mutant: any `Ok` answer of the handle reads as `Sent`.
 #[skuld::test]

@@ -253,29 +253,33 @@ fn a_failed_sigterm_waits_no_grace_and_is_the_error() {
     assert!(warns[0].contains(&said), "{warns:?}");
 }
 
-/// A `SIGTERM` that finds the root gone waits no grace and sends no kill.
+/// A `SIGTERM` that finds the root gone, or whose exit has begun, waits no grace and sends no kill.
 #[skuld::test]
 fn a_sigterm_that_finds_the_root_gone_waits_no_grace() {
     let says = "sent nothing: the root's pidfd shows it is gone";
-    let (err, sent, warns) = run(LiveBox::Own, Ok(Sent::Gone), None, Ok(Sent::Delivered));
-    assert_names_the_skip(&err);
-    assert_eq!(sent, ["term"], "{says}");
-    assert_eq!(warns.len(), 1, "{says}: {warns:?}");
-    assert!(warns[0].contains(says), "{warns:?}");
-    assert!(!warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
+    for found in [Sent::Gone, Sent::Exited] {
+        let (err, sent, warns) = run(LiveBox::Own, Ok(found), None, Ok(Sent::Delivered));
+        assert_names_the_skip(&err);
+        assert_eq!(sent, ["term"], "{found:?}: {says}");
+        assert_eq!(warns.len(), 1, "{found:?}: {says}: {warns:?}");
+        assert!(warns[0].contains(says), "{found:?}: {warns:?}");
+        assert!(!warns[0].contains(ROOT_TERMED_BY_PIDFD), "{found:?}: {warns:?}");
+    }
 }
 
 #[skuld::test]
 fn a_kill_that_finds_the_root_gone_says_so() {
-    let (err, sent, warns) = run(LiveBox::Own, Ok(Sent::Delivered), Some(Ok(false)), Ok(Sent::Gone));
-    assert_names_the_skip(&err);
-    assert_eq!(sent, ["term", "grace", "kill"]);
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(
-        warns[0].contains("its pidfd showed it gone after the grace"),
-        "{warns:?}"
-    );
-    assert!(!warns[0].contains(ROOT_KILLED_BY_PIDFD), "{warns:?}");
+    for found in [Sent::Gone, Sent::Exited] {
+        let (err, sent, warns) = run(LiveBox::Own, Ok(Sent::Delivered), Some(Ok(false)), Ok(found));
+        assert_names_the_skip(&err);
+        assert_eq!(sent, ["term", "grace", "kill"], "{found:?}");
+        assert_eq!(warns.len(), 1, "{found:?}: {warns:?}");
+        assert!(
+            warns[0].contains("its pidfd showed it gone after the grace"),
+            "{found:?}: {warns:?}"
+        );
+        assert!(!warns[0].contains(ROOT_KILLED_BY_PIDFD), "{found:?}: {warns:?}");
+    }
 }
 
 /// The grace of the root-through-its-pidfd path is cut to the call's deadline, pinned through the wait it arms on a

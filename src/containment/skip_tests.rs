@@ -368,6 +368,7 @@ fn a_skipped_kill_that_signalled_the_root_and_killed_a_held_member_says_both() {
             "killed the root through its pidfd, which names it exactly",
         ),
         (Sent::Gone, "sent nothing to the root: its pidfd shows it is gone"),
+        (Sent::Exited, "sent nothing to the root: its pidfd shows it is gone"),
     ];
     for (kind, why) in kinds() {
         for (sent, said_of_root) in rows {

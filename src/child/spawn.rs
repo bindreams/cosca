@@ -1157,7 +1157,6 @@ fn unwatched_child_fate(
         );
     }
     match via_audit_token(kernel, pid, unique, Sig::Kill) {
-        // `Exited` is a send that found the exit begun.
         Ok(Sent::Delivered | Sent::Exited) => (
             ChildFate::Killed,
             "it was sent SIGKILL, or its exit had begun when the send was made".to_owned(),

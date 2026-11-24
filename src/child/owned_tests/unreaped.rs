@@ -436,8 +436,8 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
     let denied = format!("could not be terminated ({})", crate::error::io_said("denied"));
     let boom = format!("the wait failed: {}", crate::error::io_said("boom"));
 
-    // Every kill the drop can have, over every look it can see: all 5 x 5 pairs the types allow,
-    // reachable or not on a given platform. A kill answers `Gone` once the child has exited, so a
+    // Every kill the drop can have, over every look it can see, reachable or not on a given
+    // platform. A kill answers `Gone` once the child has exited, so a
     // look right after it may still find the zombie not yet collectable. The wording is pinned for
     // each.
     let kills: [KillCase<'_>; 5] = [
