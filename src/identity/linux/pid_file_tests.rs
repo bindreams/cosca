@@ -236,12 +236,10 @@ fn an_unreadable_pid_has_the_reads_error_as_its_source() {
         panic!("EIO is no skip");
     };
     let source = std::error::Error::source(&unreadable).expect("an unreadable pid has a source");
-    assert_eq!(
-        source
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::raw_os_error),
-        Some(libc::EIO)
-    );
+    let io = source
+        .downcast_ref::<std::io::Error>()
+        .expect("the immediate source is the read's io::Error");
+    assert_eq!(io.raw_os_error(), Some(libc::EIO));
 }
 
 /// An unreadable pid says which `stat` failed and not the OS error, which is its `source()`.

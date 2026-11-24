@@ -1217,7 +1217,7 @@ fn create_leaf_under_reports_an_own_cgroup_it_cannot_open() {
     );
     let rendered = err.to_string();
     assert!(rendered.contains("no-such-slice"), "path missing from {rendered:?}");
-    assert_eq!(first_source_code(&err), Some(libc::ENOENT), "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::ENOENT), "{err:?}");
 }
 
 /// An own cgroup whose `cgroup.procs` cannot be opened is the same step, naming that file.
@@ -1236,19 +1236,11 @@ fn create_leaf_under_reports_an_own_cgroup_procs_it_cannot_open() {
     };
     assert!(matches!(err, LeafError::OpenOwnCgroup { .. }), "got {err:?}");
     assert!(err.to_string().contains("cgroup.procs"), "got {err}");
-    assert_eq!(first_source_code(&err), Some(libc::ENOENT), "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::ENOENT), "{err:?}");
     assert!(
         strays_in(dir.path()).is_empty(),
         "nothing is made before the own cgroup opens"
     );
-}
-
-/// The OS code on `err`'s `source()`.
-#[cfg(target_os = "linux")]
-fn first_source_code(err: &LeafError) -> Option<i32> {
-    std::error::Error::source(err)
-        .and_then(|source| source.downcast_ref::<std::io::Error>())
-        .and_then(std::io::Error::raw_os_error)
 }
 
 /// A writable directory with no `cgroup.kill` in the created leaf (i.e. not a cgroupfs, or a
@@ -1336,7 +1328,7 @@ fn create_leaf_under_reports_a_cgroup_kill_it_could_not_check() {
         "expected CheckKill, got {err:?}"
     );
     assert_eq!(
-        first_source_code(&err),
+        crate::error::first_os_code(&err),
         Some(libc::EACCES),
         "the errno is the diagnosis: {err:?}"
     );
@@ -2916,7 +2908,7 @@ fn create_leaf_under_reports_an_unopenable_cgroup_procs_and_removes_the_leaf() {
         "expected OpenProcs, got {err:?}"
     );
     assert!(err.to_string().contains("cgroup.procs"), "got {err}");
-    assert_eq!(first_source_code(&err), Some(libc::ENOENT), "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::ENOENT), "{err:?}");
 
     let strays = strays_in(dir.path());
     assert!(

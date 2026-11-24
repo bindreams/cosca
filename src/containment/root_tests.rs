@@ -121,10 +121,13 @@ fn an_unsure_refusal_has_the_peeks_error_as_its_source() {
     )
     .expect_err("an unsure handle refuses");
     assert!(!refusal.to_string().contains(&os_error), "{refusal}");
+    // Read from the immediate source on purpose: the test pins that layer.
     let code = |e: &dyn std::error::Error| {
-        e.source()
+        let io = e
+            .source()
             .and_then(|s| s.downcast_ref::<std::io::Error>())
-            .and_then(std::io::Error::raw_os_error)
+            .expect("the immediate source is the peek's io::Error");
+        io.raw_os_error()
     };
     assert_eq!(code(&refusal), Some(libc::EPERM));
     let unproven = NotItsGroup::unproven(refusal, None);

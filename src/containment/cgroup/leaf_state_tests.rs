@@ -121,12 +121,10 @@ fn an_unknown_state_has_what_it_wraps_as_its_source() {
     let skipped = read_proc_state(&over().on_read(&stat, Err(libc::ENOENT)), me).expect_err("no state");
     assert!(matches!(skipped, StateUnknown::Skipped(_)), "{skipped:?}");
     let source = std::error::Error::source(&skipped).expect("a skipped stat has a source");
-    assert_eq!(
-        source
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::raw_os_error),
-        Some(libc::ENOENT)
-    );
+    let io = source
+        .downcast_ref::<std::io::Error>()
+        .expect("the immediate source of a skipped read is its io::Error");
+    assert_eq!(io.raw_os_error(), Some(libc::ENOENT));
 
     let refused = read_proc_state(&over().on_read(&stat, Err(libc::ENOSYS)), me).expect_err("no state");
     assert!(matches!(refused, StateUnknown::Refused(_)), "{refused:?}");

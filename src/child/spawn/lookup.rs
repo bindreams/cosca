@@ -22,9 +22,9 @@ impl Invocation {
     ///
     /// For an exactly named program, does nothing else: the one candidate is the program, with no element.
     /// `NotFound` for a miss, `InvalidInput` for a name that cannot name a file, the candidate's error
-    /// (naming the entry, with the OS code down its `source()` chain) for one that could not be examined,
-    /// the directory's own for a located name whose directory cannot be entered; see
-    /// [`crate::resolve::posix`].
+    /// (naming the entry, with the OS code readable by [`first_os_code`](crate::error::first_os_code))
+    /// for one that could not be examined, the directory's own for a located name whose directory cannot
+    /// be entered; see [`crate::resolve::posix`].
     pub(crate) fn find(&mut self, env: &[(OsString, OsString)]) -> Result<Vec<Candidate>, Error> {
         if !self.searched {
             return Ok(vec![Candidate {

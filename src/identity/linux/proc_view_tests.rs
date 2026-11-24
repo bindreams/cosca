@@ -638,10 +638,10 @@ fn fixture_own_procfs_unprivileged() {
 fn an_unusable_view_has_its_os_error_as_its_source() {
     let with = ViewUnreadable::new("boom", Some(io::Error::from_raw_os_error(libc::EIO)));
     let source = std::error::Error::source(&with).expect("a view with an OS error has a source");
-    assert_eq!(
-        source.downcast_ref::<io::Error>().and_then(io::Error::raw_os_error),
-        Some(libc::EIO)
-    );
+    let io = source
+        .downcast_ref::<io::Error>()
+        .expect("the immediate source is the view's io::Error");
+    assert_eq!(io.raw_os_error(), Some(libc::EIO));
     assert!(std::error::Error::source(&ViewUnreadable::new("boom", None)).is_none());
 }
 

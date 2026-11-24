@@ -205,12 +205,10 @@ fn placement_unreadable_has_the_io_error_as_its_source() {
         report: NotEntered::WriteFailed(16),
     };
     let source = std::error::Error::source(&unreadable).expect("an unreadable placement has a source");
-    assert_eq!(
-        source
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::raw_os_error),
-        Some(13)
-    );
+    let io = source
+        .downcast_ref::<std::io::Error>()
+        .expect("the immediate source is the io::Error, not a layer above it");
+    assert_eq!(io.raw_os_error(), Some(13));
 }
 
 /// The degrade is logged at `warn` with the reason attached — the single line a human reading

@@ -11,7 +11,8 @@
 //!   own error, not `NotFound` and not a reason to search on.
 //! - A candidate that cannot be examined (`EACCES` on a locked entry, `ELOOP`, `EIO`, an unreachable
 //!   mount) stops the search with an error of the cause's kind that names the entry and the
-//!   candidate and holds the OS code down its `source()` chain, so `PATH=/locked:/usr/bin` is
+//!   candidate and holds the OS code down its `source()` chain (where
+//!   [`first_os_code`](crate::error::first_os_code) reads it), so `PATH=/locked:/usr/bin` is
 //!   `PermissionDenied` even when `/usr/bin` holds the program. Only a definite absence (`ENOENT`,
 //!   `ENOTDIR`) goes on.
 //! - A name with a `/` is not searched: it is the one entry it names, read against the child's
@@ -63,9 +64,10 @@ impl Found {
 /// when `None`) with the `PATH` `path_var` (`None`: it has none).
 ///
 /// `InvalidInput` for a name that carries a NUL or names no file; `ENOENT` for a miss; the
-/// candidate's error, naming the entry and the candidate, with the OS code down its `source()`
-/// chain, for one that cannot be examined (see the module doc); for a located name, the OS's own
-/// error, bare, whether its `cwd` cannot be entered or its file cannot be examined.
+/// candidate's error, naming the entry and the candidate, with the OS code readable by
+/// [`first_os_code`](crate::error::first_os_code), for one that cannot be examined (see the module
+/// doc); for a located name, the OS's own error, bare, whether its `cwd` cannot be entered or its file
+/// cannot be examined.
 pub(crate) fn lookup(program: &Path, cwd: Option<&Path>, path_var: Option<&OsStr>) -> Result<Found, Error> {
     if program.as_os_str().as_encoded_bytes().contains(&0) {
         return Err(Error::Io(std::io::Error::new(
@@ -119,8 +121,9 @@ fn miss_as_enoent(error: Error) -> Error {
 }
 
 /// The error for a walk of `candidates` that stopped at index `at` (`None`: not reported) on `errno`:
-/// worded as [`search`] words a stop, with the OS code down `source()`. A candidate with no element (a
-/// located name) gets the bare OS error, as [`lookup`] gives.
+/// worded as [`search`] words a stop, with the OS code readable by
+/// [`first_os_code`](crate::error::first_os_code). A candidate with no element (a located name) gets the
+/// bare OS error, as [`lookup`] gives.
 #[cfg(target_os = "linux")]
 pub(crate) fn walk_stop(candidates: &[Candidate], at: Option<u64>, errno: i32) -> std::io::Error {
     let cause = std::io::Error::from_raw_os_error(errno);
