@@ -30,7 +30,8 @@
 //!    races the call is answered [`ProxyAnswer::Unconfirmed`] by the wait.
 //! 9. A wait, with no cap, for the routine to see this process's own copy: only then has the console
 //!    host handed the event out, so only then may the console be left. The wait also ends when the
-//!    console closes. Measured on CI, on both Windows architectures, for both events, with one other
+//!    console closes. A closed console is [`ProxyAnswer::Unconfirmed`]; a failed wait exits with the cause
+//!    [`Step::WaitForOwnCopy`]. Measured on CI, on both Windows architectures, for both events, with one other
 //!    process on a hidden console (`.tmp/claude/findings/2026-11-17-997-measure4.md`): the proxy saw
 //!    its own copy and answered `Sent` in 2600 of 2600 runs, at the speed of the control (a handler that
 //!    returns at once), while that process was in a handler that never returns (200 runs), had every
@@ -105,7 +106,7 @@ fn send(args: &ProxyArgs) -> Result<(), ProxyExit> {
         return Err(ProxyAnswer::ConsoleIsCallers.into());
     }
     watch.generate(event)?;
-    Ok(watch.wait()?)
+    watch.wait()
 }
 
 /// The cause of a failed `what`, a call of `step`: says so on standard error and carries the Win32 code of `e`.
@@ -312,26 +313,25 @@ impl Watch {
     }
 
     /// Waits, with no cap, until the routine has seen the event it was installed for (`Ok`). The
-    /// console closing, or a failed wait, is `Unconfirmed`: the event was generated.
-    fn wait(&self) -> Result<(), ProxyAnswer> {
+    /// console closing is `Unconfirmed`, and a failed wait is the cause [`Step::WaitForOwnCopy`]: the event
+    /// was generated either way.
+    fn wait(&self) -> Result<(), ProxyExit> {
         // The own copy is first, so it wins when both are signalled.
         // SAFETY: both are live events `install` made.
         let waited = unsafe { WaitForMultipleObjects(&[self.own_copy, self.closing], false, INFINITE) };
         match waited {
             WAIT_OBJECT_0 => Ok(()),
-            w if w == WAIT_EVENT(WAIT_OBJECT_0.0 + 1) => Err(ProxyAnswer::Unconfirmed),
+            w if w == WAIT_EVENT(WAIT_OBJECT_0.0 + 1) => Err(ProxyAnswer::Unconfirmed.into()),
             WAIT_FAILED => {
-                role::line(
-                    role::PROXY,
-                    format_args!("WaitForMultipleObjects failed: {}", std::io::Error::last_os_error()),
-                );
-                Err(ProxyAnswer::Unconfirmed)
+                let e = std::io::Error::last_os_error();
+                role::line(role::PROXY, format_args!("WaitForMultipleObjects failed: {e}"));
+                Err(Cause::new(Step::WaitForOwnCopy, e.raw_os_error()).into())
             }
             // Two manual-reset events and no timeout: nothing else is a result of this wait.
             other => {
                 debug_assert!(false, "WaitForMultipleObjects returned {other:?}");
                 role::line(role::PROXY, format_args!("WaitForMultipleObjects returned {other:?}"));
-                Err(ProxyAnswer::Unconfirmed)
+                Err(Cause::new(Step::WaitForOwnCopy, None).into())
             }
         }
     }

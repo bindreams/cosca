@@ -1,23 +1,23 @@
 //! The proxy's sequence, against real consoles.
 //!
-//! Every test but the first two starts the proxy for real: this test binary started as the proxy
+//! The tests of the `CTRL_PROXY` group start the proxy for real: this test binary started as the proxy
 //! (its `main` calls `init_helpers` first), as cosca starts it, `detached()` with null stdio. A
 //! wrong proxy sends Ctrl+C or Ctrl+Break to every process on the console it attached to, so those
-//! tests are the `CTRL_PROXY` group: they run on CI, and a host runs them only after consenting
+//! tests run on CI, and a host runs them only after consenting
 //! (`COSCA_TEST_CTRL_PROXY_CONSENT=1`) or turns them off (`COSCA_TEST_CTRL_PROXY=0`).
 //!
 //! Each asserts the proxy's answer before it reads anything from its target, so a proxy that ANSWERS
 //! wrongly fails by assertion; the `Mutant:` line of a test names only mutants its assertions catch.
 //! No test reaches the handler routine's close and shutdown branch, the closing check before the
-//! generate, `Unconfirmed`, or the failed steps of the Win32 calls, and the runner's timeout is the
-//! only bound of a proxy that never generates.
+//! generate, `Unconfirmed`, or the failed steps of the Win32 calls other than the wait, and the runner's timeout
+//! is the only bound of a proxy that never generates.
 //! Targets are the `test_child::ctrl_break` members: a member's ack says which event reached its handler.
 
 use windows::core::HRESULT;
-use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, E_FAIL};
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, E_FAIL, HANDLE};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 
-use super::answer_for_failed_attach;
+use super::{answer_for_failed_attach, Watch};
 use crate::identity::windows_fixture::{deny_every_open_by_pid, drop_se_debug_privilege};
 use crate::identity::{HostKernel, ProcessId, Resolved};
 use crate::stop::proxy::protocol::{Cause, CtrlEvent, ProxyAnswer, ProxyArgs, ProxyExit, Step};
@@ -114,6 +114,22 @@ fn a_failed_call_carries_its_win32_code() {
     let cause = super::failed(Step::Generate, "a call", other);
     assert_eq!(cause, Cause::new(Step::Generate, None));
     assert_eq!(cause.os_code, None);
+}
+
+/// A wait that fails after the generate exits with the step and the Win32 code of the failure, and not with the
+/// answer that carries neither. A null handle is a wait the OS refuses with `ERROR_INVALID_HANDLE`. Mutant: the
+/// failure answers `Unconfirmed`, or the code is lost. Not in the group: it attaches to no console and generates
+/// no event.
+#[skuld::test]
+fn a_failed_wait_carries_its_win32_code() {
+    let watch = Watch {
+        own_copy: HANDLE::default(),
+        closing: HANDLE::default(),
+    };
+    assert_eq!(
+        watch.wait(),
+        Err(Cause::new(Step::WaitForOwnCopy, Some(ERROR_INVALID_HANDLE.0 as i32)).into())
+    );
 }
 
 /// Ctrl+Break to a contained child with a console of its own, which no group of the caller's

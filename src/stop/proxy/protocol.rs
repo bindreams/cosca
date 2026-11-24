@@ -12,7 +12,7 @@ use std::num::NonZeroU16;
 use crate::role::decimal;
 
 /// The protocol version this cosca speaks.
-pub(crate) const VERSION: u32 = 3;
+pub(crate) const VERSION: u32 = 4;
 
 /// A console control event that can be sent to a child's console: Ctrl+C or Ctrl+Break.
 ///
@@ -157,8 +157,9 @@ impl ProxyArgs {
 ///
 /// A proxy that fails a step before it generates the event, or cannot read its target, exits with a
 /// [`Cause`] instead of an answer: the caller's error says which call failed and with which Win32 error
-/// ([`ProxyExit`]). Nothing was sent then. 156 and 160 are left unused: a caller reads them as no
-/// answer.
+/// ([`ProxyExit`]). Nothing was sent then, but for the wait after the generate
+/// ([`Step::WaitForOwnCopy`]), which means what `Unconfirmed` means. 156 and 160 are left unused: a caller
+/// reads them as no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProxyAnswer {
     /// The event was generated on the target's console and the proxy saw its own copy of it.
@@ -176,8 +177,8 @@ pub(crate) enum ProxyAnswer {
     /// The OS refused the attach for a reason other than "no console" or "no such process": an
     /// exited process whose handle is still held answers this.
     AttachDenied = 157,
-    /// The event was generated, and the proxy did not see its own copy of it: the wait failed or
-    /// the console closed. The target may have received it.
+    /// The event was generated, and the proxy did not see its own copy of it: the console closed. The
+    /// target may have received it. A wait that failed is the cause [`Step::WaitForOwnCopy`] instead.
     Unconfirmed = 158,
     /// This platform has no proxy.
     NoProxyHere = 159,
@@ -209,7 +210,8 @@ impl ProxyAnswer {
     }
 }
 
-/// The call that failed when the proxy sent nothing for a reason of its own.
+/// The call that failed when the proxy sent nothing for a reason of its own, or, for
+/// [`WaitForOwnCopy`](Step::WaitForOwnCopy), the one that failed after it generated the event.
 #[cfg_attr(not(windows), allow(dead_code, reason = "only the Windows proxy fails a step"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
@@ -235,12 +237,15 @@ pub(crate) enum Step {
     ConsoleClosing = 10,
     /// `GenerateConsoleCtrlEvent`.
     Generate = 11,
+    /// `WaitForMultipleObjects`, for the proxy's own copy of the event, after the generate succeeded: the
+    /// event was generated, and whether the target received it is unknown.
+    WaitForOwnCopy = 12,
 }
 
 #[cfg_attr(not(windows), allow(dead_code, reason = "only the Windows proxy fails a step"))]
 impl Step {
     /// Every step, in the order of its number.
-    pub(crate) const ALL: [Step; 11] = [
+    pub(crate) const ALL: [Step; 12] = [
         Step::TargetIdentity,
         Step::OpenTarget,
         Step::FreeConsole,
@@ -252,6 +257,7 @@ impl Step {
         Step::ResetEvent,
         Step::ConsoleClosing,
         Step::Generate,
+        Step::WaitForOwnCopy,
     ];
 
     /// The step in words, as an error says where the proxy failed.
@@ -268,6 +274,25 @@ impl Step {
             Step::ResetEvent => "ResetEvent",
             Step::ConsoleClosing => "the generate, which found the console closing",
             Step::Generate => "GenerateConsoleCtrlEvent",
+            Step::WaitForOwnCopy => "WaitForMultipleObjects for the proxy's own copy, after the generate",
+        }
+    }
+
+    /// Whether the event had been generated when this step failed: only the wait after the generate.
+    pub(crate) fn event_generated(self) -> bool {
+        match self {
+            Step::TargetIdentity
+            | Step::OpenTarget
+            | Step::FreeConsole
+            | Step::AttachConsole
+            | Step::ReenableCtrlC
+            | Step::ConsoleProcessList
+            | Step::CreateEvent
+            | Step::InstallHandler
+            | Step::ResetEvent
+            | Step::ConsoleClosing
+            | Step::Generate => false,
+            Step::WaitForOwnCopy => true,
         }
     }
 
@@ -276,8 +301,8 @@ impl Step {
     }
 }
 
-/// Why the proxy sent nothing for a reason of its own: the step that failed, and the Win32 error code
-/// when the failure has one that fits 16 bits and is not 0 (0 is no code).
+/// Why a step of the proxy failed: the step, and the Win32 error code when the failure has one that fits 16
+/// bits and is not 0 (0 is no code).
 ///
 /// It travels in the proxy's exit code ([`Cause::code`]), the one channel no other process can hold open,
 /// and is for cosca's own decoder only: its layout is not a contract of a program that is not cosca's
@@ -287,7 +312,7 @@ impl Step {
 /// bit 31, 30     clear: a positive i32, and no NTSTATUS or crash status
 /// bit 29         set: the customer bit, which no system exit status sets
 /// bits 28 to 24  clear
-/// bits 23 to 17  the step's number, 1 to 11
+/// bits 23 to 17  the step's number, 1 to 12
 /// bit 16         an OS code is present
 /// bits 15 to 0   the Win32 code, 1 to 0xFFFF, or 0 when bit 16 is clear
 /// ```
@@ -313,6 +338,23 @@ impl Cause {
         Cause {
             step,
             os_code: code.and_then(|code| u16::try_from(code).ok()).and_then(NonZeroU16::new),
+        }
+    }
+
+    /// The failure's Win32 error as an `io::Error` with that raw OS error, when the cause has a code.
+    #[cfg(windows)]
+    pub(crate) fn os_error(self) -> Option<std::io::Error> {
+        self.os_code
+            .map(|code| std::io::Error::from_raw_os_error(i32::from(code.get())))
+    }
+
+    /// The error-text clause for a cause with no Win32 code; empty when it has one.
+    #[cfg(windows)]
+    pub(crate) fn no_code_clause(self) -> &'static str {
+        if self.os_code.is_some() {
+            ""
+        } else {
+            ", with no Win32 code the exit code can carry"
         }
     }
 
@@ -396,6 +438,24 @@ impl ProxyExit {
         ProxyAnswer::from_code(code)
             .map(ProxyExit::Answer)
             .or_else(|| Cause::from_code(code).map(ProxyExit::Cause))
+    }
+
+    /// The line the proxy writes to its stderr for this exit: `None` for `Sent`, which has nothing to say.
+    #[cfg(windows)]
+    pub(crate) fn stderr_line(self) -> Option<String> {
+        match self {
+            ProxyExit::Answer(ProxyAnswer::Sent) => None,
+            ProxyExit::Answer(answer) => Some(format!("answering {answer:?} (exit {})", exit_text(self.code()))),
+            ProxyExit::Cause(cause) => Some(format!(
+                "failed a step, {}: {cause:?} (exit {})",
+                if cause.step.event_generated() {
+                    "the event was generated"
+                } else {
+                    "nothing sent"
+                },
+                exit_text(self.code())
+            )),
+        }
     }
 }
 

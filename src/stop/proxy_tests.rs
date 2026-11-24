@@ -174,6 +174,11 @@ fn nothing_sent() -> ProxyExit {
     Cause::new(Step::Generate, Some(5)).into()
 }
 
+/// The exit of a proxy whose wait for its own copy failed after the generate.
+fn wait_failed_after_generate() -> ProxyExit {
+    Cause::new(Step::WaitForOwnCopy, Some(6)).into()
+}
+
 fn unsupported_detail(err: &Error) -> &str {
     match err {
         Error::Unsupported { detail, .. } => detail,
@@ -614,7 +619,8 @@ fn a_failed_step_with_no_os_code_is_named_and_has_none() {
 /// text, printed in decimal, or another cause's.
 #[skuld::test]
 fn every_failed_step_names_itself_and_holds_its_code() {
-    for step in Step::ALL {
+    // The wait after the generate is not a step that sent nothing: its error is `Unassessable`.
+    for step in Step::ALL.into_iter().filter(|step| *step != Step::WaitForOwnCopy) {
         for code in [5, 1168, 0xFFFF] {
             let cause = Cause::new(step, Some(code));
             let io = failed_step(cause, "CTRL_BREAK");
@@ -668,6 +674,55 @@ fn an_exit_that_is_no_answer_is_unassessable() {
         assert_no_break_sent();
         kill_release_reap(&child, sock, false);
     }
+}
+
+/// A failed wait after the generate is `Unassessable`: the text says the event was generated, the Win32 code is
+/// the `source()` (none when there is no code), and the exit is recorded. Mutants: read as `Unconfirmed` (code
+/// lost); as `Io` "nothing was sent"; code only in the text.
+#[skuld::test]
+fn a_wait_that_failed_after_the_generate_is_unassessable_and_holds_its_code() {
+    // ERROR_INVALID_HANDLE.
+    const CODE: i32 = 6;
+    let cause = Cause::new(Step::WaitForOwnCopy, Some(CODE));
+    let fixture = Fixture::answering(cause.code());
+    let (child, sock) = hidden_member(&fixture);
+    let err = send_err(&child, CtrlEvent::CtrlBreak);
+    let Error::Unassessable { detail, source } = &err else {
+        panic!("{err:?}")
+    };
+    assert_eq!(
+        detail,
+        &format!(
+            "the console-event proxy generated the CTRL_BREAK and failed at {} (exit {}) before it saw its own \
+             copy of it, so whether the child received it is unknown",
+            Step::WaitForOwnCopy.name(),
+            exit_text(cause.code())
+        )
+    );
+    assert!(source.is_some(), "{err:?}");
+    assert_eq!(crate::error::first_os_code(&err), Some(CODE), "{err:?}");
+    assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, cause);
+    kill_release_reap(&child, sock, false);
+
+    let cause = Cause::new(Step::WaitForOwnCopy, None);
+    let fixture = Fixture::answering(cause.code());
+    let (child, sock) = hidden_member(&fixture);
+    let err = send_err(&child, CtrlEvent::CtrlBreak);
+    let Error::Unassessable { detail, source } = &err else {
+        panic!("{err:?}")
+    };
+    assert_eq!(
+        detail,
+        &format!(
+            "the console-event proxy generated the CTRL_BREAK and failed at {} (exit {}) before it saw its own \
+             copy of it, with no Win32 code the exit code can carry, so whether the child received it is unknown",
+            Step::WaitForOwnCopy.name(),
+            exit_text(cause.code())
+        )
+    );
+    assert!(source.is_none(), "{err:?}");
+    assert_proxy_answered(child.pid(), CtrlEvent::CtrlBreak, cause);
+    kill_release_reap(&child, sock, false);
 }
 
 /// `Unconfirmed` is `Unassessable` with the event possibly sent, and the answer is recorded. Mutants: `Ok`;
@@ -1121,9 +1176,9 @@ fn the_calls_answer_what_the_proxy_answered() {
 /// could not make is a refusal. The child has a console, which no attach failure measured for a real child
 /// leaves it with, so the read finds it not finished: `TargetHasNoConsole` is `NotYet`.
 ///
-/// Mutants: `Unconfirmed` or an exit that is no answer reads as `Sent`; an answer that sent nothing reads as
-/// `Unknown`; a tree target's route loses the difference (the job object's, or the tree walk's); a no-console
-/// answer reads as `NotSent` whatever the read found.
+/// Mutants: `Unconfirmed`, a failed wait after the generate or an exit that is no answer reads as `Sent`; an
+/// answer that sent nothing reads as `Unknown`; a tree target's route loses the difference (the job object's,
+/// or the tree walk's); a no-console answer reads as `NotSent` whatever the read found.
 #[skuld::test]
 fn a_failed_call_says_from_the_proxys_exit_whether_the_event_went_out() {
     use crate::stop::SendOutcome::{self, NotSent, NotYet, Unknown};
@@ -1136,6 +1191,11 @@ fn a_failed_call_says_from_the_proxys_exit_whether_the_event_went_out() {
         (
             answered(ProxyAnswer::Unconfirmed).0,
             answered(ProxyAnswer::Unconfirmed).1,
+            Some(Unknown),
+        ),
+        (
+            wait_failed_after_generate().code(),
+            Some(wait_failed_after_generate()),
             Some(Unknown),
         ),
         (
@@ -1204,11 +1264,11 @@ fn a_failed_call_says_from_the_proxys_exit_whether_the_event_went_out() {
     }
 }
 
-/// A proxy answer that may have sent the event (`Unconfirmed`) is a send that went out: a tree call
-/// goes on to its grace and sweep, which end the member, and keeps the answer as its cooperative error
-/// (a sweep that proves the tree clear discards it, saying so). One that sent nothing (a failed step)
-/// is a refused send: the call ends with it, and the tree runs. Both mechanisms a Windows tree is
-/// signalled by are asked: a job object, and a tree walk.
+/// A proxy answer that may have sent the event (`Unconfirmed`, a failed wait after the generate) is a send
+/// that went out: a tree call goes on to its grace and sweep, which end the member, and keeps the answer as
+/// its cooperative error (a sweep that proves the tree clear discards it, saying so). One that sent nothing
+/// (a failed step) is a refused send: the call ends with it, and the tree runs. Both mechanisms a Windows
+/// tree is signalled by are asked: a job object, and a tree walk.
 ///
 /// Mutants: an `Unassessable` answer is read as a send that was not made (the call ends at it, the
 /// member runs on); a refused send is read as one that went out (the grace and sweep run).
@@ -1216,7 +1276,11 @@ fn a_failed_call_says_from_the_proxys_exit_whether_the_event_went_out() {
 fn a_tree_call_goes_on_after_a_send_that_may_have_gone_out_and_ends_after_one_that_did_not() {
     crate::log_capture::install();
     for mode in [ContainMode::Strongest, ContainMode::TreeWalk] {
-        for answer in [ProxyExit::from(ProxyAnswer::Unconfirmed), nothing_sent()] {
+        for answer in [
+            ProxyExit::from(ProxyAnswer::Unconfirmed),
+            wait_failed_after_generate(),
+            nothing_sent(),
+        ] {
             let fixture = Fixture::answering(answer.code());
             let (child, sock) = stopping_member(&fixture, mode);
             let mark = crate::log_capture::mark();
@@ -1226,7 +1290,7 @@ fn a_tree_call_goes_on_after_a_send_that_may_have_gone_out_and_ends_after_one_th
                 mark,
                 &format!("graceful_shutdown_tree({})", child.pid()),
             );
-            if answer == ProxyAnswer::Unconfirmed.into() {
+            if answer != nothing_sent() {
                 called.unwrap_or_else(|e| panic!("{mode:?}: the sweep ends the member: {e:?}"));
                 assert!(
                     logged.iter().any(|(level, text)| *level == log::Level::Debug
@@ -1260,6 +1324,7 @@ fn a_tree_call_goes_on_after_a_send_that_may_have_gone_out_and_ends_after_one_th
 fn a_root_records_a_send_that_may_have_gone_out_as_made() {
     for (answer, earlier) in [
         (ProxyExit::from(ProxyAnswer::Unconfirmed), Some("the CTRL_C")),
+        (wait_failed_after_generate(), Some("the CTRL_C")),
         (nothing_sent(), None),
     ] {
         let fixture = Fixture::answering(answer.code());

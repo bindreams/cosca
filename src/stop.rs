@@ -625,10 +625,14 @@ fn conclude(target: &StopTarget<'_>, name: &'static str, sent: SendAnswer) -> Re
 /// if the look fails, is the answer in its place. When the child had not exited and the read of it cannot
 /// tell (it failed, or the layout was not measured), or finds it finished starting without a console, the
 /// answer is the failed step's `Io`, with the OS code 31 as its `source()` (the read's failure is not in the chain).
-/// Every other failed step is an `Io`.
+/// Every other step that fails before the event is generated is an `Io`.
 ///
 /// [`Error::Unassessable`]: the proxy ended without a known answer, or generated the event and did not see
-/// its own copy. [`Error::MayHaveStarted`], from the start of the proxy, says the proxy may have run.
+/// its own copy: the console closed, or the proxy's wait for the copy failed. For the failed wait the
+/// error's text names the call (`WaitForMultipleObjects`) and, when the failure was a Win32 error of 16 bits
+/// that is not 0, the `source()` is an [`Error::Io`] holding an `io::Error` with that OS code
+/// ([`first_os_code`](crate::error::first_os_code) reads it); with no such code the error has no source.
+/// [`Error::MayHaveStarted`], from the start of the proxy, says the proxy may have run.
 ///
 /// [`Error::TimedOut`], from a call given a timeout: the proxy had not answered by it and cosca ended it
 /// (the proxy may have sent: no member is named), or the timeout was past before the proxy was started

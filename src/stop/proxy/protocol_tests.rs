@@ -38,13 +38,13 @@ fn argv_has_the_stated_layout() {
         event: CtrlEvent::CtrlBreak,
         caller: 7,
     };
-    assert_eq!(args.to_argv(OsStr::new(EXE)), argv(&["3", "4242", "99", "break", "7"]));
+    assert_eq!(args.to_argv(OsStr::new(EXE)), argv(&["4", "4242", "99", "break", "7"]));
     let args = ProxyArgs {
         event: CtrlEvent::CtrlC,
         ..args
     };
-    assert_eq!(args.to_argv(OsStr::new(EXE)), argv(&["3", "4242", "99", "c", "7"]));
-    assert_eq!(VERSION, 3);
+    assert_eq!(args.to_argv(OsStr::new(EXE)), argv(&["4", "4242", "99", "c", "7"]));
+    assert_eq!(VERSION, 4);
 }
 
 /// Mutant: the version is ignored, or judged after the tail (another version's tail may differ).
@@ -52,8 +52,8 @@ fn argv_has_the_stated_layout() {
 fn another_version_is_a_mismatch_whatever_follows() {
     for tail in [
         &["1", "4242", "99", "break", "7"][..],
-        &["4"],
-        &["4", "x"],
+        &["3"],
+        &["3", "x"],
         &["99999", "-1"],
     ] {
         let theirs = tail[0].parse().expect("a number");
@@ -97,7 +97,7 @@ fn an_argv_without_a_version_is_the_wrong_count() {
 /// Mutant: a missing or non-numeric pid or key is read as 0, or a short argv indexes out of range.
 #[skuld::test]
 fn a_malformed_tail_is_an_error() {
-    let version = "3";
+    let version = "4";
     for tail in [
         &[version][..],
         &[version, "4242"],
@@ -220,6 +220,62 @@ fn a_cause_round_trips_for_every_step_with_and_without_a_code() {
     }
 }
 
+/// Each step has its number and says whether the event had been generated when it failed: only the wait after the
+/// generate says so. Mutant: a step is renumbered, the wait says "not generated", or the generate says "generated".
+#[skuld::test]
+fn each_step_has_its_number_and_says_whether_the_event_was_generated() {
+    let table = [
+        (Step::TargetIdentity, 1, false),
+        (Step::OpenTarget, 2, false),
+        (Step::FreeConsole, 3, false),
+        (Step::AttachConsole, 4, false),
+        (Step::ReenableCtrlC, 5, false),
+        (Step::ConsoleProcessList, 6, false),
+        (Step::CreateEvent, 7, false),
+        (Step::InstallHandler, 8, false),
+        (Step::ResetEvent, 9, false),
+        (Step::ConsoleClosing, 10, false),
+        (Step::Generate, 11, false),
+        (Step::WaitForOwnCopy, 12, true),
+    ];
+    assert_eq!(table.map(|(step, ..)| step), Step::ALL);
+    for (step, number, generated) in table {
+        assert_eq!(step as i32, number, "{step:?}");
+        assert_eq!(step.event_generated(), generated, "{step:?}");
+    }
+}
+
+/// A failed wait exits with its step in bits 17 to 23 and its Win32 code in the low 16 bits. Mutant: the step
+/// or the code field sits at other bits than the layout says.
+#[skuld::test]
+fn a_failed_wait_exits_with_its_step_and_win32_code() {
+    let cause = Cause::new(Step::WaitForOwnCopy, Some(6));
+    assert_eq!(cause.code(), 0x2000_0000 | (12 << 17) | 0x1_0000 | 6);
+    assert_eq!(ProxyExit::from_code(cause.code()), Some(ProxyExit::Cause(cause)));
+}
+
+/// The proxy's stderr line says an answer by name and a failed step by whether the event had been generated;
+/// a `Sent` answer prints nothing. Mutant: the two phrasings of a failed step are swapped, or `Sent` prints.
+#[cfg(windows)]
+#[skuld::test]
+fn the_stderr_line_words_an_exit_by_whether_the_event_was_generated() {
+    assert_eq!(ProxyExit::Answer(ProxyAnswer::Sent).stderr_line(), None);
+    assert_eq!(
+        ProxyExit::Answer(ProxyAnswer::Unconfirmed).stderr_line().as_deref(),
+        Some("answering Unconfirmed (exit 158)")
+    );
+    let wait = ProxyExit::Cause(Cause::new(Step::WaitForOwnCopy, Some(6)));
+    assert_eq!(
+        wait.stderr_line().as_deref(),
+        Some("failed a step, the event was generated: Cause { step: WaitForOwnCopy, os_code: Some(6) } (exit 0x20190006)")
+    );
+    let before = ProxyExit::Cause(Cause::new(Step::Generate, None));
+    assert_eq!(
+        before.stderr_line().as_deref(),
+        Some("failed a step, nothing sent: Cause { step: Generate, os_code: None } (exit 0x20160000)")
+    );
+}
+
 /// Only an OS code of 1 to 0xFFFF travels; the step travels whatever the error was. Mutants: 0 is kept
 /// as a code, a wider code is truncated into another one, or a negative one (a non-Win32 HRESULT that
 /// `win32_io_error` keeps whole) gives a code.
@@ -272,9 +328,10 @@ fn a_malformed_cause_code_is_no_exit() {
         valid | i32::MIN,
         valid | 0x0100_0000,
         valid | 0x1000_0000,
-        // Step 0, and a step past the last one.
+        // Step 0, the first number past the last step, and the widest field.
         0x2000_0000,
         0x2000_0000 | 0x1_0000,
+        0x2000_0000 | (13 << 17),
         0x2000_0000 | (0x7F << 17),
         // A code with its flag clear has one spelling only: none.
         no_code | 5,

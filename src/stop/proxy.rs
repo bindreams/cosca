@@ -377,18 +377,27 @@ fn failed_step(cause: Cause, sent: &str) -> std::io::Error {
          failed at {}{}",
         exit_text(cause.code()),
         cause.step.name(),
-        if cause.os_code.is_some() {
-            ""
-        } else {
-            ", with no Win32 code the exit code can carry"
-        }
+        cause.no_code_clause()
     );
-    crate::error::io_context_or_other(
-        text,
-        cause
-            .os_code
-            .map(|code| std::io::Error::from_raw_os_error(i32::from(code.get()))),
-    )
+    crate::error::io_context_or_other(text, cause.os_error())
+}
+
+/// The answer for a proxy whose wait for its own copy failed after it generated the event: as for
+/// `Unconfirmed`, whether the child received it is unknown, and the failed wait's Win32 code is the
+/// `source()`.
+#[cfg(windows)]
+fn wait_after_generate_failed(cause: Cause, sent: &str) -> SendAnswer {
+    debug_assert_eq!(cause.step, Step::WaitForOwnCopy);
+    SendAnswer::Unknown(Error::Unassessable {
+        detail: format!(
+            "the console-event proxy generated the {sent} and failed at {} (exit {}) before it saw its own \
+             copy of it{}, so whether the child received it is unknown",
+            cause.step.name(),
+            exit_text(cause.code()),
+            cause.no_code_clause()
+        ),
+        source: cause.os_error().map(Error::io_cause),
+    })
 }
 
 /// The proxy's attach was refused as a child on the caller's console refuses it before its console setup is
@@ -486,6 +495,7 @@ async fn result_of<D: StopWaits>(
                 }
             };
         }
+        ProxyExit::Cause(cause) if cause.step.event_generated() => return wait_after_generate_failed(cause, sent),
         ProxyExit::Cause(cause) => {
             return SendAnswer::NotSent(Error::Io(failed_step(cause, sent)), UnsentKind::NotSent)
         }
