@@ -203,16 +203,7 @@ fn an_unknown_role_is_refused_and_the_program_does_not_run() {
         "the code is no answer of the proxy's protocol"
     );
     let tail = valid_tail();
-    for role in [
-        "",
-        "proxy",
-        "CTRL-PROXY",
-        "ctrl-proxy ",
-        "elevation-shim",
-        "x",
-        "x\ny",
-        "x\r\ny",
-    ] {
+    for role in ["", "proxy", "CTRL-PROXY", "ctrl-proxy ", "x", "x\ny", "x\r\ny"] {
         for args in [&[][..], &as_strs(&tail)[..]] {
             let out = reexec(Some(role), args);
             assert_eq!(
@@ -229,20 +220,96 @@ fn an_unknown_role_is_refused_and_the_program_does_not_run() {
     }
 }
 
-/// With the variable set the hook plays one role, chosen by it: a shim invocation in the arguments
-/// reaches no shim, and the arguments are the proxy's. Without the variable the same arguments reach
-/// the shim, whose own answer to a flag it does not know is its invocation code. Each role is told apart
-/// by its code and by the name its stderr line carries. Mutant: the shim's argument detection runs when
-/// the variable is set, or the proxy role is tried without the variable.
+/// A program whose own first argument is `--cosca-elevation-shim=1` (or the hex form, or another
+/// version), started without the variable, runs as itself: the arguments never decide. Mutant: detection
+/// by the first argument's prefix, which plays the shim (or, on Windows, runs the program only by
+/// luck) and never reaches the program.
+#[skuld::test]
+fn the_old_shim_flag_without_the_variable_is_the_programs_own_argument() {
+    for args in [
+        &["--cosca-elevation-shim=1"][..],
+        &["--cosca-elevation-shim=1x", "x"],
+        &["--cosca-elevation-shim=9", "1", "1", "break", "1"],
+        &["--cosca-elevation-shim"],
+    ] {
+        let out = reexec(None, args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(PROGRAM_RAN_EXIT), "{args:?}: {out:?}");
+        assert!(stderr.starts_with(PROGRAM_RAN_LINE), "{args:?}: {stderr}");
+        assert!(
+            !stderr.contains("cosca-elevation-shim: "),
+            "{args:?}: the shim role did not run: {stderr}"
+        );
+    }
+}
+
+/// With the variable naming the shim, the process is the shim and its arguments are the shim's data:
+/// valid ones start it (here, on a directory with no listener, so it answers that it could not connect,
+/// as Linux's shim does; macOS has no shim and says so), and the program does not run.
+/// Mutant: the role is not played, or is played as the proxy, or the program runs.
 #[cfg(unix)]
 #[skuld::test]
-fn the_variable_keeps_the_shims_argument_detection_from_running() {
+fn the_shim_role_with_valid_arguments_is_the_shim() {
+    use crate::elevation::shim::codes::{INVOCATION, NO_ANSWER};
+    use crate::elevation::shim::fixtures::shim_args;
+    use crate::role::{ELEVATION_SHIM, SHIM};
+
+    let argv = shim_args(b"/bin/true", &[]).to_argv(OsStr::new("test-binary"), false);
+    let tail: Vec<&str> = argv[1..].iter().map(|a| a.to_str().expect("ascii")).collect();
+    let out = reexec(Some(ELEVATION_SHIM), &tail);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let want = if cfg!(target_os = "linux") {
+        NO_ANSWER
+    } else {
+        INVOCATION
+    };
+    assert_eq!(out.status.code(), Some(want), "{out:?}");
+    assert!(stderr.starts_with(&format!("{SHIM}: ")), "{stderr}");
+    assert!(!stderr.contains("no such helper role"), "{stderr}");
+    assert!(!stderr.contains(&format!("{PROXY}: ")), "{stderr}");
+    assert_program_did_not_run(&out);
+}
+
+/// With the variable naming the shim, arguments it cannot use are refused with the `started with` line
+/// and the invocation code, whatever they look like, and the program does not run. Mutant: the
+/// arguments are taken for the program's own when they lack the flag, or the refusal leaves the
+/// variable out.
+#[cfg(unix)]
+#[skuld::test]
+fn the_shim_role_with_unusable_arguments_is_refused_and_the_program_does_not_run() {
     use crate::elevation::shim::codes::INVOCATION;
-    use crate::role::SHIM;
+    use crate::role::{ELEVATION_SHIM, SHIM};
+
+    for args in [
+        &[][..],
+        &["dump-argv"],
+        &["--cosca-elevation-shim=9", "1", "1", "break", "1"],
+        &["--cosca-elevation-shim=1"],
+        &["--cosca-elevation-shim=1", "/tmp", "1", "-", "1", "-", "--"],
+        &["--cosca-ctrl-proxy=1", "1", "1", "break", "1"],
+    ] {
+        let out = reexec(Some(ELEVATION_SHIM), args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(INVOCATION), "{args:?}: {out:?}");
+        assert_program_did_not_run(&out);
+        assert_eq!(stderr.lines().count(), 1, "{args:?}: one line says why: {stderr:?}");
+        assert_names_the_variable(&stderr, SHIM, ELEVATION_SHIM);
+    }
+}
+
+/// With the variable set the hook plays the one role it names: shim arguments under the proxy's value
+/// reach no shim, and the arguments are the proxy's. Each role is told apart by its code and by the
+/// name its stderr line carries. Mutant: the shim's role runs for another value, or the proxy's runs
+/// for the shim's.
+#[cfg(unix)]
+#[skuld::test]
+fn the_variable_names_the_one_role_that_runs() {
+    use crate::elevation::shim::codes::INVOCATION;
+    use crate::role::{ELEVATION_SHIM, SHIM};
 
     let shim_flag = ["--cosca-elevation-shim=9", "1", "1", "break", "1"];
 
-    let shim = reexec(None, &shim_flag);
+    let shim = reexec(Some(ELEVATION_SHIM), &shim_flag);
     let stderr = String::from_utf8_lossy(&shim.stderr);
     assert_eq!(shim.status.code(), Some(INVOCATION), "{shim:?}");
     assert!(stderr.starts_with(&format!("{SHIM}: ")), "{stderr}");

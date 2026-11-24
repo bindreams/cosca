@@ -9,9 +9,14 @@ use crate::elevation::shim::fixtures::shim_args;
 use crate::elevation::shim::protocol::ShimArgs;
 use crate::elevation::{Auth, Backend, Secret};
 use crate::error::Error;
+use crate::role::{ELEVATION_SHIM, HELPER_ENV};
 
 const EXE: &str = "/opt/host/app";
 const FRONT: &str = "/usr/bin/front";
+/// The word that makes the shim's process the shim, and the program that sets it where the tool takes no
+/// assignment: spelled out, not read from the code under test.
+const VARIABLE: &str = "__COSCA_HELPER=elevation-shim";
+const ENV: &str = "/usr/bin/env";
 
 fn os(bytes: &[u8]) -> OsString {
     OsString::from_vec(bytes.to_vec())
@@ -40,6 +45,53 @@ fn every_auth() -> Vec<Auth> {
     ]
 }
 
+/// The front's own words, then the helper variable in the form the tool delivers or refuses, then the
+/// shim's argv whole.
+#[skuld::test]
+fn the_shim_launch_carries_the_helper_variable_in_the_form_each_tool_delivers() {
+    let shim = shim_args(b"/usr/bin/id", &[b"-u"]);
+    let tail = shim.to_argv(OsStr::new(EXE), false);
+    let words =
+        |head: &[&str]| -> Vec<OsString> { head.iter().map(OsString::from).chain(tail.iter().cloned()).collect() };
+    // sudo takes the assignment on its own command line, before the `--` that ends its options. Mutants: the
+    // assignment after `--` (sudo then looks for a program of that name), an `env` in front of the shim
+    // (a rule that names one program no longer matches), no assignment.
+    assert_eq!(
+        wrapped(Backend::Sudo, &Auth::NonInteractive, &shim),
+        words(&[FRONT, "-n", VARIABLE, "--"])
+    );
+    // doas and pkexec take no assignment: `/usr/bin/env` sets it. Mutants: the assignment before the
+    // program (dropped by both tools), a bare `env` (the root's PATH would choose what runs).
+    assert_eq!(
+        wrapped(Backend::Doas, &Auth::NonInteractive, &shim),
+        words(&[FRONT, "-n", "--", ENV, VARIABLE])
+    );
+    assert_eq!(
+        wrapped(Backend::Pkexec, &Auth::NonInteractive, &shim),
+        words(&[FRONT, "--disable-internal-agent", "--keep-cwd", ENV, VARIABLE])
+    );
+    assert_eq!(VARIABLE, format!("{HELPER_ENV}={ELEVATION_SHIM}"));
+}
+
+/// `env` takes every word that holds a `=` for an assignment, so it would take a shim executable with one
+/// for the assignment and run a later word. Mutant: no check, which starts the wrong program as root.
+#[skuld::test]
+fn a_shim_executable_with_an_equals_sign_is_refused_where_env_starts_it() {
+    let exe = "/opt/a=b/app";
+    let shim = shim_args(b"id", &[]);
+    for backend in [Backend::Doas, Backend::Pkexec] {
+        match wrapped_exe(backend, &Auth::NonInteractive, exe, &shim) {
+            Err(Error::Unsupported { detail, .. }) => assert!(detail.contains('='), "{backend:?}: {detail}"),
+            other => panic!("{backend:?}: {other:?}"),
+        }
+    }
+    // sudo names the shim after its own `--`: no `env`, no limit.
+    let argv = wrapped_exe(Backend::Sudo, &Auth::NonInteractive, exe, &shim).unwrap();
+    assert_eq!(argv[shim_at(&argv, exe)], exe);
+}
+
+/// Whatever the options, the shim's argv is the same words after the same assignment, and the program is
+/// named only after the shim's own separator.
 #[skuld::test]
 fn sudo_doas_pkexec_argv_wrap_the_program_after_the_shim_separator() {
     let shim = shim_args(b"/usr/bin/id", &[b"-u", b"--", b"-x"]);
@@ -51,6 +103,12 @@ fn sudo_doas_pkexec_argv_wrap_the_program_after_the_shim_separator() {
             let env: &[_] = if backend == Backend::Sudo { &env } else { &[] };
             let mut want_front = build_argv(backend, OsStr::new(FRONT), &auth, OsStr::new("PROBE"), &[], env).unwrap();
             assert_eq!(want_front.pop().unwrap(), "PROBE");
+            match backend {
+                // `[front, options…, --]`: the assignment goes before the `--`.
+                Backend::Sudo => want_front.insert(want_front.len() - 1, VARIABLE.into()),
+                Backend::Doas | Backend::Pkexec => want_front.extend([ENV.into(), VARIABLE.into()]),
+                Backend::Auto => unreachable!(),
+            }
 
             let argv = build_shim_argv(backend, OsStr::new(FRONT), &auth, OsStr::new(EXE), &shim, env).unwrap();
             let at = shim_at(&argv, EXE);
@@ -73,7 +131,7 @@ fn is_hex_form(argv: &[OsString]) -> bool {
 }
 
 fn parsed_tail(argv: &[OsString]) -> ShimArgs {
-    ShimArgs::parse(&argv[shim_at(argv, EXE)..]).unwrap().unwrap()
+    ShimArgs::parse(&argv[shim_at(argv, EXE)..]).unwrap()
 }
 
 #[skuld::test]
@@ -139,10 +197,9 @@ fn sudo_and_doas_stay_plain_for_non_ascii() {
     }
 }
 
-/// polkit builds the dialog's short command line from the front's argv, starting with the executable.
-/// A cut that splits a multi-byte character of the executable leaves invalid UTF-8, and the executable
-/// is the one word that hex cannot protect. The rule is exactly: not UTF-8, or a command line over 80
-/// bytes whose cut at byte 38 lands inside a character of the executable.
+/// polkit builds the dialog's short command line from the front's argv: `/usr/bin/env`, the assignment,
+/// then the shim. It cuts a line over 80 bytes at byte 38, which falls inside those ASCII words, so the
+/// cut never splits a character of the executable; a non-UTF-8 executable still breaks the line itself.
 mod pkexec_exe {
     use super::*;
 
@@ -178,51 +235,18 @@ mod pkexec_exe {
         }
     }
 
+    /// Mutant: the cut is checked against the executable alone, as when the executable began the line.
     #[skuld::test]
-    fn a_character_straddling_byte_38_of_a_long_command_line_is_refused() {
+    fn a_multibyte_executable_is_accepted_whatever_byte_38_of_it_is() {
         let shim = shim_args(b"id", &[]);
         let exe = straddling_exe(40);
-        assert_eq!(exe.as_bytes()[38] & 0xc0, 0x80, "byte 38 is a continuation byte");
-        // The shim's own arguments make the line far longer than 80 bytes.
-        assert!(refused(&exe, &shim));
-    }
-
-    #[skuld::test]
-    fn a_utf8_executable_is_accepted_when_the_cut_misses_its_characters() {
-        let shim = shim_args(b"id", &[]);
-        // Multi-byte, but byte 38 starts a character.
-        let aligned = format!("/{}é{}", "a".repeat(37), "b".repeat(5));
-        assert_ne!(aligned.as_bytes()[38] & 0xc0, 0x80, "byte 38 starts a character");
-        assert!(!refused(&aligned, &shim));
-        // A short path made only of multi-byte characters: the whole line is under the cut.
-        let mut tiny = shim_args(b"i", &[]);
-        tiny.dir = PathBuf::from("/");
-        assert!(!refused("/é", &tiny));
-        // Multi-byte characters wholly before byte 38.
+        assert_eq!(
+            exe.as_bytes()[38] & 0xc0,
+            0x80,
+            "byte 38 of the executable is a continuation byte"
+        );
+        assert!(!refused(&exe, &shim));
         assert!(!refused("/日本語/app", &shim));
-    }
-
-    #[skuld::test]
-    fn the_cut_matters_only_when_the_line_is_over_80_bytes() {
-        let exe = straddling_exe(39);
-        // The command line is the executable and the shim's arguments, space-separated; the program's
-        // length sets it exactly.
-        let line_with_program_of = |len: usize| {
-            let mut shim = shim_args(&vec![b'p'; len], &[]);
-            shim.dir = PathBuf::from("/");
-            shim.cosca_pid = 0;
-            shim.cosca_euid = 0;
-            let argv = shim.to_argv(OsStr::new(&exe), false);
-            (shim, argv.iter().map(|a| a.len()).sum::<usize>() + argv.len() - 1)
-        };
-        let (_, base) = line_with_program_of(0);
-        assert!(base <= 80, "the shim's own arguments leave room: {base}");
-        let (at_80, line) = line_with_program_of(80 - base);
-        assert_eq!(line, 80);
-        assert!(!refused(&exe, &at_80), "80 bytes are shown whole");
-        let (at_81, line) = line_with_program_of(81 - base);
-        assert_eq!(line, 81);
-        assert!(refused(&exe, &at_81), "81 bytes are cut at byte 38");
     }
 }
 

@@ -3,8 +3,8 @@
 //! ([`helpers_initialized`]) that it has.
 //!
 //! The helpers are the elevation shim ([`elevation::shim`](crate::elevation::shim), Unix) and the
-//! console-event proxy ([`stop::proxy`](crate::stop::proxy)). The proxy is told it is one by the
-//! environment variable [`role::HELPER_ENV`]; the shim, on Unix, by its first argument.
+//! console-event proxy ([`stop::proxy`](crate::stop::proxy)). Each is told it is one by the environment
+//! variable [`role::HELPER_ENV`], and by nothing else.
 
 use std::ffi::{OsStr, OsString};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,22 +23,24 @@ static HELPERS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 ///
 /// # How a helper launch is recognised
 ///
-/// By the environment variable `__COSCA_HELPER`, which names the role (`ctrl-proxy`). Cosca sets it on
-/// the helper's command; it is not for setting by hand. A process that is started with it set never
+/// By the environment variable `__COSCA_HELPER`, which names the role: `ctrl-proxy`, or, on Unix,
+/// `elevation-shim`. Cosca sets it on the helper's command; it is not for setting by hand. A process that is started with it set never
 /// runs as the program: it plays the role the value names, or, for a role this build does not have or
 /// arguments the role cannot use, writes one line to stderr (it begins with
 /// `started with __COSCA_HELPER=<value>`, so a person who finds a program exiting learns why) and exits
 /// with an error code. Its arguments are the role's data and are read only once the variable has said so.
 ///
-/// A program's own arguments never decide it: a program whose first argument is `--cosca-ctrl-proxy`
-/// runs as itself. The one exception is the Unix elevation shim, which is still recognised by its first
-/// argument, because the tools that start it (`sudo`, `doas`, `pkexec`) reset the environment.
+/// A program's own arguments never decide it: a program whose first argument is `--cosca-ctrl-proxy` or
+/// `--cosca-elevation-shim=1` runs as itself.
 ///
 /// On Windows, a stop that would start this program as the console-event proxy panics when this was never
 /// called, as a broken contract of the program: see [`stop::default`](crate::stop::default#panics).
 ///
 /// - **The shim** runs on Linux. macOS has no shim: `init_helpers` reports that and does not start the
-///   program (exit 120).
+///   program (exit 120). Cosca starts a shim through `sudo`, `doas` or `pkexec`, which reset the
+///   environment, so each is given the variable in the one form it either delivers or refuses; a policy
+///   that does not allow the form makes the tool refuse the elevation, and cosca does not try another
+///   way (see [`Backend`](crate::elevation::Backend)).
 /// - **The proxy** runs on Windows: it attaches to another process's console, sends it Ctrl+C or
 ///   Ctrl+Break, and exits with its answer (a code from 150 to 159), or, when a step of its own failed
 ///   (before it sent anything, or the wait for its own copy of the event after it generated it), a code
@@ -84,12 +86,13 @@ pub fn init_helpers_with_test_hooks(hooks: &'static dyn crate::elevation::shim::
 fn start(#[cfg(unix)] hooks: Option<&'static dyn crate::elevation::shim::ShimTestHooks>) {
     HELPERS_INITIALIZED.store(true, Ordering::Relaxed);
     let argv: Vec<OsString> = std::env::args_os().collect();
-    match helper_role() {
-        Some(helper) => play(&helper, &argv),
-        #[cfg(unix)]
-        None => crate::elevation::shim::run_if_invoked(&argv, hooks),
-        #[cfg(not(unix))]
-        None => {}
+    if let Some(helper) = helper_role() {
+        play(
+            &helper,
+            &argv,
+            #[cfg(unix)]
+            hooks,
+        );
     }
 }
 
@@ -101,7 +104,15 @@ fn helper_role() -> Option<OsString> {
 
 /// Plays the helper role `helper` names, with `argv` as its data, and exits the process: this process
 /// was started as a helper and is never the program.
-fn play(helper: &OsStr, argv: &[OsString]) -> ! {
+fn play(
+    helper: &OsStr,
+    argv: &[OsString],
+    #[cfg(unix)] hooks: Option<&'static dyn crate::elevation::shim::ShimTestHooks>,
+) -> ! {
+    #[cfg(unix)]
+    if helper == role::ELEVATION_SHIM {
+        std::process::exit(crate::elevation::shim::play(argv, hooks));
+    }
     if helper != role::CTRL_PROXY {
         let answer = role::UNKNOWN_HELPER_ROLE;
         role::line(
@@ -109,7 +120,7 @@ fn play(helper: &OsStr, argv: &[OsString]) -> ! {
             format_args!(
                 "{}: no such helper role in this build (it has {:?}); the program was not started (exit {answer})",
                 role::started_with(helper),
-                role::CTRL_PROXY
+                role::ROLES
             ),
         );
         std::process::exit(answer);

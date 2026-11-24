@@ -198,6 +198,27 @@ pub fn is_elevated() -> bool {
 /// | unexamined | absent | runs |
 /// | unexamined | found | `BackendUnavailable`, `source()`: the `sudo` lookup's error |
 /// | unexamined | unexamined | `BackendUnavailable`, `source()`: the `sudo` lookup's error |
+///
+/// # What the policy must allow for the elevation shim
+///
+/// `sudo`, `doas` and `pkexec` reset the environment, so a program they start learns that it is cosca's
+/// elevation shim only from a variable they are told to set: `__COSCA_HELPER=elevation-shim`. Cosca gives
+/// each tool the one form that either delivers the variable or is refused by the tool, never one the tool
+/// can drop silently, and tries no other way. Where the policy does not allow the form, the elevation
+/// fails with the tool's own refusal. The policy must allow:
+///
+/// - `sudo`: a rule that allows every command, or one that carries `SETENV:`. The variable is an assignment
+///   on `sudo`'s command line, so a rule that names the shim without `SETENV:` refuses it ("not allowed to
+///   set the following environment variables").
+/// - `doas`: a rule that allows `/usr/bin/env`, which sets the variable. A rule that names only the shim
+///   cannot work ("Operation not permitted").
+/// - `pkexec`: the generic action `org.freedesktop.policykit.exec`, which polkit checks for the program
+///   `/usr/bin/env`; the dialog and the policy then name `/usr/bin/env`, not the shim. A per-program
+///   action cannot deliver the variable.
+///
+/// A shim executable whose path holds a `=` is refused under `doas` and `pkexec`, since `env` would take
+/// it for an assignment. A user whose policy cannot allow these will be able to supply an elevator of
+/// their own; there is no such interface yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
     #[default]

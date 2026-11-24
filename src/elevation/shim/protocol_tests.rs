@@ -42,7 +42,7 @@ fn argv(a: &ShimArgs, hex: bool) -> Vec<OsString> {
 }
 
 fn parsed(a: &ShimArgs, hex: bool) -> ShimArgs {
-    ShimArgs::parse(&argv(a, hex)).unwrap().unwrap()
+    ShimArgs::parse(&argv(a, hex)).unwrap()
 }
 
 /// `argv` with `argv[i]` replaced.
@@ -108,11 +108,7 @@ fn the_identity_form_follows_identity_present() {
         };
         for hex in [false, true] {
             let v = a.to_argv_for(OsStr::new(EXE), hex, present);
-            assert_eq!(
-                ShimArgs::parse_for(&v, present).unwrap().unwrap(),
-                a,
-                "present = {present}"
-            );
+            assert_eq!(ShimArgs::parse_for(&v, present).unwrap(), a, "present = {present}");
             assert_eq!(
                 ShimArgs::parse_for(&v, !present),
                 Err(ShimArgsError::BadIdentity),
@@ -127,14 +123,14 @@ fn identity_syntax() {
     let v = argv(&args(b"p", &[]), false);
     let parse = |t: &str| ShimArgs::parse_for(&with(v.clone(), 4, t), true);
     assert_eq!(
-        parse("77:3").unwrap().unwrap().cosca_identity,
+        parse("77:3").unwrap().cosca_identity,
         Some(ShimIdentity {
             unique_id: 77,
             id_version: 3
         })
     );
     assert_eq!(
-        parse("0:0").unwrap().unwrap().cosca_identity,
+        parse("0:0").unwrap().cosca_identity,
         Some(ShimIdentity {
             unique_id: 0,
             id_version: 0
@@ -157,10 +153,7 @@ fn identity_syntax() {
         assert_eq!(parse(bad), Err(ShimArgsError::BadIdentity), "{bad:?}");
     }
     assert_eq!(
-        ShimArgs::parse_for(&with(v, 4, "-"), false)
-            .unwrap()
-            .unwrap()
-            .cosca_identity,
+        ShimArgs::parse_for(&with(v, 4, "-"), false).unwrap().cosca_identity,
         None
     );
 }
@@ -207,7 +200,7 @@ fn the_hex_decoder_accepts_lowercase_only() {
             "{bad:?}"
         );
     }
-    assert_eq!(ShimArgs::parse(&with(v, 8, "7a")).unwrap().unwrap().program, "z");
+    assert_eq!(ShimArgs::parse(&with(v, 8, "7a")).unwrap().program, "z");
 }
 
 #[skuld::test]
@@ -248,12 +241,24 @@ fn other_versions_are_an_error() {
     }
 }
 
+/// Arguments are read only once the variable has named the role, so a first argument that is not the
+/// shim's flag is an unusable invocation, never "not a shim". Mutant: such arguments parse as a shim's,
+/// or come back as `Ok` of nothing.
 #[skuld::test]
-fn a_foreign_invocation_is_not_a_shim_invocation() {
-    assert_eq!(ShimArgs::parse(&[]), Ok(None));
-    assert_eq!(ShimArgs::parse(&[OsString::from(EXE)]), Ok(None));
-    assert_eq!(ShimArgs::parse(&[os(EXE.as_bytes()), os(b"--help")]), Ok(None));
-    assert_eq!(ShimArgs::parse(&[os(EXE.as_bytes()), os(b"")]), Ok(None));
+fn arguments_without_the_flag_are_an_error() {
+    assert_eq!(ShimArgs::parse(&[]), Err(ShimArgsError::TooFewArguments));
+    assert_eq!(
+        ShimArgs::parse(&[OsString::from(EXE)]),
+        Err(ShimArgsError::TooFewArguments)
+    );
+    assert_eq!(
+        ShimArgs::parse(&[os(EXE.as_bytes()), os(b"--help")]),
+        Err(ShimArgsError::UnknownVersion)
+    );
+    assert_eq!(
+        ShimArgs::parse(&[os(EXE.as_bytes()), os(b"")]),
+        Err(ShimArgsError::UnknownVersion)
+    );
 }
 
 #[skuld::test]
@@ -320,7 +325,7 @@ fn leading_zeros_are_rejected() {
             );
         }
         assert_eq!(
-            ShimArgs::parse(&with(v, 3, enc("0"))).unwrap().unwrap().cosca_pid,
+            ShimArgs::parse(&with(v, 3, enc("0"))).unwrap().cosca_pid,
             0,
             "a lone zero"
         );

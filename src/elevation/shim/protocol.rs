@@ -9,12 +9,11 @@ use std::path::{Path, PathBuf};
 
 use crate::role::decimal;
 
-/// `argv[1]` of a plain invocation.
+/// `argv[1]` of a plain invocation: the protocol's version, as data.
 const FLAG: &[u8] = b"--cosca-elevation-shim=1";
 /// `argv[1]` of a hex invocation: every argument after it except [`SEPARATOR`] is lowercase hex, so
 /// the text survives `osascript`, which is not byte-transparent.
 const FLAG_HEX: &[u8] = b"--cosca-elevation-shim=1x";
-const FLAG_PREFIX: &[u8] = b"--cosca-elevation-shim";
 const SEPARATOR: &str = "--";
 /// Index of [`SEPARATOR`]: `[exe, flag, dir, pid, identity, euid, search, "--", program, args…]`.
 const SEPARATOR_AT: usize = 7;
@@ -49,10 +48,10 @@ pub(crate) struct ShimArgs {
     pub(crate) args: Vec<OsString>,
 }
 
-/// Why argv is not a valid shim invocation.
+/// Why argv is not usable as the shim's data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ShimArgsError {
-    #[error("unknown protocol version")]
+    #[error("the first argument is not a protocol version of the shim (--cosca-elevation-shim=1 or =1x)")]
     UnknownVersion,
     #[error("too few arguments")]
     TooFewArguments,
@@ -128,19 +127,19 @@ impl ShimArgs {
         argv
     }
 
-    /// `Ok(None)` when `argv` is not a shim invocation at all; an error when it claims to be one and
-    /// is not valid. `argv` includes `argv[0]`.
-    pub(crate) fn parse(argv: &[OsString]) -> Result<Option<ShimArgs>, ShimArgsError> {
+    /// The shim's data in `argv`, which includes `argv[0]`. The caller has already been told by
+    /// [`HELPER_ENV`](crate::role::HELPER_ENV) that this is the shim: arguments that are not valid are an
+    /// error, never "not for the shim".
+    pub(crate) fn parse(argv: &[OsString]) -> Result<ShimArgs, ShimArgsError> {
         Self::parse_for(argv, IDENTITY_PRESENT)
     }
 
     /// [`parse`](Self::parse) for a platform that does (`identity_present`) or does not carry an
     /// identity.
-    fn parse_for(argv: &[OsString], identity_present: bool) -> Result<Option<ShimArgs>, ShimArgsError> {
-        let Some(flag) = argv.get(1) else { return Ok(None) };
-        if !flag.as_bytes().starts_with(FLAG_PREFIX) {
-            return Ok(None);
-        }
+    fn parse_for(argv: &[OsString], identity_present: bool) -> Result<ShimArgs, ShimArgsError> {
+        let Some(flag) = argv.get(1) else {
+            return Err(ShimArgsError::TooFewArguments);
+        };
         let hex = match flag.as_bytes() {
             FLAG => false,
             FLAG_HEX => true,
@@ -180,7 +179,7 @@ impl ShimArgs {
         if !Path::new(dir).is_absolute() {
             return Err(ShimArgsError::BadDir);
         }
-        Ok(Some(ShimArgs {
+        Ok(ShimArgs {
             dir: PathBuf::from(dir),
             cosca_pid: decimal_u32(pid)?,
             cosca_identity: parse_identity(identity, identity_present)?,
@@ -188,7 +187,7 @@ impl ShimArgs {
             search_path: parse_search(search)?,
             program: program.clone(),
             args: args.to_vec(),
-        }))
+        })
     }
 }
 

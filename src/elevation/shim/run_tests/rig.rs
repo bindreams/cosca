@@ -233,6 +233,7 @@ impl ShimRig {
             .args(&argv[1..])
             .env_clear()
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env(crate::role::HELPER_ENV, crate::role::ELEVATION_SHIM)
             .env(crate::shim_env_hooks::LOG_ENV, &work_log)
             .stdin(if spec.stdin_held { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())

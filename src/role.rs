@@ -1,7 +1,6 @@
 //! What the helper roles a host program is started in share: the elevation shim (Unix) and the
 //! console-event proxy. A process is started in a role when [`init_helpers`](crate::init_helpers) finds
-//! [`HELPER_ENV`] set, or, for the shim on Unix, its first argument (the tools that start the shim
-//! reset the environment).
+//! [`HELPER_ENV`] set; its arguments are then the role's data, and are read for nothing else.
 //!
 //! Neutral on purpose: the roles' protocol modules import it, and [`init_helpers`](crate::init_helpers),
 //! which exits the process, is not for them to import.
@@ -15,6 +14,15 @@ pub(crate) const HELPER_ENV: &str = "__COSCA_HELPER";
 /// The value of [`HELPER_ENV`] that makes the process the console-event proxy; the process's arguments
 /// are then the proxy's data.
 pub(crate) const CTRL_PROXY: &str = "ctrl-proxy";
+/// The value of [`HELPER_ENV`] that makes the process the elevation shim (Unix); the process's arguments
+/// are then the shim's data.
+#[cfg(unix)]
+pub(crate) const ELEVATION_SHIM: &str = "elevation-shim";
+/// The values of [`HELPER_ENV`] this build has a role for.
+#[cfg(unix)]
+pub(crate) const ROLES: &[&str] = &[CTRL_PROXY, ELEVATION_SHIM];
+#[cfg(not(unix))]
+pub(crate) const ROLES: &[&str] = &[CTRL_PROXY];
 /// What a process exits with when [`HELPER_ENV`] names a role this build does not have. It is below the
 /// elevation shim's codes (112 to 125), which are below 126 so that no shell reads one as a signal death,
 /// and outside the proxy's answers (150 to 159) and its cause codes (bit 29 set), so no protocol reads it

@@ -123,9 +123,13 @@ What a child's cooperative stop sends is an action it stores, not a rule inside 
   of the host as the proxy only when the host has called `init_helpers`: on Windows, a stop that would
   start this program as the proxy (the child is outside the caller's console, cosca created it and read
   its identity, and the command's proxy is the default `CtrlProxy::HostExecutable`) panics in a host
-  that has not, as its first act, because a missing call is a bug of the program. The Unix elevation shim is the
-  exception to the variable: the tools that start it reset the environment, so it is still recognised
-  by its first argument.
+  that has not, as its first act, because a missing call is a bug of the program. The Unix elevation shim is
+  a role of the same contract (`__COSCA_HELPER=elevation-shim`); its arguments are its data and are read only
+  once the variable has said so. The tools that start it reset the environment, so cosca gives each the
+  variable in the one form it either delivers or refuses, and tries no other way: for `sudo` an assignment
+  on its command line, for `doas` and `pkexec` `/usr/bin/env` (a fixed absolute path). The policy decides
+  whether that works (`Backend`'s doc says what each tool's must allow); where it does not, the elevation
+  fails as the tool's own refusal does.
 
 ## Boundaries still to draw
 

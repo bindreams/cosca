@@ -115,41 +115,83 @@ pub(crate) fn build_argv(
     Ok(argv)
 }
 
-/// polkit 123 and later shows the front's command line cut to this many bytes...
-const POLKIT_SHORT_LINE: usize = 80;
-/// ...keeping this many bytes of its head.
+/// The program that sets the helper variable where the tool takes no assignment of its own. A fixed
+/// absolute path: root's `PATH` must not choose what runs as root.
+const ENV_PROGRAM: &str = "/usr/bin/env";
+
+/// The assignment that makes the process the shim: `__COSCA_HELPER=elevation-shim`.
+fn helper_assignment() -> OsString {
+    format!("{}={}", crate::role::HELPER_ENV, crate::role::ELEVATION_SHIM).into()
+}
+
+/// The words that start the shim (`argv`, executable first) with the helper variable set by
+/// [`ENV_PROGRAM`]: `/usr/bin/env __COSCA_HELPER=elevation-shim <argv…>`. `env` takes every word that holds
+/// a `=` for an assignment, so it would take a shim executable with one for the assignment and run a later
+/// word instead; that executable is refused.
+pub(crate) fn env_launch(argv: &[OsString]) -> Result<Vec<OsString>, Error> {
+    if argv[0].as_bytes().contains(&b'=') {
+        return Err(Error::Unsupported {
+            op: "starting the shim through env".into(),
+            platform: "unix",
+            detail: format!(
+                "env would take {:?} for an assignment; choose a shim path without `=`",
+                argv[0]
+            ),
+            source: None,
+        });
+    }
+    let mut line = vec![OsString::from(ENV_PROGRAM), helper_assignment()];
+    line.extend_from_slice(argv);
+    Ok(line)
+}
+
+/// polkit 123 and later cuts the front's command line, when it is over 80 bytes, keeping this many bytes
+/// of its head.
 const POLKIT_HEAD_CUT: usize = 38;
 
 /// `pkexec` shows the command line (the executable, then its arguments, space-separated) in a dialog.
-/// polkit cuts a line over [`POLKIT_SHORT_LINE`] bytes at byte [`POLKIT_HEAD_CUT`], so a character of
-/// `shim_exe` that straddles the cut leaves invalid UTF-8, and a non-UTF-8 `shim_exe` breaks the line
-/// itself. From polkit's source, not measured.
-fn refuse_polkit_exe(shim_exe: &OsStr, argv: &[OsString]) -> Result<(), Error> {
-    let refuse = |why: &str| Error::Unsupported {
-        op: "pkexec with this shim executable".into(),
-        platform: "unix",
-        detail: format!("polkit cannot show {shim_exe:?}: {why}; choose a shim path that is plain ASCII"),
-        source: None,
-    };
-    let Some(exe) = shim_exe.to_str() else {
-        return Err(refuse("it is not valid UTF-8"));
-    };
-    let line = argv.iter().map(|a| a.len()).sum::<usize>() + argv.len() - 1;
-    if line > POLKIT_SHORT_LINE && !exe.is_char_boundary(POLKIT_HEAD_CUT.min(exe.len())) {
-        return Err(refuse("its command line is cut inside one of its characters"));
+/// The line is [`env_launch`]'s, whose first 42 bytes are ASCII and whose cut falls at byte
+/// [`POLKIT_HEAD_CUT`], so the cut never splits a character of `shim_exe`.
+/// A non-UTF-8 `shim_exe` still breaks the line itself. From polkit's source, not measured.
+fn refuse_polkit_exe(shim_exe: &OsStr) -> Result<(), Error> {
+    debug_assert!(
+        ENV_PROGRAM.len() + 1 + helper_assignment().len() >= POLKIT_HEAD_CUT,
+        "the head of the line must hold the cut"
+    );
+    if shim_exe.to_str().is_none() {
+        return Err(Error::Unsupported {
+            op: "pkexec with this shim executable".into(),
+            platform: "unix",
+            detail: format!(
+                "polkit cannot show {shim_exe:?}: it is not valid UTF-8; choose a shim path that is plain ASCII"
+            ),
+            source: None,
+        });
     }
     Ok(())
 }
 
 /// The argv that runs the elevation shim (`shim_exe`, told `shim`) through the front, in place of the
-/// program: the front's options, then the shim, whose own `--` precedes the program. `shim_exe` is
-/// absolute, so `pkexec`, which has no `--` shield, never meets a leading dash.
+/// program, with the helper variable that makes the process the shim. Each tool gets the one form that
+/// delivers the variable or is refused by the tool; none is silently dropped (measured, sudo 1.9.13,
+/// opendoas 6.8.2, polkit 122):
+///
+/// - `sudo`: the assignment on its own command line, before the `--` that ends its options. A rule that
+///   allows every command, or that carries `SETENV:`, lets it through; any other rule refuses it.
+/// - `doas`: [`ENV_PROGRAM`] sets it, so the rule must allow `/usr/bin/env`; a rule naming only the shim
+///   refuses it.
+/// - `pkexec`: [`ENV_PROGRAM`] sets it; polkit checks the generic action
+///   `org.freedesktop.policykit.exec` for `/usr/bin/env`, and the dialog names that program.
+///
+/// The shim's own `--` precedes the program, and `shim_exe` is absolute, so `pkexec`, which has no `--`
+/// shield, never meets a leading dash.
 ///
 /// The shim's arguments are plain, except under `pkexec` when any holds a byte outside printable
 /// ASCII (0x20..=0x7e): then they are hex, because polkit's byte-count cut of the command line breaks
 /// multi-byte characters and non-UTF-8 (from polkit's source, not measured). `pkexec` also refuses a
 /// `shim_exe` that polkit cannot show ([`refuse_polkit_exe`]), the one word hex cannot protect. `sudo`
-/// and `doas` are always plain.
+/// and `doas` are always plain. `doas` and `pkexec` refuse a `shim_exe` that holds a `=`
+/// ([`env_launch`]).
 #[allow(dead_code, reason = "no caller yet")]
 pub(crate) fn build_shim_argv(
     backend: Backend,
@@ -168,9 +210,19 @@ pub(crate) fn build_shim_argv(
         {
             argv = shim.to_argv(shim_exe, true);
         }
-        refuse_polkit_exe(shim_exe, &argv)?;
+        refuse_polkit_exe(shim_exe)?;
     }
-    build_argv(backend, backend_path, auth, &argv[0], &argv[1..], env)
+    if backend == Backend::Sudo {
+        let mut front = build_argv(backend, backend_path, auth, &argv[0], &argv[1..], env)?;
+        let end_of_options = front
+            .iter()
+            .position(|a| a == "--")
+            .expect("sudo's argv has a `--` before the program");
+        front.insert(end_of_options, helper_assignment());
+        return Ok(front);
+    }
+    let line = env_launch(&argv)?;
+    build_argv(backend, backend_path, auth, &line[0], &line[1..], env)
 }
 
 /// Does `program` begin with `-`? (Only pkexec, which has no `--` shield, cares.)

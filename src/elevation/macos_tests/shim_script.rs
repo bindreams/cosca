@@ -52,15 +52,43 @@ fn osascript_script_is_ascii_and_uses_the_hex_form() {
     assert!(script.contains("--cosca-elevation-shim=1x"), "{script}");
     let words = split(&shell_command(&script));
     assert_eq!(words[0], b"exec");
-    assert_eq!(words[1], b"/opt/host/app");
-    assert_eq!(words[2], b"--cosca-elevation-shim=1x");
-    for w in &words[3..] {
+    assert_eq!(words[1], b"/usr/bin/env");
+    assert_eq!(words[2], b"__COSCA_HELPER=elevation-shim");
+    assert_eq!(words[3], b"/opt/host/app");
+    assert_eq!(words[4], b"--cosca-elevation-shim=1x");
+    for w in &words[5..] {
         assert!(
             *w == b"--" || w.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
             "{:?}",
             String::from_utf8_lossy(w)
         );
     }
+}
+
+/// `do shell script` runs the shell as root with no policy between, so `env` carries the variable as
+/// it does for `doas` and `pkexec`. Mutant: no variable, or `env` found by `PATH`.
+#[skuld::test]
+fn the_script_sets_the_helper_variable_through_env() {
+    let script = build_shim_script(OsStr::new("/opt/host/app"), &shim_args(b"id", &[]), None, None).unwrap();
+    let words = split(&shell_command(&script));
+    let want: [&[u8]; 4] = [
+        b"exec",
+        b"/usr/bin/env",
+        b"__COSCA_HELPER=elevation-shim",
+        b"/opt/host/app",
+    ];
+    assert_eq!(words[..4], want);
+}
+
+/// `env` takes every word that holds a `=` for an assignment, so a shim executable with one is refused.
+/// Mutant: no check.
+#[skuld::test]
+fn a_shim_exe_with_an_equals_sign_is_a_typed_error() {
+    let err = build_shim_script(OsStr::new("/opt/a=b/app"), &shim_args(b"id", &[]), None, None).unwrap_err();
+    assert!(
+        matches!(&err, Error::Unsupported { detail, .. } if detail.contains('=')),
+        "{err:?}"
+    );
 }
 
 #[skuld::test]
@@ -73,13 +101,14 @@ fn adversarial_arguments_survive_quoting() {
     let script = build_shim_script(OsStr::new(exe), &shim, Some(Path::new(cwd)), None).unwrap();
 
     let words = split(&shell_command(&script));
-    // `cd -P -- <cwd> && exec <exe> <shim args…>`
+    // `cd -P -- <cwd> && exec /usr/bin/env <variable> <exe> <shim args…>`
     let want_cd: [&[u8]; 5] = [b"cd", b"-P", b"--", cwd.as_bytes(), b"&&"];
     assert_eq!(words[..5], want_cd);
-    assert_eq!(words[5], b"exec");
-    let tail: Vec<OsString> = words[6..].iter().map(|w| os(w)).collect();
+    let want_exec: [&[u8]; 3] = [b"exec", b"/usr/bin/env", b"__COSCA_HELPER=elevation-shim"];
+    assert_eq!(words[5..8], want_exec);
+    let tail: Vec<OsString> = words[8..].iter().map(|w| os(w)).collect();
     assert_eq!(tail, shim.to_argv(OsStr::new(exe), true));
-    assert_eq!(ShimArgs::parse(&tail).unwrap().unwrap(), shim);
+    assert_eq!(ShimArgs::parse(&tail).unwrap(), shim);
 }
 
 #[skuld::test]

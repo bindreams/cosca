@@ -429,7 +429,7 @@ mod proxy_fixture;
 #[cfg(test)]
 fn main() {
     // This binary is also the elevation shim in the shim's end-to-end tests: a process started with
-    // the shim's arguments runs it here and exits.
+    // `__COSCA_HELPER=elevation-shim` runs it here and exits.
     #[cfg(unix)]
     shim_env_hooks::init();
     // And the console-event proxy, which the proxy's tests start as a copy of this binary.

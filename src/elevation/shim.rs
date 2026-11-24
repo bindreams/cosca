@@ -32,22 +32,23 @@ use std::ffi::OsString;
 
 use protocol::ShimArgs;
 
-/// Runs the shim to its end and exits the process when `argv` is a shim invocation, valid or not;
-/// returns otherwise. [`init_helpers`](crate::init_helpers) calls it.
-pub(crate) fn run_if_invoked(argv: &[OsString], hooks: Option<&'static dyn ShimTestHooks>) {
+/// Plays the shim with `argv` as its data and returns its exit code. [`init_helpers`](crate::init_helpers)
+/// calls it when [`HELPER_ENV`](crate::role::HELPER_ENV) names the shim; arguments the shim cannot use are
+/// refused with the invocation code, in a line that begins with `started with __COSCA_HELPER=<value>`.
+pub(crate) fn play(argv: &[OsString], hooks: Option<&'static dyn ShimTestHooks>) -> i32 {
     match ShimArgs::parse(argv) {
-        Ok(None) => {}
-        Ok(Some(args)) => std::process::exit(run_shim(&args, hooks)),
+        Ok(args) => run_shim(&args, hooks),
         Err(e) => {
             crate::role::line(
                 crate::role::SHIM,
                 format_args!(
-                    "{}; the program was not started (exit {})",
+                    "{}: {}; the program was not started (exit {})",
+                    crate::role::started_with(std::ffi::OsStr::new(crate::role::ELEVATION_SHIM)),
                     crate::error::Report(&e),
                     codes::INVOCATION
                 ),
             );
-            std::process::exit(codes::INVOCATION);
+            codes::INVOCATION
         }
     }
 }
