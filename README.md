@@ -87,7 +87,7 @@ with a consent column of "yes" fails without `<GROUP>_CONSENT=1`.
 | `SHELL_PROBES`       | Windows probes that execute batch files through `ShellExecuteEx`                          | yes     | off        |
 | `ELEVATION_ROUTES`   | Windows token and logon probes: derived tokens, scratch accounts, a scheduled task        | yes     | off        |
 | `CTRL_PROXY`         | Windows tests that run the console-event proxy, which sends Ctrl+C or Ctrl+Break          | yes     | off        |
-| `WM_CLOSE`           | Windows tests that open windows and post `WM_CLOSE` to windows of the desktop             | yes     | off        |
+| `WM_CLOSE`           | Windows tests that open windows and a desktop, and post `WM_CLOSE` to desktop windows     | yes     | off        |
 | `PIDFD_GROUP_SIGNAL` | tests that need Linux 6.9+ (`pidfd_send_signal` on a process group)                       | no      | on         |
 | `PIDFD_GET_INFO`     | tests that need Linux 6.13+ (`PIDFD_GET_INFO` answers a cgroup id)                        | no      | on         |
 | `CLONE3`             | tests that need a host that allows `clone3`; Docker's default seccomp profile does not    | no      | on         |
@@ -114,8 +114,8 @@ It needs `COSCA_TEST_STRAY_SIGNAL_CONSENT=1`, which CI sets; on your own machine
 Ctrl+Break to every process on a console. It needs `COSCA_TEST_CTRL_PROXY_CONSENT=1`, which CI's Windows job sets;
 on your own machine set `COSCA_TEST_CTRL_PROXY=0` to skip it.
 
-`WM_CLOSE` (`COSCA_TEST_WM_CLOSE`, Windows) holds the tests of `stop::send_wm_close`, which open windows and a console
-and post `WM_CLOSE` to top-level windows of the desktop. It needs `COSCA_TEST_WM_CLOSE_CONSENT=1`, which CI's Windows
+`WM_CLOSE` (`COSCA_TEST_WM_CLOSE`, Windows) holds the tests of `stop::send_wm_close`, which open windows and a console,
+create a desktop on the process's window station and post `WM_CLOSE` to top-level windows of the desktop. It needs `COSCA_TEST_WM_CLOSE_CONSENT=1`, which CI's Windows
 job sets, and fails without it; on your own machine set `COSCA_TEST_WM_CLOSE=0` to skip it.
 
 `PIDFD_GET_INFO` (`COSCA_TEST_PIDFD_GET_INFO`) holds the cgroup tests that read a task's cgroup id through its

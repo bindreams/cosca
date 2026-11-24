@@ -1,8 +1,9 @@
 //! `stop::send_wm_close` against real windows: the lib's test binary re-run as a GUI process
 //! ([`crate::test_child::wm_close_gui`]), which creates its windows off screen and prints what each receives.
-//! The send posts `WM_CLOSE` to top-level windows of the desktop, and the tests open windows and a console, so
-//! these tests are the `WM_CLOSE` group: they run on CI, and a host runs them only after consenting
-//! (`COSCA_TEST_WM_CLOSE_CONSENT=1`) or turns them off (`COSCA_TEST_WM_CLOSE=0`).
+//! The send posts `WM_CLOSE` to top-level windows of the desktop, and the tests open windows and a console and
+//! create a desktop on the process's window station, so these tests are the `WM_CLOSE` group: they run on CI,
+//! and a host runs them only after consenting (`COSCA_TEST_WM_CLOSE_CONSENT=1`) or turns them off
+//! (`COSCA_TEST_WM_CLOSE=0`).
 //!
 //! The tests wait on nothing but the process's own message queue: every `PostMessageW` of the send has
 //! returned before a test writes `flush`, the process takes its messages in the order they were posted, and it
@@ -15,7 +16,7 @@ use std::ffi::c_void;
 use std::time::Duration;
 
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{GENERIC_ALL, HWND};
+use windows::Win32::Foundation::{SetLastError, ERROR_ALREADY_EXISTS, GENERIC_ALL, HWND};
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, CreateDesktopW, SetThreadDesktop, DESKTOP_CONTROL_FLAGS, HDESK,
 };
@@ -236,26 +237,36 @@ impl Drop for Desktop {
 /// A desktop with no top-level window is a send that found no window, which is `Unsupported` with nothing
 /// sent. `EnumWindows` answers FALSE with last error 0 there (measured on CI, 160 of 160 passes, a fresh
 /// desktop on `WinSta0` included), which is no failure. The child is a console program on another desktop;
-/// the thread that sends has made no window, so it can be assigned the desktop.
+/// the thread that sends has made no window, so it can be assigned the desktop. The thread carries a stale
+/// last error (`ERROR_ALREADY_EXISTS`, the customer's `os error 183`) before each call, as a service's does.
 ///
-/// Mutant: the listing's FALSE is read as a failure (the answer is `Io`).
+/// Mutants: the clear of the last error removed (the direct listing answers an error, and so does the send);
+/// the listing's FALSE read as a failure (`Io`, from the listing and from the send).
 #[skuld::test]
 fn a_desktop_with_no_window_is_answered_as_no_window_asked(#[fixture(wm_close)] _group: &Group) {
     let (child, stdin) = crate::test_child::held_contained_blocker(crate::Stdio::null());
     let desktop = Desktop::create();
-    let answer = std::thread::scope(|scope| {
+    let (listing, answer) = std::thread::scope(|scope| {
         scope
             .spawn(|| {
                 desktop.assign_to_this_thread();
-                sent_over(&child, false)
+                // SAFETY: sets this thread's last error.
+                unsafe { SetLastError(ERROR_ALREADY_EXISTS) };
+                let listing = list_windows(&[child.pid()]);
+                // SAFETY: as above.
+                unsafe { SetLastError(ERROR_ALREADY_EXISTS) };
+                (listing, sent_over(&child, false))
             })
             .join()
             .expect("the sending thread")
     });
+    let listing = listing.expect("an empty desktop lists as no window");
+    assert!(listing.is_empty(), "{listing:?}");
     let SendAnswer::NotSent(error, kind) = answer else {
         panic!("{answer:?}")
     };
     assert!(matches!(error, Error::Unsupported { .. }), "{error:?}");
+    assert!(detail_of(&error).contains("visible top-level window"), "{error:?}");
     assert_eq!(kind, UnsentKind::NotSent);
     drop(stdin);
     child.wait().expect("reap the child");

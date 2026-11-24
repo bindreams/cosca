@@ -95,7 +95,7 @@ pub const STRAY_SIGNAL: skuld::Label;
 pub const CTRL_PROXY: skuld::Label;
 
 /// Selects the `WM_CLOSE` group's tests: those that post `WM_CLOSE` to the top-level windows of a desktop,
-/// and open windows and a console of their own.
+/// open windows and a console of their own, and create a desktop on the process's window station.
 #[skuld::label]
 pub const WM_CLOSE: skuld::Label;
 

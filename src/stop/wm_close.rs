@@ -336,8 +336,9 @@ fn list_windows(pids: &[u32]) -> io::Result<Vec<Listed>> {
     // keep past its return.
     match unsafe { EnumWindows(Some(collect), LPARAM(&raw mut collecting as isize)) } {
         Ok(()) => {}
-        // FALSE with no error: the desktop has no top-level window (measured on CI, run 45442280861: 160 of 160
-        // passes, a fresh desktop on `WinSta0` included).
+        // FALSE with last error 0: an empty desktop answers so (measured on CI, run 45442280861, amd64: 160 of
+        // 160 passes, a fresh desktop on `WinSta0` included). A real failure of the call could not be produced, so
+        // none was seen to leave 0.
         Err(e) if e.code().is_ok() => debug_assert!(collecting.listing.is_empty()),
         Err(e) => return Err(win32_io_error(e)),
     }
