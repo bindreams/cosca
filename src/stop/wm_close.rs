@@ -328,21 +328,29 @@ fn list_windows(pids: &[u32]) -> io::Result<Vec<Listed>> {
         pids,
         listing: Vec::new(),
     };
-    // `EnumWindows` answers FALSE both for a failure and for a desktop with no top-level window, and a stale
-    // last error would read as the first: clear it first.
-    // SAFETY: sets this thread's last error.
-    unsafe { SetLastError(WIN32_ERROR(0)) };
     // SAFETY: `collect` reads `lparam` only as the `Collecting` this call lends it, which `EnumWindows` does not
     // keep past its return.
-    match unsafe { EnumWindows(Some(collect), LPARAM(&raw mut collecting as isize)) } {
-        Ok(()) => {}
-        // FALSE with last error 0: an empty desktop answers so (measured on CI, run 45442280861, amd64: 160 of
-        // 160 passes, a fresh desktop on `WinSta0` included). A real failure of the call could not be produced, so
-        // none was seen to leave 0.
-        Err(e) if e.code().is_ok() => debug_assert!(collecting.listing.is_empty()),
+    let listed = or_nothing(|| unsafe { EnumWindows(Some(collect), LPARAM(&raw mut collecting as isize)) });
+    match listed {
+        Ok(Some(())) => {}
+        // FALSE with last error 0 is an empty desktop (pinned by the `WM_CLOSE` test); any other failure is `Io`.
+        Ok(None) => debug_assert!(collecting.listing.is_empty()),
         Err(e) => return Err(win32_io_error(e)),
     }
     Ok(collecting.listing)
+}
+
+/// Makes `call`, a Win32 call that answers FALSE or null both for a failure and for "nothing there": its value,
+/// `None` for an error whose code is OK (FALSE with last error 0), or the error. Clears this thread's last error
+/// first, so a stale one is not read as the call's failure.
+fn or_nothing<T>(call: impl FnOnce() -> windows::core::Result<T>) -> windows::core::Result<Option<T>> {
+    // SAFETY: sets this thread's last error.
+    unsafe { SetLastError(WIN32_ERROR(0)) };
+    match call() {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if e.code().is_ok() => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// `EnumWindows`'s callback: reads `hwnd` into the `Collecting` that `lparam` points to, if it is wanted.
@@ -371,15 +379,12 @@ fn swallowed(pid: u32, call: &str, error: io::Error) {
 fn read(hwnd: HWND, pid: u32) -> Listed {
     // SAFETY: a call with a handle value only; a stale one is answered false.
     let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
-    // `GetWindow` answers null both for "no owner" and for a failure, and a stale last error would read
-    // as the second: clear it first. A failure (the window is gone) leaves the window unasked.
-    // SAFETY: sets this thread's last error.
-    unsafe { SetLastError(WIN32_ERROR(0)) };
     // SAFETY: a call with a handle value only.
-    let has_owner = match unsafe { GetWindow(hwnd, GW_OWNER) } {
-        Ok(_) => true,
+    let has_owner = match or_nothing(|| unsafe { GetWindow(hwnd, GW_OWNER) }) {
+        Ok(Some(_)) => true,
         // Null with no error: the window has no owner.
-        Err(e) if e.code().is_ok() => false,
+        Ok(None) => false,
+        // A failure (the window is gone) leaves the window unasked.
         Err(e) => {
             swallowed(pid, "GetWindow(GW_OWNER)", win32_io_error(e));
             true

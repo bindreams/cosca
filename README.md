@@ -115,8 +115,9 @@ Ctrl+Break to every process on a console. It needs `COSCA_TEST_CTRL_PROXY_CONSEN
 on your own machine set `COSCA_TEST_CTRL_PROXY=0` to skip it.
 
 `WM_CLOSE` (`COSCA_TEST_WM_CLOSE`, Windows) holds the tests of `stop::send_wm_close`, which open windows and a console,
-create a desktop on the process's window station and post `WM_CLOSE` to top-level windows of the desktop. It needs `COSCA_TEST_WM_CLOSE_CONSENT=1`, which CI's Windows
-job sets, and fails without it; on your own machine set `COSCA_TEST_WM_CLOSE=0` to skip it.
+create a desktop on the process's window station and post `WM_CLOSE` to top-level windows of the desktop. It needs
+`COSCA_TEST_WM_CLOSE_CONSENT=1`, which CI's Windows job sets, and fails without it; on your own machine set
+`COSCA_TEST_WM_CLOSE=0` to skip it.
 
 `PIDFD_GET_INFO` (`COSCA_TEST_PIDFD_GET_INFO`) holds the cgroup tests that read a task's cgroup id through its
 pidfd, which needs Linux 6.13+. The library supports older kernels, which read it through `/proc`. Its

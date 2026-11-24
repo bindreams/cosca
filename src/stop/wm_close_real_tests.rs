@@ -190,7 +190,6 @@ fn graceful_shutdown_tree_closes_the_parent_and_its_copy(#[fixture(wm_close)] _g
     assert_eq!(gui.lines_until_gone(), Vec::<String>::new());
 }
 
-/// A desktop made for a test: closed on every way out of the test, after the threads that were set to it.
 /// The handle is held as a number, so the guard can be shared with the thread that is assigned the desktop.
 struct Desktop(isize);
 
@@ -235,10 +234,9 @@ impl Drop for Desktop {
 }
 
 /// A desktop with no top-level window is a send that found no window, which is `Unsupported` with nothing
-/// sent. `EnumWindows` answers FALSE with last error 0 there (measured on CI, 160 of 160 passes, a fresh
-/// desktop on `WinSta0` included), which is no failure. The child is a console program on another desktop;
-/// the thread that sends has made no window, so it can be assigned the desktop. The thread carries a stale
-/// last error (`ERROR_ALREADY_EXISTS`, the customer's `os error 183`) before each call, as a service's does.
+/// sent. `EnumWindows` answers FALSE with last error 0 there, which is no failure. The child is a console
+/// program on another desktop; the thread that sends has made no window, so it can be assigned the desktop.
+/// The thread carries a stale last error (`ERROR_ALREADY_EXISTS`) before each call, as a service's does.
 ///
 /// Mutants: the clear of the last error removed (the direct listing answers an error, and so does the send);
 /// the listing's FALSE read as a failure (`Io`, from the listing and from the send).

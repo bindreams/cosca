@@ -3,7 +3,12 @@
 
 use std::io;
 
-use super::{after_failed_post, answer, asked, fold, Class, Fold, Listed, Missed, Unasked, Unposted, Why, Window};
+use windows::core::HRESULT;
+use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+use super::{
+    after_failed_post, answer, asked, fold, or_nothing, Class, Fold, Listed, Missed, Unasked, Unposted, Why, Window,
+};
 use crate::child::graceful::shutdown::{run_ready, BlockingDriver};
 use crate::containment::fake::FakeContains;
 use crate::containment::{Containment, SendAnswer};
@@ -137,6 +142,30 @@ fn a_window_that_fails_any_one_condition_is_not_asked() {
         },
     ];
     assert!(asked(&none_qualifies, PID).is_empty());
+}
+
+// A call that fails with no error -----
+
+/// A call that succeeded answers its value. Mutant: the value is dropped (`None`).
+#[skuld::test]
+fn a_call_that_succeeded_answers_its_value() {
+    assert_eq!(or_nothing(|| Ok(7)).unwrap(), Some(7));
+}
+
+/// A call that failed with an error code is that error, so `EnumWindows` failing stays `Io`. Mutant: every
+/// failure is read as nothing (`Ok(None)`).
+#[skuld::test]
+fn a_call_that_failed_with_a_code_answers_that_error() {
+    let failed = or_nothing::<()>(|| Err(HRESULT::from_win32(ERROR_ACCESS_DENIED.0).into())).unwrap_err();
+    assert_eq!(failed.code(), HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
+}
+
+/// A call that answered FALSE with last error 0, which is how `EnumWindows` answers an empty desktop, is
+/// nothing there. Mutant: the error whose code is OK is read as a failure.
+#[skuld::test]
+fn a_call_that_failed_with_no_error_answers_nothing() {
+    let none = or_nothing::<()>(|| Err(windows::core::Error::from_hresult(HRESULT(0))));
+    assert_eq!(none.unwrap(), None);
 }
 
 // The fold -----

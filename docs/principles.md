@@ -439,10 +439,9 @@ Windows groups: `COSCA_TEST_PATH_PROBES` (the `windows_path_resolution` canaries
 (`windows_shell_resolution`) and `COSCA_TEST_ELEVATION_ROUTES` (`windows_elevation_routes`), which
 are `test_group!` rows like `namespaces`. So does `COSCA_TEST_CTRL_PROXY` (the tests that run the console-event proxy,
 which sends Ctrl+C or Ctrl+Break to every process on a console), selected by `SKULD_LABELS=ctrl_proxy`; the Windows test
-job has a step of its own for it. So does `COSCA_TEST_WM_CLOSE` (the tests of `stop::send_wm_close`, which post `WM_CLOSE` to
-top-level windows of the desktop, open windows and a console, and create a desktop on the process's window
-station), selected by `SKULD_LABELS=wm_close`, in a step of its own
-beside the proxy's. The `Test (windows/...)` jobs of `ci.yaml` select them by label, as does `windows-probes.yaml` (weekly, on dispatch).
+job has a step of its own for it. So does `COSCA_TEST_WM_CLOSE` (the tests of `stop::send_wm_close`, which post
+`WM_CLOSE` to top-level windows of the desktop, open windows and a console, and create a desktop on the process's
+window station), selected by `SKULD_LABELS=wm_close`, in a step of its own beside the proxy's. The `Test (windows/...)` jobs of `ci.yaml` select them by label, as does `windows-probes.yaml` (weekly, on dispatch).
 CI's test jobs turn each off through `.github/test-group-defaults.env` (a step appends it to `$GITHUB_ENV`) and opt in
 only in the step or job that runs it; `devvm/lane-env.sh` applies the same file in a Linux guest. `windows-probes.yaml`
 does not read the file: its workflow `env` block turns the four probe groups off itself, and the job or action step
