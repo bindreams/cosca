@@ -42,7 +42,7 @@ jobs:
 
       # prek.toml is the single source of truth for lint — the same checks run
       # locally as git hooks. prek-action runs `prek run --all-files`.
-      - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
+      - uses: j178/prek-action@7b101f8338a08d2bd6fdb3625e4e7692428763a3 # v3.1.1
         with:
           prek-version: 0.5.10
         # Platform hooks run in the Test job (see prek.toml).
@@ -170,7 +170,7 @@ jobs:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
 
       # The "Platform hooks" steps run prek hooks; the version is the Lint job's.
-      - uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
+      - uses: j178/prek-action@7b101f8338a08d2bd6fdb3625e4e7692428763a3 # v3.1.1
         with:
           prek-version: 0.5.10
           install-only: true
