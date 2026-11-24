@@ -1360,8 +1360,42 @@ fn one_peer_and_no_own_cause_makes_the_peer_the_cause() {
         matches!(&**source, Error::Io(io) if io.raw_os_error() == Some(CODES[1])),
         "{source:?}"
     );
-    // So the error's first code is the peer's.
+    // So the error's first code is the peer's (the case the `Error` doc names).
     assert_eq!(first_os_code(&e), Some(CODES[1]), "{e:?}");
+}
+
+/// `first_os_code` follows the first member only, and the peers come after the cause.
+///
+/// Mutant: `first_os_code` searches a list's later members when the first has no code.
+#[skuld::test]
+fn an_answer_whose_own_cause_has_no_code_gives_none_not_a_peers() {
+    let e = Error::Unassessable {
+        detail: "d".into(),
+        source: Some(Arc::new(Error::Containment {
+            detail: "c".into(),
+            source: None,
+        })),
+    }
+    .with_peers([coded(CODES[1])]);
+    // The peer is there, after the cause: a `None` below is the reader passing it over, not its absence.
+    let Error::Unassessable {
+        source: Some(source), ..
+    } = &e
+    else {
+        panic!("{e:?}");
+    };
+    let Error::Several(list) = &**source else {
+        panic!("{source:?}");
+    };
+    assert_eq!(codes_of(list), [None, Some(CODES[1])], "{list:?}");
+    assert!(
+        matches!(
+            list.iter().next().map(|first| &**first),
+            Some(Error::Containment { .. })
+        ),
+        "{list:?}"
+    );
+    assert_eq!(first_os_code(&e), None, "{e:?}");
 }
 
 #[skuld::test]

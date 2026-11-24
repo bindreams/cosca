@@ -212,10 +212,15 @@ impl Failures {
 ///
 /// # Other failures of a call
 ///
-/// A call keeps its answer's OS code whatever else failed in it. When a call had other failures,
-/// they are below a slot variant's `source()`, as the members of an [`Error::Several`]. An
-/// [`Error::Io`] has no slot for them, so the call's answer stays the `Io` and its other failures
-/// are logged at warn.
+/// When a call failed more than once, its answer is one error, and the call's other failures may be
+/// below that error's `source()`. So the OS code [`first_os_code`] gives may be another failure's, not
+/// the answer's own cause's: an answer with no cause of its own gives the first other failure's.
+/// Classify by the variant, not by the code.
+///
+/// An [`Error::Io`] has no place for other failures. A call answers it as it is and logs its other
+/// failures at warn, or, where it cannot answer an `Io`, puts it below an [`Error::Unassessable`]. That
+/// `Unassessable` may have a cause of its own: the `Io` is then one of its other failures, after that
+/// cause, and the rule above decides the code.
 ///
 /// # The OS code
 ///
