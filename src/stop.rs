@@ -19,7 +19,9 @@
 //! Every prepared send also leaves how it went on the target, whatever it answered, for the call to read
 //! after the action returns: `terminate` and `terminate_tree` fail with a [`StopError`], which holds the
 //! action's error and the [`SendOutcome`] of its last prepared send. An action that made no prepared send
-//! and failed is [`SendOutcome::Unknown`]; `SendOutcome` says what each value claims.
+//! and failed is [`SendOutcome::Unknown`]; `SendOutcome` says what each value claims. A foreign
+//! [`Process::terminate_tree`](crate::Process::terminate_tree) (sync and tokio) fails with one too, though it has
+//! no stop action and no record: its outcome is that of its walk's send.
 //!
 //! In each tree call a prepared send answers what that call does with the route's outcome. Where
 //! nothing names the tree (a root reaped by something else, on a mechanism with no other channel) that

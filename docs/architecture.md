@@ -101,7 +101,9 @@ What a child's cooperative stop sends is an action it stores, not a rule inside 
   before it when none was. After the action returns,
   `terminate` and `terminate_tree` read the record, never what the action returned: an `Err` becomes a
   `StopError` with the last prepared send's outcome, or `Unknown` when the action made none. The action
-  closures, the prepared sends and the graceful shutdowns keep `Result<(), Error>`.
+  closures, the prepared sends and the graceful shutdowns keep `Result<(), Error>`. A foreign
+  `Process::terminate_tree` (sync and tokio) also answers a `StopError`, though a `Process` has no stop
+  action and no record: its outcome is its walk's send (`SendAnswer::outcome`).
 - **A call may be given a timeout.** `terminate_timeout` / `terminate_tree_timeout` put a `Deadline` (instant
   plus real or tokio clock) on the `StopTarget`; only the target reads or converts it. The waits for an answer
   (`wait_proxy`, `wait_exit`) end by it; per-wait behavior is in their docs. `graceful_shutdown_timeout` /

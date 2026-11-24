@@ -3,7 +3,8 @@
 
 use crate::error::Error;
 
-/// How the last prepared send of a stop went ([`StopError::outcome`]).
+/// How the last prepared send of a stop went ([`StopError::outcome`]); for
+/// [`Process::terminate_tree`](crate::Process::terminate_tree), how its walk's send went.
 ///
 /// `Sent` says the send went out, not that the child took it: a child that ignores Ctrl+C is still `Sent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,6 +32,9 @@ pub enum SendOutcome {
 /// [`Child::terminate_tree`](crate::Child::terminate_tree): the [`Error`] the stop action answered, and how
 /// the last prepared send of the action went ([`SendOutcome`]).
 ///
+/// [`Process::terminate_tree`](crate::Process::terminate_tree) (and its tokio form) answers one too. A
+/// `Process` has no stop action and no record of prepared sends: its outcome is that of its walk's one send.
+///
 /// It shows and chains as the error inside it does: `Display` is that error's, and
 /// [`source`](std::error::Error::source) is that error's own source, so a report of a `StopError`
 /// ([`Report`](crate::error::Report)) reads as a report of the [`Error`]. `?` turns it into the [`Error`]
@@ -57,7 +61,8 @@ impl StopError {
         &self.error
     }
 
-    /// How the last prepared send of the stop action went.
+    /// How the last prepared send of the stop action went; for [`Process::terminate_tree`](crate::Process::terminate_tree),
+    /// how its walk's send went.
     pub fn outcome(&self) -> SendOutcome {
         self.outcome
     }

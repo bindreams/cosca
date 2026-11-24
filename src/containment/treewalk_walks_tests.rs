@@ -5,6 +5,7 @@
 use crate::containment::dispatch::Unkilled;
 use crate::error::Error;
 use crate::identity::{Kernel, ProcessId};
+use crate::stop::SendOutcome;
 use crate::test_child::open_live;
 use crate::Recursive;
 
@@ -40,7 +41,11 @@ pub(super) fn walks() -> [(&'static str, Walk); 4] {
         terminate,
         ("kill_tree", |k, id| open_live(id).kill_tree_with("kill_tree", k)),
         ("terminate_tree", |k, id| {
-            open_live(id).terminate_tree_with(k).map_err(Error::from)
+            open_live(id).terminate_tree_with(k).map_err(|stop| {
+                // Every row that fails this walk is one that sent nothing.
+                assert_eq!(stop.outcome(), SendOutcome::NotSent, "{stop:?}");
+                Error::from(stop)
+            })
         }),
     ]
 }

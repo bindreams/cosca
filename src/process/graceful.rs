@@ -183,8 +183,12 @@ impl Process {
     /// [`Child::terminate_tree`](crate::Child::terminate_tree): [`error`](crate::stop::StopError::error) is
     /// the [`Error`] above, and [`outcome`](crate::stop::StopError::outcome) says how the send went
     /// ([`SendOutcome`](crate::stop::SendOutcome)). Every failure of this call is one where the walk sent
-    /// nothing, so the outcome is [`NotSent`](crate::stop::SendOutcome::NotSent): a signal to a member that
-    /// fails after others went out is warned of, and the call is `Ok`. `?` turns the error into an [`Error`].
+    /// nothing, so the outcome is [`NotSent`](crate::stop::SendOutcome::NotSent). `?` turns the error into
+    /// an [`Error`].
+    ///
+    /// **What `Ok` says.** A failed signal to the root or to a member is only warned of, whether or not
+    /// another signal went out, so `Ok` does not say a signal reached a process: a walk whose every send
+    /// failed or found its process gone is `Ok` as well.
     pub fn terminate_tree(&self) -> Result<(), crate::stop::StopError> {
         self.terminate_tree_with(&crate::identity::HostKernel)
     }
@@ -196,9 +200,15 @@ impl Process {
     ) -> Result<(), crate::stop::StopError> {
         let (answer, _) = self.terminate_walk(kernel);
         let outcome = answer.outcome();
-        answer
-            .into_tree_result()
-            .map_err(|error| crate::stop::StopError::new(error, outcome))
+        answer.into_tree_result().map_err(|error| {
+            // The failure of a foreign walk is one that sent nothing: a signal that fails after the walk
+            // found its members is warned of, and the call is `Ok`.
+            debug_assert!(
+                outcome == crate::stop::SendOutcome::NotSent,
+                "a foreign walk's failure sent nothing, got {outcome:?}: {error}"
+            );
+            crate::stop::StopError::new(error, outcome)
+        })
     }
 
     /// The `SIGTERM` walk of [`terminate_tree`](Self::terminate_tree), with what it found: the members it

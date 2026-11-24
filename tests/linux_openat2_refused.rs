@@ -227,18 +227,15 @@ fn a_seccomp_refused_openat2_makes_process_kill_tree_and_terminate_tree_unsuppor
         let process = cosca::Process::open(child.id().expect("the spawn read the child's identity"))
             .expect("open")
             .expect("the child is running");
-        let results = with_openat2_refused(errno, || {
-            [
-                ("kill_tree", process.kill_tree()),
-                (
-                    "terminate_tree",
-                    process.terminate_tree().map_err(cosca::error::Error::from),
-                ),
-            ]
-        });
-        for (call, result) in results {
-            assert_unsupported_naming(result, (errno, name), call);
-        }
+        let (killed, terminated) = with_openat2_refused(errno, || (process.kill_tree(), process.terminate_tree()));
+        assert_unsupported_naming(killed, (errno, name), "kill_tree");
+        let terminated = terminated.expect_err("terminate_tree: the refusal is the call's error");
+        assert_eq!(
+            terminated.outcome(),
+            cosca::stop::SendOutcome::NotSent,
+            "{name}: terminate_tree sent nothing: {terminated:?}"
+        );
+        assert_unsupported_naming(Err(terminated.into()), (errno, name), "terminate_tree");
         drop(control);
         let status = child.wait().expect("reap the child");
         assert!(
