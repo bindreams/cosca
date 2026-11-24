@@ -322,23 +322,7 @@ pub fn send_signal(target: &StopTarget<'_>, signal: crate::Signal) -> Result<(),
             Scope::Root => {
                 let sent = child
                     .refuse_unpinned("terminate", None)
-                    .and_then(|()| child.proc.signal(crate::signal::Sig::Graceful(signal)))
-                    .and_then(|sent| match sent {
-                        // A contract breach, as for a walk's send (`KillOutcome::of`): a child's handle always
-                        // holds what it verifies its pid against (macOS: the unique id it sends with).
-                        crate::signal::Sent::Unverified => {
-                            debug_assert!(false, "a child's handle always verifies its root");
-                            Err(Error::Unassessable {
-                                detail: format!(
-                                    "the root (pid {}) could not be verified, so no {} was sent",
-                                    child.pid(),
-                                    signal.name()
-                                ),
-                                source: None,
-                            })
-                        }
-                        sent => Ok(sent),
-                    });
+                    .and_then(|()| child.proc.signal(crate::signal::Sig::Graceful(signal)));
                 match &sent {
                     Ok(crate::signal::Sent::Delivered) => target.note_root_sent(signal.name()),
                     // Not delivered: the root was gone, or its exit had begun. Nothing was sent.

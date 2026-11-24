@@ -64,7 +64,7 @@ mod macos {
 
     use super::*;
     use crate::identity::{FakeKernel, HostKernel, Kernel as _, UniqInfo, UniqRead};
-    use crate::signal::{read_identity, via_audit_token};
+    use crate::signal::via_audit_token;
 
     /// `PID_MAX` is 99999, so this pid names nothing, ever.
     const NEVER_A_PID: u32 = 4_000_000;
@@ -138,7 +138,7 @@ mod macos {
     #[skuld::test]
     fn a_pid_with_another_unique_id_is_gone_and_sends_nothing() {
         let mut child = blocker();
-        let other = Some(unique_id_of(child.id()) ^ 1);
+        let other = unique_id_of(child.id()) ^ 1;
         let log = Capture::start();
         assert_eq!(
             via_audit_token(&HostKernel, child.id(), other, Sig::Kill).expect("gone is Ok"),
@@ -148,20 +148,6 @@ mod macos {
         assert!(child.try_wait().expect("try_wait").is_none(), "the child was signalled");
     }
 
-    /// A child that holds no unique id has nothing to verify its pid against: nothing is sent, and it is
-    /// `Unverified`, not `Gone`, since it may be running.
-    ///
-    /// Mutants: a process with no id is signalled anyway; it is read as gone.
-    #[skuld::test]
-    fn a_child_with_no_unique_id_is_unverified_and_sends_nothing() {
-        let log = Capture::start();
-        assert_eq!(
-            via_audit_token(&HostKernel, NEVER_A_PID, None, Sig::Kill).expect("unverified is Ok"),
-            Sent::Unverified
-        );
-        assert_eq!(log.entries(), []);
-    }
-
     /// A re-read that is refused is an error that keeps its errno's kind, so `EPERM` reaches
     /// `Unkillable`; nothing is sent.
     ///
@@ -169,7 +155,7 @@ mod macos {
     #[skuld::test]
     fn a_refused_identity_reread_keeps_its_errno_and_sends_nothing() {
         let child = blocker();
-        let known = Some(unique_id_of(child.id()));
+        let known = unique_id_of(child.id());
         let log = Capture::start();
         let kernel = FakeKernel::over(&HostKernel).on_unique_info(child.id(), UniqRead::Refused(libc::EPERM));
         let err = via_audit_token(&kernel, child.id(), known, Sig::Kill).expect_err("unverifiable");
@@ -192,7 +178,7 @@ mod macos {
             }),
         );
         assert_eq!(
-            via_audit_token(&kernel, NEVER_A_PID, Some(7), Sig::Kill).expect("gone is Ok"),
+            via_audit_token(&kernel, NEVER_A_PID, 7, Sig::Kill).expect("gone is Ok"),
             Sent::Gone
         );
         assert_eq!(log.entries(), [(NEVER_A_PID, Sig::Kill, Via::Identity)]);
@@ -205,7 +191,7 @@ mod macos {
     #[skuld::test]
     fn an_exited_unreaped_child_is_exited() {
         let mut child = blocker();
-        let identity = read_identity(&HostKernel, child.id()).expect("readable");
+        let identity = unique_id_of(child.id());
         drop(child.stdin.take());
         // The exit, seen without consuming it: the child is a zombie.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -231,7 +217,7 @@ mod macos {
     fn a_refused_send_keeps_its_raw_errno() {
         for sig in crate::test_support::kill_and_two_graceful_signals() {
             let child = blocker();
-            let identity = read_identity(&HostKernel, child.id()).expect("readable");
+            let identity = unique_id_of(child.id());
             let refused = crate::signal::seams::refuse_kills();
             let err = via_audit_token(&HostKernel, child.id(), identity, sig).expect_err("refused");
             drop(refused);
@@ -248,7 +234,7 @@ mod macos {
     fn a_child_whose_exit_began_is_exited() {
         for sig in crate::test_support::kill_and_two_graceful_signals() {
             let child = blocker();
-            let identity = read_identity(&HostKernel, child.id()).expect("readable");
+            let identity = unique_id_of(child.id());
             let kernel = FakeKernel::over(&HostKernel).on_kinfo(
                 child.id(),
                 crate::identity::kinfo::kinfo_proc::of_host_with_exit(child.id(), true),
@@ -268,7 +254,7 @@ mod macos {
     #[skuld::test]
     fn a_verified_live_child_is_signalled_and_recorded() {
         let mut child = blocker();
-        let identity = read_identity(&HostKernel, child.id()).expect("readable");
+        let identity = unique_id_of(child.id());
         let log = Capture::start();
         assert_eq!(
             via_audit_token(&HostKernel, child.id(), identity, Sig::Kill).expect("send"),

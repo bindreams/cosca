@@ -440,7 +440,7 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
     // reachable or not on a given platform. A kill answers `Gone` once the child has exited, so a
     // look right after it may still find the zombie not yet collectable. The wording is pinned for
     // each.
-    let kills: [KillCase<'_>; 6] = [
+    let kills: [KillCase<'_>; 5] = [
         (|| None, "", &["kill"], vec![LEAVING_RUNNING], &["kill"]),
         (
             || Some(Ok(Sent::Delivered)),
@@ -464,13 +464,6 @@ fn the_let_go_line_is_pinned_for_every_kill_and_look() {
             &["killed it"],
             vec!["the look saw no exit yet", LEFT],
             &["killed it", "running", LEAVING_RUNNING],
-        ),
-        (
-            || Some(Ok(Sent::Unverified)),
-            "its kill was not sent: the child could not be verified",
-            &["killed it"],
-            vec![LEAVING_RUNNING],
-            &["killed it"],
         ),
         (
             || Some(Err(Error::Io(std::io::Error::other("denied")))),

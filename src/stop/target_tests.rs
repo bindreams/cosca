@@ -271,8 +271,8 @@ fn a_tree_routes_answer_is_recorded_as_how_the_send_went() {
     }
 }
 
-/// A signal through a root's handle is `Sent` only when it was delivered: a root that was gone, one the handle
-/// could not vouch for, and a refusal are not.
+/// A signal through a root's handle is `Sent` only when it was delivered: a root that was gone, and a refusal,
+/// are not.
 ///
 /// Mutant: any `Ok` answer of the handle reads as `Sent`.
 #[skuld::test]
@@ -283,7 +283,6 @@ fn a_signal_through_a_handle_is_sent_only_when_delivered() {
 
     assert_eq!(signal_outcome(&Ok(Sent::Delivered)), SendOutcome::Sent);
     assert_eq!(signal_outcome(&Ok(Sent::Gone)), SendOutcome::NotSent);
-    assert_eq!(signal_outcome(&Ok(Sent::Unverified)), SendOutcome::NotSent);
     assert_eq!(
         signal_outcome(&Err(crate::error::Error::Io(std::io::Error::other("refused")))),
         SendOutcome::NotSent

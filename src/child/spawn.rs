@@ -267,25 +267,6 @@ pub(crate) fn finish_elevated(mut child: Child, written: Result<(), Error>) -> R
                 "the elevated child could not be terminated (it was already reaped)".to_string(),
                 Remains::collected(ChildFate::Gone),
             ),
-            // A sync child's kill always verifies: the pidfd or the handle names it, and on macOS the
-            // unique id every production spawn adopts is held (`MacosChild::new` takes it).
-            // Were it ever not, the child may still be running.
-            Ok(crate::signal::Sent::Unverified) => {
-                debug_assert!(false, "a sync child's kill always verifies its target");
-                let torn = TeardownOutcome::left_uncollected(
-                    ChildFate::Running { id: child.id() },
-                    format!(
-                        "the elevated child pid {pid} could not be terminated (it could not be verified, and may \
-                         still be running){}",
-                        Disposition::HandBack.suffix(true)
-                    ),
-                );
-                (
-                    "the elevated child could not be terminated (it could not be verified, and may still be running)"
-                        .to_string(),
-                    report.fold_clause(torn),
-                )
-            }
             Ok(crate::signal::Sent::Delivered | crate::signal::Sent::Exited) => {
                 #[cfg(test)]
                 fault::run_between_kill_and_wait();
@@ -1175,7 +1156,7 @@ fn unwatched_child_fate(
             None,
         );
     }
-    match via_audit_token(kernel, pid, Some(unique), Sig::Kill) {
+    match via_audit_token(kernel, pid, unique, Sig::Kill) {
         // `Exited` is a send that found the exit begun.
         Ok(Sent::Delivered | Sent::Exited) => (
             ChildFate::Killed,
@@ -1187,10 +1168,6 @@ fn unwatched_child_fate(
             "it was gone, or its pid names another process, so nothing was sent".to_owned(),
             None,
         ),
-        Ok(Sent::Unverified) => {
-            debug_assert!(false, "`via_audit_token` was given `Some(unique)`, so it verifies");
-            (ChildFate::Running { id: None }, "it was not signalled".to_owned(), None)
-        }
         Err(kill) => (
             ChildFate::Running { id: None },
             format!("it could not be killed ({})", crate::error::Report(&kill)),

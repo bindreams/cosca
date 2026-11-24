@@ -156,9 +156,6 @@ pub(crate) fn let_go_line(
         None => dropped,
         Some(Ok(Sent::Delivered | Sent::Exited)) => format!("{dropped} (killed it)"),
         Some(Ok(Sent::Gone)) => format!("{dropped} (its kill found nothing to signal)"),
-        Some(Ok(Sent::Unverified)) => {
-            format!("{dropped} (its kill was not sent: the child could not be verified)")
-        }
         Some(Err(refused)) => format!("{dropped} and {}", kill_refused(&crate::error::Report(refused))),
     };
     let (level, line) = match look.status() {

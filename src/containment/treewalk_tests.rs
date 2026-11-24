@@ -61,28 +61,6 @@ fn a_tree_call_given_no_owner_sends_the_roots_term_by_identity() {
     drop(stdin);
 }
 
-/// An unverified send, which no handle a walk sends through gives, asserts in debug. Mutant: it is
-/// read as an ordinary answer.
-#[cfg(debug_assertions)]
-#[skuld::test]
-fn an_unverified_send_is_a_contract_breach() {
-    assert!(
-        std::panic::catch_unwind(|| super::KillOutcome::of(Ok(crate::signal::Sent::Unverified))).is_err(),
-        "the breach did not assert"
-    );
-}
-
-/// Release reads an unverified send as nothing sent to a process that may be running. Mutant: it
-/// is read as delivered or gone.
-#[cfg(not(debug_assertions))]
-#[skuld::test]
-fn an_unverified_send_is_not_attempted_in_release() {
-    match super::KillOutcome::of(Ok(crate::signal::Sent::Unverified)) {
-        super::KillOutcome::NotAttempted(Error::Unassessable { .. }) => {}
-        other => panic!("an unverified send is not attempted, Unassessable: {other:?}"),
-    }
-}
-
 /// The one reading of a send's answer, for a walk's members and the root alike. Mutants: a refusal
 /// is read as delivered or gone; an exit under way is read as delivered, or as gone (a kill would not wait for it).
 #[skuld::test]

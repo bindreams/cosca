@@ -72,13 +72,6 @@ pub(crate) enum Sent {
     /// Nothing was delivered because the child is gone: reaped, or its pid no longer names it. Not
     /// an error; logged at `debug`.
     Gone,
-    /// Nothing was delivered because there was nothing to verify the pid against (macOS: no unique
-    /// id is held). The child may be running. Not an error; logged at `debug`.
-    #[cfg_attr(
-        not(target_os = "macos"),
-        allow(dead_code, reason = "only macOS's audit-token send cannot verify a process")
-    )]
-    Unverified,
 }
 
 /// Whether an owned child's root is still its own child to act on, as its own handle says.
@@ -276,11 +269,10 @@ pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
 }
 
 /// Send `sig` to the child at `pid` through an audit token, only while the pid still has the unique
-/// id `identity` (`None`: no id is held, so nothing is sent). The kernel checks the pid with its
-/// `p_idversion` and signals while it holds a reference, so a reused pid is never signalled; only
-/// the documented 2^32 version wrap is left, and the id read right before each send follows an
-/// `exec`. A refused send is the bare errno, so an `EPERM` stays raw; a refused id read keeps its
-/// errno's kind, so an `EPERM` stays `PermissionDenied`.
+/// id `unique`. The kernel checks the pid with its `p_idversion` and signals while it holds a
+/// reference, so a reused pid is never signalled; only the documented 2^32 version wrap is left, and
+/// the id read right before each send follows an `exec`. A refused send is the bare errno, so an
+/// `EPERM` stays raw; a refused id read keeps its errno's kind, so an `EPERM` stays `PermissionDenied`.
 ///
 /// A child that has exited and is not reaped, or whose exit has begun, is [`Sent::Exited`]: it is ours, and
 /// its zombie holds the pid, so it is not [`Sent::Gone`].
@@ -288,15 +280,11 @@ pub(crate) fn identity_unreadable(pid: u32, errno: i32) -> crate::error::Error {
 pub(crate) fn via_audit_token(
     kernel: &dyn crate::identity::Kernel,
     pid: u32,
-    identity: Option<u64>,
+    unique: u64,
     sig: Sig,
 ) -> io::Result<Sent> {
     use crate::os_process::macos::{read_version, signal_by_token, SignalByTokenOutcome};
 
-    let Some(unique) = identity else {
-        log::debug!("child {pid} holds no unique id; {sig} not sent");
-        return Ok(Sent::Unverified);
-    };
     let Some(mut idversion) = read_version(kernel, pid, unique, sig)? else {
         log::debug!("child {pid} is gone or its pid names another process; {sig} not sent");
         return Ok(Sent::Gone);

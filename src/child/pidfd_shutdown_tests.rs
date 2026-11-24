@@ -253,21 +253,16 @@ fn a_failed_sigterm_waits_no_grace_and_is_the_error() {
     assert!(warns[0].contains(&said), "{warns:?}");
 }
 
-/// A `SIGTERM` that finds the root gone, or a handle that no longer reaches it (a tokio backend
-/// forgotten unproven holds no pidfd), waits no grace and sends no kill.
+/// A `SIGTERM` that finds the root gone waits no grace and sends no kill.
 #[skuld::test]
-fn a_sigterm_that_reached_nothing_waits_no_grace() {
-    for (term, says) in [
-        (Sent::Gone, "sent nothing: the root's pidfd shows it is gone"),
-        (Sent::Unverified, "sent nothing: the root's handle no longer reaches it"),
-    ] {
-        let (err, sent, warns) = run(LiveBox::Own, Ok(term), None, Ok(Sent::Delivered));
-        assert_names_the_skip(&err);
-        assert_eq!(sent, ["term"], "{says}");
-        assert_eq!(warns.len(), 1, "{says}: {warns:?}");
-        assert!(warns[0].contains(says), "{warns:?}");
-        assert!(!warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
-    }
+fn a_sigterm_that_finds_the_root_gone_waits_no_grace() {
+    let says = "sent nothing: the root's pidfd shows it is gone";
+    let (err, sent, warns) = run(LiveBox::Own, Ok(Sent::Gone), None, Ok(Sent::Delivered));
+    assert_names_the_skip(&err);
+    assert_eq!(sent, ["term"], "{says}");
+    assert_eq!(warns.len(), 1, "{says}: {warns:?}");
+    assert!(warns[0].contains(says), "{warns:?}");
+    assert!(!warns[0].contains(ROOT_TERMED_BY_PIDFD), "{warns:?}");
 }
 
 #[skuld::test]

@@ -1066,11 +1066,9 @@ impl<'a> Swept<'a> {
 
 impl SweepFailure {
     /// Whether the root is not running after a kill of it through its handle: it was killed, or was
-    /// already dead ([`ChildFate::not_running`](crate::error::ChildFate::not_running)'s meaning). A
-    /// kill that could not be verified (`Sent::Unverified`) may have left the root running.
+    /// already dead ([`ChildFate::not_running`](crate::error::ChildFate::not_running)'s meaning).
     pub(crate) fn killed_root(sent: &Result<crate::signal::Sent, Error>) -> bool {
-        use crate::signal::Sent;
-        matches!(sent, Ok(Sent::Delivered | Sent::Exited | Sent::Gone))
+        sent.is_ok()
     }
 
     /// The handle backstop's answer from its root kill's `sent`, and whether it ended the root.

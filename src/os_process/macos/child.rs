@@ -92,7 +92,7 @@ impl<K: Kernel + Send> OsProcess for MacosChild<K> {
     /// refused send; `Gone` once the unique id says the pid names another process; `Exited` for this
     /// child's own unreaped zombie, and for one whose exit has begun.
     fn signal(&self, sig: Sig) -> Result<Sent, Error> {
-        via_audit_token(&self.kernel, self.pid, Some(self.unique), sig).map_err(Error::Io)
+        via_audit_token(&self.kernel, self.pid, self.unique, sig).map_err(Error::Io)
     }
 
     /// `Exited` once the child is a zombie or gone, as [`MacosProcess`](super::MacosProcess) answers it

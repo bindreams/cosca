@@ -223,8 +223,7 @@ impl RootRecord {
     }
 }
 
-/// How a signal sent through a root's handle went: delivered, or not (the root was gone, or the handle
-/// could not vouch for it, or the OS refused).
+/// How a signal sent through a root's handle went: delivered, or not (the root was gone, or the OS refused).
 pub(super) fn signal_outcome(sent: &Result<crate::signal::Sent, Error>) -> SendOutcome {
     match sent {
         Ok(crate::signal::Sent::Delivered) => SendOutcome::Sent,

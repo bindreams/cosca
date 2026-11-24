@@ -294,22 +294,12 @@ impl KillOutcome {
     /// What `sent`, the answer of the one send to a process held by identity, achieved. The one
     /// reading of a send's answer for every per-member send of a walk and of a group's resend. A
     /// refusal is the OS's own error, as `Process::kill` gives it. Already gone (`ESRCH`, or exited
-    /// when the call came) is success. [`Sent::Unverified`] is a contract breach, asserted in debug:
-    /// every handle a send goes through (a member's opened by identity, a child's, which always holds
-    /// the unique id it sends with) verifies its target. Release reads it as nothing sent to a
-    /// process that may be running.
+    /// when the call came) is success.
     pub(crate) fn of(sent: Result<Sent, Error>) -> KillOutcome {
         match sent {
             Ok(Sent::Delivered) => KillOutcome::Terminated,
             Ok(Sent::Exited) => KillOutcome::Exited,
             Ok(Sent::Gone) => KillOutcome::AlreadyGone,
-            Ok(Sent::Unverified) => {
-                debug_assert!(false, "a walk's send cannot be unverified");
-                KillOutcome::NotAttempted(Error::Unassessable {
-                    detail: "it could not be verified".to_owned(),
-                    source: None,
-                })
-            }
             Err(refused) => KillOutcome::NotAttempted(refused),
         }
     }
