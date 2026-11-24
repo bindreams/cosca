@@ -589,8 +589,9 @@ mod call {
                     ..same("sent nothing")
                 },
                 (None, Some(Ok(Sent::Delivered))) => same(&sent_root),
-                (None, Some(Ok(Sent::Gone))) => same("sent nothing to the root: its pidfd shows it is gone"),
-                (None, Some(Ok(_))) => same("sent nothing to the root: its handle no longer reaches it"),
+                (None, Some(Ok(Sent::Gone | Sent::Exited))) => {
+                    same("sent nothing to the root: its pidfd shows it is gone")
+                }
                 (None, Some(Err(e))) => Went::of(
                     format!("sent nothing to the root: {failed_root} through its pidfd failed"),
                     format!(

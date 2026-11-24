@@ -733,11 +733,10 @@ impl PidfdShutdown {
             (Ok(Sent::Delivered), Some(Err(_))) => {
                 format!("{termed}, then the kill of the root through its pidfd failed")
             }
-            (Ok(Sent::Delivered), Some(Ok(_))) => {
+            (Ok(Sent::Delivered), Some(Ok(Sent::Gone | Sent::Exited))) => {
                 format!("{termed}, and its pidfd showed it gone after the grace; sent nothing else")
             }
-            (Ok(Sent::Gone), _) => "sent nothing: the root's pidfd shows it is gone".to_owned(),
-            (Ok(_), _) => "sent nothing: the root's handle no longer reaches it".to_owned(),
+            (Ok(Sent::Gone | Sent::Exited), _) => "sent nothing: the root's pidfd shows it is gone".to_owned(),
         };
         let detail = call.skipped_detail(skip, &sent(false));
         skip.why.warn(&call.skipped_detail(skip, &sent(true)));

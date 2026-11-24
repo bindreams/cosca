@@ -223,11 +223,13 @@ impl RootRecord {
     }
 }
 
-/// How a signal sent through a root's handle went: delivered, or not (the root was gone, or the OS refused).
+/// How a signal sent through a root's handle went: delivered, or not (the root was gone, its exit had
+/// begun (macOS), or the OS refused).
 pub(super) fn signal_outcome(sent: &Result<crate::signal::Sent, Error>) -> SendOutcome {
+    use crate::signal::Sent;
     match sent {
-        Ok(crate::signal::Sent::Delivered) => SendOutcome::Sent,
-        Ok(_) | Err(_) => SendOutcome::NotSent,
+        Ok(Sent::Delivered) => SendOutcome::Sent,
+        Ok(Sent::Exited | Sent::Gone) | Err(_) => SendOutcome::NotSent,
     }
 }
 
