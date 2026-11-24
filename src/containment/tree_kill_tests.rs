@@ -11,7 +11,7 @@ use crate::containment::fake::FakeContains;
 use crate::containment::tree_kill::refused_unobserved;
 use crate::containment::{Containment, KillWait, Mechanism, Tree, TreeKill};
 use crate::error::Error;
-use crate::identity::Liveness;
+use crate::identity::{HostKernel, Liveness};
 use crate::os_process::fake::{Answer, FakeProcess};
 #[cfg(feature = "tokio")]
 use crate::test_child::over_fake::tokio_child_reaching;
@@ -127,7 +127,7 @@ fn a_kill_tree_does_not_wait_for_a_root_whose_kill_was_refused() {
 fn a_member_whose_exit_cannot_be_observed_is_named_once_the_rest_are_waited_for() {
     let (member, writer, id) = live_member();
     let why = refused_unobserved(4242);
-    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())))
+    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
         .unobserved(why)
         .reaching([id])
         .split();
@@ -162,7 +162,9 @@ fn a_member_that_is_gone_has_exited() {
     member.wait().expect("the member exits when its stdin closes");
     drop(member);
 
-    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
+    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
+        .reaching([id])
+        .split();
     wait.wait(None).expect("a member that is gone has exited");
 }
 
@@ -174,7 +176,7 @@ fn a_member_that_is_gone_has_exited() {
 #[cfg(target_os = "linux")]
 #[skuld::test]
 fn a_failed_open_is_not_an_exit() {
-    use crate::identity::{FakeKernel, HostKernel};
+    use crate::identity::FakeKernel;
 
     let (first, first_writer, first_id) = live_member();
     let (second, second_writer, second_id) = live_member();
@@ -182,8 +184,7 @@ fn a_failed_open_is_not_an_exit() {
         .on_pidfd_open(first_id.pid(), Err(rustix::io::Errno::MFILE))
         .on_pidfd_open(second_id.pid(), Err(rustix::io::Errno::MFILE));
 
-    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())))
-        .through(&kernel)
+    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &kernel)
         .reaching([first_id, second_id, first_id])
         .split();
     let err = wait.wait(None).expect_err("neither member can be opened");
@@ -229,7 +230,9 @@ fn a_failed_open_is_not_an_exit() {
 fn a_wait_error_keeps_the_record_that_the_root_was_killed() {
     let root = root_looking([Answer::Exited]);
     let why = refused_unobserved(4242);
-    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).unobserved(why).split();
+    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
+        .unobserved(why)
+        .split();
 
     let failure = Swept::new("kill_tree", Ok(()), wait.with_root(&root, ROOT_PID, None, true))
         .wait(None)
@@ -246,12 +249,17 @@ fn a_wait_error_keeps_the_record_that_the_root_was_killed() {
 #[skuld::test]
 fn the_roots_state_is_set_by_root_killed_and_kept_by_with_root() {
     let root = root_looking([Answer::Exited]);
-    let killed = |landed| TreeKill::of(TreeKillOutcome::Ran(Ok(()))).root_killed(landed).split().1;
+    let killed = |landed| {
+        TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
+            .root_killed(landed)
+            .split()
+            .1
+    };
 
     assert!(killed(true).root_killed(), "a walk that killed the root says so");
     assert!(!killed(false).root_killed(), "a walk that did not says so");
     assert!(
-        !TreeKill::of(TreeKillOutcome::Ran(Ok(())))
+        !TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
             .root_killed(true)
             .root_killed(false)
             .split()
@@ -297,7 +305,7 @@ fn an_edge_that_says_members_remain_is_no_drain() {
 fn a_root_whose_look_fails_is_named_as_the_root() {
     let root = FakeProcess::new([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
 
-    let err = KillWait::none()
+    let err = KillWait::none(&HostKernel)
         .with_root(&root, ROOT_PID, None, true)
         .wait(None)
         .expect_err("the root's exit cannot be observed");
@@ -330,7 +338,9 @@ fn a_wait_goes_to_the_members_then_the_root() {
             drop(writer.take());
         }
     });
-    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
+    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
+        .reaching([id])
+        .split();
 
     wait.with_root(&root, ROOT_PID, None, true)
         .wait(None)
@@ -363,7 +373,7 @@ fn the_edge_is_waited_for_after_the_root() {
             "the edge was asked before the root was waited for"
         );
     });
-    let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), edge).split();
+    let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), edge, &HostKernel).split();
 
     wait.with_root(&root, ROOT_PID, None, true)
         .wait(None)
@@ -425,7 +435,14 @@ impl FailingEdge {
 #[skuld::test]
 fn an_edge_that_fails_is_the_waits_error() {
     let failing = FailingEdge::new();
-    let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), failing.edge()).split();
+    let (_, wait) = TreeKill::listed(
+        TreeKillOutcome::Ran(Ok(())),
+        Vec::new(),
+        Vec::new(),
+        failing.edge(),
+        &HostKernel,
+    )
+    .split();
 
     let err = wait.wait(None).expect_err("the edge could not be waited on");
 
@@ -476,7 +493,14 @@ fn assert_the_root_comes_before_the_edge(err: &Error) {
 fn the_roots_error_comes_before_the_edges() {
     let failing = FailingEdge::new();
     let root = FakeProcess::new([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
-    let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), failing.edge()).split();
+    let (_, wait) = TreeKill::listed(
+        TreeKillOutcome::Ran(Ok(())),
+        Vec::new(),
+        Vec::new(),
+        failing.edge(),
+        &HostKernel,
+    )
+    .split();
 
     let err = wait
         .with_root(&root, ROOT_PID, None, true)
@@ -525,7 +549,7 @@ fn a_wait_whose_first_failure_is_an_io_error_keeps_every_failure_below_an_unasse
 /// Mutant: a failed kill's wait is not made; a wait error replaces the kill's.
 fn a_failed_kill_is_the_answer_and_its_members_are_still_waited_for(wait_fails: bool) {
     let (member, writer, id) = live_member();
-    let mut kill = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]);
+    let mut kill = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel).reaching([id]);
     if wait_fails {
         kill = kill.unobserved(refused_unobserved(4242));
     }
@@ -580,7 +604,7 @@ fn a_failed_kill_whose_wait_fails_too_is_the_answer_and_its_members_are_waited_f
 fn a_failed_waits_failure_behind_a_failed_kill_is_logged_once_at_warn() {
     crate::log_capture::install();
     let mark = crate::log_capture::mark();
-    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())))
+    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
         .unobserved(refused_unobserved(4242))
         .split();
     let refused = SweepFailure {
@@ -680,7 +704,7 @@ fn a_wait_whose_deadline_has_passed_names_each_member_still_running_and_blocks_o
     let (gone, gone_writer, gone_id) = live_member();
     drop(gone_writer);
     _ = gone.wait();
-    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())))
+    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
         .reaching([gone_id, running_id])
         .split();
     let writer = Cell::new(Some(writer));
@@ -722,7 +746,7 @@ fn a_root_still_running_at_the_deadline_is_named_by_its_identity_and_the_failure
     let root_id = ProcessId::from_parts_for_test(ROOT_PID, Key::for_test(2));
     for (named, members) in [(Some(root_id), vec![root_id]), (None, vec![])] {
         let root = root_looking([Answer::Running]);
-        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())))
+        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
             .unobserved(refused_unobserved(77))
             .split();
 
@@ -754,7 +778,9 @@ fn a_wait_with_time_left_waits_for_its_members() {
 
     let timeout = std::time::Duration::from_secs(3600);
     let (member, writer, id) = live_member();
-    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
+    let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
+        .reaching([id])
+        .split();
     let writer = Cell::new(Some(writer));
     let _blocking = crate::wait::block_probe::on_blocking(move || drop(writer.take()));
     crate::wait::block_probe::take();
@@ -794,7 +820,7 @@ fn a_drain_edge_that_has_not_fired_is_a_timeout_naming_no_member() {
 
     let (child, writer) = crate::test_child::held_contained_blocker(crate::Stdio::null());
     let edge = child.tree.drain_edge().expect("the tree has a drain edge");
-    let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), edge).split();
+    let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), edge, &HostKernel).split();
 
     let error = wait
         .wait(Deadline::real(std::time::Duration::ZERO))
@@ -828,7 +854,9 @@ mod awaited {
     #[skuld::test]
     async fn an_awaited_wait_waits_for_each_member_its_kill_reached() {
         let (member, writer, id) = live_member();
-        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
+        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
+            .reaching([id])
+            .split();
 
         let mut waiting = pin!(wait.wait_async(None));
         assert!(
@@ -859,7 +887,9 @@ mod awaited {
     async fn an_awaited_wait_blocks_no_runtime_thread() {
         crate::tokio::test_runtime::assert_current_thread();
         let (member, writer, id) = live_member();
-        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
+        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
+            .reaching([id])
+            .split();
         let writer = Rc::new(Cell::new(Some(writer)));
         let blocked = Rc::new(Cell::new(false));
         let _blocking = crate::wait::block_probe::on_blocking({
@@ -898,7 +928,9 @@ mod awaited {
         crate::tokio::test_runtime::assert_current_thread();
         let (member, writer, id) = live_member();
         let root = root_looking([Answer::Exited]);
-        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
+        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
+            .reaching([id])
+            .split();
 
         let (waited, ()) = ::tokio::join!(wait.with_root(&root, ROOT_PID, None, true).wait_async(None), async {
             ::tokio::task::yield_now().await;
@@ -923,7 +955,14 @@ mod awaited {
     #[skuld::test]
     async fn an_awaited_edge_that_fails_is_the_waits_error() {
         let failing = FailingEdge::new();
-        let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), failing.edge()).split();
+        let (_, wait) = TreeKill::listed(
+            TreeKillOutcome::Ran(Ok(())),
+            Vec::new(),
+            Vec::new(),
+            failing.edge(),
+            &HostKernel,
+        )
+        .split();
 
         let err = wait
             .wait_async(None)
@@ -942,7 +981,14 @@ mod awaited {
     async fn an_awaited_roots_error_comes_before_the_edges() {
         let failing = FailingEdge::new();
         let root = FakeProcess::new([Answer::Err(std::io::ErrorKind::PermissionDenied)]);
-        let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), failing.edge()).split();
+        let (_, wait) = TreeKill::listed(
+            TreeKillOutcome::Ran(Ok(())),
+            Vec::new(),
+            Vec::new(),
+            failing.edge(),
+            &HostKernel,
+        )
+        .split();
 
         let err = wait
             .with_root(&root, ROOT_PID, None, true)
@@ -961,7 +1007,7 @@ mod awaited {
     async fn an_awaited_wait_names_a_member_it_cannot_observe_once_the_rest_are_waited_for() {
         let (member, writer, id) = live_member();
         let why = refused_unobserved(4242);
-        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())))
+        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
             .unobserved(why)
             .reaching([id])
             .split();
@@ -987,7 +1033,7 @@ mod awaited {
     /// Mutant: a failed kill's wait is not made; a wait error replaces the kill's.
     async fn a_failed_kill_is_the_awaited_answer_and_its_members_are_still_waited_for(wait_fails: bool) {
         let (member, writer, id) = live_member();
-        let mut kill = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]);
+        let mut kill = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel).reaching([id]);
         if wait_fails {
             kill = kill.unobserved(refused_unobserved(4242));
         }
@@ -1146,7 +1192,9 @@ mod awaited {
     async fn an_awaited_wait_error_keeps_the_record_that_the_root_was_killed() {
         let root = root_looking([Answer::Exited]);
         let why = refused_unobserved(4242);
-        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).unobserved(why).split();
+        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
+            .unobserved(why)
+            .split();
 
         let failure = Swept::new("kill_tree", Ok(()), wait.with_root(&root, ROOT_PID, None, true))
             .wait_async(None)
@@ -1171,7 +1219,9 @@ mod awaited {
         let (member, writer, id) = live_member();
         let root_id = ProcessId::from_parts_for_test(ROOT_PID, Key::for_test(2));
         let root = root_looking([Answer::Running]);
-        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
+        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
+            .reaching([id])
+            .split();
 
         let (error, ()) = ::tokio::join!(
             async {
@@ -1202,7 +1252,9 @@ mod awaited {
 
         crate::tokio::test_runtime::assert_current_thread();
         let (member, writer, id) = live_member();
-        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching([id]).split();
+        let (_, wait) = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &HostKernel)
+            .reaching([id])
+            .split();
         let done = Cell::new(false);
 
         let (waited, ()) = ::tokio::join!(
@@ -1250,7 +1302,8 @@ mod awaited {
 
         let (child, writer) = crate::test_child::held_contained_blocker(crate::Stdio::null());
         let edge = child.tree.drain_edge().expect("the tree has a drain edge");
-        let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), edge).split();
+        let (_, wait) =
+            TreeKill::listed(TreeKillOutcome::Ran(Ok(())), Vec::new(), Vec::new(), edge, &HostKernel).split();
 
         let error = wait
             .wait_async(Deadline::tokio(std::time::Duration::ZERO))

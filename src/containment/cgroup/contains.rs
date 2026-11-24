@@ -73,7 +73,7 @@ impl Contains for CgroupLeaf {
             }
             _ => listed.into_iter().map(|member| member.id).collect(),
         };
-        TreeKill::listed(sent, members, unobserved, DrainEdge::Cgroup(self))
+        TreeKill::listed(sent, members, unobserved, DrainEdge::Cgroup(self), &*self.kernel)
     }
 
     /// The bare `cgroup.kill`: no member is listed, for a caller that waits for none.

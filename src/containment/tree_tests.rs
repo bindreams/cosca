@@ -25,9 +25,15 @@ fn a_tree_reports_the_containment_of_what_holds_it() {
     #[cfg(unix)]
     {
         use crate::containment::unix::Group;
-        let group = Tree::contained(Mechanism::Group(Group::process_group(1)));
+        let group = Tree::contained(Mechanism::Group(Group::process_group(
+            1,
+            crate::identity::spawn_kernel(crate::identity::HostKernel),
+        )));
         assert_eq!(group.containment(), Containment::ProcessGroup);
-        let session = Tree::contained(Mechanism::Group(Group::session(1)));
+        let session = Tree::contained(Mechanism::Group(Group::session(
+            1,
+            crate::identity::spawn_kernel(crate::identity::HostKernel),
+        )));
         assert_eq!(session.containment(), Containment::Session);
     }
     #[cfg(target_os = "linux")]
@@ -63,7 +69,10 @@ fn only_a_cgroup_leaf_has_awaitable_release_steps() {
             crate::identity::ProcessId::current(),
             crate::identity::HostKernel,
         )),
-        Mechanism::Group(Group::process_group(1)),
+        Mechanism::Group(Group::process_group(
+            1,
+            crate::identity::spawn_kernel(crate::identity::HostKernel),
+        )),
         Mechanism::Fake(fake),
     ];
     for other in &others {
@@ -141,9 +150,15 @@ fn a_teardown_names_its_tree_as_it_always_did() {
     assert_eq!(walk.teardown_subject(), format!("TreeWalk({id:?})"));
     {
         use crate::containment::unix::Group;
-        let group = Tree::contained(Mechanism::Group(Group::process_group(123)));
+        let group = Tree::contained(Mechanism::Group(Group::process_group(
+            123,
+            crate::identity::spawn_kernel(crate::identity::HostKernel),
+        )));
         assert_eq!(group.teardown_subject(), "ProcessGroup(123)");
-        let session = Tree::contained(Mechanism::Group(Group::session(123)));
+        let session = Tree::contained(Mechanism::Group(Group::session(
+            123,
+            crate::identity::spawn_kernel(crate::identity::HostKernel),
+        )));
         assert_eq!(session.teardown_subject(), "ProcessGroup(123)");
     }
     #[cfg(target_os = "linux")]
@@ -187,7 +202,10 @@ fn a_released_tree_keeps_its_kind() {
     let (fake, _) = FakeContains::new(Containment::Session, false);
     let trees = [
         (
-            Tree::contained(Mechanism::Group(Group::process_group(1))),
+            Tree::contained(Mechanism::Group(Group::process_group(
+                1,
+                crate::identity::spawn_kernel(crate::identity::HostKernel),
+            ))),
             Containment::ProcessGroup,
         ),
         (Tree::contained(Mechanism::Fake(fake)), Containment::Session),
@@ -238,7 +256,10 @@ fn a_released_tree_is_not_actionable_and_has_no_drain_edge() {
     use crate::containment::unix::Group;
 
     let trees = [
-        Tree::contained(Mechanism::Group(Group::process_group(1))),
+        Tree::contained(Mechanism::Group(Group::process_group(
+            1,
+            crate::identity::spawn_kernel(crate::identity::HostKernel),
+        ))),
         Tree::contained(Mechanism::Walk(Walker::over(
             crate::identity::ProcessId::current(),
             crate::identity::HostKernel,
@@ -263,7 +284,10 @@ fn a_send_on_a_released_tree_that_kept_its_mechanism_asserts() {
 
     use crate::containment::unix::Group;
 
-    let mut tree = Tree::contained(Mechanism::Group(Group::process_group(1)));
+    let mut tree = Tree::contained(Mechanism::Group(Group::process_group(
+        1,
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+    )));
     tree.release().wait();
     let asserts = |send: &dyn Fn()| catch_unwind(AssertUnwindSafe(send)).is_err();
     assert!(asserts(&|| _ = tree.kill(None)), "kill did not assert");

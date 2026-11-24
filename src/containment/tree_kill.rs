@@ -13,7 +13,7 @@ use crate::containment::dispatch::TreeKillOutcome;
 use crate::containment::drain_edge::DrainEdge;
 use crate::containment::TreeDrain;
 use crate::error::Error;
-use crate::identity::{HostKernel, Kernel, ProcessId};
+use crate::identity::{Kernel, ProcessId};
 use crate::os_process::OsProcess;
 use crate::stop::{ClockKind, Deadline};
 
@@ -131,19 +131,13 @@ enum RootEnd<'a> {
 }
 
 impl<'a> TreeKill<'a> {
-    /// A kill that did `outcome`, which reached no member yet. Members are re-opened through the
-    /// host's kernel unless [`through`](Self::through) says otherwise.
-    pub(crate) fn of(outcome: impl Into<TreeKillOutcome>) -> TreeKill<'a> {
+    /// A kill that did `outcome`, which reached no member yet. Its wait re-opens the members through
+    /// `kernel`, the kernel of whatever made the kill.
+    pub(crate) fn of(outcome: impl Into<TreeKillOutcome>, kernel: &'a dyn Kernel) -> TreeKill<'a> {
         TreeKill {
             outcome: outcome.into(),
-            wait: KillWait::none(),
+            wait: KillWait::none(kernel),
         }
-    }
-
-    /// Re-open the members through `kernel`.
-    pub(crate) fn through(mut self, kernel: &'a dyn Kernel) -> TreeKill<'a> {
-        self.wait.kernel = kernel;
-        self
     }
 
     /// The kill reached `members`.
@@ -170,6 +164,7 @@ impl<'a> TreeKill<'a> {
         members: Vec<ProcessId>,
         unobserved: Vec<Unnamed>,
         edge: DrainEdge<'a>,
+        kernel: &'a dyn Kernel,
     ) -> TreeKill<'a> {
         if !matches!(sent, TreeKillOutcome::Ran(Ok(()))) {
             for unnamed in &unobserved {
@@ -178,9 +173,9 @@ impl<'a> TreeKill<'a> {
                     report = crate::error::Report(&unnamed.why)
                 );
             }
-            return TreeKill::of(sent);
+            return TreeKill::of(sent, kernel);
         }
-        let mut kill = TreeKill::of(sent).reaching(members);
+        let mut kill = TreeKill::of(sent, kernel).reaching(members);
         kill.wait.unobserved = unobserved;
         kill.wait.edge = Some(edge);
         kill
@@ -204,13 +199,14 @@ impl<'a> TreeKill<'a> {
 }
 
 impl<'a> KillWait<'a> {
-    pub(crate) fn none() -> KillWait<'a> {
+    /// A wait that names nothing yet; what it is given to wait for is re-opened through `kernel`.
+    pub(crate) fn none(kernel: &'a dyn Kernel) -> KillWait<'a> {
         KillWait {
             members: Vec::new(),
             unobserved: Vec::new(),
             edge: None,
             root: RootEnd::NotKilled,
-            kernel: &HostKernel,
+            kernel,
         }
     }
 
@@ -283,7 +279,7 @@ impl<'a> KillWait<'a> {
         }
         if let RootEnd::Waited { os: root, pid, id } = root {
             let unsettled = unseen.after_root(id, crate::os_process::drive::exited_until(root, by));
-            settle_root(root, pid, unsettled, &mut members, &mut reported);
+            settle_root(kernel, root, pid, unsettled, &mut members, &mut reported);
         }
         if let Some(edge) = edge {
             // Every member reached is settled: it exited or was reported above, once.
@@ -318,7 +314,7 @@ impl<'a> KillWait<'a> {
         }
         if let RootEnd::Waited { os: root, pid, id } = root {
             let unsettled = unseen.after_root(id, crate::tokio::drive::exited_until(root, by).await);
-            settle_root(root, pid, unsettled, &mut members, &mut reported);
+            settle_root(kernel, root, pid, unsettled, &mut members, &mut reported);
         }
         if let Some(edge) = edge {
             let settled = Settled::new(members, reported);
@@ -447,14 +443,21 @@ fn reported_pids(unnamed: &[Unnamed]) -> Vec<u32> {
 /// settled is lost, so a snapshot entry for it that reads an identity can be named a second time. Only a
 /// Job's edge reads the settlement.
 #[cfg(windows)]
-fn settle_root(root: &dyn OsProcess, pid: u32, failed: bool, members: &mut Vec<ProcessId>, reported: &mut Vec<u32>) {
+fn settle_root(
+    kernel: &dyn Kernel,
+    root: &dyn OsProcess,
+    pid: u32,
+    failed: bool,
+    members: &mut Vec<ProcessId>,
+    reported: &mut Vec<u32>,
+) {
     use std::os::windows::io::AsRawHandle as _;
 
     let raw = windows::Win32::Foundation::HANDLE(root.os_handle().as_raw_handle());
     if failed {
         reported.push(pid);
     }
-    match crate::identity::windows_identity_from_handle_result(&crate::identity::HostKernel, raw, pid) {
+    match crate::identity::windows_identity_from_handle_result(kernel, raw, pid) {
         Ok(id) => members.push(id),
         Err(e) => log::warn!(
             "the identity of the root, pid {pid}, cannot be read, so the drain's snapshot may name it again: \
@@ -467,6 +470,7 @@ fn settle_root(root: &dyn OsProcess, pid: u32, failed: bool, members: &mut Vec<P
 /// Only a Job's edge reads the root's settlement ([`Settled`]).
 #[cfg(not(windows))]
 fn settle_root(
+    _kernel: &dyn Kernel,
     _root: &dyn OsProcess,
     _pid: u32,
     _failed: bool,

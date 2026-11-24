@@ -69,6 +69,7 @@ fn assert_refused_sends_are_not_sent() {
     let leader = spawn_group_leader();
     let job = crate::containment::windows::assign_to_kill_on_close_job(
         std::os::windows::io::AsRawHandle::as_raw_handle(&*leader),
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
     )
     .expect("assign the group leader to a job");
     let broken = TreeStop::named(

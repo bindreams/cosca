@@ -1152,8 +1152,8 @@ pub(crate) use backend::ReadErr;
 #[cfg(target_os = "macos")]
 pub(crate) use backend::ppid_of as macos_ppid_of;
 
-/// What an ALREADY-OPEN Windows handle says about an identity. The held handle pins the
-/// kernel object, so this is pid-reuse-safe (unlike re-resolving by raw pid).
+/// What an ALREADY-OPEN Windows handle says about an identity, read through `kernel`. The held handle
+/// pins the kernel object, so this is pid-reuse-safe (unlike re-resolving by raw pid).
 #[cfg(windows)]
 #[derive(Debug)]
 pub(crate) enum HandleIdentity {
@@ -1168,8 +1168,12 @@ pub(crate) enum HandleIdentity {
 }
 
 #[cfg(windows)]
-pub(crate) fn windows_handle_identity(handle: windows::Win32::Foundation::HANDLE, id: ProcessId) -> HandleIdentity {
-    match backend::creation_token_result(handle) {
+pub(crate) fn windows_handle_identity(
+    kernel: &dyn Kernel,
+    handle: windows::Win32::Foundation::HANDLE,
+    id: ProcessId,
+) -> HandleIdentity {
+    match kernel.creation_token(handle) {
         Ok(t) if t == id.key => HandleIdentity::Same,
         Ok(_) => HandleIdentity::Different,
         Err(e) => HandleIdentity::Unreadable(e),

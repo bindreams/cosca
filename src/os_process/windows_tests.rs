@@ -198,7 +198,8 @@ fn a_uac_handle_keeps_the_access_it_was_read_as() {
 #[skuld::test]
 fn kill_of_a_process_that_is_exiting_but_not_signalled_is_ok() {
     let (child, _stdin, id) = blocker();
-    let kernel = std::sync::Arc::new(refusing_the_next_terminate());
+    // The open reads the handle's token through the kernel.
+    let kernel = std::sync::Arc::new(refusing_the_next_terminate().on_creation_token(Ok(id.key())));
     let p = open_with(std::sync::Arc::clone(&kernel), id)
         .map_err(OpenFailure::into_open_error)
         .unwrap()
@@ -294,7 +295,8 @@ fn event_handle() -> HANDLE {
 /// Mutant: `holds_process` converts with `.into()`, so the source's code is `0x80070006`.
 #[skuld::test]
 fn holds_process_of_an_unreadable_handle_carries_the_win32_code() {
-    let err = super::holds_process(event_handle(), ProcessId::current()).expect_err("an event has no creation time");
+    let err = super::holds_process(&crate::identity::HostKernel, event_handle(), ProcessId::current())
+        .expect_err("an event has no creation time");
     let crate::error::Error::Unassessable { source, .. } = err else {
         panic!("expected Unassessable, got {err:?}");
     };
@@ -319,7 +321,9 @@ fn open_verified_of_an_access_denied_live_process_carries_the_win32_code() {
     ) else {
         return;
     };
-    let io = denied_open_source(&done, |id| super::open_verified(id).map(|_| ()));
+    let io = denied_open_source(&done, |id| {
+        super::open_verified(&crate::identity::HostKernel, id).map(|_| ())
+    });
     assert_eq!(io.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32), "{io:?}");
 }
 

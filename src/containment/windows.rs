@@ -36,7 +36,7 @@ use windows::Win32::System::Threading::{
 use crate::containment::mechanism::Members;
 use crate::containment::tree_kill::{Settled, Unnamed};
 use crate::error::{io_context, win32_io_error};
-use crate::identity::ProcessId;
+use crate::identity::{ProcessId, SpawnKernel};
 
 /// Owns the Job Object handle. `KILL_ON_JOB_CLOSE` means the whole process tree
 /// is terminated when this handle is closed (by `Drop`, unless [`disarm`](JobHandle::disarm)ed).
@@ -50,6 +50,8 @@ pub(crate) struct JobHandle {
     /// ever had counts, wherever it came from, and the count never falls, so an empty listing at the
     /// same count has no process that was not confirmed.
     confirmed: AtomicU32,
+    /// The kernel of the spawn that made the job: its kill's wait re-opens the members through it.
+    kernel: SpawnKernel,
 }
 
 // A Windows job-object HANDLE is a process-wide kernel handle; using it
@@ -69,11 +71,12 @@ impl std::fmt::Debug for JobHandle {
 }
 
 impl JobHandle {
-    fn new(handle: HANDLE) -> Self {
+    fn new(handle: HANDLE, kernel: SpawnKernel) -> Self {
         debug_assert!(!handle.0.is_null(), "job handle must not be null");
         JobHandle {
             raw: handle,
             confirmed: AtomicU32::new(0),
+            kernel,
         }
     }
 
@@ -131,7 +134,7 @@ impl JobHandle {
         // Safety: CreateJobObjectW with null name/attrs returns an owned job handle.
         let handle = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }
             .expect("CreateJobObjectW for test placeholder");
-        JobHandle::new(handle)
+        JobHandle::new(handle, crate::identity::spawn_kernel(crate::identity::HostKernel))
     }
 
     /// Test-only: assign the process at `process` to this job, beside its members.
@@ -170,7 +173,7 @@ impl JobHandle {
             )
         }
         .expect("DuplicateHandle with reduced access");
-        JobHandle::new(weak)
+        JobHandle::new(weak, std::sync::Arc::clone(&self.kernel))
     }
 }
 
@@ -424,6 +427,7 @@ impl crate::containment::Contains for JobHandle {
             members,
             unobserved,
             crate::containment::drain_edge::DrainEdge::Job(self),
+            &*self.kernel,
         )
     }
 
@@ -1102,14 +1106,17 @@ pub(crate) mod fault {
 /// `pub(crate)`: also the sole constructor behind the public [`crate::containment::job::Job`]
 /// primitive — reused verbatim rather than duplicated, so `Command::contain()` and `Job::assign`
 /// share exactly one implementation.
-pub(crate) fn assign_to_kill_on_close_job(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
+pub(crate) fn assign_to_kill_on_close_job(
+    proc_handle: std::os::windows::io::RawHandle,
+    kernel: SpawnKernel,
+) -> io::Result<JobHandle> {
     // A Windows `RawHandle` is a `*mut c_void`.
     let raw_handle = HANDLE(proc_handle.cast());
     // SAFETY: a standard Win32 call; its handle is closed on every error path below.
     let job = owned_job(unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) })?;
     set_kill_on_close_or_close(job)?;
     assign_or_close(job, raw_handle)?;
-    Ok(JobHandle::new(job))
+    Ok(JobHandle::new(job, kernel))
 }
 
 /// The job `CreateJobObjectW` made, or its failure with the plain Win32 code.
@@ -1152,10 +1159,10 @@ fn assign_or_close(job: HANDLE, process: HANDLE) -> io::Result<()> {
 
 /// [`assign_to_kill_on_close_job`] as `attach` takes it: the job is assigned and the child is NOT
 /// resumed.
-pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle) -> io::Result<JobHandle> {
+pub(crate) fn assign_held(proc_handle: std::os::windows::io::RawHandle, kernel: SpawnKernel) -> io::Result<JobHandle> {
     #[cfg(test)]
     forced(fault::Step::Assign, None).map_err(win32_io_error)?;
-    assign_to_kill_on_close_job(proc_handle)
+    assign_to_kill_on_close_job(proc_handle, kernel)
 }
 
 /// Read the job's LIVE member pids via `QueryInformationJobObject(JobObjectBasicProcessIdList)`
@@ -2541,8 +2548,9 @@ pub(crate) fn resume_initial_threads(
 pub(crate) fn attach_job(
     proc_handle: std::os::windows::io::RawHandle,
     strict: bool,
+    kernel: SpawnKernel,
 ) -> Result<Option<JobHandle>, crate::containment::dispatch::AttachFailure> {
-    let job_result = match assign_held(proc_handle) {
+    let job_result = match assign_held(proc_handle, kernel) {
         Err(e) if strict => {
             let detail = "the child could not be put in its Job Object";
             let source = crate::error::Error::io_cause(e);

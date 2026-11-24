@@ -1021,9 +1021,13 @@ impl<'a> Swept<'a> {
         Swept { op, answer, wait }
     }
 
-    /// The answer of a call that killed nothing, so it waits for nothing.
-    pub(crate) fn unwaited(op: &'static str, answer: Result<(), SweepFailure>) -> Swept<'a> {
-        Swept::new(op, answer, crate::containment::KillWait::none())
+    /// The answer of a call that killed nothing, so it waits for nothing. `kernel` is the caller's.
+    pub(crate) fn unwaited(
+        op: &'static str,
+        answer: Result<(), SweepFailure>,
+        kernel: &'a dyn crate::identity::Kernel,
+    ) -> Swept<'a> {
+        Swept::new(op, answer, crate::containment::KillWait::none(kernel))
     }
 
     /// The sweep's answer, for a caller that sends and does not wait.
@@ -1883,7 +1887,7 @@ fn attach_tree(
                 // Session mode: setsid was applied pre-spawn; no cgroup.
                 // pgid == sid == pid for the session leader; killpg works.
                 if matches!(prepared.mode, Some(ContainMode::Session)) {
-                    return Ok(Tree::contained(Mechanism::Group(Group::session(pgid))));
+                    return Ok(Tree::contained(Mechanism::Group(Group::session(pgid, prepared.kernel))));
                 }
 
                 // Strongest and BestEffort: the cgroup leaf if `prepare` made one, else the
@@ -1918,7 +1922,10 @@ fn attach_tree(
                                 // in the process group set before the spawn: a degrade.
                                 Err(reason) => {
                                     crate::containment::cgroup::log_degrade(&reason);
-                                    Ok(Tree::contained(Mechanism::Group(Group::process_group(pgid))))
+                                    Ok(Tree::contained(Mechanism::Group(Group::process_group(
+                                        pgid,
+                                        prepared.kernel,
+                                    ))))
                                 }
                             };
                         }
@@ -1926,7 +1933,10 @@ fn attach_tree(
                 }
                 // No cgroup leaf (none offered, or a `BestEffort` spawn made none): the process
                 // group set pre-spawn.
-                return Ok(Tree::contained(Mechanism::Group(Group::process_group(pgid))));
+                return Ok(Tree::contained(Mechanism::Group(Group::process_group(
+                    pgid,
+                    prepared.kernel,
+                ))));
             } else {
                 // Nested member: it joined the ancestor's cgroup/process group (or the
                 // root's tree-walk) rather than creating its own, so it owns no teardown —
@@ -1975,8 +1985,8 @@ fn attach_tree(
                 );
                 let pgid = raw_pid as i32;
                 let group = match prepared.mode {
-                    Some(ContainMode::Session) => Group::session(pgid),
-                    _ => Group::process_group(pgid),
+                    Some(ContainMode::Session) => Group::session(pgid, prepared.kernel),
+                    _ => Group::process_group(pgid, prepared.kernel),
                 };
                 return Ok(Tree::contained(Mechanism::Group(group)));
             } else {
@@ -2012,7 +2022,7 @@ fn attach_tree(
             // A frozen root is assigned its job and left suspended. It gets no `TreeWalk` fallback:
             // a frozen root without a job would have nothing to kill it if its owner died.
             if prepared.frozen {
-                return match crate::containment::windows::assign_held(proc_handle) {
+                return match crate::containment::windows::assign_held(proc_handle, prepared.kernel) {
                     Ok(job) => Ok(Tree::contained(Mechanism::Job(job))),
                     Err(e) => Err(Error::Containment {
                         detail: "the frozen child could not be put in its Job Object".to_owned(),
@@ -2022,7 +2032,8 @@ fn attach_tree(
                 };
             }
             let strict = prepared.mode.is_some_and(ContainMode::is_strict);
-            match crate::containment::windows::attach_job(proc_handle, strict) {
+            match crate::containment::windows::attach_job(proc_handle, strict, std::sync::Arc::clone(&prepared.kernel))
+            {
                 Ok(Some(job)) => return Ok(Tree::contained(Mechanism::Job(job))),
                 Ok(None) => {
                     // Fall back to the universal TreeWalk mechanism rather than silently yielding no

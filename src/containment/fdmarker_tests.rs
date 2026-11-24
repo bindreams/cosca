@@ -1602,6 +1602,35 @@ fn a_holders_kill_reads_its_identity_through_the_markers_kernel() {
     crate::child::spawn::identity_macos_tests::end_unsignalled_and_reap(pid);
 }
 
+/// A marker's kill is waited for through the marker's kernel: the member the test adds to the wait is
+/// a pid the host does not have (above `PID_MAX`), and the stated row refuses its open, where the host
+/// finds no such process, which is an exit. The row is asserted taken.
+///
+/// Mutant: `Marker::kill_tree` builds its kill over a host kernel.
+#[skuld::test]
+fn a_markers_kill_waits_through_the_kernel_the_marker_holds() {
+    use crate::identity::{FakeKernel, HostKernel, Key, ProcessId, UniqRead};
+
+    let _serialize = test_spawn_lock();
+    let member = ProcessId::from_parts_for_test(999_999, Key::for_test(1));
+    let kernel =
+        std::sync::Arc::new(FakeKernel::over(&HostKernel).on_unique_info(member.pid(), UniqRead::Refused(libc::EPERM)));
+    let marker = marker_without_holders(
+        inert_root(),
+        None,
+        crate::identity::spawn_kernel(std::sync::Arc::clone(&kernel)),
+    );
+
+    let (_, mut wait) = marker
+        .kill_tree(Some(&crate::test_support::stated_root::StatedRoot::unreaped()))
+        .split();
+    wait.reaching([member]);
+    let err = wait.wait(None).expect_err("the stated member's open was refused");
+
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EPERM), "{err:?}");
+    assert!(kernel.all_rows_taken(), "the wait read the row");
+}
+
 /// Two failures of one teardown fold into one error with both failures whole as the members of the
 /// `Several` below it, and neither's words in the detail. The variant says what failed:
 /// `Containment` when either is one, else `Unassessable`.

@@ -324,7 +324,11 @@ pub(crate) fn spawn_job_member() -> (StdChild, crate::containment::windows::JobH
     use std::os::windows::io::AsRawHandle as _;
 
     let child = spawn_more_blocker();
-    let job = crate::containment::windows::assign_to_kill_on_close_job(child.as_raw_handle()).expect("assign to job");
+    let job = crate::containment::windows::assign_to_kill_on_close_job(
+        child.as_raw_handle(),
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+    )
+    .expect("assign to job");
     (child, job)
 }
 
@@ -352,7 +356,11 @@ pub(crate) fn spawn_job_gui_member() -> (GuiMember, crate::containment::windows:
     crate::test_reexec::scrub_env(|var| _ = cmd.env_remove(var));
     cmd.env(ack::ACK_ENV, "1");
     let child = StdChild::spawn(&mut cmd);
-    let job = crate::containment::windows::assign_to_kill_on_close_job(child.as_raw_handle()).expect("assign to job");
+    let job = crate::containment::windows::assign_to_kill_on_close_job(
+        child.as_raw_handle(),
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+    )
+    .expect("assign to job");
     let id = crate::identity::ProcessId::of(child.id())
         .found()
         .expect("the member's identity");
@@ -1248,8 +1256,8 @@ fn watch_windows(listener: &std::net::TcpListener, target: crate::identity::Proc
     use windows::Win32::Networking::WinSock::{WSAEventSelect, FD_ACCEPT, SOCKET, WSAEVENT};
     use windows::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
 
-    let Some((process, _granted)) =
-        crate::os_process::windows::open_verified(target).expect("open a handle to watch the target")
+    let Some((process, _granted)) = crate::os_process::windows::open_verified(&crate::identity::HostKernel, target)
+        .expect("open a handle to watch the target")
     else {
         return WatchEvent::Died;
     };

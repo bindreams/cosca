@@ -81,6 +81,7 @@ fn the_wait_over_a_jobs_listed_members_blocks_on_a_running_member() {
         members,
         unobserved,
         DrainEdge::Job(&job.0),
+        &crate::identity::HostKernel,
     )
     .split();
     wait.wait(None).expect("the member exited and the job drained");

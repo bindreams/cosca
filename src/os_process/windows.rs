@@ -58,7 +58,7 @@ impl<K: Kernel + Send> WindowsProcess<K> {
     /// Open the process `id` names, asking `kernel`, which the process then owns. `Ok(None)`: it is
     /// gone, or its pid now names another process.
     pub(crate) fn open(kernel: K, id: ProcessId) -> Result<Option<Self>, Error> {
-        let Some((handle, granted)) = open_verified(id)? else {
+        let Some((handle, granted)) = open_verified(&kernel, id)? else {
             return Ok(None);
         };
         #[cfg(test)]
@@ -143,8 +143,8 @@ fn close(handle: HANDLE) {
 /// Whether `handle` still names `id`'s process. `Ok(false)`: the pid was recycled before the
 /// open, so the original is gone. The handle is closed on `Ok(false)` and on `Err`; on `Ok(true)`
 /// the caller still holds it.
-fn holds_process(handle: HANDLE, id: ProcessId) -> Result<bool, Error> {
-    match crate::identity::windows_handle_identity(handle, id) {
+fn holds_process(kernel: &dyn Kernel, handle: HANDLE, id: ProcessId) -> Result<bool, Error> {
+    match crate::identity::windows_handle_identity(kernel, handle, id) {
         HandleIdentity::Same => Ok(true),
         HandleIdentity::Different => {
             close(handle);
@@ -163,7 +163,10 @@ fn holds_process(handle: HANDLE, id: ProcessId) -> Result<bool, Error> {
 /// Opens `id` with the rights it grants (see the module doc), verifies the handle names that
 /// process, and returns it with the rights granted. `None`: it is gone, or its pid was recycled
 /// before the open. The caller closes the handle.
-pub(crate) fn open_verified(id: ProcessId) -> Result<Option<(HANDLE, PROCESS_ACCESS_RIGHTS)>, Error> {
+pub(crate) fn open_verified(
+    kernel: &dyn Kernel,
+    id: ProcessId,
+) -> Result<Option<(HANDLE, PROCESS_ACCESS_RIGHTS)>, Error> {
     let (opened, granted) = windows_open_dropping_refused(id.pid(), &[PROCESS_SYNCHRONIZE, PROCESS_TERMINATE]);
     let handle = match opened {
         Opened::Found(h) => h,
@@ -184,7 +187,7 @@ pub(crate) fn open_verified(id: ProcessId) -> Result<Option<(HANDLE, PROCESS_ACC
     };
     // The handle already in hand answers the recycle question with no race; a second by-pid
     // lookup would not. An UNREADABLE token is not proof the target is gone, so it is an error.
-    if !holds_process(handle, id)? {
+    if !holds_process(kernel, handle, id)? {
         return Ok(None); // recycled before open - the original is gone
     }
     Ok(Some((handle, granted)))

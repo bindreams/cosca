@@ -319,9 +319,12 @@ fn a_tree_is_actionable() {
     assert!(Tree::contained(walk).require_contained().is_ok());
     #[cfg(unix)]
     assert!(
-        Tree::contained(Mechanism::Group(crate::containment::unix::Group::process_group(0)))
-            .require_contained()
-            .is_ok()
+        Tree::contained(Mechanism::Group(crate::containment::unix::Group::process_group(
+            0,
+            crate::identity::spawn_kernel(crate::identity::HostKernel)
+        )))
+        .require_contained()
+        .is_ok()
     );
     #[cfg(target_os = "linux")]
     assert!(Tree::contained(Mechanism::Cgroup(

@@ -1224,8 +1224,8 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
     );
 }
 
-/// A walk sends each descendant's kill through the kernel it was given: one `terminate` row per
-/// descendant, taken by its kill. The root's kill is the host's (a `ByIdentity` over the host
+/// A walk sends each descendant's kill through the kernel it was given: one `creation_token` row (the
+/// open by identity) and one `terminate` row per descendant, taken by its kill. The root's kill is the host's (a `ByIdentity` over the host
 /// kernel) and ends the root.
 ///
 /// Mutant: `kill_one` asks the host kernel instead of the walk's.
@@ -1254,9 +1254,9 @@ fn a_walk_kills_each_descendant_through_its_kernel_on_windows() {
     assert_eq!(read, 1, "the root closed its output before its child echoed");
     let descendants = root.children(Recursive::Yes).expect("the root's descendants");
     assert!(!descendants.is_empty(), "precondition: the root has descendants");
-    let kernel = descendants
-        .iter()
-        .fold(FakeKernel::new(), |kernel, _| kernel.on_terminate(Ok(())));
+    let kernel = descendants.iter().fold(FakeKernel::new(), |kernel, descendant| {
+        kernel.on_creation_token(Ok(descendant.key())).on_terminate(Ok(()))
+    });
 
     let outcome = super::hard_kill(&kernel, root, &super::ByIdentity::new(&HostKernel, root))
         .outcome()
@@ -1669,7 +1669,8 @@ fn kill_by_identity_reports_a_member_that_is_exiting_but_not_signalled_as_gone()
         child.id(),
     )
     .expect("the owned handle always yields an identity");
-    let kernel = crate::identity::refusing_the_next_terminate();
+    // The member is opened by its identity, which reads the handle's token through the kernel.
+    let kernel = crate::identity::refusing_the_next_terminate().on_creation_token(Ok(id.key()));
     let outcome = super::kill_by_identity(&kernel, id);
 
     assert!(

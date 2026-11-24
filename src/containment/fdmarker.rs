@@ -1193,7 +1193,7 @@ impl Marker {
     /// while the root's number names the root; the holders alone, with the rest skipped
     /// ([`TreeKillOutcome::Skipped`]), when the number may name another process or the root is
     /// `Unpinned` or `Unknown`.
-    pub(crate) fn kill_tree<'a>(&self, root: Option<&dyn Root>) -> TreeKill<'a> {
+    pub(crate) fn kill_tree(&self, root: Option<&dyn Root>) -> TreeKill<'_> {
         let ran = |sent: Result<(), Error>| sent.map_err(Unkilled::from);
         let mut killed = Vec::new();
         let outcome = match self.look_at(root) {
@@ -1221,7 +1221,7 @@ impl Marker {
                 }
             }
         };
-        TreeKill::of(outcome).reaching(killed)
+        TreeKill::of(outcome, &*self.kernel).reaching(killed)
     }
 
     fn hard_kill_impl(&self, scope: Scope<'_>, killed: &mut Vec<ProcessId>) -> Result<(), Error> {

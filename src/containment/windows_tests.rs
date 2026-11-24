@@ -857,6 +857,7 @@ fn a_kill_wait_reports_a_member_whose_identity_cannot_be_read_once() {
         Vec::new(),
         vec![unnamed],
         DrainEdge::Job(&job),
+        &crate::identity::HostKernel,
     )
     .split();
 
@@ -948,7 +949,14 @@ fn a_kill_wait_reports_a_member_it_waited_for_once_when_the_snapshot_cannot_read
         .expect("assign the restricted member to the job");
     let _failed = super::fault::force_next_for_thread(super::fault::Step::Identity, ERROR_ACCESS_DENIED.0, pid);
     let forced = super::fault::force_job_pid_list(Vec::new());
-    let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), DrainEdge::Job(&job)).split();
+    let (_, wait) = TreeKill::listed(
+        TreeKillOutcome::Ran(Ok(())),
+        vec![id],
+        Vec::new(),
+        DrainEdge::Job(&job),
+        &crate::identity::HostKernel,
+    )
+    .split();
 
     let verdict = wait.wait(None);
 
@@ -1533,7 +1541,14 @@ fn a_kill_wait_names_a_member_it_may_not_wait_on_once() {
     job.assign_for_test(member.handle().0)
         .expect("assign the restricted member to the job");
     let forced = super::fault::force_job_pid_list(Vec::new());
-    let (_, wait) = TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), DrainEdge::Job(&job)).split();
+    let (_, wait) = TreeKill::listed(
+        TreeKillOutcome::Ran(Ok(())),
+        vec![id],
+        Vec::new(),
+        DrainEdge::Job(&job),
+        &crate::identity::HostKernel,
+    )
+    .split();
 
     let verdict = wait.wait(None);
 
@@ -1618,6 +1633,7 @@ fn assert_the_failed_root_is_the_one_error(done: &crate::test_own_process::Compl
         Vec::new(),
         Vec::new(),
         DrainEdge::Job(&job),
+        &crate::identity::HostKernel,
     )
     .split();
 
@@ -1747,7 +1763,8 @@ fn wait_drained_raw_tracks_a_real_member_through_exit() {
     .expect("spawn cmd /C more");
     let raw = child.as_raw_handle();
 
-    let job = super::assign_to_kill_on_close_job(raw).expect("assign to job");
+    let job = super::assign_to_kill_on_close_job(raw, crate::identity::spawn_kernel(crate::identity::HostKernel))
+        .expect("assign to job");
 
     let pids = super::query_job_pid_list(job.raw).expect("query pid list");
     assert_eq!(
@@ -2182,8 +2199,11 @@ impl SuspendedHelper {
             options,
         )
         .expect("spawn the suspended helper");
-        let job =
-            super::assign_to_kill_on_close_job(child.process().as_raw_handle()).expect("assign the helper to a job");
+        let job = super::assign_to_kill_on_close_job(
+            child.process().as_raw_handle(),
+            crate::identity::spawn_kernel(crate::identity::HostKernel),
+        )
+        .expect("assign the helper to a job");
         Self { child, _job: job }
     }
 }
@@ -2820,9 +2840,13 @@ fn death_watch_attach_job_succeeds_when_the_initial_thread_was_already_running()
     let thread = crate::test_frozen::InitialThread::of(child.id());
     assert_eq!(thread.release_one(), 1);
 
-    let job = super::attach_job(crate::test_frozen::raw(&child), true)
-        .expect("an ordinary attach must not fail on a running thread")
-        .expect("the job was assigned");
+    let job = super::attach_job(
+        crate::test_frozen::raw(&child),
+        true,
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+    )
+    .expect("an ordinary attach must not fail on a running thread")
+    .expect("the job was assigned");
 
     // KILL_ON_JOB_CLOSE ends the child. `wait` closes its stdin, so a close that killed nothing
     // lets it run to its end.
@@ -2854,7 +2878,12 @@ fn attach_job_whose_resume_and_job_kill_both_fail_returns_the_kill_as_cleanup() 
         move || *kill_failure.borrow_mut() = Some(force_next(Step::JobKill, ERROR_INVALID_HANDLE))
     });
 
-    let failure = super::attach_job(crate::test_frozen::raw(&child), true).expect_err("the resume failed");
+    let failure = super::attach_job(
+        crate::test_frozen::raw(&child),
+        true,
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+    )
+    .expect_err("the resume failed");
 
     assert!(
         matches!(failure.cause, crate::error::Error::Containment { .. }),
@@ -2940,7 +2969,11 @@ fn death_watch_assign_held_assigns_the_job_without_resuming() {
     let mut child = crate::test_frozen::spawn_suspended_releasable();
     let thread = crate::test_frozen::InitialThread::of(child.id());
 
-    let job = super::assign_held(crate::test_frozen::raw(&child)).expect("assign the held child");
+    let job = super::assign_held(
+        crate::test_frozen::raw(&child),
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+    )
+    .expect("assign the held child");
 
     assert_eq!(thread.suspend_count(), 1, "assign_held must not resume");
     assert_ne!(
@@ -2969,7 +3002,10 @@ fn event_handle() -> windows::Win32::Foundation::HANDLE {
 /// Mutant: `hard_kill` converts with `.into()`, so the code is `0x80070006`.
 #[skuld::test]
 fn hard_kill_failure_carries_the_win32_code() {
-    let h = super::JobHandle::new(event_handle());
+    let h = super::JobHandle::new(
+        event_handle(),
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+    );
     let err = h.hard_kill().expect_err("an event is not a job");
     assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE), "{err:?}");
 }
@@ -2981,7 +3017,10 @@ fn hard_kill_failure_carries_the_win32_code() {
 #[skuld::test]
 fn a_failed_job_kill_is_a_containment_over_the_win32_error() {
     use crate::containment::Contains as _;
-    let h = super::JobHandle::new(event_handle());
+    let h = super::JobHandle::new(
+        event_handle(),
+        crate::identity::spawn_kernel(crate::identity::HostKernel),
+    );
     let left = h.send_kill(None).into_result().expect_err("an event is not a job");
     let [error] = &left.members[..] else {
         panic!("{left:?}");

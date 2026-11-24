@@ -698,7 +698,7 @@ impl Child {
         #[cfg(not(unix))]
         let _ = earlier;
         if let Err(e) = self.require_contained() {
-            return Swept::unwaited(op, Err(e.into()));
+            return Swept::unwaited(op, Err(e.into()), self.proc.kernel());
         }
         // The mechanism looks at the root right before it sends by the root's number, and sends the
         // root its own signal through this handle.
@@ -713,7 +713,10 @@ impl Child {
         // What the settlement kills again is waited for with what the send reached.
         let kill_tree = || match kind {
             KillTree::Waiting => self.tree.kill(root).split(),
-            KillTree::SendOnly => (self.tree.send_kill(root), crate::containment::KillWait::none()),
+            KillTree::SendOnly => (
+                self.tree.send_kill(root),
+                crate::containment::KillWait::none(self.proc.kernel()),
+            ),
         };
         let killed = self.proc.kill_root(
             reach,
@@ -734,7 +737,7 @@ impl Child {
             },
         );
         match killed {
-            KillRootOutcome::Refused(refusal) => Swept::unwaited(op, Err(refusal.into())),
+            KillRootOutcome::Refused(refusal) => Swept::unwaited(op, Err(refusal.into()), self.proc.kernel()),
             // A signal after the front's cgroup kill could only be refused, and whether the kill reached
             // it was read after it. One whose kill failed may still have its program running: left alone.
             KillRootOutcome::Contained { reached, carry: wait } => {

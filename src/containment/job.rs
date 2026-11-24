@@ -60,7 +60,9 @@ impl Job {
     #[must_use = "dropping the returned `Job` immediately kills the whole tree just assigned to \
                   it, unless `disarm()` is called first"]
     pub fn assign(process: BorrowedHandle<'_>) -> Result<Job, Error> {
-        Ok(Job(assign_to_kill_on_close_job(process.as_raw_handle())?))
+        // A `Job` has no spawn to take a kernel from, and its process is the caller's own host process.
+        let kernel = crate::identity::spawn_kernel(crate::identity::HostKernel);
+        Ok(Job(assign_to_kill_on_close_job(process.as_raw_handle(), kernel)?))
     }
 
     /// Terminate every process still in the job, and wait for them to exit.

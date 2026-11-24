@@ -16,14 +16,13 @@ use crate::containment::mechanism::{nothing_held, Contains, KillLeftOutcome};
 use crate::containment::tree_kill::refused_unobserved;
 use crate::containment::treewalk::{Left, Listing};
 use crate::containment::{Containment, Root, TerminateOutcome, TreeKill, TreeStop};
-use crate::identity::ProcessId;
+use crate::identity::{spawn_kernel, HostKernel, ProcessId, SpawnKernel};
 
 /// The sends a [`FakeContains`] was asked for, in order: `"kill"`, `"terminate"`, `"disarm"` and
 /// `"release"`.
 pub(crate) type Sends = Arc<Mutex<Vec<&'static str>>>;
 
 /// The answers of a mechanism that names a tree no process is in.
-#[derive(Debug)]
 pub(crate) struct FakeContains {
     kind: Containment,
     /// Whether a kill through it reaches the child asked about ([`Contains::would_reach`]).
@@ -50,6 +49,18 @@ pub(crate) struct FakeContains {
     /// went out and found nothing wrong.
     terminate_answers: Mutex<VecDeque<TerminateOutcome>>,
     sends: Sends,
+    /// The kernel its kill's wait re-opens the members through. The members it states are host
+    /// processes that a test ends.
+    kernel: SpawnKernel,
+}
+
+impl std::fmt::Debug for FakeContains {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeContains")
+            .field("kind", &self.kind)
+            .field("killed", &self.killed)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The members a [`FakeContains`] states it names, the ones it states it cannot name, and a listing it
@@ -82,6 +93,7 @@ impl FakeContains {
             kill_answers: Mutex::default(),
             terminate_answers: Mutex::default(),
             sends: sends.clone(),
+            kernel: spawn_kernel(HostKernel),
         };
         (fake, sends)
     }
@@ -199,9 +211,9 @@ impl Contains for FakeContains {
                 detail: "the process table could not be read".into(),
                 source: None,
             };
-            return TreeKill::of(TreeKillOutcome::Unwalked(error));
+            return TreeKill::of(TreeKillOutcome::Unwalked(error), &*self.kernel);
         }
-        let kill = TreeKill::of(TreeKillOutcome::Ran(Ok(()))).reaching(self.killed.iter().copied());
+        let kill = TreeKill::of(TreeKillOutcome::Ran(Ok(())), &*self.kernel).reaching(self.killed.iter().copied());
         #[cfg(unix)]
         let kill = self
             .unobserved

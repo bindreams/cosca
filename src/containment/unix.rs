@@ -61,32 +61,51 @@ use crate::containment::{
     check_number, Containment, Root, SendAnswer, Skip, TerminateOutcome, TreeKill, TreeStop, UnsentKind, Why,
 };
 use crate::error::{Error, Failures};
+use crate::identity::{Kernel, SpawnKernel};
 use std::sync::Arc;
 
 /// A process group or a session, named by the root's pid (`pgid == sid == pid` for a session's
 /// leader): its kill and its terminate send by that number, as the root's own state allows
 /// ([`kill_group_tree`], [`term_group_tree`]).
-#[derive(Debug)]
 pub(crate) struct Group {
     pgid: i32,
     session: bool,
+    /// The kernel of the spawn that made the group: its kill's wait re-opens the members through it.
+    kernel: SpawnKernel,
+}
+
+impl std::fmt::Debug for Group {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Group")
+            .field("pgid", &self.pgid)
+            .field("session", &self.session)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Group {
     /// The process group `pgid`, led by the root.
-    pub(crate) fn process_group(pgid: i32) -> Group {
-        Group { pgid, session: false }
+    pub(crate) fn process_group(pgid: i32, kernel: SpawnKernel) -> Group {
+        Group {
+            pgid,
+            session: false,
+            kernel,
+        }
     }
 
     /// The session whose initial process group is `pgid`, led by the root.
-    pub(crate) fn session(pgid: i32) -> Group {
-        Group { pgid, session: true }
+    pub(crate) fn session(pgid: i32, kernel: SpawnKernel) -> Group {
+        Group {
+            pgid,
+            session: true,
+            kernel,
+        }
     }
 }
 
 impl Contains for Group {
     fn kill(&self, root: Option<&dyn Root>) -> TreeKill<'_> {
-        kill_group_tree(self.pgid, root)
+        kill_group_tree(&*self.kernel, self.pgid, root)
     }
 
     fn send_terminate(&self, _pid: u32, root: Option<&dyn Root>, how: TreeStop) -> (TerminateOutcome, Option<Listing>) {
@@ -413,7 +432,7 @@ fn log_empty_group(pgid: i32) {
 /// by the number, when the number may name another process ([`TreeKillOutcome::Skipped`]: on Linux the
 /// caller kills the root alone through its handle when [`Skip::root_alone`]). A group kill is given
 /// its `root`, as [`check_number`] needs it.
-pub(crate) fn kill_group_tree<'a>(pgid: i32, root: Option<&dyn Root>) -> TreeKill<'a> {
+pub(crate) fn kill_group_tree<'a>(kernel: &'a dyn Kernel, pgid: i32, root: Option<&dyn Root>) -> TreeKill<'a> {
     let mut killed = Vec::new();
     let ran = |sent: Result<(), Error>| TreeKillOutcome::Ran(sent.map_err(Unkilled::from));
     let outcome = match root {
@@ -430,7 +449,7 @@ pub(crate) fn kill_group_tree<'a>(pgid: i32, root: Option<&dyn Root>) -> TreeKil
             look => TreeKillOutcome::Skipped(skipped_group(pgid, "kill", look)),
         },
     };
-    TreeKill::of(outcome).reaching(killed)
+    TreeKill::of(outcome, kernel).reaching(killed)
 }
 
 /// [`term_group`] as a tree call decides it, on one look at `root` ([`kill_group_tree`]). A skip ends

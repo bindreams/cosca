@@ -823,8 +823,14 @@ mod windows {
             .expect("assign the restricted member to the job");
         let rt = single_thread_pool_runtime();
         let forced = crate::containment::windows::fault::force_job_pid_list(Vec::new());
-        let (_, wait) =
-            TreeKill::listed(TreeKillOutcome::Ran(Ok(())), vec![id], Vec::new(), DrainEdge::Job(&job)).split();
+        let (_, wait) = TreeKill::listed(
+            TreeKillOutcome::Ran(Ok(())),
+            vec![id],
+            Vec::new(),
+            DrainEdge::Job(&job),
+            &crate::identity::HostKernel,
+        )
+        .split();
 
         let verdict = rt.block_on(wait.wait_async(None));
 

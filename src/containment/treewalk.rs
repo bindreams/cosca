@@ -882,15 +882,15 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
     let skip_root = false;
     let table = match crate::containment::enumerate::process_table(kernel) {
         Ok(table) => table,
-        Err(error) => return TreeKill::of(TreeKillOutcome::Unwalked(error)).through(kernel),
+        Err(error) => return TreeKill::of(TreeKillOutcome::Unwalked(error), kernel),
     };
     let Walk {
         members: descendants,
         unassessed,
     } = match walk_from(kernel, root, &table.parents, Recursive::Yes) {
         Ok(Some(walk)) => walk,
-        Ok(None) => return TreeKill::of(TreeKillOutcome::NoRoot(root.pid(), None)).through(kernel),
-        Err(error) => return TreeKill::of(TreeKillOutcome::Unwalked(error)).through(kernel),
+        Ok(None) => return TreeKill::of(TreeKillOutcome::NoRoot(root.pid(), None), kernel),
+        Err(error) => return TreeKill::of(TreeKillOutcome::Unwalked(error), kernel),
     };
     #[cfg(test)]
     fault::note_walk(root.pid());
@@ -923,10 +923,10 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
     let mut unread: Option<(usize, Error)> = None;
     let begun = match exit_begun(kernel, &table, root) {
         Ok(true) if !walked && root_left.is_none() => {
-            return TreeKill::of(TreeKillOutcome::NoRoot(root.pid(), None)).through(kernel);
+            return TreeKill::of(TreeKillOutcome::NoRoot(root.pid(), None), kernel);
         }
         Err(unreadable) if !walked && root_left.is_none() => {
-            return TreeKill::of(TreeKillOutcome::Unwalked(unreadable)).through(kernel);
+            return TreeKill::of(TreeKillOutcome::Unwalked(unreadable), kernel);
         }
         Ok(begun) => begun,
         Err(unreadable) => {
@@ -982,10 +982,7 @@ pub(crate) fn hard_kill<'a>(kernel: &'a dyn Kernel, root: ProcessId, held: &dyn 
             resolved,
         }))
     };
-    TreeKill::of(outcome)
-        .through(kernel)
-        .reaching(killed)
-        .root_killed(root_killed)
+    TreeKill::of(outcome, kernel).reaching(killed).root_killed(root_killed)
 }
 
 /// `id`'s SIGKILL by identity (`TerminateProcess` on Windows).
@@ -1525,7 +1522,7 @@ fn skipped_walk(root: Option<&dyn crate::containment::Root>) -> Option<Skip> {
 /// else walked.
 pub(crate) fn kill_tree<'a>(kernel: &'a dyn Kernel, root: ProcessId, owner: Option<&dyn Root>) -> TreeKill<'a> {
     match skipped_walk(owner) {
-        Some(skip) => TreeKill::of(TreeKillOutcome::Skipped(skip)).through(kernel),
+        Some(skip) => TreeKill::of(TreeKillOutcome::Skipped(skip), kernel),
         None => hard_kill(kernel, root, owner.unwrap_or(&ByIdentity::new(kernel, root))),
     }
 }

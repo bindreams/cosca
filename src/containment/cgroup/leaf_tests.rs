@@ -873,6 +873,38 @@ fn a_cgroup_lists_its_members_before_it_kills_them(#[fixture(cgroup)] _group: &G
     );
 }
 
+/// A cgroup kill is waited for through the kernel the leaf holds: the member the test adds to the wait
+/// is a pid the host does not have (above `pid_max`), and the stated row refuses its open, where the
+/// host answers `ESRCH`, which is an exit. The leaf's own member is real, and its kill ends it.
+///
+/// Mutant: `Contains::kill` of the leaf builds its `TreeKill::listed` over a host kernel.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_cgroup_kill_waits_through_the_kernel_the_leaf_holds(#[fixture(cgroup)] _group: &Group) {
+    use crate::containment::Contains as _;
+    use crate::identity::{spawn_kernel, FakeKernel, HostKernel, Key, ProcessId};
+
+    const STATED: u32 = 2_000_000_000;
+    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(STATED, Err(rustix::io::Errno::MFILE));
+    let leaf = lane_leaf().asking_for_test(spawn_kernel(kernel));
+    let (mut member, id) = cat_member();
+    place(&member, &leaf.leaf_path);
+
+    let (sent, mut wait) = leaf.kill(None).split();
+    sent.into_result().expect("the leaf's kill");
+    assert_eq!(wait.members_for_test(), [id], "the leaf's own member was reached");
+    wait.reaching([ProcessId::from_parts_for_test(STATED, Key::Pidfs(1))]);
+    let err = wait.wait(None).expect_err("the stated member's open was refused");
+
+    _ = member.wait();
+    let said = crate::error::said(&err);
+    assert!(
+        said.contains(&format!("pid {STATED} was killed, but its exit cannot be observed")),
+        "{said}"
+    );
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EMFILE), "{err:?}");
+}
+
 /// A kill the kernel refused names no member to wait for: its `Err` is returned, where a wait over
 /// members it did not kill would hang. The wait is made to end the member where it blocks, so a mutant
 /// fails by assertion.
@@ -1124,6 +1156,7 @@ fn the_wait_over_a_leafs_listed_members_blocks_on_a_running_member(#[fixture(cgr
         members,
         unobserved,
         DrainEdge::Cgroup(&leaf),
+        &crate::identity::HostKernel,
     )
     .split();
     wait.wait(None).expect("the member exited and the leaf drained");

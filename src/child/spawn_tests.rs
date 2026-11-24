@@ -531,6 +531,42 @@ fn a_tree_walk_spawns_tree_walks_through_the_kernel_the_spawn_was_started_with()
     child.wait().expect("reap the root");
 }
 
+/// A Windows raw spawn hands the kernel it was started with to its tree walk: the walk's kill of an
+/// exited root settles the root through a `creation_token` read of its handle, and that read is the
+/// row the spawn's own identity read left second. A host kernel would answer it with the handle's real
+/// token and leave the row.
+///
+/// Mutants: `prepare` or the Windows arm of `attach_tree` gives the `Walker` a host kernel; the kill's
+/// wait settles the root through a host kernel.
+#[cfg(windows)]
+#[skuld::test]
+fn a_windows_raw_tree_walk_spawn_walks_through_the_kernel_the_spawn_was_started_with() {
+    use std::sync::Arc;
+
+    use crate::identity::{FakeKernel, Key};
+
+    let mut cmd = crate::test_child::command(Console::Hidden);
+    cmd.args(["cmd", "/C", "exit 0"]);
+    // The raw backend: `CreateProcessW`, not std's spawn.
+    cmd.executable("cmd");
+    cmd.contain_with(crate::ContainMode::TreeWalk);
+    let kernel = Arc::new(
+        FakeKernel::new()
+            .on_creation_token(Ok(Key::from_raw(1)))
+            .on_creation_token(Ok(Key::from_raw(1))),
+    );
+    let child = super::spawn_with(&mut cmd, Arc::clone(&kernel)).expect("spawn");
+    assert!(child.wait().expect("wait").success());
+
+    // Its answer (an exited root names no process of the tree) is not the row's subject.
+    _ = child.kill_tree();
+
+    assert!(
+        kernel.all_rows_taken(),
+        "the walk's wait settled the root through the spawn's kernel"
+    );
+}
+
 #[skuld::test]
 fn spawn_unelevated_runs_a_plain_child() {
     let mut c = crate::test_child::command(Console::Hidden);

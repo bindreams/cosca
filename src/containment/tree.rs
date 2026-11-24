@@ -177,8 +177,9 @@ impl Tree {
     pub(crate) fn kill(&self, root: Option<&dyn Root>) -> TreeKill<'_> {
         match &self.holder {
             Holder::None | Holder::Delegated => {
-                debug_assert!(!self.released, "a send on a released tree");
-                TreeKill::of(TreeKillOutcome::Ran(Ok(())))
+                debug_assert!(false, "Tree::kill on a tree that is not contained");
+                // Its wait names no member, so no kernel is read through this one.
+                TreeKill::of(TreeKillOutcome::Ran(Ok(())), &crate::identity::HostKernel)
             }
             Holder::Contained(mechanism) => {
                 debug_assert!(!self.released, "a send on a released tree");

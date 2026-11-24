@@ -113,6 +113,43 @@ fn kill_group_on_owned_group_succeeds() {
     );
 }
 
+/// A group's kill is waited for through the kernel its spawn started with: the member the test adds
+/// to the wait is a pid the host does not have (above `pid_max`), and the stated row refuses its
+/// open, where the host answers `ESRCH`, which is an exit. The group is real, and its kill ends it.
+///
+/// Mutant: `kill_group_tree` builds its kill over a host kernel.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_groups_kill_waits_through_the_kernel_its_spawn_started_with() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt as _};
+
+    use crate::containment::Contains as _;
+    use crate::identity::{spawn_kernel, FakeKernel, HostKernel, Key, ProcessId};
+
+    const STATED: u32 = 2_000_000_000;
+    let mut child = blocker_with(|cat| {
+        cat.process_group(0);
+    });
+    let stdin = child.stdin.take().expect("piped stdin");
+    let kernel = FakeKernel::over(&HostKernel).on_pidfd_open(STATED, Err(rustix::io::Errno::MFILE));
+    let group = super::Group::process_group(child.id() as i32, spawn_kernel(kernel));
+
+    let (sent, mut wait) = group.kill(Some(&StatedRoot::unreaped())).split();
+    sent.into_result().expect("the group's kill");
+    wait.reaching([ProcessId::from_parts_for_test(STATED, Key::Pidfs(1))]);
+    let err = wait.wait(None).expect_err("the stated member's open was refused");
+
+    drop(stdin);
+    let status = child.wait().expect("reap the leader");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
+    let said = crate::error::said(&err);
+    assert!(
+        said.contains(&format!("pid {STATED} was killed, but its exit cannot be observed")),
+        "{said}"
+    );
+    assert_eq!(crate::error::first_os_code(&err), Some(libc::EMFILE), "{err:?}");
+}
+
 /// `kill_group`'s `killpg` dooms the group BEFORE `converge` lists it: a member cannot fork once
 /// its `SIGKILL` is pending, so the process the listing never saw is never created. Without that
 /// first `killpg`, `converge`'s per-member resend is the only delivery, and a member that forks
@@ -323,7 +360,7 @@ mod group_kill_and_terminate {
     fn a_group_kill_sends_or_skips_by_the_roots_state() {
         for root in [Root::Unreaped, Root::ReapedElsewhere, Root::Unknown] {
             let recorder = fault::record_kill_group();
-            let outcome = kill_group_tree(PGID, Some(&stated(root))).outcome();
+            let outcome = kill_group_tree(&crate::identity::HostKernel, PGID, Some(&stated(root))).outcome();
             let sent = recorder.killed();
             match (root, outcome) {
                 (Root::Unreaped, TreeKillOutcome::Ran(Ok(()))) => assert_eq!(sent, [PGID], "{root:?}"),
