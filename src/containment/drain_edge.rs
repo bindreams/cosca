@@ -280,7 +280,7 @@ pub(crate) async fn cgroup_wait_tree_drained(
                 deadline: None,
             } => {
                 #[cfg(test)]
-                crate::wait::block_probe::blocking(None, crate::wait::block_probe::WaitObject::DrainAwait);
+                crate::wait::block_probe::blocking(None, crate::wait::block_probe::WaitObject::Await);
                 #[cfg(test)]
                 crate::tokio::wait::armed_deadline_seam::notify(
                     crate::tokio::wait::armed_deadline_seam::Armed::Unbounded,
@@ -295,7 +295,7 @@ pub(crate) async fn cgroup_wait_tree_drained(
                 #[cfg(test)]
                 crate::wait::block_probe::blocking(
                     Some(at.saturating_duration_since(tokio_now())),
-                    crate::wait::block_probe::WaitObject::DrainAwait,
+                    crate::wait::block_probe::WaitObject::Await,
                 );
                 let _ = arm_at(at, listener).await;
             }

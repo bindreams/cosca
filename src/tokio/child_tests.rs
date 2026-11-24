@@ -141,8 +141,8 @@ async fn a_teardown_future_dropped_while_panicking_gives_the_child_up_and_warns(
 /// The awaited teardown awaits its cgroup leaf's drain and never blocks the thread on it: a drain
 /// that is pending leaves the teardown pending. A fake leaf that no one empties holds the drain
 /// open. A teardown that blocks its thread on the drain is let go as it blocks, which the row sees in
-/// [`assert_never_blocked`](UndrainedLeaf::assert_never_blocked); the awaited drain is a
-/// [`DrainAwait`](crate::wait::block_probe::WaitObject::DrainAwait) await, no block. The release runs on the
+/// [`assert_never_blocked`](UndrainedLeaf::assert_never_blocked); the awaited drain is an
+/// [`Await`](crate::wait::block_probe::WaitObject::Await), no block. The release runs on the
 /// teardown's own thread as it blocks, so the order is the call order.
 #[cfg(target_os = "linux")]
 mod leaf_drain {

@@ -520,6 +520,47 @@ async fn a_timed_async_tree_shutdown_arms_its_cgroup_drain_wait_at_the_timeout_n
     assert_eq!(armed.first(), Some(&Armed::At(start + timeout)), "{armed:?}");
 }
 
+/// Windows: the awaited tree shutdown given a timeout watches the grace through the Job's registered wait, and arms
+/// that wait at the timeout, not for the grace: a grace of an hour under a timeout of 2 s first arms an awaited wait
+/// for at most 2 s. The registered waits are on the real clock, so the runtime is the default one. The child ignores
+/// the signal and the stop sends nothing, so the wait runs out at the call's own deadline; only what the first wait
+/// was armed for is asserted, by the hook, as the wait is armed (a wait armed for no bound would not end).
+///
+/// Mutants: `job_wait_tree_drained` passes `None` to `wait_any` (the hook sees `None`), arms from the grace alone
+/// (the hook sees about an hour), or `wait_any` reports no arming (the call ends and no awaited wait was seen).
+#[cfg(windows)]
+#[skuld::test]
+async fn a_timed_async_tree_shutdown_arms_its_job_drain_wait_at_the_timeout_not_the_grace() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::wait::block_probe::{on_each_block, WaitObject};
+
+    let timeout = Duration::from_secs(2);
+    let mut child = contained_child_ignoring_the_signal(|cmd| _ = cmd.contain()).await;
+    assert_eq!(child.containment(), crate::Containment::JobObject);
+    let seen = Rc::new(Cell::new(false));
+    let _blocks = on_each_block({
+        let seen = seen.clone();
+        move |block| {
+            if matches!(block.on, WaitObject::Await) && !seen.replace(true) {
+                assert!(
+                    block.armed.is_some_and(|armed| armed <= timeout),
+                    "the first awaited wait was armed for {:?}, not for at most {timeout:?}",
+                    block.armed
+                );
+            }
+        }
+    });
+
+    // The answer is the sweep's and the reap's, which this row does not pin.
+    _ = child
+        .graceful_shutdown_tree_timeout(Duration::from_secs(3600), timeout)
+        .await;
+
+    assert!(seen.get(), "the call armed no awaited wait");
+}
+
 // Async twin of `members_remain_still_reaps_an_already_exited_root`; see there for the fixture's
 // rationale (`drive::exited_held`, like the sync wait, does not reap) and for `mode` and `swept`.
 #[cfg(unix)]

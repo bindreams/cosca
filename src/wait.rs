@@ -582,7 +582,7 @@ pub(crate) mod block_probe {
     /// What one wait waits on.
     #[allow(
         dead_code,
-        reason = "`Fd` is read only by `Block::ready`, which only macOS tests call; `Drain` and `DrainAwait` are built on Linux only"
+        reason = "`Fd` is read only by `Block::ready`, which only macOS tests call; `Drain` is built on Linux only and `Await` on Linux and Windows"
     )]
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum WaitObject<'a> {
@@ -598,8 +598,9 @@ pub(crate) mod block_probe {
         /// A thread blocking on a cgroup leaf's drain, on the pump's broadcast or on the leaf's own
         /// watch: the drain is in the leaf, so there is nothing to look at.
         Drain,
-        /// A task awaiting a cgroup leaf's drain: nothing blocks, and there is nothing to look at.
-        DrainAwait,
+        /// A task's await (a cgroup leaf's drain on Linux, a registered wait on Windows): it blocks
+        /// no thread, and there is nothing to look at.
+        Await,
         /// Another waiter's reap: nothing to look at.
         Condvar,
     }
@@ -609,7 +610,7 @@ pub(crate) mod block_probe {
     pub(crate) struct Block<'a> {
         /// `Some(1)` for the first block of a wait this hook sees. `None` at a block that is no
         /// round of a thread's wait: a `Condvar` block (another waiter's reap) and a
-        /// [`WaitObject::DrainAwait`] (a task's await blocks no thread).
+        /// [`WaitObject::Await`] (a task's await blocks no thread).
         #[cfg_attr(not(target_os = "macos"), allow(dead_code, reason = "only macOS tests read it"))]
         pub(crate) n: Option<u32>,
         /// What the call is armed for; `None` is unbounded.
@@ -619,7 +620,7 @@ pub(crate) mod block_probe {
 
     impl Block<'_> {
         /// Whether this is a round of a thread's wait: not another waiter's `Condvar` block, and not
-        /// a task's [`WaitObject::DrainAwait`].
+        /// a task's [`WaitObject::Await`].
         pub(crate) fn is_round(&self) -> bool {
             self.n.is_some()
         }
@@ -646,13 +647,13 @@ pub(crate) mod block_probe {
     /// The one call a block site makes, just before the blocking call: records what the block is
     /// armed for (`None`: no timeout) and runs the hooks [`on_each_block`] armed. Every lock the
     /// wait took is released, except a `Condvar` block's: it holds the child's lock. A
-    /// [`WaitObject::DrainAwait`] blocks no thread: the hooks run at it, but it is not recorded
+    /// [`WaitObject::Await`] blocks no thread: the hooks run at it, but it is not recorded
     /// for [`take`] and is not counted as a block by any hook.
     pub(crate) fn blocking(armed: Option<Duration>, on: WaitObject<'_>) {
-        if !matches!(on, WaitObject::DrainAwait) {
+        if !matches!(on, WaitObject::Await) {
             record(armed);
         }
-        let is_round = !matches!(on, WaitObject::Condvar | WaitObject::DrainAwait);
+        let is_round = !matches!(on, WaitObject::Condvar | WaitObject::Await);
         // A hook another hook disarmed meanwhile does not run.
         let ids: Vec<u64> = ON_BLOCK.with(|hooks| hooks.borrow().iter().map(|a| a.id).collect());
         for id in ids {
@@ -793,7 +794,7 @@ pub(crate) mod block_probe {
 
     /// Run `hook` once, at this thread's next round of a wait ([`Block::is_round`]): the thread has
     /// released every lock it took for the wait it is about to make. A `Condvar` block and a task's
-    /// await ([`WaitObject::DrainAwait`]) are no round here.
+    /// await ([`WaitObject::Await`]) are no round here.
     pub(crate) fn on_blocking(hook: impl FnOnce() + 'static) -> Armed {
         once_at(|block| block.is_round(), move |_| hook())
     }
@@ -808,11 +809,11 @@ pub(crate) mod block_probe {
 
     #[cfg(target_os = "linux")]
     pub(crate) fn is_drain_wait(block: &Block<'_>) -> bool {
-        matches!(block.on, WaitObject::Drain | WaitObject::DrainAwait)
+        matches!(block.on, WaitObject::Drain | WaitObject::Await)
     }
 
     /// Run `hook` once, at the next wait of this thread for a cgroup leaf's drain: a block on it
-    /// ([`WaitObject::Drain`]) or a task's await of it ([`WaitObject::DrainAwait`]). A user that
+    /// ([`WaitObject::Drain`]) or a task's await of it ([`WaitObject::Await`]). A user that
     /// must tell the two apart filters on the kind itself, through [`on_each_block`].
     #[cfg(target_os = "linux")]
     pub(crate) fn on_drain_block(hook: impl FnOnce() + 'static) -> Armed {

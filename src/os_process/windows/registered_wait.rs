@@ -165,6 +165,9 @@ pub(crate) async fn wait_any<'h>(
             .clone()
             .map(|handle| RegisteredWait::register(handle, remaining))
             .collect::<io::Result<Vec<_>>>()?;
+        // Reports what the wait is armed for, as the awaited cgroup drain does.
+        #[cfg(test)]
+        crate::wait::block_probe::blocking(remaining, crate::wait::block_probe::WaitObject::Await);
         match first_woken(&mut waits).await {
             Woke::TimedOut if crate::wait::remaining(deadline) != Some(Duration::ZERO) => {}
             woke => return Ok(woke),
