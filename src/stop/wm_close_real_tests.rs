@@ -14,12 +14,16 @@
 use std::ffi::c_void;
 use std::time::Duration;
 
-use windows::Win32::Foundation::HWND;
+use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::Foundation::{GENERIC_ALL, HWND};
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, CreateDesktopW, SetThreadDesktop, DESKTOP_CONTROL_FLAGS, HDESK,
+};
 use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
 use super::wm_close_tests::{detail_of, fake_tree, sent_over};
 use super::{asked, list_windows, Class};
-use crate::containment::SendAnswer;
+use crate::containment::{SendAnswer, UnsentKind};
 use crate::error::Error;
 use crate::identity::{spawn_kernel, FakeKernel};
 use crate::os_process::fake::{Answer, FakeProcess};
@@ -183,6 +187,78 @@ fn graceful_shutdown_tree_closes_the_parent_and_its_copy(#[fixture(wm_close)] _g
     assert_eq!(status.code(), Some(0), "{status:?}");
     // Every process of the tree is gone when the stdout they share ends.
     assert_eq!(gui.lines_until_gone(), Vec::<String>::new());
+}
+
+/// A desktop made for a test: closed on every way out of the test, after the threads that were set to it.
+/// The handle is held as a number, so the guard can be shared with the thread that is assigned the desktop.
+struct Desktop(isize);
+
+impl Desktop {
+    /// A fresh, empty desktop on this process's window station, named for this process.
+    fn create() -> Desktop {
+        let name = HSTRING::from(format!("cosca-wm-close-{}", std::process::id()));
+        // SAFETY: a NUL-terminated name; no device, mode or security attributes. The handle is closed by `drop`.
+        let desktop = unsafe {
+            CreateDesktopW(
+                &name,
+                PCWSTR::null(),
+                None,
+                DESKTOP_CONTROL_FLAGS(0),
+                GENERIC_ALL.0,
+                None,
+            )
+        }
+        .expect("create a desktop");
+        Desktop(desktop.0 as isize)
+    }
+
+    fn handle(&self) -> HDESK {
+        HDESK(self.0 as *mut c_void)
+    }
+
+    /// Makes the calling thread, which must own no window, run on this desktop.
+    fn assign_to_this_thread(&self) {
+        // SAFETY: the handle is live; the calling thread owns no window or hook.
+        unsafe { SetThreadDesktop(self.handle()) }.expect("assign the desktop to a thread that owns no window");
+    }
+}
+
+impl Drop for Desktop {
+    fn drop(&mut self) {
+        // SAFETY: the handle `create` made, closed once.
+        let closed = unsafe { CloseDesktop(self.handle()) };
+        if !std::thread::panicking() {
+            closed.expect("close the desktop");
+        }
+    }
+}
+
+/// A desktop with no top-level window is a send that found no window, which is `Unsupported` with nothing
+/// sent. `EnumWindows` answers FALSE with last error 0 there (measured on CI, 160 of 160 passes, a fresh
+/// desktop on `WinSta0` included), which is no failure. The child is a console program on another desktop;
+/// the thread that sends has made no window, so it can be assigned the desktop.
+///
+/// Mutant: the listing's FALSE is read as a failure (the answer is `Io`).
+#[skuld::test]
+fn a_desktop_with_no_window_is_answered_as_no_window_asked(#[fixture(wm_close)] _group: &Group) {
+    let (child, stdin) = crate::test_child::held_contained_blocker(crate::Stdio::null());
+    let desktop = Desktop::create();
+    let answer = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                desktop.assign_to_this_thread();
+                sent_over(&child, false)
+            })
+            .join()
+            .expect("the sending thread")
+    });
+    let SendAnswer::NotSent(error, kind) = answer else {
+        panic!("{answer:?}")
+    };
+    assert!(matches!(error, Error::Unsupported { .. }), "{error:?}");
+    assert_eq!(kind, UnsentKind::NotSent);
+    drop(stdin);
+    child.wait().expect("reap the child");
 }
 
 /// A look at the root that fails the first time is not the answer: the send goes on, and the look made after it,

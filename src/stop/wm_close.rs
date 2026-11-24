@@ -328,9 +328,19 @@ fn list_windows(pids: &[u32]) -> io::Result<Vec<Listed>> {
         pids,
         listing: Vec::new(),
     };
+    // `EnumWindows` answers FALSE both for a failure and for a desktop with no top-level window, and a stale
+    // last error would read as the first: clear it first.
+    // SAFETY: sets this thread's last error.
+    unsafe { SetLastError(WIN32_ERROR(0)) };
     // SAFETY: `collect` reads `lparam` only as the `Collecting` this call lends it, which `EnumWindows` does not
     // keep past its return.
-    unsafe { EnumWindows(Some(collect), LPARAM(&raw mut collecting as isize)) }.map_err(win32_io_error)?;
+    match unsafe { EnumWindows(Some(collect), LPARAM(&raw mut collecting as isize)) } {
+        Ok(()) => {}
+        // FALSE with no error: the desktop has no top-level window (measured on CI, run 45442280861: 160 of 160
+        // passes, a fresh desktop on `WinSta0` included).
+        Err(e) if e.code().is_ok() => debug_assert!(collecting.listing.is_empty()),
+        Err(e) => return Err(win32_io_error(e)),
+    }
     Ok(collecting.listing)
 }
 
