@@ -17,10 +17,6 @@ steps:
   # file exists. It is written here, never by a script that could be run on a host.
   - elevated: true
     run: echo 'devvm guest' > /etc/cosca-devvm-guest
-  # The user's sessions get umask 022, as a CI runner's do. Under Ubuntu's 002 the tests' temp directories are
-  # group-writable, which the shim's private-directory check refuses.
-  - elevated: true
-    run: sed -i 's/^USERGROUPS_ENAB yes/USERGROUPS_ENAB no/' /etc/login.defs
   # What the root lanes' container has (`.github/actions/root-lane`): the checkout at /repo, the archive in
   # /artifacts, the JUnit directory /junit-out, and `cargo-nextest` on root's PATH. The root lanes' uid 65534 must
   # reach the tree.

@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use super::protocol::{ShimArgs, ShimIdentity, IDENTITY_PRESENT};
 
 /// A temp directory a private directory or a shim link may be made in: mode 0700 whatever the umask,
-/// since the path check refuses a directory others can write that is not sticky.
+/// since the path check refuses a directory others can write that is not sticky. The directory's ancestors are the
+/// environment's: a `TMPDIR` that is itself group-writable and not sticky is still refused.
 pub(crate) fn private_tmp() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("a temp directory");
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod the temp directory");
