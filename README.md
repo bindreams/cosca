@@ -117,7 +117,8 @@ on your own machine set `COSCA_TEST_CTRL_PROXY=0` to skip it.
 `WM_CLOSE` (`COSCA_TEST_WM_CLOSE`, Windows) holds the tests of `stop::send_wm_close`, which open windows and a console,
 create desktops and a window station, start a process on one of them, and post `WM_CLOSE` to top-level windows of the
 desktop. It needs `COSCA_TEST_WM_CLOSE_CONSENT=1`, which CI's Windows job sets, and fails without it; on your own
-machine set `COSCA_TEST_WM_CLOSE=0` to skip it.
+machine set `COSCA_TEST_WM_CLOSE=0` to skip it. Its window station test also needs an elevated Administrator, because
+Windows lets only members of Administrators name a window station.
 
 `PIDFD_GET_INFO` (`COSCA_TEST_PIDFD_GET_INFO`) holds the cgroup tests that read a task's cgroup id through its
 pidfd, which needs Linux 6.13+. The library supports older kernels, which read it through `/proc`. Its

@@ -143,6 +143,12 @@ pub struct RawOptions<'a> {
     /// The security attributes of the new process object (`lpProcessAttributes`): its DACL, for a
     /// process the creator may not open by pid. `None` is the default security.
     pub process_security: Option<&'a SECURITY_ATTRIBUTES>,
+    /// The desktop the process starts on (`STARTUPINFOW::lpDesktop`, `station\desktop`). `None` is
+    /// the parent's own, which is the only one `std`'s spawn can give.
+    pub desktop: Option<&'a OsStr>,
+    /// Variables of our environment the child does not get, matched ignoring ASCII case as Windows
+    /// does: a re-exec's skuld variables (`test_reexec::SCRUBBED_ENV`).
+    pub env_remove: &'a [&'a str],
 }
 
 /// [`spawn_locked_raw_with`] with [`RawOptions::default()`].
@@ -246,8 +252,12 @@ pub fn spawn_locked_raw_with(
         .exact_image
         .then(|| exe.encode_wide().chain(std::iter::once(0)).collect());
 
-    let block =
-        super::windows_env::env_block(std::env::vars_os().chain(env.iter().map(|&(k, v)| (k.into(), v.into()))));
+    let kept =
+        std::env::vars_os().filter(|(name, _)| !options.env_remove.iter().any(|gone| name.eq_ignore_ascii_case(gone)));
+    let block = super::windows_env::env_block(kept.chain(env.iter().map(|&(k, v)| (k.into(), v.into()))));
+    let mut desktop: Option<Vec<u16>> = options
+        .desktop
+        .map(|desktop| desktop.encode_wide().chain(std::iter::once(0)).collect());
     let mut pi = PROCESS_INFORMATION::default();
     // The inheritable duplicates exist only under the lock, so no other spawn in this process
     // inherits them; `_duplicates` drops (closes them) before the guard does.
@@ -287,6 +297,9 @@ pub fn spawn_locked_raw_with(
             STARTF_USESTDHANDLES
         },
         wShowWindow: SW_HIDE.0 as u16,
+        lpDesktop: desktop
+            .as_mut()
+            .map_or(PWSTR::null(), |desktop| PWSTR(desktop.as_mut_ptr())),
         hStdInput: stdin,
         hStdOutput: stdout,
         hStdError: stderr,
@@ -297,7 +310,7 @@ pub fn spawn_locked_raw_with(
     // valid, correctly-sized in/out parameters; `options.process_security`, when set, is a live
     // `SECURITY_ATTRIBUTES` whose descriptor the caller keeps alive across the call; each std handle
     // is a live inheritable duplicate or NULL (the process has none); `image` is a NUL-terminated
-    // UTF-16 buffer that outlives the call.
+    // UTF-16 buffer that outlives the call; so is `desktop`, when `si.lpDesktop` points into it.
     unsafe {
         CreateProcessW(
             image.as_ref().map_or(PCWSTR::null(), |image| PCWSTR(image.as_ptr())),

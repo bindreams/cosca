@@ -16,25 +16,19 @@
 //! screen (`IsWindowVisible` is false for all of them). The vehicle is a last-resort test system: the lib's
 //! test binary is started with `CreateProcessW` and an `lpDesktop` that names a desktop of a station the test
 //! made ([`crate::test_child::wm_close_station`]), because [`Command`](crate::Command) has no desktop setter
-//! and production code does not grow one for a test.
+//! and production code does not grow one for a test. That row needs an elevated Administrator, because a named
+//! window station does, and runs in a process of its own, because it moves the process to that station.
 
-use std::ffi::c_void;
+use std::ffi::{c_void, OsStr};
 use std::io::{BufRead as _, BufReader};
-use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+use std::os::windows::io::AsHandle as _;
 use std::time::Duration;
 
-use windows::core::{HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{
-    SetHandleInformation, SetLastError, ERROR_ALREADY_EXISTS, GENERIC_ALL, HANDLE, HANDLE_FLAG_INHERIT, HWND,
-    WAIT_OBJECT_0,
-};
+use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::Foundation::{SetLastError, ERROR_ALREADY_EXISTS, GENERIC_ALL, HWND};
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, CloseWindowStation, CreateDesktopW, CreateWindowStationW, GetProcessWindowStation,
     SetProcessWindowStation, SetThreadDesktop, DESKTOP_CONTROL_FLAGS, HDESK, HWINSTA,
-};
-use windows::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW, INFINITE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, WINSTA_ALL_ACCESS};
 
@@ -49,6 +43,9 @@ use crate::test_child::over_fake::child_with;
 use crate::test_child::wm_close_gui::{Gui, Mode, Plan};
 use crate::test_child::wm_close_station::{asked_lines, ROLE as HOST};
 use crate::test_groups::{wm_close, Group};
+use crate::test_reexec::SCRUBBED_ENV;
+use crate::test_spawn::console_flags::Console;
+use crate::test_spawn::raw_spawn::{spawn_locked_raw_with, RawOptions, RawStdio};
 use crate::{ContainMode, StopTarget};
 
 /// The lines, sorted: the order in which the posts were taken is not the test's to rely on.
@@ -66,8 +63,17 @@ fn sorted(mut lines: Vec<String>) -> Vec<String> {
 /// missing); nothing is posted (both are missing); `IsWindowVisible` is the test of visibility (the
 /// non-interactive station answers `Unsupported`, and its line is an `error`); visibility is not tested (the
 /// hidden window is asked on both stations).
+///
+/// The row runs in a process of its own: [`Station::desktop`] moves the process to the station it makes, which
+/// a shared test process would carry for every other test.
 #[skuld::test]
 fn the_visible_unowned_windows_are_asked_and_no_other(#[fixture(wm_close)] _group: &Group) {
+    let Some(_done) = crate::test_own_process::own_process(
+        crate::test_own_process::test_path!(the_visible_unowned_windows_are_asked_and_no_other),
+        crate::test_spawn::spawn,
+    ) else {
+        return;
+    };
     let on_the_interactive_desktop = asked_lines();
     let on_a_station_that_is_not_interactive = lines_from_the_host_on_a_private_station();
     for (station, lines) in [
@@ -253,16 +259,20 @@ impl Drop for Desktop {
 }
 
 /// A window station made for a test, named for this process and closed on every way out of the test, after the
-/// desktops made on it. A station made by a process that is not a service is not interactive: it is no
-/// `WinSta0`, so none of its desktops is visible.
+/// desktops made on it. Any station other than `WinSta0` is not interactive, whoever makes it, so none of its
+/// desktops is visible. Naming a station needs a member of Administrators (Microsoft's reference for
+/// `CreateWindowStationW`, `lpwinsta`: "Only members of the Administrators group are allowed to specify a
+/// name").
 struct Station(isize);
 
 impl Station {
     fn create() -> Station {
         let name = HSTRING::from(Self::name());
         // SAFETY: a NUL-terminated name; no security attributes. The handle is closed by `drop`.
-        let station =
-            unsafe { CreateWindowStationW(&name, 0, WINSTA_ALL_ACCESS as u32, None) }.expect("create a window station");
+        let station = unsafe { CreateWindowStationW(&name, 0, WINSTA_ALL_ACCESS as u32, None) }.expect(
+            "create a window station: a named one needs a member of Administrators, so this test needs an \
+             elevated Administrator (COSCA_TEST_WM_CLOSE=0 turns the group off)",
+        );
         Station(station.0 as isize)
     }
 
@@ -299,61 +309,34 @@ impl Drop for Station {
 }
 
 /// The lines [`HOST`] prints when it runs on a desktop of a window station of its own, which is not
-/// interactive: the test binary started with `CreateProcessW`, `lpDesktop` naming the desktop, its stdout and
-/// stderr one pipe the test reads to its end. The host has exited when this returns, and a host that failed is
-/// a panic that shows what it printed.
+/// interactive: the test binary started through the test code's raw spawn with `lpDesktop` naming the desktop and
+/// without the skuld variables, its stdout and stderr one pipe the test reads to its end. The host has exited
+/// when this returns, and a host that failed is a panic that shows what it printed.
 fn lines_from_the_host_on_a_private_station() -> Vec<String> {
     let station = Station::create();
     let desktop_name = "Default";
     let _desktop = station.desktop(desktop_name);
 
+    let desktop_path = format!("{}\\{desktop_name}", Station::name());
     let (reader, writer) = std::io::pipe().expect("make a pipe");
-    let output = HANDLE(writer.as_raw_handle());
-    // SAFETY: the handle is live; the host inherits it as its stdout and stderr.
-    unsafe { SetHandleInformation(output, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
-        .expect("make the pipe's write end inheritable");
-
-    let wide = |text: String| -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() };
-    let exe = std::env::current_exe().expect("current_exe");
-    let argv: Vec<String> = HOST
-        .argv(&[])
-        .into_iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    let mut command_line = wide(format!("\"{}\" {}", exe.display(), argv.join(" ")));
-    let mut desktop = wide(format!("{}\\{desktop_name}", Station::name()));
-    let startup = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        lpDesktop: PWSTR(desktop.as_mut_ptr()),
-        dwFlags: STARTF_USESTDHANDLES,
-        hStdOutput: output,
-        hStdError: output,
-        ..STARTUPINFOW::default()
+    let options = RawOptions {
+        stdio: RawStdio::Given {
+            stdin: None,
+            output: writer.as_handle(),
+        },
+        desktop: Some(OsStr::new(&desktop_path)),
+        env_remove: &SCRUBBED_ENV,
+        ..Default::default()
     };
-    let mut process = PROCESS_INFORMATION::default();
-    // SAFETY: the strings are NUL-terminated and outlive the call; `startup` is complete.
-    unsafe {
-        CreateProcessW(
-            PCWSTR::null(),
-            Some(PWSTR(command_line.as_mut_ptr())),
-            None,
-            None,
-            true,
-            CREATE_NO_WINDOW,
-            None,
-            PCWSTR::null(),
-            &startup,
-            &mut process,
-        )
-    }
+    let host = spawn_locked_raw_with(
+        std::env::current_exe().expect("current_exe"),
+        &HOST.argv(&[]),
+        &[],
+        0,
+        Console::Hidden,
+        options,
+    )
     .expect("start the host on the station's desktop");
-    // SAFETY: the two handles `CreateProcessW` made, each owned from here.
-    let (host, _thread) = unsafe {
-        (
-            OwnedHandle::from_raw_handle(process.hProcess.0),
-            OwnedHandle::from_raw_handle(process.hThread.0),
-        )
-    };
     // The host holds the only write end that is left, so the read ends when it and what it started are gone.
     drop(writer);
     let lines: Vec<String> = BufReader::new(reader)
@@ -361,12 +344,7 @@ fn lines_from_the_host_on_a_private_station() -> Vec<String> {
         .collect::<Result<_, _>>()
         .expect("read what the host printed");
 
-    // SAFETY: `host` is a live process handle.
-    let waited = unsafe { WaitForSingleObject(HANDLE(host.as_raw_handle()), INFINITE) };
-    assert_eq!(waited, WAIT_OBJECT_0, "wait for the host to exit");
-    let mut code = 0u32;
-    // SAFETY: `host` is a live process handle, `code` a live out-parameter.
-    unsafe { GetExitCodeProcess(HANDLE(host.as_raw_handle()), &mut code) }.expect("the host's exit code");
+    let code = host.wait().expect("wait for the host to exit");
     assert_eq!(code, 0, "the host failed; it printed {lines:?}");
     lines
 }

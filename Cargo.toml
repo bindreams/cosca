@@ -100,7 +100,9 @@ static_assertions = "1"
 #   polls after completed synchronously.
 # - `Win32_Graphics_Gdi`: `RegisterClassW`/`WNDCLASSW`, for the window class of the test GUI process.
 # - `Win32_System_StationsAndDesktops`: `CreateDesktopW`, `SetThreadDesktop` and `CloseDesktop`, for the
-#   `WM_CLOSE` test of a desktop with no window.
+#   `WM_CLOSE` test of a desktop with no window; and `CreateWindowStationW`, `SetProcessWindowStation`,
+#   `GetProcessWindowStation`, `CloseWindowStation` and `GetUserObjectInformationW`, for the `WM_CLOSE` test on a
+#   window station that is not interactive.
 #
 # Declaring them here, in dev-dependencies, keeps them out of the published crate's own
 # dependency footprint for downstream consumers who only pull in `[dependencies]`. The `windows_*`
