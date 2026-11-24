@@ -66,12 +66,12 @@ fn stated_break(target: &crate::StopTarget<'_>) -> Result<(), crate::error::Erro
 }
 
 /// A root of stated answers: its kill is delivered, and its looks answer `exits`. The kernel it lends to
-/// the policy layer (`OsChild::kernel`) is the host's, for the calls that borrow one and read nothing
-/// through it.
+/// the policy layer (`OsChild::kernel`) has no rows: the calls that borrow one read nothing through it,
+/// and a read that does panics.
 pub(crate) fn root_looking(exits: impl IntoIterator<Item = Answer>) -> FakeProcess {
     let root = FakeProcess::new(exits)
         .signals([Ok(Sent::Delivered)])
-        .with_kernel(crate::identity::spawn_kernel(crate::identity::HostKernel));
+        .with_kernel(crate::identity::spawn_kernel(crate::identity::FakeKernel::new()));
     #[cfg(target_os = "macos")]
     let root = root.peeks_always(|| Ok(crate::os_process::child::PeekOutcome::Running));
     root

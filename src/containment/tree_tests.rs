@@ -299,6 +299,23 @@ fn a_send_on_a_released_tree_that_kept_its_mechanism_asserts() {
     assert!(asserts(&|| _ = tree.disarm()), "disarm did not assert");
 }
 
+/// A tree that holds no mechanism has nothing to kill, which the tree calls rule out before a kill: asked
+/// anyway, it asserts in debug.
+///
+/// Mutant: `Tree::kill` of a none or delegated tree drops its assertion.
+#[cfg(debug_assertions)]
+#[skuld::test]
+fn killing_a_tree_that_holds_no_mechanism_asserts() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    for tree in [Tree::none(), Tree::delegated()] {
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| _ = tree.kill(None))).is_err(),
+            "kill did not assert"
+        );
+    }
+}
+
 /// A cgroup leaf's release consumes it: the tree still reports a cgroup, a settle still answers, and
 /// the awaited steps of the release have nothing left to take.
 ///

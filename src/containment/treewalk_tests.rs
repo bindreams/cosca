@@ -1225,8 +1225,8 @@ fn a_root_that_exited_while_its_handle_is_held_is_walked_and_its_child_killed() 
 }
 
 /// A walk sends each descendant's kill through the kernel it was given: one `creation_token` row (the
-/// open by identity) and one `terminate` row per descendant, taken by its kill. The root's kill is the host's (a `ByIdentity` over the host
-/// kernel) and ends the root.
+/// open by identity) and one `terminate` row per descendant, taken by its kill. The root's kill is the
+/// host's (a `ByIdentity` over the host kernel) and ends the root.
 ///
 /// Mutant: `kill_one` asks the host kernel instead of the walk's.
 #[cfg(windows)]

@@ -171,8 +171,9 @@ impl Tree {
     }
 
     /// Hard-kill the contained tree (best-effort; a member that is already gone is success), as the
-    /// mechanism's [`kill`](Contains::kill) decides it from `root`. A tree that is none or delegated
-    /// has nothing to kill. The [`TreeKill`] has what the kill reached, for a caller that waits; one
+    /// mechanism's [`kill`](Contains::kill) decides it from `root`. Like [`terminate`](Self::terminate),
+    /// only a contained tree is killed: the tree calls rule the others out first, and asked anyway,
+    /// this asserts in debug. The [`TreeKill`] has what the kill reached, for a caller that waits; one
     /// that does not calls [`send_kill`](Self::send_kill).
     pub(crate) fn kill(&self, root: Option<&dyn Root>) -> TreeKill<'_> {
         match &self.holder {

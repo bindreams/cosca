@@ -173,10 +173,10 @@ pub(crate) fn open_verified(
         Opened::Gone => return Ok(None), // no such pid => exited
         // Denied on a LIVE process => a real failure: reporting "exited" would let a
         // supervisor conclude a healthy service had died, and an Unknown liveness must NOT be
-        // reported as a successful kill. The error comes from the classifier: `is_alive()` below
-        // overwrites the thread's last-error.
+        // reported as a successful kill. The error comes from the classifier: `is_alive_with()`
+        // below overwrites the thread's last-error.
         Opened::Denied(e) => {
-            return match id.is_alive() {
+            return match id.is_alive_with(kernel) {
                 Liveness::Dead => Ok(None),
                 Liveness::Alive | Liveness::Unknown => Err(Error::Unassessable {
                     detail: format!("pid {} could not be opened", id.pid()),

@@ -51,16 +51,16 @@ lends it through `OsChild::kernel()`. A spawn starts with one kernel (`spawn_wit
 production passes `HostKernel`), erased once at its entry into a `SpawnKernel`, an `Arc<dyn Kernel +
 Send>`, so the spawn body below the entry is not generic. The child's box owns it, and the cgroup
 leaf, the placement probe's box, the macOS fd marker, the tree walk (`Walker`), the process group
-(`Group`) and the Job Object (`JobHandle`) each own a clone of the `Arc`: a tree outlives the box, and
-still reads through the spawn's kernel. A mechanism's `TreeKill` is built over its kernel
+(`Group`) and the Job Object (`JobHandle`) each own a clone of the `Arc`: a tree outlives the box,
+and still reads through the spawn's kernel. A mechanism's `TreeKill` is built over its kernel
 (`TreeKill::of(outcome, kernel)`, which every kill takes), so the wait for the members it reached
 re-opens them through that kernel. The spawn's own reads ask it as `&dyn Kernel`. A foreign
 `Process`'s graceful call makes one kernel for the call and every read of it goes through that. A
-foreign `Process` and the public `Job` name `HostKernel` at their entries: neither has a spawn to take
-a kernel from, and the process is the caller's own host process. A borrow, a `Box` and an `Arc` of a kernel are kernels, so the walks,
-which open one process per member from one borrowed kernel, pass `&dyn Kernel`, and tests move a
-`FakeKernel` in. `Process` and `OwnedChild` hold a `Box<dyn OsProcess>` or `Box<dyn OsChild>`: the
-kernel's type stops at the OS layer.
+foreign `Process` and the public `Job` name `HostKernel` at their entries: neither has a spawn to
+take a kernel from, and the process is the caller's own host process. A borrow, a `Box` and an `Arc`
+of a kernel are kernels, so the walks, which open one process per member from one borrowed kernel,
+pass `&dyn Kernel`, and tests move a `FakeKernel` in. `Process` and `OwnedChild` hold a `Box<dyn
+OsProcess>` or `Box<dyn OsChild>`: the kernel's type stops at the OS layer.
 
 The public types follow the same line:
 
