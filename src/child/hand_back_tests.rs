@@ -108,10 +108,11 @@ fn a_refused_kill_is_left_when_the_caller_leaves_it() {
     crate::log_capture::install();
     let (mut child, stdin) = held_uncontained_blocker(true);
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    let exit = ExitGuard::new(Some(stdin), id);
     refuse_the_kill(&mut child);
     let mark = crate::log_capture::mark();
 
-    let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::Leave);
+    let (fate, handed_back) = tear_down_holding(child, exit, Disposition::Leave);
 
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
     assert!(handed_back.is_none(), "the teardown handed the child back");
@@ -121,8 +122,6 @@ fn a_refused_kill_is_left_when_the_caller_leaves_it() {
         warns[0].starts_with("teardown after a failed run: ") && warns[0].contains("leaving it running"),
         "{warns:?}"
     );
-    drop(handed_back);
-    crate::test_child::wait_until_zombie(id.pid());
 }
 
 /// A child that opted out of `kill_on_drop` is not torn down and not handed back: its `Unreaped`
@@ -481,9 +480,10 @@ fn an_elevation_front_sent_no_kill_has_the_refusal_among_its_failures() {
 fn an_elevation_front_is_left_when_the_caller_leaves_it() {
     let (child, stdin) = a_running_front();
     let id = child.id().expect(crate::test_child::IDENTITY_READ);
+    let exit = ExitGuard::new(Some(stdin), id);
     let mark = crate::log_capture::mark();
 
-    let (fate, handed_back) = tear_down_holding(child, stdin, Disposition::Leave);
+    let (fate, handed_back) = tear_down_holding(child, exit, Disposition::Leave);
 
     assert_eq!(fate, ChildFate::Running { id: Some(id) });
     assert!(handed_back.is_none(), "the teardown handed the child back");
@@ -493,8 +493,6 @@ fn an_elevation_front_is_left_when_the_caller_leaves_it() {
         warns[0].starts_with("teardown after a failed run: ") && warns[0].contains("is left running and unreaped"),
         "{warns:?}"
     );
-    drop(handed_back);
-    crate::test_child::wait_until_zombie(id.pid());
 }
 
 /// A front whose look fails is uncollected and still ours: it is handed back though its fate is
