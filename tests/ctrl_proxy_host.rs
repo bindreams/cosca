@@ -395,6 +395,8 @@ fn main() {
         }
         common::install_log_capture();
     }
+    #[cfg(windows)]
+    common::temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

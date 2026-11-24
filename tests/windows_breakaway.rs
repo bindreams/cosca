@@ -197,6 +197,8 @@ fn a_forbidding_job_yields_a_typed_containment_error_via_the_raw_backend() {
 mod test_harness;
 
 fn main() {
+    #[cfg(windows)]
+    common::temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

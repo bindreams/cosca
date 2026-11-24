@@ -14,7 +14,11 @@ mod verdict_tests;
 #[path = "../src/test_harness.rs"]
 mod test_harness;
 
+#[path = "common/temp_root.rs"]
+mod temp_root;
+
 fn main() {
+    temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

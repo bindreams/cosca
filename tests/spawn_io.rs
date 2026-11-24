@@ -2080,6 +2080,7 @@ fn restore_rlimit_nofile_lowers_the_soft_limit_and_drop_restores_it() {
 mod test_harness;
 
 fn main() {
+    common::temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

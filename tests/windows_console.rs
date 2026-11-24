@@ -126,6 +126,8 @@ fn a_gui_subsystem_child_is_outside_our_console_whatever_its_flags() {
 mod test_harness;
 
 fn main() {
+    #[cfg(windows)]
+    common::temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

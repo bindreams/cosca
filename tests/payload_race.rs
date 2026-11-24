@@ -292,6 +292,7 @@ fn release_joins_the_exit_watch() {
 mod test_harness;
 
 fn main() {
+    common::temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

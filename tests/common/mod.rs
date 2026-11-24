@@ -18,6 +18,7 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(target_os = "linux")]
 pub use test_groups::cgroup_leaf as cgroup;
 pub mod payload;
+pub mod temp_root;
 
 #[cfg(target_os = "linux")]
 pub mod seccomp;

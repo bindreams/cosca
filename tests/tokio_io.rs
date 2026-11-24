@@ -1331,6 +1331,8 @@ async fn death_watch_spawn_tree_ending_a_failure_ends_a_tree_whose_root_reported
 mod test_harness;
 
 fn main() {
+    #[cfg(feature = "tokio")]
+    common::temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

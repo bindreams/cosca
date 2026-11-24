@@ -22,6 +22,8 @@ libc = "0.2"
 # The test harness for the `harness = false` lib.
 skuld.workspace = true
 tempfile = "3"
+# Reads `COSCA_TESTING_TEMP_ROOT` from a `.env` file (`tests/common/temp_root.rs`).
+dotenvy = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 # File identity (`Filesystem::same_file`): `GetFileInformationByHandleEx` with `FileIdInfo`.

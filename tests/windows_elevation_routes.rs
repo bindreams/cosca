@@ -100,6 +100,8 @@ fn main() {
             std::process::exit(2);
         }
     }
+    #[cfg(windows)]
+    common::temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

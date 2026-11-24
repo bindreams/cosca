@@ -539,6 +539,8 @@ use common::test_groups;
 mod test_harness;
 
 fn main() {
+    #[cfg(windows)]
+    common::temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

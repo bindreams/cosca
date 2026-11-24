@@ -378,6 +378,8 @@ mod test_harness;
 fn main() {
     #[cfg(target_os = "linux")]
     common::install_log_capture();
+    #[cfg(target_os = "linux")]
+    common::temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

@@ -322,6 +322,8 @@ fn holders_and_folds_cloexec_across_a_holder_with_a_mixed_copy() {
 mod test_harness;
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    common::temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

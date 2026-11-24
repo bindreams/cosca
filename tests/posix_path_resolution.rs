@@ -226,6 +226,8 @@ fn target_env() -> &'static str {
 mod test_harness;
 
 fn main() {
+    #[cfg(unix)]
+    common::temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

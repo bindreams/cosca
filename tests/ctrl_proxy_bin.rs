@@ -78,6 +78,7 @@ fn the_cosca_ctrl_proxy_executable_plays_the_proxy(#[fixture(ctrl_proxy)] _group
 mod test_harness;
 
 fn main() {
+    common::temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

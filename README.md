@@ -49,6 +49,16 @@ Libtest's `#[test]` never runs in a `harness = false` target, so
 source file, whatever its `cfg`, and on any target left on the default harness. It parses source
 and needs no build of the crate, so it runs in about a second as a prek hook and in CI's Lint job.
 
+### Temp directories
+
+The tests make their temp directories with `tempfile`, in the system's temp directory. To put them
+elsewhere, set `COSCA_TESTING_TEMP_ROOT` to a directory, in the environment or in a `.env` file in
+the directory the tests start in (the package's); the file's value wins. A relative path is taken
+from that directory, so `COSCA_TESTING_TEMP_ROOT=.tmp/tests` keeps them inside the checkout, under
+the ignored `.tmp/`. The tests write many short-lived executables, which an antivirus scans one by
+one unless the directory is excluded. Each test target's `main` applies the setting
+([`tests/common/temp_root.rs`](tests/common/temp_root.rs)).
+
 ### Doc tests
 
 nextest doesn't run doctests, so CI runs them separately with `cargo test --doc`. An example that would act on a real process (spawn, open, kill) is `no_run`: it compiles and never runs. Claude Code agents in this repo deny plain

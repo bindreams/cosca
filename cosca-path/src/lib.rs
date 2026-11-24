@@ -119,8 +119,14 @@ impl<P: PurePath + ?Sized> Debug for Display<'_, P> {
     }
 }
 
+// Where the tests' temp directories go; the one file the `cosca` tests use.
+#[cfg(test)]
+#[path = "../../tests/common/temp_root.rs"]
+mod test_temp_root;
+
 #[cfg(test)]
 fn main() {
+    test_temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

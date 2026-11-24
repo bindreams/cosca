@@ -189,6 +189,8 @@ mod test_harness;
 fn main() {
     #[cfg(feature = "tokio")]
     common::install_log_capture();
+    #[cfg(feature = "tokio")]
+    common::temp_root::apply();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.require_known_labels();

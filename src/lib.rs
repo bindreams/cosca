@@ -379,6 +379,11 @@ mod test_seccomp;
 #[cfg(test)]
 mod test_spawn;
 
+// Where the tests' temp directories go; shared with the integration tests.
+#[cfg(test)]
+#[path = "../tests/common/temp_root.rs"]
+mod test_temp_root;
+
 #[cfg(all(test, windows))]
 mod test_frozen;
 
@@ -435,6 +440,7 @@ fn main() {
     // And the console-event proxy, which the proxy's tests start as a copy of this binary.
     #[cfg(windows)]
     init_helpers();
+    test_temp_root::apply();
     // The fixture roles the tests re-run this binary as.
     test_child::fixture_role::run_if_requested();
     let mut runner = skuld::TestRunner::new();
