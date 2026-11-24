@@ -409,7 +409,7 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
 /// A running [`ROLE`] process (and its copy), and its stdout read line by line.
 pub(crate) struct Gui {
     pub(crate) child: crate::Child,
-    stdin: Option<crate::PipeWriter>,
+    stdin: crate::PipeWriter,
     lines: std::io::Lines<BufReader<crate::PipeReader>>,
     /// The tags that print `flushed` when they are flushed.
     tags: Vec<&'static str>,
@@ -437,7 +437,7 @@ impl Gui {
         }
         let mut gui = Gui {
             child,
-            stdin: Some(stdin),
+            stdin,
             lines: BufReader::new(stdout).lines(),
             tags,
             startup: Vec::new(),
@@ -460,8 +460,7 @@ impl Gui {
 
     /// Writes `flush`. A process that has ended has no pipe to take it, which is no failure.
     pub(crate) fn flush(&mut self) {
-        let stdin = self.stdin.as_mut().expect("the stdin is still open");
-        _ = writeln!(stdin, "flush").and_then(|()| stdin.flush());
+        _ = writeln!(self.stdin, "flush").and_then(|()| self.stdin.flush());
     }
 
     /// The lines up to and including the `flushed` of each process, without the `flushed` lines, after a
@@ -492,10 +491,5 @@ impl Gui {
             lines.push(line);
         }
         lines
-    }
-
-    /// Ends the stdin, which ends the process.
-    pub(crate) fn end_stdin(&mut self) {
-        self.stdin = None;
     }
 }

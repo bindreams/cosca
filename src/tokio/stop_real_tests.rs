@@ -5,9 +5,6 @@
 //!
 //! Each asserts the recorded answer of the proxy before it reads a member's ack, so a stop that sent nothing
 //! fails by assertion.
-//!
-//! The last test is the async twin of `stop/wm_close_real_tests.rs`'s exited-child case, in the `WM_CLOSE`
-//! group.
 
 use std::time::Duration;
 
@@ -16,8 +13,7 @@ use crate::test_child::ctrl_break::{
     assert_acked_event, assert_proxy_answered, kill_release_reap_async, spawn_member_async, Handler,
     STATUS_CONTROL_C_EXIT,
 };
-use crate::test_child::wm_close_gui::{Gui, Mode, Plan};
-use crate::test_groups::{ctrl_proxy, wm_close, Group};
+use crate::test_groups::{ctrl_proxy, Group};
 use crate::tokio::stop::{self, StopFuture};
 use crate::tokio::test_runtime::{assert_current_thread, never_blocking};
 use crate::{ContainMode, StopTarget};
@@ -97,24 +93,4 @@ async fn async_the_tree_calls_use_the_proxy_too(#[fixture(ctrl_proxy)] _group: &
     check.assert_fired();
     assert_eq!(status.code(), Some(STATUS_CONTROL_C_EXIT), "the root, got {status:?}");
     assert_eq!(grand.exit.wait_for_exit_code(), STATUS_CONTROL_C_EXIT, "the grandchild");
-}
-
-/// An action that asks the windows to close: the twin's future is `Send`, as an action's must be.
-fn asking_the_windows() -> impl for<'t, 'c> Fn(&'t StopTarget<'c>) -> StopFuture<'t> + Send + Sync + 'static {
-    |target| Box::pin(stop::send_wm_close(target))
-}
-
-/// The async `send_wm_close` for a child that has exited is answered `Ok` with nothing asked, as the sync
-/// one answers it. Mutant: the look at the root is dropped (the exited child is answered `Unsupported`, as a
-/// process with no window is). That the twin's future is `Send` is checked by `asking_the_windows` compiling.
-#[skuld::test]
-async fn async_wm_close_answers_an_exited_child_ok(#[fixture(wm_close)] _group: &Group) {
-    assert_current_thread();
-    let mut gui = Gui::start(&Plan::new(Mode::Closing), |_| {});
-    gui.end_stdin();
-    assert_eq!(gui.child.wait().expect("the child exits").code(), Some(0));
-    let ask = asking_the_windows();
-    ask(&StopTarget::from(&gui.child))
-        .await
-        .expect("an exited child is answered Ok");
 }

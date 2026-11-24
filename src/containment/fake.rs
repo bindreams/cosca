@@ -46,7 +46,8 @@ pub(crate) struct FakeContains {
     /// kill that leaves nothing running.
     kill_answers: Mutex<VecDeque<TreeKillOutcome>>,
     /// What each [`send_terminate`](Contains::send_terminate) answers, in order, once; a send past them
-    /// is the signal that went out and found nothing wrong.
+    /// is, on Windows, the answer of the stop it is given, as a job states it, and on Unix the signal that
+    /// went out and found nothing wrong.
     terminate_answers: Mutex<VecDeque<TerminateOutcome>>,
     sends: Sends,
 }
@@ -228,9 +229,16 @@ impl Contains for FakeContains {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop_front();
-        let sent = stated.unwrap_or_else(|| TerminateOutcome::Sent {
-            result: Ok(()),
-            earlier: Some(how.earlier()),
+        let sent = stated.unwrap_or_else(|| {
+            let earlier = Some(how.earlier());
+            #[cfg(windows)]
+            return TerminateOutcome::of(how.into_sent(), earlier);
+            // Unix: a `TreeStop` carries no answer of its own, so the signal went out.
+            #[cfg(unix)]
+            TerminateOutcome::Sent {
+                result: Ok(()),
+                earlier,
+            }
         });
         (sent, None)
     }

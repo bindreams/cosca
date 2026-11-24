@@ -711,8 +711,9 @@ pub fn send_console_event_via_proxy(target: &StopTarget<'_>, event: CtrlEvent) -
 /// - every post was refused (`ERROR_ACCESS_DENIED`: the window belongs to a program of higher integrity, or
 ///   has a message filter, which is set per window): [`Error::Unsupported`], whose
 ///   [`source`](std::error::Error::source) is that error;
-/// - no window was asked and the child had exited when cosca looked: as every other send answers an exited
-///   child, `Ok` on a root target, and on a tree target the tree call's own answer (see the module doc);
+/// - no window was asked and the child had exited when cosca looked: `Ok` on a root target whose child has an
+///   identity, and on a tree target the tree call's own answer (see the module doc). A child with no identity
+///   is refused as above, exited or not;
 /// - no window was asked: [`Error::Unsupported`], which says the process shows no visible top-level window
 ///   without an owner on this desktop, and names [`Child::kill`](crate::Child::kill).
 ///
@@ -737,7 +738,7 @@ pub fn send_wm_close(target: &StopTarget<'_>) -> Result<(), Error> {
 }
 
 /// Windows: the one body of [`send_wm_close`], for the driver that blocks and the one that awaits, which
-/// make only the look at the root.
+/// make only looks at the root.
 #[cfg(windows)]
 pub(crate) async fn send_wm_close_with<D: StopWaits>(driver: &D, target: &StopTarget<'_>) -> Result<(), Error> {
     wm_close::send(driver, target).await

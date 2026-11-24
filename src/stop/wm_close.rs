@@ -459,21 +459,36 @@ fn after_failed_post(pid: u32, class: &str, error: io::Error) -> Window {
 
 // The send -----
 
-/// The send, made without waiting: `None` when no window was asked; [`send`] then looks at the root.
+/// The identity of the root, for a root target whose child has one: the process whose windows a root target
+/// asks. A tree target asks its members', so it has none.
+fn root_identity(target: &StopTarget<'_>) -> Option<ProcessId> {
+    match target.scope() {
+        Scope::Root => target.id(),
+        Scope::Tree(_) => None,
+    }
+}
+
+/// The send, made without waiting: `None` when no window was asked; [`outcome`] then looks at the root.
 fn attempt(target: &StopTarget<'_>) -> Option<SendAnswer> {
     let not_sent = |error| Some(SendAnswer::NotSent(error, UnsentKind::NotSent));
-    let Some(id) = target.id() else {
+    if target.id().is_none() {
         return not_sent(unsupported(format!("{NO_IDENTITY_REASON} {REMEDIES}"), None));
-    };
-    let Members { named, unnamed } = match target.scope() {
-        Scope::Root => Members {
+    }
+    let Members { named, unnamed } = match root_identity(target) {
+        Some(id) => Members {
             named: vec![id],
             unnamed: Vec::new(),
         },
-        Scope::Tree(_) => match target.child().tree.member_ids() {
-            Ok(members) => members,
-            Err(listing_failed) => return not_sent(listing_failed),
-        },
+        None => {
+            debug_assert!(
+                target.covers_tree(),
+                "a root target has the identity the refusal above checked"
+            );
+            match target.child().tree.member_ids() {
+                Ok(members) => members,
+                Err(listing_failed) => return not_sent(listing_failed),
+            }
+        }
     };
     let unasked: Vec<Unasked> = unnamed.into_iter().map(|cause| Unasked { cause }).collect();
     let mut came = Vec::new();
@@ -500,18 +515,34 @@ fn attempt(target: &StopTarget<'_>) -> Option<SendAnswer> {
     answer(fold(came))
 }
 
-/// How the send went: [`attempt`], and when no window was asked, one look at the root.
+/// The answer for a root that had exited when it was looked at, and for which no window was asked.
+fn exited(target: &StopTarget<'_>) -> SendAnswer {
+    SendAnswer::RootExited(root_exited(
+        &format!(
+            "the child (pid {}) had exited when cosca looked, and no window of it was asked",
+            target.pid()
+        ),
+        "no window of a member of its tree that outlived it was asked",
+    ))
+}
+
+/// How the send went: on a root target with an identity, one look at the root first, so that a root that has
+/// exited costs no window listing; then [`attempt`], and when no window was asked, one look at the root.
 async fn outcome<D: StopWaits>(driver: &D, target: &StopTarget<'_>) -> SendAnswer {
+    if root_identity(target).is_some() {
+        match driver.root_exited(Duration::ZERO).await {
+            Ok(true) => return exited(target),
+            Ok(false) => {}
+            Err(look_failed) => log::debug!(
+                "WM_CLOSE: the first look at the root (pid {}) failed, the send goes on: {look_failed}",
+                target.pid()
+            ),
+        }
+    }
     match attempt(target) {
         Some(sent) => sent,
         None => match driver.root_exited(Duration::ZERO).await {
-            Ok(true) => SendAnswer::RootExited(root_exited(
-                &format!(
-                    "the child (pid {}) had exited when cosca looked, and no window of it was asked",
-                    target.pid()
-                ),
-                "no window of a member of its tree that outlived it was asked",
-            )),
+            Ok(true) => exited(target),
             Ok(false) => SendAnswer::NotSent(no_visible_window(target.covers_tree()), UnsentKind::NotSent),
             Err(look_failed) => SendAnswer::NotSent(look_failed, UnsentKind::NotSent),
         },

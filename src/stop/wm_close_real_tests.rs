@@ -17,9 +17,14 @@ use std::time::Duration;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
+use super::wm_close_tests::{detail_of, fake_tree, sent_over};
 use super::{asked, list_windows, Class};
+use crate::containment::SendAnswer;
 use crate::error::Error;
+use crate::identity::{spawn_kernel, FakeKernel};
+use crate::os_process::fake::{Answer, FakeProcess};
 use crate::stop;
+use crate::test_child::over_fake::child_with;
 use crate::test_child::wm_close_gui::{Gui, Mode, Plan};
 use crate::test_groups::{wm_close, Group};
 use crate::{ContainMode, StopTarget};
@@ -82,16 +87,6 @@ fn a_process_with_only_a_hidden_window_is_refused_and_asked_nothing(#[fixture(wm
     assert!(detail.contains("visible top-level window"), "{detail}");
     gui.flush();
     assert_eq!(gui.lines_until_flushed(), Vec::<String>::new());
-}
-
-/// A child that has exited is answered as every other send answers one: `Ok`, with nothing asked. Mutant: the
-/// look at the root is dropped, so the answer is the refusal for a process with no window.
-#[skuld::test]
-fn an_exited_child_is_answered_ok(#[fixture(wm_close)] _group: &Group) {
-    let mut gui = Gui::start(&Plan::new(Mode::Closing), |_| {});
-    gui.end_stdin();
-    assert_eq!(gui.child.wait().expect("the child exits").code(), Some(0));
-    stop::send_wm_close(&StopTarget::from(&gui.child)).expect("an exited child is answered Ok");
 }
 
 /// A console program with a console of its own: its console window is in the real listing under the console
@@ -188,4 +183,29 @@ fn graceful_shutdown_tree_closes_the_parent_and_its_copy(#[fixture(wm_close)] _g
     assert_eq!(status.code(), Some(0), "{status:?}");
     // Every process of the tree is gone when the stdout they share ends.
     assert_eq!(gui.lines_until_gone(), Vec::<String>::new());
+}
+
+/// A look at the root that fails the first time is not the answer: the send goes on, and the look made after it,
+/// when no window was asked, gives the answer: `RootExited` for a root that had exited, the refusal for a
+/// running one that shows no window. The root is a fake whose pid no process has, so no window is posted to,
+/// but the send lists this desktop's windows: the row is in the group.
+///
+/// Mutants: the first look's failure is the answer (both rows fail); the failure is answered as an exit (the
+/// running row fails).
+#[skuld::test]
+fn a_first_look_that_fails_is_not_the_answer(#[fixture(wm_close)] _group: &Group) {
+    for second in [Answer::Exited, Answer::Running] {
+        let root = FakeProcess::new([Answer::Err(std::io::ErrorKind::Other), second])
+            .with_kernel(spawn_kernel(FakeKernel::new()));
+        let child = child_with(&root, fake_tree());
+        match (second, sent_over(&child, false)) {
+            (Answer::Exited, SendAnswer::RootExited(error)) => {
+                assert!(detail_of(&error).contains("had exited when cosca looked"), "{error:?}");
+            }
+            (Answer::Running, SendAnswer::NotSent(error, _)) => {
+                assert!(detail_of(&error).contains("visible top-level window"), "{error:?}");
+            }
+            (_, other) => panic!("the second look is {second:?}, and the answer is {other:?}"),
+        }
+    }
 }

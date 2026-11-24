@@ -9,7 +9,7 @@
 //! functions, not for an action that also calls the blocking ones of [`cosca::stop`](crate::stop) over
 //! the same target. A prepared function that sends and does not wait (`send_signal`,
 //! `send_ctrl_break_to_group`) is the sync function made `async`, so an action composes it as it
-//! composes the others. So is `send_wm_close`, whose one await is the look at the root.
+//! composes the others. So is `send_wm_close`, whose awaits are only looks at the root.
 //!
 //! [`tokio::Child::terminate`]: crate::tokio::Child::terminate
 

@@ -509,7 +509,7 @@ fn no_visible_window_says_what_it_covers_and_names_kill() {
 // No window is listed or posted to: each case is answered before the desktop is read.
 
 /// How the send of a child over a fake root answers, for a tree target (`tree`) or a root target.
-fn sent_over(child: &Child, tree: bool) -> SendAnswer {
+pub(super) fn sent_over(child: &Child, tree: bool) -> SendAnswer {
     let target = if tree {
         StopTarget::tree(child, TreeCall::SignalOnly)
     } else {
@@ -524,12 +524,12 @@ fn child_over_a_fake_tree(root_exited: bool, fake: FakeContains) -> Child {
     child_with(&root, fake)
 }
 
-fn fake_tree() -> FakeContains {
+pub(super) fn fake_tree() -> FakeContains {
     FakeContains::new(Containment::JobObject, false).0
 }
 
 /// The detail of an `Unsupported` or `Unassessable` answer.
-fn detail_of(error: &Error) -> &str {
+pub(super) fn detail_of(error: &Error) -> &str {
     match error {
         Error::Unsupported { detail, .. } | Error::Unassessable { detail, .. } => detail,
         other => panic!("{other:?}"),
@@ -557,7 +557,7 @@ fn a_child_with_no_identity_is_refused_naming_kill() {
 
 /// What `terminate` (a root target) or `terminate_tree` (a tree target) answers of `send_wm_close` over `child`:
 /// the send's answer, concluded into the target's record, read as the calls read it. A root target with an
-/// identity lists the desktop: only the cases answered before that are run here.
+/// identity over a root that runs lists the desktop: only the cases answered before that are run here.
 fn wm_close_call(child: &Child, tree: bool) -> Result<(), crate::stop::StopError> {
     let target = if tree {
         StopTarget::tree(child, TreeCall::SignalOnly)
@@ -570,32 +570,29 @@ fn wm_close_call(child: &Child, tree: bool) -> Result<(), crate::stop::StopError
 
 /// The outcome a failed `terminate` and `terminate_tree` report of a `send_wm_close` that sent nothing, for
 /// every case that is answered before a window is listed: a child with no identity (a root and a tree
-/// target), and a tree that names no member (a tree target only: a root target always lists the desktop),
-/// over a root that runs (no visible window) and over one that had exited. Each is `NotSent`, through the
-/// tree's real route (an empty job).
+/// target), and a tree that names no member (a tree target only: a root target over a root that runs always
+/// lists the desktop), over a root that runs (no visible window) and over one that had exited. Each is
+/// `NotSent`: the tree records the answer of the stop it was given.
 ///
 /// Mutants: the send's end is not recorded (the failed call reads `Unknown`); an exited root's answer is
-/// recorded as a send.
+/// recorded as a send; the fake tree states `Sent` whatever the stop answered.
 #[skuld::test]
 fn a_wm_close_that_sent_nothing_is_not_sent_for_a_root_and_for_a_tree() {
     use crate::stop::SendOutcome::NotSent;
 
-    let over_a_job = |root_exited: bool, identity: bool| {
+    let over_a_fake = |root_exited: bool, identity: bool| {
         let mut child = child_over_a_fake_tree(root_exited, fake_tree());
-        child.tree = crate::containment::Tree::contained(crate::containment::Mechanism::Job(
-            crate::containment::windows::JobHandle::create_empty_for_test(),
-        ));
         if !identity {
             child.id = None;
         }
         child
     };
     for tree in [false, true] {
-        let err = wm_close_call(&over_a_job(false, false), tree).expect_err("no identity, nothing sent");
+        let err = wm_close_call(&over_a_fake(false, false), tree).expect_err("no identity, nothing sent");
         assert_eq!(err.outcome(), NotSent, "tree: {tree}, no identity: {err:?}");
     }
     for (what, root_exited) in [("no visible window", false), ("an exited root", true)] {
-        let err = wm_close_call(&over_a_job(root_exited, true), true).expect_err("no member asked, nothing sent");
+        let err = wm_close_call(&over_a_fake(root_exited, true), true).expect_err("no member asked, nothing sent");
         assert_eq!(err.outcome(), NotSent, "{what}: {err:?}");
     }
 }
@@ -638,6 +635,22 @@ fn a_tree_that_names_no_member_is_answered_by_the_look_at_the_root() {
         detail_of(&error).contains("no member of the contained tree shows"),
         "{error:?}"
     );
+}
+
+/// A root target whose root has exited is `RootExited` from the look at the root, which is made before the
+/// desktop is read: the call is answered `Ok`, and no window is listed for a process that is gone.
+///
+/// Mutants: the exited root is answered as the no-window refusal, or the look is dropped. A look made after the
+/// listing answers the same, so no assertion on the answer tells the orders apart; what pins the order is the
+/// read of the kernel the listing leads to, which the fake root states no answer for (the fake fails the call
+/// as asked "past the stated facts").
+#[skuld::test]
+fn a_root_target_whose_root_has_exited_is_answered_by_the_look_before_the_desktop_is_read() {
+    let SendAnswer::RootExited(error) = sent_over(&child_over_a_fake_tree(true, fake_tree()), false) else {
+        panic!("a root that had exited is answered RootExited")
+    };
+    assert!(detail_of(&error).contains("had exited when cosca looked"), "{error:?}");
+    wm_close_call(&child_over_a_fake_tree(true, fake_tree()), false).expect("a root that had exited is answered Ok");
 }
 
 /// A tree whose every member the mechanism could not name is the `Io` failure naming the first of them, with
@@ -734,4 +747,19 @@ fn a_process_with_no_listed_window_is_not_opened() {
     };
     assert!(super::ask(&[], &HostKernel, id).is_empty(), "no window listed");
     assert!(super::ask(&[hidden], &HostKernel, id).is_empty(), "no window selected");
+}
+
+// The send over a real child, with no window involved -----
+
+/// A real child that has exited is answered `Ok`, with nothing asked. The root target looks at the root before
+/// it reads the desktop, so no window is listed or posted to.
+///
+/// Mutant: both looks at the root are dropped, so the answer is the refusal for a process with no window. (Only
+/// the first look dropped is not caught: the look after the listing still answers `Ok`.)
+#[skuld::test]
+fn an_exited_child_is_answered_ok() {
+    let (child, stdin) = crate::test_child::held_uncontained_blocker(false);
+    drop(stdin);
+    child.wait().expect("the child ends on the EOF");
+    crate::stop::send_wm_close(&StopTarget::from(&child)).expect("an exited child is answered Ok");
 }

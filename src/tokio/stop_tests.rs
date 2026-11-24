@@ -1416,3 +1416,25 @@ async fn async_the_default_refuses_a_child_cosca_did_not_create() {
         crate::test_child::ctrl_break::assert_no_break_sent();
     }
 }
+
+/// An action that asks the windows to close: the twin's future is `Send`, as an action's must be.
+#[cfg(windows)]
+fn asking_the_windows() -> impl for<'t, 'c> Fn(&'t StopTarget<'c>) -> StopFuture<'t> + Send + Sync + 'static {
+    |target| Box::pin(stop::send_wm_close(target))
+}
+
+/// The async `send_wm_close` for a child that has exited is answered `Ok` with nothing asked, as the sync one
+/// answers it. Mutant: both looks at the root are dropped (answered `Unsupported`). That the twin's future is
+/// `Send` is checked by `asking_the_windows` compiling.
+#[cfg(windows)]
+#[skuld::test]
+async fn async_wm_close_answers_an_exited_child_ok() {
+    assert_current_thread();
+    let (mut child, stdin) = blocker_stopping_by(|_| Box::pin(async { Ok(()) }), false).await;
+    drop(stdin);
+    child.wait().await.expect("the child ends on the EOF");
+    let ask = asking_the_windows();
+    never_blocking(ask(&StopTarget::from(&child.inner)))
+        .await
+        .expect("an exited child is answered Ok");
+}
