@@ -205,6 +205,33 @@ fn program_keeps_the_callers_other_ignored_signals() {
     assert_eq!(caught, 0, "exec resets every handler");
 }
 
+/// The program gets the shim's environment without the helper variable: a program that plays its own
+/// `init_helpers` would otherwise play the shim again.
+///
+/// Mutant: the shim hands the program its whole environment, `__COSCA_HELPER` too.
+#[skuld::test]
+fn the_program_sees_the_shims_environment_without_the_helper_variable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("env");
+    let path = tmp.path().join("tool");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\necho \"${{__COSCA_HELPER-unset}} $PATH\" > '{}'\n",
+            out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (outcome, _) = outcome_of(Spec::new(path.as_os_str(), &[]));
+    assert_eq!(outcome, LinkOutcome::Exited(0));
+    // `PATH` is what the rig gave the shim: the rest of its environment reaches the program.
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "unset /usr/local/bin:/usr/bin:/bin\n"
+    );
+}
+
 // The file found changes between the search and the exec -----
 
 /// Two directories, searched in this order, and the `PATH` that names them.

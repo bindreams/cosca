@@ -121,8 +121,11 @@ pub(super) fn start_and_supervise(shim: &mut Shim, args: &ShimArgs, owner: &Owne
     let argv: Vec<&OsStr> = std::iter::once(args.program.as_os_str())
         .chain(args.args.iter().map(|a| a.as_os_str()))
         .collect();
-    let launch = Launch::new(found.into_candidates(), &argv, std::env::vars_os())
-        .expect("argv carries no NUL: ShimArgs::parse checked");
+    // The program is not the shim: it gets the shim's environment without the variable that made this
+    // process one, or its own `init_helpers` would play the shim again.
+    let environment = std::env::vars_os().filter(|(name, _)| name != crate::role::HELPER_ENV);
+    let launch =
+        Launch::new(found.into_candidates(), &argv, environment).expect("argv carries no NUL: ShimArgs::parse checked");
     let gate_path = shim.hooks.and_then(|h| h.child_gate());
     let prepared = Prepared::new(
         inherited,

@@ -64,7 +64,8 @@ fn run_shim(_: &ShimArgs, _: Option<&'static dyn ShimTestHooks>) -> i32 {
     crate::role::line(
         crate::role::SHIM,
         format_args!(
-            "this platform has no shim; the program was not started (exit {})",
+            "{}: this platform has no shim; the program was not started (exit {})",
+            crate::role::started_with(std::ffi::OsStr::new(crate::role::ELEVATION_SHIM)),
             codes::INVOCATION
         ),
     );

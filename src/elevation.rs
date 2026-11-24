@@ -201,6 +201,9 @@ pub fn is_elevated() -> bool {
 ///
 /// # What the policy must allow for the elevation shim
 ///
+/// No elevated launch of cosca starts the shim yet: today's elevation runs the program itself, and needs
+/// none of what follows. This is what a shim launch will need.
+///
 /// `sudo`, `doas` and `pkexec` reset the environment, so a program they start learns that it is cosca's
 /// elevation shim only from a variable they are told to set: `__COSCA_HELPER=elevation-shim`. Cosca gives
 /// each tool the one form that either delivers the variable or is refused by the tool, never one the tool
@@ -216,9 +219,13 @@ pub fn is_elevated() -> bool {
 ///   `/usr/bin/env`; the dialog and the policy then name `/usr/bin/env`, not the shim. A per-program
 ///   action cannot deliver the variable.
 ///
-/// A shim executable whose path holds a `=` is refused under `doas` and `pkexec`, since `env` would take
-/// it for an assignment. A user whose policy cannot allow these will be able to supply an elevator of
-/// their own; there is no such interface yet.
+/// A `doas` rule or a polkit authorization for `/usr/bin/env` lets that user run every command as root,
+/// since `env` runs any program: that is the limit of this route, and a policy that must not grant it
+/// cannot carry the variable.
+///
+/// A shim executable whose path holds a `=` is refused under `doas`, `pkexec` and the macOS
+/// `do shell script` route, since `env` would take it for an assignment. A user whose policy cannot allow
+/// these will be able to supply an elevator of their own; there is no such interface yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
     #[default]

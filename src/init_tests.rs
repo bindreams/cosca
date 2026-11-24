@@ -191,7 +191,8 @@ fn another_protocol_version_is_answered_before_anything_runs() {
 
 /// A role this build does not have is refused with one line and a code that is no answer of either
 /// role's protocol, and the program does not run, whatever the arguments are. Mutant: an unknown role
-/// runs the program, or the proxy, or exits with a code the shim or the proxy reads.
+/// runs the program, or the proxy, or exits with a code the shim or the proxy reads, or (Windows) the
+/// shim's name is dispatched there.
 #[skuld::test]
 fn an_unknown_role_is_refused_and_the_program_does_not_run() {
     // Only the proxy's collision can be derived from production: its answers are enumerable
@@ -203,7 +204,10 @@ fn an_unknown_role_is_refused_and_the_program_does_not_run() {
         "the code is no answer of the proxy's protocol"
     );
     let tail = valid_tail();
-    for role in ["", "proxy", "CTRL-PROXY", "ctrl-proxy ", "x", "x\ny", "x\r\ny"] {
+    // The shim is a role of Unix builds only; elsewhere its name is as unknown as any other.
+    let shim_elsewhere: &[&str] = if cfg!(unix) { &[] } else { &["elevation-shim"] };
+    let near_misses = ["", "proxy", "CTRL-PROXY", "ctrl-proxy ", "x", "x\ny", "x\r\ny"];
+    for &role in near_misses.iter().chain(shim_elsewhere) {
         for args in [&[][..], &as_strs(&tail)[..]] {
             let out = reexec(Some(role), args);
             assert_eq!(
@@ -245,8 +249,9 @@ fn the_old_shim_flag_without_the_variable_is_the_programs_own_argument() {
 
 /// With the variable naming the shim, the process is the shim and its arguments are the shim's data:
 /// valid ones start it (here, on a directory with no listener, so it answers that it could not connect,
-/// as Linux's shim does; macOS has no shim and says so), and the program does not run.
-/// Mutant: the role is not played, or is played as the proxy, or the program runs.
+/// as Linux's shim does; macOS has no shim and says so, in the `started with` line), and the program
+/// does not run. Mutant: the role is not played, or is played as the proxy, or the program runs, or a
+/// platform without a shim leaves the variable out of its line (macOS only).
 #[cfg(unix)]
 #[skuld::test]
 fn the_shim_role_with_valid_arguments_is_the_shim() {
@@ -254,7 +259,10 @@ fn the_shim_role_with_valid_arguments_is_the_shim() {
     use crate::elevation::shim::fixtures::shim_args;
     use crate::role::{ELEVATION_SHIM, SHIM};
 
-    let argv = shim_args(b"/bin/true", &[]).to_argv(OsStr::new("test-binary"), false);
+    let dir = tempfile::tempdir().expect("a directory with no listener");
+    let mut args = shim_args(b"/bin/true", &[]);
+    args.dir = dir.path().to_owned();
+    let argv = args.to_argv(OsStr::new("test-binary"), false);
     let tail: Vec<&str> = argv[1..].iter().map(|a| a.to_str().expect("ascii")).collect();
     let out = reexec(Some(ELEVATION_SHIM), &tail);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -265,6 +273,10 @@ fn the_shim_role_with_valid_arguments_is_the_shim() {
     };
     assert_eq!(out.status.code(), Some(want), "{out:?}");
     assert!(stderr.starts_with(&format!("{SHIM}: ")), "{stderr}");
+    if !cfg!(target_os = "linux") {
+        // A platform without a shim refuses in the same shape as every other refusal of the role.
+        assert_names_the_variable(&stderr, SHIM, ELEVATION_SHIM);
+    }
     assert!(!stderr.contains("no such helper role"), "{stderr}");
     assert!(!stderr.contains(&format!("{PROXY}: ")), "{stderr}");
     assert_program_did_not_run(&out);

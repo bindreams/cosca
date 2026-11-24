@@ -116,7 +116,9 @@ What a child's cooperative stop sends is an action it stores, not a rule inside 
   `cosca-ctrl-proxy` executable, started with the environment variable `__COSCA_HELPER=ctrl-proxy`. The
   variable, never the program's arguments, says a process is a helper: `cosca::init_helpers()`, first in
   `main`, reads it, and plays the role the value names (an unknown value is refused, and the program does
-  not run). The variable is only read (a helper launch starts no process). The proxy's arguments and
+  not run). `init_helpers` only reads the variable. The proxy role starts no process; the shim role starts
+  the elevated program, which is given the shim's environment without the variable, so that its own
+  `init_helpers` does not play the shim again. The proxy's arguments and
   exit codes (a failed step's cause among them: the step and its Win32 error, in the code itself, so
   that no pipe is read) are the only thing the caller's side and the proxy's own sequence share. The
   caller names the target by identity, so a reused pid is never sent an event, and cosca starts a copy

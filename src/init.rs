@@ -37,10 +37,11 @@ static HELPERS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// called, as a broken contract of the program: see [`stop::default`](crate::stop::default#panics).
 ///
 /// - **The shim** runs on Linux. macOS has no shim: `init_helpers` reports that and does not start the
-///   program (exit 120). Cosca starts a shim through `sudo`, `doas` or `pkexec`, which reset the
-///   environment, so each is given the variable in the one form it either delivers or refuses; a policy
-///   that does not allow the form makes the tool refuse the elevation, and cosca does not try another
-///   way (see [`Backend`](crate::elevation::Backend)).
+///   program (exit 120). No elevated launch of cosca starts the shim yet. A shim launch will go through
+///   `sudo`, `doas` or `pkexec`, which reset the environment, so each is given the variable in the one
+///   form it either delivers or refuses; a policy that does not allow the form makes the tool refuse the
+///   elevation, and cosca does not try another way (see [`Backend`](crate::elevation::Backend)). The
+///   shim starts the elevated program without the variable.
 /// - **The proxy** runs on Windows: it attaches to another process's console, sends it Ctrl+C or
 ///   Ctrl+Break, and exits with its answer (a code from 150 to 159), or, when a step of its own failed
 ///   (before it sent anything, or the wait for its own copy of the event after it generated it), a code
