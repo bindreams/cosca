@@ -84,7 +84,7 @@ impl Rig {
 
     pub(crate) fn with_peer_euid(peer_euid: u32) -> Rig {
         crate::log_capture::install();
-        let tmp = tempfile::tempdir().expect("a temp directory");
+        let tmp = crate::elevation::shim::fixtures::private_tmp();
         let (probe, events) = super::probe::Probe::new();
         let link = super::ShimLink::bind_probed(tmp.path(), peer_euid, probe.clone()).expect("the link binds");
         Rig {
@@ -98,7 +98,7 @@ impl Rig {
     /// A link whose directory is under a temp directory nested deeper than `min_len` bytes.
     #[cfg(target_os = "linux")]
     pub(crate) fn deep(min_len: usize) -> Rig {
-        let tmp = tempfile::tempdir().expect("a temp directory");
+        let tmp = crate::elevation::shim::fixtures::private_tmp();
         let base = crate::elevation::shim::private_dir::PrivateDir::resolve(tmp.path()).unwrap();
         let nested = nested_of_len(&base, min_len + 1);
         Rig::bind_at(tmp, &nested)
@@ -106,7 +106,7 @@ impl Rig {
 
     /// A link whose temp directory has exactly the real path length `len`.
     pub(crate) fn at_real_len(len: usize) -> Rig {
-        let tmp = tempfile::tempdir().expect("a temp directory");
+        let tmp = crate::elevation::shim::fixtures::private_tmp();
         let base = crate::elevation::shim::private_dir::PrivateDir::resolve(tmp.path()).unwrap();
         let nested = nested_of_len(&base, len);
         Rig::bind_at(tmp, &nested)

@@ -1,3 +1,4 @@
+use super::super::fixtures::private_tmp;
 use super::super::fork_guard::Origin;
 use super::facts::{check_dir, check_facts, refused_filesystem, FsOverride, Unfit};
 use super::{DirFacts, NotOriginal, PrivateDir, PrivateDirError, Removal};
@@ -117,7 +118,7 @@ fn chmod_acl(dir: &Path, ace: &str) {
 
 #[cfg(target_os = "macos")]
 fn acl_dir(ace: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let dir = root.path().join("tmp");
     fs::create_dir(&dir).unwrap();
     chmod(&dir, 0o700);
@@ -164,7 +165,7 @@ fn an_acl_with_only_denials_reads_and_our_own_entries_is_accepted() {
 
 #[skuld::test]
 fn ancestor_writable_by_others_is_refused() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let wide = root.path().join("wide");
     let tmp = wide.join("tmp");
     fs::create_dir_all(&tmp).unwrap();
@@ -178,7 +179,7 @@ fn ancestor_writable_by_others_is_refused() {
 
 #[skuld::test]
 fn world_writable_tmpdir_itself_is_refused() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let tmp = root.path().join("tmp");
     fs::create_dir(&tmp).unwrap();
     chmod(&tmp, 0o777);
@@ -208,7 +209,7 @@ fn accepts_the_real_system_tmpdir() {
 #[skuld::test]
 fn cleanup_leaves_a_directory_swapped_in_under_our_name() {
     crate::log_capture::install();
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
     fs::rename(&path, root.path().join("moved")).unwrap();
@@ -223,7 +224,7 @@ fn cleanup_leaves_a_directory_swapped_in_under_our_name() {
 #[skuld::test]
 fn leftover_file_reports_not_empty_and_warns() {
     crate::log_capture::install();
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
     fs::write(path.join("leftover"), b"x").unwrap();
@@ -237,7 +238,7 @@ fn leftover_file_reports_not_empty_and_warns() {
 #[skuld::test]
 fn already_removed_directory_is_gone_and_not_a_warning() {
     crate::log_capture::install();
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
     fs::remove_dir(&path).unwrap();
@@ -257,7 +258,7 @@ fn relative_or_missing_tmpdir_is_an_error_naming_it() {
     };
     assert!(e.to_string().contains("relative/tmp"), "{e}");
 
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let missing = root.path().join("missing");
     let Err(e @ PrivateDirError::Tmpdir { .. }) = PrivateDir::create_in(&missing) else {
         panic!("a missing tmpdir must be refused");
@@ -269,7 +270,7 @@ fn relative_or_missing_tmpdir_is_an_error_naming_it() {
 
 #[skuld::test]
 fn a_private_directory_error_has_its_cause_as_its_source() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let Err(e @ PrivateDirError::Create { .. }) = PrivateDir::create_with(root.path(), open_fails, true) else {
         panic!("a failing open must be a Create error");
     };
@@ -296,7 +297,7 @@ fn the_directory_is_0700_whatever_the_umask_says() {
     ) else {
         return;
     };
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     // SAFETY: `umask` has no preconditions; this test runs alone in its process.
     unsafe { libc::umask(0o277) };
     let dir = PrivateDir::create_in(root.path()).unwrap();
@@ -305,7 +306,7 @@ fn the_directory_is_0700_whatever_the_umask_says() {
 
 #[skuld::test]
 fn drop_in_the_owning_pid_removes_the_directory() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
     drop(dir);
@@ -315,7 +316,7 @@ fn drop_in_the_owning_pid_removes_the_directory() {
 #[skuld::test]
 fn drop_logs_what_remove_logs() {
     crate::log_capture::install();
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
     fs::write(path.join("leftover"), b"x").unwrap();
@@ -328,7 +329,7 @@ fn drop_logs_what_remove_logs() {
 
 #[skuld::test]
 fn a_fork_copys_drop_leaves_the_directory() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let mut dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
     dir.release(Origin::Copy);
@@ -343,7 +344,7 @@ fn a_fork_copys_drop_leaves_the_directory() {
 /// The real thing: a forked child drops its copy of the directory.
 #[skuld::test]
 fn a_real_fork_copys_drop_leaves_the_directory() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
     // SAFETY: the child only drops its copy (which takes malloc's lock, and glibc and libmalloc
@@ -377,7 +378,7 @@ fn dropping_with_a_full_fd_table_does_not_panic() {
     ) else {
         return;
     };
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
     let _restore = crate::test_child::exhaust_fds(&done);
@@ -393,7 +394,7 @@ fn dropping_with_a_full_fd_table_does_not_panic() {
 #[skuld::test]
 fn remove_refuses_a_copy_and_an_unknown_origin() {
     for origin in [Origin::Copy, Origin::Unknown] {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tmp();
         let dir = PrivateDir::create_unguarded(root.path()).unwrap();
         let path = dir.path().to_owned();
         assert_eq!(dir.remove(origin), Err(NotOriginal(origin)));
@@ -406,7 +407,7 @@ fn remove_refuses_a_copy_and_an_unknown_origin() {
 /// An unguarded directory is removed by its owner only: dropping it does nothing.
 #[skuld::test]
 fn dropping_an_unguarded_directory_leaves_it() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let dir = PrivateDir::create_unguarded(root.path()).unwrap();
     let path = dir.path().to_owned();
     drop(dir);
@@ -417,7 +418,7 @@ fn dropping_an_unguarded_directory_leaves_it() {
 /// the original's.
 #[skuld::test]
 fn an_unknown_origin_leaves_the_directory() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let mut dir = PrivateDir::create_in(root.path()).unwrap();
     let path = dir.path().to_owned();
     dir.release(Origin::Unknown);
@@ -444,7 +445,7 @@ fn open_fails_after_removing(
 
 #[skuld::test]
 fn a_failure_after_mkdirat_removes_the_directory() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let Err(PrivateDirError::Create { path, .. }) = PrivateDir::create_with(root.path(), open_fails, true) else {
         panic!("a failing open must be a Create error");
     };
@@ -455,7 +456,7 @@ fn a_failure_after_mkdirat_removes_the_directory() {
 #[skuld::test]
 fn a_failed_cleanup_after_a_failure_warns() {
     crate::log_capture::install();
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let mark = crate::log_capture::mark();
     let Err(PrivateDirError::Create { path, .. }) =
         PrivateDir::create_with(root.path(), open_fails_after_removing, true)
@@ -560,7 +561,7 @@ fn the_temp_directorys_own_filesystem_decides() {
             fs_type,
         })
     };
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let real = PrivateDir::resolve(root.path()).unwrap();
     let Err(error @ PrivateDirError::Filesystem { .. }) =
         PrivateDir::create_resolved(root.path(), real.clone(), super::open_and_harden, true, over(0x6969))
@@ -598,7 +599,7 @@ fn a_volume_that_is_not_local_is_refused() {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn macos_a_temp_directory_without_mnt_local_is_refused() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let real = PrivateDir::resolve(root.path()).unwrap();
     let over = Some(FsOverride {
         mount_flags: 0,
@@ -614,7 +615,7 @@ fn macos_a_temp_directory_without_mnt_local_is_refused() {
 
 #[skuld::test]
 fn the_directory_fd_names_the_directory() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let dir = PrivateDir::create_in(root.path()).unwrap();
     let by_fd = rustix::fs::fstat(dir.dir_fd()).unwrap();
     let by_path = fs::metadata(dir.path()).unwrap();
@@ -628,7 +629,7 @@ fn the_directory_fd_names_the_directory() {
 #[cfg(debug_assertions)]
 #[skuld::test]
 fn an_unresolved_path_trips_the_debug_assertion() {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tmp();
     let relative = std::path::PathBuf::from("relative/tmp");
     let caught = std::panic::catch_unwind(|| PrivateDir::create_unguarded_resolved(root.path(), relative));
     assert!(caught.is_err());

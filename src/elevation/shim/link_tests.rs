@@ -318,7 +318,7 @@ fn a_tmpdir_deeper_than_200_bytes_binds_and_accepts() {
 fn an_unusable_proc_is_refused_naming_tmpdir() {
     use super::super::link::BindError;
     crate::log_capture::install();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::elevation::shim::fixtures::private_tmp();
     let (probe, _events) = super::probe::Probe::new();
     probe.use_proc_root(tmp.path().join("no-proc-here"));
     let Err(error @ BindError::ProcUnusable { .. }) = super::ShimLink::bind_probed(tmp.path(), my_euid(), probe) else {
@@ -343,7 +343,7 @@ fn an_unusable_proc_is_refused_naming_tmpdir() {
 fn a_tmpdir_too_long_for_sun_path_is_refused_before_anything_is_made() {
     use super::super::link::BindError;
     crate::log_capture::install();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::elevation::shim::fixtures::private_tmp();
     let mut nested = tmp.path().to_owned();
     while nested.as_os_str().len() < 90 {
         nested.push("n".repeat(20));
@@ -378,7 +378,7 @@ fn the_socket_path_limit_is_exact() {
     // Through `bind`: the boundary, a short given path to a long real one, and a long given path to
     // a short real one.
     crate::log_capture::install();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::elevation::shim::fixtures::private_tmp();
     let base = crate::elevation::shim::private_dir::PrivateDir::resolve(tmp.path()).unwrap();
     let bind = |at: &std::path::Path| {
         let (probe, events) = super::probe::Probe::new();
@@ -438,7 +438,7 @@ fn a_real_path_at_the_limit_binds_accepts_and_unlinks() {
 fn a_proc_whose_descriptor_names_another_directory_is_refused() {
     use super::super::link::BindError;
     crate::log_capture::install();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::elevation::shim::fixtures::private_tmp();
     let decoy = tmp.path().join("decoy");
     std::fs::create_dir(&decoy).unwrap();
     let fds = tmp.path().join("fake-proc/thread-self/fd");
@@ -533,7 +533,7 @@ fn a_bind_error_has_its_cause_as_its_source() {
 fn emfile_opening_through_proc_is_an_io_error_not_a_proc_error() {
     use super::super::link::BindError;
     crate::log_capture::install();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::elevation::shim::fixtures::private_tmp();
     for (errno, is_proc) in [
         (Errno::MFILE, false),
         (Errno::NFILE, false),

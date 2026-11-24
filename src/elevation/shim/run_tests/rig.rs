@@ -757,7 +757,7 @@ impl Owner {
     /// [`start`](Self::start) behind `wrapper`, a command that runs what follows it (`setpriv …`).
     pub(super) fn start_with(mode: &str, wrapper: &[&str]) -> Owner {
         use std::io::BufRead;
-        let work = tempfile::tempdir().expect("a work directory");
+        let work = crate::elevation::shim::fixtures::private_tmp();
         let exe = std::env::current_exe().expect("the test binary's path");
         let mut command = match wrapper.split_first() {
             Some((first, rest)) => {
