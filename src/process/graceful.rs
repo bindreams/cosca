@@ -178,13 +178,27 @@ impl Process {
     /// A walk that finds members signals them whatever the flag says, and the call is `Ok` (a signal
     /// settles nothing), but the members it found are not taken for the whole tree, and a graceful
     /// shutdown's sweep does not stand on them.
-    pub fn terminate_tree(&self) -> Result<(), Error> {
+    ///
+    /// **What a failure says of the send.** The error is a [`StopError`](crate::stop::StopError), as for
+    /// [`Child::terminate_tree`](crate::Child::terminate_tree): [`error`](crate::stop::StopError::error) is
+    /// the [`Error`] above, and [`outcome`](crate::stop::StopError::outcome) says how the send went
+    /// ([`SendOutcome`](crate::stop::SendOutcome)). Every failure of this call is one where the walk sent
+    /// nothing, so the outcome is [`NotSent`](crate::stop::SendOutcome::NotSent): a signal to a member that
+    /// fails after others went out is warned of, and the call is `Ok`. `?` turns the error into an [`Error`].
+    pub fn terminate_tree(&self) -> Result<(), crate::stop::StopError> {
         self.terminate_tree_with(&crate::identity::HostKernel)
     }
 
     /// [`terminate_tree`](Self::terminate_tree), reading through `kernel`.
-    pub(crate) fn terminate_tree_with(&self, kernel: &dyn crate::identity::Kernel) -> Result<(), Error> {
-        self.terminate_walk(kernel).0.into_tree_result()
+    pub(crate) fn terminate_tree_with(
+        &self,
+        kernel: &dyn crate::identity::Kernel,
+    ) -> Result<(), crate::stop::StopError> {
+        let (answer, _) = self.terminate_walk(kernel);
+        let outcome = answer.outcome();
+        answer
+            .into_tree_result()
+            .map_err(|error| crate::stop::StopError::new(error, outcome))
     }
 
     /// The `SIGTERM` walk of [`terminate_tree`](Self::terminate_tree), with what it found: the members it

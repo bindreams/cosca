@@ -116,10 +116,14 @@ fn process_soft_tree_unsupported_on_windows() {
     use std::time::Duration;
     let (child, sock) = common::spawn_blocker();
     let p = cosca::Process::open_pid(child.pid()).expect("open").expect("running");
-    assert!(matches!(
-        p.terminate_tree(),
-        Err(cosca::error::Error::Unsupported { .. })
-    ));
+    let refused = p
+        .terminate_tree()
+        .expect_err("a foreign tree has no graceful signal on Windows");
+    assert!(
+        matches!(refused.error(), cosca::error::Error::Unsupported { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(refused.outcome(), cosca::stop::SendOutcome::NotSent, "{refused:?}");
     assert!(matches!(
         p.graceful_shutdown_tree(Duration::from_secs(1)),
         Err(cosca::error::Error::Unsupported { .. })

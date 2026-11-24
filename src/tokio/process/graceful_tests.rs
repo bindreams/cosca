@@ -108,6 +108,31 @@ async fn async_foreign_terminate_tree_sigterms_the_root_and_its_descendant() {
     tree.assert_died_of_sigterm();
 }
 
+// As the sync call: a walk from an exited root finds no member, sends nothing and says `NotSent`.
+//
+// Mutants: the empty walk is `Ok`; the error's outcome is not the answer's (`Sent` or `Unknown`).
+#[skuld::test]
+async fn async_foreign_terminate_tree_over_an_exited_root_with_an_empty_walk_says_not_sent() {
+    let mut child = crate::test_child::blocker();
+    let p = crate::tokio::Process::open_pid(child.id())
+        .expect("open")
+        .expect("running");
+    child.kill().expect("kill the root");
+    crate::test_child::wait_until_zombie(child.id());
+    let sends = Capture::start();
+
+    let err = p
+        .terminate_tree()
+        .expect_err("a walk from an exited root finds no member");
+
+    assert!(
+        matches!(err.error(), crate::error::Error::Unassessable { .. }),
+        "{err:?}"
+    );
+    assert_eq!(err.outcome(), crate::stop::SendOutcome::NotSent, "{err:?}");
+    assert_eq!(sends.entries(), vec![], "nothing was sent");
+}
+
 #[skuld::test]
 async fn async_foreign_graceful_shutdown_tree_graceful_path() {
     crate::tokio::test_runtime::assert_current_thread();

@@ -39,7 +39,9 @@ pub(super) fn walks() -> [(&'static str, Walk); 4] {
         hard_kill,
         terminate,
         ("kill_tree", |k, id| open_live(id).kill_tree_with("kill_tree", k)),
-        ("terminate_tree", |k, id| open_live(id).terminate_tree_with(k)),
+        ("terminate_tree", |k, id| {
+            open_live(id).terminate_tree_with(k).map_err(Error::from)
+        }),
     ]
 }
 

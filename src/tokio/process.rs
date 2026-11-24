@@ -118,7 +118,8 @@ impl Process {
 
     /// Best-effort graceful (`SIGTERM`) identity-walk sweep. Unix only; Windows returns
     /// `Unsupported` (see [`Process::terminate_tree`](crate::Process::terminate_tree)).
-    pub fn terminate_tree(&self) -> Result<(), Error> {
+    /// A failure is a [`StopError`](crate::stop::StopError) saying how the send went, as for the sync call.
+    pub fn terminate_tree(&self) -> Result<(), crate::stop::StopError> {
         self.inner.terminate_tree()
     }
 }

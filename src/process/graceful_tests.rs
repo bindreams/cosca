@@ -355,9 +355,10 @@ fn foreign_kill_tree_over_an_exited_unreaped_root_is_unassessable() {
     assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
 }
 
-// `terminate_tree` over an exited root whose walk finds no member is `Unassessable` and sends nothing.
+// `terminate_tree` over an exited root whose walk finds no member is `Unassessable` and sends nothing,
+// and says so: the outcome is `NotSent`.
 //
-// Mutant: the empty walk is `Ok`.
+// Mutants: the empty walk is `Ok`; the error's outcome is not the answer's (`Sent` or `Unknown`).
 #[skuld::test]
 fn foreign_terminate_tree_over_an_exited_root_with_an_empty_walk_is_unassessable_and_sends_nothing() {
     let mut child = blocker();
@@ -370,6 +371,10 @@ fn foreign_terminate_tree_over_an_exited_root_with_an_empty_walk_is_unassessable
         .terminate_tree()
         .expect_err("a walk from an exited root finds no member");
 
-    assert!(matches!(err, crate::error::Error::Unassessable { .. }), "{err:?}");
+    assert!(
+        matches!(err.error(), crate::error::Error::Unassessable { .. }),
+        "{err:?}"
+    );
+    assert_eq!(err.outcome(), crate::stop::SendOutcome::NotSent, "{err:?}");
     assert_eq!(sends.entries(), vec![], "nothing was sent");
 }

@@ -292,7 +292,8 @@ impl SendAnswer {
     /// The answer of a tree call that makes this send and nothing else (the Unix group send,
     /// `terminate_tree`): `Err` when nothing was sent (not sent, or the root had exited) or the answer is
     /// an error, else what the send answered. Not for a root target: on Windows it answers an exited root
-    /// `Ok`. The one flattening: `terminate_tree` of a `Child` and of a foreign `Process` both end in it.
+    /// `Ok`. The one flattening: `terminate_tree` of a `Child` and of a foreign `Process` both end in it, and
+    /// both say [`outcome`](SendAnswer::outcome) beside it.
     pub(crate) fn into_tree_result(self) -> Result<(), Error> {
         match self {
             SendAnswer::NotSent(error, _) | SendAnswer::RootExited(error) | SendAnswer::Unknown(error) => Err(error),
