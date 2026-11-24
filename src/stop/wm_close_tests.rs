@@ -517,7 +517,7 @@ fn no_visible_window_says_what_it_covers_and_names_kill() {
             panic!("{error:?}")
         };
         for fragment in [
-            "visible top-level window",
+            "top-level window without an owner that has been shown (one with the WS_VISIBLE style)",
             "this desktop",
             "keeps its window hidden",
             "notification area",
@@ -528,7 +528,12 @@ fn no_visible_window_says_what_it_covers_and_names_kill() {
         ] {
             assert!(detail.contains(fragment), "{fragment:?} is missing from {detail}");
         }
-        assert_eq!(detail.contains("no member of the contained tree"), tree, "{detail}");
+        let negation = if tree {
+            "no member of the contained tree has a top-level window"
+        } else {
+            "the process has no top-level window"
+        };
+        assert!(detail.contains(negation), "{negation:?} is missing from {detail}");
         assert!(source.is_none());
     }
 }
@@ -661,7 +666,7 @@ fn a_tree_that_names_no_member_is_answered_by_the_look_at_the_root() {
         panic!("a running root with no member shows no window")
     };
     assert!(
-        detail_of(&error).contains("no member of the contained tree shows"),
+        detail_of(&error).contains("no member of the contained tree has a top-level window"),
         "{error:?}"
     );
 }

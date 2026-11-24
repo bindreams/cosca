@@ -10,7 +10,8 @@ use windows::Win32::Foundation::{
     SetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_WINDOW_HANDLE, HWND, LPARAM, WIN32_ERROR, WPARAM,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindow, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, GW_OWNER, WM_CLOSE,
+    EnumWindows, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowThreadProcessId, PostMessageW, GWL_STYLE,
+    GW_OWNER, WM_CLOSE, WS_VISIBLE,
 };
 
 use super::{conclude, root_exited, unsupported, Scope, StopTarget, StopWaits, REMEDIES};
@@ -63,6 +64,8 @@ pub(super) struct Listed {
     pub(super) hwnd: isize,
     /// The process that owns the window's thread.
     pub(super) pid: u32,
+    /// The window's own `WS_VISIBLE` style (what `ShowWindow` sets); not `IsWindowVisible`, which also needs the
+    /// desktop to be visible and is false for every window of a station that is not interactive, as a service's.
     pub(super) visible: bool,
     /// The window has an owner (`GetWindow(GW_OWNER)`), or its owner could not be read.
     pub(super) has_owner: bool,
@@ -76,8 +79,8 @@ pub(super) struct Asked<'a> {
     pub(super) class: &'a str,
 }
 
-/// The windows of the process `pid` that a stop asks: those that are visible, have no owner, and have a
-/// class that was read and is not a console's.
+/// The windows of the process `pid` that a stop asks: those that are visible (`WS_VISIBLE`), have no owner, and
+/// have a class that was read and is not a console's.
 pub(super) fn asked(listing: &[Listed], pid: u32) -> Vec<Asked<'_>> {
     listing
         .iter()
@@ -292,21 +295,22 @@ pub(super) fn answer(folded: Fold) -> Option<SendAnswer> {
     }
 }
 
-/// The answer for a target none of whose processes shows a visible top-level window: it is what a program
-/// that keeps its window hidden, or lives in the notification area, gets, and so does a child that has not
-/// shown its window yet.
+/// The answer for a target none of whose processes has a top-level window without an owner that has been shown
+/// (has `WS_VISIBLE`): it is what a program that keeps its window hidden, or lives in the notification area,
+/// gets, and so does a child that has not shown its window yet.
 fn no_visible_window(tree: bool) -> Error {
     let who = if tree {
-        "no member of the contained tree shows"
+        "no member of the contained tree has a"
     } else {
-        "the process shows"
+        "the process has no"
     };
     unsupported(
         format!(
-            "{who} a visible top-level window without an owner on this desktop, which is all WM_CLOSE is posted \
-             to, so nothing was sent. That covers a program that keeps its window hidden or lives in the \
-             notification area, a child that has not shown its window yet, a window on another desktop or in \
-             another session, and a console program (a console's window is never posted to). {REMEDIES}"
+            "{who} top-level window without an owner that has been shown (one with the WS_VISIBLE style) on this \
+             desktop, which is all WM_CLOSE is posted to, so nothing was sent. That covers a program that keeps \
+             its window hidden or lives in the notification area, a child that has not shown its window yet, a \
+             window on another desktop or in another session, and a console program (a console's window is never \
+             posted to). {REMEDIES}"
         ),
         None,
     )
@@ -377,8 +381,8 @@ fn swallowed(pid: u32, call: &str, error: io::Error) {
 
 /// What the OS says of `hwnd`, a window of the process `pid`, now.
 fn read(hwnd: HWND, pid: u32) -> Listed {
-    // SAFETY: a call with a handle value only; a stale one is answered false.
-    let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+    // SAFETY: a call with a handle value only; a stale one is answered 0, which reads as not visible.
+    let visible = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32 & WS_VISIBLE.0 != 0;
     // SAFETY: a call with a handle value only.
     let has_owner = match or_nothing(|| unsafe { GetWindow(hwnd, GW_OWNER) }) {
         Ok(Some(_)) => true,

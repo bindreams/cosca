@@ -56,6 +56,8 @@ static ROLES: &[&FixtureRole] = &[
     &super::zombie_leader_root::ROLE,
     #[cfg(windows)]
     &super::wm_close_gui::ROLE,
+    #[cfg(windows)]
+    &super::wm_close_station::ROLE,
 ];
 
 /// Plays the role named by argument 1, if any; does not return when it does.

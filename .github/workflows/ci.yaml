@@ -224,8 +224,8 @@ jobs:
           --lib --test ctrl_proxy_bin --no-tests=fail
 
       # `stop::send_wm_close` posts `WM_CLOSE` to top-level windows of the desktop, and its tests open windows and a
-      # console and create a desktop on the process's window station: the `WM_CLOSE` group, off everywhere else. A CI
-      # runner is the sandbox, so this step consents.
+      # console, create desktops and a window station, and start a process on one of them: the `WM_CLOSE` group, off
+      # everywhere else. A CI runner is the sandbox, so this step consents.
       - name: Run the WM_CLOSE tests (Windows)
         if: matrix.os == 'windows'
         timeout-minutes: 10

@@ -674,7 +674,10 @@ pub fn send_console_event_via_proxy(target: &StopTarget<'_>, event: CtrlEvent) -
 ///
 /// It posts `WM_CLOSE` to the top-level windows of the target's processes that are **visible and have no
 /// owner**: a tool window is one of them, a hidden window and an owned one (a dialog, an input-method
-/// helper) are not. A window of a console (class `ConsoleWindowClass` or `PseudoConsoleWindow`) is never
+/// helper) are not. A window is visible when it has the `WS_VISIBLE` style of its own, which `ShowWindow`
+/// sets; `IsWindowVisible` is not the test, as it also needs the desktop to be visible. On a window station
+/// that is not interactive, as a service's, no window is visible on screen; a window the program has shown
+/// is asked all the same. A window of a console (class `ConsoleWindowClass` or `PseudoConsoleWindow`) is never
 /// posted to, whichever process it is listed under: the system turns a close of a `ConsoleWindowClass`
 /// window into `CTRL_CLOSE_EVENT` for every process on that console, and what a post to the other class does
 /// was not established. A window whose class cannot be read is not asked.
@@ -718,16 +721,17 @@ pub fn send_console_event_via_proxy(target: &StopTarget<'_>, event: CtrlEvent) -
 /// - no window was asked and the child had exited when cosca looked: `Ok` on a root target whose child has an
 ///   identity, and on a tree target the tree call's own answer (see the module doc). A child with no identity
 ///   is refused as above, exited or not;
-/// - no window was asked: [`Error::Unsupported`], which says the process shows no visible top-level window
-///   without an owner on this desktop, and names [`Child::kill`](crate::Child::kill).
+/// - no window was asked: [`Error::Unsupported`], which says the process has no top-level window without an
+///   owner that has been shown (one with the `WS_VISIBLE` style) on this desktop (on a tree target, that no
+///   member of the tree has one), and names [`Child::kill`](crate::Child::kill).
 ///
 /// # Limits
 ///
 /// Each is an [`Error::Unsupported`] with nothing sent, or a window that is not asked, and
 /// [`Child::kill`](crate::Child::kill) is the alternative.
 ///
-/// - **A program with no visible window without an owner is not asked:** one that keeps its window hidden or
-///   lives in the notification area. Hidden windows are not a fallback.
+/// - **A program with no visible window without an owner is not asked:** one that keeps its window hidden (no
+///   `WS_VISIBLE` style) or lives in the notification area. Hidden windows are not a fallback.
 /// - **Before the child has shown its window,** it has none to ask. A child that was just created can be
 ///   refused as one with no window; a caller that has observed output or a handshake from the child is past
 ///   that window. A caller that wants the child gone before it has run at all uses `Child::kill`.

@@ -209,7 +209,7 @@ test_group!(CLONE3 => clone3, env = "COSCA_TEST_CLONE3");
 test_group!(STRAY_SIGNAL => stray_signal, env = "COSCA_TEST_STRAY_SIGNAL", consent = "may signal an unrelated process (a number no live process of the test pins, or a walk from a reaped root's pid)");
 test_group!(UNPRIVILEGED => unprivileged, env = "COSCA_TEST_UNPRIVILEGED");
 test_group!(CTRL_PROXY => ctrl_proxy, env = "COSCA_TEST_CTRL_PROXY", consent = "sends a console control event to a whole console");
-test_group!(WM_CLOSE => wm_close, env = "COSCA_TEST_WM_CLOSE", consent = "posts WM_CLOSE to top-level windows of the desktop, opens windows and a console, and creates a desktop on the process's window station");
+test_group!(WM_CLOSE => wm_close, env = "COSCA_TEST_WM_CLOSE", consent = "posts WM_CLOSE to top-level windows of the desktop, opens windows and a console, creates desktops and a window station, and starts a process on one of them");
 
 /// A pidfd of this process, for the kernel preconditions to query.
 #[cfg(target_os = "linux")]

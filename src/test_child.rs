@@ -33,6 +33,9 @@ pub(crate) mod fixture_role;
 #[cfg(windows)]
 pub(crate) mod wm_close_gui;
 
+#[cfg(windows)]
+pub(crate) mod wm_close_station;
+
 #[cfg(unix)]
 pub(crate) mod blocked_tree_root;
 

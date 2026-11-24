@@ -99,6 +99,16 @@ impl Plan {
         }
     }
 
+    /// A reporting process with every kind of window.
+    pub(crate) fn every_window() -> Plan {
+        Plan {
+            tool: true,
+            hidden: true,
+            owned: true,
+            ..Plan::new(Mode::Reporting)
+        }
+    }
+
     /// The arguments after the role's flag that start a process with the tag `tag`.
     fn words(&self, tag: &str) -> Vec<String> {
         let mut words = vec![self.mode.name().to_owned(), format!("tag={tag}")];
